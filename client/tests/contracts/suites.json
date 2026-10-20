@@ -1,0 +1,649 @@
+{
+  "schema_version": 1,
+  "redaction": {
+    "bearer": "(?i)(bearer\\s+)[A-Za-z0-9._~+/=-]+",
+    "pem-private-key": "-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+  },
+  "suites": {
+    "foundation": {
+      "package": "harness",
+      "tags": [
+        "pr",
+        "sdk-free",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/harness",
+        "tools/live"
+      ],
+      "contracts": [
+        "LIVE.harness"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "uri": {
+      "package": "runtime",
+      "tags": [
+        "pr",
+        "sdk-free",
+        "native"
+      ],
+      "fixtures": [
+        "tests/runtime"
+      ],
+      "contracts": [
+        "LIVE.endpoint.uri"
+      ],
+      "budget": {
+        "artifact_bytes": 16777216,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "wire-envelope": {
+      "package": "wire",
+      "tags": [
+        "pr",
+        "sdk-free",
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/wire"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics"
+      ],
+      "budget": {
+        "artifact_bytes": 16777216,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "lock-noalloc": {
+      "package": "runtime",
+      "tags": [
+        "pr",
+        "sdk-free",
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/core"
+      ],
+      "contracts": [
+        "LIVE.thread.safety"
+      ],
+      "budget": {
+        "artifact_bytes": 16777216,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "usd-values": {
+      "package": "wire",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/wire"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "wire-scene": {
+      "package": "scene",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/scene"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "scene-journal": {
+      "package": "scene",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/scene"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "sdf-scene": {
+      "package": "scene",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/usd"
+      ],
+      "contracts": [
+        "LIVE.usd"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "runtime-foundation": {
+      "package": "runtime",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/runtime",
+        "tests/contracts/diagnostic-catalog.json"
+      ],
+      "contracts": [
+        "LIVE.lifecycle",
+        "LIVE.operational.status",
+        "LIVE.time.jitter"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "resolver-probe": {
+      "package": "resolver",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/native/resolver"
+      ],
+      "contracts": [
+        "LIVE.usd"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "diagnostics-schema": {
+      "package": "runtime",
+      "tags": [
+        "native",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/diagnostics",
+        "tests/contracts/diagnostic-snapshot.schema.json"
+      ],
+      "contracts": [
+        "LIVE.observability"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "reference-service": {
+      "package": "reference",
+      "tags": [
+        "reference",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service"
+      ],
+      "contracts": [
+        "LIVE.harness"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "native-reference": {
+      "package": "runtime",
+      "tags": [
+        "reference",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/runtime"
+      ],
+      "contracts": [
+        "LIVE.authentication",
+        "LIVE.layer.streams",
+        "LIVE.mutations",
+        "LIVE.recovery",
+        "LIVE.session.creation"
+      ],
+      "case_selection": true,
+      "driver_modes": [
+        "actor-auth-timeout"
+      ],
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "scene-reference": {
+      "package": "scene",
+      "tags": [
+        "reference",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/scene"
+      ],
+      "contracts": [
+        "LIVE.sequence.reconnect",
+        "LIVE.usd"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "resolver-reference": {
+      "package": "resolver",
+      "tags": [
+        "reference",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/resolver_runtime"
+      ],
+      "contracts": [
+        "LIVE.usd"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "plugin-reference": {
+      "package": "plugin",
+      "tags": [
+        "reference",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/plugin",
+        "tests/native/participant",
+        "tests/native/diagnostics_log"
+      ],
+      "contracts": [
+        "LIVE.abi.loading",
+        "LIVE.presence.messages",
+        "LIVE.many.writer.preservation"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "python-reference": {
+      "package": "python",
+      "tags": [
+        "reference"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/python"
+      ],
+      "contracts": [
+        "LIVE.python"
+      ],
+      "case_selection": true,
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "writer-fuzz": {
+      "package": "plugin",
+      "tags": [
+        "reference",
+        "campaign",
+        "mandatory"
+      ],
+      "fixtures": [
+        "tests/reference_service"
+      ],
+      "contracts": [
+        "LIVE.many.writer.preservation",
+        "LIVE.reconnect.load.balancing"
+      ],
+      "budget": {
+        "artifact_bytes": 8589934592,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "kit-reference": {
+      "package": "kit",
+      "tags": [
+        "reference",
+        "manual"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/python",
+        "source/kit"
+      ],
+      "contracts": [
+        "LIVE.kit"
+      ],
+      "budget": {
+        "artifact_bytes": 4294967296,
+        "artifact_files": 20000
+      },
+      "redact": [
+        "bearer",
+        "pem-private-key"
+      ]
+    },
+    "core": {
+      "planned": true,
+      "package": "scene",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/core",
+        "tests/native/wire",
+        "tests/native/scene"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "runtime": {
+      "planned": true,
+      "package": "runtime",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/runtime"
+      ],
+      "contracts": [
+        "LIVE.identity",
+        "LIVE.session.creation",
+        "LIVE.endpoint.uri",
+        "LIVE.operational.status",
+        "LIVE.presence.messages",
+        "LIVE.time.jitter",
+        "LIVE.lifecycle"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "transport": {
+      "planned": true,
+      "package": "runtime",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/reference_service",
+        "tests/native/runtime"
+      ],
+      "contracts": [
+        "LIVE.authentication",
+        "LIVE.layer.streams",
+        "LIVE.sequence.reconnect",
+        "LIVE.mutations",
+        "LIVE.recovery"
+      ],
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "abi": {
+      "planned": true,
+      "package": "plugin",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/abi",
+        "tests/native/plugin"
+      ],
+      "contracts": [
+        "LIVE.abi.loading"
+      ],
+      "budget": {
+        "artifact_bytes": 67108864,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "python": {
+      "planned": true,
+      "package": "python",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/python"
+      ],
+      "contracts": [
+        "LIVE.python"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "usd": {
+      "planned": true,
+      "package": "scene",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/usd",
+        "tests/native/scene"
+      ],
+      "contracts": [
+        "LIVE.usd"
+      ],
+      "budget": {
+        "artifact_bytes": 268435456,
+        "artifact_files": 5000
+      },
+      "redact": []
+    },
+    "kit": {
+      "planned": true,
+      "package": "kit",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "source/kit"
+      ],
+      "contracts": [
+        "LIVE.kit"
+      ],
+      "budget": {
+        "artifact_bytes": 4294967296,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "convergence": {
+      "planned": true,
+      "package": "plugin",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/reference_service"
+      ],
+      "contracts": [
+        "LIVE.many.writer.preservation",
+        "LIVE.reconnect.load.balancing"
+      ],
+      "budget": {
+        "artifact_bytes": 4294967296,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "benchmarks": {
+      "planned": true,
+      "package": "scene",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/benchmarks"
+      ],
+      "contracts": [
+        "LIVE.performance"
+      ],
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "package": {
+      "planned": true,
+      "package": "plugin",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/plugin",
+        "tests/native/python"
+      ],
+      "contracts": [
+        "LIVE.packaging"
+      ],
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "fuzz": {
+      "planned": true,
+      "package": "scene",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tests/native/wire",
+        "tests/reference_service"
+      ],
+      "contracts": [
+        "LIVE.core.scene.wire.semantics",
+        "LIVE.many.writer.preservation"
+      ],
+      "budget": {
+        "artifact_bytes": 4294967296,
+        "artifact_files": 20000
+      },
+      "redact": []
+    },
+    "sanitizers": {
+      "planned": true,
+      "package": "runtime",
+      "tags": [
+        "planned"
+      ],
+      "fixtures": [
+        "tools/live/lsan.supp",
+        "tools/live/tsan.supp"
+      ],
+      "contracts": [
+        "LIVE.thread.safety"
+      ],
+      "budget": {
+        "artifact_bytes": 1073741824,
+        "artifact_files": 20000
+      },
+      "redact": []
+    }
+  }
+}

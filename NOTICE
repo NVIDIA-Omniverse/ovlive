@@ -1,0 +1,30 @@
+ovlive
+
+Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Unless otherwise noted in this file, in a subdirectory-specific license file,
+or in a source-file license identifier, NVIDIA-authored source code and
+documentation in this repository is licensed under the Apache License,
+Version 2.0.
+
+Original copyright attributions remain in the sources. The NVIDIA-owned
+LiveService proto and OMPF schema copies carry Apache-2.0 notices.
+Third-party dependencies and external SDKs retain their own licenses.
+
+This repository contains unmodified FlatBuffers 1.12.0 runtime headers
+(Copyright 2014-2017 Google Inc.) under Apache-2.0 in
+client/source/live/wire/third_party/flatbuffers; see LICENSE.txt in that directory.
+
+The SHA-256 implementation derives from Zilong Tan (Copyright 2011, MIT)
+and Allan Saddi (Copyright 2001-2003, BSD-2-Clause). Both notices are in
+client/source/live/support/SHA256.cpp and client/THIRD_PARTY_NOTICES.md.
+
+Internal client native builds statically link gRPC, Protobuf, Abseil, RE2, c-ares,
+OpenSSL and zlib. client/THIRD_PARTY_LICENSES.txt reproduces their license
+texts and client/BOM.json lists their versions. Public distribution from
+this repository is source only.
+
+The Live Edit service carries its own attribution in service/NOTICE and
+service/ATTRIBUTIONS.md. service/oss/SOURCE-INVENTORY.md and
+service/oss/RUST-DEPENDENCY-LICENSES.md record its dependency and source
+license evidence. THIRD_PARTY_NOTICES.md indexes both components.

@@ -1,0 +1,95 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- /*
+  The scaler's identity and its namespaced, least-privilege access. No
+  ClusterRole: everything it touches is in the release namespace.
+
+  - deployments/scale get + patch: the server Deployment only
+    (resourceNames). The scaler owns the replica count and can resize no
+    other Deployment. /scale carries the replica counts and the label
+    selector, never the pod template. There is deliberately no rule on
+    deployments itself: a Deployment GET returns the pod template, and with
+    it every inline environment value.
+  - endpointslices list: how it finds the server pods, their addresses,
+    readiness and termination state. Slice names are generated, so the rule
+    cannot name the Service's slices and covers every EndpointSlice in the
+    namespace.
+  - pods patch, ONLY with autoscaling.scaler.podDeletionCost=true: to mark
+    the emptiest pod for removal before a scale-down. Pod names are
+    generated too, so the rule covers every pod in the namespace. A patch
+    returns the whole pod, environment included, and may change labels,
+    annotations and container images, so it is off by default.
+
+  The ServiceAccount follows the server's semantics: a supplied name is used
+  as-is and no ServiceAccount is rendered. With rbac.create=false the chart
+  renders neither Role nor RoleBinding, and the operator grants the rules
+  above to that ServiceAccount.
+
+  Never write a literal comment-close sequence inside this comment — it
+  terminates the comment early and leaks text into the manifest.
+*/}}
+{{- if eq (include "live-edit-service.scalerEnabled" .) "true" }}
+{{- $scaler := .Values.autoscaling.scaler }}
+{{- $saName := include "live-edit-service.scalerServiceAccountName" . }}
+{{- if and $scaler.serviceAccount.create (not $scaler.serviceAccount.name) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $saName }}
+  labels:
+    {{- include "live-edit-service.scalerLabels" . | nindent 4 }}
+automountServiceAccountToken: true
+{{- end }}
+{{- if $scaler.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "live-edit-service.scalerFullname" . }}
+  labels:
+    {{- include "live-edit-service.scalerLabels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: [{{ include "live-edit-service.fullname" . | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+  {{- if $scaler.podDeletionCost }}
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "live-edit-service.scalerFullname" . }}
+  labels:
+    {{- include "live-edit-service.scalerLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "live-edit-service.scalerFullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $saName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

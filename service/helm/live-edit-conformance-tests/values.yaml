@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+image:
+  repository: nvcr.io/nvidia/omniverse/live-edit-conformance-tests
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+service:
+  endpoint: "http://live-edit-service:50001"
+  # Existing base layer for which the supplied principal has read/write access.
+  basePath: ""
+  peerEndpoint: ""
+  deniedPath: ""
+  # Optional deployment adapter: provision a UUID-named base file under basePath.
+  storageEndpoint: ""
+auth:
+  existingSecret: ""
+  key: token
+  sidecar: {}
+  serviceAccountAnnotations: {}
+tls:
+  existingSecret: ""
+  key: ca.crt
+profiles: [deployment]
+timeouts:
+  request: 15
+  readiness: 120
+activeDeadlineSeconds: 900
+ttlSecondsAfterFinished: 86400
+serviceAccountName: ""
+# app.kubernetes.io/name is omitted from pods to exclude test clients from
+# service Deployment selectors, including when podLabels are copied from servers.
+podLabels: {}
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: "1"
+    memory: 512Mi

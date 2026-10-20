@@ -1,0 +1,51 @@
+-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+-- Fail-closed object-id allocation (b.b2j).
+--
+-- KEYS[1] = le:counter:object_id
+--
+-- Returns the newly allocated object_id, or a nil reply (Lua `false`) when the
+-- counter key is absent.
+--
+-- The absent verdict is a nil reply rather than an in-band numeric sentinel
+-- because `INCR` can produce ANY integer. An earlier revision returned `-1`,
+-- which a counter sitting at `-2` — corrupt, but reachable if anything ever
+-- wrote a negative value — would reproduce exactly by INCRing to `-1`, and the
+-- caller would read a live counter as "the keyspace was lost" and run a
+-- spurious repair. A nil reply is outside `INCR`'s range entirely, so the two
+-- cases are structurally distinguishable: nil means absent, any integer means
+-- the INCR ran, and the caller rejects a non-positive one as corrupt.
+--
+-- A bare `INCR` on an absent key returns 1, so a Valkey keyspace loss under
+-- surviving pods silently restarts object-id allocation from 1 and re-mints
+-- ids that pre-loss checkpoint blobs still claim. Every downstream
+-- consequence of that reuse (live-state clobber via `write_object`'s
+-- unconditional header HSET, retention-prune inversion, cross-layer restore)
+-- is unreachable if allocation simply refuses to proceed against an absent
+-- counter. The caller repairs the counter from the checkpoint-store counters
+-- sidecar and retries.
+--
+-- `EXISTS` + `INCR` must be one atomic block: split across two round-trips a
+-- concurrent allocator could observe the key present, have the keyspace
+-- vanish, and then INCR-from-absent anyway.
+--
+-- Single key, no hash tag, so this is single-slot on Valkey Cluster — the
+-- same routing argument the sibling `seed_object_id_if_below` script makes.
+if redis.call('EXISTS', KEYS[1]) == 0 then
+  -- Lua `false` converts to a RESP nil reply.
+  return false
+end
+return redis.call('INCR', KEYS[1])

@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[core]
+reloadable = false
+
+[package]
+title = "Live Services"
+version = "0.1.0"
+description = "Live Services plugin lifecycle adapter; host supplies authentication and session policy."
+category = "Internal"
+
+[dependencies]
+"omni.usd" = {}
+"omni.usd.libs" = {}
+"omni.kit.async_engine" = {}
+
+# Kit imports the declared modules in order and starts each module's IExt before importing the next.
+# omni.kit.live_services is first: its on_startup checks the package profile, Python ABI and USD plugins
+# before it imports omni.usd.live, so the omni.usd.live entry finds the already imported module and a
+# failed check stops startup before Kit reaches it. The omni.usd.live entry declares the public API
+# module for Kit's API tooling; it holds no IExt to search for.
+[[python.module]]
+name = "omni.kit.live_services"
+path = "python"
+
+[[python.module]]
+name = "omni.usd.live"
+path = "python"
+searchExt = false

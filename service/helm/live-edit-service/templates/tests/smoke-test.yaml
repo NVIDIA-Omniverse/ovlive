@@ -1,0 +1,209 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- if .Values.tests.enabled }}
+{{- if not .Values.tests.storageApiResourceBase }}
+{{- fail "tests.storageApiResourceBase is required when tests.enabled=true — set it to a base storage path the smoke principal has write permission on in the upstream permissions service (e.g. https://storage.example.com/mybucket/). See values.yaml for context." }}
+{{- end }}
+{{- if and .Values.tests.serviceIdentity.accessTokenFile.enabled (not .Values.tests.serviceIdentity.accessTokenFile.provisionerSidecar.container) }}
+{{- fail "tests.serviceIdentity.accessTokenFile.enabled=true requires tests.serviceIdentity.accessTokenFile.provisionerSidecar.container to be set (the sidecar that writes the token file)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "live-edit-service.fullname" . }}-test-smoke
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "live-edit-service.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test,post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  {{- if gt (int .Values.tests.ttlSecondsAfterFinished) 0 }}
+  ttlSecondsAfterFinished: {{ .Values.tests.ttlSecondsAfterFinished }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- /* Omit a required selector key AFTER merging overrides: a test
+              runner must never match the Deployment, even with nameOverride
+              or podLabels copied from the server. Keep the selector immutable. */}}
+        {{- $podLabels := mergeOverwrite (dict) (include "live-edit-service.labels" . | fromYaml) (.Values.smokeTest.podLabels | default .Values.podLabels | default dict) (dict "app.kubernetes.io/component" "smoke-test") }}
+        {{- if and .Values.tests.serviceAccount.annotations (hasKey .Values.tests.serviceAccount.annotations "azure.workload.identity/client-id") }}
+        {{- $_ := set $podLabels "azure.workload.identity/use" "true" }}
+        {{- end }}
+        {{- omit $podLabels "app.kubernetes.io/name" | toYaml | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "live-edit-service.smokeTestServiceAccountName" . }}
+      restartPolicy: Never
+      {{- with .Values.smokeTest.image.pullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if and .Values.tests.serviceIdentity.accessTokenFile.enabled .Values.tests.serviceIdentity.accessTokenFile.provisionerSidecar.container }}
+      initContainers:
+        - name: {{ .Chart.Name }}-token-provisioner
+          restartPolicy: Always
+            {{- (omit .Values.tests.serviceIdentity.accessTokenFile.provisionerSidecar.container "volumeMounts" "name" "restartPolicy") | toYaml | nindent 10 }}
+          volumeMounts:
+              {{- with .Values.tests.serviceIdentity.accessTokenFile.provisionerSidecar.container.volumeMounts }}
+                {{- toYaml . | nindent 12 }}
+              {{- end }}
+            - name: token-exchange
+              mountPath: "/etc/secrets/access-token"
+      {{- end }}
+
+      volumes:
+        - name: smoke-tests
+          configMap:
+            name: {{ include "live-edit-service.fullname" . }}-smoke-tests
+        {{- if .Values.tests.serviceIdentity.accessTokenFile.enabled }}
+        - name: token-exchange
+          emptyDir:
+            sizeLimit: 4Mi
+            medium: Memory
+        {{- end }}
+
+      containers:
+        - name: smoke-test
+          image: {{ .Values.smokeTest.image.repository }}:{{ .Values.smokeTest.image.tag }}
+          imagePullPolicy: {{ .Values.smokeTest.image.pullPolicy }}
+          workingDir: /tests
+          volumeMounts:
+            # Test configuration and files
+            - name: smoke-tests
+              mountPath: /tests/pytest.ini
+              subPath: pytest.ini
+            - name: smoke-tests
+              mountPath: /tests/conftest.py
+              subPath: conftest.py
+            - name: smoke-tests
+              mountPath: /tests/utils.py
+              subPath: utils.py
+            - name: smoke-tests
+              mountPath: /tests/live_edit_helpers.py
+              subPath: live_edit_helpers.py
+            - name: smoke-tests
+              mountPath: /tests/smoke-tests/test_live_edit_grpc.py
+              subPath: test_live_edit_grpc.py
+            # gRPC package structure (__init__.py mounted multiple times to
+            # make nvidia.omniverse.live.v1alpha an importable package).
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/__init__.py
+              subPath: __init__.py
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/omniverse/__init__.py
+              subPath: __init__.py
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/omniverse/live/__init__.py
+              subPath: __init__.py
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/omniverse/live/v1alpha/__init__.py
+              subPath: __init__.py
+            # LiveService gRPC stubs
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/omniverse/live/v1alpha/live_service_pb2.py
+              subPath: live_service_pb2.py
+            - name: smoke-tests
+              mountPath: /grpc/nvidia/omniverse/live/v1alpha/live_service_pb2_grpc.py
+              subPath: live_service_pb2_grpc.py
+            {{- if .Values.tests.serviceIdentity.accessTokenFile.enabled }}
+            # Workload-identity access token written by the sidecar
+            - name: token-exchange
+              readOnly: true
+              mountPath: "/etc/secrets/access-token"
+            {{- end }}
+          env:
+            - name: PYTHONPATH
+              value: "/grpc:/tests"
+            {{- /* Endpoint: if tests.grpcEndpoint is set, use it; else default
+                  to ingress URL when httpProxy.enabled, otherwise the
+                  in-cluster service URL. */}}
+            {{- $serviceName := include "live-edit-service.servicename" . }}
+            {{- $namespace := .Release.Namespace }}
+            {{- $grpcPort := .Values.service.grpc.port }}
+            {{- $inCluster := printf "http://%s.%s.svc.cluster.local:%v" $serviceName $namespace $grpcPort }}
+            {{- $defaultGrpc := $inCluster }}
+            {{- if .Values.httpProxy.enabled }}
+              {{- $scheme := ternary "https" "http" .Values.httpProxy.tls.enabled }}
+              {{- $fqdn := printf "%s.%s" .Values.httpProxy.fqdn.host .Values.httpProxy.fqdn.domain }}
+              {{- $defaultGrpc = printf "%s://%s" $scheme $fqdn }}
+            {{- end }}
+            {{- $grpcVal := .Values.tests.grpcEndpoint | default $defaultGrpc }}
+            - name: SMOKE_TESTS_GRPC_ENDPOINT
+              value: {{ $grpcVal | quote }}
+            - name: SMOKE_TESTS_RESOURCE_BASE
+              value: {{ .Values.tests.storageApiResourceBase | quote }}
+            {{- /*
+              Storage-api REST endpoint reused from the same value the
+              live-edit service uses to talk to storage-api for permission
+              checks. The smoke pod uses it to PUT a fixture file before
+              tests run and DELETE it after — `CreateSession` requires the
+              base layer path to actually exist (storage-api returns 404 if
+              the file is not registered) and our smoke principal has access.
+            */}}
+            - name: SMOKE_TESTS_STORAGE_REST_ENDPOINT
+              value: {{ .Values.authorization.storageServiceEndpoint | quote }}
+            {{- if .Values.tests.timeout }}
+            - name: SMOKE_TESTS_TIMEOUT
+              value: {{ .Values.tests.timeout | quote }}
+            {{- end }}
+            {{- if .Values.tests.grpcSkipTls }}
+            - name: SMOKE_TESTS_GRPC_SKIP_TLS
+              value: {{ .Values.tests.grpcSkipTls | quote }}
+            {{- end }}
+            {{- /* Authentication configuration (OAuth 2.0 client-credentials) */}}
+            {{- with .Values.tests.auth.microsoftUrl }}
+            {{- if or .value .valueFrom }}
+            - name: SMOKE_TESTS_AUTH_MICROSOFT_URL
+              {{- if .value }}
+              value: {{ .value | quote }}
+              {{- else }}
+              valueFrom:
+                {{- toYaml .valueFrom | nindent 16 }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.tests.auth.credentials }}
+            {{- if or .value .valueFrom }}
+            - name: SMOKE_TESTS_AUTH_CREDENTIALS
+              {{- if .value }}
+              value: {{ .value | quote }}
+              {{- else }}
+              valueFrom:
+                {{- toYaml .valueFrom | nindent 16 }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.tests.auth.scope }}
+            {{- if or .value .valueFrom }}
+            - name: SMOKE_TESTS_AUTH_SCOPE
+              {{- if .value }}
+              value: {{ .value | quote }}
+              {{- else }}
+              valueFrom:
+                {{- toYaml .valueFrom | nindent 16 }}
+              {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.tests.serviceIdentity.accessTokenFile.enabled }}
+            - name: SMOKE_TESTS_ACCESS_TOKEN_FILE_PATH
+              value: "/etc/secrets/access-token/token"
+            {{- end }}
+          command: ["python", "-m", "pytest"]
+          args: ["-v", "-s", "--tb=short", "smoke-tests/"]
+{{- end }}

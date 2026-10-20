@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+.cache/
+.claude/
+.pytest_cache/
+.remember/
+.superpowers/
+_build/
+__pycache__/
+*.py[cod]
+.venv/
+.vscode/
+.DS_Store
+*.swp
+client/deps/*.user
+client/deps/*.generated.packman.xml
+client/deps/live-services-build.json
+PACKAGE-INFO.yaml
+PACKAGE-DEPS.yaml
+client/source/OmniUsdVersion.h

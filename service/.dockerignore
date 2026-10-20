@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Secrets — keep these at the top. `.env` is gitignored but the Dockerfile
+# does `COPY . .` in the builder stage; without these excludes the real
+# bearer token in `.env` would be baked into the builder layer (b.bm8).
+.env
+.env.*
+*.pem
+*.key
+secret*
+
+# Build outputs and VCS metadata
+target/
+.github-publish/
+.git/
+.gitignore
+
+# Project docs — not needed at build time
+docs/
+docs-internal/
+scripts/
+*.md
+!ATTRIBUTIONS.md
+.dockerignore
+
+# Test, fuzz, and example sources — none of these are compiled into the
+# release binary, and keeping them out of the build context measurably
+# shrinks the layer Docker has to upload to the daemon.
+tests/
+oodf-ffi/tests/
+oodf-ffi/fuzz/
+oodf-ffi/examples/
+proptest-regressions/
+
+# Local dev caches and IDE / agent state
+tools/__pycache__/
+**/__pycache__/
+tools/.venv*/
+*.log
+.idea/
+.claude/
+.bees/

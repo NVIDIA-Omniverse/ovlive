@@ -1,0 +1,75 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Task 5.4 — cargo-fuzz subcrate for oodf-ffi.
+#
+# This is an independent package (not a workspace member) per the cargo-fuzz
+# convention; the top-level workspace excludes this directory so regular
+# `cargo build` / `cargo test` at the repo root do not require the fuzzer
+# toolchain. Build + run requires nightly + `cargo install cargo-fuzz`.
+
+[package]
+name = "oodf-ffi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Pin this crate as its own workspace root so cargo does not walk up to the
+# repo-root workspace (which excludes this directory but can't suppress
+# bottom-up workspace detection from a child manifest).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
+# `internal-bridge` is required by `fuzz_round_trip` so the structure-aware
+# fuzzer can construct bridge values directly via `arbitrary` and check
+# that `parse(build(x)) == x` round-trips byte-for-byte. The fuzz crate is
+# excluded from the top-level workspace, so enabling the feature here
+# does not leak into normal workspace builds (b.vvs items 7 + 10).
+oodf-ffi = { path = "..", features = ["internal-bridge"] }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "fuzz_parse_delta"
+path = "fuzz_targets/fuzz_parse_delta.rs"
+test = false
+doc = false
+bench = false
+
+# Structure-aware round-trip fuzzer (b.vvs item 10). Generates an
+# arbitrary `OwnedDelta`, runs `parse(build(x))`, and asserts the round
+# trip is byte-stable. Seeds: `tests/fixtures/oodf/*.oodf` (manual:
+# `cargo +nightly fuzz run fuzz_round_trip -- -max_total_time=60`).
+[[bin]]
+name = "fuzz_round_trip"
+path = "fuzz_targets/fuzz_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+# Mutate-built-bytes fuzzer (b.vvs item 10). Generates a structurally-
+# valid OODF buffer, then applies libfuzzer's mutator to the bytes and
+# feeds the result back into `parse_delta`. Catches accessor crashes /
+# UB on FlatBuffers shapes that pass the verifier but stress the post-
+# verifier accessor path. Seed corpus: `tests/fixtures/oodf/*.oodf`.
+[[bin]]
+name = "fuzz_mutate_built"
+path = "fuzz_targets/fuzz_mutate_built.rs"
+test = false
+doc = false
+bench = false

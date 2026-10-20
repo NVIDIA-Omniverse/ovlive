@@ -1,0 +1,15 @@
+{
+  "Plugins": [{
+    "Type": "library",
+    "Name": "omni_usd_live_resolver",
+    "Root": ".",
+    "LibraryPath": "@OMNI_USD_LIVE_RESOLVER_LIBRARY@",
+    "ResourcePath": ".",
+    "Info": {"Types": {
+      "OmniUsdLiveResolver": {
+        "bases": ["ArResolver"],
+        "uriSchemes": ["live"]
+      }
+    }}
+  }]
+}

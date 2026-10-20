@@ -1,0 +1,252 @@
+-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+-- ext_store_value.lua — atomic external-value pre-flight store (b.rej).
+--
+-- The exact inverse of `gc_decrement_and_collect.lua`, and deliberately its
+-- mirror image in shape: same two `{hash_hex}`-tagged keys, same meta-first
+-- KEYS order, same single-atomic-step discipline. That one decrements a
+-- reference and collects at zero; this one writes the blob if no copy is
+-- stored yet (or, for bytes the caller verified, replaces a copy whose type or
+-- length shows it is damaged) and pays the PRE-FLIGHT `+1` that the commit
+-- which materialises a referencing row will later justify.
+--
+-- Replaces the per-hash `MULTI { SET data; HINCRBY meta ref_count 1 } EXEC`
+-- that `ValkeyExternalValueStore::store_values` ran on the exclusive `txn_pool`
+-- until b.rej. Two things changed for the caller and neither is cosmetic:
+--
+--   * The call runs on the multiplexed DATA pool. A blob store no longer takes
+--     a `txn_pool` slot, so it no longer pays the b.7td checkout hygiene probe
+--     (`DISCARD` + `UNWATCH`, ≈ 63 µs and two extra round-trips per blob) and
+--     no longer contends with the `update_layer` slow path / `CreateSession`
+--     for exclusive connections. Lua is atomic under Valkey's single server
+--     thread, so the exclusivity a `MULTI` needed a dedicated session for is
+--     free here.
+--   * The increment now carries a SERVER-SIDE CLOCK STAMP. `last_store_ms` is
+--     what the reference-count reconciler (`storage::ext_reconcile`, b.yda)
+--     reads to tell a standing surplus from an upload whose pre-flight `+1`
+--     has not reached its commit yet — the one thing neither of its other two
+--     guards can see. Deriving it here rather than in the caller is the point:
+--     a caller-supplied local clock would put every service replica's own clock
+--     into that comparison, which is the skew the `redis.call("TIME")`
+--     discipline in this directory exists to refuse (same argument as
+--     `gc_claim_pending.lua` / `gc_reclaim_stale.lua`). It does not
+--     make the comparison single-clock: this stamp is written by the node
+--     owning `{hash_hex}`, while the reconciler samples its cutoff with a
+--     KEYLESS `TIME` on an arbitrary node, so under Cluster an inter-node
+--     residual survives. That residual costs the guard only if a node's clock
+--     runs AHEAD by more than the reconciler's grace (>= 10 min), which is why
+--     `docs/service/docs/backing-store.md` § Requirements requires cluster
+--     nodes be time-synchronised
+--     — a bound any NTP-synchronised fleet clears by orders of magnitude.
+--
+-- ── Contract ──────────────────────────────────────────────────────────────
+--
+-- KEYS:
+--   [1]  ext_meta:{hash_hex}   (ref_count + last_store_ms)
+--   [2]  ext_data:{hash_hex}   (the content-addressed blob)
+--
+-- ARGV:
+--   [1]  the blob bytes — BINARY SAFE. The caller passes a `Value::Bytes`, so
+--        NUL bytes and arbitrary non-UTF-8 payloads round-trip unchanged.
+--   [2]  the VERIFIED flag: exactly `"1"` when the caller checked ARGV[1]
+--        against the hash it is stored under (the live upload path under
+--        `LIVE_EDIT_EXT_VALUE_VERIFY=enforce`), anything else — `"0"`, or
+--        absent — otherwise. It arms only the heal described below; it changes
+--        nothing when the data key was absent.
+--
+-- Both keys MUST share the `{hash_hex}` Cluster slot (see KeySchema::ext_meta /
+-- ext_data). The caller derives both from one `hash_hex`, so this holds by
+-- construction — the same guarantee `gc_decrement_and_collect.lua` relies on.
+--
+-- ── Return value ──────────────────────────────────────────────────────────
+--
+-- Two-element table:
+--   [1] ref_count      — the integer ref_count AFTER this call's `+1`.
+--   [2] last_store_ms  — the stamp this call wrote, as the same decimal string
+--                        that is now in the hash. Returned rather than
+--                        recomputed by the caller so a test can assert the
+--                        written value without a second round trip.
+--
+-- Nothing on the write path branches on the count. The store path hands the
+-- stamp to the ext-mirror with the value's copy: the worker's confirmation of
+-- that copy (`ext_backup_confirm.lua`) writes only while the meta still
+-- carries this stamp, so a later store of the hash declines it.
+--
+-- ── Why `SET NX`, and the one heal a VERIFIED store performs ───────────────
+--
+-- The data write is set-if-absent. A store whose data key already exists
+-- writes nothing to it and still pays the `+1` and the stamp below. "Exists"
+-- means a key of ANY type. The one exception is the heal in the next
+-- paragraph, which only a verified store (ARGV[2] == "1") can trigger. Every
+-- other store leaves an existing key exactly as it stands — including a
+-- hand-corrupted key that holds something other than a string, so uploads of
+-- that hash keep succeeding and reads surface `WRONGTYPE` until an operator
+-- deletes the key or a verified store of that hash replaces it.
+--
+-- The rule exists because an unconditional `SET` was how one bad upload
+-- destroyed a good blob: a truncated or mismatched upload rewrote the bytes
+-- under a hash every other referencing layer shares. Bytes are now verified
+-- before they reach this script on the live path —
+-- `store_external_values` runs `verify_external_values` (every part must be
+-- its declared `extValueSize` long and its content hash — SHA-256 over the
+-- SHA-256 digests of its 1 MiB blocks — must equal the hash it claims)
+-- before it stores. Under `LIVE_EDIT_EXT_VALUE_VERIFY=observe` the live path
+-- stores a failing part anyway and passes the flag unset, so `NX` is then
+-- what keeps it from replacing a copy already stored.
+--
+-- The heal. When the `NX` write was skipped AND the caller verified ARGV[1],
+-- the existing key is replaced with a plain `SET` if it is not a string (a
+-- `SET` replaces a key of any type), or if it is a string whose `STRLEN`
+-- differs from ARGV[1]'s length.
+-- Verified bytes ARE the content of the hash, so this can only ever replace
+-- damaged bytes with correct ones, never a good copy with a bad one. It is
+-- what lets a live re-upload repair a blob stored corrupt before the gate
+-- existed in the shape that bug produced (a truncated prefix stored under the
+-- full value's hash) and a wrong-typed key, as the old unconditional `SET`
+-- did, without that form's hazard. Deliberately no byte compare: a stored
+-- string of the right length is trusted and left alone. Comparing would read
+-- the whole stored blob on Valkey's single command thread on every store of
+-- an existing hash, and rewriting identical bytes would pay the memory churn
+-- and the replication of the whole blob for nothing. The heal changes neither
+-- the `+1` nor the stamp: both are paid exactly as on every other call.
+--
+-- What is given up, deliberately:
+--   * a corrupt stored string of the RIGHT length is never replaced;
+--   * a blob stored corrupt before the gate existed is replaced only by a
+--     verified live upload of its hash, not by the composed DR restore's
+--     SR-3.4 pre-store (whose residue wipe does not cover
+--     `le:ext:data:{hash_hex}`) and not by `try_recover_via_checkpoint`'s
+--     rewrite, which both pass the flag unset;
+--   * the checkpoint adapter's mirror copy is not healed: the caller still
+--     enqueues the verified bytes for mirroring after this script, but the
+--     adapter keeps the first copy it was given.
+-- Such a blob stands until its last reference retires and the GC collects
+-- it. That is a documented residual (SDD §11.1), not an oversight.
+--
+-- The other callers reach this script without the gate (the SR-3.4 pre-store,
+-- `try_recover_via_checkpoint`'s rewrite), pass the flag unset, and carry
+-- only bytes the gate admitted or bytes stored before it existed.
+-- `try_recover_via_checkpoint` is entered only when `GET ext_data` returned
+-- `None`, so `NX` writes for it exactly as an unconditional `SET` would. No
+-- `XX`, no TTL and no `GET`.
+--
+-- ── Why `SET` before `HINCRBY` ────────────────────────────────────────────
+--
+-- Reads 1:1 against the command order the replaced `MULTI` queued, which keeps
+-- wire-level monitors and the replication stream looking the same across the
+-- change. The failure shape is identical too, and that is worth stating
+-- plainly because it is a HALF-WRITE that survives: Valkey rolls back neither a
+-- script nor a `MULTI`, so a `WRONGTYPE` on the meta hash (a hand-corrupted key
+-- holding a string) aborts the script with the data write — when the key was
+-- absent and the `SET NX` wrote, or when the heal replaced it — already
+-- standing, exactly what the `MULTI` did. No refusal arm is added here for
+-- it: the pre-existing shape is the one the callers and their error mapping
+-- are written against. (A heal that lands before such an abort only ever
+-- wrote verified bytes, so the standing half is a correct blob.)
+--
+-- ── Slot migrations: nothing is emptied before it is written (b.cyu) ──────
+--
+-- During a legacy cluster slot migration every in-script command is checked
+-- against the slot's state again, and on the migrating source one that names
+-- a key absent at that moment is refused, aborting the script with its
+-- earlier writes kept. On a migrating source this script runs only when both
+-- of its keys are present (the store refuses it up front otherwise), and no
+-- command here empties a key, so every command names a key that is present
+-- then: the script either runs whole or is refused before it starts. The
+-- heal's plain `SET` (no `DEL` first) is what keeps that true; see the
+-- invariant at that call.
+--
+-- ── The stamp is written by THIS script and by nothing else ───────────────
+--
+-- **Invariant: `gc_decrement_and_collect.lua` must never touch
+-- `last_store_ms`.** The field's meaning is "when did a pre-flight store last
+-- touch this hash", and the reconciler acts on a meta only once that instant is
+-- a full grace old. A decrement that re-stamped would refresh the field on
+-- every GC pass over a busy hash and shield it from repair forever — the
+-- reconciler would enumerate it, find it always too fresh to judge, and the
+-- surplus it exists to drain would stand permanently. The GC deletes the whole
+-- meta at zero, which takes the stamp with it; that is the only interaction the
+-- two scripts have.
+--
+-- Plain `HSET`, never `HSETNX`, for the same reason from the other side: the
+-- reconciler wants the MOST RECENT pre-flight increment, so every store
+-- re-stamps. An `HSETNX` would pin the first store a hash ever saw and let a
+-- hash that has been re-uploaded a thousand times since read as ancient.
+--
+-- ── Retry shape ───────────────────────────────────────────────────────────
+--
+-- NOT idempotent on the meta half, and that is the pre-existing contract, not a
+-- regression: the `+1` is paid BEFORE the commit that would justify it, so a
+-- retried store — or a commit that never lands — leaves `ref_count` one too
+-- high. The direction is always leak, never over-release, and the residual is
+-- drained by `storage::ext_reconcile`. See the module header of
+-- `storage::external_values` for the full case analysis.
+--
+-- "Retried" here is not only the caller re-driving a store. The multiplexed
+-- DATA pool this now runs on carries fred's DEFAULT `max_command_attempts` (3),
+-- so fred re-issues the `EVALSHA` TRANSPARENTLY when a connection drops
+-- mid-command — including after the script has already executed server-side but
+-- before its reply landed. That second execution pays a second `+1` and the
+-- caller still sees success. Same direction (leak only), same drain
+-- (`storage::ext_reconcile` acting on the `last_store_ms` stamp this call
+-- writes), and deliberately not suppressed by pinning `max_attempts: 1` on the
+-- call — see the posture note at the `evalsha_with_reload` site in
+-- `storage::external_values`.
+
+local meta_key = KEYS[1]
+local data_key = KEYS[2]
+
+-- Set only if absent; see the `SET NX` note above. A skipped write is not an
+-- error and does not skip the increment or the stamp below. `SET … NX`
+-- replies nil (Lua `false`) when it skipped the write.
+local written = redis.call("SET", data_key, ARGV[1], "NX")
+
+-- The verified-only heal; see the note above. Only on a skipped write, only
+-- for a caller that verified ARGV[1], and only on a type or length difference
+-- — never a byte compare.
+if not written and ARGV[2] == "1" then
+    -- `TYPE` is a status reply, which reaches Lua as `{ ok = "<type>" }`.
+    if redis.call("TYPE", data_key).ok ~= "string" then
+        -- A plain `SET`, with no `DEL` before it: `SET` replaces a key of any
+        -- type and clears its TTL, so the stored result is what `DEL` + `SET`
+        -- gave. Ordering invariant (b.cyu): never empty `data_key` before
+        -- writing it. A `DEL` first would make this `SET` name an absent key,
+        -- which a migrating cluster slot refuses mid-script, tearing the run
+        -- (the blob deleted, no `+1`, no stamp). See "Slot migrations" above.
+        redis.call("SET", data_key, ARGV[1])
+    elseif redis.call("STRLEN", data_key) ~= string.len(ARGV[1]) then
+        redis.call("SET", data_key, ARGV[1])
+    end
+end
+
+-- The pre-flight increment. Exactly one per call, per hash, whether or not the
+-- `SET` above wrote or the heal replaced the key — `ref_count` counts LIVE
+-- OBJECTS (b.qpf), not stored
+-- copies, and the surplus this pays ahead of the commit is handed back by that
+-- commit's `surplus_acquire` release.
+local ref = redis.call("HINCRBY", meta_key, "ref_count", 1)
+
+-- Valkey's own clock, never the caller's. `TIME` returns {seconds, microseconds}
+-- as strings; fold to milliseconds and format with `%d` so the field never
+-- acquires an exponent or a decimal point (Lua numbers are doubles, and
+-- `tostring` on a large one yields `1.7654e+12`, which the reconciler's
+-- `parse::<u64>()` would read as unparseable).
+local t = redis.call("TIME")
+local ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local stamp = string.format("%d", ms)
+redis.call("HSET", meta_key, "last_store_ms", stamp)
+
+return { ref, stamp }

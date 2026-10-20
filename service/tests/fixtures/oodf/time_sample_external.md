@@ -1,0 +1,60 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# `time_sample_external.oodf` capture metadata
+
+**Scenario**: `time_sample_external` (synthetic — see the notes below)
+
+- **Origin**: `oodf_ffi::build_delta` via `cargo run -p oodf-ffi --example generate_fixtures` (NOT captured from the real C++ service)
+- **RPC**: N/A (synthesized; not captured from a live RPC)
+- **Client config**:
+  - Generator: `oodf-ffi/examples/generate_fixtures.rs`
+  - StructCommands: 0
+  - SetFields: 0
+  - TimeSamples: 1 × TimeSample(time=0.5, ext_size=2048, ext_idx=2, 32-byte hash)
+- **Server version**: N/A (synthesized)
+- **Capture date**: 2026-04-16 (generator run)
+- **Byte length**: 168
+
+## Semantic summary
+
+See the table in `README.md` for the full per-fixture summary.
+
+## Regenerating
+
+Regenerate the synthetic file byte-for-byte:
+
+```sh
+cargo run -p oodf-ffi --example generate_fixtures
+```
+
+No recorded capture from the C++ reference service replaces this fixture;
+the notes below say why the synthetic file is kept.
+
+## Notes
+
+Time-sample analog of set_field_external. Same capture-workflow gap. Synthetic retained.
+
+## Real C++ verification
+
+- **Date**: 2026-04-17
+- **Path**: CreateLayer on a fresh per-fixture layer, a deployed C++ reference service
+- **Status**: `rejected`
+- **OODF bytes**: 168 (OMPF-wrapped: 184)
+- **gRPC code**: `INTERNAL`
+- **gRPC detail**: `Failed to overwrite object`
+- **Meaning**: the C++ reference service's `CreateLayer` rejected this delta (see [`CAPTURE.md`](./CAPTURE.md) §3). The fixture's builder+parser round-trip is still validated by `oodf-ffi/tests/wire_fixtures.rs`.

@@ -1,0 +1,14 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- Matched generator packages from the same authoritative target manifest
+       as live-services-target.packman.xml. These are HOST release binaries.
+       live_services_host_platform_abi is an explicit caller-supplied input,
+       not an assumed repo/BOM token. Never substitute the target platform. -->
+  <dependency name="live-grpc-host-tools" linkPath="../_build/host-deps/live-services/grpc-release" tags="non-redist">
+    <package name="grpc" version="1.65.4-1-${live_services_host_platform_abi}-static-release" />
+  </dependency>
+  <dependency name="live-protobuf-host-tools" linkPath="../_build/host-deps/live-services/protobuf-release" tags="non-redist">
+    <package name="protobuf" version="5.26.0-2-${live_services_host_platform_abi}-static-release" />
+  </dependency>
+</project>

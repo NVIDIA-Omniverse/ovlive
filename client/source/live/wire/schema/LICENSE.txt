@@ -1,0 +1,6 @@
+SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+These NVIDIA-owned OMPF schema files are licensed under the Apache License, Version 2.0.
+The complete license text is in the repository root LICENSE file and, in an installed package, in share/omni_usd_live/LICENSE.
+https://www.apache.org/licenses/LICENSE-2.0

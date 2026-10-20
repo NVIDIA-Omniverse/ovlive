@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "scope": "ovlive client native package and host dependencies; excludes the Live Edit service",
+  "components": [
+    {
+      "name": "grpc",
+      "version": "1.65.4-1",
+      "license": "Apache-2.0 AND BSD-3-Clause AND MPL-2.0",
+      "upstream": "https://github.com/grpc/grpc",
+      "linkage": "static",
+      "license_sha256": "590198e3f305f2c347fde64d637c65492bbef554db6c8364e149cd375e3797ee"
+    },
+    {
+      "name": "protobuf",
+      "version": "5.26.0-2",
+      "license": "BSD-3-Clause",
+      "upstream": "https://github.com/protocolbuffers/protobuf",
+      "linkage": "static",
+      "license_sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d"
+    },
+    {
+      "name": "abseil",
+      "version": "20240116.1-1",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/abseil/abseil-cpp",
+      "linkage": "static",
+      "license_sha256": "c79a7fea0e3cac04cd43f20e7b648e5a0ff8fa5344e644b0ee09ca1162b62747"
+    },
+    {
+      "name": "re2",
+      "version": "20230301-1",
+      "license": "BSD-3-Clause",
+      "upstream": "https://github.com/google/re2",
+      "linkage": "static",
+      "license_sha256": "6040cda75d90b1738292a631d89934c411ef7ffd543c4d6a1b7edfc8edf29449"
+    },
+    {
+      "name": "c-ares",
+      "version": "1.34.8-0",
+      "license": "MIT",
+      "upstream": "https://github.com/c-ares/c-ares",
+      "linkage": "static",
+      "license_sha256": "460f5e768fda3752ca2169a95df062578a10fb126bfd65f3b9b1a1bed2f84807"
+    },
+    {
+      "name": "openssl",
+      "version": "3.5.9-0",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/openssl/openssl",
+      "linkage": "static",
+      "license_sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a"
+    },
+    {
+      "name": "zlib",
+      "version": "1.3.2-0",
+      "license": "Zlib",
+      "upstream": "https://github.com/madler/zlib",
+      "linkage": "static",
+      "license_sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2"
+    },
+    {
+      "name": "flatbuffers",
+      "version": "1.12.0",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/google/flatbuffers",
+      "linkage": "header",
+      "license_sha256": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5"
+    },
+    {
+      "name": "pybind11",
+      "version": "2.11.1",
+      "license": "BSD-3-Clause",
+      "upstream": "https://github.com/pybind/pybind11",
+      "linkage": "header",
+      "license_sha256": "83965b843b98f670d3a85bd041ed4b372c8ec50d7b4a5995a83ac697ba675dcb"
+    },
+    {
+      "name": "sha256",
+      "version": null,
+      "license": "MIT AND BSD-2-Clause",
+      "upstream": null,
+      "linkage": "source",
+      "provenance": "source/live/support/SHA256.cpp, derived from Zilong Tan's SHA-256 implementation, itself derived from Allan Saddi's code; MIT and BSD-2-Clause texts in THIRD_PARTY_NOTICES.md",
+      "license_sha256": "8234917ee38409cc41b5e28a744b0ec5f8919575e0e4c364e034dab361c6cbdf"
+    },
+    {
+      "name": "OpenUSD",
+      "version": "25.11",
+      "license": "LicenseRef-OpenUSD",
+      "upstream": "https://github.com/PixarAnimationStudios/OpenUSD",
+      "linkage": "host-shared",
+      "license_sha256": null
+    },
+    {
+      "name": "TBB",
+      "version": null,
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/uxlfoundation/oneTBB",
+      "linkage": "host-shared",
+      "license_sha256": null
+    },
+    {
+      "name": "Python",
+      "version": "3.12",
+      "license": "PSF-2.0",
+      "upstream": "https://github.com/python/cpython",
+      "linkage": "host-shared",
+      "license_sha256": null
+    }
+  ]
+}

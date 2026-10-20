@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# LeakSanitizer suppressions for the instrumented native lanes (tools/live/sanitizer.py).
+# Entries name third-party USD, TBB or statically linked OpenSSL allocating frames only.
+# Each `leak:` line follows a comment giving its owner and reason. A leak whose
+# allocation site is omni::usd::live or a live_* binary is a product or test
+# defect to fix, never an entry here (tests/harness/test_sanitizer.py).
+# LeakSanitizer matches an entry against every frame of an allocation stack, so
+# an entry also hides any leak whose stack passes through that frame, including
+# one reached from product code. That is the accepted cost of each entry below.
+# Never suppress libstdc++ or allocator frames.
+
+# owner: live-services; reason: USD Sdf caches path tokens in a table keyed by pooled path-node handles, which LSan cannot trace.
+leak:Sdf_PathNode::GetPathToken
+# owner: live-services; reason: USD Sdf interns variant-selection path nodes in pooled storage addressed by handles, which LSan cannot trace.
+leak:Sdf_PathNode::FindOrCreatePrimVariantSelection
+# owner: live-services; reason: USD Sdf layer identity registry entries are reached only through pooled path handles.
+leak:Sdf_IdentityRegistry::Identify
+# owner: live-services; reason: USD Sdf change manager keeps per-thread change lists in TBB thread-specific storage.
+leak:Sdf_ChangeManager::_GetListFor
+# owner: live-services; reason: USD Trace collector keeps per-thread event lists for the process lifetime.
+leak:TraceEventList::TraceEventList
+# owner: live-services; reason: USD Trace event container nodes belong to the per-thread collector data.
+leak:TraceEventContainer::_Node::New
+# owner: live-services; reason: USD Trace collector per-thread collection data lives in thread-specific storage.
+leak:TraceCollector::_PerThreadData::GetCollectionData
+# owner: live-services; reason: USD Trace thread identifiers are cached per thread for the process lifetime.
+leak:TraceThreadId::TraceThreadId
+# owner: live-services; reason: USD Tf registry functions registered at library load are retained for the process lifetime.
+leak:Tf_RegistryInit::Add
+# owner: live-services; reason: USD Tf registry manager tables and its TBB thread-specific library state are retained for the process lifetime; the entry also matches product TF_REGISTRY_FUNCTION bodies, which is the accepted cost.
+leak:Tf_RegistryManagerImpl
+# owner: live-services; reason: USD Tf diagnostic manager keeps per-thread log text in thread-specific storage.
+leak:TfDiagnosticMgr::_LogText
+# owner: live-services; reason: USD Sdf computes a layer's asset info through a raw pointer, which is lost when a later allocation of that computation throws (the allocation-fault sweep of SdfLayer::New); the entry also matches product resolver code that USD calls while computing it, which is the accepted cost.
+leak:Sdf_ComputeAssetInfoFromIdentifier
+# owner: live-services; reason: USD Sdf layer registry alias strings are lost when a later allocation of the registry insert throws during SdfLayer's constructor (the allocation-fault sweep of SdfLayer::New).
+leak:_AssetInfoToAliases
+# owner: live-services; reason: statically linked OpenSSL keeps each thread's DRBGs (the EVP_RAND contexts, their cipher contexts and the seed source's EVP_RAND method) in thread-local state that its thread-exit handler frees; a gRPC thread whose handler has not run when the process exits leaves them unreachable. The entry keys on OpenSSL's RAND front-end source file, which only OpenSSL frames carry, and hides any leak allocated under OpenSSL's RAND front end; OpenSSL never calls back into product code there.
+leak:/src/crypto/rand/rand_lib.c
+# owner: live-services; reason: statically linked OpenSSL caches the cipher methods an SSL_CTX fetches, and the per-thread DRBGs above hold the last references to the AES methods once gRPC frees its SSL_CTX. The entry names OpenSSL's SSL cipher fetch function only; an SSL_CTX leak is still reported from its own allocation.
+leak:^ssl_evp_cipher_fetch$

@@ -1,0 +1,16 @@
+{
+  "Plugins": [{
+    "Type": "library",
+    "Name": "live_resolver_hook_probe",
+    "Root": ".",
+    "LibraryPath": "$<TARGET_FILE:live_resolver_probe_plugin>",
+    "ResourcePath": ".",
+    "Info": {"Types": {
+      "LiveHookProbeResolver": {"bases": ["ArResolver"], "uriSchemes": ["live"]},
+      "LiveHookProbeFormat": {
+        "bases": ["SdfFileFormat"], "displayName": "Test-only resolver hook probe",
+        "extensions": ["live"], "formatId": "liveprobe", "primary": true, "target": "usd"
+      }
+    }}
+  }]
+}

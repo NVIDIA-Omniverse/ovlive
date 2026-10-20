@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b241dfcacafb0bbe2ec0f44faf181c9df06f352d3b59a2710855a9bcc2fd8051 # shrinks to path = ":"
+cc df30485eff1ea307b5697b777ece8c1c846c7d9a4438df2cb8b98f195c8d046f # shrinks to cmds = [CreateSection { parent_id: 2, section_id: 2, name: "a" }]
+cc 330ef9cac873f11833ea6f4da38edda9e688f311142d348e402517307f87f057 # shrinks to cmds = [CreateSection { parent_id: 1, section_id: 1, name: "a" }]
+cc d3243ffa185114145654c1876fdbef58633d2a133001f6b3939488327378665b # shrinks to cmds = [CreateSection { parent_id: 2, section_id: 2, name: "a" }]
+cc dcbb60caef98fbb02ca0fbbe0e953d74a0619f020645a1780cc7f11c3ce049f5 # shrinks to cmds = [CreateSection { parent_id: 2, section_id: 2, name: "a" }]
+cc 54dfbf0cce06e43d310457b9cecb4b8d4efe0e3db51b1ec4864bf0323786ae33 # shrinks to cmds = [CreateSection { parent_id: 5, section_id: 5, name: "a" }]
+cc 2154fe0a153f1684605da1345c61732c396f32023a014b6369c774a45238240d # shrinks to cmds = [CreateSection { parent_id: 2, section_id: 2, name: "a" }]

@@ -1,0 +1,120 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# cargo-deny configuration.
+#
+# Enforces the supply-chain policies for this repo. The `supply-chain:deny`
+# GitLab CI job runs `cargo deny check advisories licenses bans` against the
+# default feature set. The `sources` check is deliberately omitted for now so
+# an ad-hoc git dependency does not instantly fail CI. `--all-features` is NOT
+# used because it activates `protobuf` in a transitive dep and re-pulls
+# `protobuf 2.28.0` (RUSTSEC-2024-0437) which the service does not link in
+# its default-features production binary.
+#
+# See https://embarkstudios.github.io/cargo-deny/ for the full schema.
+
+[graph]
+# Match the production binary's feature set. `all-features = false` skips
+# transitive `protobuf` 2.x pulled in only by optional features we don't ship.
+# Add specific features here if a future feature subset needs scanning.
+all-features = false
+
+[advisories]
+# RUSTSEC advisories — overlaps with `cargo audit` but cargo-deny reports
+# them in a single structured pass alongside license/ban checks.
+version = 2
+yanked = "deny"
+ignore = [
+    # RUSTSEC-2026-0249: `smartstring` is unmaintained (repo archived
+    # 2026-05-03). It is NOT a vulnerability — it is an `unmaintained`
+    # advisory. It enters our graph transitively and only via
+    # `opentelemetry-prometheus-text-exporter` (our Prometheus text exporter,
+    # the replacement for the deprecated `opentelemetry-prometheus`), which
+    # depends on `smartstring` at EVERY published version incl. the latest
+    # 0.3.0 — so there is no upgrade that removes it (and 0.3.0 would also
+    # force a major opentelemetry 0.31 -> 0.32 bump across the telemetry
+    # stack). The advisory itself states "No safe upgrade is available." Keep
+    # the exporter; revisit if it drops `smartstring` or we change exporters.
+    # The same ID is passed to `cargo audit --ignore` in .gitlab-ci.yml.
+    "RUSTSEC-2026-0249",
+]
+
+[licenses]
+# Allowlist is aligned with `tools/generate_attributions.py::PERMISSIVE_LICENSES`
+# but diverges where cargo-deny needs SPDX expressions (e.g.
+# `Apache-2.0 WITH LLVM-exception`) that don't appear in the attributions
+# tool's raw license-string list. Any new license spdx that appears in the
+# dep tree must be added here or the build fails. This is intentional — it
+# forces a conscious decision when a new category of license enters the tree.
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    # webpki-roots (the Mozilla CA bundle) switched to CDLA-Permissive-2.0
+    # in the 1.0 series. CDLA-Permissive-2.0 is a permissive data license
+    # published by the Linux Foundation, widely accepted alongside MIT/Apache.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Skip license checking for the workspace's own crates (those with
+# `publish = false`). live-edit and oodf-ffi are NVIDIA's own Apache-2.0
+# crates (see LICENSE.txt) and are never published to crates.io.
+ignore = true
+
+[bans]
+# `multiple-versions` / `wildcards` stay WARN-only: duplicates are common in a
+# large dep tree (e.g., multiple syn majors in transitive deps) and gating CI on
+# zero duplicates is noisy. The `deny` list below, by contrast, is a HARD failure.
+multiple-versions = "warn"
+wildcards = "warn"
+
+# Hard deny: the `aws-lc-rs` rustls crypto provider and its `aws-lc-sys` /
+# `aws-lc-fips-sys` C backends must NEVER enter the dependency graph. The graph
+# must carry exactly one rustls crypto provider — `ring`. With two providers
+# compiled in, `rustls::crypto::CryptoProvider::from_crate_features()` returns
+# None and `ClientConfig::builder()` panics
+# (rustls-0.23.38/src/crypto/mod.rs:248-286) on the service's Valkey-TLS startup
+# path (fred `TlsConnector::default_rustls()` -> `FredConfig::from_url`). Epic 4
+# (t1.tr5.we) adds an AWS SigV4 / aws-sdk edge that defaults to aws-lc-rs; it must
+# be pinned to the ring backend. Invariant owned by Task t2.tr5.t4.oq.
+#
+# This ban is a SECOND, WEAKER layer. cargo-deny runs with `all-features = false`
+# ([graph] above), so it scans only the default-feature graph and would MISS an
+# aws-lc-rs arriving behind a non-default feature or a dev-dependency. The
+# load-bearing mechanism is `scripts/check-crypto-provider-invariant.sh` (the
+# `supply-chain:crypto-provider-invariant` CI job), which is strictly stronger: it
+# also asserts `ring` is present, that every rustls stanza depends on ring, and
+# that Cargo.toml's TLS feature routing has not drifted. Do NOT delete that script
+# job as "redundant with cargo-deny" — it is not.
+deny = [
+    { crate = "aws-lc-rs", reason = "second rustls crypto provider; co-present with ring it panics ClientConfig::builder() on the Valkey-TLS startup path (Task t2.tr5.t4.oq)." },
+    { crate = "aws-lc-sys", reason = "aws-lc-rs C backend; banned for the same reason as aws-lc-rs (Task t2.tr5.t4.oq)." },
+    { crate = "aws-lc-fips-sys", reason = "aws-lc-rs FIPS C backend; banned for the same reason as aws-lc-rs (Task t2.tr5.t4.oq)." },
+]

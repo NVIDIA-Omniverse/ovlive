@@ -1,0 +1,624 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package nvidia.omniverse.live.v1alpha;
+
+option go_package = "pb.api.nvidia.com/omniverse/live/v1alpha;live";
+option java_multiple_files = true;
+option java_outer_classname = "LiveServiceProto";
+option java_package = "com.nvidia.omniverse.live.v1alpha";
+
+// Live service for session management, presence, and live layer streaming.
+service LiveService {
+  // Creates a session for a base layer path and a client-provided name.
+  //
+  // This call requires write permission on the base path.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // Deletes a session and all associated live layers.
+  //
+  // This call requires write permission on the session.
+  rpc DeleteSession(DeleteSessionRequest) returns (DeleteSessionResponse);
+
+  // Lists sessions for a base layer path.
+  //
+  // This call requires read permission on the base path.
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
+
+  // Joins a session for presence and messages; bidirectional stream.
+  //
+  // This call requires read permission on the session.
+  // First response contains the connection id; later responses are
+  // join/leave/message events.
+  //
+  // Client keepalive: a header that sets client_keepalive asks the server
+  // for a keepalive interval. The client sends keepalives only when this
+  // join's SessionConnected carries a non-zero keepalive_interval_ms, and
+  // decides it again on every join. It then sends a JoinSessionKeepalive
+  // whenever it has sent nothing else for an interval, and the server ends
+  // a join that sends nothing for three intervals. A zero interval, from a
+  // server that has the keepalive disabled or predates it, means the client
+  // sends none; such a server ends the stream with INVALID_ARGUMENT on a
+  // keepalive.
+  //
+  // A stream the server ends UNAVAILABLE carries a google.rpc.ErrorInfo in
+  // domain nvidia.omniverse.live.v1alpha with one of these reasons:
+  //   CLIENT_KEEPALIVE_TIMEOUT: the join sent nothing for three keepalive
+  //   intervals.
+  rpc JoinSession(stream JoinSessionRequest) returns (stream JoinSessionResponse);
+
+  // Creates or replaces layer content for a layer in a session.
+  //
+  // This call requires write permission on the session.
+  // The client sends one header followed by zero or more chunks; total
+  // accumulated content must not exceed the server's max layer size
+  // (default 100 MB) or the call fails with INVALID_ARGUMENT.
+  // The server authorizes the call from the header before it reads any
+  // content: a missing permission or session fails without the content
+  // being read. Content under the max layer size is never refused for its
+  // size; a large upload may wait, within the call's deadline, for the
+  // server's upload capacity. When that capacity is full the call fails with
+  // UNAVAILABLE and nothing is applied, so it is safe to re-send.
+  // Every call that commits allocates a new object_id, even on overwrite of an
+  // existing layer; the old object_id is retired and the sequence number
+  // resets to 1 for the new object. Server responds with the new object_id.
+  // A call whose header carries an operation_id that an earlier CreateLayer
+  // in the same session already committed allocates nothing and answers that
+  // call's object_id with OPERATION_OUTCOME_ALREADY_COMMITTED, so a client can
+  // safely re-send a create whose response was lost (see
+  // CreateLayerHeader.operation_id).
+  rpc CreateLayer(stream CreateLayerRequest) returns (CreateLayerResponse);
+
+  // Appends an update to an existing object for a live layer.
+  //
+  // This call requires write permission on the session.
+  // The client sends one header followed by zero or more chunks; total
+  // accumulated content must not exceed the server's max layer size
+  // (default 100 MB) or the call fails with INVALID_ARGUMENT.
+  // If the header's object_id does not match the layer's current object,
+  // the call fails with FAILED_PRECONDITION (see UpdateLayerHeader).
+  // The server authorizes the call and resolves its layer and object_id from
+  // the header before it reads any content: a missing permission, session or
+  // layer, or a stale object_id, fails without the content being read.
+  // Content under the max layer size is never refused for its size; a large
+  // upload may wait, within the call's deadline, for the server's upload
+  // capacity. When that capacity is full the call fails with UNAVAILABLE and
+  // nothing is applied, so it is safe to re-send.
+  // Server responds with sequence_num and server timestamp.
+  // A request without an operation_id carries no idempotency key: re-sending
+  // one whose response was lost may apply the update again. A re-send that
+  // carries the same operation_id as a commit already recorded for its
+  // object and client_id applies nothing and answers that commit with
+  // OPERATION_OUTCOME_ALREADY_COMMITTED (see UpdateLayerHeader.operation_id).
+  // That guarantee needs one client_id per writer per object: concurrent
+  // writers to one object must never share a client_id.
+  rpc UpdateLayer(stream UpdateLayerRequest) returns (UpdateLayerResponse);
+
+  // Deletes a live layer and its associated content.
+  //
+  // This call requires write permission on the session.
+  rpc DeleteLayer(DeleteLayerRequest) returns (DeleteLayerResponse);
+
+  // Returns metadata for a live layer.
+  //
+  // This call requires read permission on the session.
+  rpc StatLayer(StatLayerRequest) returns (StatLayerResponse);
+
+  // Subscribes to live layer content and update stream.
+  //
+  // This call requires read permission on the session.
+  // Client provides a known object identifier and sequence number to resume.
+  // If the client has no existing content, set both values to 0 to request
+  // full content.
+  // If the provided object identifier is not current, the server sends full
+  // content for the current object.
+  // If the client is already current (object_id and sequence_num match),
+  // the server sends an acknowledgment header (total_size = 0, both
+  // timestamps = 0) to confirm the subscription is active, then streams
+  // future updates as they arrive.
+  // If the client is behind by multiple sequence numbers on the same
+  // object, the server sends a single collapsed diff covering all
+  // intermediate updates rather than one response per sequence.
+  rpc SubscribeReadLayer(SubscribeReadLayerRequest) returns (stream SubscribeReadLayerResponse);
+
+  // Measures round-trip latency and returns server time for jitter estimation.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// Request to create a session for a base layer path.
+message CreateSessionRequest {
+  // Base layer path to create a session for.
+  string path = 1;
+  // Client-provided session name.
+  string name = 2;
+}
+
+// Response containing the created session identifier.
+message CreateSessionResponse {
+  // Server-assigned session identifier.
+  string session_id = 1;
+}
+
+// Request to delete a session.
+message DeleteSessionRequest {
+  // Session identifier to delete.
+  string session_id = 1;
+}
+
+// Response for DeleteSession request.
+message DeleteSessionResponse {}
+
+// Request to list sessions for a base layer path.
+message ListSessionsRequest {
+  // Base layer path the sessions belong to.
+  string path = 1;
+}
+
+// Response containing a list of sessions.
+message ListSessionsResponse {
+  // Sessions scoped to the requested base layer path.
+  repeated Session sessions = 1;
+}
+
+// Session metadata returned by ListSessions.
+message Session {
+  // Server-assigned session identifier.
+  string session_id = 1;
+  // Client-provided session name.
+  string name = 2;
+  // User name of the session creator.
+  string created_by_user_name = 3;
+  // Session creation time in microseconds since epoch.
+  uint64 created_at = 4;
+}
+
+// JoinSession request message for presence and session messages.
+message JoinSessionRequest {
+  // First request must be a header; later requests can send messages.
+  oneof request_type {
+    // Join header for the session stream.
+    JoinSessionHeader header = 1;
+    // Client message to broadcast to session members.
+    SessionMessageRequest message = 2;
+    // Placeholder pending the live edit service schema: field number and
+    // name follow the service commit that adds the client keepalive.
+    // Liveness signal, sent only on a join whose SessionConnected carried a
+    // non-zero keepalive_interval_ms; the service relays nothing to peers.
+    JoinSessionKeepalive keepalive = 3;
+  }
+}
+
+// JoinSession header identifying the target session and client application.
+message JoinSessionHeader {
+  // Session identifier to join.
+  string session_id = 1;
+  // Client application identifier for presence events.
+  string user_application = 2;
+  // Placeholder pending the live edit service schema: field number and
+  // name follow the service commit that adds the client keepalive.
+  // Opts in to the client keepalive. A service that honours it returns a
+  // non-zero keepalive_interval_ms in SessionConnected and ends a join that
+  // sends nothing for three intervals UNAVAILABLE with ErrorInfo reason
+  // CLIENT_KEEPALIVE_TIMEOUT.
+  bool client_keepalive = 3;
+}
+
+// Placeholder pending the live edit service schema: the message follows the
+// service commit that adds the client keepalive.
+// Client keepalive on a JoinSession stream; it carries nothing.
+message JoinSessionKeepalive {}
+
+// Client-to-server message sent over JoinSession stream.
+message SessionMessageRequest {
+  // Application-defined message payload.
+  bytes data = 1;
+}
+
+// Response stream for JoinSession.
+message JoinSessionResponse {
+  // First response is SessionConnected; later responses are presence or
+  // message events.
+  oneof response_type {
+    SessionConnected connected = 1;
+    PeerJoined peer_joined = 2;
+    PeerLeft peer_left = 3;
+    PeerMessage peer_message = 4;
+  }
+}
+
+// First response from JoinSession with the caller's connection ID.
+message SessionConnected {
+  // Connection ID for this client in the session.
+  string connection_id = 1;
+  // Placeholder pending the live edit service schema: field number and
+  // name follow the service commit that adds the client keepalive.
+  // Interval in milliseconds at which the client sends a message when it
+  // has sent nothing else, present only when the header set
+  // client_keepalive. Zero, as from a service that has the keepalive
+  // disabled or predates it, means the client sends no keepalive on this
+  // join.
+  uint64 keepalive_interval_ms = 2;
+}
+
+// A peer joined the session.
+message PeerJoined {
+  // Connection ID of the peer that joined.
+  string connection_id = 1;
+  // User name of the peer that joined.
+  string user_name = 2;
+  // Application identifier of the peer that joined.
+  string user_application = 3;
+}
+
+// A peer left the session.
+message PeerLeft {
+  // Connection ID of the peer that left.
+  string connection_id = 1;
+}
+
+// A peer sent a message.
+message PeerMessage {
+  // Connection ID of the peer that sent the message.
+  string connection_id = 1;
+  // Application-defined message payload.
+  bytes data = 2;
+}
+
+// How the server handled a request's operation_id.
+enum OperationOutcome {
+  // No operation_id was sent, or this server does not implement operation ids
+  // and ignored the field. No exactly-once guarantee applies.
+  OPERATION_OUTCOME_UNSPECIFIED = 0;
+  // This call committed the operation and recorded its operation_id.
+  OPERATION_OUTCOME_APPLIED = 1;
+  // Another call with the same operation_id had already committed it. This
+  // call applied nothing; the response reports that commit.
+  OPERATION_OUTCOME_ALREADY_COMMITTED = 2;
+}
+
+// Header for a streamed CreateLayer call.
+message CreateLayerHeader {
+  // Session identifier that owns the layer.
+  string session_id = 1;
+  // Client-defined layer_name within the session.
+  string layer_name = 2;
+  // Optional client-supplied id for this create intent, which makes a re-send
+  // of the call exactly-once. Empty means absent: every call that commits
+  // creates (or replaces) the layer, as without this field.
+  //
+  // Otherwise 1-64 bytes, each one of the ASCII characters A-Z a-z 0-9 - . _ ~,
+  // compared byte for byte; anything else is INVALID_ARGUMENT before any
+  // chunk is read. Recommended value: a random UUIDv4 in canonical
+  // 36-character text, minted once per create intent and never reused for a
+  // different one.
+  //
+  // The server records the id per session for 24 hours. A later call in the
+  // same session with the same id and the same layer_name and chunk bytes
+  // allocates nothing and answers the recorded object_id with
+  // OPERATION_OUTCOME_ALREADY_COMMITTED, even if the layer has since been
+  // replaced or deleted. The same id with a different layer_name or different
+  // chunk bytes fails with ALREADY_EXISTS and changes nothing. A re-send whose
+  // original never committed creates the layer normally.
+  //
+  // The record does not survive a backing-store loss followed by a restore
+  // from checkpoint; a re-send after one may create the layer again.
+  string operation_id = 3;
+}
+
+// Data chunk for a streamed CreateLayer call.
+message CreateLayerChunk {
+  // OMPF container bytes. Every SetField or TimeSample in the OODF delta
+  // whose extValueSize is non-zero is an external-value reference, and for
+  // each one:
+  //   - valueOrExtHash must be exactly 32 bytes and equal the content hash of
+  //     the OMPF part its extValueIndex names. The content hash is SHA-256
+  //     over the concatenated SHA-256 digests of the value's consecutive
+  //     1,048,576-byte blocks, the last block holding the remainder; an
+  //     empty value hashes to SHA-256 of the empty string.
+  //   - extValueSize must equal that part's length in bytes.
+  // Otherwise the call fails with INVALID_ARGUMENT and nothing is stored or
+  // applied. Inline values (extValueSize zero) are not checked. A deployment
+  // may be configured to accept and log such a value instead while its
+  // clients are being rolled out; clients must not rely on that.
+  bytes data = 1;
+}
+
+// Streamed CreateLayer request carrying a header or content chunk.
+message CreateLayerRequest {
+  // Send the header once before any chunks.
+  oneof message_type {
+    CreateLayerHeader header = 1;
+    CreateLayerChunk chunk = 2;
+  }
+}
+
+// Response for CreateLayer stream completion.
+message CreateLayerResponse {
+  // Object identifier for the created/replaced content.
+  // For this object, the sequence number resets to 1.
+  // With OPERATION_OUTCOME_ALREADY_COMMITTED this is the object_id the
+  // earlier call with the same operation_id created; that object may since
+  // have been replaced or deleted.
+  uint64 object_id = 1;
+  // How the server handled CreateLayerHeader.operation_id. UNSPECIFIED when
+  // the header carried none, or when the server ignored it (an older server,
+  // or a replica of one during a rolling upgrade): a re-send answered OK with
+  // UNSPECIFIED may have created the layer a second time.
+  OperationOutcome operation_outcome = 2;
+}
+
+// Header for a streamed UpdateLayer call.
+// The stream must send exactly one header, followed by zero or more chunks.
+message UpdateLayerHeader {
+  // Session identifier that owns the layer.
+  string session_id = 1;
+  // Client-defined layer_name within the session.
+  string layer_name = 2;
+  // Object identifier that this update applies to. Must match the layer's
+  // current object_id; this is the optimistic-concurrency precondition.
+  // A mismatch (for example because another client issued CreateLayer and
+  // retired the previous object) returns FAILED_PRECONDITION. Obtain the
+  // current value from CreateLayer or SubscribeReadLayer.
+  uint64 object_id = 3;
+  // Client-provided estimate of the server time when this update will be
+  // received.
+  // If there were no jitter, this would match the server timestamp reported
+  // in the response.
+  uint64 timestamp_microseconds_since_epoch = 4;
+  // Caller-generated identity (e.g. UUID) for self-echo suppression.
+  // Updates and subscriptions that share the same client_id will not echo
+  // each other's writes. Use a different client_id on the write and
+  // subscribe calls (or omit from one side) to receive all updates.
+  // Use one client_id per writer per object: concurrent writers to one object
+  // must never share a client_id (see operation_id).
+  string client_id = 5;
+  // Optional client-supplied id for this write intent, which makes a re-send
+  // of the call exactly-once. Empty means absent: a re-send whose original
+  // committed may apply the update again.
+  //
+  // Otherwise 1-64 bytes, each one of the ASCII characters A-Z a-z 0-9 - . _ ~,
+  // compared byte for byte; anything else is INVALID_ARGUMENT before any
+  // chunk is read. A non-empty operation_id requires a non-empty client_id
+  // (INVALID_ARGUMENT otherwise). Recommended value: a random UUIDv4 in
+  // canonical 36-character text, minted once per write intent and never
+  // reused for a different one.
+  //
+  // The server records only the latest operation per (object_id, client_id).
+  // A re-send must keep this id, the chunk bytes, session_id, layer_name,
+  // object_id and client_id unchanged (the timestamp may change), and must be
+  // sent before the same client_id's next UpdateLayer to the same object.
+  // Then, if the original committed, the re-send applies nothing and answers
+  // the original sequence_num and server timestamp with
+  // OPERATION_OUTCOME_ALREADY_COMMITTED; if it did not, the re-send applies
+  // normally. The same id with different chunk bytes fails with
+  // ALREADY_EXISTS and applies nothing. A re-send after the layer was
+  // replaced fails with FAILED_PRECONDITION, and after it was deleted with
+  // NOT_FOUND, like any other write to that object.
+  //
+  // No part of a call carrying an operation_id applies after the same
+  // client_id's next UpdateLayer to the same object has committed, as long as
+  // that commit came after the server read this call's starting state. The
+  // server reads it once, as soon as it has received the whole call. A call
+  // still in flight when its record moves (another commit under this
+  // client_id to the object, or a restore of the object from checkpoint)
+  // applies nothing further and fails with UNAVAILABLE, with a message
+  // starting "this attempt applied nothing, but an earlier attempt of this
+  // call may have committed". The server can no longer tell whether an earlier
+  // attempt of the call landed. A re-send with the same operation_id is a new
+  // call: it finds no matching record and applies, so if an earlier attempt
+  // had landed with its response lost, the update lands twice. A caller still
+  // connected to the call normally sees this only after a restore, or when
+  // writers share a client_id (forbidden below). The exception is the
+  // client's own earlier call to the same object: one it gave up on that is
+  // still running on the server can commit while this call is in flight.
+  // One case is not covered: a call the client abandoned without the server
+  // noticing (for example, over a connection lost silently) whose
+  // starting-state read ran only after that next commit can still apply once.
+  //
+  // The record does not survive a backing-store loss followed by a restore
+  // from checkpoint; a re-send after one may apply the update again.
+  //
+  // Use one client_id per writer per object: never share a client_id between
+  // concurrent writers to one object. Writers that do overwrite each other's
+  // record, so a call can fail UNAVAILABLE as above because another writer
+  // committed, and a re-send may then apply again and land an update twice. A
+  // re-send is never answered from another writer's commit.
+  string operation_id = 6;
+}
+
+// Data chunk for a streamed UpdateLayer call.
+message UpdateLayerChunk {
+  // OMPF container bytes. Every SetField or TimeSample in the OODF delta
+  // whose extValueSize is non-zero is an external-value reference, and for
+  // each one:
+  //   - valueOrExtHash must be exactly 32 bytes and equal the content hash of
+  //     the OMPF part its extValueIndex names. The content hash is SHA-256
+  //     over the concatenated SHA-256 digests of the value's consecutive
+  //     1,048,576-byte blocks, the last block holding the remainder; an
+  //     empty value hashes to SHA-256 of the empty string.
+  //   - extValueSize must equal that part's length in bytes.
+  // Otherwise the call fails with INVALID_ARGUMENT and nothing is stored or
+  // applied. Inline values (extValueSize zero) are not checked. A deployment
+  // may be configured to accept and log such a value instead while its
+  // clients are being rolled out; clients must not rely on that.
+  bytes data = 1;
+}
+
+// Header of a chained UpdateLayer call: the update's header and its
+// predecessor in the writer's chain on this object.
+//
+// A chained call requires a non-empty operation_id and client_id
+// (INVALID_ARGUMENT otherwise, before any chunk is read). previous_operation_id
+// is the operation_id of the same client_id's previous UpdateLayer to this
+// object, or empty for the client_id's first write to the object. Every
+// INVALID_ARGUMENT the service gives a chained call carries an ErrorInfo of
+// domain nvidia.omniverse.live.v1alpha, reason INVALID_UPDATE unless another
+// reason applies; a server that does not know this header refuses it
+// INVALID_ARGUMENT without one.
+//
+// The call commits only if the latest write recorded for
+// (object_id, client_id) is previous_operation_id (an absent record matches
+// empty). After its content is read, the call waits for that predecessor,
+// holding no writer slot, until it commits, its deadline passes or the client
+// cancels it; a cancelled or disconnected waiting call applies nothing. A call
+// already committing checks its predecessor atomically; one handed to the
+// store may still be written after the call ended, right after its
+// predecessor. A call that cannot commit at its deadline, or at once under
+// no_wait, applies nothing and fails ABORTED with ErrorInfo reason
+// PREDECESSOR_NOT_COMMITTED, whose metadata last_operation_id holds the latest operation recorded for
+// (object_id, client_id), empty if none, and last_record says what that
+// latest write left: absent (no record), operation (last_operation_id) or
+// no_operation_id (a write without an operation_id).
+message ChainedUpdateLayerHeader {
+  UpdateLayerHeader header = 1;
+  string previous_operation_id = 2;
+  // Do not wait for the predecessor: commit, answer ALREADY_COMMITTED, or
+  // fail PREDECESSOR_NOT_COMMITTED at once.
+  bool no_wait = 3;
+}
+
+// Streamed UpdateLayer request carrying a header or content chunk.
+message UpdateLayerRequest {
+  // Send one header, unchained or chained, once before any chunks.
+  oneof message_type {
+    UpdateLayerHeader header = 1;
+    UpdateLayerChunk chunk = 2;
+    ChainedUpdateLayerHeader chained_header = 3;
+  }
+}
+
+// Response for UpdateLayer stream completion.
+// Sequence number is monotonic within a given object.
+message UpdateLayerResponse {
+  // Monotonic sequence number within a given object.
+  uint64 sequence_num = 1;
+  // Server time when the update was received.
+  // The difference from the client estimate is used to measure jitter and
+  // smooth it locally.
+  // With OPERATION_OUTCOME_ALREADY_COMMITTED both fields belong to the
+  // earlier commit: the sequence may be at or below sequences the client has
+  // already observed, and the timestamp is not a jitter sample for this call.
+  uint64 server_timestamp_microseconds_since_epoch = 2;
+  // How the server handled UpdateLayerHeader.operation_id. UNSPECIFIED when
+  // the header carried none, or when the server ignored it (an older server,
+  // or a replica of one during a rolling upgrade): a re-send answered OK with
+  // UNSPECIFIED may have applied the update a second time.
+  OperationOutcome operation_outcome = 3;
+}
+
+// Request to delete a live layer.
+message DeleteLayerRequest {
+  // Session identifier that owns the layer.
+  string session_id = 1;
+  // Client-defined layer_name within the session.
+  string layer_name = 2;
+}
+
+// Response for DeleteLayer request.
+message DeleteLayerResponse {}
+
+// Request to retrieve metadata for a live layer.
+message StatLayerRequest {
+  // Session identifier that owns the layer.
+  string session_id = 1;
+  // Client-defined layer_name within the session.
+  string layer_name = 2;
+}
+
+// Response containing metadata for a live layer.
+message StatLayerResponse {
+  // User name of the layer creator when available.
+  string created_by_user_name = 1;
+  // Layer creation time in microseconds since epoch when available.
+  uint64 created_at = 2;
+  // Layer last-modified time in microseconds since epoch when available.
+  uint64 last_modified_at = 3;
+}
+
+// Request to subscribe to live layer content.
+message SubscribeReadLayerRequest {
+  // Session identifier that owns the layer.
+  string session_id = 1;
+  // Client-defined layer_name within the session.
+  string layer_name = 2;
+  // Object ID the client already has; 0 requests full content.
+  uint64 object_id = 3;
+  // Sequence number the client already has; 0 requests full content.
+  uint64 sequence_num = 4;
+  // Caller-generated identity (e.g. UUID) for self-echo suppression.
+  // Updates and subscriptions that share the same client_id will not echo
+  // each other's writes. Use a different client_id on the write and
+  // subscribe calls (or omit from one side) to receive all updates.
+  string client_id = 5;
+}
+
+// Header sent before content chunks on the read stream.
+message SubscribeReadLayerHeader {
+  // Object ID for the content being streamed.
+  uint64 object_id = 1;
+  // Sequence number for the content being streamed.
+  uint64 sequence_num = 2;
+  // Total content size in bytes for this update.
+  // The update is complete when accumulated chunk bytes reach total_size.
+  uint64 total_size = 3;
+  // Client timestamp echoed from the UpdateLayer that produced this change.
+  // 0 when the content originates from a CreateLayer (which has no client
+  // timestamp) or from the subscription acknowledgment header. For a
+  // collapsed catch-up diff covering multiple updates, this is the
+  // timestamp from the last update in the range.
+  uint64 client_timestamp_microseconds_since_epoch = 4;
+  // Server time when the update was recorded.
+  // 0 for the subscription acknowledgment header (no associated update).
+  uint64 server_timestamp_microseconds_since_epoch = 5;
+}
+
+// Data chunk for SubscribeReadLayer stream.
+message SubscribeReadLayerChunk {
+  // OMPF container bytes.
+  bytes data = 1;
+}
+
+// Streamed SubscribeReadLayer response carrying a header or chunk.
+// A header marks the start of a content update; all following chunks belong
+// to it until the next header arrives (or the stream ends).
+message SubscribeReadLayerResponse {
+  // Header arrives before any chunks for a content update.
+  oneof response_type {
+    SubscribeReadLayerHeader header = 1;
+    SubscribeReadLayerChunk chunk = 2;
+  }
+}
+
+// Ping request for jitter estimation.
+message PingRequest {
+  // Client timestamp for when the request was sent.
+  uint64 client_timestamp_microseconds_since_epoch = 1;
+}
+
+// Ping response for jitter estimation.
+message PingResponse {
+  // Client timestamp echoed from the request.
+  uint64 client_timestamp_microseconds_since_epoch = 1;
+  // Server time when the ping request was received.
+  uint64 server_timestamp_microseconds_since_epoch = 2;
+  // The service honours UpdateLayerHeader.operation_id and
+  // CreateLayerHeader.operation_id: a re-send is answered from the original
+  // commit.
+  bool operation_ids = 3;
+  // The service accepts UpdateLayerRequest.chained_header.
+  bool chained_writes = 4;
+}

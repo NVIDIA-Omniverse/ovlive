@@ -1,0 +1,8 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+// Generated private provenance. Never include dependency manifest contents.
+#pragma once
+#define LIVE_PROTO_SHA256 "@live_proto_sha256@"
+#define LIVE_BUILD_SOURCE_SHA256 "@live_source_sha256@"
+#define LIVE_BUILD_REVISION "@live_revision@"
+#define LIVE_BUILD_COMPILER "@CMAKE_CXX_COMPILER_ID@ @CMAKE_CXX_COMPILER_VERSION@"

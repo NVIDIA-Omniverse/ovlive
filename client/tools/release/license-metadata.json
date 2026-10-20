@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "description": "Explicit license evidence for comment-free formats and preserved license/provenance records; original notices retain their terms. NVIDIA-authored metadata is Apache-2.0 under LICENSE.",
+  "files": {
+    "client/source/bindings/python/omni/usd/live/py.typed": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/source/kit/config/live-sdk.json.in": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/source/live/resolver/plugInfo.json.in": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/source/live/scene/plugInfo.json.in": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/source/live/scene/plugin/plugInfo.json.in": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/benchmarks/scene-workloads.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/catalog.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/diagnostic-catalog.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/diagnostic-snapshot.schema.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/implementation-plan.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/source-manifest.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/contracts/suites.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tests/native/resolver/plugInfo.json.in": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tools/release/hygiene-allowlist.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/tools/release/license-metadata.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/BOM.json": {
+      "license_evidence": "client/THIRD_PARTY_NOTICES.md",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/THIRD_PARTY_LICENSES.txt": {
+      "license_evidence": "client/THIRD_PARTY_NOTICES.md",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/PROVENANCE.json": {
+      "license_evidence": "LICENSE",
+      "reason": "Preserved notice or metadata format without an inline SPDX header."
+    },
+    "client/LICENSES/SHA256-BSD-2-Clause.txt": {
+      "license_evidence": "client/LICENSES/SHA256-BSD-2-Clause.txt",
+      "reason": "Preserved Allan Saddi BSD-2-Clause notice."
+    },
+    "client/NOTICE": {
+      "license_evidence": "LICENSE",
+      "reason": "NVIDIA client attribution and preserved third-party notice references."
+    }
+  }
+}

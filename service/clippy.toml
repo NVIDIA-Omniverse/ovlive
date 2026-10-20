@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Clippy configuration for the live-edit workspace.
+#
+# `disallowed-methods` mechanizes a prohibition that would otherwise live only
+# in prose. Each entry names the *definition* path (not a re-export), which is
+# what clippy's path resolver walks.
+
+disallowed-methods = [
+  # b.ji8 — fred's `UNWATCH` carries no arguments, so in cluster mode the
+  # default `ClusterHash::FirstKey` policy finds no key, `cluster_hash()`
+  # yields `None`, and fred's router falls through to an ARBITRARY node
+  # (`writers.values_mut().next()`). The UNWATCH then misses the node actually
+  # holding the WATCH, and the residue punishes the NEXT borrower of the
+  # pooled connection with a `CROSSSLOT` naming a key it never mentioned.
+  #
+  # Every teardown must go through `WatchGuard::unwatch_pinned`, which pins the
+  # command to the slot recorded at `mark_watched` time. The single sanctioned
+  # bare call is `storage::watch_guard::unwatch_attempt`'s `None` arm (there is
+  # no slot to pin to there), which carries an explicit
+  # `#[allow(clippy::disallowed_methods)]`.
+  { path = "fred::commands::interfaces::keys::KeysInterface::unwatch", reason = "keyless UNWATCH is routed to an arbitrary cluster node; tear WATCH down via WatchGuard::unwatch_pinned (b.ji8)" },
+]

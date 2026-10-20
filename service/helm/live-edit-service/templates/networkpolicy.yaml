@@ -1,0 +1,99 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- if .Values.networkPolicy.enabled -}}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "live-edit-service.fullname" . }}
+  labels:
+    {{- include "live-edit-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "live-edit-service.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: grpc
+          protocol: TCP
+        - port: metrics
+          protocol: TCP
+      {{- with .Values.networkPolicy.ingressFromNamespaces }}
+      from:
+        {{- range . }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .name | quote }}
+        {{- end }}
+      {{- end }}
+    {{- if eq (include "live-edit-service.scalerEnabled" .) "true" }}
+    # The release's scaler reads each server pod's /scaling/v1 on the metrics
+    # port. Admitted on its own, so it is not cut off when
+    # ingressFromNamespaces does not list the release namespace.
+    - ports:
+        - port: metrics
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "live-edit-service.scalerSelectorLabels" . | nindent 14 }}
+    {{- end }}
+  egress:
+    # Always permit cluster DNS resolution.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if .Values.networkPolicy.egressToValkey }}
+    # Egress to Valkey. Operators with a non-default Valkey location (different
+    # namespace / hostname) should override this rule via the chart's
+    # `networkPolicy.egressToValkey: false` and supply their own policy.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: valkey
+      ports:
+        - protocol: TCP
+          port: 6379
+    {{- end }}
+    {{- if .Values.networkPolicy.egressToAuth }}
+    # Egress to the auth backends. Catch-all to any pod on the standard HTTPS
+    # ports; cluster-mesh-aware deployments can scope further by overriding.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 8011
+        - protocol: TCP
+          port: 8080
+    {{- end }}
+{{- else -}}
+### NetworkPolicy is disabled, see .Values.networkPolicy.enabled
+{{- end }}

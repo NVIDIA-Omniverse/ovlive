@@ -1,0 +1,1399 @@
+{
+  "catalog_version": 1,
+  "diagnostic_schema_version": 1,
+  "purpose": "Human/agent diagnostic interpretation; Kit control uses typed status/results/callbacks.",
+  "compatibility": "Additive fields/events retain schema major. Preserve existing numeric codes/names/meaning; never reuse retired IDs. Unknown fields/events must not become host recovery decisions.",
+  "delivery": "Filtered, bounded, best-effort records; gaps/absence can reflect suppression, eviction, queue drops or shutdown. Metrics are independent. No ordering is promised across status and diagnostic callbacks.",
+  "field_presence": "Variants describe current production emitters, not mandatory ABI fields. Missing is distinct from zero; consumers tolerate additions and partial/future records.",
+  "fields": [
+    {
+      "key": "Operation",
+      "name": "operation",
+      "kind": "UINT64",
+      "meaning": "Public operation code."
+    },
+    {
+      "key": "Result",
+      "name": "result",
+      "kind": "UINT64",
+      "meaning": "Public result for this emitter; not necessarily the final logical operation result."
+    },
+    {
+      "key": "GrpcStatus",
+      "name": "grpc_status",
+      "kind": "UINT64",
+      "meaning": "Raw gRPC status when available; absence differs from an explicit zero."
+    },
+    {
+      "key": "Request",
+      "name": "request_id",
+      "kind": "UINT64",
+      "meaning": "Runtime-local request correlation; zero when unavailable or not applicable. Not a deduplication key."
+    },
+    {
+      "key": "Attempt",
+      "name": "attempt_id",
+      "kind": "UINT64",
+      "meaning": "Emitter-local attempt correlation. Retry variants distinguish previous from next attempt."
+    },
+    {
+      "key": "Generation",
+      "name": "stream_generation",
+      "kind": "UINT64",
+      "meaning": "Stream incarnation-local generation; zero when unavailable or not applicable."
+    },
+    {
+      "key": "AuthGeneration",
+      "name": "auth_generation",
+      "kind": "UINT64",
+      "meaning": "Credential generation used or observed by this emitter; no token contents."
+    },
+    {
+      "key": "Challenge",
+      "name": "challenge_id",
+      "kind": "UINT64",
+      "meaning": "Endpoint authentication challenge correlation; zero when no challenge applies."
+    },
+    {
+      "key": "Reason",
+      "name": "reason",
+      "kind": "UINT64",
+      "meaning": "Event/variant-specific numeric domain; never interpret globally."
+    },
+    {
+      "key": "DelayMs",
+      "name": "delay_ms",
+      "kind": "UINT64",
+      "meaning": "Selected retry delay in milliseconds; does not prove a retry started."
+    },
+    {
+      "key": "PendingBytes",
+      "name": "pending_bytes",
+      "kind": "UINT64",
+      "meaning": "Emitter-specific pending bytes: retained-work total for status/layers, outbound FIFO payload total for messages (including receive events). Not RSS or the global charged-capacity gauge."
+    },
+    {
+      "key": "PendingWrites",
+      "name": "pending_writes",
+      "kind": "UINT64",
+      "meaning": "Local pending work count for this subject, not remote convergence."
+    },
+    {
+      "key": "DurationMs",
+      "name": "duration_ms",
+      "kind": "UINT64",
+      "meaning": "Monotonic elapsed milliseconds; interval is event-specific."
+    },
+    {
+      "key": "Count",
+      "name": "count",
+      "kind": "UINT64",
+      "meaning": "Event-specific count."
+    },
+    {
+      "key": "State",
+      "name": "state",
+      "kind": "UINT64",
+      "meaning": "Public subject state code."
+    },
+    {
+      "key": "Revision",
+      "name": "revision",
+      "kind": "UINT64",
+      "meaning": "Monotonic revision within this subject lifetime."
+    },
+    {
+      "key": "ReadSequence",
+      "name": "read_sequence",
+      "kind": "UINT64",
+      "meaning": "Read frontier observed by this emitter."
+    },
+    {
+      "key": "WriteSequence",
+      "name": "write_sequence",
+      "kind": "UINT64",
+      "meaning": "Reserved numeric key; no current production emitter. Not a global ordering key."
+    },
+    {
+      "key": "AppliedSequence",
+      "name": "applied_sequence",
+      "kind": "UINT64",
+      "meaning": "Locally applied frontier observed by this emitter."
+    },
+    {
+      "key": "Bytes",
+      "name": "bytes",
+      "kind": "UINT64",
+      "meaning": "Event-specific payload byte count; never payload contents."
+    },
+    {
+      "key": "RetryDisposition",
+      "name": "retry_disposition",
+      "kind": "UINT64",
+      "meaning": "Reserved numeric key; no current production emitter."
+    },
+    {
+      "key": "QueueDepth",
+      "name": "queue_depth",
+      "kind": "UINT64",
+      "meaning": "Event-specific queue count, not a memory or convergence measure."
+    },
+    {
+      "key": "SampleAgeMs",
+      "name": "sample_age_ms",
+      "kind": "UINT64",
+      "meaning": "Reserved numeric key; estimator age appears in metrics instead."
+    },
+    {
+      "key": "ResumeSequence",
+      "name": "resume_sequence",
+      "kind": "UINT64",
+      "meaning": "Read resume cursor for this stream attempt."
+    },
+    {
+      "key": "Work",
+      "name": "work_id",
+      "kind": "UINT64",
+      "meaning": "Actor-local work correlation, not server idempotency."
+    },
+    {
+      "key": "Session",
+      "name": "session_handle",
+      "kind": "UINT64",
+      "meaning": "Runtime-local session handle, not a portable session identity."
+    },
+    {
+      "key": "TargetLocalOrdinal",
+      "name": "target_local_ordinal",
+      "kind": "UINT64",
+      "meaning": "Captured local admission target for this save."
+    },
+    {
+      "key": "LocalRetired",
+      "name": "local_retired",
+      "kind": "UINT64",
+      "meaning": "Retired local admission frontier at this boundary."
+    },
+    {
+      "key": "AuthFailureCause",
+      "name": "auth_failure_cause",
+      "kind": "UINT64",
+      "meaning": "0 provider, 1 deadline, 2 rejected-generation limit, 3 internal; result remains UNAUTHENTICATED."
+    },
+    {
+      "key": null,
+      "name": "canonical_resource",
+      "kind": "STRING",
+      "meaning": "Optional validated canonical live URI, maximum 512 bytes, only with runtime AND callback/export permission. No signed/base URLs or payloads. Appended typed callback field; top-level record member outside fields in snapshot JSON."
+    },
+    {
+      "key": "CallbackKind",
+      "name": "callback_kind",
+      "kind": "UINT64",
+      "meaning": "Native callback family: 0 request, 1 auth, 2 status, 3 session. Diagnostic sink failures have separate nonrecursive counters."
+    },
+    {
+      "key": "Callback",
+      "name": "callback_id",
+      "kind": "UINT64",
+      "meaning": "Runtime-local auth/status callback registration handle; not a host address."
+    },
+    {
+      "key": "StructCommands",
+      "name": "struct_commands",
+      "kind": "UINT64",
+      "meaning": "Struct commands the live edit service counted in a delta it refused as DELTA_TOO_LARGE."
+    },
+    {
+      "key": "SetFields",
+      "name": "set_fields",
+      "kind": "UINT64",
+      "meaning": "Set fields the live edit service counted in a delta it refused as DELTA_TOO_LARGE."
+    },
+    {
+      "key": "TimeSamples",
+      "name": "time_samples",
+      "kind": "UINT64",
+      "meaning": "Time samples the live edit service counted in a delta it refused as DELTA_TOO_LARGE."
+    },
+    {
+      "key": "Limit",
+      "name": "limit",
+      "kind": "UINT64",
+      "meaning": "The live edit service's limit a refused delta exceeded: max_entries for DELTA_TOO_LARGE, the children list limit for CHILDREN_LIST_TOO_LONG."
+    }
+  ],
+  "variants": {
+    "status": {
+      "fields": [
+        "state",
+        "revision",
+        "result",
+        "operation",
+        "pending_bytes",
+        "pending_writes"
+      ],
+      "optional": [
+        "canonical_resource"
+      ],
+      "meaning": "Cached subject transition; result may be latched from an earlier incident."
+    },
+    "rpc": {
+      "fields": [
+        "operation",
+        "result",
+        "duration_ms",
+        "request_id",
+        "attempt_id",
+        "stream_generation",
+        "auth_generation",
+        "work_id",
+        "session_handle"
+      ],
+      "optional": [
+        "grpc_status",
+        "reason",
+        "struct_commands",
+        "set_fields",
+        "time_samples",
+        "limit",
+        "count"
+      ],
+      "meaning": "Duration ends at CQ receipt. Zero correlation values are allowed when unavailable/not applicable. An UPDATE or CREATE the live edit service refused INVALID_ARGUMENT with its entry-limit google.rpc.ErrorInfo adds reason 1 DELTA_TOO_LARGE with struct_commands, set_fields, time_samples and limit (max_entries), or reason 2 CHILDREN_LIST_TOO_LONG with limit and count (the list's length)."
+    },
+    "auth_challenge": {
+      "fields": [
+        "operation",
+        "auth_generation",
+        "challenge_id",
+        "reason"
+      ],
+      "optional": [],
+      "meaning": "reason uses authentication-reason domain."
+    },
+    "auth_replaced": {
+      "fields": [
+        "operation",
+        "result",
+        "auth_generation",
+        "challenge_id"
+      ],
+      "optional": [],
+      "meaning": "Accepted token generation; challenge_id may be zero."
+    },
+    "auth_failed": {
+      "fields": [
+        "operation",
+        "result",
+        "auth_generation",
+        "challenge_id",
+        "reason",
+        "auth_failure_cause"
+      ],
+      "optional": [],
+      "meaning": "reason uses authentication-reason domain; internal cause can occur without an initialized challenge (reason zero)."
+    },
+    "backpressure_exit": {
+      "fields": [
+        "state",
+        "revision",
+        "result",
+        "operation",
+        "pending_bytes",
+        "pending_writes",
+        "duration_ms",
+        "reason"
+      ],
+      "optional": [
+        "canonical_resource"
+      ],
+      "meaning": "reason: 0 left BLOCKED, 1 failed, 2 closed. Duration is the published interval, including a true zero."
+    },
+    "save": {
+      "fields": [
+        "operation",
+        "result",
+        "reason",
+        "stream_generation",
+        "target_local_ordinal",
+        "local_retired",
+        "pending_writes",
+        "pending_bytes",
+        "read_sequence",
+        "applied_sequence",
+        "duration_ms"
+      ],
+      "optional": [],
+      "meaning": "result is save outcome; reason is current actor result, possibly different. Duration ends at save return before diagnostic queries."
+    },
+    "drain": {
+      "fields": [
+        "result",
+        "duration_ms"
+      ],
+      "optional": [],
+      "meaning": "Runtime-present public drain interval; excludes pre-runtime rejection."
+    },
+    "finite_retry": {
+      "fields": [
+        "operation",
+        "request_id",
+        "attempt_id",
+        "auth_generation",
+        "reason",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "reason is failed public result; attempt_id identifies the NEXT attempt. No result field."
+    },
+    "layer_retry": {
+      "fields": [
+        "operation",
+        "result",
+        "request_id",
+        "attempt_id",
+        "stream_generation",
+        "resume_sequence",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "result is failed public result; attempt_id identifies the PREVIOUS attempt. No reason field."
+    },
+    "session_retry": {
+      "fields": [
+        "operation",
+        "result",
+        "session_handle",
+        "attempt_id",
+        "stream_generation",
+        "auth_generation",
+        "reason",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "reason and result are failed public result; attempt_id identifies the PREVIOUS stream attempt."
+    },
+    "write_retry": {
+      "fields": [
+        "operation",
+        "result",
+        "request_id",
+        "attempt_id",
+        "stream_generation",
+        "work_id",
+        "reason",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "An UPDATE or CREATE the service refused UNAVAILABLE with nothing applied, before its reissue. result is the refusal's public result; attempt_id counts the write's or creation's consecutive refusals, this one included; stream_generation and work_id are zero for a CREATE; reason is the delay's source: 1 the service's RetryInfo, the least wait below reconnect_maximum_ms, or the reconnect schedule's draw when that is longer; 2 the reconnect schedule."
+    },
+    "chain_resend": {
+      "fields": [
+        "operation",
+        "result",
+        "attempt_id",
+        "count",
+        "target_local_ordinal",
+        "reason",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "A layer's broken write chain was resolved and its writes are re-sent. reason is 3; result is OUTCOME_UNKNOWN while a re-sent write's earlier attempt has an unknown outcome, otherwise OK; attempt_id counts resolution rounds without an acknowledgment; count is the writes re-sent; target_local_ordinal is the local admission ordinal the chain committed through."
+    },
+    "resend_hold": {
+      "fields": [
+        "operation",
+        "result",
+        "request_id",
+        "stream_generation",
+        "work_id",
+        "reason",
+        "delay_ms"
+      ],
+      "optional": [],
+      "meaning": "An unchained UPDATE whose outcome is unknown is re-sent once at once, and the layer holds its later writes until the first attempt's request_timeout_ms deadline plus 5 s. reason is 4; result is OUTCOME_UNKNOWN; request_id is the first attempt; delay_ms is the remaining hold."
+    },
+    "suppression": {
+      "fields": [
+        "count",
+        "reason"
+      ],
+      "optional": [],
+      "meaning": "reason is suppressed event code; count is accumulated repeated WARN inputs, with prior endpoint/subject/incident correlation."
+    },
+    "message": {
+      "fields": [
+        "operation",
+        "result",
+        "session_handle",
+        "request_id",
+        "stream_generation",
+        "auth_generation",
+        "bytes",
+        "queue_depth",
+        "pending_bytes"
+      ],
+      "optional": [],
+      "meaning": "Local message lifecycle; bytes counts payload length without exporting content. Local queue events use zero transport generations. queue_depth/pending_bytes describe the outbound FIFO even on message_received, not incoming callback backlog."
+    },
+    "layer_stream": {
+      "fields": [
+        "operation",
+        "result",
+        "request_id",
+        "attempt_id",
+        "stream_generation",
+        "resume_sequence",
+        "read_sequence",
+        "applied_sequence"
+      ],
+      "optional": [],
+      "meaning": "Actual read attempt correlation; first-response boundary is distinct from applied readiness."
+    },
+    "session_stream": {
+      "fields": [
+        "operation",
+        "result",
+        "session_handle",
+        "attempt_id",
+        "stream_generation",
+        "auth_generation"
+      ],
+      "optional": [
+        "reason"
+      ],
+      "meaning": "Actual JOIN attempt; connected frame can be initial readiness. A stream_disconnected for a join the live edit service ended UNAVAILABLE with its google.rpc.ErrorInfo reason CLIENT_KEEPALIVE_TIMEOUT adds reason 1."
+    },
+    "shutdown_timeout": {
+      "fields": [
+        "operation",
+        "result",
+        "duration_ms",
+        "reason"
+      ],
+      "optional": [],
+      "meaning": "Final/resumed matched-runtime shutdown returned TIMEOUT. reason is the first wait stage that did not finish, not necessarily the sole blocker; duration covers the whole call before diagnostic observation and local runtime destruction. Runtime/endpoint/subject/incident correlation uses runtime_instance_id with other identities zero. History/metrics only: never dispatches sinks, including after stopping."
+    },
+    "callback_request": {
+      "fields": [
+        "callback_kind",
+        "request_id",
+        "operation",
+        "attempt_id"
+      ],
+      "optional": [],
+      "meaning": "Exception escaping a native request callback. The independently known operation result and incident remain unchanged."
+    },
+    "callback_auth": {
+      "fields": [
+        "callback_kind",
+        "callback_id",
+        "operation",
+        "auth_generation",
+        "challenge_id"
+      ],
+      "optional": [],
+      "meaning": "Exception escaping an auth observer. No implicit refresh failure or callback retry; later challenges can still be delivered."
+    },
+    "callback_status": {
+      "fields": [
+        "callback_kind",
+        "callback_id",
+        "session_handle",
+        "revision"
+      ],
+      "optional": [],
+      "meaning": "Exception escaping a status observer; disables that observer. The delivered subject revision/incident is context, not a new subject failure."
+    },
+    "callback_session": {
+      "fields": [
+        "callback_kind",
+        "session_handle",
+        "reason"
+      ],
+      "optional": [],
+      "meaning": "Exception escaping a session event callback. Reason is the delivered event kind; existing policy disables callbacks and fails the session locally without altering accepted message receipts."
+    },
+    "flush_unsupported": {
+      "fields": [
+        "operation",
+        "result",
+        "reason"
+      ],
+      "optional": [],
+      "meaning": "operation is UPDATE and result is UNSUPPORTED. reason: 1 value type, 2 payload offset, 3 identity type change, 4 multi-update, 5 move cycle, 6 time-sample dictionary key, 7 identity realization. Subject and incident identify the failed layer."
+    },
+    "host_edits_discarded": {
+      "fields": [
+        "count",
+        "result"
+      ],
+      "optional": [],
+      "meaning": "count is the unadmitted host edit records; result is the layer's FAILED cause or OK. Subject identifies the closed layer; incident is the layer status incident, zero for a healthy layer."
+    },
+    "read_flow": {
+      "fields": [
+        "stream_generation",
+        "queue_depth"
+      ],
+      "optional": [],
+      "meaning": "queue_depth is the layer's queued read frames plus unapplied peer coverage when the read paused or resumed; stream_generation is the read generation. Subject identifies the layer."
+    },
+    "apply_lag": {
+      "fields": [
+        "stream_generation",
+        "read_sequence",
+        "applied_sequence"
+      ],
+      "optional": [],
+      "meaning": "read_sequence is the highest sequence the layer's read delivered and applied_sequence the highest applied in order when the lag crossed its bound; stream_generation is the read generation. Subject identifies the layer."
+    },
+    "apply_lag_exit": {
+      "fields": [
+        "stream_generation",
+        "read_sequence",
+        "applied_sequence",
+        "duration_ms"
+      ],
+      "optional": [],
+      "meaning": "The sequences when the lag fell to half of apply_lag_warning_threshold or less; duration_ms is the interval since apply_lag_entered. Subject identifies the layer."
+    }
+  },
+  "events": [
+    {
+      "code": 1,
+      "symbol": "OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED",
+      "name": "endpoint_registered",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Endpoint subject admitted; not a successful service connection."
+    },
+    {
+      "code": 2,
+      "symbol": "OMNI_USD_LIVE_RECORD_ENDPOINT_CLOSED",
+      "name": "endpoint_closed",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Endpoint subject reached CLOSED; does not establish complete runtime shutdown."
+    },
+    {
+      "code": 3,
+      "symbol": "OMNI_USD_LIVE_RECORD_RPC_COMPLETED",
+      "name": "rpc_completed",
+      "default_severity": "DEBUG",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "rpc"
+      ],
+      "meaning": "One successful transport attempt; READ/JOIN duration is stream lifetime, not readiness."
+    },
+    {
+      "code": 4,
+      "symbol": "OMNI_USD_LIVE_RECORD_RPC_FAILED",
+      "name": "rpc_failed",
+      "default_severity": "WARN",
+      "severity_rule": "WARN for UNAVAILABLE, TIMEOUT, CANCELLED, UNAUTHENTICATED; ERROR for every other non-OK result. The result_severities table also includes OK, which selects rpc_completed instead.",
+      "emission": "implemented",
+      "variants": [
+        "rpc"
+      ],
+      "meaning": "One failed transport attempt; a safe retry can still make the logical operation succeed.",
+      "result_severities": {
+        "OMNI_USD_LIVE_OK": "DEBUG",
+        "OMNI_USD_LIVE_INVALID_ARGUMENT": "ERROR",
+        "OMNI_USD_LIVE_INVALID_HANDLE": "ERROR",
+        "OMNI_USD_LIVE_NOT_INITIALIZED": "ERROR",
+        "OMNI_USD_LIVE_NOT_FOUND": "ERROR",
+        "OMNI_USD_LIVE_ALREADY_EXISTS": "ERROR",
+        "OMNI_USD_LIVE_UNAUTHENTICATED": "WARN",
+        "OMNI_USD_LIVE_PERMISSION_DENIED": "ERROR",
+        "OMNI_USD_LIVE_UNAVAILABLE": "WARN",
+        "OMNI_USD_LIVE_TIMEOUT": "WARN",
+        "OMNI_USD_LIVE_CANCELLED": "WARN",
+        "OMNI_USD_LIVE_MALFORMED_STREAM": "ERROR",
+        "OMNI_USD_LIVE_UNSUPPORTED": "ERROR",
+        "OMNI_USD_LIVE_RESOURCE_EXHAUSTED": "ERROR",
+        "OMNI_USD_LIVE_BUSY": "ERROR",
+        "OMNI_USD_LIVE_STALE_TOKEN_GENERATION": "ERROR",
+        "OMNI_USD_LIVE_OBJECT_REPLACED": "ERROR",
+        "OMNI_USD_LIVE_BUFFER_TOO_SMALL": "ERROR",
+        "OMNI_USD_LIVE_OUTCOME_UNKNOWN": "ERROR",
+        "OMNI_USD_LIVE_INTERNAL_ERROR": "ERROR",
+        "OMNI_USD_LIVE_IO_ERROR": "ERROR"
+      }
+    },
+    {
+      "code": 5,
+      "symbol": "OMNI_USD_LIVE_RECORD_AUTH_CHALLENGE",
+      "name": "auth_challenge",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "auth_challenge"
+      ],
+      "meaning": "Credential challenge opened; proactive expiry does not necessarily block work."
+    },
+    {
+      "code": 6,
+      "symbol": "OMNI_USD_LIVE_RECORD_AUTH_REPLACED",
+      "name": "auth_replaced",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "auth_replaced"
+      ],
+      "meaning": "A credential generation replacement was accepted; no server acceptance or readiness guarantee."
+    },
+    {
+      "code": 7,
+      "symbol": "OMNI_USD_LIVE_RECORD_AUTH_FAILED",
+      "name": "auth_failed",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "auth_failed"
+      ],
+      "meaning": "Endpoint credential acquisition failed; cause is separate from the UNAUTHENTICATED result."
+    },
+    {
+      "code": 8,
+      "symbol": "OMNI_USD_LIVE_RECORD_STREAM_DISCONNECTED",
+      "name": "stream_disconnected",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "layer_stream",
+        "session_stream",
+        "status"
+      ],
+      "meaning": "A layer/session attempt ended, or an endpoint status entered RECONNECTING."
+    },
+    {
+      "code": 9,
+      "symbol": "OMNI_USD_LIVE_RECORD_STREAM_RESUMED",
+      "name": "stream_resumed",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "layer_stream",
+        "session_stream",
+        "status"
+      ],
+      "meaning": "Validated layer first-response boundary or session connected frame, including initial connection; host application may still be pending. The generic status variant can instead reflect endpoint RECONNECTING-to-READY with no transport validation."
+    },
+    {
+      "code": 10,
+      "symbol": "OMNI_USD_LIVE_RECORD_LAYER_READY",
+      "name": "layer_ready",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Layer subject entered READY locally; no peer-convergence or durability guarantee."
+    },
+    {
+      "code": 11,
+      "symbol": "OMNI_USD_LIVE_RECORD_OBJECT_REPLACED",
+      "name": "object_replaced",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Subject result changed to OBJECT_REPLACED; use typed status for preservation/reopen policy."
+    },
+    {
+      "code": 12,
+      "symbol": "OMNI_USD_LIVE_RECORD_RECOVERY_GATE_CLOSED",
+      "name": "recovery_gate_closed",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Subject entered RECONNECTING; not an exhaustive ledger of every reason writes can be blocked."
+    },
+    {
+      "code": 13,
+      "symbol": "OMNI_USD_LIVE_RECORD_RECOVERY_GATE_OPENED",
+      "name": "recovery_gate_opened",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Subject moved directly from RECONNECTING to READY; not guaranteed paired with a prior delivered close event."
+    },
+    {
+      "code": 14,
+      "symbol": "OMNI_USD_LIVE_RECORD_OUTCOME_UNKNOWN",
+      "name": "outcome_unknown",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Subject result changed to OUTCOME_UNKNOWN; the mutation may have committed. Never authorize replay from this record."
+    },
+    {
+      "code": 15,
+      "symbol": "OMNI_USD_LIVE_RECORD_BACKPRESSURE_ENTERED",
+      "name": "backpressure_entered",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "status"
+      ],
+      "meaning": "Subject began a published nonterminal BLOCKED interval; rejected admission need not produce this event."
+    },
+    {
+      "code": 16,
+      "symbol": "OMNI_USD_LIVE_RECORD_BACKPRESSURE_EXITED",
+      "name": "backpressure_exited",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "backpressure_exit"
+      ],
+      "meaning": "Published BLOCKED interval ended, possibly through failure or closure; does not imply READY."
+    },
+    {
+      "code": 17,
+      "symbol": "OMNI_USD_LIVE_RECORD_SAVE_COMPLETED",
+      "name": "save_completed",
+      "default_severity": "INFO",
+      "severity_rule": "DEBUG for OK or BUSY; WARN for TIMEOUT or CANCELLED; ERROR otherwise.",
+      "emission": "implemented",
+      "variants": [
+        "save"
+      ],
+      "meaning": "Actor save returned, including BUSY/failure; inspect result. Dirty polling and first-save creation are excluded."
+    },
+    {
+      "code": 18,
+      "symbol": "OMNI_USD_LIVE_RECORD_DRAIN_COMPLETED",
+      "name": "drain_completed",
+      "default_severity": "INFO",
+      "severity_rule": "INFO for OK; WARN otherwise.",
+      "emission": "implemented",
+      "variants": [
+        "drain"
+      ],
+      "meaning": "Public drain call returned with a result other than TIMEOUT; inspect result, including BUSY/failure."
+    },
+    {
+      "code": 19,
+      "symbol": "OMNI_USD_LIVE_RECORD_DRAIN_TIMEOUT",
+      "name": "drain_timeout",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "drain"
+      ],
+      "meaning": "Public drain reached its deadline; accepted work was not canceled or acknowledged as drained."
+    },
+    {
+      "code": 20,
+      "symbol": "OMNI_USD_LIVE_RECORD_QUIESCENCE_FAILED",
+      "name": "quiescence_failed",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "shutdown_timeout"
+      ],
+      "meaning": "Final or resumed runtime shutdown timed out; final runtime reference remains for CopyDiagnostics(0) and retry. Only shutdown wait TIMEOUT emits; nonfinal release and admission BUSY are metrics only. Callback/endpoint/request/session cleanup failures are outside this emitter scope."
+    },
+    {
+      "code": 21,
+      "symbol": "OMNI_USD_LIVE_RECORD_RETRY_SCHEDULED",
+      "name": "retry_scheduled",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "finite_retry",
+        "layer_retry",
+        "session_retry",
+        "write_retry",
+        "chain_resend",
+        "resend_hold"
+      ],
+      "meaning": "A retry decision was made; cancellation, auth wait or deadline can prevent issuance."
+    },
+    {
+      "code": 22,
+      "symbol": "OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED",
+      "name": "records_suppressed",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "suppression"
+      ],
+      "meaning": "Deferred summary of identical WARN inputs for one event code; not a general drop summary."
+    },
+    {
+      "code": 24,
+      "symbol": "OMNI_USD_LIVE_RECORD_MESSAGE_ACCEPTED",
+      "name": "message_accepted",
+      "default_severity": "DEBUG",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "message"
+      ],
+      "meaning": "Message copied into the local bounded queue; no server/peer receipt guarantee."
+    },
+    {
+      "code": 25,
+      "symbol": "OMNI_USD_LIVE_RECORD_MESSAGE_WRITE_COMPLETED",
+      "name": "message_write_completed",
+      "default_severity": "DEBUG",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "message"
+      ],
+      "meaning": "gRPC write completion succeeded locally; no peer delivery or durable acknowledgment."
+    },
+    {
+      "code": 26,
+      "symbol": "OMNI_USD_LIVE_RECORD_MESSAGE_RECEIVED",
+      "name": "message_received",
+      "default_severity": "DEBUG",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "message"
+      ],
+      "meaning": "Inbound peer message frame processed; host callback delivery may still be pending."
+    },
+    {
+      "code": 27,
+      "symbol": "OMNI_USD_LIVE_RECORD_MESSAGE_DISCARDED",
+      "name": "message_discarded",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "message"
+      ],
+      "meaning": "Accepted local message removed during terminal/leave cleanup; original receipt is unchanged."
+    },
+    {
+      "code": 28,
+      "symbol": "OMNI_USD_LIVE_RECORD_MESSAGE_REJECTED",
+      "name": "message_rejected",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "message"
+      ],
+      "meaning": "Local message admission rejected; no accepted queue ownership established."
+    },
+    {
+      "code": 29,
+      "symbol": "OMNI_USD_LIVE_RECORD_CALLBACK_FAILED",
+      "name": "callback_failed",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "callback_request",
+        "callback_auth",
+        "callback_status",
+        "callback_session"
+      ],
+      "meaning": "A caught native host callback exception. Contains numeric correlation only, never exception text, callback addresses or payloads. Events metric counts failures even with history disabled. This is not evidence that the underlying RPC failed."
+    },
+    {
+      "code": 30,
+      "symbol": "OMNI_USD_LIVE_RECORD_FLUSH_UNSUPPORTED",
+      "name": "flush_unsupported",
+      "default_severity": "ERROR",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "flush_unsupported"
+      ],
+      "meaning": "A host edit flush failed the layer UNSUPPORTED; nothing was issued and the host content keeps every edit. Contains the numeric reason only; a USD runtime error on the host names the layer and reason, plus the path, field and value type when a single operation causes it."
+    },
+    {
+      "code": 31,
+      "symbol": "OMNI_USD_LIVE_RECORD_HOST_EDITS_DISCARDED",
+      "name": "host_edits_discarded",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "host_edits_discarded"
+      ],
+      "meaning": "A live layer closed with unadmitted host edit records; they are never issued. A release discards them; after an explicit close of a layer the host still holds, its content keeps them for export. The CLOSED layer status carries the same buffered_edit_count. Contains numeric correlation only."
+    },
+    {
+      "code": 32,
+      "symbol": "OMNI_USD_LIVE_RECORD_READ_PAUSED",
+      "name": "read_paused",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "read_flow"
+      ],
+      "meaning": "A layer's read issued no further receive because its queued frames and unapplied peer coverage reached max_requests minus one eighth; the pause changes no state, so a caught-up layer with no other condition stays READY. Contains numeric correlation only."
+    },
+    {
+      "code": 33,
+      "symbol": "OMNI_USD_LIVE_RECORD_READ_RESUMED",
+      "name": "read_resumed",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "read_flow"
+      ],
+      "meaning": "A paused read resumed once its queued frames and unapplied peer coverage fell to half of max_requests. Contains numeric correlation only."
+    },
+    {
+      "code": 34,
+      "symbol": "OMNI_USD_LIVE_RECORD_APPLY_LAG_ENTERED",
+      "name": "apply_lag_entered",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "apply_lag"
+      ],
+      "meaning": "A layer's applied sequence trails its read sequence by more than apply_lag_warning_threshold positions: the host applies peer updates slower than the read delivers them. Only a READY layer past its initial application is evaluated, and positions up to the read generation's accepted catch-up target (a bootstrap snapshot or reconnect catch-up) never count. The lag changes no state, so a caught-up layer with no other condition stays READY. Contains numeric correlation only."
+    },
+    {
+      "code": 35,
+      "symbol": "OMNI_USD_LIVE_RECORD_APPLY_LAG_EXITED",
+      "name": "apply_lag_exited",
+      "default_severity": "INFO",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "apply_lag_exit"
+      ],
+      "meaning": "A lagging layer's applied sequence came within half of apply_lag_warning_threshold of its read sequence. The interval continues through RECONNECTING, AUTH_WAIT and BLOCKED; a layer that fails or closes while lagging records no exit. Contains numeric correlation only."
+    }
+  ],
+  "retired_event_codes": [
+    23
+  ],
+  "retired_domain_values": {
+    "operations": [
+      15
+    ],
+    "results": [
+      17
+    ],
+    "states": [
+      6
+    ]
+  },
+  "domains": {
+    "operations": [
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_NONE",
+        "value": 0
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_OPEN",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_CREATE",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_READ",
+        "value": 3
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_UPDATE",
+        "value": 4
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_SAVE",
+        "value": 5
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_JOIN",
+        "value": 6
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_MESSAGE",
+        "value": 7
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_AUTH",
+        "value": 8
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_DRAIN",
+        "value": 9
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_LIST",
+        "value": 10
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_DELETE",
+        "value": 11
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_STAT",
+        "value": 12
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_PING",
+        "value": 13
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OPERATION_SHUTDOWN",
+        "value": 14
+      }
+    ],
+    "results": [
+      {
+        "symbol": "OMNI_USD_LIVE_OK",
+        "value": 0
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_INVALID_ARGUMENT",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_INVALID_HANDLE",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_NOT_INITIALIZED",
+        "value": 3
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_NOT_FOUND",
+        "value": 4
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_ALREADY_EXISTS",
+        "value": 5
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_UNAUTHENTICATED",
+        "value": 6
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_PERMISSION_DENIED",
+        "value": 7
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_UNAVAILABLE",
+        "value": 8
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_TIMEOUT",
+        "value": 9
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_CANCELLED",
+        "value": 10
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_MALFORMED_STREAM",
+        "value": 11
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_UNSUPPORTED",
+        "value": 12
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RESOURCE_EXHAUSTED",
+        "value": 13
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_BUSY",
+        "value": 14
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STALE_TOKEN_GENERATION",
+        "value": 15
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OBJECT_REPLACED",
+        "value": 16
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_BUFFER_TOO_SMALL",
+        "value": 18
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_OUTCOME_UNKNOWN",
+        "value": 19
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_INTERNAL_ERROR",
+        "value": 20
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_IO_ERROR",
+        "value": 21
+      }
+    ],
+    "states": [
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_OPENING",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_READY",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_RECONNECTING",
+        "value": 3
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_AUTH_WAIT",
+        "value": 4
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_BLOCKED",
+        "value": 5
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_FAILED",
+        "value": 7
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_CLOSING",
+        "value": 8
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_STATE_CLOSED",
+        "value": 9
+      }
+    ],
+    "recovery_actions": [
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_NONE",
+        "value": 0
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_WAIT_FOR_RETRY",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_REFRESH_AUTH",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_RELIEVE_BACKPRESSURE",
+        "value": 3
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_PRESERVE_AND_REOPEN",
+        "value": 4
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_RECOVERY_RECONFIGURE",
+        "value": 5
+      }
+    ],
+    "auth_reasons": [
+      {
+        "symbol": "OMNI_USD_LIVE_AUTH_MISSING",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_AUTH_EXPIRING",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_AUTH_REJECTED",
+        "value": 3
+      }
+    ],
+    "severities": [
+      {
+        "symbol": "OMNI_USD_LIVE_SEVERITY_TRACE",
+        "value": 0
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_SEVERITY_DEBUG",
+        "value": 1
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_SEVERITY_INFO",
+        "value": 2
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_SEVERITY_WARN",
+        "value": 3
+      },
+      {
+        "symbol": "OMNI_USD_LIVE_SEVERITY_ERROR",
+        "value": 4
+      }
+    ]
+  },
+  "host_actions": [
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_NONE",
+      "guidance": "No runtime-requested recovery action; still inspect state/result and honor host USD synchronization."
+    },
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_WAIT_FOR_RETRY",
+      "guidance": "Allow bounded safe runtime recovery to progress; do not manually resend an uncertain mutation."
+    },
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_REFRESH_AUTH",
+      "guidance": "Use the typed auth challenge/generation flow; do not extract credentials or decisions from logs."
+    },
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_RELIEVE_BACKPRESSURE",
+      "guidance": "Reduce admission or let retained work progress; do not discard accepted edits."
+    },
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_PRESERVE_AND_REOPEN",
+      "guidance": "Quiesce authoring, query the matching subject, export the failed layer with SdfLayer::Export, release all old owners, then reopen authoritative state and reconcile explicitly. Never replay uncertain work automatically."
+    },
+    {
+      "symbol": "OMNI_USD_LIVE_RECOVERY_RECONFIGURE",
+      "guidance": "Correct endpoint/configuration or unsupported setup; preserve any accepted local work before releasing its attachment."
+    }
+  ],
+  "defaults": {
+    "max_diagnostic_records": 2048,
+    "max_diagnostic_bytes": 8388608,
+    "max_diagnostic_sink_records": 512,
+    "max_diagnostic_sinks": 8,
+    "max_closed_incidents": 128,
+    "max_status_subjects": 4096,
+    "max_status_observers": 64,
+    "apply_lag_warning_threshold": 256
+  },
+  "default_policy": "NULL runtime options selects INFO; a supplied zero-initialized options struct explicitly selects TRACE (zero). Zero capacity fields select defaults, not disablement. Disable history with its flag; metrics remain active.",
+  "limits": "History capacity is min(records, floor(bytes / native fixed record size)); each sink has its bounded FIFO plus one in-flight record. Two dedicated diagnostic workers; three sink exceptions disable delivery. Exact repeated WARN inputs coalesce in a 1000 ms per-event window. These are configured logical limits, not an RSS bound.",
+  "metric_contract": {
+    "scope": "Runtime-wide even for endpoint-filtered exports; no arbitrary URI/request/user labels.",
+    "duration_bounds_ms": [
+      1,
+      5,
+      10,
+      50,
+      100,
+      500,
+      1000,
+      5000
+    ],
+    "duration_bins": "Noncumulative inclusive upper bounds plus overflow; zero is a sample, missing is not.",
+    "arithmetic": "Cumulative fields saturate independently at UINT64_MAX; current gauges are exact within their defined owners. Arithmetic identities need not survive saturation.",
+    "definitions": "docs/ovlive-diagnostic-schema.md"
+  },
+  "exclusions": [
+    "Tokens, auth headers, certificates/private keys, arbitrary metadata, scene/delta/message content and signed base-layer URLs are excluded at every verbosity.",
+    "Overhead/RSS budgets and consumer sign-off remain unqualified.",
+    "Reserved event codes do not establish implemented instrumentation coverage."
+  ],
+  "shutdown_phases": [
+    {
+      "name": "ReferenceRelease",
+      "value": 0
+    },
+    {
+      "name": "Admission",
+      "value": 1
+    },
+    {
+      "name": "CompletionQueue",
+      "value": 2
+    },
+    {
+      "name": "Sessions",
+      "value": 3
+    },
+    {
+      "name": "Authentication",
+      "value": 4
+    },
+    {
+      "name": "Status",
+      "value": 5
+    },
+    {
+      "name": "Requests",
+      "value": 6
+    },
+    {
+      "name": "Diagnostics",
+      "value": 7
+    },
+    {
+      "name": "Complete",
+      "value": 8
+    }
+  ],
+  "operation_auth_wait_kinds": [
+    {
+      "name": "Finite",
+      "value": 0,
+      "meaning": "Admitted LiveFinite operations at an unusable credential gate, including owned resolver metadata operations."
+    },
+    {
+      "name": "Layer",
+      "value": 1,
+      "meaning": "Logical layer actors at an unusable credential gate; one actor is one waiter regardless of queued edits."
+    },
+    {
+      "name": "Session",
+      "value": 2,
+      "meaning": "Logical joined sessions at an unusable credential gate; one session is one waiter regardless of queued messages."
+    }
+  ],
+  "callback_kinds": [
+    {
+      "name": "Request",
+      "value": 0
+    },
+    {
+      "name": "Auth",
+      "value": 1
+    },
+    {
+      "name": "Status",
+      "value": 2
+    },
+    {
+      "name": "Session",
+      "value": 3
+    }
+  ]
+}

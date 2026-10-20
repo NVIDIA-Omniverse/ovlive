@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "source_repository": "client-library",
+  "source_commit": "b38701a98b16ce82ea84a8b15a2b29512639cf0d",
+  "entries": [
+    {
+      "source_repository": "NVIDIA Live Edit service",
+      "source_path": "proto/nvidia/omniverse/live/v1alpha/live_service.proto",
+      "source_commit": "13a309911db51140d1ffc6cc0c4351fba1cfb138",
+      "source_ref": "live_edit_service main",
+      "sha256": "b24e9c1883db7d3887c7dd976c1b9366e7341b1e009f8ac5a4f37e5c4af3c82a",
+      "scope": "whole-file wire contract; ten LiveService RPCs",
+      "destination": "source/live/protos/nvidia/omniverse/live/v1alpha/live.proto",
+      "state": "vendored_modified",
+      "validation": "Upstream blob 7863bc9e plus the agreed client keepalive fields (JoinSessionHeader.client_keepalive 3, SessionConnected.keepalive_interval_ms 2, JoinSessionRequest.keepalive 3 and message JoinSessionKeepalive), checked by the service team against the live edit service's own unmerged change, and the agreed chained-writes extension (ChainedUpdateLayerHeader with no_wait 3, UpdateLayerRequest.chained_header 3, the last_record refusal metadata and PingResponse.operation_ids 3 and chained_writes 4), ahead of the live edit service's own change, both reconciled when the service and its proto move into this repository; protoc 26.0/gRPC 1.65.4 generated C++ compiles and links in live_proto; schema probe passes; the runtime issues all ten RPCs."
+    },
+    {
+      "source_path": "source/library/provider_omnistorage/StorageProvider.cpp",
+      "sha256": "2c994650f8ae6e2b5b6f462b7c1504837d14000cbf75e8f36da60c49c4d0b26c",
+      "scope": "selected live classes only: createObject, liveReadObject, liveUpdateObject, listLiveSessions, createLiveSession, _deleteLiveSession, _deleteLiveLayer, joinLiveSession, sendMessage; Request/GrpcCall/CQ/status, live stat/Ping, channel creation",
+      "destination": "source/live/runtime/LiveGrpc.cpp, LiveLayerClient.cpp, LiveSessionClient.cpp, LiveEndpoint.cpp",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/provider_omnistorage/StorageProvider.h",
+      "sha256": "28fc56f044cabfda5bdbc577a7c2151ed55d70fe50bc849a1dd30ced27af4688",
+      "scope": "selected request/CQ declarations and live-owned state only; no whole provider",
+      "destination": "source/live/runtime/LiveGrpc.h, LiveEndpoint.h",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/provider_omnistorage/JitterReduction.cpp",
+      "sha256": "d6aad8ddd49f8242d0df01245c5f881e62e9bf983616b6bd5aefdd2c82c4c6ae",
+      "scope": "timing estimator with clock/logging hooks adapted; preserve wire precision",
+      "destination": "source/live/runtime/JitterReduction.cpp",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/provider_omnistorage/JitterReduction.h",
+      "sha256": "2e728185f77db4e325fa2ae5fb8563ef0f8e6e551c9f2a2ddb7e625c7667c0ba",
+      "scope": "private estimator data and interface",
+      "destination": "source/live/runtime/JitterReduction.h",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/core/Content.cpp",
+      "sha256": "4faa6fdde27f4b7c7a04b4e706579cc51e0288f6cd1a7587c22643c86d715a35",
+      "scope": "minimal allocation/move/free ownership semantics; replace legacy public types",
+      "destination": "source/live/runtime/LiveContent.h",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/core/ContentRefCounted.cpp",
+      "sha256": "449dd30c045282817620afb1c00499b7384712ab46bbbbc6385424d7199b6fdd",
+      "scope": "reference-counted content ownership semantics only",
+      "destination": "source/live/runtime/LiveContent.h",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/library/core/ContentRefCounted.h",
+      "sha256": "b3eac9d73424a4c4d34da86c50b77365a7e465247591aff61dd97ba491e8b23d",
+      "scope": "private lifetime semantics; no OmniClient header/type dependency",
+      "destination": "source/live/runtime/LiveContent.h",
+      "state": "not_extracted"
+    },
+    {
+      "source_path": "source/utils/AsyncCallbackQueue.h",
+      "sha256": "0b244bd8421f097df984ad976d270b054b2befb80af296ccf3c2fdf6c140dee9",
+      "scope": "ordered callback dispatch semantics with cancellation/quiescence; replace Core hooks",
+      "destination": "source/live/runtime/LiveDispatchQueue.cpp",
+      "state": "not_extracted"
+    }
+  ],
+  "wire_schema": {
+    "manifest": "source/live/wire/schema/provenance.json",
+    "state": "vendored_unchanged",
+    "scope": "Source-only OMPF layout, FlatBuffers schema/generated header/builder and original license; no Nucleus implementation. The runtime's envelope validation and value decoder consume it."
+  }
+}

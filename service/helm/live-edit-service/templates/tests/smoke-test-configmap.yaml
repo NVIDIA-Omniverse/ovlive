@@ -1,0 +1,51 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- if .Values.tests.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "live-edit-service.fullname" . }}-smoke-tests
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "live-edit-service.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test,post-install,post-upgrade
+    "helm.sh/hook-delete-policy": hook-succeeded,hook-failed,before-hook-creation
+data:
+  # Empty __init__.py for package structure (mounted multiple times to
+  # turn /grpc/nvidia/... into an importable Python package).
+  __init__.py: ""
+  # Test configuration
+  pytest.ini: |
+{{ .Files.Get "files/tests/pytest.ini" | indent 4 }}
+  # Test fixtures and helpers
+  conftest.py: |
+{{ .Files.Get "files/tests/conftest.py" | indent 4 }}
+  utils.py: |
+{{ .Files.Get "files/tests/utils.py" | indent 4 }}
+  live_edit_helpers.py: |
+{{ .Files.Get "files/tests/live_edit_helpers.py" | indent 4 }}
+  # Smoke test cases
+  test_live_edit_grpc.py: |
+{{ .Files.Get "files/tests/smoke-tests/test_live_edit_grpc.py" | indent 4 }}
+  # LiveService gRPC stubs (regenerate with scripts/regenerate-smoke-test-stubs.sh)
+  live_service_pb2.py: |
+{{ .Files.Get "files/generated/nvidia/omniverse/live/v1alpha/live_service_pb2.py" | indent 4 }}
+  live_service_pb2_grpc.py: |
+{{ .Files.Get "files/generated/nvidia/omniverse/live/v1alpha/live_service_pb2_grpc.py" | indent 4 }}
+{{- end }}

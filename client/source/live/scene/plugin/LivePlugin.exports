@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Public C ABI plus the explicitly visible host C++ facade. USD registration
+# uses internal static factories and requires no additional exported symbols.
+{
+  global:
+    omniUsdLiveGetAbiVersion;
+    omniUsdLiveGetCapabilities;
+    omniUsdLiveInitialize;
+    omniUsdLiveShutdown;
+    omniUsdLiveRegisterEndpoint;
+    omniUsdLiveUnregisterEndpoint;
+    omniUsdLiveGetAuthState;
+    omniUsdLiveSetAccessToken;
+    omniUsdLiveRegisterAuthRequiredCallback;
+    omniUsdLiveFailAuthRefresh;
+    omniUsdLiveListSessions;
+    omniUsdLiveCreateSession;
+    omniUsdLiveDeleteSession;
+    omniUsdLiveJoinSession;
+    omniUsdLiveLeaveSession;
+    omniUsdLiveSendMessage;
+    omniUsdLiveStatLayer;
+    omniUsdLiveDeleteLayer;
+    omniUsdLiveGetEndpointStatus;
+    omniUsdLiveGetSessionStatus;
+    omniUsdLiveGetLayerStatus;
+    omniUsdLiveRegisterStatusCallback;
+    omniUsdLiveCreateStatusObserver;
+    omniUsdLiveReadStatus;
+    omniUsdLiveAcknowledgeStatus;
+    omniUsdLiveWaitForPendingUpdates;
+    omniUsdLiveConfigureJitterReduction;
+    omniUsdLiveWait;
+    omniUsdLiveCancel;
+    omniUsdLiveReleaseRequest;
+    omniUsdLiveGetRequestStatus;
+    omniUsdLiveGetRequestError;
+    omniUsdLiveUnregisterCallback;
+    omniUsdLiveMakeSessionUri;
+    omniUsdLiveMakeLayerUri;
+    omniUsdLiveParseUri;
+    omniUsdLiveCombineWithBaseUri;
+    omniUsdLiveGetResultString;
+    omniUsdLiveRegisterDiagnosticCallback;
+    omniUsdLiveCopyDiagnostics;
+    # Itanium ABI names for the dedicated public host namespace (Linux).
+    # Hidden implementation classes stay hidden even when nested in this scope.
+    _ZN4omni3usd4live4host*;
+    _ZNK4omni3usd4live4host*;
+    _ZTVN4omni3usd4live4host*;
+    _ZTIN4omni3usd4live4host*;
+    _ZTSN4omni3usd4live4host*;
+  local: *;
+};

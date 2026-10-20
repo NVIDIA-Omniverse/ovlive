@@ -1,0 +1,15 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- The kit-25.11 host SDKs, named as in Kit's own manifests; tools/live/provision.py pulls them for the host's
+       platform_target_abi and names them in the worker configuration. -->
+  <dependency name="live-sdk-usd" linkPath="../_build/sdk-deps/kit-25.11/usd">
+    <package name="usd.py312.${platform_target_abi}.ov-full-monolithic.release" version="0.25.11.kit.5-gl.21209" />
+  </dependency>
+  <dependency name="live-sdk-python" linkPath="../_build/sdk-deps/kit-25.11/python">
+    <package name="python" version="3.12.13+nv3-${platform_target_abi}" />
+  </dependency>
+  <dependency name="live-sdk-pybind11" linkPath="../_build/sdk-deps/kit-25.11/pybind11">
+    <package name="pybind11" version="2.11.1-0" />
+  </dependency>
+</project>

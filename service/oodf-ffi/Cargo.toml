@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "oodf-ffi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+# `staticlib` is the downstream-consumable artifact: it bundles the cxx
+# runtime, oodf.cpp, and flatc-generated FlatBuffers code into a single `.a`
+# that the standalone C++ test binary (see build.rs — Task 2.4.A) links
+# against. `rlib` is retained so `cargo test` / the lib+bin split still works.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# `internal-bridge` re-exposes the otherwise `pub(crate)` `bridge` and
+# `convert` modules so the crate's own integration tests (in
+# `oodf-ffi/tests/`) can construct cxx bridge values and exercise FFI edge
+# cases. NOT a default feature — Cargo unifies features across the
+# workspace, so making it default would silently expose the bridge module
+# in `live-edit` even with `default-features = false` on its dependency
+# declaration. Keeping it opt-in means: tests for oodf-ffi run with
+# `--features internal-bridge`, every other build (workspace builds,
+# live-edit narrow tests, `cargo check --workspace`) sees `pub(crate)`,
+# so `oodf_ffi::bridge::ffi` cannot be named from a live-edit `use`
+# statement — the load-bearing acceptance criterion 4 of b.vvs item 7.
+# CLAUDE.md `## Build Commands` documents the test invocation.
+[features]
+internal-bridge = []
+
+[dependencies]
+cxx = "=1.0.195"
+thiserror = "2"
+
+# On Linux, build.rs statically links libstdc++ (`cargo:rustc-link-lib=static=stdc++`)
+# regardless of what the distroless/cc runtime image ships, to avoid libstdc++
+# version skew against the base image; the Dockerfile `ldd` guard enforces it.
+# `cxx` transitively pulls `link-cplusplus`, whose default build
+# emits a *dynamic* `cargo:rustc-link-lib=stdc++` — a competing reference that
+# re-introduces a libstdc++.so DT_NEEDED and trips the Dockerfile `ldd` guard.
+# Enabling link-cplusplus's `nothing` feature (Linux only) suppresses that
+# emission, leaving our static link as the sole stdc++ reference. macOS dev
+# builds are untouched: there link-cplusplus's default libc++ link is still
+# needed (oodf-ffi's static path is Linux-gated).
+[target.'cfg(target_os = "linux")'.dependencies]
+link-cplusplus = { version = "1.0", features = ["nothing"] }
+
+[build-dependencies]
+# cc is pinned exactly to match the cxx-build = 1.0.195 transitive ecosystem.
+# Pin tightens supply-chain surface area so a silently-upgraded cc release
+# cannot change compiler-flag selection for oodf-ffi between local dev and CI.
+# Bump atomically with Cargo.lock; the workspace has no other direct cc user.
+cc = "=1.2.60"
+cxx-build = "=1.0.195"
+which = "6"
+
+[dev-dependencies]
+sha2 = "0.10"
+proptest = "1"

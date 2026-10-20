@@ -1,0 +1,77 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- /*
+  Rendered only in autoscaling.mode=hpa. The mode helper runs whenever
+  autoscaling is enabled, so its render failures fire here in either mode
+  (see the helper's comment in _helpers.tpl for the list). The
+  sidecar-request validation below is HPA-only: a Utilization metric needs
+  a request on every container in the pod, while the scaler reads the
+  service's own CPU time.
+*/}}
+{{- if and .Values.autoscaling.enabled (eq (include "live-edit-service.autoscalingMode" .) "hpa") -}}
+{{- if eq (include "live-edit-service.accessTokenSidecarEnabled" .) "true" -}}
+{{- $container := .Values.serviceIdentity.accessTokenFile.provisionerSidecar.container -}}
+{{- $requests := get ($container.resources | default dict) "requests" | default dict -}}
+{{- range $resource, $target := dict "cpu" .Values.autoscaling.targetCPUUtilizationPercentage "memory" .Values.autoscaling.targetMemoryUtilizationPercentage -}}
+{{- if $target -}}
+{{- $request := get $requests $resource | toString -}}
+{{- if or (empty (get $requests $resource)) (hasPrefix "-" $request) (regexMatch "^\\+?0*(\\.0*)?([eE][+-]?[0-9]+|[numkKMGTPE]i?)?$" $request) -}}
+{{- fail (printf "serviceIdentity.accessTokenFile.provisionerSidecar.container.resources.requests.%s must be positive when the credential sidecar and autoscaling %s utilization target are enabled; size requests for your sidecar image and workload" $resource $resource) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "live-edit-service.fullname" . }}
+  labels:
+    {{- include "live-edit-service.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "live-edit-service.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+  {{- /* Rendered verbatim; null omits it and leaves Kubernetes' default behavior. An override of {} does not: Helm merges it with the chart default. */}}
+  {{- with .Values.autoscaling.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- else -}}
+### HPA is not rendered, see .Values.autoscaling.enabled and .Values.autoscaling.mode
+{{- end }}

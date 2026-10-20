@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "boundary": "sdf_storage",
+  "qualification": "characterization_only",
+  "completion": "synchronous SdfSceneData method completion; no transport or host publication",
+  "warmup_operations": 512,
+  "cases": [
+    {
+      "id": "scalar_small",
+      "kind": "field_set",
+      "specs": 32,
+      "operations": 8192,
+      "array_elements": 0,
+      "readers": 0
+    },
+    {
+      "id": "scalar_large_scene",
+      "kind": "field_set",
+      "specs": 4096,
+      "operations": 8192,
+      "array_elements": 0,
+      "readers": 0
+    },
+    {
+      "id": "array_install",
+      "kind": "array_set",
+      "specs": 32,
+      "operations": 2048,
+      "array_elements": 4096,
+      "readers": 0
+    },
+    {
+      "id": "time_samples",
+      "kind": "time_sample",
+      "specs": 128,
+      "operations": 8192,
+      "array_elements": 0,
+      "readers": 0
+    },
+    {
+      "id": "namespace_move_pairs",
+      "kind": "move_pair",
+      "specs": 128,
+      "operations": 4096,
+      "array_elements": 0,
+      "readers": 0
+    },
+    {
+      "id": "field_reads",
+      "kind": "field_read",
+      "specs": 4096,
+      "operations": 16384,
+      "array_elements": 0,
+      "readers": 0
+    },
+    {
+      "id": "mixed_pair_2_readers",
+      "kind": "mixed_pair",
+      "specs": 128,
+      "operations": 8192,
+      "array_elements": 0,
+      "readers": 2
+    },
+    {
+      "id": "mixed_pair_4_readers",
+      "kind": "mixed_pair",
+      "specs": 128,
+      "operations": 8192,
+      "array_elements": 0,
+      "readers": 4
+    }
+  ]
+}

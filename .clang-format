@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# clang-format 18.1.1, pinned by tools/release/check_format.py. Every option
+# keeps formatting whitespace-only: no include sorting, comment reflow,
+# namespace comments, brace or parenthesis edits, string splitting, or
+# macro-body line continuation edits. Layout values follow the tree's
+# prevailing hand layout: each is the value that reformats the fewest lines.
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++17
+ColumnLimit: 120
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AlignAfterOpenBracket: DontAlign
+AlignOperands: DontAlign
+AlignTrailingComments:
+  Kind: Leave
+  OverEmptyLines: 0
+AllowAllArgumentsOnNextLine: false
+BreakBeforeTernaryOperators: false
+PenaltyBreakAssignment: 25
+AccessModifierOffset: -4
+EmptyLineBeforeAccessModifier: Leave
+NamespaceIndentation: None
+IndentCaseLabels: false
+IndentPPDirectives: AfterHash
+LambdaBodyIndentation: OuterScope
+PointerAlignment: Left
+DerivePointerAlignment: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: true
+  AfterExternBlock: false
+  BeforeCatch: false
+  BeforeElse: false
+  BeforeLambdaBody: false
+  BeforeWhile: false
+  IndentBraces: false
+  SplitEmptyFunction: true
+  SplitEmptyRecord: true
+  SplitEmptyNamespace: true
+AllowShortBlocksOnASingleLine: Always
+AllowShortCaseLabelsOnASingleLine: true
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLambdasOnASingleLine: All
+AllowShortLoopsOnASingleLine: true
+AlwaysBreakTemplateDeclarations: MultiLine
+BinPackArguments: true
+BinPackParameters: true
+PenaltyReturnTypeOnItsOwnLine: 1000
+SpaceBeforeParens: ControlStatements
+SpaceAfterTemplateKeyword: false
+MaxEmptyLinesToKeep: 2
+KeepEmptyLinesAtTheStartOfBlocks: false
+InsertNewlineAtEOF: true
+SortIncludes: Never
+SortUsingDeclarations: Never
+IncludeBlocks: Preserve
+ReflowComments: false
+FixNamespaceComments: false
+BreakStringLiterals: false
+InsertBraces: false
+RemoveBracesLLVM: false
+RemoveSemicolon: false
+RemoveParentheses: Leave
+QualifierAlignment: Leave
+SeparateDefinitionBlocks: Leave
+SkipMacroDefinitionBody: true

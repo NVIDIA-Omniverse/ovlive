@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Local development values overrides for Docker Desktop Kubernetes.
+#
+# Prerequisites:
+#   1. Build the image: docker build -t live-edit-service:local .
+#   2. Enable Docker Desktop Kubernetes
+#   3. Create namespace: kubectl create namespace storage-api
+#   4. Install Valkey at the same patch version CI and `scripts/dev-valkey.sh`
+#      pull (upstream public image):
+#        helm install valkey oci://registry-1.docker.io/bitnamicharts/valkey \
+#          -n storage-api \
+#          --set auth.enabled=false \
+#          --set primary.persistence.enabled=false \
+#          --set replica.replicaCount=0 \
+#          --set image.registry=docker.io \
+#          --set image.repository=valkey/valkey \
+#          --set image.tag=9.0.3-alpine
+#      If you have already installed a bitnami/valkey:8 instance with a
+#      previous version of this file, uninstall it first (`helm uninstall
+#      valkey -n storage-api`) before installing this one — mixing versions
+#      across local development, CI and deployed clusters is the kind of bug
+#      we want to stop falling into.
+#   5. Create the secret:
+#        kubectl create secret generic live-edit-env -n storage-api \
+#          --from-literal=valkey-url='redis://valkey-primary.storage-api.svc.cluster.local:6379'
+#   6. Replace the example.com endpoints below with your userinfo and storage
+#      services; the endpoints must be reachable from the cluster.
+#
+# Deploy:
+#   helm upgrade --install live-edit-service ./helm/live-edit-service -n storage-api \
+#     -f helm/live-edit-service/values-local.yaml
+
+image:
+  repository: live-edit-service
+  tag: local
+  pullPolicy: Never  # Use local image; don't try to pull from registry
+
+replicaCount: 1
+
+# The base chart enables an autoscaler and a PodDisruptionBudget by default
+# for production. Neither makes sense for a single-replica local-dev install —
+# the autoscaler would force minReplicas=3, and a PDB with minAvailable=2 would
+# block any voluntary disruption against the single replica indefinitely.
+autoscaling:
+  enabled: false
+podDisruptionBudget:
+  enabled: false
+
+userInfo:
+  # REST-over-HTTPS. https:// scheme triggers TLS; see normalize_endpoint in
+  # src/auth/mod.rs. authorization.protocol defaults to "rest" in values.yaml.
+  # userInfo.enabled defaults to false, so this endpoint is inert unless enabled.
+  endpoint: "https://userinfo.example.com"
+
+authorization:
+  enabled: true
+  # REST-over-HTTPS storage endpoint.
+  storageServiceEndpoint: "https://storage.example.com"
+
+envSecretName: "live-edit-env"
+
+# The service sizes its memory budgets from the memory limit and stops at
+# startup, naming the limit it needs, when the limit cannot carry the chart's
+# settings (2709Mi (2,709 MiB, about 2.65Gi) at its defaults, on any CPU count;
+# 2809Mi on any CPU count with a checkpoint backup store).
+# 4Gi leaves room; the pod's actual use at local load stays far below it.
+resources:
+  requests:
+    cpu: "250m"
+    memory: "128Mi"
+  limits:
+    cpu: "1"
+    memory: "4Gi"

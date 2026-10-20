@@ -1,0 +1,10 @@
+{
+  "contract": "nvidia.omniverse.live.v1alpha.LiveService",
+  "sha256": {
+    "proto": "59a0221672d9afa4d5d680e73fda489eb604c49bcd4b9336d1c9d898281629a6",
+    "oodf_schema": "41b5b1ee2ccd4404f9f66238d50e70e8af92c8deca01f6afda97fc95dd661fbe",
+    "synthetic": "864a6acc8d949c7b1e4277b8adaf64bdea71d40722f97739e44d1b403169ff47",
+    "captured": "0c3095e2a9485121ede4449529294d12a6fb96c8bee7eb8b274ded0f08918df5",
+    "captured_golden": "53ffcb26cb4589c431331da0d0fd45224e0b293611aa8de7c357e6d42cb0b1b1"
+  }
+}

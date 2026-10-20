@@ -1,0 +1,5 @@
+# FlatBuffers runtime headers
+
+These three headers are copied unchanged from the FlatBuffers package `flatbuffers` version `c81cf824-2-linux-x86_64` (FlatBuffers 1.12.0, https://github.com/google/flatbuffers): the runtime that the generated [OMPF schema header](../../schema/OmniObjectDelta_generated.h) requires. `flatbuffers.h` includes only `base.h` and `stl_emulation.h`; no other FlatBuffers header, tool or library is used. [provenance.json](provenance.json) records the exact file hashes, and the [schema provenance](../../schema/provenance.json) pins the same header hashes for the generated code. The build takes no external FlatBuffers root: CMake uses this directory and checks the header hashes at configure time.
+
+[LICENSE.txt](LICENSE.txt) is the package's license file (Apache-2.0), kept byte-exact including its CRLF line endings, and each header keeps Google's Apache-2.0 notice. These are unmodified third-party copies: the repository's NVIDIA Apache-2.0 grant does not apply to them. Package metadata is not redistributed.

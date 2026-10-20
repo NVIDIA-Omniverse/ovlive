@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Public host C ABI of the runtime component libraries. The omni_usd_live plugin
+# uses scene/plugin/LivePlugin.exports, which adds the host C++ facade.
+{
+  global:
+    omniUsdLiveGetAbiVersion;
+    omniUsdLiveGetCapabilities;
+    omniUsdLiveInitialize;
+    omniUsdLiveShutdown;
+    omniUsdLiveRegisterEndpoint;
+    omniUsdLiveUnregisterEndpoint;
+    omniUsdLiveGetAuthState;
+    omniUsdLiveSetAccessToken;
+    omniUsdLiveRegisterAuthRequiredCallback;
+    omniUsdLiveFailAuthRefresh;
+    omniUsdLiveListSessions;
+    omniUsdLiveCreateSession;
+    omniUsdLiveDeleteSession;
+    omniUsdLiveJoinSession;
+    omniUsdLiveLeaveSession;
+    omniUsdLiveSendMessage;
+    omniUsdLiveStatLayer;
+    omniUsdLiveDeleteLayer;
+    omniUsdLiveGetEndpointStatus;
+    omniUsdLiveGetSessionStatus;
+    omniUsdLiveGetLayerStatus;
+    omniUsdLiveRegisterStatusCallback;
+    omniUsdLiveCreateStatusObserver;
+    omniUsdLiveReadStatus;
+    omniUsdLiveAcknowledgeStatus;
+    omniUsdLiveWaitForPendingUpdates;
+    omniUsdLiveConfigureJitterReduction;
+    omniUsdLiveWait;
+    omniUsdLiveCancel;
+    omniUsdLiveReleaseRequest;
+    omniUsdLiveGetRequestStatus;
+    omniUsdLiveGetRequestError;
+    omniUsdLiveUnregisterCallback;
+    omniUsdLiveMakeSessionUri;
+    omniUsdLiveMakeLayerUri;
+    omniUsdLiveParseUri;
+    omniUsdLiveCombineWithBaseUri;
+    omniUsdLiveGetResultString;
+    omniUsdLiveRegisterDiagnosticCallback;
+    omniUsdLiveCopyDiagnostics;
+  local: *;
+};

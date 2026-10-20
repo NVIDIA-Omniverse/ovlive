@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Normalize text files to LF endings on commit and on every checkout, so source hashes and fingerprints agree on
+# every platform, including a Windows client with autocrlf=true
+* text=auto eol=lf
+# Make sure Windows batch files preserve CR/LF line endings, otherwise they may not be able to execute.  Windows
+# batch files require a CR/LF for labels to work properly, otherwise they may fail when labels straddle 512-byte
+# block boundaries.  This is important when files are downloaded through a zip archive that was authored on a
+# Linux machine (the default behavior on GitHub)
+*.bat text eol=crlf
+*.cmd text eol=crlf
+# Make sure shell scripts have LF line endings, even when checked out on a Windows client with autocrlf=true
+*.sh text eol=lf
+# Vendored upstream copies keep their exact, hash-pinned bytes (including CRLF).
+client/source/live/wire/third_party/** -text -whitespace
+client/source/live/wire/schema/** -text -whitespace
+client/tools/packman/** -text -whitespace
+# The generated third-party license bundle reproduces upstream license texts byte for byte (including CRLF).
+THIRD_PARTY_LICENSES.txt -text -whitespace
+# Contributor Covenant license text retains its upstream formatting.
+LICENSES/CC-BY-4.0.txt -text -whitespace

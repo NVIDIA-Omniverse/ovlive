@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Workspace-local cargo aliases. The nextest aliases (`nt`, `ntf`) require
+# `cargo install cargo-nextest --locked` once per developer machine; CI
+# installs it as part of the test job.
+#
+# The `--features oodf-ffi/internal-bridge` flag is mandatory for any test
+# run that touches the oodf-ffi integration tests — they reach into
+# `oodf_ffi::bridge::*`, which is `pub(crate)` unless the feature is on.
+[alias]
+t   = ["test", "--workspace", "--features", "oodf-ffi/internal-bridge", "--features", "test-support"]
+tf  = ["test", "--workspace", "--features", "oodf-ffi/internal-bridge", "--features", "test-fault-injection", "--features", "test-checkpoint-fault-injection", "--features", "test-support"]
+nt  = ["nextest", "run", "--workspace", "--features", "oodf-ffi/internal-bridge", "--features", "test-support"]
+ntf = ["nextest", "run", "--workspace", "--features", "oodf-ffi/internal-bridge", "--features", "test-fault-injection", "--features", "test-checkpoint-fault-injection", "--features", "test-support"]
+
+# Debug test threads get an 8 MiB stack instead of std's 2 MiB default.
+#
+# `RUST_MIN_STACK` sets the stack of every thread std spawns without an
+# explicit `stack_size`: libtest's test thread and tokio's runtime workers
+# (tokio sets no stack size unless `thread_stack_size` is called). Debug
+# builds nest several copies of each awaited future per poll frame, so the
+# `update_layer` paths and the test helpers around them run past 2 MiB in
+# debug alone and abort a test with "has overflowed its stack". That is not
+# a product signal: release builds measure the WATCH `update_layer` handler
+# at 86 KB, and the whole unboxed `upload_memory_envelope` WATCH test passes
+# on a 192 KiB release thread (measurements from plan b.dkt Epic 6 Task 11).
+# The product's depth is pinned by the release-build stack guard,
+# `tests/release_stack_guard`, which the `test-release-stack-guard` CI job
+# builds in release. Its measured threads and tokio runtime set explicit stack
+# sizes, so this setting does not reach them, and its thread-bounds self-check
+# fails if it ever did.
+#
+# Set here, not in `.config/nextest.toml`: nextest has no stable per-profile
+# environment setting (setup scripts can set one but are experimental), and
+# nextest passes this `[env]` table to every test process, under every
+# profile (default and `ci`). So this one entry covers local `cargo nextest`
+# and `cargo test` runs and every CI job that runs the test binaries, all of
+# which run cargo from the repository root. It also reaches `cargo run` /
+# `cargo bench` processes and rustc, whose own default stack is already
+# 8 MiB. An explicit `RUST_MIN_STACK` in the environment wins (no `force`).
+# A service started with `cargo run` therefore gets 8 MiB tokio workers, not
+# production's 2 MiB: to reproduce production stack depth, run the built
+# binary directly or set `RUST_MIN_STACK=2097152`.
+[env]
+RUST_MIN_STACK = "8388608"

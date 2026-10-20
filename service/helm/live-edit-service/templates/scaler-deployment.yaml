@@ -1,0 +1,139 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- /*
+  The replica autoscaler (autoscaling.mode=scaler): the service image run as
+  `live-edit scaler`, owning the server Deployment's /scale subresource.
+
+  - One replica with strategy Recreate, so two scalers never run at once
+    (an old and a new one would fight over the replica count during a
+    rolling update).
+  - Its settings are inline env, not the settings ConfigMap: a values change
+    rolls the scaler, and the server's ConfigMap never reaches it.
+  - Its labels carry component=scaler and no app.kubernetes.io/name, so no
+    server selector (Deployment, Service, PDB, NetworkPolicy) matches it.
+  - Liveness follows the poll loop's heartbeat, not the API server: a scaler
+    that cannot reach the API server holds the replica count and stays up.
+  - No Service: nothing calls the scaler. Its /metrics is on port 9090 for a
+    pod-level scrape.
+  - Scheduling: nodeSelector and tolerations are the server's, so the scaler
+    can run wherever the server pods can; affinity is its own
+    (autoscaling.scaler.affinity), never the server's, because a rule written
+    for server pods (a required anti-affinity against them, say) could leave
+    the scaler unschedulable and the replica count frozen.
+
+  Never write a literal comment-close sequence inside this comment — it
+  terminates the comment early and leaks text into the manifest.
+*/}}
+{{- if eq (include "live-edit-service.scalerEnabled" .) "true" }}
+{{- $scaler := .Values.autoscaling.scaler }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "live-edit-service.scalerFullname" . }}
+  labels:
+    {{- include "live-edit-service.scalerLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  {{- with .Values.revisionHistoryLimit }}
+  revisionHistoryLimit: {{ . }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "live-edit-service.scalerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with $scaler.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "live-edit-service.scalerLabels" . | nindent 8 }}
+    spec:
+      {{- include "live-edit-service.imagePullSecrets" ( dict "images" (list .Values.image) "global" .Values) | nindent 6 }}
+      serviceAccountName: {{ include "live-edit-service.scalerServiceAccountName" . }}
+      # The scaler authenticates to the API server with this token.
+      automountServiceAccountToken: true
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: scaler
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["scaler"]
+          ports:
+            - name: http
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: LIVE_EDIT_SCALER_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: LIVE_EDIT_SCALER_DEPLOYMENT
+              value: {{ include "live-edit-service.fullname" . | quote }}
+            - name: LIVE_EDIT_SCALER_SERVICE
+              value: {{ include "live-edit-service.servicename" . | quote }}
+            - name: LIVE_EDIT_SCALER_MIN_REPLICAS
+              value: {{ .Values.autoscaling.minReplicas | quote }}
+            - name: LIVE_EDIT_SCALER_MAX_REPLICAS
+              value: {{ .Values.autoscaling.maxReplicas | quote }}
+            - name: LIVE_EDIT_SCALER_CPU_TARGET_PERCENT
+              value: {{ .Values.autoscaling.targetCPUUtilizationPercentage | default 0 | quote }}
+            - name: LIVE_EDIT_SCALER_CPU_REQUEST
+              value: {{ dig "requests" "cpu" "" (.Values.resources | default dict) | toString | quote }}
+            - name: LIVE_EDIT_SCALER_POLL_INTERVAL_SECS
+              value: {{ $scaler.pollIntervalSeconds | quote }}
+            - name: LIVE_EDIT_SCALER_CATCHUP_TARGET_SECS
+              value: {{ $scaler.catchupTargetSeconds | quote }}
+            - name: LIVE_EDIT_SCALER_OCCUPANCY_HEADROOM_PERCENT
+              value: {{ $scaler.occupancyHeadroomPercent | quote }}
+            - name: LIVE_EDIT_SCALER_SCALE_DOWN_WINDOW_SECS
+              value: {{ $scaler.scaleDown.windowSeconds | quote }}
+            - name: LIVE_EDIT_SCALER_SCALE_DOWN_INTERVAL_SECS
+              value: {{ $scaler.scaleDown.intervalSeconds | quote }}
+            - name: LIVE_EDIT_SCALER_POD_DELETION_COST
+              value: {{ $scaler.podDeletionCost | toString | quote }}
+            - name: LIVE_EDIT_SCALER_HTTP_PORT
+              value: "9090"
+            - name: LIVE_EDIT_LOG_LEVEL
+              value: {{ .Values.observability.logging.level | quote }}
+            - name: LIVE_EDIT_LOG_FORMAT
+              value: "{{ if .Values.observability.logging.structured.enabled }}json{{ else }}pretty{{ end }}"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $scaler.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $scaler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

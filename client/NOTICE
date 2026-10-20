@@ -1,0 +1,24 @@
+ovlive client
+
+Copyright (c) 2018-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Unless otherwise noted in a subdirectory-specific license file or source-file
+license identifier, NVIDIA-authored client source code and documentation are
+licensed under the Apache License, Version 2.0. Original copyright attributions
+remain in the sources. The NVIDIA-owned LiveService proto and OMPF schema copies
+carry Apache-2.0 notices. Third-party dependencies and external SDKs retain
+their own licenses.
+
+The client contains unmodified FlatBuffers 1.12.0 runtime headers
+(Copyright 2014-2017 Google Inc.) under Apache-2.0. Their license is in
+source/live/wire/third_party/flatbuffers/LICENSE.txt in the client source tree
+and provenance/flatbuffers/LICENSE.txt beside this NOTICE in a native package.
+
+The SHA-256 implementation derives from Zilong Tan (Copyright 2011, MIT)
+and Allan Saddi (Copyright 2001-2003, BSD-2-Clause). Both notices are reproduced
+in THIRD_PARTY_NOTICES.md beside this file.
+
+Internal client native builds statically link gRPC, Protobuf, Abseil, RE2, c-ares,
+OpenSSL and zlib. THIRD_PARTY_LICENSES.txt reproduces their license texts and
+BOM.json lists their versions; both files sit beside this NOTICE in the source
+tree and in a native package. Public client distribution is source only.

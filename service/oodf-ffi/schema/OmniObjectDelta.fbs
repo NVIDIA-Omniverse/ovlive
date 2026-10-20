@@ -1,0 +1,111 @@
+// SPDX-FileCopyrightText: Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// IDL For describing an Omniverse object delta
+
+namespace OmniObjectDelta;
+
+enum SectionId : uint64
+{
+    Invalid = 0,
+    Root = 1,
+    FirstValid
+}
+
+table CommandDiffChangeSection
+{
+    parentId:uint64;
+    sectionId:uint64;
+    sectionName:string;
+    sectionType:uint8;
+    sectionOrder:uint32;
+}
+
+table CommandDiffDeleteSection
+{
+    sectionId:uint64;
+}
+
+
+table CommandCreateSection
+{
+    parentId:uint64;
+    sectionId:uint64;
+    sectionName:string;
+    sectionType:uint8;
+}
+
+table CommandDeleteSection
+{
+    parentId:uint64;
+    sectionId:uint64;
+}
+
+table CommandMoveSection
+{
+    oldParentId:uint64;
+    newParentId:uint64;
+    sectionId:uint64;
+    newName:string;
+}
+
+table CommandReorderChildren
+{
+    sectionId:uint64;
+    childrenListId:uint8;
+    childrenList:[uint64];
+}
+
+union StructCommand
+{
+    CommandCreateSection,
+    CommandDeleteSection,
+    CommandMoveSection,
+    CommandReorderChildren,
+    CommandDiffChangeSection,
+    CommandDiffDeleteSection
+}
+
+table SetField
+{
+    sectionId:uint64;
+    keyName:string;
+    valueOrExtHash:[uint8]; // stores either actual value or hash for external value (if extValueSize is set)
+    extValueSize:uint64; // size of external value in bytes (shouldn't be set for internal value!)
+    extValueIndex:uint32; // index of external value (shouldn't be set for internal value!)
+    setOrder:uint64;
+}
+
+table TimeSample
+{
+    sectionId:uint64;
+    time:double;
+    valueOrExtHash:[uint8]; // stores either actual value or hash for external value (if extValueSize is set)
+    extValueSize:uint64; // size of external value in bytes (shouldn't be set for internal value!)
+    extValueIndex:uint32; // index of external value (shouldn't be set for internal value!)
+}
+
+table Delta
+{
+    isDiff:bool; // If true, this delta is a diff between baseVersion and the latest (diff _only_ has 'DiffChangeSection' & 'DiffDeleteSection' commands)
+    baseVersion:uint64; // if isDiff is true, 0 value indicates reset - all previous content should be deleted
+    structCommands:[StructCommand];
+    setFields:[SetField];
+    timeSamples:[TimeSample];
+    sourceFormat:string; // only valid if isDiff is true
+}
+
+root_type Delta;
+file_identifier "OODF";

@@ -1,0 +1,651 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The root crate (`live-edit`) stays at the repo root as a workspace member
+# rather than being moved into a `live-edit/` subdirectory. This preserves git
+# blame and keeps the diff minimal while still allowing sibling crates such as
+# `oodf-ffi` to live under the workspace root.
+[workspace]
+members = [".", "oodf-ffi", "capabilities-proto", "scaler"]
+# The cargo-fuzz subcrate lives under `oodf-ffi/fuzz/`. It depends on
+# `libfuzzer-sys` which only builds on nightly, so we exclude it from the
+# stable workspace to keep `cargo build` / `cargo test` green without
+# nightly + cargo-fuzz installed. Run it manually per
+# `oodf-ffi/fuzz/README.md`.
+#
+# `vendor/fred-10.1.0` is the patched third-party fred crate `[patch.crates-io]`
+# below points at. It lives under the workspace root, so without the exclude it
+# would become a workspace member and the repo's `--workspace` builds and lints
+# would treat fred as our own code.
+exclude = ["oodf-ffi/fuzz", "vendor/fred-10.1.0"]
+
+[package]
+name = "live-edit"
+version = "0.2.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[[bin]]
+name = "live-edit"
+path = "src/main.rs"
+
+# Cargo features. Kept intentionally minimal — `test-fault-injection` gates
+# every test-only fault-injection seam so they compile out of production
+# library builds: the storage layer's seams (the first were `LayerStore`'s,
+# b.1dz; others sit on `ValkeyClient`, the txn checkout, the external-value GC
+# and the snapshot reads), the stream multiplexer's fault sites
+# (`MuxFaultSite`, from a reader's XREAD to its connect) and its test knobs,
+# the presence sweeper's seam, and the gRPC subscribe and presence seams on
+# `LiveEditService` (its `*_for_test` fields). It is NOT a default feature: release
+# builds and plain `cargo build` / `cargo test` never include the injection
+# fields, builder methods, or consumer branches. Integration tests that rely
+# on the seams are similarly gated and require the feature to be enabled:
+#
+#   cargo test --workspace --features test-fault-injection
+#
+# CI runs with the feature on so the fault-injection regression tests execute
+# on every pipeline. See .gitlab-ci.yml and CLAUDE.md "Build & Test Commands".
+#
+# `test-checkpoint-fault-injection` is the analogous gate for the checkpoint
+# adapters (b.fgj). It is NOT a default feature: the `CheckpointFaultInjector`
+# trait and any adapter seams that consult it compile out of production
+# library builds. The SR-1.3 conformance harness enables this feature to drive
+# `Transient` / `Conflict` paths through the InMemory and LocalDisk adapters.
+[features]
+default = ["valkey-tls"]
+# `valkey-tls` is an *alias* that routes fred's `enable-rustls-ring` TLS feature.
+# It is deliberately NOT set inline on the fred dependency line below. Four things
+# a future reader cannot recover from the one-liner:
+#
+# (a) The alias exists because `cfg!(feature = ...)` is evaluated against the
+#     features of the crate being compiled, so live-edit cannot observe fred's
+#     feature set — `cfg!(feature = "enable-rustls-ring")` inside live-edit is
+#     always `false` no matter what fred is built with. `src/config.rs`'s SR-1.4
+#     scheme guard needs a compile-time-observable bool for "TLS is compiled in",
+#     and `cfg!(feature = "valkey-tls")` is a faithful proxy precisely because
+#     this alias is the sole route by which fred receives a TLS feature. (No
+#     stable-Rust alternative exists: build scripts see only their own
+#     `CARGO_FEATURE_*`; `DEP_<name>_*` needs a `links` key, which fred lacks;
+#     `cfg(accessible(..))` is unstable.)
+# (b) `enable-rustls-ring` is chosen over `enable-rustls` because the latter pulls
+#     `tokio-rustls/aws_lc_rs`, which would put a SECOND rustls crypto provider in
+#     the graph alongside the `ring` backend already established by tonic's
+#     `tls-ring` (line 61) and the direct `rustls` dep (line 229).
+# (c) With two providers in the graph, `rustls::crypto::CryptoProvider::from_crate_features()`
+#     returns `None` (rustls-0.23.38/src/crypto/mod.rs:265-286), so
+#     `ClientConfig::builder()` panics (rustls-0.23.38/src/crypto/mod.rs:248-253)
+#     UNLESS some earlier code path already called `install_default()` —
+#     `get_default_or_install_from_crate_features` returns an already-installed
+#     provider before it reaches the `.expect(...)`. This path is reached from
+#     fred's `TlsConnector::default_rustls()` (fred-10.1.0/src/protocol/tls.rs:159)
+#     on the startup path. (Stated conditionally on purpose — it is not an
+#     absolute panic.)
+# (d) `enable-native-tls` must NEVER be added: fred silently *prefers* native-tls
+#     when both stacks are compiled in (fred-10.1.0/src/utils.rs:678-689), swapping
+#     the TLS stack with no lockfile-visible signal.
+#
+# `scripts/check-crypto-provider-invariant.sh` mechanically enforces the
+# single-provider invariant.
+valkey-tls = ["fred/enable-rustls-ring"]
+test-fault-injection = []
+test-checkpoint-fault-injection = []
+# `test-support` gates two test-only modules out of production library builds
+# (b.bsc follow-up): `src/storage/test_support` (TestValkey,
+# connect_test_client, raise_fd_limit_for_tests) and
+# `observability::trace_export::test_support` (the shared trace-capture
+# doubles: CollectingExporter, CapturingWriter and helpers), plus smaller
+# `cfg(any(test, feature = "test-support"))` items elsewhere in `src/`.
+# In-crate `#[cfg(test)]` unit tests see the modules for free via the `test`
+# arm on their `pub mod` declarations; external integration-test crates
+# consume them through the public API (cfg(test) = false) and must opt in with
+# `--features test-support`. The only direct dependency pulled by the seam is
+# `libc` (used by `raise_fd_limit_for_tests` on unix), so `libc` is an
+# optional dep enabled by this feature.
+# It also turns on the vendored fred's `live-edit-retention-report` feature: a
+# per-client report of each connection's retention state (warm and idle flags,
+# read progress, in-flight command count, buffer capacities), test sweep modes,
+# per-client sweep counters and a per-thread in-sweep flag
+# (`fred::live_edit::retention::test_support`), which the connection-buffer
+# tests read. This line is the feature's only enabling edge; the release build
+# (`Dockerfile`, no features) resolves without it, and
+# `scripts/check-vendored-fred.sh` fails if anything else turns it on.
+# In the service binary it also compiles in a measurement-only override of the
+# snapshot fan-out arena's dirty decay, read at startup from an environment
+# variable (`src/allocator.rs`, `FANOUT_ARENA_DECAY_OVERRIDE_ENV`), so one
+# release build with `--features test-support` can measure several decays.
+# Such a measurement build also carries everything above (fred's
+# retention-report counters and the crate's test-support seams, some on
+# measured paths), as `.gitlab-ci.yml` records at `test-release-stack-guard`,
+# so a re-measurement knows its binary is not the shipped one beyond the
+# override. `test-support` must therefore come only from the command line:
+# `scripts/check-measurement-features.sh` fails if a manifest edge enables it
+# or the featureless workspace resolves it (CI's `measurement-features:fence`,
+# and `scripts/guard-tests.sh`), and the Dockerfile's measurement-feature gate
+# fails if the release binary carries the variable's name.
+test-support = ["dep:libc", "fred/live-edit-retention-report"]
+# `jemalloc-profiling` compiles jemalloc's heap profiler into the service
+# binary for a diagnostic build. It carries no code of its own: once the
+# profiler is compiled in, profiling is driven entirely by `_RJEM_MALLOC_CONF`
+# at run time, for example `prof:true,lg_prof_sample:17,prof_prefix:<dir>/jeprof`
+# plus `prof_gdump:true` or `prof_final:true`. NOT a default feature and never
+# enabled by the release build: the Dockerfile gate proves the shipped binary
+# rejects the `prof` option. It has no effect on targets that do not use
+# jemalloc (see the linux-gnu target table below).
+jemalloc-profiling = ["tikv-jemalloc-sys/profiling"]
+
+[dependencies]
+# gRPC
+# tonic 0.14 moved the TLS provider selection into feature flags. Use the
+# `tls-ring` backend (matches what rustls 0.23 picks up through the rest of
+# the dep graph) together with `tls-native-roots` to load system trust anchors,
+# mirroring the pre-0.14 `tls` + `tls-native-roots` combo.
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14"
+tonic-health = "0.14"
+tonic-reflection = "0.14"
+# The standard gRPC rich error model (`google.rpc.ErrorInfo`, `RetryInfo`) in
+# `grpc-status-details-bin`: the retry hint the service attaches to its
+# nothing-applied `UNAVAILABLE` refusals (`crate::error::refusal_status`).
+tonic-types = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+# HTTP/2 floor. The service never names `h2` itself; this entry exists to set
+# the floor for the lockfile's single `h2` version, which the service's inbound
+# connections, its outbound gRPC clients (auth, OTLP) and every in-repo tonic
+# client share. It sits here, not in `[dev-dependencies]`, so the floor holds
+# for the production build's resolution as well as the tests'. The raw HTTP/2
+# client in the server-side small-frame budget regression test uses it too:
+# that test must control exactly how many DATA frames it sends and how large
+# each one is, and tonic packs queued messages into shared frames.
+#
+# h2 0.4.16–0.4.18 close a connection with GOAWAY `ENHANCE_YOUR_CALM` once a
+# fixed 25,600 bytes of small-DATA-frame overhead (each non-final frame under
+# 256 bytes costs `256 − payload`) sits unread on it — at worst, one message
+# per DATA frame, about 100 of the smallest frames (about 120–150 presence
+# events of 45–85 bytes) across the streams of one connection. A client
+# multiplexing several `JoinSession` streams reaches that under ordinary
+# presence fan-out, and the service's own inbound side reaches it when a client
+# sends small messages faster than the service reads them.
+# From 0.4.19 the budget defaults to half the connection's initial window:
+# 512 KiB for the service on hyper's 1 MiB default. 0.4.15 and older are not an
+# option either: RUSTSEC-2026-0258 (unbounded empty DATA frames), patched in
+# 0.4.16, fails the supply-chain audit. See SDD §5.1.
+h2 = "0.4.19"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server (metrics endpoint)
+axum = "0.7"
+
+# Valkey/Redis client
+# fred v10: subscriber-client feature required for dedicated pub/sub
+# connection; sha-1 + i-scripts features required for `Script::from_lua` +
+# `evalsha_with_reload` / `script_load_cluster` (b.67u Lua EVAL fast path
+# for `update_layer`). `i-config` is required by the SR-5.5 durability-guard
+# startup probe (`CONFIG GET appendonly`) — see
+# `src/checkpoint/durability_guard.rs` and SDD §5.5.
+#
+# `i-client` + `i-cluster` moved here from `[dev-dependencies]` in b.bhb. The
+# pre-dispatch watch-validity check (`storage::watched_txn::WatchFingerprint`)
+# reads fred's cached connection-id map (`ClientInterface::connection_ids`,
+# `i-client`) and, on a clustered deployment, resolves the watched slot's owner
+# through fred's cached routing view (`ClusterInterface::cached_cluster_state`,
+# `i-cluster`) so the check names the connection the WATCH actually went to
+# rather than any connection. Both features are empty (`i-client = []`,
+# `i-cluster = []`): they gate trait modules and pull in no new dependencies.
+fred = { version = "10", features = ["subscriber-client", "sha-1", "i-scripts", "i-config", "i-client", "i-cluster", "credential-provider"] }
+
+# OODF FFI (C++-backed OODF wire-format parse/build; Epic 4 replaces flatbuf.rs)
+#
+# live-edit MUST NOT be able to name `oodf_ffi::bridge::ffi` from a `use`
+# statement — that is the load-bearing acceptance criterion 4 of b.vvs
+# item 7. The `internal-bridge` feature gate accomplishes this by leaving
+# the cxx bridge module `pub(crate)` unless the feature is explicitly
+# enabled. We do NOT enable the feature here, so the workspace build of
+# live-edit only sees the public API surface (idiomatic Rust types +
+# `parse_delta` / `build_delta` wrappers).
+oodf-ffi = { path = "oodf-ffi" }
+
+# Discovery Service v2alpha CapabilitiesService types (b.hv2). buf-generated
+# from the registry module `pb.api.nvidia.com/omniverse/discovery` — see
+# capabilities-proto/buf.gen.yaml and scripts/regenerate-capabilities-proto.sh.
+# Deliberately NOT vendored/tonic-build like `proto/`: the protos are a
+# cross-service artifact owned by the Discovery team.
+live-edit-capabilities-proto = { path = "capabilities-proto" }
+
+# The replica autoscaler (`scaler/`). The binary runs it as `live-edit scaler`
+# (dispatched in `src/main.rs` before the service configuration loads), and the
+# service serves its `/scaling/v1` snapshot in the crate's wire type, so both
+# ends share one definition. The edge runs this way only: the scaler crate
+# depends on no `live-edit` code, which keeps it out of storage, gRPC, domain
+# and auth by construction.
+live-edit-scaler = { path = "scaler" }
+
+# Metrics
+# Metrics are instrumented on the OpenTelemetry metrics API (OMPE-98174) and
+# exported through `opentelemetry-prometheus-text-exporter` (declared below),
+# which serves the `/metrics` text exposition directly with no
+# `prometheus::Registry` round-trip. The `prometheus` crate is therefore no
+# longer a production dependency — it survives only as a dev-dependency used by
+# unit/integration tests that construct throwaway registries. Keeping it out of
+# `[dependencies]` also keeps `protobuf` out of the release graph.
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-opentelemetry = "0.32"
+# `metrics` is in opentelemetry's default feature set but named explicitly here
+# because the metrics API (Counter/Histogram/Gauge/UpDownCounter/Meter) is now
+# load-bearing (OMPE-98174).
+opentelemetry = { version = "0.31", features = ["metrics"] }
+
+# Concurrent maps
+dashmap = "6"
+
+# Error handling
+thiserror = "2"
+
+# Float keys (OrderedFloat<f64> for time sample HashMap keys)
+ordered-float = "4"
+
+# UUID generation
+uuid = { version = "1", features = ["v4"] }
+
+# Byte buffers
+bytes = "1"
+
+# SHA-256: the external-value content check on upload, operation-id request
+# digests, token-file fingerprints, and the auth-cache HMAC
+sha2 = "0.10"
+
+# SHA-1 for the `commit_chain` header fold (`storage::commit_chain`), which must
+# be byte-identical to Lua's `redis.sha1hex`. A fence identity, not a security
+# boundary. The maintained RustCrypto crate name `sha1`, chosen over the
+# deprecated `sha-1` alias that `fred`'s `sha-1` feature already pulls in: the
+# alias is frozen at 0.10.1 and receives no fixes, while `sha1` 0.10 tracks
+# the same `digest` 0.10 that `sha2` uses, so the only new lockfile entry is
+# `sha1` itself.
+sha1 = "0.10"
+
+# HMAC-SHA256 for auth cache token hashing (b.nrt)
+hmac = "0.12"
+
+# Zero-on-drop wrapper for the auth-cache HMAC seed (b.ohw medium)
+zeroize = "1"
+
+# Random number generation (auth-cache seed + retry jitter, b.nrt)
+rand = "0.9"
+
+# Base64 encoding
+base64 = "0.22"
+
+# Epic t1.fgj.dp Task 1: RFC3339 timestamp parsing for the sidecar-written
+# service-identity token file. Locked at PM-review time to `chrono` (NOT
+# `time`) so the sibling test Subtasks and the Epic 5 StorageApi adapter
+# consumer share one time-library shape. `default-features = false` drops
+# the legacy `oldtime` feature; `clock` keeps `Utc::now()` available for the
+# polling task's stale-phase entry check and `cached_bearer_if_unexpired()`'s
+# expiry check; `std` is required for `chrono`'s `Error` impls; `serde`
+# enables `Deserialize` on `DateTime<Utc>`.
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# JSON deserialization with bounded buffers (b.j5t item 2 — userinfo body
+# size cap). Already in the dep graph transitively via reqwest's `json`
+# feature; declared directly so `serde_json::from_slice` callers don't
+# rely on a transitive include.
+serde_json = "1"
+
+# TTL cache for auth results
+mini-moka = "0.10"
+
+# RAII scope guards for cleanup paths that must run regardless of caller
+# cancellation (b.j5t item 4 — auth singleflight inflight-map cleanup). Already
+# in the dep graph transitively via fred / rustls; declared directly so the
+# cleanup-on-cancel contract has a stable explicit anchor.
+scopeguard = "1"
+
+# Stream utilities
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-stream = "0.1"
+
+# Async trait support (object-safe async traits via Arc<dyn Trait>)
+async-trait = "0.1"
+
+# Future combinators
+futures = "0.3"
+
+# Tower middleware layer/service traits
+tower = { version = "0.5", features = ["util"] }
+
+# HTTP types (request/response, URI, status)
+http = "1"
+
+# HTTP body trait — needed at runtime by the metrics-layer body wrapper
+# (b.avd item 4) that taps the gRPC trailer to record the `grpc_code`
+# label on `live_endpoint_calls_total` / `live_endpoint_duration_microseconds`.
+http-body = "1"
+
+# `metrics` on opentelemetry-otlp adds the OTLP `MetricExporter` (the endpoint-
+# gated push arm of the dual-reader metrics pipeline, OMPE-98174); `grpc-tonic`
+# carries both the span and metric exporters over gRPC.
+#
+# `tls-ring` is what lets an `https://` collector endpoint work:
+# - It and `tls` both map to `tonic/tls-ring`, so `ring` stays the only rustls
+#   crypto provider. `tls-aws-lc` and `tls-provider-agnostic` are forbidden
+#   (`scripts/check-crypto-provider-invariant.sh`).
+# - `tls-native-roots` already comes from the `tonic` entry above, which is
+#   what `ClientTlsConfig::with_native_roots` needs.
+# - The feature only compiles the exporter builders' `with_tls_config` in. The
+#   exporter builds its channel with `Channel::from_shared`, which never gets
+#   tonic's automatic TLS for `https`, so `observability::otlp` attaches the
+#   TLS settings itself, and only for an `https://` endpoint.
+# - It adds no package to `Cargo.lock`: tonic's entry already depends on
+#   `tokio-rustls` and `rustls-native-certs`.
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics", "tls-ring"] }
+# `metrics` + `rt-tokio` give the `SdkMeterProvider` + tokio-backed
+# `PeriodicReader`; `spec_unstable_metrics_views` unlocks `StreamBuilder::
+# with_aggregation`, required to pin each histogram's explicit Prometheus
+# bucket boundaries so `/metrics` output stays byte-identical (OMPE-98174).
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics", "spec_unstable_metrics_views"] }
+# Prometheus scrape arm of the dual-reader metrics pipeline. This is the OTel
+# `SdkMeterProvider`'s `/metrics` reader: it is a `MetricReader` attached via
+# `.with_reader(exporter.clone())` and serves text exposition directly through
+# `exporter.export(&mut writer)` — no `prometheus::Registry` round-trip.
+# Replaces the upstream-deprecated `opentelemetry-prometheus`, which pulled the
+# `protobuf` crate (RustSec exposure this repo is actively clearing). This
+# exporter has no `protobuf` dependency and pins to `opentelemetry ^0.31`,
+# matching the rest of the stack. The name-mangling knobs (`without_units`,
+# `without_counter_suffixes`, `without_scope_info`, `without_target_info`) keep
+# the emitted wire names byte-identical to the pre-migration output.
+opentelemetry-prometheus-text-exporter = "0.2.1"
+
+# HTTP client for REST-based auth services
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# URL path segment encoding for storage service REST client
+percent-encoding = "2"
+
+# URL parsing for the SR-1.4 Valkey-URL TLS-scheme guard
+# (`src/config.rs::valkey_url_uses_tls`). Already in the dependency graph
+# transitively via fred (`fred-10.1.0/Cargo.toml` declares `url = "2.4"`;
+# `Cargo.lock` resolves 2.5.8); declared directly so the guard can reproduce
+# fred's own scheme detection (`fred-10.1.0/src/utils.rs`) exactly — same
+# `Url::parse`, same lowercasing / whitespace-stripping semantics — rather than
+# hand-rolling prefix matching that would miss fred's bypasses. Pinned `"2"` so
+# it resolves to the already-locked 2.5.8 and moves no version.
+url = "2"
+
+# Direct rustls dep so the auth REST client can downcast `reqwest::Error`'s
+# source chain to `rustls::Error` and treat TLS handshake failures as
+# permanent (b.ohw H-auth-4). The version (0.23) must track reqwest 0.12 +
+# hyper-rustls 0.27's transitive rustls; bumping reqwest may require this
+# pin to follow.
+rustls = { version = "0.23", default-features = false }
+
+# AWS IAM passwordless Valkey auth (Epic 4, t1.tr5.we). The provider builds a
+# SigV4 pre-signed AUTH URI in-process and resolves the pod's AWS credentials via
+# the standard provider chain (IRSA — an STS AssumeRoleWithWebIdentity round-trip
+# the AWS credential provider caches). SDD §15.3. Provider body lands in a
+# sibling Subtask; this edge is dependencies-only.
+#
+# `default-features = false` on the client-bearing edges is LOAD-BEARING for the
+# single-rustls-crypto-provider invariant (scripts/check-crypto-provider-invariant.sh,
+# CLAUDE.md `## Technology Stack`, SDD §15.3): the AWS crates' default feature
+# sets route their HTTPS client through `aws-smithy-http-client/rustls-aws-lc`,
+# i.e. a SECOND rustls crypto provider (`aws-lc-rs`) alongside the `ring` backend
+# the rest of the graph uses (tonic `tls-ring`, fred `enable-rustls-ring`, the
+# direct `rustls` dep). Co-present, the two make
+# `rustls::crypto::CryptoProvider::from_crate_features()` return None and panic
+# `ClientConfig::builder()` on fred's Valkey-TLS startup path. We therefore drop
+# aws-config's `default-https-client` (and heavy, unused `sso`) default features
+# and pin the STS HTTPS connector to `ring` by declaring `aws-smithy-http-client`
+# directly with only its `rustls-ring` feature — the modern hyper-1.x, ring-backed
+# connector the provider body installs on the config loader.
+#
+# `aws-sigv4` (default `sign-http` — sha2/hmac, no bundled TLS client) is the pure
+# signing path. `aws-credential-types` is a types-only crate (`Credentials`,
+# `ProvideCredentials`). `aws-config`'s `rt-tokio` feature backs the credential
+# cache; its core web-identity (AssumeRoleWithWebIdentity) provider is not
+# feature-gated. `deny.toml`'s `[bans]` is the second enforcement layer.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-credential-types = "1"
+aws-sigv4 = "1"
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+
+# Used only by `test_support::raise_fd_limit_for_tests` to lift the per-process
+# RLIMIT_NOFILE on macOS / Linux so the integration suite (many parallel Valkey
+# pools, subscribers, streams) does not exhaust the launchd-inherited 256 FD
+# soft cap. Already present transitively; declared here so test_support.rs can
+# call libc::{getrlimit, setrlimit} directly.
+# `libc` is only used by `test_support::raise_fd_limit_for_tests` (unix
+# getrlimit/setrlimit). It is an OPTIONAL normal dependency enabled by the
+# `test-support` feature so external integration-test crates that opt in get
+# the symbol, while production library/release builds (which do NOT enable the
+# feature — see Dockerfile's plain `cargo build --release --workspace`) link no
+# direct `live-edit -> libc` edge. The `test-support` feature maps to
+# `dep:libc` via the [features] table above. `test_support.rs` itself compiles
+# under `cfg(test)` for in-crate unit tests; the dev-dependency below supplies
+# `libc` on that path so `cargo test` / `cargo check --lib --tests` resolve the
+# symbol with no feature flag.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+# jemalloc is the service binary's global allocator on linux-gnu (b.u5k): under
+# stock glibc malloc the resident set ratchets up to each load peak and never
+# returns to the OS. `src/allocator.rs` installs it and compiles its options in.
+#
+# Both crates are NON-optional so no feature combination (including
+# `--no-default-features`) can build the binary without the allocator. The
+# target is linux-gnu, not `cfg(unix)`: on macOS jemalloc has no background
+# threads, so the compiled-in `background_thread:true` makes jemalloc's init
+# fail and the binary abort, and musl has no background-thread support either.
+#
+# Pinned to 0.6: the retention fix was measured on 0.6.1 (jemalloc
+# 5.3.0-1-ge13ca99). Re-run the retention check before moving to 0.7.
+#
+# `tikv-jemalloc-sys` is declared directly for its `stats` feature, which
+# `stats.allocated` / `stats.resident` need, and for `mallctl`, which
+# `src/allocator.rs` calls itself. `tikv-jemalloc-ctl` is deliberately NOT
+# used: 0.6.1 and 0.7.0 both depend on `paste`, which is flagged unmaintained
+# (RUSTSEC-2024-0436), and CI runs `cargo audit --deny warnings`.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemallocator = "0.6"
+tikv-jemalloc-sys = { version = "0.6", features = ["stats"] }
+
+# `libc` as a dev-dependency makes the symbol available under `cfg(test)` (the
+# in-crate unit-test path that sees `test_support` via the `test` arm of its
+# `#[cfg(any(test, feature = "test-support"))]` gate) without requiring the
+# `test-support` feature. Dev-dependencies never enter the production binary,
+# so this does not undermine the production-exclusion goal. Keep the version in
+# sync with the optional normal dependency above.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# `i-client` gates `CLIENT ID` / `LIST` / `KILL` / `PAUSE`; `i-cluster` gates the
+# cached `CLUSTER SLOTS` routing view, `CLUSTER MYID` and the slot-admin
+# commands. Neither is in fred's `i-std` default set.
+#
+# Both moved into the `[dependencies]` fred line in b.bhb — the service itself
+# now uses them (see that line's comment). Restated here because the tests need
+# them independently of that: the cluster-gated subscriber regression suite
+# (b.yxt, `tests/integration/storage/cluster_subscriber_test.rs`) identifies and
+# then disturbs the exact connection a consumer's `XREAD BLOCK` is parked on
+# (`CLIENT ID` pinned to a node, then `CLIENT LIST ID` / `CLIENT KILL ID` /
+# `CLIENT PAUSE`), and reads slot→primary ownership from the same cached routing
+# table fred's own router dispatches by — so the test's notion of "which shard"
+# is by construction fred's. Keeping the dev entry means dropping the production
+# use would not silently red the test suite.
+fred = { version = "10", features = ["i-client", "i-cluster"] }
+# `h2` (the raw HTTP/2 client for the small-frame budget regression test) comes
+# from the `[dependencies]` entry, which carries the version floor and its
+# rationale.
+http-body-util = "0.1"
+proptest = "1"
+temp-env = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-health = "0.14"
+futures = "0.3"
+axum = "0.7"
+prometheus = { version = "0.14", default-features = false }
+wiremock = "0.6"
+tonic-prost = "0.14"
+# Statistics-driven benchmark harness for the `benches/` targets (b.9ft).
+#
+# `default-features = false` drops criterion's `rayon` + `plotters` default
+# features: the HTML-report plotting stack is dead weight in CI (the job
+# publishes the `--output-format bencher` text stream plus the raw
+# `target/criterion/**` estimates, never the rendered SVGs) and `rayon`
+# would add a second thread-pool alongside the tokio runtime the
+# `ext_mirror_store_values` bench drives. `cargo_bench_support` is
+# mandatory — without it criterion refuses to run under `cargo bench`
+# (it assumes cargo-criterion is driving). `async_tokio` supplies
+# `Bencher::to_async(&Runtime)`, which the Valkey-backed bench needs.
+#
+# Dev-dependency only: `cargo build --release` (Dockerfile) never resolves
+# it, `dd-rust-license-tool` filters dev-deps out of ATTRIBUTIONS.md, and
+# `cargo test` / `cargo nextest run` do not select bench targets, so the
+# Full-test suite is unaffected.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+# The OTLP trace collector service, for a local stub collector (not part of
+# the published source) that counts the spans and bytes the service exports.
+# Already in the graph through `opentelemetry-otlp`'s `grpc-tonic` feature
+# with exactly these features, so it adds nothing to build; dev-only, so the
+# release build and ATTRIBUTIONS.md never see the direct edge.
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace"] }
+# An in-test TLS collector for the `https://` OTLP export test: `rcgen`
+# generates a throwaway CA and server certificate at run time, so no key
+# material is committed; `tokio-rustls` with the `ring` provider terminates TLS
+# (ALPN `h2`), and the `h2` server (from the `[dependencies]` entry) records
+# each request's path. `default-features = false` with `ring` keeps `ring` the
+# only rustls crypto provider: rcgen's `aws_lc_rs` and `fips` features, and
+# tokio-rustls's default `aws_lc_rs`, would add a second one
+# (`scripts/check-crypto-provider-invariant.sh`). `rustls` is restated here
+# only to name its `ring` provider, which the normal dependency, built without
+# default features, leaves to the rest of the graph. Dev-only: the release
+# build never compiles them and ATTRIBUTIONS.md lists none of them, though a
+# crate it already attributes (`base64`) shows the license text of every
+# version `Cargo.lock` records, rcgen's included.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# ── Benchmarks (b.9ft) ───────────────────────────────────────────────────────
+#
+# `harness = false` on all of them: criterion supplies its own `main`, so
+# libtest's harness must be off. No bench target is selected by `cargo test` /
+# `cargo nextest run` (both select lib/bin/test targets, never `bench`
+# targets), so the release-gating suite's runtime is untouched. `cargo test
+# --benches` and `cargo clippy --all-targets` DO build them — criterion's
+# Test mode runs one iteration per benchmark id, which is the cheap
+# smoke-check that keeps the benches from bit-rotting.
+
+# Valkey-free precision instrument for the SR-3.1 ext-mirror enqueue cost.
+# No `required-features`: it touches only `checkpoint::` + `observability::`
+# public API, so it builds under a bare `cargo bench` and under
+# `cargo clippy --no-default-features --all-targets`.
+[[bench]]
+name = "ext_mirror_enqueue"
+harness = false
+
+# Report-only composed-call-site bench. Needs `test-support` for
+# `live_edit::storage::test_support::TestValkey`; `cargo clippy
+# --all-targets` honours `required-features` and skips the target when the
+# feature is absent, so the repo Lint command (which passes `test-support`)
+# lints it and a feature-less clippy run does not fail on a missing symbol.
+[[bench]]
+name = "ext_mirror_store_values"
+harness = false
+required-features = ["test-support"]
+
+# Report-only instrument on the full-content diff plan (`DiffEngine::plan`'s
+# `plan_full_content` branch) and, isolated beside it, the SR-9.2
+# byte-determinism field sort that branch acquired (b.gcb / b.vz7). No
+# `required-features` and no Valkey: it touches only `domain::diff` +
+# `domain::types` public API, so it builds under a bare `cargo bench`.
+# Deliberately NOT gated in CI — `tools/check_bench_thresholds.py` gates one
+# named ext-mirror id and nothing here is added to it; see the file's module
+# header for the local-instrument posture.
+[[bench]]
+name = "diff_plan_full_content"
+harness = false
+
+# Report-only A/B of the per-session presence fan-out queue against the tokio
+# broadcast channel it replaced: process CPU per delivered event at 400 and 5
+# receivers, lockstep and saturated, on jemalloc where the service uses it.
+# With `--features test-support` it adds the replica-wide relay groups (thread
+# CPU per relayed message, and the longest turn a full drain holds a worker),
+# which use the `test-support`-gated relay API in `presence::` and
+# `grpc::session::`, `grpc::session_cache::SessionBasePathCache` and fred's
+# pub/sub message types. No `required-features` and no Valkey: a bare
+# `cargo bench` builds only the fan-out arms, which touch only `presence::`
+# public API (`LocalPresenceRouter::join_channel` / `broadcast`). Not gated in
+# CI; see the file's module header.
+[[bench]]
+name = "presence_fanout"
+harness = false
+
+# ── Examples ─────────────────────────────────────────────────────────────────
+#
+# `examples/local_disk_write_kill_harness.rs` is deliberately NOT declared here:
+# it must build feature-free because the atomicity tests spawn it as a child
+# process from a plain workspace build.
+#
+# The golden-fixture generator is the opposite case — it drives real commits
+# through `LayerStore::update_layer` against a `TestValkey`, so it needs
+# `test-support`. Declaring `required-features` keeps it out of the release
+# build (`Dockerfile`'s `cargo build --release --workspace` is feature-free) and
+# out of a feature-less `cargo clippy --all-targets`, while the repo Lint
+# command — which passes `test-support` — still lints it. Its output is
+# committed under `tests/fixtures/tail_lineage/`; the replay test that consumes
+# those bytes is Valkey-free and ungated.
+[[example]]
+name = "generate_tail_lineage_goldens"
+required-features = ["test-support"]
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+# fred is built from a vendored copy of the published 10.1.0 crate with one
+# line-count-preserving patch file (`vendor/fred-10.1.0.patch`) carrying eight
+# changes: an `-ASK` redirect is followed to its target, with a pipelined
+# `ASKING` and the command on the target's connection; an `-ASK` redirect that
+# cannot be followed fails only its own command instead of ending the client's
+# router task; the unresponsive check
+# judges a connection's oldest outstanding command, with read progress and
+# evidence from peer connections, instead of its newest write, gives a fast
+# verdict its own error text and records where the stuck bytes sit; every
+# router wait on one connection's I/O is bounded; a RESP2 data reply shaped like
+# a pubsub frame reaches its command; the router flushes fed frames before it
+# waits and resyncs its command-queue counter at every receive; a `Pool`
+# member can be re-pointed to a fresh client; and opt-in limits on what a
+# connection keeps once its traffic drains — one warm connection per client
+# at its class limits, every other drained connection cut to a small idle
+# shape — which the service sets per connection class
+# (`src/storage/connection_buffers.rs`). This covers both the dependency and
+# the dev-dependency entries. Provenance, rationale, the drop and re-vendor
+# procedures and the upstream issue text: `vendor/fred-10.1.0.SOURCE.md`.
+# The `fred:vendor-drift-check` CI job (`scripts/check-vendored-fred.sh`)
+# rebuilds the tree from crates.io and fails on any other difference.
+[patch.crates-io]
+fred = { path = "vendor/fred-10.1.0" }

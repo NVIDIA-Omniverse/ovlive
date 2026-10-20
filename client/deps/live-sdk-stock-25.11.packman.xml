@@ -1,0 +1,14 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- The stock-25.11 host SDKs; tools/live/provision.py pulls them and names them in the worker configuration. -->
+  <dependency name="live-sdk-usd" linkPath="../_build/sdk-deps/stock-25.11/usd">
+    <package name="usd.py312.manylinux_2_35_x86_64.stock.release" version="0.25.11-gl.18041+v25.11.363a7c8d" />
+  </dependency>
+  <dependency name="live-sdk-python" linkPath="../_build/sdk-deps/stock-25.11/python">
+    <package name="python" version="3.12.12+nv2-linux-x86_64" />
+  </dependency>
+  <dependency name="live-sdk-pybind11" linkPath="../_build/sdk-deps/stock-25.11/pybind11">
+    <package name="pybind11" version="2.11.1-0" />
+  </dependency>
+</project>

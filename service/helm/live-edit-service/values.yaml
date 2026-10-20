@@ -1,0 +1,2552 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Default values for live-edit-service.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+## @param replicaCount Number of Live Edit service replicas to deploy
+## Type: integer. Default: 3. Optional.
+replicaCount: 3
+
+## Container image configuration
+image:
+  ## @param image.repository Live Edit container image repository
+  ## Type: string. Required. Default: nvcr.io/nvidia/omniverse/live-edit-service
+  repository: nvcr.io/nvidia/omniverse/live-edit-service
+  ## @param image.pullPolicy Image pull policy
+  ## Type: string. Allowed values: Always, Never, IfNotPresent. Default: IfNotPresent
+  pullPolicy: IfNotPresent
+  ## @param image.tag Image tag to deploy
+  ## Type: string. Required. Overrides the chart appVersion.
+  tag: "0.0.0"
+  ## @param image.pullSecrets Pull secrets for images.
+  ## Default: none
+  ## Optional.
+  pullSecrets: []
+    # - name: secret
+    # - name: secret
+    # ...
+
+## @param nameOverride String to override the chart name
+## Type: string. Optional. Default: ""
+nameOverride: ""
+
+## @param fullnameOverride String to fully override the generated name
+## Type: string. Optional. Default: ""
+fullnameOverride: ""
+
+## ServiceAccount configuration
+## ServiceAccount semantics: a supplied `name` means "use it, don't touch it" —
+## the chart references that pre-provisioned ServiceAccount and never renders an
+## SA object of its own (production clusters commonly forbid Helm from creating
+## or modifying ServiceAccounts; rendering one over a pre-existing SA fails
+## `helm upgrade` with Helm's invalid-ownership-metadata error). `create` is only
+## consulted when `name` is empty.
+serviceAccount:
+  ## @param serviceAccount.create Create a chart-owned ServiceAccount (only consulted when `name` is empty)
+  ## Type: boolean. Default: true. With `name` empty: true creates a
+  ## generated-name SA; false FAILS rendering (the pod would otherwise silently
+  ## run as the namespace's shared `default` SA). Ignored when `name` is set —
+  ## a supplied name always means use-without-creating.
+  create: true
+  ## @param serviceAccount.automount Automatically mount ServiceAccount API credentials
+  ## Type: boolean. Default: false. Only rendered on the chart-created SA
+  ## (i.e. when `name` is empty and `create` is true).
+  automount: false
+  ## @param serviceAccount.annotations Annotations for the ServiceAccount / workload-identity detection
+  ## Type: object. Optional. Default: {}. Two independent uses: (1) applied to
+  ## the chart-created SA object when the chart creates one; (2) ALWAYS consulted
+  ## to detect the `azure.workload.identity/client-id` key, which drives the
+  ## `azure.workload.identity/use: "true"` pod label. So when using a
+  ## pre-provisioned SA (`name` set), still pass the client-id annotation here
+  ## (matching the annotation already on the SA) so the pod label renders and the
+  ## Azure workload-identity webhook projects the federated token.
+  annotations: {}
+  ## @param serviceAccount.name Name of a PRE-PROVISIONED ServiceAccount to use
+  ## Type: string. Optional. Default: "" (chart creates a generated-name SA when
+  ## `create` is true). When set, the chart uses this SA as-is and renders NO
+  ## ServiceAccount object — it must already exist in the release namespace.
+  name: ""
+
+## @param podAnnotations Annotations to add to the pod
+## Type: object. Optional. Default: {}
+podAnnotations: {}
+
+## @param podLabels Labels to add to the pod
+## Type: object. Optional. Default: {}
+## Deployment selector labels and app.kubernetes.io/component=server are reserved.
+podLabels: {}
+
+## @param podSecurityContext Security context for the pod
+## Type: object. Optional.
+## Hardened defaults:
+## - runAsNonRoot: enforce that the container image's USER is non-root
+##   (Dockerfile sets USER 1000:1000 — the `nvs` user in the NVIDIA hardened
+##   distroless base. Numeric form is required so kubelet can verify non-root
+##   at admission; a named USER would fail with CreateContainerConfigError).
+## - seccompProfile.type: RuntimeDefault — apply the container runtime's
+##   default seccomp filter (blocks the more dangerous syscalls).
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+## @param securityContext Security context for the container
+## Type: object. Optional.
+## Hardened defaults (the live-edit binary makes no filesystem writes — it
+## logs to stdout and uses Valkey for all state — so readOnlyRootFilesystem
+## is safe):
+## - readOnlyRootFilesystem: true — no writes to the container FS.
+## - allowPrivilegeEscalation: false — block setuid/setgid and capability gain.
+## - capabilities.drop: [ALL] — no Linux capabilities needed.
+## - runAsNonRoot: true — enforced at the container level too.
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  capabilities:
+    drop:
+      - ALL
+
+## Kubernetes service configuration
+service:
+  ## @param service.nameOverride Override the canonical Service object name
+  ## Type: string. Optional. Default: "" (falls back to the chart name,
+  ## `live-edit-service`). Unlike the release-prefixed Deployment / PDB /
+  ## ServiceMonitor / NetworkPolicy, the Service is the stable DNS identity that
+  ## ingress backends and in-cluster clients resolve by name, so it is NOT
+  ## release-prefixed. Override only when a second release in the same namespace
+  ## needs a distinct Service name.
+  nameOverride: ""
+  ## @param service.type Kubernetes service type
+  ## Type: string. Allowed values: ClusterIP, NodePort, LoadBalancer. Default: ClusterIP
+  type: ClusterIP
+  ## @param service.annotations Extra annotations for the Service object
+  ## Type: object. Default: {}. Generic passthrough rendered under
+  ## metadata.annotations when non-empty. Used by per-environment values to
+  ## opt the Service into v2 Discovery-operator scanning
+  ## (discovery.omniverse.nvidia.com/enabled: "true"); this chart deliberately
+  ## bakes in no discovery-specific values — enablement is a per-environment
+  ## deployment decision.
+  annotations: {}
+  ## gRPC service configuration
+  grpc:
+    ## @param service.grpc.port gRPC service port
+    ## Type: integer. Required. Maps to LIVE_EDIT_PORT env var. Default: 50001
+    ## Matches the binary default (`LIVE_EDIT_PORT=50001`) and the Dockerfile
+    ## `EXPOSE 50001 9090` directive. Keep these three in sync.
+    port: 50001
+  ## Metrics service configuration
+  metrics:
+    ## @param service.metrics.port Prometheus metrics HTTP port
+    ## Type: integer. Maps to LIVE_EDIT_METRICS_PORT env var. Default: 9090
+    port: 9090
+
+## Authentication is always enabled (LIVE_EDIT_AUTHN_ENABLED is hardcoded to
+## "true" in templates/configmap.yaml). The service rejects a start with authn
+## off, so there is no operator knob for it.
+##
+## Auth-backend pinning policy
+##
+## `authorization.enabled: true` and `userInfo.enabled: false` are deliberate
+## pins that mirror the bare binary's own defaults, so a
+## chart-deployed cluster behaves identically to a
+## bare-binary deployment out of the box: permission checks are enforced
+## against the storage permissions service, and user identity is extracted
+## from the bearer-token JWT claims rather than fetched from a separate
+## userinfo backend.
+##
+## Implications for operators:
+##   - A permissions-service endpoint MUST be configured via
+##     `authorization.storageServiceEndpoint` for the chart to deploy
+##     successfully — the binary rejects the empty default at startup.
+##   - No userinfo-service endpoint is required under this pinning;
+##     `userInfo.endpoint` becomes consequential only when `userInfo.enabled`
+##     is flipped to `true`.
+
+## Authorization + permissions-client configuration
+## Controls whether the service enforces authorization (permission checks) on
+## incoming requests, and carries the permissions-client tuning knobs (protocol,
+## timeout, cache TTLs, retry budget). When `enabled: false`, all permission
+## checks short-circuit to "allowed".
+authorization:
+  ## @param authorization.enabled Enable authorization enforcement
+  ## Type: boolean. Default: true (pinned to match the bare binary's own
+  ## default; see pinning-policy block above).
+  ## Maps to LIVE_EDIT_AUTHZ_ENABLED env var.
+  ## Deployment requirement: `authorization.storageServiceEndpoint` MUST be
+  ## configured below for the chart to deploy successfully — the binary
+  ## rejects the empty default at startup when this flag is `true`.
+  ## Setting this `false` requires `userInfo.enabled: true`, and then nothing
+  ## checks the bearer token's signature or expiry unless a validating proxy
+  ## fronts the userinfo endpoint: the userinfo service resolves identity, it
+  ## does not itself validate the token.
+  enabled: true
+  ## @param authorization.storageServiceEndpoint Storage service URL for path-level authorization
+  ## Type: string. Required when authorization.enabled is true.
+  ## Maps to LIVE_EDIT_STORAGE_SERVICE_ENDPOINT env var.
+  ## Must include an explicit scheme — `https://` (production) or `http://` (test/dev only).
+  ## Bare hostnames are rejected at startup to prevent a silent
+  ## plaintext downgrade of the auth channel; bearer tokens transit this connection.
+  ## Examples: ingress URL `https://storage.example.com`, cluster-internal REST URL
+  ## `http://storage-service.storage-api:8011`, gRPC URL `https://grpc.storage.example.com:50051`.
+  ## Protocol selected by `authorization.protocol`; TLS is enabled when the scheme is `https://`
+  ## or the endpoint's port is exactly `443` (the port is compared for equality, so
+  ## `host:4430` through `host:4439` stay plaintext). See `normalize_endpoint` in
+  ## `src/auth/mod.rs`.
+  storageServiceEndpoint: "http://storage-service:8012"
+  ## @param authorization.protocol Auth client protocol for permissions AND userinfo calls
+  ## Type: string. Default: "rest". Accepted values: "rest", "grpc" (case-insensitive).
+  ## Maps to LIVE_EDIT_AUTH_PROTOCOL env var. ONE shared setting for both the
+  ## permissions client (this block) and the userinfo client (`userInfo:` block).
+  ## REST is recommended for current deployed storage/userinfo services; gRPC is
+  ## retained for legacy backends.
+  protocol: "rest"
+  ## @param authorization.timeoutMs Auth service call timeout in milliseconds
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_TIMEOUT_MS env var. Default: 5000
+  timeoutMs: 5000
+  ## @param authorization.cacheTtlSecs Auth result cache TTL in seconds (positive decisions)
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_CACHE_TTL_SECS env var. Default: 600
+  ## `Allowed` permission decisions and successful userinfo lookups live for this
+  ## long, or until the bearer's own JWT `exp` if that comes first (an opaque,
+  ## non-JWT bearer keeps the full TTL). Pair with the negative-TTL knob below to
+  ## bound revocation lag for denied / unauthenticated decisions independently.
+  cacheTtlSecs: 600
+  ## @param authorization.cacheNegativeTtlSecs Auth result cache TTL for Denied / Unauthenticated / PathNotFound / InvalidRequest (seconds)
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_CACHE_NEGATIVE_TTL_SECS env var. Default: 30.
+  ## Caps revocation lag for negative permission decisions (Denied / Unauthenticated /
+  ## PathNotFound / InvalidRequest, the storage service refusing the probe as a
+  ## malformed request). Independent from the
+  ## positive TTL so a tightened permission or revoked token doesn't stay denied-only-in-cache
+  ## (or allowed-in-cache, inverted) for the full positive window.
+  cacheNegativeTtlSecs: 30
+  ## @param authorization.cacheMaxEntries Max entries per auth cache (permissions + userinfo)
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_CACHE_MAX_ENTRIES env var. Default: 10000
+  ## LRU-evicted when the cap is reached; bounds memory under token churn or
+  ## flash-crowd traffic. Zero is rejected at startup; values above the hard ceiling
+  ## of 10_000_000 are also rejected so a fat-fingered `100_000_000`
+  ## fails fast instead of allocating four 100-million-entry mini-moka caches.
+  cacheMaxEntries: 10000
+  ## @param authorization.maxAttempts Max attempts for transient auth errors
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_MAX_ATTEMPTS env var. Default: 3
+  maxAttempts: 3
+  ## @param authorization.retryInitialDelayMs Initial retry delay in ms (exponential backoff)
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_RETRY_INITIAL_DELAY_MS env var. Default: 100
+  retryInitialDelayMs: 100
+
+## Observability configuration for OpenTelemetry (OTEL).
+##
+## Standardized, workspace-wide `observability` schema. The Live Edit Service
+## ships both traces and metrics over OTLP/gRPC, reading each signal's endpoint
+## from its `.endpoint.grpc` and ignoring `.endpoint.http`. Each `.endpoint.grpc`
+## is an `http://` URL (plaintext) or an `https://` URL (TLS); any other value
+## stops the service at startup with `configuration error:`. An `https://`
+## collector's certificate is checked against the image's CA bundle, read once
+## at startup; for a collector signed by a private CA, mount a bundle of the
+## public roots plus that CA over the image's bundle (`volumes` /
+## `volumeMounts`). No client certificate is sent.
+##
+## Metrics are instrumented on the OpenTelemetry metrics API (OMPE-98174) with a
+## dual-reader pipeline: the `/metrics` Prometheus scrape endpoint (see
+## `service.metrics.port` / `serviceMonitor`) is ALWAYS served, and enabling
+## `observability.metrics` additionally pushes the same metrics over OTLP/gRPC.
+## The two coexist — enabling OTLP push does not disable the scrape contract.
+##
+## Example (production snippet):
+## observability:
+##   tracing:
+##     enabled: true
+##     endpoint:
+##       grpc: "http://otel-collector.observability.svc.cluster.local:4317"
+##   metrics:
+##     enabled: true
+##     endpoint:
+##       grpc: "http://otel-collector.observability.svc.cluster.local:4317"
+observability:
+  ## @param observability.serviceName Service name reported on exported telemetry.
+  ## Type: string. Default: "" (falls back to the chart name via .Chart.Name).
+  ## Exported as OTEL_SERVICE_NAME; set this to override the value that identifies
+  ## this service in traces and metrics (otherwise it is reported as
+  ## "unknown_service").
+  serviceName: ""
+  ## Structured logging configuration.
+  logging:
+    ## @param observability.logging.level Logging level for the service
+    ## Type: string. Allowed values: trace, debug, info, warn, error.
+    ## Maps to LIVE_EDIT_LOG_LEVEL env var. Default: info
+    level: "info"
+    ## @param observability.logging.structured.enabled Emit JSON structured logs
+    ## Type: boolean. Default: false. Renders LIVE_EDIT_LOG_FORMAT as `json` when
+    ## true (machine-parseable) and `pretty` when false (default; human-readable).
+    ## The chart default is `false` for cross-chart consistency with the platform's
+    ## other services; the live-edit binary's own default is `json`, so production
+    ## deployments that want JSON logs set this to `true` explicitly (the
+    ## production per-environment values do).
+    structured:
+      enabled: false
+  tracing:
+    ## @param observability.tracing.enabled Enable OTLP trace export.
+    ## Type: boolean. Default: false. When true, `.endpoint.grpc` is required and
+    ## is exported as OTEL_EXPORTER_OTLP_ENDPOINT.
+    enabled: false
+    endpoint:
+      ## @param observability.tracing.endpoint.grpc OTLP/gRPC traces endpoint.
+      ## Type: string. Maps to OTEL_EXPORTER_OTLP_ENDPOINT. Required when
+      ## observability.tracing.enabled is true. `http://` for plaintext,
+      ## `https://` for TLS (trust roots: see the block comment above); any
+      ## other value fails startup.
+      grpc: ""
+      ## @param observability.tracing.endpoint.http OTLP/HTTP traces endpoint.
+      ## Type: string. Ignored by this service (gRPC transport only). Optional.
+      http: ""
+    ## @param observability.tracing.samplingRatio Fraction of traces sampled.
+    ## Type: string or number from 0 to 1. Default: "1.0" (every trace). Rendered
+    ## as OTEL_TRACES_SAMPLER_ARG with OTEL_TRACES_SAMPLER=parentbased_traceidratio:
+    ## a request whose W3C `traceparent` carries a sampling decision keeps it, and
+    ## any other request is sampled at this ratio. Rendering fails outside 0..1.
+    samplingRatio: "1.0"
+    ## @param observability.tracing.filter Which spans and events are exported.
+    ## Type: string, EnvFilter directive syntax. Default: "live_edit=info" (the
+    ## service's own INFO-and-above spans and events; every other crate off).
+    ## Maps to LIVE_EDIT_TRACE_FILTER. Independent of observability.logging.level.
+    ## An empty or unparseable value fails startup.
+    filter: "live_edit=info"
+    batch:
+      ## @param observability.tracing.batch.maxQueueSize Spans buffered for export.
+      ## Type: integer >= 1. Default: 2048. Maps to OTEL_BSP_MAX_QUEUE_SIZE. A span
+      ## ended while this many are waiting is dropped and counted in
+      ## live_edit_trace_spans_dropped_total{reason="queue_full"}. Each queued span
+      ## holds an estimated 1 KB in memory; only its ~0.5 KB export payload has
+      ## been measured, not its in-memory size.
+      maxQueueSize: 2048
+      ## @param observability.tracing.batch.maxExportBatchSize Spans per export call.
+      ## Type: integer >= 1. Default: 512. Maps to OTEL_BSP_MAX_EXPORT_BATCH_SIZE;
+      ## a full batch is exported without waiting for the schedule. Capped at
+      ## maxQueueSize.
+      maxExportBatchSize: 512
+      ## @param observability.tracing.batch.scheduleDelayMs Export interval.
+      ## Type: integer >= 1, milliseconds. Default: 5000. Maps to
+      ## OTEL_BSP_SCHEDULE_DELAY.
+      scheduleDelayMs: 5000
+  metrics:
+    ## @param observability.metrics.enabled Enable OTLP metrics push.
+    ## Type: boolean. Default: false. When true, `.endpoint.grpc` is required and
+    ## is exported as OTEL_EXPORTER_OTLP_METRICS_ENDPOINT; the service then pushes
+    ## metrics over OTLP/gRPC in addition to the always-on `/metrics` scrape.
+    ## When false, no OTLP metrics env var is rendered and metrics are collected
+    ## via the Prometheus scrape only (backward compatible).
+    enabled: false
+    endpoint:
+      ## @param observability.metrics.endpoint.grpc OTLP/gRPC metrics endpoint.
+      ## Type: string. Maps to OTEL_EXPORTER_OTLP_METRICS_ENDPOINT. Required when
+      ## observability.metrics.enabled is true. `http://` for plaintext,
+      ## `https://` for TLS (trust roots: see the observability block comment);
+      ## any other value fails startup.
+      grpc: ""
+      ## @param observability.metrics.endpoint.http OTLP/HTTP metrics endpoint.
+      ## Type: string. Ignored by this service (gRPC transport only). Optional.
+      http: ""
+
+## @param envSecretName Name of the Kubernetes secret containing sensitive env vars
+## Type: string. Required only under `static` (or any credential-bearing URL): the
+## fallback source for LIVE_EDIT_VALKEY_URL when neither valkey.url.value nor
+## valkey.url.valueFrom is set. Ignored when valkey.url.value or valkey.url.valueFrom
+## is set. When used as the fallback the Secret must contain key: valkey-url (Valkey
+## connection URL, which may contain credentials). All other env vars are non-sensitive
+## and live in the ConfigMap.
+## Created via: kubectl create secret generic live-edit-env --from-literal=valkey-url=redis://...
+envSecretName: "live-edit-env"
+
+## Valkey connection configuration
+valkey:
+  ## Source for the LIVE_EDIT_VALKEY_URL env var. Selects where the connection URL
+  ## comes from, independent of the credential mode selected under
+  ## valkey.credentials (the discriminator is whether the URL carries a credential,
+  ## a property of the URL — not the mode). Accepts `value`
+  ## (inline plain URL — the non-secret passwordless path) or `valueFrom` (any env
+  ## var source, e.g. secretKeyRef / configMapKeyRef). When neither is set, the URL
+  ## falls back to a Secret (envSecretName, key valkey-url) — the default, byte-identical
+  ## to the historical render.
+  url:
+    ## @param valkey.url.value Inline Valkey connection URL (plain, non-secret).
+    ## Type: string. Renders LIVE_EDIT_VALKEY_URL as a literal `value:`. Use under
+    ## passwordless modes (accessTokenFile / iam) where the URL carries no credential. Edit in
+    ## place, e.g. value: "rediss://my-cache.example.net:6380". Empty (the default) is
+    ## falsy and falls through to the envSecretName fallback.
+    value: ""
+    ## @param valkey.url.valueFrom Valkey connection URL from an explicit env source.
+    ## Type: object (Kubernetes EnvVarSource). Rendered verbatim under `valueFrom:`.
+    ## Use to point at a Secret, ConfigMap, or any source explicitly, e.g.
+    ## valueFrom: { configMapKeyRef: { name: "live-edit-valkey", key: "valkey-url" } }.
+    ## Empty (the default) is falsy and falls through to the envSecretName fallback.
+    valueFrom: {}
+  ## Valkey authentication is selected under `valkey.credentials` below by
+  ## enabling exactly ONE of `static` / `accessTokenFile` / `awsIam`. The chart
+  ## derives LIVE_EDIT_VALKEY_AUTH_MODE from that choice and FAILS rendering if
+  ## zero or more than one section is enabled, so the choice is always
+  ## unambiguous. `static` (password / ACL credentials carried in the connection
+  ## URL) is enabled by default — the historical behavior and a no-op for
+  ## existing deployments.
+  ## @param valkey.poolSize Multiplexed connection pool size for general Valkey commands
+  ## Type: integer. Maps to LIVE_EDIT_VALKEY_POOL_SIZE env var. Default: 64.
+  ## Backs non-transactional reads/writes (header reads, external value reads, snapshot-fence
+  ## scripts, etc); whole-layer state reads use the snapshot lane (snapshotPoolSize), not
+  ## this pool. Fred pipelines requests on each
+  ## connection, so this is the count of physical TCP sockets, not the concurrency ceiling.
+  ## The code default is 0 (auto = cores × 2, floored at 8) to keep local-dev runs lightweight;
+  ## production replicas typically run in CPU-limited containers where `cores × 2` resolves to ~4,
+  ## so the auto path lands on the floor of 8 there, not on 4. The floor keeps the data pool at
+  ## least as wide as one 8-blob external-value write wave; an explicit value below 8 is rejected
+  ## at startup. It is a hard lower limit, not a sizing recommendation — hence the chart-level 64.
+  ## The chart-level 64 was set after a 2026-05-18 paired sweep on dev: pool=32 vs pool=64 showed
+  ## a consistent ~21% Rust throughput regression at N=50 concurrent writers on a single object
+  ## (mean 213/s at pool=32 across three runs vs 269/s at pool=64), with no detectable
+  ## difference at N=10 or N=100. The mid-concurrency regime is where extra TCP sockets matter;
+  ## at N=100 Valkey's single-thread Lua execution becomes the bottleneck and pool size stops
+  ## mattering. Override it in your deployment's values if a workload profile
+  ## warrants a different value.
+  poolSize: 64
+  ## @param valkey.connectTimeoutSecs Valkey connection retry budget in seconds
+  ## Type: integer. Maps to LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS env var. Default: 30
+  connectTimeoutSecs: 30
+  ## @param valkey.commandTimeoutMs Per-command timeout for Valkey operations in ms
+  ## Type: integer. Maps to LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS env var. Default: 5000
+  ## How long the service waits for Valkey to answer one request before failing it.
+  ## Set to 0 to disable. Stops requests hanging while a connection is reconnecting.
+  ## Large whole-layer writes get a longer deadline automatically.
+  commandTimeoutMs: 5000
+  ## @param valkey.reconnectMaxDelayMs Exponential reconnect backoff cap in ms
+  ## Type: integer. Maps to LIVE_EDIT_VALKEY_RECONNECT_MAX_DELAY_MS env var. Default: 30000
+  ## Reconnect attempts are unlimited, starting at 100 ms and doubling up to this cap.
+  reconnectMaxDelayMs: 30000
+  ## @param valkey.subscriberPoolSize Stream-reader connections for SubscribeReadLayer live updates
+  ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_POOL_SIZE env var. Default: 256
+  ## Each reader is one dedicated Valkey connection running a single XREAD BLOCK for every
+  ## subscription routed to it, so subscriptions share readers: this does NOT limit how many
+  ## subscriptions a replica serves. Separate from valkey.poolSize so readers
+  ## parked in XREAD BLOCK never delay UpdateLayer WATCH/MULTI/EXEC writers. A reader opens
+  ## its connection when it first serves a subscription, not at startup, so this is a
+  ## ceiling on the replica's reader connections rather than a count it opens at boot.
+  ## Non-clustered Valkey: sets read parallelism only; a small value (e.g. 8-32) serves any
+  ## number of subscriptions and cuts the replica's connection count.
+  ## Valkey Cluster (MemoryDB, AMR): a reader serves one hash slot — in practice one layer —
+  ## at a time, and connects only to the primary that owns that slot (one socket, plus a
+  ## backchannel socket opened only when a read that timed out on the service's side is
+  ## still blocked on the server), moving to
+  ## another primary when it binds a slot there. This is also the number of DISTINCT layers
+  ## a replica can serve at once. A
+  ## subscribe to one more layer waits for a reader within its capacity budget
+  ## (subscriberAdmissionWaitMs); if none frees, its stream ends with a retryable
+  ## UNAVAILABLE (reason reader_capacity) before any content
+  ## (live_edit_stream_mux_bind_refusals_total). Size it for peak concurrent distinct layers
+  ## per replica there.
+  ## Set to 0 for auto (cpus * 2, matching valkey.poolSize); the code default is 0 to keep
+  ## local dev under macOS's typical 256-fd ulimit. Overridden per env under
+  ## your deployment's values.
+  ## Each reader's replies take up to 1 MiB of the replica's memory, which the service
+  ## counts against resources.limits.memory: raising this lowers the catch-up memory
+  ## budget, and past what the limit can carry the service stops at startup naming the
+  ## limit it needs.
+  subscriberPoolSize: 256
+  ## @param valkey.subscriberMaxConcurrentCatchups Per-replica bound on SubscribeReadLayer catch-ups reading and building at once
+  ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS env var. Default: 8
+  ## (0 is refused at startup). A catch-up (reading the layer's state and building the full state or
+  ## diff, overwrite re-bootstraps included) is where a subscribe spends its CPU and memory —
+  ## about 0.16 CPU-seconds above the atomic-read ceilings; about 13 MiB measured for a flat
+  ## 2,150-section test layer (short section ids), about 18 MiB derived for the Kitchen_set
+  ## live layer (1,241 prims) with real (random 64-bit) section ids, up to 24 MiB at the
+  ## snapshot byte ceiling. The default is CPU-derived:
+  ## 4 slots per CPU at this chart's resources.limits.cpu of 2. More slots than that do not
+  ## raise catch-up throughput on 2 CPUs; they only lengthen every catch-up and take more
+  ## CPU from UpdateLayer and live delivery on the replica while a burst runs. Re-derive it
+  ## (4 per CPU) if you change resources.limits.cpu; the CPU request is not the basis.
+  ## Each slot's memory (about 24 MiB at the snapshot byte ceiling) is counted against
+  ## resources.limits.memory: raising this lowers the catch-up memory budget, and past
+  ## what the limit can carry the service stops at startup naming the limit it needs. A slot
+  ## covers only a catch-up's backing-store reads and its build: never a send, so a slow client
+  ## cannot hold one, and a subscriber that is already up to date takes none. (In rollback
+  ## mode, layer.catchupSnapshotEnabled=false, a same-object reconnect on Valkey Cluster
+  ## also holds its slot while it waits for a stream reader.) Past the limit a catch-up
+  ## waits its turn in arrival order within its capacity budget
+  ## (subscriberAdmissionWaitMs), with the stream open and nothing delivered. The
+  ## wait ends on client disconnect, session deletion or shutdown; when the budget runs out
+  ## the stream ends with a retryable UNAVAILABLE (reason catchup_capacity) before any
+  ## content. This is what keeps a reconnect storm from OOM-killing the replica (which would
+  ## drop every subscription on it and trigger another storm).
+  ## Watch live_edit_subscribe_catchups_waiting.
+  subscriberMaxConcurrentCatchups: 8
+  ## @param valkey.subscriberAdmissionWaitMs A subscribe's capacity budget: the total time it may wait for capacity
+  ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_ADMISSION_WAIT_MS env var. Default: 20000
+  ## One budget covers the four waits for capacity a SubscribeReadLayer can make: admission
+  ## past the subscription ceiling (derived from resources.limits.memory; see resources
+  ## below), on Valkey Cluster a free stream reader
+  ## (subscriberPoolSize), each catch-up slot (subscriberMaxConcurrentCatchups), and
+  ## each snapshot read permit (catchupSnapshotReadConcurrency).
+  ## Each wait is charged only for the time it spends waiting; reading, building and sending
+  ## are not charged, and a waiting subscription buffers nothing. An overwrite re-bootstrap
+  ## (the layer replaced under the subscription, during its catch-up or after it) starts a
+  ## fresh budget. So each overwrite that lands during a first open's catch-up adds one more
+  ## budget of possible waiting before any content: 2 x the budget (40 s at the default) for
+  ## one overwrite, already past the tightest client's 30 s first-open window, and since
+  ## re-bootstraps can chain, (k+1) x the budget for k overwrites landing during successive
+  ## catch-ups. 0 = never wait for capacity: each wait takes a free slot, reader
+  ## or permit or is refused at once.
+  ## Every refusal is a retryable UNAVAILABLE. An admission refusal comes before the stream
+  ## opens (Trailers-Only); a reader, catch-up-slot or read-permit refusal (reason
+  ## reader_capacity, or catchup_capacity for the last two) comes in-stream, after the stream
+  ## opens and before any content. The one
+  ## exception is a steady-state overwrite re-bootstrap, whose refusal comes after the
+  ## caught-up ack. A subscribe refused at a full replica, or for want of a free reader, is
+  ## refused only once its budget has run out (20 s at the default). Every wait ends early on
+  ## client disconnect, session deletion or graceful shutdown. The 20 s default is derived
+  ## from the clients' retry windows; a shorter budget refuses sooner, so a retry may land on
+  ## a less-loaded replica.
+  subscriberAdmissionWaitMs: 20000
+  ## @param valkey.subscriberAdmissionMaxWaiters Cap on subscribes queued for admission at once
+  ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_ADMISSION_MAX_WAITERS env var.
+  ## Default: 0, for which the chart leaves the variable out so the binary applies its own
+  ## default — the subscription ceiling, which it derives from resources.limits.memory.
+  ## Past the cap a subscribe is refused immediately
+  ## instead of joining the admission queue. NOTE: the binary REJECTS an explicit 0 at startup (a zero cap next to a non-zero
+  ## wait makes the wait dead code) — express fail-fast with subscriberAdmissionWaitMs: 0
+  ## instead.
+  subscriberAdmissionMaxWaiters: 0
+  ## @param valkey.layerStreamMaxlen Entry cap (approximate MAXLEN) for per-layer live-update streams
+  ## Type: integer. Maps to LIVE_EDIT_LAYER_STREAM_MAXLEN env var. Default: 4096. 0 = no entry cap.
+  ## Every XADD to a per-layer stream (le:{object_id}:obj:stream) is issued with
+  ## MAXLEN ~ N trimming. Each entry holds the writer's whole update, large values
+  ## included, so this cap bounds memory only for layers of small updates: a stream
+  ## keeps the smaller of this window and layerStreamMaxBytes's (below). Increase
+  ## for cursor-tracking workloads where write rates can exceed 600/sec per layer.
+  ## Size Valkey from docs/service/docs/backing-store.md § Memory, per hot layer
+  ## about min(N × mean update size, layerStreamMaxBytes) × 1.2.
+  layerStreamMaxlen: 4096
+  ## @param valkey.layerStreamMaxBytes Per-object byte budget for retained relay bytes on per-layer streams
+  ## Type: integer. Maps to LIVE_EDIT_LAYER_STREAM_MAX_BYTES env var. Default: 134217728 (128 MiB).
+  ## Every UpdateLayer trims its layer's stream once the newest entries hold more
+  ## than this many bytes of updates, keeping at least the 2 newest entries, so one
+  ## layer's stream holds at most about this plus 2 × layer.maxSize. At the default a
+  ## layer keeps all 4096 entries while its updates average 32 KiB or less. Lowering it
+  ## saves Valkey memory and shortens the window subscribers can lag within and
+  ## incremental backups can cover (checkpoint.tail.maxBytes above it logs a startup
+  ## WARN). 0 turns the byte budget off (entry-count retention only), the no-redeploy
+  ## rollback. Must be set to a whole number of bytes: null and anything else
+  ## that is not a non-negative integer (e.g. "128Mi") are refused at render time.
+  layerStreamMaxBytes: 134217728
+  ## @param valkey.memoryBytes The backing store's total memory, in bytes, as the provider states it
+  ## Type: integer. Maps to LIVE_EDIT_VALKEY_MEMORY_BYTES env var. Default: unset (empty).
+  ## The store's total memory as the provider states it, e.g. 12000000000 for a
+  ## 12 GB Azure Managed Redis cache. Set it only on a store that does not report
+  ## its own memory limit, in practice Azure Managed Redis; leave it empty on
+  ## self-hosted Valkey, Amazon MemoryDB and Amazon ElastiCache, which report
+  ## theirs. After resizing the cache, update it to the new total. Values below
+  ## 100000000, 0 included, stop startup. Rendered as an integer only when set.
+  ## See docs/service/docs/configuration.md.
+  memoryBytes: ""
+  ## @param valkey.extReleaseMaxBytes External-value release budget, in bytes
+  ## Type: integer. Maps to LIVE_EDIT_EXT_RELEASE_MAX_BYTES env var. Default: unset (empty).
+  ## How many bytes of deleted or replaced large values may await background
+  ## clean-up in the backing store. While they are at or above it, uploads
+  ## carrying large values wait, then fail with a retryable UNAVAILABLE and
+  ## nothing applied. Empty (the default): the service works it out from the
+  ## store's memory (the limit the store reports, or memoryBytes) and keeps it
+  ## current; with neither, it is 8 x layer.maxSize capped at 100 MB, and
+  ## startup logs why. Leave it empty unless you need a specific budget. 0 turns
+  ## it off (startup WARN). See docs/service/docs/configuration.md.
+  extReleaseMaxBytes: ""
+  ## @param valkey.maintenancePoolSize Dedicated multiplexed pool for the periodic maintenance loops
+  ## Type: integer. Maps to LIVE_EDIT_MAINTENANCE_POOL_SIZE env var. Default: 1.
+  ## Sizes a dedicated multiplexed Valkey pool used exclusively by the periodic
+  ## maintenance loops so their SCAN / HGETALL / EVALSHA traffic cannot queue
+  ## behind hot-path readers and writers on the data pool. THREE consumers now
+  ## share it, on independent cadences: the external-value GC loop (a pass about
+  ## once a second), the orphan sweep (300 s) and the reference-count reconciler
+  ## (its own interval, with a per-pass budget of interval/2). All three are gated on the same
+  ## `le:gc:leader` lease, but one replica's three loops share that lease rather
+  ## than exclude each other, so on the leader replica they overlap freely.
+  ## One connection is still sufficient: fred multiplexes concurrent commands over
+  ## a single connection, and the reconciler is both leader-gated and
+  ## budget-bounded. What one connection does not do is isolate them from each
+  ## other — a heavy keyspace walk adds latency to the GC passes that run during it.
+  ## If that is observed (live_edit_ext_release_oldest_age_seconds climbing during
+  ## reconciler passes), raise
+  ## this to `maintenancePoolSize: 2` so the walk and the sweeps get separate
+  ## connections. Operators with very large keyspaces who want extra parallelism
+  ## inside a single sweep can raise it further; values above ~4 are rarely
+  ## useful. Zero is not rejected: the service treats it as 1.
+  maintenancePoolSize: 1
+  ## @param valkey.catchupSnapshotReadConcurrency Catch-up atomic snapshot reads in flight at once per replica
+  ## Type: integer. Maps to LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY env var. Default: 1.
+  ## A catch-up of a layer at or under both snapshot ceilings reads it in one atomic
+  ## server-side script, which blocks its Valkey shard while it runs; this is how many
+  ## such reads one replica runs at once (read permits). A catch-up takes its permit
+  ## inside its catch-up slot (subscriberMaxConcurrentCatchups) and holds it across the
+  ## read only. Waiting for a permit is charged to the subscribe's capacity budget
+  ## (subscriberAdmissionWaitMs); when the budget runs out the stream ends with a
+  ## retryable UNAVAILABLE (reason catchup_capacity) before any content. A legacy
+  ## in-window replay (catchupSnapshotEnabled false) takes one permit per replayed
+  ## commit the same way, except for an empty commit, which it sends with no read. A live
+  ## subscriber never reads layer state, so it takes no permit. The snapshot
+  ## ceilings are derived at this value: raising it raises the writer delay a join wave can
+  ## cause, so raise it only with your own measurement. Every replica runs this many, so
+  ## a fully scaled-out fleet runs autoscaling.maxReplicas times this many: keep
+  ## autoscaling.maxReplicas × this value at or below 10 (at the default maxReplicas of 10,
+  ## leave it at 1). The snapshot lane
+  ## (snapshotPoolSize) grows with it unless you override that value. Watch
+  ## live_edit_catchup_snapshot_reads_in_flight
+  ## and live_edit_catchup_snapshot_read_wait_seconds. Zero is rejected at startup.
+  catchupSnapshotReadConcurrency: 1
+  ## @param valkey.catchupFencedReadConcurrency Catch-up fenced snapshot reads in flight at once per replica
+  ## Type: integer. Maps to LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY env var. Default: 1.
+  ## A catch-up of a layer over either snapshot ceiling reads it with the fenced read, which
+  ## can run for seconds on a large layer; this is how many such reads one replica runs at
+  ## once. They take read permits of their own, separate from
+  ## catchupSnapshotReadConcurrency, so a long fenced read never holds a permit the atomic
+  ## reads of other layers need. Under layer.updateLayerBackend lua the structural
+  ## write-planning cache's fenced cold start of such a layer, and its sampled audit's fenced
+  ## read, take one of these permits too, at most one of them per replica at a time (a cold
+  ## start waits only as long as its edit can spare, the audit not at all). It also bounds how
+  ## far catch-up memory can run past the catch-up memory budget, which the service derives
+  ## from resources.limits.memory (see resources below): raising it lowers that budget. The
+  ## snapshot lane (snapshotPoolSize)
+  ## grows with it unless you override that value. Every catch-up of a layer over either
+  ## ceiling reads it through its layer's shared fenced read on the replica, which holds one
+  ## of these permits while it reads. Zero is rejected at startup.
+  catchupFencedReadConcurrency: 1
+  ## @param valkey.snapshotPoolSize Dedicated multiplexed pool for object-snapshot reads (the snapshot lane)
+  ## Type: integer or null. Maps to LIVE_EDIT_SNAPSHOT_POOL_SIZE env var. Default: null
+  ## (the variable is not rendered and the binary derives the size: 6 at the defaults).
+  ## Snapshot reads (catch-up, per-commit, checkpoint and structural reads of a layer's
+  ## whole state) carry replies of up to hundreds of KiB, so they get connections of their
+  ## own and never queue in front of UpdateLayer commands on the data pool
+  ## (valkey.poolSize). The clean-up of a deleted or replaced layer reads only the layer's
+  ## large-value references, in pages, and runs on the lane at every size. Structural edits
+  ## (backend lua) read a layer's whole state only to fill the structural write-planning
+  ## cache — a cold start or reload, and its sampled audit — not on every attempt; those
+  ## reads, and the structural reads of the WATCH path (an uncacheable layer, an edit too
+  ## large for one script call, or the lua-watch-structural and txn backends, at every
+  ## size), run on the lane too. The
+  ## catch-up, per-commit and checkpoint reads run on it at every size: over either
+  ## ceiling a catch-up, a checkpoint or a structural cache cold start or audit reads
+  ## through the fenced read, whose windows run
+  ## on the lane while its fence requests and renewals stay on the data pool (a per-commit
+  ## read never goes over a ceiling). The default is P_a + P_f + 4: one
+  ## connection for each atomic read (catch-up or per-commit; P_a =
+  ## catchupSnapshotReadConcurrency, 1) and fenced read
+  ## (P_f = catchupFencedReadConcurrency, 1) a replica runs at once, plus four for the
+  ## structural and checkpoint reads and the clean-up's reference reads. Left null, the
+  ## binary derives it from those two
+  ## values, so the lane follows them. Set it only to override the derived size; an override
+  ## does not follow them, so keep it at catchupSnapshotReadConcurrency +
+  ## catchupFencedReadConcurrency + 4 (or above) when you change either. The lane
+  ## uses the data pool's credentials, TLS, reconnect policy and timeouts. Each replica
+  ## opens this many more Valkey connections; count them in the backing store's connection
+  ## budget (docs/service/docs/backing-store.md § Connections). An explicit 0 is rendered
+  ## and rejected at
+  ## startup.
+  snapshotPoolSize: null
+  ## @param valkey.snapshotAtomicReadMaxItems Item ceiling for one atomic object-snapshot read
+  ## Type: integer. Maps to LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS env var. Default: 37554.
+  ## A layer at or under both snapshot ceilings is read in one atomic server-side
+  ## script, which blocks its Valkey shard while it runs; a layer over either ceiling
+  ## takes the slower above-ceiling read instead, which is still correct and is never
+  ## refused. The catch-up, per-commit and checkpoint reads take the atomic read, and so do
+  ## the structural write-planning cache's cold starts, reloads and audits (backend lua,
+  ## consumers structural_cache and structural_cache_audit; a cold start over either
+  ## ceiling, or whose item count at 18 bytes per item would pass the byte ceiling, takes
+  ## the snapshot-fenced read instead, and so does an audit over either ceiling).
+  ## The structural reads of the WATCH path (an uncacheable layer, an edit too large for
+  ## one script call, or the lua-watch-structural and txn backends) never do and size
+  ## their bounded fan-out windows from this value. The clean-up of a deleted or replaced
+  ## layer never does either: it reads only the layer's large-value references, in pages
+  ## sized from its own memory allowance (see resources below), not from this value.
+  ## The default is derived, not picked: it is the largest read that keeps one read
+  ## within 50 ms and a join wave within its writer-latency bound on Azure Managed Redis
+  ## (dev), the slower measured platform, with the measured excess allowance taken off.
+  ## There is no per-platform default: the AMR ceiling is safe on a faster store. Raise it only with
+  ## your own measurement of your store's read cost. It also sets the bounded fan-out
+  ## read's window (this value / 5.266 commands outstanding, capped at 2141, so 2141 at the
+  ## default; 7131 uncapped). Zero is rejected at startup.
+  snapshotAtomicReadMaxItems: 37554
+  ## @param valkey.snapshotAtomicReadMaxBytes Byte ceiling for one atomic object-snapshot read
+  ## Type: integer. Maps to LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_BYTES env var. Default: 604619.
+  ## The byte side of the same ceiling (see snapshotAtomicReadMaxItems): it bounds
+  ## an atomic read's reply size and the server-side script's memory, and it is the
+  ## bounded fan-out read's per-window reply-byte target (a target sized from the read's
+  ## average entry size, not a maximum). The catch-up, per-commit and checkpoint reads take
+  ## the atomic read, and so do the structural write-planning cache's cold starts, reloads
+  ## and audits within the ceilings (backend lua, consumers structural_cache and
+  ## structural_cache_audit); the structural reads of the WATCH path (an uncacheable
+  ## layer, an edit too large for one script call, or the lua-watch-structural and txn
+  ## backends) never do and size their fan-out windows from it, and the clean-up of a
+  ## deleted or replaced layer never reads whole rows or sizes anything from it. The default is the
+  ## item ceiling at 16.1 bytes per item: a Kitchen_set live layer with real section ids
+  ## (random 64-bit, 19-20 digits, as clients allocate them). It is a reply-size and
+  ## memory bound, not a time bound: the read's time scales with items. The pod memory
+  ## terms (the catch-up slots, the fan-out window, the checkpoint reference read) are
+  ## derived from it, so raise it only together with the item ceiling and re-derive them.
+  ## Zero is rejected at startup.
+  snapshotAtomicReadMaxBytes: 604619
+
+  ## Valkey credential provider selection.
+  ##
+  ## AT MOST ONE of the three sub-sections below may have `enabled: true`. The
+  ## chart derives LIVE_EDIT_VALKEY_AUTH_MODE from whichever is enabled and FAILS
+  ## rendering if more than one is enabled. With NONE enabled (the default), the
+  ## mode is `static` — password / ACL credentials carried in the connection URL
+  ## (the binary's own default), so a bare install keeps the historical behavior.
+  ## The `accessTokenFile` and `awsIam` sections are passwordless rotating-credential
+  ## providers and are inert unless enabled — at the default none of their keys
+  ## reach any manifest.
+  credentials:
+    ## static: password / ACL credentials carried IN the Valkey connection URL
+    ## (`valkey.url.value` / `valkey.url.valueFrom`, or the `envSecretName`
+    ## secret's `valkey-url` key). This is the ordinary `username:password@host`
+    ## Valkey AUTH path — there is NO separate password field because the
+    ## credential rides the URL. This is also the fallback when no credential
+    ## section is enabled, so `static.enabled: true` is an explicit way to select
+    ## it. Selects LIVE_EDIT_VALKEY_AUTH_MODE=static.
+    static:
+      ## @param valkey.credentials.static.enabled Use password / ACL credentials carried in the connection URL
+      ## Type: boolean. Default: false (leaving all three sections disabled also
+      ## resolves to static). Mutually exclusive with accessTokenFile.enabled and
+      ## awsIam.enabled — the chart fails rendering if more than one is enabled.
+      enabled: false
+
+    ## accessTokenFile: bearer-token file provider. Conventionally an Azure Entra
+    ## managed-identity Redis-scoped token, but the mode is agnostic to the token
+    ## issuer. Selects LIVE_EDIT_VALKEY_AUTH_MODE=accessTokenFile.
+    ##
+    ## The token WRITER is your token provisioner, run as the one provisioner
+    ## container under `serviceIdentity.accessTokenFile.provisionerSidecar`: it
+    ## writes every file-based token the pod needs (the Storage Service token AND
+    ## this backing-store token). Enabling this section therefore REQUIRES
+    ## `serviceIdentity.accessTokenFile.enabled: true`; the chart fails rendering
+    ## otherwise. This block holds only the live-edit *reader* surface: the
+    ## provisioner writes the token to `path` in the shared memory-backed
+    ## `token-exchange` emptyDir (`medium: Memory`, tmpfs) mounted at
+    ## `/etc/secrets/access-token`, and the live-edit process reads that file and
+    ## uses `username` as the Valkey AUTH username. File format and refresh rules:
+    ## docs/service/docs/authentication.md § Token file format.
+    ##
+    ## NOT in this chart (it is supplied by your deployment's values): your
+    ## provisioner's image and its configuration for the backing-store scope, and
+    ## the Azure Managed Redis (AMR) data-plane RBAC grant. Azure managed-identity
+    ## binding is driven by the existing
+    ## `serviceAccount.annotations."azure.workload.identity/client-id"` surface.
+    accessTokenFile:
+      ## @param valkey.credentials.accessTokenFile.enabled Use a provisioner-written access-token file as the Valkey AUTH credential
+      ## Type: boolean. Default: false. Mutually exclusive with static.enabled and
+      ## awsIam.enabled. REQUIRES serviceIdentity.accessTokenFile.enabled: true
+      ## (your token provisioner writes this token).
+      enabled: false
+      ## @param valkey.credentials.accessTokenFile.path Filesystem path your token provisioner writes the Valkey access token to
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_TOKEN_FILE env var.
+      ## Default: /etc/secrets/access-token/valkey_access_token. MUST live in the
+      ## SAME directory as `checkpoint.credentials.accessTokenFile.path` — that
+      ## directory is the shared `token-exchange` mount
+      ## (`/etc/secrets/access-token`) — and MUST use a DIFFERENT filename from the
+      ## Storage Service token's path so both token files coexist in the one shared
+      ## volume. Only consulted when this section is enabled.
+      path: /etc/secrets/access-token/valkey_access_token
+      ## @param valkey.credentials.accessTokenFile.username Valkey AUTH username (conventionally the token issuer's identity)
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_TOKEN_USERNAME env var.
+      ## Default: "". Under an Azure Entra managed identity this MUST be the
+      ## identity's **Object (Principal) ID**, NOT its client ID — a client-id
+      ## value is accepted by the chart but fails at runtime with `WRONGPASS` when
+      ## Valkey AUTH is attempted. Only consulted when this
+      ## section is enabled.
+      username: ""
+      ## @param valkey.credentials.accessTokenFile.refreshLeadSecs Pre-expiry lead (seconds) at which the service starts re-reading the token file hunting for the replacement
+      ## Type: integer. Maps to LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS env var.
+      ## Default: 180. Only consulted when this section is enabled. The binary
+      ## rejects `0` at startup, and rejects values too large for the timestamp
+      ## arithmetic the lead feeds (a representability bound, not an operational
+      ## one). It enforces NO practical upper limit beyond that, deliberately:
+      ## an oversized lead withholds no credential, it only re-reads the token
+      ## file over a wider window.
+      ## Leave it at the default unless the sizing note at the end of this
+      ## comment applies to your deployment.
+      ##
+      ## It is the *refresh lead* handed to the Redis-scoped token provider, and
+      ## it schedules re-reads only: once the cached token's `expires_on` is
+      ## within `refreshLeadSecs` + `pollIntervalSecs` of now, the provider
+      ## re-reads the token file every 250ms until a replacement lands (and for
+      ## 20s past the expiry if none does), instead of waiting for the steady
+      ## `checkpoint.credentials.accessTokenFile.pollIntervalSecs` tick
+      ## (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, default 15s) that the same
+      ## single provisioner sidecar's token file is otherwise polled on.
+      ##
+      ## It does NOT decide which credential is presented. The Valkey credential
+      ## provider serves the cached token for its whole real lifetime and fails
+      ## the connection's AUTH/HELLO only when no token is cached or the cached
+      ## one has actually expired. Azure's "reauthenticate at least 3 min before
+      ## token expiry" is client refresh-cadence guidance — which is exactly what
+      ## this knob implements — not a rule against using a still-valid token.
+      ##
+      ## Operator-override boundary: this knob tunes only the re-read lead and
+      ## never which credential is presented (the re-AUTH cadence is a fixed
+      ## constant; since the rotation gate the periodic tick only re-sends a
+      ## credential after the token file actually rotated). Lowering it is
+      ## inert at best and gives up the head start on a late sidecar rotation.
+      ## Raising it is NOT inert: set it to at least the provisioner sidecar's
+      ## own refresh lead minus the token-file poll interval and the service is
+      ## already re-reading at 250ms when the replacement lands, so pickup
+      ## takes ~250ms instead of up to one poll — which removes the poll term
+      ## from the sidecar sizing recommendation below, tightening it from 195s
+      ## to ~180s. That is the only effect a higher value has; it cannot make
+      ## the recommendation worse.
+      ##
+      ## The setting that DOES need sizing is not this one — it is the
+      ## provisioner sidecar's own refresh lead, i.e. how far ahead of expiry it
+      ## rewrites the token file. Recommend >= 180s PLUS the service's token-file
+      ## poll interval (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, 15s by
+      ## default) — 195s at the defaults — with margin above that (a sidecar
+      ## already sized against the pre-rotation-gate 375s recommendation is
+      ## fine). The 180s is the rotation-gated fan-out ceiling: after the file
+      ## rotates, the first periodic tick to observe it opens a fan-out window
+      ## and every connection re-AUTHs within one further tick (ticks are
+      ## jittered 60–90s, two serial stages worst-case ≈ 180s); the poll
+      ## interval is the pickup delay (a token written at expiry-lead is not
+      ## cached until up to one poll later). A sidecar lead clearing their sum
+      ## guarantees every connection re-AUTHs with the replacement token before
+      ## the old one expires and is prolonged in place. A shorter sidecar lead
+      ## is NOT an outage: below the threshold the fraction of connections
+      ## dropped by the backing store at expiry — reconnecting immediately with
+      ## the by-then-cached fresh token — grows roughly in proportion to the
+      ## shortfall, worst case one reconnect blip per pooled connection per token
+      ## lifetime. The service cannot check that sidecar lead at startup (it is
+      ## not a live-edit setting), so it measures the achieved headroom at every
+      ## token rotation instead: gauge
+      ## live_edit_service_token_refresh_headroom_seconds{role="valkey"} plus a
+      ## WARN whenever a rotation lands under the 180s floor — once per rotation,
+      ## typically once a day, since a healthy sidecar rotates once per token
+      ## lifetime. See docs/service/docs/backing-store-azure.md § Token refresh.
+      refreshLeadSecs: 180
+
+    ## awsIam: AWS IAM (MemoryDB / ElastiCache) passwordless provider. Selects
+    ## LIVE_EDIT_VALKEY_AUTH_MODE=iam. Unlike accessTokenFile, the IAM path adds
+    ## NO sidecar and NO volume: the pod's AWS credential is supplied via IRSA (IAM
+    ## Roles for Service Accounts) — the operator sets
+    ## `serviceAccount.annotations."eks.amazonaws.com/role-arn"` (the SAME
+    ## pass-through the accessTokenFile path reuses for
+    ## azure.workload.identity/client-id) — and the in-cluster AWS credential
+    ## provider resolves it via STS. There is no token file and no provisioner
+    ## sidecar; the live-edit process SigV4-signs the Valkey AUTH exchange
+    ## in-process. The concrete IAM role, its OIDC trust binding, and the cache
+    ## IAM-auth ACL grant belong in your deployment's configuration, NOT here.
+    awsIam:
+      ## @param valkey.credentials.awsIam.enabled Use AWS IAM (MemoryDB / ElastiCache) passwordless auth
+      ## Type: boolean. Default: false. Mutually exclusive with static.enabled and
+      ## accessTokenFile.enabled.
+      enabled: false
+      ## @param valkey.credentials.awsIam.service AWS IAM-auth backend selector (MemoryDB vs ElastiCache SigV4 flavor)
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_IAM_SERVICE env var.
+      ## Default: memorydb. Accepted values: memorydb | elasticache
+      ## (case-insensitive at the binary). Selects the AWS service the SigV4
+      ## request is signed for — MemoryDB and ElastiCache use different signing
+      ## parameters. Only consulted when this section is enabled.
+      service: memorydb
+      ## @param valkey.credentials.awsIam.username IAM-enabled Valkey ACL username used as the Valkey AUTH username
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_IAM_USERNAME env var.
+      ## Default: "". MUST match the IAM-auth-enabled ACL user configured on the
+      ## MemoryDB / ElastiCache cluster. Only consulted when this section is enabled.
+      username: ""
+      ## @param valkey.credentials.awsIam.region AWS region used for SigV4 signing of the Valkey AUTH exchange
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_IAM_REGION env var.
+      ## Default: "". MUST be the region hosting the MemoryDB / ElastiCache
+      ## cluster. Only consulted when this section is enabled.
+      region: ""
+      ## @param valkey.credentials.awsIam.clusterHost Cluster/cache NAME used for SigV4 signing of the Valkey AUTH exchange
+      ## Type: string. Maps to LIVE_EDIT_VALKEY_IAM_CLUSTER_HOST env var.
+      ## Default: "". This is the cluster/cache **name**, NOT the endpoint FQDN —
+      ## despite the `Host`/`_HOST` suffix. Set it to the short MemoryDB cluster
+      ## name (e.g. `my-cluster`) or ElastiCache replication-group / cache name
+      ## (e.g. `my-cache`), NOT its `clustercfg.….memorydb.<region>.amazonaws.com`
+      ## / `….cache.amazonaws.com` endpoint hostname. This is a real-auth
+      ## correctness requirement: the service signs the SigV4 connect token
+      ## against exactly this string and AWS re-signs against the cluster name, so
+      ## the endpoint FQDN here silently fails AUTH. The endpoint FQDN belongs in
+      ## `valkey.url` (LIVE_EDIT_VALKEY_URL) instead; the two are different values.
+      ## Only consulted when this section is enabled.
+      clusterHost: ""
+
+## Userinfo (user-identity resolution) configuration
+##
+## The permissions-client knobs (protocol, timeout, cache TTLs, retry budget)
+## now live under `authorization:` above — they are shared by both auth clients.
+## This block carries only the userinfo-backend surface.
+userInfo:
+  ## @param userInfo.enabled Enable the userinfo service backend for user identity resolution
+  ## Type: boolean. Default: false (pinned to match the bare binary's own
+  ## default; see pinning-policy block above
+  ## the `authorization:` stanza).
+  ## Maps to LIVE_EDIT_USERINFO_SERVICE_ENABLED env var.
+  ## When `false`, the service skips the userinfo backend entirely; bearer-token
+  ## identity extraction (JWT claims) is used instead, and `userInfo.endpoint`
+  ## is not consulted. When `true`, the service calls out to the userinfo backend
+  ## at `userInfo.endpoint` to resolve token → user identity. That lookup is not
+  ## token validation: with `authorization.enabled: false` the token's signature
+  ## and expiry are checked only if a validating proxy fronts the endpoint.
+  ## With this flag `true` and `authorization.enabled: true`, a caller the
+  ## userinfo service has no user for is shown by the name its token's claims
+  ## give it instead of failing the call.
+  ## `userInfo.endpoint` is only consequential when this flag is `true`.
+  enabled: false
+  ## @param userInfo.endpoint Userinfo service URL for user identity resolution
+  ## Type: string. Optional when `userInfo.enabled` is `true`; ignored otherwise
+  ## (the ConfigMap omits the `LIVE_EDIT_USERINFO_ENDPOINT` env var entirely when
+  ## the flag is `false`). When left empty AND userInfo is enabled, the chart
+  ## defaults to the in-cluster userinfo Service by protocol:
+  ## `http://userinfo-service:8080` (REST) or `http://userinfo-service:50051`
+  ## (gRPC), selected by `authorization.protocol`. Set this to override.
+  ## Maps to LIVE_EDIT_USERINFO_ENDPOINT env var.
+  ## Must include an explicit scheme — `https://` (production) or `http://` (test/dev only).
+  ## Bare hostnames are rejected at startup to prevent a silent
+  ## plaintext downgrade of the auth channel; bearer tokens transit this connection.
+  ## Examples: ingress URL `https://userinfo.example.com`, cluster-internal REST URL
+  ## `http://userinfo-service.storage-api:8080`, gRPC URL `https://grpc.userinfo.example.com:50051`.
+  ## Protocol selected by `authorization.protocol`; TLS is enabled when the scheme is `https://`
+  ## or the port is exactly `:443`. See `normalize_endpoint` in `src/auth/mod.rs`.
+  endpoint: ""
+  ## @param userInfo.negativeTtlSecs Userinfo backend-failure cache TTL (seconds)
+  ## Type: integer. Maps to LIVE_EDIT_AUTH_USERINFO_NEGATIVE_TTL_SECS env var. Default: 5.
+  ## Memoizes a userinfo rejection (`AuthError::InvalidResponse("userinfo service
+  ## rejected the bearer …")`) plus transient `Timeout` / `Unreachable` so a long-running
+  ## client holding a rejected bearer doesn't pound the userinfo backend on every RPC,
+  ## and a flapping backend can't trigger a stampede. Independent of `authorization.cacheNegativeTtlSecs` because userinfo
+  ## failures recover via token refresh, not policy revocation. Set to `0` to disable
+  ## the negative cache.
+  negativeTtlSecs: 5
+
+## Service identity — outbound-credential provisioning
+##
+## Hosts your token provisioner as the pod's one token-writer container. It
+## writes every token the pod needs (e.g. the Storage Service token that the
+## checkpoint StorageApi adapter reads AND the backing-store token that
+## passwordless Valkey `credentials.accessTokenFile` auth reads), each to its own
+## path in the single shared memory-backed `token-exchange` emptyDir mounted at
+## `/etc/secrets/access-token`. Each file holds JSON `{"access_token": ...,
+## "expires_on": <RFC 3339>}`, written atomically and replaced at least 420 s
+## before it expires: docs/service/docs/authentication.md § Token file format. The *reader* paths live
+## with their consumers (`checkpoint.credentials.accessTokenFile.path` for
+## storage-api, `valkey.credentials.accessTokenFile.path` for Valkey); both MUST
+## live in that one directory with DISTINCT filenames so the token files coexist
+## in the shared volume. The chart supplies a predefined container name
+## (`<chart>-token-provisioner`) and the `token-exchange` volumeMount; the rest of
+## the container (image, env, args) comes from values.
+##
+## Everything defaults off; with the defaults the chart renders identically to a
+## no-sidecar deployment (no sidecar container, no shared volume, no env additions).
+##
+## storage-api credential sub-modes:
+##   A (V1-supported): `accessTokenFile` — your token provisioner writes a JSON
+##     token file the live-edit process polls. Recommended for V1.
+##   B (forward-compat): `clientCredentials` — an in-process OAuth
+##     client-credentials flow inside the binary. The V1 binary does NOT
+##     implement this flow; `clientCredentials.enabled: true` only logs a startup
+##     warning and has no other effect (outbound storage-api calls authenticate
+##     only with sub-mode A's token file). Kept as forward-compat surface.
+serviceIdentity:
+  clientCredentials:
+    ## @param serviceIdentity.clientCredentials.enabled (forward-compat) Enable in-process OAuth client-credentials flow
+    ## Type: boolean. Default: false. The V1 binary does not implement this
+    ## flow — enabling it only logs a startup warning and has no other effect;
+    ## it does not satisfy `checkpoint.adapter: StorageApi`, which requires
+    ## sub-mode A. Use sub-mode A (accessTokenFile) instead.
+    enabled: false
+
+  accessTokenFile:
+    ## @param serviceIdentity.accessTokenFile.enabled Enable the access-token-file mode (token-file env vars; the provisioner container when an image is set)
+    ## Type: boolean. Default: false. When true, the live-edit container's env
+    ## block gains `LIVE_EDIT_SERVICE_TOKEN_FILE` (from
+    ## `checkpoint.credentials.accessTokenFile.path`) plus
+    ## `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` (from
+    ## `checkpoint.credentials.accessTokenFile.pollIntervalSecs`). Only when
+    ## `provisionerSidecar.container.image` is ALSO supplied does the chart render
+    ## the sidecar and the shared memory-backed `token-exchange` emptyDir volume
+    ## (`medium: Memory`, i.e. tmpfs — token material stays in RAM and never
+    ## spills to node disk) mounted at `/etc/secrets/access-token` (read-only on
+    ## the live-edit container, writable on the sidecar). Without an image, supply
+    ## the token file at that path through your own `volumes` / `volumeMounts`.
+    ## This ONE provisioner
+    ## writes EVERY file-based token the pod needs — the Storage Service token
+    ## (read by the checkpoint StorageApi adapter) AND, when
+    ## `valkey.credentials.accessTokenFile.enabled: true`, the backing-store
+    ## token — so enabling Valkey accessTokenFile auth REQUIRES this flag to be
+    ## true, and so does `checkpoint.adapter: StorageApi` (the render fails
+    ## without it). Configure your provisioner to write one file per token, at
+    ## the two `accessTokenFile.path` values.
+    enabled: false
+
+    ## @param serviceIdentity.accessTokenFile.provisionerSidecar.container Kubernetes container spec for your token provisioner
+    ## Type: object. Default: image unset, requests cpu=20m and memory=32Mi.
+    ## Rendered into `spec.template.spec.containers[]` only when
+    ## `serviceIdentity.accessTokenFile.enabled: true` and image is non-empty.
+    ## The chart supplies a predefined container `name`
+    ## (`<chart>-token-provisioner`) and the `token-exchange` volumeMount;
+    ## operators supply the rest — `image`, `env` and `args` configuring every
+    ## token and its path, all paths under `/etc/secrets/access-token`. Any
+    ## `name` set here is replaced by the chart's; `volumeMounts` set here are
+    ## kept, and the chart appends the shared `token-exchange` mount to them.
+    ## The default requests suit a small provisioner refreshing two tokens.
+    ## These are starting reservations, not measured peaks or resource limits.
+    ## Override resources.requests for your image and workload; overriding one
+    ## request preserves the other default. Resource defaults do not enable the
+    ## provisioner without an image. With autoscaling in mode hpa, removing or
+    ## zeroing a request for an enabled utilization target fails rendering: the
+    ## HorizontalPodAutoscaler needs a request on every container. The default
+    ## mode, scaler, reads the service's own CPU time and needs none here.
+    ##
+    ## Use a provisioner that can write several tokens from one container: one
+    ## that writes a single token cannot serve both the Storage Service and the
+    ## backing-store tokens.
+    provisionerSidecar:
+      container:
+        image: ""
+        resources:
+          requests:
+            cpu: 20m
+            memory: 32Mi
+
+## RPC configuration
+rpc:
+  ## @param rpc.deadlineMs Default RPC deadline in milliseconds
+  ## Type: integer. Maps to LIVE_EDIT_RPC_DEADLINE_MS env var. Default: 30000
+  deadlineMs: 30000
+  ## @param rpc.sessionListTimeoutMs ListSessions deadline in milliseconds
+  ## Type: integer. Maps to LIVE_EDIT_SESSION_LIST_TIMEOUT_MS env var. Default: 2000
+  sessionListTimeoutMs: 2000
+
+## Layer configuration
+layer:
+  ## @param layer.maxSize Cap in bytes on any one CreateLayer or UpdateLayer upload (100 MB)
+  ## Type: integer. Maps to LIVE_EDIT_MAX_LAYER_SIZE env var. Default: 104857600
+  ## A larger upload fails INVALID_ARGUMENT; no smaller one is refused for its byte size. Bounds a
+  ## single upload, not the size a layer reaches across updates. The upload memory budget,
+  ## which the service derives from resources.limits.memory (7.5 % of it, 384 MiB at 5Gi),
+  ## never falls below about 8 MiB plus twice maxSize (about 208 MiB at the default), so no
+  ## upload under it is refused for its size. One upload of this size is counted against
+  ## the memory limit beside the budget: raising it lowers the catch-up memory budget, and
+  ## past what the limit can carry the service stops at startup naming the limit it needs.
+  maxSize: 104857600
+  ## @param layer.uploadAdmissionWaitMs Longest an upload waits for upload capacity, in milliseconds
+  ## Type: integer or null. Maps to LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS env var. Default: null
+  ## (unset: the service derives min(2000, rpc.deadlineMs / 2), so 2000 at the default deadline).
+  ## Past it the upload is refused UNAVAILABLE with nothing applied. 0 means never wait. A
+  ## waiting upload leaves its unread content in its connection's flow-control window, so this
+  ## also bounds how long it can hold up other calls on that connection. A value set here must be
+  ## below rpc.deadlineMs; one at or above it is rejected at startup. Bounds admission only: an
+  ## admitted upload's wait to be processed is bounded by rpc.deadlineMs.
+  uploadAdmissionWaitMs: null
+  ## @param layer.uploadAdmissionMaxWaiters Uploads that may wait for the upload budget at once
+  ## Type: integer. Maps to LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS env var. Default: 64
+  ## One more is refused UNAVAILABLE at once. Zero is rejected at startup (set
+  ## uploadAdmissionWaitMs to 0 to never wait).
+  uploadAdmissionMaxWaiters: 64
+  ## @param layer.updateRetryMaxAttempts Max UpdateLayer retry attempts
+  ## Type: integer. Maps to LIVE_EDIT_UPDATE_LAYER_RETRY_MAX_ATTEMPTS env var. Default: 128
+  ## Bounds the server-side retry budget for UpdateLayer. On the slow path (WATCH/MULTI/EXEC)
+  ## covers WATCH conflicts, connection-drop canceled-EXEC, and transient Valkey I/O. On the
+  ## Lua fast path (default) Lua atomicity eliminates WATCH conflicts and EXEC cancels,
+  ## so only transient Valkey I/O during the single EVALSHA can trigger retries. Each retry uses
+  ## full-jitter exponential backoff (cap 50 ms) and re-reads state. Once the budget is
+  ## exhausted the client sees UNAVAILABLE (retriable). Zero is rejected at startup.
+  updateRetryMaxAttempts: 128
+  ## @param layer.updatePerObjectConcurrency Per-object_id concurrent-writer cap for UpdateLayer
+  ## Type: integer. Maps to LIVE_EDIT_UPDATE_LAYER_PER_OBJECT_CONCURRENCY env var. Default: 16.
+  ## Raised 8 → 16 after load measurements on 2026-04-22 showed K=16 closes the N=10
+  ## collaborative-editing throughput gap vs the C++ service with no measurable downside at
+  ## higher N.
+  ## Caps concurrent update_layer writers per object_id via the per-object admission entry's
+  ## writers semaphore (under updateLayerBackend "lua", structural and reset calls first take
+  ## a second, one-at-a-time per-object permit, then this one).
+  ## Permit is acquired BEFORE the backend dispatch so waiters queue on the semaphore rather
+  ## than on exclusive txn-pool slots (slow path) or data-pool slots (fast path), and is held
+  ## across every retry of a single call. On the slow path this bounds WATCH contention
+  ## (per-attempt win probability ≈ 1/K rather than 1/N); on the Lua fast path Lua atomicity
+  ## already guarantees correctness and K contributes bounded-latency fairness. Tuned together
+  ## with updateRetryMaxAttempts — at K=16 and A=128 the slow-path single-call exhaustion
+  ## probability is (15/16)^128 ≈ 0.028 %. Zero is rejected at startup.
+  updatePerObjectConcurrency: 16
+  ## @param layer.updateLayerBackend UpdateLayer commit backend
+  ## Type: string. Maps to LIVE_EDIT_UPDATE_LAYER_BACKEND env var. Default: "lua".
+  ## Accepts "lua" (default), "lua-watch-structural" or "txn" (case-insensitive); read at
+  ## startup. "lua" dispatches field / time-sample / empty deltas through an atomic server-side
+  ## EVALSHA in a single round-trip, eliminating WATCH-conflict retry amplification under high
+  ## single-object concurrency; structural and reset deltas on one object are admitted one at a
+  ## time per replica, planned on the per-replica structural write-planning cache
+  ## (5 % of resources.limits.memory) and committed by one EVALSHA of the same script's seq-fenced
+  ## structural mode, with no WATCH; a layer the cache cannot hold, and an edit too large
+  ## for one script call (clearing, resetting or deleting about 3,000 or more placed assets
+  ## at once; the limit is fixed, not a setting), commit them on the legacy WATCH/MULTI/EXEC
+  ## path. "lua-watch-structural"
+  ## keeps the same fast path and sends structural and reset deltas down the legacy path under
+  ## the plain per-object admission (updatePerObjectConcurrency concurrent calls) — the
+  ## rollback for "lua"'s structural route. "txn" forces every UpdateLayer call down the legacy
+  ## path, also under the plain per-object admission — a no-redeploy-code rollback escape hatch
+  ## if the Lua path ever misbehaves in production, and the mode used for parity testing
+  ## (commit output is byte-for-byte identical between the "lua" and "txn" backends).
+  ## Production default should stay "lua".
+  updateLayerBackend: lua
+
+  ## @param layer.catchupSnapshotEnabled Corrected-snapshot late-join / rejoin catch-up
+  ## Type: boolean. Maps to LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED env var. Default: true.
+  ## true (default) serves the corrected faithful full-state snapshot on late-join / rejoin;
+  ## false falls back to the legacy catch-up reconstruction.
+  catchupSnapshotEnabled: true
+
+  ## @param layer.structuralCacheAuditRate Probability a structural edit starts a sampled audit of the structural write-planning cache
+  ## Type: number in [0, 1]. Maps to LIVE_EDIT_STRUCTURAL_CACHE_AUDIT_RATE env var. Default: 0.001.
+  ## 0 never audits; 1 audits every committed structural edit (a dedicated cache-correctness run).
+  ## Metric only (live_edit_structural_cache_audit_total{outcome}); never writes to the backing store.
+  ## At most one audit runs per replica. Outside [0, 1] fails startup. Rendered unconditionally.
+  ## REQUIRED: an explicit null or empty value fails `helm template` with an error naming
+  ## layer.structuralCacheAuditRate; a deliberate 0 renders "0".
+  ## See docs/service/docs/configuration.md.
+  structuralCacheAuditRate: 0.001
+
+  ## @param layer.structuralCacheAuditAboveCeiling Let the sampled audit read layers above the atomic-read ceilings
+  ## Type: boolean. Maps to LIVE_EDIT_STRUCTURAL_CACHE_AUDIT_ABOVE_CEILING env var. Default: true.
+  ## true reads such a layer with the snapshot-fenced read, as the cache's own load does: it pauses
+  ## an edit to that layer that meets it for about one polling step (typically 1-2 s, at most
+  ## about 2.5-3.2 s on layers of about 7,000-17,400 prims in the Kitchen_set live layer's
+  ## shape, 4-10x the item ceiling), so it runs at most once per replica per
+  ## 10 minutes, skips rather than wait for the replica's read capacity, and its memory counts in
+  ## the catch-up memory budget. false counts such an audit `skipped`, leaving the
+  ## cache's largest entries unchecked. Exactly true or false (1 fails startup).
+  ## REQUIRED: an explicit null or empty value fails `helm template` with an error naming
+  ## layer.structuralCacheAuditAboveCeiling; a deliberate false renders "false".
+  ## See docs/service/docs/configuration.md.
+  structuralCacheAuditAboveCeiling: true
+
+  ## @param layer.extValueVerify What the CreateLayer / UpdateLayer external-value content check does on a mismatch
+  ## Type: string. Maps to LIVE_EDIT_EXT_VALUE_VERIFY env var. Default: "enforce".
+  ## Accepts "enforce" (default) or "observe" (case-insensitive; anything else, including an
+  ## empty value, fails startup). Every external value in an upload must be extValueSize bytes
+  ## long and match its valueOrExtHash (SHA-256 over the SHA-256 digests of its 1 MiB blocks).
+  ## "enforce" refuses an upload that breaks either rule INVALID_ARGUMENT, with nothing stored.
+  ## "observe" counts and logs (WARN) the mismatch and stores the upload anyway: a rollout setting
+  ## for clients not yet confirmed to compute the hash. A copy already stored under the hash is
+  ## never replaced, but a mismatched first copy is what every reader of that hash gets, and
+  ## clients that check content refuse it on read. Both modes count every checked value on
+  ## live_edit_ext_value_verify_total{result}. A change rolls the pods.
+  extValueVerify: enforce
+
+## Session lifecycle retry configuration
+session:
+  ## @param session.retryMaxAttempts Max CreateSession attempts on duplicate-name conflict or connection drop at EXEC
+  ## Type: integer. Maps to LIVE_EDIT_SESSION_RETRY_MAX_ATTEMPTS env var. Default: 32.
+  ## Mirrors the shape of `layer.updateRetryMaxAttempts`. Full-jitter exponential backoff
+  ## capped at 50 ms (`SESSION_RETRY_CAP_DELAY_MS` in code — not configurable so it stays
+  ## aligned with the update_layer cap on the same Valkey, preserving cross-writer fairness).
+  ## Zero rejected at startup.
+  retryMaxAttempts: 32
+  ## @param session.retryInitialDelayMs Initial full-jitter backoff window in ms
+  ## Type: integer. Maps to LIVE_EDIT_SESSION_RETRY_INITIAL_DELAY_MS env var. Default: 1.
+  ## Sleep before retry N drawn uniformly from `[0, min(2^(N-1) × initial, 50 ms)]`.
+  retryInitialDelayMs: 1
+
+## Presence (JoinSession) configuration
+presence:
+  ## @param presence.broadcastCapacity How many presence events a JoinSession stream may fall behind before it loses any
+  ## Type: integer. Maps to LIVE_EDIT_PRESENCE_BROADCAST_CAPACITY env var. Default: 4096
+  ## Applied exactly to the events a stream has not yet taken from the
+  ## queue (it may hold up to 7 more, taken but not yet sent). A lag bound, not memory reserved per session: an idle
+  ## session costs the same at any value. A stream that falls further behind
+  ## loses the oldest events (live_edit_presence_broadcast_dropped_total); one
+  ## that missed another participant joining or leaving is ended UNAVAILABLE
+  ## so the client rejoins (live_edit_presence_resyncs_total). Raise it when
+  ## those climb, and keep it well above twice your largest session's member
+  ## count: each rejoin adds a leave and a join to its session's events, so a
+  ## smaller value lets rejoins push other slow streams past it in turn.
+  ## That rule has been measured with sessions of up to 100 members, and
+  ## streams that read too slowly under sustained message traffic can keep
+  ## rejoining whatever the value. Raising it costs nothing while streams keep up, but raises the
+  ## worst-case memory of a session with a stalled stream in proportion:
+  ## about 112 B per unread event plus the event's own data, up to this many
+  ## events. Must be greater than 0.
+  broadcastCapacity: 4096
+  ## @param presence.sweeperIntervalSecs Crash-recovery presence sweep interval in seconds
+  ## Type: integer. Maps to LIVE_EDIT_SWEEPER_INTERVAL_SECS env var. Default: 15
+  ## (matches DEFAULT_SWEEPER_INTERVAL_SECS). Lower values remove a crashed
+  ## replica's connections sooner at the cost of more Valkey traffic; higher
+  ## values cut that traffic and let stale connections linger longer. 0 is
+  ## not rendered, so the service default applies (the service itself rejects
+  ## 0 at startup).
+  sweeperIntervalSecs: 15
+  ## @param presence.keepaliveIntervalMs JoinSession client keepalive interval in milliseconds; 0 turns it off
+  ## Type: integer. Maps to LIVE_EDIT_PRESENCE_KEEPALIVE_INTERVAL_MS env var. Default: 15000
+  ## A client that opts in to keepalives (JoinSessionHeader.client_keepalive)
+  ## is told this interval and sends a keepalive whenever it has sent nothing
+  ## for that long. A join whose client then sends no data for three
+  ## intervals (45 s at the default) is ended, so its participant leaves
+  ## even when the client vanished behind a proxy without closing its
+  ## stream; these endings are counted on
+  ## live_edit_presence_keepalive_timeouts_total. Clients that do not opt in
+  ## are never ended for silence. 0 turns the keepalive off for every join
+  ## (clients are told 0 and send none): the rollback if live clients are
+  ## ever ended falsely. Otherwise at least 1000: this is the only presence
+  ## setting in milliseconds, and 1–999 (e.g. 15 meant as seconds) is refused
+  ## at render time and by the service at startup. Must be set to a whole
+  ## number: null and anything else that is not a non-negative integer (e.g.
+  ## "15s") are refused at render time.
+  keepaliveIntervalMs: 15000
+
+## Shutdown configuration
+##
+## Constraint: `shutdown.overallBudgetSecs` must be at least
+## `shutdown.timeoutSecs` + 15; the service refuses to start otherwise. The
+## 15 s covers closing the Valkey connections (`ValkeyClient::quit()`, whose
+## internal bounds sum to 11.5 s) plus slack for the shutdown steps with no
+## timeout of their own. The metrics-server abort and the final telemetry
+## flush run after the overall budget, outside it. The floor leaves room for
+## one full per-task wait plus 15 s; it is not the worst case, because the
+## shutdown sequence runs several per-task waits one after another (at least
+## four), so a shutdown in which each of them uses its whole budget can still
+## reach the overall cap, which then cuts the sequence short with a "shutdown
+## overall budget exceeded" warning. Raising `timeoutSecs` without also
+## raising `overallBudgetSecs` makes that warning more likely. The two
+## values are intentionally separate knobs so operators can tune
+## drain-vs-cleanup independently, but the floor above must hold.
+shutdown:
+  ## @param shutdown.timeoutSecs Graceful shutdown deadline in seconds
+  ## Type: integer. Maps to LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS env var. Default: 5.
+  ## Covers the drain window after readiness flips to NOT_SERVING (live
+  ## streams keep serving through it; when it ends the listening socket
+  ## closes, and just after the server's GOAWAY the streams start ending
+  ## UNAVAILABLE, paced — see streamEndRate — which clients retry) and the
+  ## per-task budget for each background-task join and for the JoinSession
+  ## and SubscribeReadLayer cleanup waits during shutdown.
+  timeoutSecs: 5
+  ## @param shutdown.overallBudgetSecs Overall cap on post-server shutdown in seconds
+  ## Type: integer. Maps to LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS env var.
+  ## Default: 30. Wraps the whole post-server shutdown sequence (layer
+  ## cleanup + stream and session-checkpoint drains + background-task joins +
+  ## parallelised Valkey quit()) in a single tokio::time::timeout; the
+  ## metrics-server abort and the final telemetry flush run after it. A term
+  ## of the minimum terminationGracePeriodSeconds (see there). MUST be at
+  ## least timeoutSecs + 15; see the constraint above.
+  overallBudgetSecs: 30
+  ## @param shutdown.streamEndRate Graceful shutdown's stream endings per second, per replica
+  ## Type: integer >= 0. Maps to LIVE_EDIT_SHUTDOWN_STREAM_END_RATE env var.
+  ## Default: 25. After the drain, the replica's live SubscribeReadLayer and
+  ## JoinSession streams end UNAVAILABLE in random order at this rate, so
+  ## their clients' reconnects reach the other replicas as a ramp rather than
+  ## all at once. The window is (live streams) / streamEndRate, capped at
+  ## streamEndMaxWindowSecs; once the cap binds (more than
+  ## streamEndRate x streamEndMaxWindowSecs streams, 500 at the
+  ## defaults) the streams end faster, at (live streams) /
+  ## streamEndMaxWindowSecs per second. 0 ends every stream at once.
+  streamEndRate: 25
+  ## @param shutdown.streamEndMaxWindowSecs Cap on graceful shutdown's stream-ending window in seconds
+  ## Type: integer >= 0. Maps to LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS
+  ## env var. Default: 20. 0 ends every stream at once. Counts toward the
+  ## minimum terminationGracePeriodSeconds (see there) and the derived
+  ## minReadySeconds.
+  streamEndMaxWindowSecs: 20
+
+## @param serviceLabel Optional value for the `service` Prometheus label
+## Type: string. Maps to LIVE_EDIT_SERVICE_LABEL env var when set. Default: "" (binary falls back to HOSTNAME, then "unknown").
+## Operators who want a stable service label across pod restarts (e.g. a Deployment
+## or release identifier) can pin it here. Empty string skips the ConfigMap entry,
+## which preserves the HOSTNAME-based default. It also sets the `replica_id` log
+## field. Leader election does not depend on it: every leader lock holds this
+## value plus a per-process ID, so pinning one value for all replicas is safe.
+serviceLabel: ""
+
+## Garbage collection configuration
+gc:
+  ## @param gc.extReconcileIntervalSecs External-value ref_count reconciler interval in seconds
+  ## Type: integer. Maps to LIVE_EDIT_EXT_RECONCILE_INTERVAL_SECS env var. Default: 3600.
+  ##
+  ## The reconciler is the only thing in the service that can compare each external
+  ## value's reference count against the layers that actually reference it and hand
+  ## back the difference. It is the drain for the leak-direction residuals that no
+  ## keyspace event reaches: a replica that died between committing an edit and
+  ## recording the release it owed, a disaster-recovery restore's suppressed
+  ## surplus, references stranded by corrupt keyspace.
+  ##
+  ## Each pass also audits every layer's own reference index (how many of its
+  ## fields and time samples hold each external value) against the layer's rows
+  ## and repairs it atomically where they disagree, releasing nothing itself. A
+  ## layer it cannot repair (more rows than half
+  ## valkey.snapshotAtomicReadMaxItems, not live, or carrying a `hash`
+  ## column in uppercase or mixed-case hex, which is keyspace corruption to fix:
+  ## outcome="withheld") has its values held from reclamation for that pass, so
+  ## the pass never hands back the excess that may be keeping a value alive. A
+  ## `hash` column that is not hex at all, or a key of the wrong type, in a layer
+  ## the audit reads stops every pass until an operator fixes it, and nothing is
+  ## repaired or reclaimed meanwhile
+  ## (live_edit_ext_reconcile_total{outcome="enumeration_failed"}). See
+  ## live_edit_ext_index_recount_total and live_edit_ext_index_drift_total.
+  ##
+  ## Each pass also moves time samples an older build stored at time -0.0 to
+  ## 0.0, merging each with any 0.0 sample of the same attribute, so each time
+  ## is stored once.
+  ## Readers already serve one sample per time, so the merge changes nothing they
+  ## see. See live_edit_time_sample_signed_zero_merge_total.
+  ##
+  ## It declines to judge any stored value uploaded within its safety window, so
+  ## a value re-uploaded faster than once per window is not reclaimed while that
+  ## traffic continues. On a dashboard that reads as
+  ## live_edit_ext_reconcile_total{outcome="skipped_recent_store"} carrying the
+  ## traffic while `repaired` sits near zero — the pass refusing to race a live
+  ## upload, not a stall.
+  ##
+  ## It walks the whole object and blob keyspace, so it runs on its own long
+  ## interval rather than with the external-value GC loop's once-a-second passes,
+  ## and it is leader-elected — exactly one replica runs a pass per interval,
+  ## whatever the replica count.
+  ##
+  ## `0` disables it. That is a supported, deliberate choice (it logs a startup
+  ## WARN), but on a `noeviction` store it means those residuals accumulate with
+  ## nothing to reclaim them, and the per-layer index audit stops too: an index
+  ## gone wrong is no longer repaired on a schedule (a layer created before 0.1.0
+  ## cannot lose a value through it, since nothing drains its excess, unless an
+  ## earlier build's reconciler already did; drift from any other cause stays
+  ## exposed to edits). The time-sample merge stops as well: -0.0 samples an
+  ## older build stored stay as they are (reads stay correct). It is also the
+  ## switch to use for the duration of a rolling upgrade FROM a build older than
+  ## this one, whose uploads record no last-upload timestamp and could otherwise
+  ## be misread as surplus by an already-upgraded replica holding the maintenance
+  ## lease. The exposure is bounded to one interval and needs the old replicas to
+  ## still be accepting uploads a full interval after that point; no released
+  ## build can produce it.
+  ##
+  ## Values below the reconciler's internally-derived grace window are REJECTED at
+  ## startup: a pass shorter than the grace could never act on what it observed.
+  ##
+  ## The 3600 below is a BASELINE the binary raises when the derived grace is
+  ## larger. Unset, the binary's default is `max(3600, derived grace)`, and that
+  ## grace scales with `rpc.deadlineMs` — above an RPC deadline of 360000 the
+  ## grace exceeds an hour. This chart always emits the env var, so the value
+  ## here is taken VERBATIM and never raised for you: a chart value of 3600
+  ## paired with such an RPC deadline is a startup rejection, not a silent clamp.
+  ## Raise this key alongside `rpc.deadlineMs` if you raise that one.
+  extReconcileIntervalSecs: 3600
+
+## Checkpoint configuration (the disaster-recovery layer)
+##
+## The checkpoint subsystem is the belt-and-suspenders durability layer alongside
+## Valkey AOF. When `checkpoint.enabled: true` (the chart default), a periodic
+## writer materializes layer state to the configured `adapter` so a catastrophic
+## Valkey loss can be recovered without depending on AOF alone. When `enabled:
+## false`, the service relies on AOF only — startup refuses if AOF is also off
+## (best-effort probe; degrades to a startup WARN on Azure Managed Redis (AMR)
+## where `CONFIG GET appendonly` is blocked).
+##
+## Safe-default reasoning:
+##   - `enabled: true` is the chart default — AMR-managed and self-hosted
+##     deployments both get DR coverage out of the box.
+##   - `adapter: Disabled` is the chart default because no adapter has a sensible
+##     production default (LocalDisk requires a PVC, StorageApi requires an
+##     endpoint + base path + service identity). Combined with `enabled: true`,
+##     a fresh `helm install` with no checkpoint overrides FAILS LOUD at startup
+##     with the no-durability error message — operators MUST make a deliberate
+##     adapter choice. This is intentional: the silent "checkpoints on, adapter
+##     off" zero-durability case is the precise failure mode that startup
+##     guardrail was added to prevent.
+##
+## See docs/service/docs/durability.md for the durability modes and
+## docs/service/docs/backing-store-azure.md § Durability for Azure Managed Redis.
+## The `## @param` comments below must stay consistent with durability.md.
+checkpoint:
+  ## @param checkpoint.enabled Enable periodic checkpoint writes for catastrophic Valkey-loss recovery
+  ## Type: boolean. Maps to LIVE_EDIT_CHECKPOINT_ENABLED env var. Default: true.
+  ##   true (default): belt-and-suspenders DR. Requires `adapter` to be non-Disabled,
+  ##     otherwise startup refuses with the no-durability error message ("live-edit refuses
+  ##     to start with no durability configured: enable Valkey AOF, enable
+  ##     LIVE_EDIT_CHECKPOINT_ENABLED with a configured adapter, or both").
+  ##   false: rely on Valkey AOF alone. Startup refuses if Valkey AOF is also off,
+  ##     except on a managed store (Azure Managed Redis, Amazon MemoryDB,
+  ##     ElastiCache) that cannot answer `CONFIG GET appendonly`: there the
+  ##     refusal degrades to a startup WARN (the operator is trusted to know the
+  ##     store's persistence setting).
+  ##   See docs/service/docs/durability.md and, on Azure Managed Redis,
+  ##   docs/service/docs/backing-store-azure.md § Durability for full operator guidance.
+  enabled: true
+
+  ## @param checkpoint.adapter Backend selector for checkpoint storage
+  ## Type: string. Maps to LIVE_EDIT_CHECKPOINT_ADAPTER env var. Default: "Disabled".
+  ## Accepted values (case-insensitive): "Disabled", "InMemory", "LocalDisk", "StorageApi".
+  ##   Disabled (default): NO checkpoint backend. Combined with `enabled: true`,
+  ##     startup refuses with the no-durability error message. Operators MUST set this
+  ##     to InMemory, LocalDisk, or StorageApi when `enabled: true`.
+  ##   InMemory: process-local; lost on restart. Dev/test only.
+  ##   LocalDisk: requires `localDiskPath`. Single-replica / HostPath only — NOT
+  ##     safe for the chart's default 3-replica deployment (each replica would
+  ##     write its own divergent checkpoints to a per-pod ephemeral volume).
+  ##   StorageApi: production target. Requires `storageApiEndpoint` +
+  ##     `basePath` and the service-identity token file:
+  ##     `serviceIdentity.accessTokenFile.enabled: true`, with the token file
+  ##     written by your token provisioner or supplied through your own volume
+  ##     (stanza above). The render FAILS for StorageApi (any letter
+  ##     case) with `serviceIdentity.accessTokenFile.enabled: false`, because
+  ##     the chart then sets no LIVE_EDIT_SERVICE_TOKEN_FILE and the service
+  ##     refuses to start without it; `clientCredentials` does not satisfy
+  ##     this. Network prerequisite: checkpoint artifacts at or
+  ##     above storage-api's `writeBodyMaxSize` (2 MiB in the reference
+  ##     deployment) are uploaded through a presigned blob-storage URL that
+  ##     storage-api hands back, so the pod needs DNS/TLS/NetworkPolicy egress
+  ##     to that blob endpoint — see docs/service/docs/durability.md § Network
+  ##     access to the backup store. Reads are served inline and need no extra egress.
+  adapter: Disabled
+
+  ## @param checkpoint.interval Inter-checkpoint cadence in seconds
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_INTERVAL_SECS env var. Default: 60.
+  ## Upper bound on the wall-clock gap between completed checkpoint writes per
+  ## layer, measured from when the last one landed — a layer under continuous
+  ## write is still captured on this cadence. Lower values reduce worst-case
+  ## recovery loss but raise adapter write traffic; higher values widen the
+  ## recovery window. The tick loop (`tick`) re-evaluates per-layer eligibility
+  ## on a faster cadence.
+  interval: 60
+
+  ## @param checkpoint.quiesce Post-idle early-checkpoint window in seconds
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_QUIESCE_SECS env var. Default: 30.
+  ## Once a layer has been write-idle this long, the checkpointer captures it
+  ## early instead of waiting out the rest of `interval` — so a layer that just
+  ## went quiet gets a fresh backup promptly. This is OR'd with `interval`, not a
+  ## precondition for it. Zero rejected at startup.
+  quiesce: 30
+
+  ## @param checkpoint.tick Checkpointer scheduler tick in seconds
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_TICK_SECS env var. Default: 10.
+  ## Cadence at which the checkpointer evaluates per-layer eligibility (combining
+  ## `interval` + `quiesce` + last-write timestamps). MUST be strictly less than
+  ## `checkpoint.interval` — `Config::from_env` rejects `tick >= interval` at
+  ## startup. Zero rejected at startup.
+  tick: 10
+
+  ## @param checkpoint.retainGenerations Number of historical checkpoint generations to keep per layer
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_RETAIN_GENERATIONS env var. Default: 2.
+  ## Older generations are pruned after a successful new write. Two generations
+  ## give one prior fallback if the most recent write is partially corrupt; raise
+  ## for longer rollback windows at the cost of adapter storage. Zero rejected at
+  ## startup.
+  retainGenerations: 2
+
+  ## @param checkpoint.seqSafetyMargin FLOOR for the sequence_num guard band applied when a layer is restored from checkpoint
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_SEQ_SAFETY_MARGIN env var. Default: 1000.
+  ## Applied at RESTORE time, not at checkpoint-write time: a recovered layer's
+  ## sequence resumes at `max(snapshot_seq, observed_high_water) + band`, where
+  ## `band = max(margin, commit span the checkpoint measured)`, so sequence
+  ## numbers already acknowledged for commits lost in the recovery window cannot
+  ## be re-issued with different content. When the layer's update stream survived
+  ## the loss, the observed high-water makes the bound exact; otherwise the
+  ## guarantee holds only if the band exceeds the commits lost in that window.
+  ## The band self-sizes per layer from the commits each checkpoint measured
+  ## since the previous one that landed, so this value is the FLOOR — it governs
+  ## the restores with no larger measurement behind them: a layer's first
+  ## checkpoint (which records no measurement at all), checkpoints written
+  ## before the measurement existed, and layers quieter than the floor.
+  ## Sizing is TWO-SIDED:
+  ##   - Lower bound: `margin >= peak_commits_per_sec × checkpoint.interval`,
+  ##     or a quiet layer's band is too small and the no-reuse guarantee fails.
+  ##   - Upper bound: the band is charged to CLIENTS. The client protocol
+  ##     requires gapless sequence numbers, so every number the band skips is
+  ##     synthesized by every reconnecting subscriber as a no-op gap-fill
+  ##     callback in one uncapped, unyielding loop. Over-sizing costs a
+  ##     reconnect burst per client per restore. That cost has NOT been measured
+  ##     empirically yet — leave the default unless quiet layers commit faster
+  ##     than it, and let measurement size the band on the hot layers.
+  ## Zero rejected at startup.
+  seqSafetyMargin: 1000
+
+  ## Incremental ("tail") backups between full checkpoints.
+  ## The four sub-keys below map 1:1 to the LIVE_EDIT_CHECKPOINT_TAIL_* env
+  ## vars, which the ConfigMap emits UNCONDITIONALLY (like the other non-
+  ## adapter-specific checkpoint rows) so a rendered manifest always carries
+  ## the canonical spelling whether or not the feature is on.
+  ##
+  ## The feature is on by default; the chart matches the binary default. Setting
+  ## `enabled: false` is the opt-out and leaves every behaviour described under
+  ## `checkpoint.*` above unchanged — see docs/service/docs/durability.md
+  ## § Incremental backups and retention.
+  tail:
+    ## @param checkpoint.tail.enabled Take incremental backups between full checkpoints
+    ## Type: boolean. Maps to LIVE_EDIT_CHECKPOINT_TAIL_ENABLED env var. Default: true.
+    ##   true (default): each eligible checkpoint pass may capture only the
+    ##     layer's edits since its last full backup, so a layer under continuous
+    ##     write advances its recovery point at pass cadence instead of waiting
+    ##     for a full backup it may never be quiet enough to produce.
+    ##   false: no incremental backups. Recovery reads full backups only,
+    ##     exactly as described in the `checkpoint.*` params above.
+    ## The binary parses this with the plain stdlib bool parser, so the rendered
+    ## value must be exactly `true` or `false`, LOWER-CASE — a quoted override
+    ## such as `--set checkpoint.tail.enabled="True"` (or `yes`/`on`) renders a
+    ## string the binary REJECTS at startup. An unquoted `--set
+    ## checkpoint.tail.enabled=true` is a YAML boolean and renders correctly.
+    ## Recovery itself does not consult the flag — it restores from whatever the
+    ## backup store holds — so flipping this to `false` keeps recovering
+    ## from already-captured incremental backups until they age out.
+    enabled: true
+
+    ## @param checkpoint.tail.maxChain Incremental backups that may chain onto one full backup before the chain is composed
+    ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_TAIL_MAX_CHAIN env var. Default: 8.
+    ## A bound on RECOVERY COST, not on coverage: a recovery fetches the full
+    ## backup a chain rests on plus the verified incremental backups above it, so
+    ## this caps how many artifacts one restore fetches and applies — and, since
+    ## those fetches share the one per-restore time budget, how much of that
+    ## budget a single restore can spend. When a layer's chain reaches this
+    ## limit the next pass composes the chain into a FRESH full backup (built
+    ## from artifacts the store already holds, so it needs no quiet period) and
+    ## incremental backups resume on top of it. Raising it means more artifacts
+    ## fetched at recovery time and fewer composed full backups written;
+    ## lowering it does the reverse. A change applies to chains written from
+    ## then on — it does not shorten chains the store already holds.
+    ## Zero rejected at startup (a chain bound of zero admits no tail at all, so
+    ## every eligible pass would refuse and the feature would be silently inert
+    ## while reporting itself enabled).
+    maxChain: 8
+
+    ## @param checkpoint.tail.maxEntries Maximum number of edits one incremental backup may carry
+    ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES env var. Default: 4096.
+    ## An incremental backup is built by replaying the layer's live update
+    ## stream, so this cap and `valkey.layerStreamMaxlen` interact:
+    ##   - Setting it ABOVE `valkey.layerStreamMaxlen` logs a startup WARN
+    ##     rather than being rejected. A tail can never carry more edits than the
+    ##     stream retains, so the larger number is inert, not wrong — it just
+    ##     reads like capacity the deployment does not have. The chart default
+    ##     matches `valkey.layerStreamMaxlen`'s default (also 4096), so the
+    ##     WARN is silent until you change one of the two.
+    ##   - Note the reverse direction is a DURABILITY knob once `enabled: true`:
+    ##     stream retention becomes a recovery floor, because incremental
+    ##     backups can only cover edits the stream still holds when the pass
+    ##     reaches them. Lower `valkey.layerStreamMaxlen` or
+    ##     `valkey.layerStreamMaxBytes` to save memory only while a hot
+    ##     layer's edits, and its update bytes, per `checkpoint.interval` stay
+    ##     comfortably inside the window (docs/service/docs/backing-store.md
+    ##     § Memory).
+    ## Zero rejected at startup, as is any value above 9007199254740991
+    ## (2^53 - 1) — a ceiling far above any workable setting, present because a
+    ## tail's entry count is already bounded by the Lua-f64-bounded stream
+    ## sequence span it covers.
+    maxEntries: 4096
+
+    ## @param checkpoint.tail.maxBytes Size limit in bytes for one incremental backup artifact
+    ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES env var. Default: 67108864 (64 MiB).
+    ## The default is an order of magnitude above the measured size of a
+    ## 4096-entry tail while keeping any one incremental backup well below the
+    ## 100 MB `layer.maxSize` scale of the full backups it layers onto — a tail
+    ## must never cost more to fetch than its base.
+    ## It has a byte twin of maxEntries' interaction: setting it ABOVE a non-zero
+    ## `valkey.layerStreamMaxBytes` logs a startup WARN rather than being
+    ## rejected, because a tail can never carry more update bytes than the
+    ## stream retains. The defaults (64 MiB against 128 MiB) are silent.
+    ## Zero rejected at startup, as is anything below 66 bytes: that is one tail
+    ## header plus one record prefix plus a single payload byte, the smallest
+    ## artifact that can hold one edit, and below it every capture would refuse
+    ## forever while the feature reported itself enabled.
+    maxBytes: 67108864
+
+  ## @param checkpoint.localDiskPath Filesystem path for the LocalDisk adapter
+  ## Type: string. Maps to LIVE_EDIT_CHECKPOINT_LOCAL_DISK_PATH env var.
+  ## Default: "" (empty — REQUIRED when `adapter: LocalDisk`, ignored otherwise).
+  ## The chart only emits this env var when `adapter: LocalDisk`. Set to a
+  ## persistent-volume mount inside the container (e.g.
+  ## `/var/lib/live-edit/checkpoints`). Single-replica deployments only — the
+  ## per-pod ephemeral path means a 3-replica deployment would write divergent
+  ## checkpoints to three different volumes.
+  localDiskPath: ""
+
+  ## @param checkpoint.storageApiEndpoint StorageApi base URL for the StorageApi adapter
+  ## Type: string. Maps to LIVE_EDIT_CHECKPOINT_STORAGE_API_ENDPOINT env var.
+  ## Default: "" (empty — REQUIRED when `adapter: StorageApi`, ignored otherwise).
+  ## Must include an explicit scheme — `https://` (production) or `http://`
+  ## (test/dev only). Bare hostnames are rejected at startup to
+  ## prevent silent plaintext downgrade of the service-identity bearer transit.
+  ## The chart only emits this env var when `adapter: StorageApi`.
+  storageApiEndpoint: ""
+
+  ## @param checkpoint.basePath StorageApi base path prefix for per-object checkpoint blobs
+  ## Type: string. Maps to LIVE_EDIT_CHECKPOINT_BASE_PATH env var.
+  ## Default: "" (empty — REQUIRED when `adapter: StorageApi`, ignored otherwise).
+  ## Identifies the path-prefix under which the adapter writes per-object
+  ## checkpoint blobs. Must agree with the path-prefix the configured service
+  ## identity holds write permission on in the upstream storage permissions
+  ## service — otherwise checkpoint writes will fail with PERMISSION_DENIED.
+  basePath: ""
+
+  ## Service-identity access-token reader for the StorageApi checkpoint adapter.
+  ## Schema mirrors `valkey.credentials.accessTokenFile` for cross-consumer
+  ## consistency: your token provisioner under
+  ## `serviceIdentity.accessTokenFile.provisionerSidecar` is the token WRITER;
+  ## this block is the checkpoint adapter's READER surface. Only consulted when
+  ## `serviceIdentity.accessTokenFile.enabled: true`.
+  credentials:
+    accessTokenFile:
+      ## @param checkpoint.credentials.accessTokenFile.path Filesystem path your token provisioner writes the service-identity access token to
+      ## Type: string. Maps to LIVE_EDIT_SERVICE_TOKEN_FILE env var.
+      ## Default: /etc/secrets/access-token/access_token. The checkpoint StorageApi
+      ## adapter is the *reader* of this token. Its DIRECTORY is the shared
+      ## `token-exchange` mount (`/etc/secrets/access-token`),
+      ## so `valkey.credentials.accessTokenFile.path` MUST live in the same directory
+      ## with a DIFFERENT filename for both token files to coexist in the one shared
+      ## volume. Only consulted when `serviceIdentity.accessTokenFile.enabled: true`.
+      path: /etc/secrets/access-token/access_token
+
+      ## @param checkpoint.credentials.accessTokenFile.pollIntervalSecs Polling cadence (integer seconds) for the live-edit process re-reading the service-identity token file
+      ## Type: integer. Default: 15. Emitted as
+      ## `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` on the live-edit container
+      ## when `serviceIdentity.accessTokenFile.enabled: true`. Token file writes by
+      ## the provisioner must be atomic (write-temp + rename), so the live-edit reader picks
+      ## up rotations within `pollIntervalSecs` of the rename. Lower values reduce
+      ## the worst-case staleness window at the cost of extra filesystem reads. Zero
+      ## rejected at startup by the live-edit binary.
+      pollIntervalSecs: 15
+
+  ## @param checkpoint.connectTimeoutMs Connect-phase timeout for the StorageApi outbound HTTP client (ms)
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_CONNECT_TIMEOUT_MS env var. Default: 5000.
+  ## Bounds the TCP/TLS connect phase so a hung peer cannot stall the
+  ## checkpointer indefinitely. Zero rejected at startup (a zero connect-phase
+  ## timeout would fail every StorageApi checkpoint call synchronously).
+  connectTimeoutMs: 5000
+
+  ## @param checkpoint.requestTimeoutMs End-to-end request timeout for StorageApi checkpoint calls (ms)
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_REQUEST_TIMEOUT_MS env var. Default: 30000.
+  ## Larger than the auth-RPC timeout pattern because checkpoint blobs can be
+  ## multi-MB; the budget must accommodate a full upload of the
+  ## largest layer in the deployment. Zero rejected at startup.
+  requestTimeoutMs: 30000
+
+  ## @param checkpoint.countersSyncInterval Periodic counter-sidecar write cadence (seconds)
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_COUNTERS_SYNC_SECS env var. Default: 60.
+  ## Controls how often the checkpoint leader copies the object_id counter
+  ## (stored in Valkey) into a sidecar in the checkpoint store, so a fresh
+  ## restart after catastrophic Valkey loss can re-seed the counter above any
+  ## object_id referenced by a surviving checkpoint. Zero rejected at startup
+  ## (would tight-loop the sidecar writer and saturate the maintenance pool).
+  countersSyncInterval: 60
+
+  ## @param checkpoint.counterSafetyMargin Safety margin added to the re-seeded object_id counter at recovery
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_COUNTER_SAFETY_MARGIN env var. Default: 1000000.
+  ## After a recovery-from-checkpoint that re-seeds the object_id counter from
+  ## the sidecar's last-known max, the counter resumes at `(persisted_max +
+  ## margin)` so any object_ids that were assigned but not-yet-sidecar-synced
+  ## before the loss cannot collide with new CreateLayer-assigned ids. The
+  ## margin must exceed the number of layers created across the deployment
+  ## while the sidecar lags behind the counter. Raising it is safe; lowering
+  ## it below the default risks reused layer ids after a Valkey data loss.
+  ## A pod start can advance object_ids by up to this amount, which is
+  ## harmless. Accepted range: 1 to 1000000000; zero and larger values are
+  ## rejected at startup.
+  counterSafetyMargin: 1000000
+
+  ## @param checkpoint.extMirrorQueueCapacity How many large values can wait to be copied to the backup store
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_EXT_MIRROR_QUEUE_CAPACITY env var. Default: 1000.
+  ## How many large values (external values) can wait at once to be copied to the
+  ## backup store after their upload is stored. A limit on the number of values, not
+  ## on memory: the memory they hold is capped separately, sized from
+  ## resources.limits.memory (128 MiB at 5Gi; live_edit_checkpoint_ext_mirror_budget_bytes).
+  ## A value that finds either limit full is not copied and the upload still succeeds;
+  ## live_edit_checkpoint_ext_mirror_dropped_total counts it by reason (queue_full for
+  ## this limit). The backup repair uploads a skipped copy a few minutes later, while
+  ## the backing store still holds the value; until then a restore after the backing
+  ## store loses its data cannot bring it back. Raise this when drops show reason
+  ## queue_full. Zero rejected at startup.
+  extMirrorQueueCapacity: 1000
+
+  ## @param checkpoint.extMirrorWorkers How many large values each replica copies to the backup store at once
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_EXT_MIRROR_WORKERS env var. Default: 2.
+  ## How many large values each replica copies to the backup store at once. Raise it
+  ## when a slow remote backup store leaves values waiting (drops with reason
+  ## budget_full or queue_full while the backup store is healthy); values above ~4
+  ## rarely help on the InMemory or LocalDisk adapters. A copy the backup store
+  ## refuses (live_edit_checkpoint_ext_mirror_errors_total) is not retried by the
+  ## worker; the backup repair uploads it again a few minutes later. Accepted range: 1
+  ## to 16; zero and larger values are rejected at startup.
+  extMirrorWorkers: 2
+
+  ## @param checkpoint.reconcileIntervalSecs Cadence of the checkpoint-store reconciliation (housekeeping) pass
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_RECONCILE_INTERVAL_SECS env var.
+  ## Default: "" (empty — leave UNSET and the service derives
+  ## `max(3600, reconciliation grace)`). The chart only emits this env var when
+  ## the value is non-empty, so an empty value is "operator expressed no
+  ## opinion", not "empty string", which the binary's config parsing rejects.
+  ## The pass reclaims orphaned partial-publish artifacts and collects
+  ## tombstoned ext blobs. It is pure garbage reclamation on a cold path —
+  ## nothing downstream waits on its latency — and every pass enumerates the
+  ## adapter's whole `layers/` namespace, which is LIST-shaped and billable on
+  ## a blob backend, so hourly is the deliberate baseline: raising the cadence
+  ## reclaims storage sooner, lowering it multiplies LIST traffic.
+  ## Two startup validations apply to an explicitly set value:
+  ##   - Zero rejected (it would panic `tokio::time::interval` and spin a full
+  ##     namespace enumeration).
+  ##   - Must be `>=` the derived reconciliation grace
+  ##     (`max(3 × adapter publish worst case, 60s)` — 540s under `StorageApi`
+  ##     at the default `requestTimeoutMs`, 60s under the local adapters).
+  ##     Below the grace no candidate is ever observed twice a grace apart, so
+  ##     every pass defers everything and reclaims nothing forever while still
+  ##     paying for the enumeration.
+  ## The DERIVED default follows that same rule automatically — it is
+  ## `max(3600, grace)` rather than a flat hour, so raising
+  ## `checkpoint.requestTimeoutMs` far enough to push the grace past an hour
+  ## still boots with this value left empty. Read the grace off a scrape via
+  ## `live_edit_checkpoint_config_reconcile_grace_seconds`.
+  reconcileIntervalSecs: ""
+
+## Memory allocator
+##
+## The service binary allocates through jemalloc with
+## `background_thread:true,thp:never` compiled in, so freed memory returns to
+## the OS within minutes of load ending whether the node's
+## transparent-huge-page setting is `always`, `madvise` or `never`, provided
+## the service can read that setting (it warns at startup if not). Nothing
+## here needs setting for that; this block only exists to override jemalloc
+## options for diagnosis or tuning.
+allocator:
+  ## @param allocator.mallocConf jemalloc option override
+  ## Type: string. Maps to the _RJEM_MALLOC_CONF env var. Default: "" (unset —
+  ## the compiled-in options apply unchanged).
+  ## Comma-separated jemalloc `key:value` options, e.g. `narenas:8`. Each key
+  ## given overrides the compiled-in value for that key only; keys not given
+  ## keep their compiled-in values. The plain MALLOC_CONF variable has no
+  ## effect on this binary. Unknown keys and bad values are reported by
+  ## jemalloc on stderr at startup and otherwise ignored.
+  ## KEEP `thp:never` if you override `thp`, and do not turn
+  ## `background_thread` off: either change makes freed memory stay resident
+  ## (on nodes whose transparent huge pages are `always`, as on stock AKS
+  ## Ubuntu nodes, purged memory is re-filled). The service logs a startup WARN when it runs
+  ## with either. Changing this value rolls the pods.
+  mallocConf: ""
+
+## @param resources Resource limits and requests for the container
+## Type: object. Default: requests cpu=1 and memory=null; limits cpu=2 and memory=5Gi.
+## REQUIRED: resources.limits.memory, a non-zero quantity. The service reads its
+## container's memory limit at startup and sizes every memory budget from it, so the
+## render fails without one.
+## Nothing else sets those budgets:
+##   - the upload memory budget: 7.5 % of the limit, never below the floor
+##     layer.maxSize needs;
+##   - the structural write-planning cache: 5 % of the limit (a full cache holds about
+##     1.21 x that with the indexes it keeps beside each layer);
+##   - the subscription ceiling: 0.8 subscriptions per MiB of the limit (compare
+##     live_edit_subscriber_admitted against live_edit_subscriber_max_subscriptions);
+##   - the catch-up memory budget: what the limit leaves once 20 % is held back and
+##     every other term is counted, among them the steady state, the subscriptions,
+##     the catch-up slots, the stream readers, the cache, the uploads and the Valkey
+##     connections' buffers;
+##   - with backups on (checkpoint.enabled, with checkpoint.adapter other than Disabled), the memory for large values waiting
+##     to be copied to the backup store: 2.5 % of the limit, never below one
+##     layer.maxSize value, taken from the 20 % held back;
+##   - the memory for cleaning up deleted and replaced layers, which grows with the
+##     limit: the clean-ups on one replica run a few at a time within it, each taking
+##     room sized from its layer, and are admitted in arrival order: one waits while
+##     the room it needs is in use or another waits ahead of it
+##     (live_edit_retirement_wait_seconds). Layers of about 1,000 large values clean
+##     up about two at a time at 5Gi, and one at a time near the minimum limit.
+## At 5Gi they are 384 MiB, 256 MiB, 4,096 subscriptions, 744 MiB and 128 MiB; at 4Gi
+## 307 MiB, 204 MiB, 3,276, 433 MiB and 102 MiB; at 8Gi 614 MiB, 409 MiB, 6,553,
+## 1,607 MiB and 204 MiB. The
+## startup log and live_edit_pod_memory_limit_bytes show the limit read and the values
+## derived. The settings that are counts or sizes (valkey.poolSize and the other pool
+## sizes, valkey.subscriberPoolSize, valkey.subscriberMaxConcurrentCatchups,
+## valkey.catchupFencedReadConcurrency, the snapshot ceilings, layer.maxSize,
+## layer.uploadAdmissionMaxWaiters) are counted against the limit: raising one lowers
+## the catch-up memory budget. When the limit cannot carry the configuration (below
+## 2709Mi (2,709 MiB, about 2.65Gi) at this chart's defaults, on any CPU count, or
+## below 2809Mi (2,809 MiB) on any CPU count with a backup store) the service stops at
+## startup with an error naming the smallest limit it needs, so a rolling upgrade
+## keeps the old pods serving.
+## A change of the memory limit restarts the container, because the budgets are sized
+## once, at start: on Kubernetes 1.27 and later the chart sets resizePolicy memory:
+## RestartContainer, so an in-place resize restarts it too; before 1.27 there is no
+## in-place resize and the chart leaves the field out.
+## The memory request: null or empty (the default) renders 70 % of
+## resources.limits.memory, rounded down to whole Mi (3584Mi at 5Gi, 1896Mi at
+## 2709Mi), and follows the limit when you change it, so nodes are not over-committed
+## by replicas growing toward their limit. A request you set is used exactly as
+## written; one above the limit fails the render. `helm upgrade --reuse-values` from
+## an older chart carries that chart's memory request over as a set value (1Gi, in
+## 0.2.0-rc.84 and every later release before the 70 % default; from an earlier
+## release `--reuse-values` fails first on the renamed values); upgrade with
+## --reset-then-reuse-values or your values files to get the 70 % default.
+## Both memory values take any Kubernetes quantity: bytes (5368709120), a decimal
+## fraction (2.5Gi), a unit Ki, Mi, Gi, Ti, Pi, Ei or k, M, G, T, P, E, or a decimal
+## exponent (5e9). The render fails, naming the value, on a form Kubernetes refuses
+## (5GB, 5gi, a negative), on the m, u and n suffixes (fractions of a byte, almost
+## certainly a typo for Mi or M), on a decimal exponent below -1000, on a zero limit
+## and above 8Pi.
+## The autoscaler does not scale on memory by default, so the request does not change
+## scaling. See docs/service/docs/scaling.md § Starting size.
+## The CPU request is one core: a replica uses about 0.6-0.8 cores in join bursts while
+## the replica count is below autoscaling.maxReplicas (at maxReplicas it can reach the
+## CPU limit). The autoscaler's
+## CPU target is a percentage of the request, so at the default 80 it adds replicas when
+## they average about 0.8 cores; a smaller request scales out on load a replica handles
+## well.
+resources:
+  requests:
+    cpu: 1
+    memory: null
+  limits:
+    cpu: 2
+    memory: 5Gi
+
+## Startup probe configuration
+## Uses the gRPC health check protocol. Suspends the liveness and readiness
+## probes until it first succeeds, so a slow-but-progressing boot cannot be
+## killed as if it were a wedged process.
+##
+## It deliberately targets the READINESS service name, not the liveness
+## ("") name. The service binds :50001 and answers "" = SERVING within
+## milliseconds of process start, so a startup probe pointed at "" would
+## protect nothing AND would remove the only restart path for a boot that
+## wedges — e.g. a counter-seed recovery that never completes leaves
+## readiness NOT_SERVING forever while liveness stays happy. Pointing at the
+## readiness name restores that restart path.
+##
+## Set to `null` (or `~`) to omit the probe entirely.
+startupProbe:
+  grpc:
+    ## @param startupProbe.grpc.port gRPC port for startup probe
+    ## Type: integer. Should match service.grpc.port. Default: 50001
+    port: 50001
+    ## @param startupProbe.grpc.service gRPC health service name for the startup probe
+    ## Type: string. Must be the readiness service name — see above.
+    service: "nvidia.omniverse.live.v1alpha.LiveService"
+  ## @param startupProbe.initialDelaySeconds Delay before the first startup probe
+  ## Type: integer. Default: 0. The socket is bound before any dependency is
+  ## wired, so there is nothing to wait for.
+  initialDelaySeconds: 0
+  ## @param startupProbe.periodSeconds Interval between startup probes
+  ## Type: integer. Default: 5
+  periodSeconds: 5
+  ## @param startupProbe.timeoutSeconds Per-probe timeout
+  ## Type: integer. Default: 2
+  timeoutSeconds: 2
+  ## @param startupProbe.failureThreshold Consecutive failures before the pod is restarted
+  ## Type: integer. Default: 57. periodSeconds × failureThreshold = 285 s of
+  ## boot budget. A normal boot takes seconds; this budget only matters for a
+  ## DEGRADED boot, where each Valkey connect phase runs to its full timeout.
+  ## The worst-case boot terms are ADDITIVE, not alternative: the counter-seed
+  ## recovery routine runs *after* Valkey wiring completes, so a
+  ## slow-but-progressing boot pays both. 150 s (degraded Valkey connect:
+  ## 5 sequential connect phases — the data, txn, maintenance and snapshot
+  ## pools and the pub/sub connection — each cut off at
+  ## LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS 30 s; the stream readers are not
+  ## connected at startup, each connects when it first serves a subscription)
+  ## + 5 s (the atomic snapshot-read self-test: one attempt, bounded by
+  ##   LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS 5 s)
+  ## + 90 s (counter-seed bounded retry: 30 attempts × 3 s)
+  ## + 40 s margin (scheduling jitter, image-layer decompression, probe
+  ##   granularity, the 5 s bootstrap handoff budget)
+  ## = 285 s. A budget that covered each term individually would kill a boot
+  ## that was slow but healthy and progressing — precisely the failure mode
+  ## the early-bind work exists to eliminate. If you raise
+  ## LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS or LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS,
+  ## raise this with it.
+  ## A boot that uses the whole budget cannot fit Helm's default 5-minute
+  ## `--wait`. Such a boot means the backing store or the credential sidecar
+  ## is degraded: the upgrade times out and, under `--atomic`, rolls back
+  ## (any pods already replaced are rolled back too) without serving capacity
+  ## ever dropping (strategy.rollingUpdate.maxUnavailable is 0), so it fails
+  ## cleanly and is retried once the dependency recovers.
+  failureThreshold: 57
+  ## @param startupProbe.successThreshold Successes required to pass
+  ## Type: integer. Must be 1 for startup probes.
+  successThreshold: 1
+
+## Liveness probe configuration
+## Uses the gRPC health check protocol. The liveness probe checks that
+## the process is responsive (not deadlocked). Empty service name uses
+## the overall server health status, which the service marks SERVING as
+## soon as the socket is bound — dependency readiness is the readiness
+## probe's job, never liveness's.
+livenessProbe:
+  grpc:
+    ## @param livenessProbe.grpc.port gRPC port for liveness probe
+    ## Type: integer. Should match service.grpc.port. Default: 50001
+    port: 50001
+    service: ""
+  ## @param livenessProbe.periodSeconds Interval between liveness probes
+  ## Type: integer. Default: 10
+  periodSeconds: 10
+  ## @param livenessProbe.timeoutSeconds Per-probe timeout
+  ## Type: integer. Default: 2. Explicit because the kubelet's implicit
+  ## default is 1 s, which is tight for a gRPC dial under node load.
+  timeoutSeconds: 2
+  ## @param livenessProbe.failureThreshold Consecutive failures before restart
+  ## Type: integer. Default: 3
+  failureThreshold: 3
+  ## @param livenessProbe.successThreshold Successes required to pass
+  ## Type: integer. Must be 1 for liveness probes.
+  successThreshold: 1
+
+## Readiness probe configuration
+## Uses the gRPC health check protocol with the service-specific check.
+readinessProbe:
+  grpc:
+    ## @param readinessProbe.grpc.port gRPC port for readiness probe
+    ## Type: integer. Should match service.grpc.port. Default: 50001
+    port: 50001
+    service: "nvidia.omniverse.live.v1alpha.LiveService"
+  ## @param readinessProbe.periodSeconds Interval between readiness probes
+  ## Type: integer. Default: 5
+  periodSeconds: 5
+  ## @param readinessProbe.timeoutSeconds Per-probe timeout
+  ## Type: integer. Default: 2. Explicit for the same reason as the liveness
+  ## probe's — the kubelet default is 1 s.
+  timeoutSeconds: 2
+  ## @param readinessProbe.failureThreshold Consecutive failures before the pod leaves rotation
+  ## Type: integer. Default: 3
+  failureThreshold: 3
+  ## @param readinessProbe.successThreshold Successes required to return to rotation
+  ## Type: integer. Default: 1
+  successThreshold: 1
+
+## @param terminationGracePeriodSeconds Time given to the pod to shut down gracefully
+## Type: integer. Default: 80. The chart refuses to render a value below the
+## minimum the shutdown settings need:
+##   shutdown.timeoutSecs
+##   + max(ceil(rpc.deadlineMs / 1000), shutdown.streamEndMaxWindowSecs)
+##   + 6 + shutdown.overallBudgetSecs + 6
+## which is 77 s at the defaults. The terms:
+##   (1) readiness probe flip → drain (shutdown.timeoutSecs, 5 s), everything
+##       still serving; then the listening socket closes
+##   (2) GOAWAY to every connection; ~250 ms later the live streams start
+##       ending UNAVAILABLE, paced (shutdown.streamEndRate), over at most
+##       shutdown.streamEndMaxWindowSecs. The server is waited for at
+##       most the later of rpc.deadlineMs (an upload in flight) and the end
+##       of that window, plus a 5 s close grace (the 0.25 s and 5 s together
+##       are the first 6 s); a connection still open then is left to finish
+##       on its own
+##   (3) JoinSession + SubscribeReadLayer cleanup waits, background-task
+##       joins, parallelised Valkey quit(), all bounded by
+##       shutdown.overallBudgetSecs (30 s cap)
+##   (4) the final metrics and tracing flush, capped at 6 s
+## The service logs the same minimum at startup (min_termination_grace_secs).
+terminationGracePeriodSeconds: 80
+
+## Rollout strategy for `helm upgrade` (the Deployment's RollingUpdate)
+## Defaults move about a third of the pods per step: k = ceil(33% x replicas)
+## new pods are added (maxSurge, which Kubernetes rounds up) before as many
+## old ones are drained (maxUnavailable 0, so capacity never drops), and each
+## slot's next old pod is not drained until its new one has been Ready for
+## minReadySeconds — long enough for the drained pod's drain and paced stream
+## ending to finish, so at most k pods drain at once.
+##
+## A rollout therefore takes at most 3 steps of (pod startup +
+## minReadySeconds) at any replica count from 1 to 99: about 2.5 minutes with
+## a 20 s startup, inside Helm's default 5-minute `--wait`, and with a minute's
+## margin under it even if one pod takes about 110 s to start. At 3 replicas
+## or fewer, k is 1 and pods move one at a time.
+##
+##   replicas         1-3  4-6  7-9  10-12  13-15  16-18  19-21
+##   k (extra pods)     1    2    3      4      5      6      7
+##
+## The k extra pods need node capacity and ResourceQuota headroom during the
+## rollout (old pods still terminating, up to terminationGracePeriodSeconds,
+## can briefly hold up to about 2k more); a surge pod stuck Pending holds the
+## rollout. In a namespace without that headroom set maxSurge to 1: pods then
+## move one at a time and a rollout takes about replicas x (pod startup +
+## minReadySeconds), so size `helm upgrade --wait --timeout` to that.
+strategy:
+  rollingUpdate:
+    ## @param strategy.rollingUpdate.maxSurge Pods added above the desired count during a rollout
+    ## Type: integer or percentage string. Default: "33%" (rounded up; 1 at 3 replicas).
+    ## Not "34%": that rounds up to 2 at 3 replicas.
+    maxSurge: "33%"
+    ## @param strategy.rollingUpdate.maxUnavailable Pods that may be unavailable during a rollout
+    ## Type: integer or percentage string. Default: 0.
+    maxUnavailable: 0
+
+## @param minReadySeconds Seconds a new pod must be Ready before the rollout counts it available
+## Type: integer or null. Default: null, which renders shutdown.timeoutSecs +
+## shutdown.streamEndMaxWindowSecs + 5 (30 s at the defaults), so the next
+## old pod in the same surge slot is drained only after the previous one's
+## streams have ended. Each rollout step adds it once (at most 3 steps at the
+## default maxSurge; see `strategy` above).
+minReadySeconds: null
+
+## External ingress via Contour's HTTPProxy objects
+## Off by default. When enabled, templates/httpproxy.yaml renders one HTTPProxy
+## that routes gRPC (h2c) to the service, with optional TLS, CORS and an Envoy
+## auth extension configured below.
+httpProxy:
+  ## @param httpProxy.enabled Enable the ingress HTTP proxy
+  ## Type: boolean. Default: false
+  enabled: false
+
+  ## FQDN configuration for the ingress
+  ## Final ingress hostname will be composed as "<host>.<domain>"
+  ## When `httpProxy.enabled: true`, `domain` is REQUIRED — the template
+  ## uses `{{ required ... }}` to fail rendering if it's left at the
+  ## placeholder default below. This blocks an accidental deploy that
+  ## would otherwise publish an ingress at `live-edit.nodomain.none`.
+  fqdn:
+    ## @param httpProxy.fqdn.host Host component of the FQDN
+    ## Type: string. Default: live-edit
+    host: "grpc.live-edit"
+    ## @param httpProxy.fqdn.domain Domain component of the FQDN
+    ## Type: string. REQUIRED when httpProxy.enabled is true.
+    ## Default placeholder `nodomain.none` is rejected by the template — operators
+    ## MUST override (e.g. `live.example.com`).
+    domain: "nodomain.none"
+
+  ## @param httpProxy.annotations Annotations to add to the HTTPProxy resource
+  ## Type: object. Optional. Default: {}
+  annotations: {}
+
+  ## Response headers policy applied to all routes
+  responseHeadersPolicy:
+    ## @param httpProxy.responseHeadersPolicy.set Response headers to set
+    ## Type: array of objects. Default: HSTS header
+    set:
+      - name: Strict-Transport-Security
+        value: max-age=31536000;includeSubDomains
+
+  ## TLS configuration for the ingress
+  tls:
+    ## @param httpProxy.tls.enabled Enable TLS for the HTTP proxy
+    ## Type: boolean. Default: true. Bearer tokens transit the auth channel
+    ## through this ingress; plaintext would expose them on the wire. Non-prod
+    ## environments that genuinely need HTTP (CI smoke clusters, local
+    ## docker-desktop test rigs) must opt out explicitly by setting this to false.
+    enabled: true
+    ## @param httpProxy.tls.secretName Name of the secret containing the TLS cert
+    ## Type: string. Optional. Default: ""
+    secretName: ""
+    ## cert-manager integration for automatic certificate provisioning
+    certManager:
+      ## @param httpProxy.tls.certManager.enabled Enable cert-manager Certificate resource
+      ## Type: boolean. Default: false
+      enabled: false
+      ## @param httpProxy.tls.certManager.issuerRef Reference to the cert-manager issuer
+      ## Type: object. Required when certManager.enabled is true.
+      issuerRef:
+        name: ""
+        kind: ClusterIssuer
+        group: cert-manager.io
+
+  ## Timeout policy for HTTPProxy routes
+  timeoutPolicy:
+    ## @param httpProxy.timeoutPolicy.response Time the proxy will wait for a response
+    ## Type: string. Default: "30s"
+    response: "30s"
+    ## @param httpProxy.timeoutPolicy.idle Maximum duration of inactivity on a connection
+    ## Type: string. Default: "30s"
+    idle: "30s"
+
+  ## CORS policy configuration
+  ##
+  ## Default is an empty allow-list — operators MUST explicitly opt in to the
+  ## origins they want browsers to be able to call from. The previous default
+  ## of `["*"]` is too permissive for a service that authenticates with bearer
+  ## tokens. Set `allowOrigin` to the concrete site list (e.g.
+  ## `["https://omniverse.nvidia.com"]`); leave empty in cluster-internal-only
+  ## deployments. When `allowOrigin` is empty the entire `corsPolicy` stanza is
+  ## omitted from the rendered HTTPProxy (Contour's CRD rejects a corsPolicy
+  ## with zero origins).
+  corsPolicy:
+    ## @param httpProxy.corsPolicy.allowCredentials Allow credentials in CORS
+    ## Type: boolean. Default: false
+    allowCredentials: false
+    ## @param httpProxy.corsPolicy.allowOrigin Allowed origins for CORS requests
+    ## Type: array of strings. Default: [] (opt-in only)
+    allowOrigin: []
+    ## @param httpProxy.corsPolicy.allowHeaders Allowed headers for CORS requests
+    ## Type: array of strings. Default: ["*"]
+    allowHeaders:
+      - "*"
+    ## @param httpProxy.corsPolicy.allowMethods Allowed HTTP methods for CORS
+    ## Type: array of strings. Default: ["POST"] (gRPC uses POST)
+    allowMethods:
+      - 'POST'
+    ## @param httpProxy.corsPolicy.exposeHeaders Headers exposed to browser JS
+    ## Type: array of strings. Default: ["*"]
+    exposeHeaders:
+      - "*"
+
+  ## Envoy auth extension configuration
+  authExtension:
+    enabled: false
+    extensionRef:
+      name: "auth-extension"
+      namespace: ""
+    responseTimeout: 2s
+
+## PodDisruptionBudget configuration
+## Protects streaming RPCs (JoinSession, SubscribeReadLayer) from losing all
+## replicas at once during voluntary disruptions (node drains, cluster
+## upgrades). Only engages for voluntary disruptions — does not block
+## involuntary events (node failure). Ignored when replica count < 2.
+podDisruptionBudget:
+  ## @param podDisruptionBudget.enabled Create a PodDisruptionBudget resource
+  ## Type: boolean. Default: true
+  enabled: true
+  ## @param podDisruptionBudget.minAvailable Minimum number of pods that must remain available
+  ## Type: integer or percentage string. Default: 2. Mutually exclusive with maxUnavailable.
+  ## With the chart's default minReplicas=3, "minAvailable: 2" lets a node drain
+  ## or eviction take at most one replica at a time. This budget does NOT shape
+  ## `helm upgrade` rollouts: a PDB does not constrain a Deployment's rolling
+  ## update (pods deleted during a roll count against the budget, but the
+  ## controller's update behaviour is governed by its own strategy). Rollout
+  ## staggering comes from the chart's RollingUpdate strategy (`strategy` and
+  ## `minReadySeconds` above): maxSurge "33%" / maxUnavailable 0, about a third
+  ## of the pods per step, at most 3 steps. Override to a
+  ## percentage (e.g. "50%") for autoscaled deployments where an absolute count
+  ## doesn't track maxReplicas.
+  minAvailable: 2
+  ## @param podDisruptionBudget.maxUnavailable Alternative to minAvailable
+  ## Type: integer or percentage string. Default: null (unset). Mutually exclusive with minAvailable.
+  maxUnavailable: null
+
+## Autoscaling configuration
+## When enabled, the autoscaler selected by autoscaling.mode owns the server
+## Deployment's replica count and replicaCount is ignored. Disable by setting
+## autoscaling.enabled=false to pin the replica count to replicaCount.
+##
+## In both modes the Deployment's spec.replicas is left unset, so a
+## `helm upgrade` never resets the live count. On a fresh install the
+## Deployment therefore starts at one replica until the autoscaler raises it
+## to minReplicas.
+autoscaling:
+  ## @param autoscaling.enabled Let an autoscaler own the server replica count
+  ## Type: boolean. Default: true
+  enabled: true
+  ## @param autoscaling.mode Which autoscaler owns the replica count
+  ## Type: string. Allowed values: scaler, hpa. Default: scaler. Any other value fails rendering.
+  ##
+  ## scaler: the chart runs a small scaler Deployment (the service image, run as
+  ## `live-edit scaler`) that resizes the server Deployment through its /scale
+  ## subresource. Every few seconds it reads each server pod's load from
+  ## /scaling/v1 on the metrics port and sets the count to the largest of:
+  ##   - CPU: the HorizontalPodAutoscaler's utilization rule against
+  ##     targetCPUUtilizationPercentage of resources.requests.cpu, from the
+  ##     service process's own CPU time (no metrics pipeline or sidecar request
+  ##     needed);
+  ##   - catch-up queue: enough replicas to drain the subscribes queued for
+  ##     their first catch-up within scaler.catchupTargetSeconds, at the drain
+  ##     rate it measures per replica;
+  ##   - subscription occupancy: enough replicas to keep subscriptions at or
+  ##     below scaler.occupancyHeadroomPercent of each replica's ceiling
+  ##     (derived from resources.limits.memory);
+  ## bounded by minReplicas and maxReplicas. It scales up at once and scales
+  ## down one pod at a time, only after scaler.scaleDown.windowSeconds of lower
+  ## demand, only while no server pod is unready, terminating or not reporting
+  ## and the Deployment has exactly its replica count of pods, and only when
+  ## no catch-up queue has built up: no more catch-ups pending across the fleet
+  ## than one replica drains within scaler.catchupTargetSeconds. It does not
+  ## size scale-down to the removed pod's reconnecting subscriptions: every
+  ## scale-down leaves at least minReplicas pods, and minReplicas is the
+  ## setting that decides how large a burst of reconnects from losing one pod
+  ## you accept. When the scaler is not running, the replica count stays where
+  ## it is.
+  ##
+  ## What new replicas relieve: new subscribes, which land on them. They do not
+  ## drain catch-ups already queued on a replica, and established streams never
+  ## move to them; the scaler never ends streams to rebalance.
+  ##
+  ## The scaler mode renders a ServiceAccount, a namespaced Role and a
+  ## RoleBinding (see scaler.serviceAccount and scaler.rbac). A cluster that
+  ## does not allow Helm to create Roles must set scaler.rbac.create=false and
+  ## grant the rules itself, or use mode hpa.
+  ##
+  ## hpa: a HorizontalPodAutoscaler on CPU (and optionally memory) utilization,
+  ## with autoscaling.behavior. It cannot see queued catch-ups or subscription
+  ## occupancy. Every container in the selected server pods needs a positive
+  ## request for each enabled metric, including credential and
+  ## admission-injected sidecars.
+  mode: scaler
+  ## @param autoscaling.minReplicas Minimum number of replicas
+  ## Type: integer. Default: 3. In mode scaler, a minReplicas above maxReplicas
+  ## fails rendering.
+  minReplicas: 3
+  ## @param autoscaling.maxReplicas Maximum number of replicas
+  ## Type: integer. Default: 10. In mode scaler, a maxReplicas below minReplicas
+  ## fails rendering.
+  ## Every replica can run valkey.catchupSnapshotReadConcurrency atomic
+  ## catch-up reads against the backing store at once, so a fully scaled-out
+  ## fleet runs up to maxReplicas times that many. Keep
+  ## maxReplicas × catchupSnapshotReadConcurrency at or below 10: above it a
+  ## join wave can block the store for longer than writers tolerate. The
+  ## default 10 at the default concurrency of 1 is at that limit. The scaler logs
+  ## a WARN when it sees the product above 10.
+  maxReplicas: 10
+  ## @param autoscaling.targetCPUUtilizationPercentage Target CPU utilization for scaling
+  ## Type: integer or null. Default: 80. A percentage of resources.requests.cpu,
+  ## in either mode: at the default 1-core request, replicas are added when they
+  ## average about 0.8 cores. null turns the CPU signal off. In mode scaler, setting it
+  ## with resources.requests.cpu empty fails rendering.
+  targetCPUUtilizationPercentage: 80
+  ## @param autoscaling.targetMemoryUtilizationPercentage Target memory utilization for scaling (mode hpa only)
+  ## Type: integer or null. Default: null (scale on CPU only). Setting it with
+  ## mode scaler fails rendering: the scaler has no memory signal.
+  ## Memory is off by default because it is not a useful scaling signal for
+  ## this service: load shows up as CPU, and memory peaks from joins last
+  ## well under a minute. The target is a percentage of
+  ## resources.requests.memory, which by default is 70 % of the memory limit
+  ## (3584Mi at 5Gi): at 80, replicas are added when they average about
+  ## 2867Mi. Set an integer to add a memory metric; every server-pod container
+  ## then needs a positive memory request.
+  targetMemoryUtilizationPercentage: null
+  ## The autoscaling.scaler settings below (mode scaler). Every one must be set:
+  ## an absent, null or empty value fails rendering, naming the key, except
+  ## for resources, serviceAccount.name, podAnnotations and affinity, whose
+  ## @param says what null means, and serviceAccount.create, which is not read
+  ## while serviceAccount.name is set.
+  ##
+  ## @param autoscaling.scaler.pollIntervalSeconds Seconds between the scaler's polls (mode scaler)
+  ## Type: integer. Default: 5. Minimum 1.
+  ##
+  ## @param autoscaling.scaler.catchupTargetSeconds Seconds the catch-up signal sizes the fleet to drain queued first catch-ups in (mode scaler)
+  ## Type: integer. Default: 10, half of the 20 s budget a subscribe may spend
+  ## waiting for capacity (valkey.subscriberAdmissionWaitMs). Minimum 1.
+  ## Smaller adds replicas for smaller queues. It also sets when scale-down
+  ## is blocked: while more first catch-ups are pending across the fleet than
+  ## one replica drains within this many seconds, so smaller also blocks
+  ## scale-down at smaller queues.
+  ##
+  ## @param autoscaling.scaler.occupancyHeadroomPercent Share of each replica's subscription ceiling the fleet is sized to stay under (mode scaler)
+  ## Type: integer, 1-100. Default: 80, so a replica is added before replicas
+  ## reach their ceiling and start refusing subscribes. The ceiling is derived
+  ## from resources.limits.memory (see resources).
+  ##
+  ## @param autoscaling.scaler.scaleDown.windowSeconds Seconds every desired count must stay below the current count before a scale-down (mode scaler)
+  ## Type: integer. Default: 600. A restarted scaler also waits this long
+  ## before its first scale-down.
+  ##
+  ## @param autoscaling.scaler.scaleDown.intervalSeconds Minimum seconds between scale-downs, each of one pod (mode scaler)
+  ## Type: integer. Default: 60.
+  ##
+  ## @param autoscaling.scaler.podDeletionCost Mark the emptiest pod for removal before each scale-down (mode scaler)
+  ## Type: boolean, unquoted; a quoted "true" or "false" fails rendering. Default: false.
+  ## true: just before each scale-down the scaler sets the
+  ## controller.kubernetes.io/pod-deletion-cost annotation on every server pod
+  ## to its subscriptions plus queued catch-ups, so the pod with the fewest is
+  ## removed and the fewest clients reconnect. This grants the scaler's
+  ## ServiceAccount `patch` on pods, which Kubernetes cannot limit to the
+  ## server pods. Whoever obtains that token can then read every pod in the
+  ## release namespace in full, including its containers' inline environment
+  ## values (a patch returns the whole pod), and change the labels,
+  ## annotations and container images of any of them, subject to the
+  ## namespace's admission policies; a replaced image runs with that pod's
+  ## environment, volumes and ServiceAccount.
+  ## false: no pod permission; the ReplicaSet picks the pod, which may be a
+  ## busier one, so a scale-down can end more streams than it needs to.
+  ##
+  ## @param autoscaling.scaler.serviceAccount.create Create the scaler's ServiceAccount (only consulted when `name` is empty)
+  ## Type: boolean. Default: true. Same semantics as serviceAccount.create:
+  ## with `name` empty, false fails rendering.
+  ##
+  ## @param autoscaling.scaler.serviceAccount.name Name of a PRE-PROVISIONED ServiceAccount for the scaler
+  ## Type: string or null. Default: "". null is the same as "". When set, the
+  ## chart uses it as-is and renders no ServiceAccount. It must mount its token
+  ## (the scaler authenticates with it).
+  ##
+  ## @param autoscaling.scaler.rbac.create Render the scaler's Role and RoleBinding
+  ## Type: boolean. Default: true. The Role is namespaced: get and patch on the
+  ## server Deployment's /scale subresource (limited to that Deployment by
+  ## name), list on EndpointSlices, and patch on pods only with
+  ## podDeletionCost. /scale carries replica counts and the label selector,
+  ## not the pod template, so without podDeletionCost the scaler can read no
+  ## pod template, Pod, Secret or ConfigMap. Whoever obtains its
+  ## ServiceAccount token can set the server replica count to any value,
+  ## including 0, and list every EndpointSlice in the namespace. Set false
+  ## to grant the same rules yourself.
+  ##
+  ## @param autoscaling.scaler.resources Resources of the scaler container
+  ## Type: object or null. Default: requests cpu=10m and memory=32Mi; limits cpu=100m and memory=128Mi.
+  ## null removes the requests and limits (the container renders resources: null),
+  ## for example where a LimitRange sets them; {} does not, because Helm merges
+  ## it with this default.
+  ##
+  ## @param autoscaling.scaler.podAnnotations Annotations to add to the scaler pod
+  ## Type: object or null. Optional. Default: {}. null is the same as {}. The
+  ## scaler serves live_edit_scaler_* metrics on /metrics, port 9090, with no
+  ## Service: scrape the pod.
+  ##
+  ## @param autoscaling.scaler.affinity Affinity rules for the scaler pod
+  ## Type: object or null. Optional. Default: {}. null is the same as {}.
+  ## Separate from the server's affinity, which the scaler pod deliberately
+  ## does not inherit: a rule written for server pods, such as a required
+  ## anti-affinity against them, could leave the single scaler pod
+  ## unschedulable, and with no scaler running the replica count stays frozen.
+  ## The scaler pod does inherit the server's nodeSelector and tolerations, so
+  ## it can run wherever the server pods can (a dedicated node pool, say).
+  scaler:
+    pollIntervalSeconds: 5
+    catchupTargetSeconds: 10
+    occupancyHeadroomPercent: 80
+    scaleDown:
+      windowSeconds: 600
+      intervalSeconds: 60
+    podDeletionCost: false
+    serviceAccount:
+      create: true
+      name: ""
+    rbac:
+      create: true
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+    podAnnotations: {}
+    affinity: {}
+  ## @param autoscaling.behavior HPA scaling behavior, rendered verbatim into the HPA's spec.behavior (mode hpa only)
+  ## Type: object or null. Default: scale-down damped (below), scale-up at Kubernetes' defaults.
+  ## Set to `null` (or `~`) to omit spec.behavior and restore Kubernetes' defaults for both
+  ## directions. An override is merged into this default key by key, as Helm merges every
+  ## value: adding `scaleUp` keeps the scaleDown damping below, and `scaleDown: null`
+  ## removes it.
+  ##
+  ## Why scale-down is damped. Every pod the HPA drains ends its SubscribeReadLayer streams,
+  ## and their clients reconnect to the remaining pods; every pod it later adds opens its own
+  ## set of backing-store connections, each with a TLS handshake and AUTH. A CPU-only HPA on
+  ## Kubernetes' default 300 s scale-down window still drained pods during short lulls in a
+  ## load test and scaled straight back up minutes later, so each lull cost the store a
+  ## connection and AUTH burst and every client a reconnect. The default below waits for
+  ## 600 s of lower recommendations before it removes anything, then removes at most one pod
+  ## per 60 s. Scale-up is left at Kubernetes' defaults, so added load is still met at once.
+  ##
+  ## For a fixed-size window (a demo, say), pin minReplicas = maxReplicas instead.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+
+## NetworkPolicy configuration
+##
+## When enabled, restricts ingress to the grpc + metrics ports and (optionally)
+## scopes egress to Valkey + the configured auth backends. Disabled by default
+## because most clusters configure NetworkPolicies at the namespace level; turn
+## this on for clusters where per-workload NetworkPolicy is the norm.
+networkPolicy:
+  ## @param networkPolicy.enabled Create a NetworkPolicy resource
+  ## Type: boolean. Default: false
+  enabled: false
+  ## @param networkPolicy.ingressFromNamespaces Allow ingress to grpc + metrics from these namespaces (by label)
+  ## Type: array of objects with `name` keys. Optional. Default: [] (cluster-wide).
+  ## When empty, the policy allows ingress from any pod in any namespace to the
+  ## chart's grpc + metrics ports. Populate to scope.
+  ingressFromNamespaces: []
+  ## @param networkPolicy.egressToValkey Allow egress to the Valkey backing store
+  ## Type: boolean. Default: true. When false, the policy omits the Valkey egress
+  ## rule and operators must wire a separate cluster-wide policy.
+  egressToValkey: true
+  ## @param networkPolicy.egressToAuth Allow egress to the configured auth backends
+  ## Type: boolean. Default: true. When false, the policy omits the auth egress
+  ## rule. Cluster-wide DNS egress is always retained.
+  egressToAuth: true
+
+## Prometheus ServiceMonitor configuration
+##
+## When enabled, creates a `monitoring.coreos.com/v1` ServiceMonitor scraping
+## the metrics port. Disabled by default because the cluster's Prometheus
+## operator may not be installed; turn this on once the prometheus-operator
+## CRDs are present.
+serviceMonitor:
+  ## @param serviceMonitor.enabled Create a ServiceMonitor resource
+  ## Type: boolean. Default: false
+  enabled: false
+  ## @param serviceMonitor.interval Scrape interval
+  ## Type: string. Default: "30s"
+  interval: "30s"
+  ## @param serviceMonitor.scrapeTimeout Scrape timeout
+  ## Type: string. Default: "10s"
+  scrapeTimeout: "10s"
+  ## @param serviceMonitor.labels Additional labels (e.g. the prometheus selector
+  ## label expected by the local Prometheus instance)
+  ## Type: object. Default: {}
+  labels: {}
+
+## @param revisionHistoryLimit Number of old ReplicaSets to retain
+## Type: integer. Default: 3. Lower than k8s's default of 10 — three is enough
+## for an operator to quickly roll back through recent revisions without
+## littering etcd with stale ReplicaSets.
+revisionHistoryLimit: 3
+
+## @param volumes Additional volumes to add to the deployment
+## Type: array of objects. Optional. Default: []
+volumes: []
+# - name: foo
+#   secret:
+#     secretName: mysecret
+#     optional: false
+
+## @param volumeMounts Additional volume mounts to add to the container
+## Type: array of objects. Optional. Default: []
+volumeMounts: []
+# - name: foo
+#   mountPath: "/etc/foo"
+#   readOnly: true
+
+## @param nodeSelector Node labels for pod assignment
+## Type: object. Optional. Default: {}
+nodeSelector: {}
+
+## @param tolerations Tolerations for pod assignment
+## Type: array of objects. Optional. Default: []
+tolerations: []
+
+## @param affinity Affinity rules for pod assignment
+## Type: object. Optional. Default: {}
+affinity: {}
+
+## Smoke-test image configuration
+## A small container with python + grpcio + requests pre-installed. The
+## test sources are mounted in from the smoke-tests ConfigMap rendered by
+## the chart, so the image itself stays generic across services.
+smokeTest:
+  image:
+    ## @param smokeTest.image.repository Smoke test base image repository
+    repository: nvcr.io/nvidia/omniverse/smoke-test-base
+    ## @param smokeTest.image.tag Smoke test base image tag
+    tag: "1.0.1"
+    ## @param smokeTest.image.pullPolicy Image pull policy.
+    ## Allowed values: Always, IfNotPresent, Never. Default: IfNotPresent
+    pullPolicy: IfNotPresent
+    ## @param smokeTest.image.pullSecrets Pull secrets for the smoke test image
+    pullSecrets: []
+    #  - name: secret
+  ## @param smokeTest.podLabels Labels applied to the smoke-test pod only (not the main Deployment).
+  ## Required for workload-identity: the Azure mutating webhook injects the
+  ## projected token volume/env only into pods carrying
+  ## `azure.workload.identity/use: "true"`. Merged on top of the standard
+  ## chart labels; falls back to `.Values.podLabels` when unset.
+  ## app.kubernetes.io/name is always omitted and component is smoke-test,
+  ## so overrides cannot make a test pod match the server Deployment selector.
+  podLabels: {}
+  # Example:
+  # podLabels:
+  #   azure.workload.identity/use: "true"
+
+## Smoke-test suite configuration
+##
+## Renders a Helm test Job (`helm.sh/hook: test,post-install,post-upgrade`)
+## that pytest-runs a minimal set of gRPC smoke tests against the deployed
+## Live Edit service: Ping, CreateSession / ListSessions / DeleteSession,
+## JoinSession bidi connect, and SubscribeReadLayer NOT_FOUND probe. The
+## tests do not exercise CreateLayer / UpdateLayer (OODF delta construction
+## is out of scope for an in-cluster smoke).
+tests:
+  ## @param tests.enabled Enable/disable the smoke test Job + ConfigMap.
+  ## Type: boolean. Default: false.
+  enabled: false
+
+  ## Dedicated ServiceAccount for the smoke-test Job. Separate from the
+  ## main service SA so the test runs under its own AAD identity — the
+  ## smoke-test is a client of live-edit-service, not the service itself.
+  ## Set `azure.workload.identity/client-id` under `annotations` to bind
+  ## the Job to a Managed Identity dedicated to smoke-tests.
+  ## Same use-don't-touch semantics as the main `serviceAccount` block: a
+  ## supplied `name` means the SA is pre-provisioned — the chart uses it and
+  ## renders NO SA object; `create` is only consulted when `name` is empty
+  ## (true creates `<fullname>-test-smoke`; false with no name fails rendering).
+  serviceAccount:
+    ## @param tests.serviceAccount.create Create a chart-owned smoke-test SA (only consulted when `name` is empty)
+    create: true
+    ## @param tests.serviceAccount.name Name of a PRE-PROVISIONED SA for the smoke-test Job
+    ## When set, used as-is with no SA object rendered; must already exist.
+    name: ""
+    ## @param tests.serviceAccount.annotations Annotations on the SA (e.g.
+    ## workload-identity client-id).
+    annotations: {}
+    ## @param tests.serviceAccount.automount Automatically mount the SA's
+    ## API credentials.
+    automount: true
+
+  ## Workload-identity for the smoke-test pod. Independent from the main
+  ## service's identity — the smoke-test has its own SA (above) and its own
+  ## sidecar toggle here. When enabled, a token-provisioner sidecar writes a
+  ## JSON token file that the suite reads via SMOKE_TESTS_ACCESS_TOKEN_FILE_PATH
+  ## (mutually exclusive with the `tests.auth.*` client-credentials flow).
+  serviceIdentity:
+    accessTokenFile:
+      ## @param tests.serviceIdentity.accessTokenFile.enabled Enable the access-token-file flow for smoke-test.
+      enabled: false
+
+      provisionerSidecar:
+        ## Container spec for the token-provisioner sidecar. Rendered as a
+        ## K8s 1.29+ native sidecar (an initContainer with
+        ## `restartPolicy: Always`). The chart adds a `token-exchange`
+        ## volumeMount; `name` and `restartPolicy` are controlled by the
+        ## chart and any values supplied here for those keys are ignored.
+        ##
+        ## CONTRACT: your token provisioner MUST write the token to
+        ## `/etc/secrets/access-token/token` — that path is hardcoded in
+        ## the test container's read side (SMOKE_TESTS_ACCESS_TOKEN_FILE_PATH)
+        ## — in the JSON format of docs/service/docs/authentication.md
+        ## § Token file format. A wrong path makes the test wait the full 30s
+        ## and then fail.
+        container: {}
+        # Example:
+        # container:
+        #   image: <your-token-provisioner-image>
+        #   env:
+        #     - name: <setting naming the token scope>
+        #       value: <resource-app-id>/.default
+        #     - name: <setting naming the output file>
+        #       value: /etc/secrets/access-token/token
+
+  ## @param tests.storageApiResourceBase Base storage path the smoke principal
+  ## has write permission on. REQUIRED when `tests.enabled: true`. Maps to the
+  ## SMOKE_TESTS_RESOURCE_BASE env var; the suite appends a random suffix to
+  ## form the per-test layer path passed to CreateSession. Must match a path
+  ## the OAuth client-credentials identity (sourced from `tests.auth.*`) holds
+  ## write permission on in the upstream permissions service — otherwise
+  ## CreateSession returns PERMISSION_DENIED. Aligned with storage-service's
+  ## `tests.storageApiResourceBase` key so operators reuse the same value
+  ## across the suite. Example:
+  ##   storageApiResourceBase: "https://storage.example.com/mybucket/"
+  storageApiResourceBase: ""
+
+  ## @param tests.timeout Per-RPC timeout in seconds (string; empty = default 5s).
+  timeout: ""
+
+  ## Live Edit gRPC endpoint (optional override). If unset, the chart
+  ## defaults to the in-cluster Service URL, or the ingress FQDN when
+  ## `httpProxy.enabled: true`.
+  grpcEndpoint: ""
+
+  ## @param tests.grpcSkipTls Skip TLS verification for gRPC (e.g. "true").
+  ## When unset, TLS is derived from the URL scheme (https://* → TLS,
+  ## http://* → insecure).
+  grpcSkipTls: ""
+
+  ## @param tests.ttlSecondsAfterFinished Seconds after the smoke test Job
+  ## completes (Succeeded or Failed) before it is cleaned up. 0 = do not
+  ## delete automatically. Default: 900 (15 minutes). Type: integer.
+  ttlSecondsAfterFinished: 900
+
+  ## Token authentication for smoke tests (optional). Required because the
+  ## service always enforces authn (LIVE_EDIT_AUTHN_ENABLED is hardcoded true).
+  ## Uses OAuth 2.0 client credentials: the test pod fetches a bearer token from
+  ## the configured token endpoint and attaches it as gRPC metadata. Each
+  ## property accepts `value` or `valueFrom` (e.g. `secretKeyRef`).
+  auth: {}
+    # microsoftUrl:
+    #   value: "https://login.microsoftonline.com/.../v2.0/.well-known/openid-configuration"
+    # credentials:
+    #   valueFrom:
+    #     secretKeyRef:
+    #       name: "smoke-test-oauth"
+    #       key: "credentials"
+    # scope:
+    #   value: "<client-id>/.default"
+## Run the matching standalone conformance chart during GitOps validation.
+## Requires tests.enabled and the smoke-test token-file identity configuration.
+conformance:
+  enabled: true

@@ -1,0 +1,502 @@
+{
+  "byte_len": 4624,
+  "captured_at": "2026-08-19T22:11:07.378313+00:00",
+  "catchup_ompf_b64": "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",
+  "cpp_endpoint": "reference-service.example.com",
+  "normalized_signature": {
+    "baseVersion": 0,
+    "externalValueHashes": [],
+    "isDiff": true,
+    "setFields": [
+      {
+        "extValueSize": 0,
+        "keyName": "endTimeCode",
+        "sectionId": 1,
+        "setOrder": 0,
+        "valueOrExtHash": "09000000000000005940"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "metersPerUnit",
+        "sectionId": 1,
+        "setOrder": 3,
+        "valueOrExtHash": "09007b14ae47e17a843f"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "startTimeCode",
+        "sectionId": 1,
+        "setOrder": 1,
+        "valueOrExtHash": "09000000000000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "timeCodesPerSecond",
+        "sectionId": 1,
+        "setOrder": 2,
+        "valueOrExtHash": "09000000000000004e40"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "upAxis",
+        "sectionId": 1,
+        "setOrder": 4,
+        "valueOrExtHash": "0b000100000059"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 36719294895387868,
+        "setOrder": 136,
+        "valueOrExtHash": "1700000000000000000000000000000000000000000000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 36719294895387868,
+        "setOrder": 135,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 507830835434476256,
+        "setOrder": 140,
+        "valueOrExtHash": "1700000000000000f03f000000000000f03f000000000000f03f"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 507830835434476256,
+        "setOrder": 139,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "specifier",
+        "sectionId": 641504060204211146,
+        "setOrder": 66,
+        "valueOrExtHash": "2a0000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 1396375711122871695,
+        "setOrder": 70,
+        "valueOrExtHash": "0800352e9141"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 1396375711122871695,
+        "setOrder": 69,
+        "valueOrExtHash": "0b0005000000666c6f6174"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "customData",
+        "sectionId": 1935122343505658114,
+        "setOrder": 44,
+        "valueOrExtHash": "1f000100000000000000040000006f6d6e691f000100000000000000030000006b69741f00020000000000000014000000686964655f696e5f73746167655f77696e646f77010001090000006e6f5f64656c657465010001"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "hide_in_stage_window",
+        "sectionId": 1935122343505658114,
+        "setOrder": 45,
+        "valueOrExtHash": "010001"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "kind",
+        "sectionId": 1935122343505658114,
+        "setOrder": 41,
+        "valueOrExtHash": "0b0009000000636f6d706f6e656e74"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "no_delete",
+        "sectionId": 1935122343505658114,
+        "setOrder": 46,
+        "valueOrExtHash": "010001"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "specifier",
+        "sectionId": 1935122343505658114,
+        "setOrder": 42,
+        "valueOrExtHash": "2a0000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 1935122343505658114,
+        "setOrder": 43,
+        "valueOrExtHash": "0b000600000043616d657261"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 2444550230040932535,
+        "setOrder": 124,
+        "valueOrExtHash": "09000000000000005940"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 2444550230040932535,
+        "setOrder": 123,
+        "valueOrExtHash": "0b0006000000646f75626c65"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "custom",
+        "sectionId": 2590379634061370490,
+        "setOrder": 53,
+        "valueOrExtHash": "010001"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 2590379634061370490,
+        "setOrder": 55,
+        "valueOrExtHash": "0a0000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 2590379634061370490,
+        "setOrder": 54,
+        "valueOrExtHash": "0b0006000000737472696e67"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 4838027035830472215,
+        "setOrder": 84,
+        "valueOrExtHash": "1700000000000000000000000000000000000000000000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 4838027035830472215,
+        "setOrder": 83,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 4865688153437211020,
+        "setOrder": 93,
+        "valueOrExtHash": "8b0003000000000000001100000078666f726d4f703a7472616e736c6174651100000078666f726d4f703a726f7461746558595a0d00000078666f726d4f703a7363616c65"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 4865688153437211020,
+        "setOrder": 91,
+        "valueOrExtHash": "0b0007000000746f6b656e5b5d"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "variability",
+        "sectionId": 4865688153437211020,
+        "setOrder": 92,
+        "valueOrExtHash": "2c0001000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "specifier",
+        "sectionId": 5131590939648125535,
+        "setOrder": 63,
+        "valueOrExtHash": "2a0000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 6195934264762118290,
+        "setOrder": 132,
+        "valueOrExtHash": "1700000000000000000000000000000000000000000000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 6195934264762118290,
+        "setOrder": 131,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 6342097646872199879,
+        "setOrder": 88,
+        "valueOrExtHash": "1700000000000000f03f000000000000f03f000000000000f03f"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 6342097646872199879,
+        "setOrder": 87,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 6358204455613567733,
+        "setOrder": 145,
+        "valueOrExtHash": "8b0003000000000000001100000078666f726d4f703a7472616e736c6174651100000078666f726d4f703a726f7461746558595a0d00000078666f726d4f703a7363616c65"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 6358204455613567733,
+        "setOrder": 143,
+        "valueOrExtHash": "0b0007000000746f6b656e5b5d"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "variability",
+        "sectionId": 6358204455613567733,
+        "setOrder": 144,
+        "valueOrExtHash": "2c0001000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "specifier",
+        "sectionId": 17052835229667916853,
+        "setOrder": 120,
+        "valueOrExtHash": "2a0000000000"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 17052835229667916853,
+        "setOrder": 121,
+        "valueOrExtHash": "0b000400000043756265"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 17130279763733852038,
+        "setOrder": 128,
+        "valueOrExtHash": "98000200000000000000000048c2000048c2000048c2000048420000484200004842"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 17130279763733852038,
+        "setOrder": 127,
+        "valueOrExtHash": "0b0008000000666c6f6174335b5d"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 17387567167253789396,
+        "setOrder": 117,
+        "valueOrExtHash": "1700200881a3e9c22bc000cd09c69237004080349ef304b52740"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 17387567167253789396,
+        "setOrder": 79,
+        "valueOrExtHash": "0b0007000000646f75626c6533"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "custom",
+        "sectionId": 18061108321143083485,
+        "setOrder": 48,
+        "valueOrExtHash": "010001"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "default",
+        "sectionId": 18061108321143083485,
+        "setOrder": 50,
+        "valueOrExtHash": "0a000b0000007065727370656374697665"
+      },
+      {
+        "extValueSize": 0,
+        "keyName": "typeName",
+        "sectionId": 18061108321143083485,
+        "setOrder": 49,
+        "valueOrExtHash": "0b0006000000737472696e67"
+      }
+    ],
+    "sourceFormat": "",
+    "structCommands": [
+      {
+        "parentId": 0,
+        "sectionId": 1,
+        "sectionName": "",
+        "sectionOrder": 0,
+        "sectionType": 7,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 1,
+        "sectionId": 17335223249888182793,
+        "sectionName": "World",
+        "sectionOrder": 1,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 1,
+        "sectionId": 5131590939648125535,
+        "sectionName": "__session_shared_data__",
+        "sectionOrder": 0,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 17130279763733852038,
+        "sectionName": "extent",
+        "sectionOrder": 1,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 2444550230040932535,
+        "sectionName": "size",
+        "sectionOrder": 0,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 36719294895387868,
+        "sectionName": "xformOp:rotateXYZ",
+        "sectionOrder": 3,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 507830835434476256,
+        "sectionName": "xformOp:scale",
+        "sectionOrder": 4,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 6195934264762118290,
+        "sectionName": "xformOp:translate",
+        "sectionOrder": 2,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17052835229667916853,
+        "sectionId": 6358204455613567733,
+        "sectionName": "xformOpOrder",
+        "sectionOrder": 5,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17335223249888182793,
+        "sectionId": 17052835229667916853,
+        "sectionName": "Cube",
+        "sectionOrder": 1,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 17335223249888182793,
+        "sectionId": 9554457595780733193,
+        "sectionName": "Sphere",
+        "sectionOrder": 0,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 1935122343505658114,
+        "sectionId": 1396375711122871695,
+        "sectionName": "focalLength",
+        "sectionOrder": 0,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 5131590939648125535,
+        "sectionId": 641504060204211146,
+        "sectionName": "_bc6108fc_2D22b2_2D43bb_2D8e29_2D71ef95fc698e",
+        "sectionOrder": 1,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 5131590939648125535,
+        "sectionId": 7746669408204714241,
+        "sectionName": "_51e8101c_2D31b1_2D48e7_2D87da_2D1dbe8dfc6de7",
+        "sectionOrder": 0,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 7746669408204714241,
+        "sectionId": 18061108321143083485,
+        "sectionName": "bound_camera",
+        "sectionOrder": 1,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 7746669408204714241,
+        "sectionId": 1935122343505658114,
+        "sectionName": "perspective",
+        "sectionOrder": 0,
+        "sectionType": 6,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 7746669408204714241,
+        "sectionId": 2590379634061370490,
+        "sectionName": "following_user",
+        "sectionOrder": 2,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 9554457595780733193,
+        "sectionId": 17387567167253789396,
+        "sectionName": "xformOp:translate",
+        "sectionOrder": 0,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 9554457595780733193,
+        "sectionId": 4838027035830472215,
+        "sectionName": "xformOp:rotateXYZ",
+        "sectionOrder": 1,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 9554457595780733193,
+        "sectionId": 4865688153437211020,
+        "sectionName": "xformOpOrder",
+        "sectionOrder": 3,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      },
+      {
+        "parentId": 9554457595780733193,
+        "sectionId": 6342097646872199879,
+        "sectionName": "xformOp:scale",
+        "sectionOrder": 2,
+        "sectionType": 1,
+        "type": "CommandDiffChangeSection"
+      }
+    ],
+    "timeSamples": []
+  },
+  "num_deltas": 36,
+  "sha256": "f33e5878352afd21d22dbec35797bb00aa0de046dc0e2f8749cece94614dfe8e"
+}

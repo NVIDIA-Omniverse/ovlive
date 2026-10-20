@@ -1,0 +1,25 @@
+Omniverse Live Edit Service
+
+Copyright (c) 2019-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Unless otherwise noted in this file, in a subdirectory-specific license file,
+or in a source-file license identifier, NVIDIA-authored source code and
+documentation in this repository is licensed under the Apache License,
+Version 2.0.
+
+Original copyright attributions remain in the sources. The OODF schema copy's
+provenance and notice are recorded in oodf-ffi/schema/SOURCE.md.
+
+This repository contains a patched copy of the fred 10.1.0 crate
+(Copyright 2024 Alec Embke) under the MIT License in vendor/fred-10.1.0; see
+vendor/fred-10.1.0/LICENSE-MIT. NVIDIA's modifications to the upstream fred
+files are licensed under the MIT License and are recorded in
+vendor/fred-10.1.0.SOURCE.md. The NVIDIA files under
+vendor/fred-10.1.0/src/live_edit/ are licensed under the Apache License,
+Version 2.0.
+
+Third-party dependencies retain their own licenses. ATTRIBUTIONS.md
+reproduces the license texts of the Rust crates compiled into the service.
+The service container image carries its license notices in /licenses/ and, in
+/vendor.tar.gz, the source of the third-party code compiled into the service
+binary; the base image supplies its own notices (see /licenses/SOURCES.md).

@@ -1,0 +1,702 @@
+{
+  "schema_version": 1,
+  "object_id": 90100200,
+  "base_snap_seq": 9,
+  "composed_seq": 36,
+  "sections": [
+    {
+      "section_id": 1,
+      "parent_id": 0,
+      "name": "",
+      "section_type": 7,
+      "section_order": 0
+    },
+    {
+      "section_id": 36719294895387868,
+      "parent_id": 17052835229667916853,
+      "name": "xformOp:rotateXYZ",
+      "section_type": 1,
+      "section_order": 3
+    },
+    {
+      "section_id": 507830835434476256,
+      "parent_id": 17052835229667916853,
+      "name": "xformOp:scale",
+      "section_type": 1,
+      "section_order": 4
+    },
+    {
+      "section_id": 641504060204211146,
+      "parent_id": 5131590939648125535,
+      "name": "_bc6108fc_2D22b2_2D43bb_2D8e29_2D71ef95fc698e",
+      "section_type": 6,
+      "section_order": 1
+    },
+    {
+      "section_id": 1396375711122871695,
+      "parent_id": 1935122343505658114,
+      "name": "focalLength",
+      "section_type": 1,
+      "section_order": 0
+    },
+    {
+      "section_id": 1935122343505658114,
+      "parent_id": 7746669408204714241,
+      "name": "perspective",
+      "section_type": 6,
+      "section_order": 0
+    },
+    {
+      "section_id": 2444550230040932535,
+      "parent_id": 17052835229667916853,
+      "name": "size",
+      "section_type": 1,
+      "section_order": 0
+    },
+    {
+      "section_id": 2590379634061370490,
+      "parent_id": 7746669408204714241,
+      "name": "following_user",
+      "section_type": 1,
+      "section_order": 2
+    },
+    {
+      "section_id": 4838027035830472215,
+      "parent_id": 9554457595780733193,
+      "name": "xformOp:rotateXYZ",
+      "section_type": 1,
+      "section_order": 1
+    },
+    {
+      "section_id": 4865688153437211020,
+      "parent_id": 9554457595780733193,
+      "name": "xformOpOrder",
+      "section_type": 1,
+      "section_order": 3
+    },
+    {
+      "section_id": 5131590939648125535,
+      "parent_id": 1,
+      "name": "__session_shared_data__",
+      "section_type": 6,
+      "section_order": 0
+    },
+    {
+      "section_id": 6195934264762118290,
+      "parent_id": 17052835229667916853,
+      "name": "xformOp:translate",
+      "section_type": 1,
+      "section_order": 2
+    },
+    {
+      "section_id": 6342097646872199879,
+      "parent_id": 9554457595780733193,
+      "name": "xformOp:scale",
+      "section_type": 1,
+      "section_order": 2
+    },
+    {
+      "section_id": 6358204455613567733,
+      "parent_id": 17052835229667916853,
+      "name": "xformOpOrder",
+      "section_type": 1,
+      "section_order": 5
+    },
+    {
+      "section_id": 7746669408204714241,
+      "parent_id": 5131590939648125535,
+      "name": "_51e8101c_2D31b1_2D48e7_2D87da_2D1dbe8dfc6de7",
+      "section_type": 6,
+      "section_order": 0
+    },
+    {
+      "section_id": 9554457595780733193,
+      "parent_id": 17335223249888182793,
+      "name": "Sphere",
+      "section_type": 6,
+      "section_order": 0
+    },
+    {
+      "section_id": 17052835229667916853,
+      "parent_id": 17335223249888182793,
+      "name": "Cube",
+      "section_type": 6,
+      "section_order": 1
+    },
+    {
+      "section_id": 17130279763733852038,
+      "parent_id": 17052835229667916853,
+      "name": "extent",
+      "section_type": 1,
+      "section_order": 1
+    },
+    {
+      "section_id": 17335223249888182793,
+      "parent_id": 1,
+      "name": "World",
+      "section_type": 6,
+      "section_order": 1
+    },
+    {
+      "section_id": 17387567167253789396,
+      "parent_id": 9554457595780733193,
+      "name": "xformOp:translate",
+      "section_type": 1,
+      "section_order": 0
+    },
+    {
+      "section_id": 18061108321143083485,
+      "parent_id": 7746669408204714241,
+      "name": "bound_camera",
+      "section_type": 1,
+      "section_order": 1
+    }
+  ],
+  "children": [
+    {
+      "parent_id": 0,
+      "child_ids": [
+        1
+      ]
+    },
+    {
+      "parent_id": 1,
+      "child_ids": [
+        5131590939648125535,
+        17335223249888182793
+      ]
+    },
+    {
+      "parent_id": 1935122343505658114,
+      "child_ids": [
+        1396375711122871695
+      ]
+    },
+    {
+      "parent_id": 5131590939648125535,
+      "child_ids": [
+        7746669408204714241,
+        641504060204211146
+      ]
+    },
+    {
+      "parent_id": 7746669408204714241,
+      "child_ids": [
+        1935122343505658114,
+        18061108321143083485,
+        2590379634061370490
+      ]
+    },
+    {
+      "parent_id": 9554457595780733193,
+      "child_ids": [
+        17387567167253789396,
+        4838027035830472215,
+        6342097646872199879,
+        4865688153437211020
+      ]
+    },
+    {
+      "parent_id": 17052835229667916853,
+      "child_ids": [
+        2444550230040932535,
+        17130279763733852038,
+        6195934264762118290,
+        36719294895387868,
+        507830835434476256,
+        6358204455613567733
+      ]
+    },
+    {
+      "parent_id": 17335223249888182793,
+      "child_ids": [
+        9554457595780733193,
+        17052835229667916853
+      ]
+    }
+  ],
+  "fields": [
+    {
+      "section_id": 1,
+      "key_name": "endTimeCode",
+      "value": {
+        "kind": "inline",
+        "hex": "09000000000000005940"
+      },
+      "authoring_set_order": 0,
+      "version": null
+    },
+    {
+      "section_id": 1,
+      "key_name": "metersPerUnit",
+      "value": {
+        "kind": "inline",
+        "hex": "09007b14ae47e17a843f"
+      },
+      "authoring_set_order": 3,
+      "version": null
+    },
+    {
+      "section_id": 1,
+      "key_name": "startTimeCode",
+      "value": {
+        "kind": "inline",
+        "hex": "09000000000000000000"
+      },
+      "authoring_set_order": 1,
+      "version": null
+    },
+    {
+      "section_id": 1,
+      "key_name": "timeCodesPerSecond",
+      "value": {
+        "kind": "inline",
+        "hex": "09000000000000004e40"
+      },
+      "authoring_set_order": 2,
+      "version": null
+    },
+    {
+      "section_id": 1,
+      "key_name": "upAxis",
+      "value": {
+        "kind": "inline",
+        "hex": "0b000100000059"
+      },
+      "authoring_set_order": 4,
+      "version": null
+    },
+    {
+      "section_id": 36719294895387868,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700000000000000000000000000000000000000000000000000"
+      },
+      "authoring_set_order": 18,
+      "version": 35
+    },
+    {
+      "section_id": 36719294895387868,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 17,
+      "version": 35
+    },
+    {
+      "section_id": 507830835434476256,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700000000000000f03f000000000000f03f000000000000f03f"
+      },
+      "authoring_set_order": 22,
+      "version": 35
+    },
+    {
+      "section_id": 507830835434476256,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 21,
+      "version": 35
+    },
+    {
+      "section_id": 641504060204211146,
+      "key_name": "specifier",
+      "value": {
+        "kind": "inline",
+        "hex": "2a0000000000"
+      },
+      "authoring_set_order": 3,
+      "version": null
+    },
+    {
+      "section_id": 1396375711122871695,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "0800352e9141"
+      },
+      "authoring_set_order": 7,
+      "version": null
+    },
+    {
+      "section_id": 1396375711122871695,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0005000000666c6f6174"
+      },
+      "authoring_set_order": 6,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "customData",
+      "value": {
+        "kind": "inline",
+        "hex": "1f000100000000000000040000006f6d6e691f000100000000000000030000006b69741f00020000000000000014000000686964655f696e5f73746167655f77696e646f77010001090000006e6f5f64656c657465010001"
+      },
+      "authoring_set_order": 6,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "hide_in_stage_window",
+      "value": {
+        "kind": "inline",
+        "hex": "010001"
+      },
+      "authoring_set_order": 7,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "kind",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0009000000636f6d706f6e656e74"
+      },
+      "authoring_set_order": 3,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "no_delete",
+      "value": {
+        "kind": "inline",
+        "hex": "010001"
+      },
+      "authoring_set_order": 8,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "specifier",
+      "value": {
+        "kind": "inline",
+        "hex": "2a0000000000"
+      },
+      "authoring_set_order": 4,
+      "version": null
+    },
+    {
+      "section_id": 1935122343505658114,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b000600000043616d657261"
+      },
+      "authoring_set_order": 5,
+      "version": null
+    },
+    {
+      "section_id": 2444550230040932535,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "09000000000000005940"
+      },
+      "authoring_set_order": 6,
+      "version": 35
+    },
+    {
+      "section_id": 2444550230040932535,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0006000000646f75626c65"
+      },
+      "authoring_set_order": 5,
+      "version": 35
+    },
+    {
+      "section_id": 2590379634061370490,
+      "key_name": "custom",
+      "value": {
+        "kind": "inline",
+        "hex": "010001"
+      },
+      "authoring_set_order": 15,
+      "version": null
+    },
+    {
+      "section_id": 2590379634061370490,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "0a0000000000"
+      },
+      "authoring_set_order": 17,
+      "version": null
+    },
+    {
+      "section_id": 2590379634061370490,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0006000000737472696e67"
+      },
+      "authoring_set_order": 16,
+      "version": null
+    },
+    {
+      "section_id": 4838027035830472215,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700000000000000000000000000000000000000000000000000"
+      },
+      "authoring_set_order": 8,
+      "version": null
+    },
+    {
+      "section_id": 4838027035830472215,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 7,
+      "version": null
+    },
+    {
+      "section_id": 4865688153437211020,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "8b0003000000000000001100000078666f726d4f703a7472616e736c6174651100000078666f726d4f703a726f7461746558595a0d00000078666f726d4f703a7363616c65"
+      },
+      "authoring_set_order": 17,
+      "version": null
+    },
+    {
+      "section_id": 4865688153437211020,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000746f6b656e5b5d"
+      },
+      "authoring_set_order": 15,
+      "version": null
+    },
+    {
+      "section_id": 4865688153437211020,
+      "key_name": "variability",
+      "value": {
+        "kind": "inline",
+        "hex": "2c0001000000"
+      },
+      "authoring_set_order": 16,
+      "version": null
+    },
+    {
+      "section_id": 5131590939648125535,
+      "key_name": "specifier",
+      "value": {
+        "kind": "inline",
+        "hex": "2a0000000000"
+      },
+      "authoring_set_order": 0,
+      "version": null
+    },
+    {
+      "section_id": 6195934264762118290,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700000000000000000000000000000000000000000000000000"
+      },
+      "authoring_set_order": 14,
+      "version": 35
+    },
+    {
+      "section_id": 6195934264762118290,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 13,
+      "version": 35
+    },
+    {
+      "section_id": 6342097646872199879,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700000000000000f03f000000000000f03f000000000000f03f"
+      },
+      "authoring_set_order": 12,
+      "version": null
+    },
+    {
+      "section_id": 6342097646872199879,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 11,
+      "version": null
+    },
+    {
+      "section_id": 6358204455613567733,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "8b0003000000000000001100000078666f726d4f703a7472616e736c6174651100000078666f726d4f703a726f7461746558595a0d00000078666f726d4f703a7363616c65"
+      },
+      "authoring_set_order": 27,
+      "version": 35
+    },
+    {
+      "section_id": 6358204455613567733,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000746f6b656e5b5d"
+      },
+      "authoring_set_order": 25,
+      "version": 35
+    },
+    {
+      "section_id": 6358204455613567733,
+      "key_name": "variability",
+      "value": {
+        "kind": "inline",
+        "hex": "2c0001000000"
+      },
+      "authoring_set_order": 26,
+      "version": 35
+    },
+    {
+      "section_id": 7523432890544368566,
+      "key_name": "custom",
+      "value": {
+        "kind": "inline",
+        "hex": "010001"
+      },
+      "authoring_set_order": 2,
+      "version": null
+    },
+    {
+      "section_id": 7523432890544368566,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "8a0001000000000000000b0000002f576f726c642f43756265"
+      },
+      "authoring_set_order": 0,
+      "version": 36
+    },
+    {
+      "section_id": 7523432890544368566,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0008000000737472696e675b5d"
+      },
+      "authoring_set_order": 3,
+      "version": null
+    },
+    {
+      "section_id": 17052835229667916853,
+      "key_name": "specifier",
+      "value": {
+        "kind": "inline",
+        "hex": "2a0000000000"
+      },
+      "authoring_set_order": 2,
+      "version": 35
+    },
+    {
+      "section_id": 17052835229667916853,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b000400000043756265"
+      },
+      "authoring_set_order": 3,
+      "version": 35
+    },
+    {
+      "section_id": 17130279763733852038,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "98000200000000000000000048c2000048c2000048c2000048420000484200004842"
+      },
+      "authoring_set_order": 10,
+      "version": 35
+    },
+    {
+      "section_id": 17130279763733852038,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0008000000666c6f6174335b5d"
+      },
+      "authoring_set_order": 9,
+      "version": 35
+    },
+    {
+      "section_id": 17387567167253789396,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "1700200881a3e9c22bc000cd09c69237004080349ef304b52740"
+      },
+      "authoring_set_order": 0,
+      "version": 33
+    },
+    {
+      "section_id": 17387567167253789396,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0007000000646f75626c6533"
+      },
+      "authoring_set_order": 3,
+      "version": null
+    },
+    {
+      "section_id": 18061108321143083485,
+      "key_name": "custom",
+      "value": {
+        "kind": "inline",
+        "hex": "010001"
+      },
+      "authoring_set_order": 10,
+      "version": null
+    },
+    {
+      "section_id": 18061108321143083485,
+      "key_name": "default",
+      "value": {
+        "kind": "inline",
+        "hex": "0a000b0000007065727370656374697665"
+      },
+      "authoring_set_order": 12,
+      "version": null
+    },
+    {
+      "section_id": 18061108321143083485,
+      "key_name": "typeName",
+      "value": {
+        "kind": "inline",
+        "hex": "0b0006000000737472696e67"
+      },
+      "authoring_set_order": 11,
+      "version": null
+    }
+  ],
+  "time_samples": [],
+  "ext_values": []
+}

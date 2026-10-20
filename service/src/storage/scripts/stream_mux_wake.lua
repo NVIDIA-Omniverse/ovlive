@@ -1,0 +1,60 @@
+-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+-- Licensed under the Apache License, Version 2.0 (the "License");
+-- you may not use this file except in compliance with the License.
+-- You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+
+-- stream_mux_wake.lua — wake a stream-multiplexer reader's blocked XREAD.
+--
+-- ── What a wake is ────────────────────────────────────────────────────────
+--
+-- Every multiplexed `XREAD BLOCK` a reader issues names that reader's wake
+-- key (`le:{<tag>}:mux:wake:<instance>:<reader>`, built by
+-- `KeySchema::stream_mux_wake`) alongside its layer streams. Appending one
+-- entry here makes the blocked read return, so the reader re-plans: it is how
+-- a new subscription, or one whose cursor is behind the read, gets onto the
+-- in-flight read, and how shutdown ends a read before each reader connection's
+-- QUIT.
+-- `storage::stream_mux::reader` is the only caller, for both.
+--
+-- ── Why one script rather than XADD then PEXPIRE ─────────────────────────
+--
+-- The key must never exist without a TTL. The instance id in its name is new
+-- on every process start, so a wake key whose TTL was never set is an orphan
+-- no later process will touch again, and a `noeviction` store never reclaims
+-- it. Issued as two commands, an XADD that lands followed by a PEXPIRE that
+-- fails leaves exactly that orphan. One script makes the pair atomic.
+--
+-- Not MULTI/EXEC: new transactional call sites must go through
+-- `acquire_txn_for` and `storage::watched_txn::WatchedTxn`, and a two-command
+-- write on one key needs none of that machinery. `stamp_cursor_if_live.lua`
+-- is the repo precedent for the same trade.
+--
+-- Cluster-safe by construction: one key, therefore one slot, and the caller
+-- tags the key with the slot of the stream keys the read names.
+--
+-- ── Contract ─────────────────────────────────────────────────────────────
+--
+-- KEYS:
+--   [1]  the reader's wake key.
+--
+-- ARGV:
+--   [1]  TTL in milliseconds (`stream_mux::WAKE_KEY_TTL_MS`), refreshed on
+--        every wake.
+--
+-- ── Return value ─────────────────────────────────────────────────────────
+--
+--   The id of the appended entry. `MAXLEN 1` keeps only that entry: a reader
+--   reads the key from the last wake id it saw, so one entry is all it needs.
+local id = redis.call("XADD", KEYS[1], "MAXLEN", "1", "*", "w", "1")
+redis.call("PEXPIRE", KEYS[1], ARGV[1])
+return id

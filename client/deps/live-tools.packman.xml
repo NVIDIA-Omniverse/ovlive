@@ -1,0 +1,10 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- The Python 3.12 of the reference and diagnostic environments for every USD profile, for the host's
+       platform_target_abi; on Linux a manylinux_2_35 build, so it has the pidfd support the test process guard
+       requires. tools/live/provision.py pulls it. -->
+  <dependency name="live-tools-python" linkPath="../_build/tool-deps/python">
+    <package name="python" version="3.12.14+nv4-${platform_target_abi}" />
+  </dependency>
+</project>

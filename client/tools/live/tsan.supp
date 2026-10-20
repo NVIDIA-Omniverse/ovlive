@@ -1,0 +1,137 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# ThreadSanitizer suppressions for the tsan profile (tools/live/sanitizer.py).
+# Entries name third-party frames only: the prebuilt USD and TBB shared
+# libraries, the statically linked gRPC, absl, upb and OpenSSL code, the glibc
+# dynamic loader, and third-party header templates inlined into our code. A
+# report whose happens-before edge runs through uninstrumented third-party code
+# (a handoff or a lock inside a prebuilt library) may be keyed on that
+# third-party frame only; an entry never names a product frame. A report with
+# both accesses in product code and no third-party edge is a product or test
+# defect to fix or annotate, never an entry here
+# (tests/harness/test_sanitizer.py). Each entry follows a comment giving its
+# owner and reason.
+# Each race: entry is keyed on a third-party frame in the report's stacks.
+# A race: entry matches a function, file or module name in any frame of the
+# racing access stacks (or a global variable's name or module), never a heap
+# allocation stack or a thread creation stack, so each entry also hides a
+# product race whose access stack passes through that frame; that is the
+# accepted cost of each entry below. A race: module entry names exactly one
+# library, so each prebuilt library carries its own reason. No race: entry
+# names a prebuilt USD module: USD's allocations reach ThreadSanitizer only
+# through its interceptors, which called_from_lib ignores, and the USD-linked
+# test executables keep the standard allocator under ThreadSanitizer so USD
+# calls it directly.
+# A called_from_lib: entry names exactly one library, because ThreadSanitizer
+# aborts when a pattern matches two loaded libraries; the USD entries cover the
+# NEEDED closure of the live_* binaries and the plugin.
+
+# owner: live-services; reason: prebuilt USD ar is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_ar.so
+# owner: live-services; reason: prebuilt USD arch is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_arch.so
+# owner: live-services; reason: prebuilt USD gf is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_gf.so
+# owner: live-services; reason: prebuilt USD js is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_js.so
+# owner: live-services; reason: prebuilt USD kind is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_kind.so
+# owner: live-services; reason: prebuilt USD pcp is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_pcp.so
+# owner: live-services; reason: prebuilt USD plug is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_plug.so
+# owner: live-services; reason: prebuilt USD python is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_python.so
+# owner: live-services; reason: prebuilt USD sdf is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_sdf.so
+# owner: live-services; reason: prebuilt USD tf is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_tf.so
+# owner: live-services; reason: prebuilt USD trace is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_trace.so
+# owner: live-services; reason: prebuilt USD ts is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_ts.so
+# owner: live-services; reason: prebuilt USD usd is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_usd.so
+# owner: live-services; reason: prebuilt USD usdGeom is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_usdGeom.so
+# owner: live-services; reason: prebuilt USD vt is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_vt.so
+# owner: live-services; reason: prebuilt USD work is uninstrumented; its allocation and copy interceptor calls synchronize through USD and TBB internals ThreadSanitizer cannot see.
+called_from_lib:libusd_work.so
+# The USD entries below key on USD 25.11 header templates that are compiled
+# into our binaries, anchored (^) at the start of the frame's function name, so
+# they never match a product function that only takes or returns a USD type.
+# Each hides a race whose access runs inside that template, including one
+# reached from product code (HostSceneStorage::_VisitSpecs,
+# WireSceneBuilder::build, buildSceneCandidate, LayerActor and SceneJournal
+# value handling, wire value decoding); that is their accepted cost.
+# owner: live-services; reason: VtValue's inlined copy, move and destroy run on TBB workers and host threads that hand values over through USD and TBB internals ThreadSanitizer cannot see.
+race:^pxrInternal_v0_25_11__pxrReserved__::VtValue::
+# owner: live-services; reason: TfDelegatedCountPtr and its increment and decrement hooks count VtValue's shared storage; the matching count change runs inside uninstrumented USD, so the final release and free have no visible happens-before.
+race:^pxrInternal_v0_25_11__pxrReserved__::TfDelegatedCount
+# owner: live-services; reason: TfToken's inlined reference release pairs with registry and copies inside uninstrumented libusd_tf.
+race:^pxrInternal_v0_25_11__pxrReserved__::TfToken::
+# owner: live-services; reason: TfPointerAndBits holds TfToken and SdfPath representations whose owners synchronize inside uninstrumented libusd_tf and libusd_sdf.
+race:^pxrInternal_v0_25_11__pxrReserved__::TfPointerAndBits<
+# owner: live-services; reason: VtDictionary's inlined destructor frees storage whose last owner released it inside uninstrumented USD.
+race:^pxrInternal_v0_25_11__pxrReserved__::VtDictionary::
+# owner: live-services; reason: TfRefPtr's inlined reference counters (Tf_RefPtr_Counter, Tf_RefPtr_UniqueChangedCounter) decrement a count whose other decrement runs inside uninstrumented libusd_sdf, so the deleting release has no visible happens-before.
+race:^pxrInternal_v0_25_11__pxrReserved__::Tf_RefPtr_
+# owner: live-services; reason: libusd_pcp's PcpLayerStack constructor and destructor call the std::shared_ptr count templates our executables export, and the final release runs on a TBB worker after a handoff inside uninstrumented USD; the entry keys on the PcpLayerStack frame in libusd_pcp.
+race:^pxrInternal_v0_25_11__pxrReserved__::PcpLayerStack::
+# owner: live-services; reason: uninstrumented USD code on TBB workers calls libstdc++'s out-of-line std::string::find on strings a host thread built before USD dispatched the work, and the dispatch is inside uninstrumented USD and TBB; the stack ends at the libstdc++ frame because its USD caller is uninstrumented. It also hides any other race whose racing read is that libstdc++ find.
+race:^std::__cxx11::basic_string<char,*>::find(
+# owner: live-services; reason: prebuilt TBB is uninstrumented; its allocation and copy interceptor calls synchronize through TBB task queues ThreadSanitizer cannot see.
+called_from_lib:libtbb.so.12
+# owner: live-services; reason: prebuilt TBB is uninstrumented; work on threads its RML server creates synchronizes through TBB task queues ThreadSanitizer cannot see.
+race:libtbb.so.12
+# owner: live-services; reason: TBB headers inlined into USD and our translation units synchronize through uninstrumented TBB internals.
+race:tbb::detail::*
+# The gRPC entries never match the grpc_schema_probe.cpp test file, the
+# live_grpc_schema_probe module or a product function that only takes a gRPC
+# C++ type: C symbols and the C++ API are anchored (^) at the start of the
+# frame's function name, gRPC C types match only inside a parameter list,
+# which no file or module name has, and the C++ API otherwise matches only as
+# a template argument or in grpc::internal. Statically linked gRPC frames often
+# carry no source location and a truncated stack, so a parameter or template
+# argument is frequently the only gRPC name in a report.
+# owner: live-services; reason: statically linked gRPC core is uninstrumented; its event engine, channels and completion queues synchronize through absl and atomics ThreadSanitizer cannot see; product code never names this namespace.
+race:grpc_core::
+# owner: live-services; reason: statically linked gRPC event engine is uninstrumented; its thread pool, poller and timer manager synchronize internally; product code never names this namespace.
+race:grpc_event_engine::
+# owner: live-services; reason: statically linked gRPC C symbols are uninstrumented.
+race:^grpc_
+# owner: live-services; reason: statically linked gRPC internals whose only gRPC name is a C type in the parameter list (eventfd_wakeup(grpc_wakeup_fd*), tcp_free(grpc_tcp*)) synchronize through gRPC's uninstrumented pollers and reference counts.
+race:(*grpc_
+# owner: live-services; reason: statically linked gRPC C++ and its header templates synchronize channel and client-context reference counts inside uninstrumented gRPC.
+race:^grpc::
+# owner: live-services; reason: a standard template over a gRPC C++ type (the shared_ptr<grpc::Channel> control block) whose last release runs inside uninstrumented gRPC.
+race:<grpc::
+# owner: live-services; reason: gRPC's call-operation header templates, instantiated in our binaries, synchronize through the uninstrumented completion queue.
+race:grpc::internal::
+# owner: live-services; reason: statically linked gRPC support (gpr) is uninstrumented.
+race:gpr_*
+# owner: live-services; reason: statically linked absl is uninstrumented; its hash tables and synchronization primitives are invisible to ThreadSanitizer.
+race:absl::*
+# owner: live-services; reason: statically linked upb is uninstrumented.
+race:upb_*
+# owner: live-services; reason: the Ar plugin factory hands the resolver to ArGetResolver's singleton inside libusd_ar, which is not instrumented; construction on the creating thread and the first _Resolve on another thread have no visible happens-before.
+race:Ar_ResolverFactory
+# owner: live-services; reason: USD's Tf_RegistryStaticInit static initializer pairs a mutex lock inside uninstrumented libusd_tf with an unlock ThreadSanitizer attributes to the inlined header, so it reports an unlock of an unlocked mutex.
+mutex:Tf_RegistryStaticInit
+# owner: live-services; reason: statically linked gRPC's posix endpoint sends buffers the caller handed over through gRPC's uninstrumented slice and completion-queue synchronization; the previous access stack is truncated to libstdc++ frames.
+race:tcp_send
+# owner: live-services; reason: statically linked gRPC's epoll poller frees its engine on the grpc_shutdown thread after an uninstrumented gRPC shutdown handoff; the previous access stack is not restored.
+race:shutdown_engine
+# owner: live-services; reason: statically linked gRPC's TLS frame protector is written under gRPC's uninstrumented secure-endpoint locks on the threads that drive gRPC calls and freed on a gRPC event-engine thread after the endpoint's uninstrumented last unref; the previous access stack is not restored. The entry keys on the function name up to its parameter list.
+race:^ssl_protector_destroy(
+# owner: live-services; reason: statically linked gRPC's secure endpoint is written under its uninstrumented locks on the threads that drive gRPC calls and freed on a gRPC event-engine thread after its uninstrumented last unref; the previous access stack is not restored. The entry keys on the function name up to its parameter list.
+race:^secure_endpoint_unref(
+# owner: live-services; reason: statically linked OpenSSL is uninstrumented as a dependency and its objects (BIO pairs, certificates, names, stacks, locks) are shared between gRPC's completion-queue poller and event-engine threads under gRPC's uninstrumented TLS locks and credential reference counts; the entry keys on OpenSSL's crypto/ source directory, which only OpenSSL frames carry.
+race:/src/crypto/
+# owner: live-services; reason: statically linked OpenSSL is uninstrumented as a dependency and its objects (BIO pairs, certificates, names, stacks, locks) are shared between gRPC's completion-queue poller and event-engine threads under gRPC's uninstrumented TLS locks and credential reference counts; the entry keys on OpenSSL's ssl/ source directory, which only OpenSSL frames carry.
+race:/src/ssl/
+# owner: live-services; reason: statically linked OpenSSL is uninstrumented as a dependency and its cipher contexts are initialized and used on gRPC's completion-queue poller and event-engine threads under gRPC's uninstrumented TLS locks; the entry keys on OpenSSL's providers/ source directory, which only OpenSSL frames carry, and hides any race whose access stack passes through OpenSSL's providers; OpenSSL never calls back into product code.
+race:/src/providers/
+# owner: live-services; reason: the glibc dynamic loader frees an exiting thread's dynamic TLS blocks under its own internal locking, which ThreadSanitizer does not see.
+race:_dl_deallocate_tls

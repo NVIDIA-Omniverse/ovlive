@@ -1,0 +1,115 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- if .Values.httpProxy.enabled -}}
+{{- $domain := .Values.httpProxy.fqdn.domain | required "httpProxy.fqdn.domain is required when httpProxy.enabled is true (the placeholder default `nodomain.none` is rejected to prevent an accidental ingress on a non-routable FQDN)" -}}
+{{- if eq $domain "nodomain.none" -}}
+{{- fail "httpProxy.fqdn.domain is still the placeholder value `nodomain.none`; set it to the real ingress domain (e.g. live.example.com) before deploying with httpProxy.enabled=true" -}}
+{{- end -}}
+{{- $fqdn := print .Values.httpProxy.fqdn.host "." $domain -}}
+---
+apiVersion: projectcontour.io/v1
+kind: HTTPProxy
+metadata:
+  name: {{ include "live-edit-service.fullname" . }}
+  labels:
+    {{- include "live-edit-service.labels" . | nindent 4 }}
+  {{- with .Values.httpProxy.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  virtualhost:
+    fqdn: {{ $fqdn }}
+    {{- if .Values.httpProxy.tls.enabled }}
+    tls:
+      secretName: {{ include "live-edit-service.tls-secret-name" . }}
+    {{- end }}
+    {{- /*
+      Contour's HTTPProxy CRD rejects a corsPolicy whose allowOrigin list is
+      empty (`spec.virtualhost.corsPolicy.allowOrigin in body should have at
+      least 1 items`). The chart's default allowOrigin is `[]` because CORS
+      is opt-in, so only emit the stanza when an operator has actually
+      configured at least one origin.
+    */}}
+    {{- with .Values.httpProxy.corsPolicy.allowOrigin }}
+    corsPolicy:
+      {{- toYaml $.Values.httpProxy.corsPolicy | nindent 6 }}
+    {{- end }}
+
+    {{- /*
+      Ingress-layer auth (Envoy external auth) is independent from the
+      service's internal authn. live-edit handles bearer-token validation
+      itself (authn is always enabled). Only emit the HTTPProxy authorization
+      stanza when the operator has explicitly opted in to an Envoy auth
+      extension.
+    */}}
+    {{- if .Values.httpProxy.authExtension.enabled }}
+    authorization:
+      responseTimeout: "{{ .Values.httpProxy.authExtension.responseTimeout }}"
+      extensionRef:
+        name: {{ .Values.httpProxy.authExtension.extensionRef.name }}
+        namespace: {{ .Values.httpProxy.authExtension.extensionRef.namespace | default .Release.Namespace }}
+    {{- end }}
+
+  routes:
+    # Bidirectional streaming RPC — clients maintain long-lived
+    # connections for presence and peer messaging.
+    - conditions:
+        - prefix: /nvidia.omniverse.live.v1alpha.LiveService/JoinSession
+      timeoutPolicy:
+        response: 240m
+        idle: 240m
+      {{- with .Values.httpProxy.responseHeadersPolicy }}
+      responseHeadersPolicy: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      services:
+        - name: {{ include "live-edit-service.servicename" . }}
+          port: {{ .Values.service.grpc.port }}
+          protocol: h2c
+    # Server-streaming RPC — clients receive real-time layer
+    # updates over long-lived connections.
+    - conditions:
+        - prefix: /nvidia.omniverse.live.v1alpha.LiveService/SubscribeReadLayer
+      timeoutPolicy:
+        response: 240m
+        idle: 240m
+      {{- with .Values.httpProxy.responseHeadersPolicy }}
+      responseHeadersPolicy: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      services:
+        - name: {{ include "live-edit-service.servicename" . }}
+          port: {{ .Values.service.grpc.port }}
+          protocol: h2c
+    # All other (non-streaming) RPCs use the configurable
+    # timeouts from values.yaml.
+    - conditions:
+        - prefix: /
+      timeoutPolicy:
+        response: {{ .Values.httpProxy.timeoutPolicy.response }}
+        idle: {{ .Values.httpProxy.timeoutPolicy.idle }}
+      {{- with .Values.httpProxy.responseHeadersPolicy }}
+      responseHeadersPolicy: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      services:
+        - name: {{ include "live-edit-service.servicename" . }}
+          port: {{ .Values.service.grpc.port }}
+          protocol: h2c
+
+{{- else -}}
+### HTTPProxy (ingress) is disabled, see .Values.httpProxy.enabled
+{{- end }}

@@ -1,0 +1,16 @@
+{
+  "Plugins": [{
+    "Type": "library",
+    "Name": "omni_usd_live_native",
+    "Root": ".",
+    "LibraryPath": "",
+    "ResourcePath": ".",
+    "Info": {"Types": {
+      "OmniUsdLiveResolver": {"bases": ["ArResolver"], "uriSchemes": ["live"]},
+      "OmniUsdLiveNativeFileFormat": {
+        "bases": ["SdfFileFormat"], "displayName": "Live Services",
+        "extensions": ["live"], "formatId": "live", "primary": true, "target": "usd"
+      }
+    }}
+  }]
+}

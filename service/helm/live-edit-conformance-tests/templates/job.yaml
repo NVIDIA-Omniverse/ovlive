@@ -1,0 +1,139 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- $basePath := required "service.basePath is required" .Values.service.basePath -}}
+{{- if eq (empty .Values.auth.existingSecret) (empty .Values.auth.sidecar) -}}
+{{- fail "Set exactly one of auth.existingSecret or auth.sidecar" -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    app.kubernetes.io/name: live-edit-conformance-tests
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- /* Test clients must not acquire the service Deployment's required
+              name label through copied podLabels. Job metadata stays labelled. */}}
+        {{- $podLabels := mergeOverwrite (dict "app.kubernetes.io/instance" .Release.Name) (.Values.podLabels | default dict) }}
+        {{- omit $podLabels "app.kubernetes.io/name" | toYaml | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      serviceAccountName: {{ .Values.serviceAccountName | default .Release.Name }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.auth.sidecar }}
+      initContainers:
+        - name: token-provisioner
+          restartPolicy: Always
+          {{- omit . "name" "restartPolicy" "volumeMounts" | toYaml | nindent 10 }}
+          volumeMounts:
+            - name: auth
+              mountPath: /etc/secrets/access-token
+      {{- end }}
+      containers:
+        - name: conformance
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [python, -m, live_edit_conformance.deployment]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          args:
+            {{- range .Values.profiles }}
+            - --profile
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: CONFORMANCE_GRPC_ENDPOINT
+              value: {{ .Values.service.endpoint | quote }}
+            - name: CONFORMANCE_BASE_PATH
+              value: {{ $basePath | quote }}
+            - name: CONFORMANCE_PEER_ENDPOINT
+              value: {{ .Values.service.peerEndpoint | quote }}
+            - name: CONFORMANCE_DENIED_PATH
+              value: {{ .Values.service.deniedPath | quote }}
+            - name: CONFORMANCE_STORAGE_ENDPOINT
+              value: {{ .Values.service.storageEndpoint | quote }}
+            - name: CONFORMANCE_REPORT_STDOUT
+              value: "true"
+            - name: CONFORMANCE_AUTH_TOKEN_FILE
+              value: /auth/token
+            - name: CONFORMANCE_TIMEOUT
+              value: {{ .Values.timeouts.request | quote }}
+            - name: CONFORMANCE_READY_TIMEOUT
+              value: {{ .Values.timeouts.readiness | quote }}
+            {{- if .Values.tls.existingSecret }}
+            - name: CONFORMANCE_CA_FILE
+              value: /tls/ca.crt
+            {{- end }}
+          resources: {{ toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: reports
+              mountPath: /reports
+            - name: tmp
+              mountPath: /tmp
+            - name: auth
+              mountPath: /auth
+              readOnly: true
+            {{- if .Values.tls.existingSecret }}
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: reports
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: auth
+          {{- if .Values.auth.existingSecret }}
+          secret:
+            secretName: {{ .Values.auth.existingSecret }}
+            items:
+              - key: {{ .Values.auth.key }}
+                path: token
+          {{- else }}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi
+          {{- end }}
+        {{- if .Values.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            items:
+              - key: {{ .Values.tls.key }}
+                path: ca.crt
+        {{- end }}

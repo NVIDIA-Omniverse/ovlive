@@ -1,0 +1,1978 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omni USD Live CopyDiagnostics snapshot version 1",
+  "$comment": "Additive consumer schema. currentProducer additionally requires all current metric/configuration fields. x-unique-dimensions is a supplemental offline-validator check, not a standard JSON Schema assertion. No globally atomic capture or unsaturated arithmetic is assumed.",
+  "$ref": "#/$defs/snapshot",
+  "$defs": {
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "uint32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "flag": {
+      "type": "integer",
+      "enum": [
+        0,
+        1
+      ]
+    },
+    "positiveCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "bounds": {
+      "const": [
+        1,
+        5,
+        10,
+        50,
+        100,
+        500,
+        1000,
+        5000
+      ]
+    },
+    "counts": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/uint64"
+      },
+      "minItems": 9,
+      "maxItems": 9
+    },
+    "duration": {
+      "type": "object",
+      "properties": {
+        "bounds": {
+          "$ref": "#/$defs/bounds"
+        },
+        "count": {
+          "$ref": "#/$defs/uint64"
+        },
+        "sum_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        }
+      },
+      "required": [
+        "bounds",
+        "count",
+        "sum_ms",
+        "counts"
+      ],
+      "additionalProperties": true
+    },
+    "resultDurations": {
+      "type": "object",
+      "properties": {
+        "bounds": {
+          "$ref": "#/$defs/bounds"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "result": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              },
+              "sum_ms": {
+                "$ref": "#/$defs/uint64"
+              },
+              "counts": {
+                "$ref": "#/$defs/counts"
+              }
+            },
+            "required": [
+              "result",
+              "count",
+              "sum_ms",
+              "counts"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "result"
+          ]
+        }
+      },
+      "required": [
+        "bounds",
+        "entries"
+      ],
+      "additionalProperties": true
+    },
+    "resolutionDurations": {
+      "type": "object",
+      "properties": {
+        "bounds": {
+          "$ref": "#/$defs/bounds"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "resolution": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              },
+              "sum_ms": {
+                "$ref": "#/$defs/uint64"
+              },
+              "counts": {
+                "$ref": "#/$defs/counts"
+              }
+            },
+            "required": [
+              "resolution",
+              "count",
+              "sum_ms",
+              "counts"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "resolution"
+          ]
+        }
+      },
+      "required": [
+        "bounds",
+        "entries"
+      ],
+      "additionalProperties": true
+    },
+    "slots": {
+      "type": "object",
+      "properties": {
+        "current": {
+          "$ref": "#/$defs/uint64"
+        },
+        "high_water": {
+          "$ref": "#/$defs/uint64"
+        },
+        "admitted": {
+          "$ref": "#/$defs/uint64"
+        },
+        "released": {
+          "$ref": "#/$defs/uint64"
+        },
+        "rejected": {
+          "$ref": "#/$defs/uint64"
+        }
+      },
+      "required": [
+        "current",
+        "high_water",
+        "admitted",
+        "released",
+        "rejected"
+      ],
+      "additionalProperties": true
+    },
+    "executor": {
+      "type": "object",
+      "properties": {
+        "enqueued": {
+          "$ref": "#/$defs/uint64"
+        },
+        "started": {
+          "$ref": "#/$defs/uint64"
+        },
+        "completed": {
+          "$ref": "#/$defs/uint64"
+        },
+        "queued": {
+          "$ref": "#/$defs/uint64"
+        },
+        "running": {
+          "$ref": "#/$defs/uint64"
+        },
+        "queue_high_water": {
+          "$ref": "#/$defs/uint64"
+        },
+        "configured_workers": {
+          "$ref": "#/$defs/uint64"
+        },
+        "live_workers": {
+          "$ref": "#/$defs/uint64"
+        },
+        "oldest_queued_age_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "oldest_running_age_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "queue_wait_ms": {
+          "$ref": "#/$defs/duration"
+        },
+        "dispatch_duration_ms": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "required": [
+        "enqueued",
+        "started",
+        "completed",
+        "queued",
+        "running",
+        "queue_high_water",
+        "configured_workers",
+        "live_workers",
+        "oldest_queued_age_ms",
+        "oldest_running_age_ms",
+        "queue_wait_ms",
+        "dispatch_duration_ms"
+      ],
+      "additionalProperties": true
+    },
+    "status": {
+      "type": "object",
+      "properties": {
+        "endpoint": {
+          "$ref": "#/$defs/uint64"
+        },
+        "session": {
+          "$ref": "#/$defs/uint64"
+        },
+        "subject_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "revision": {
+          "$ref": "#/$defs/uint64"
+        },
+        "changed_at_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "incident_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "pending_write_count": {
+          "$ref": "#/$defs/uint64"
+        },
+        "pending_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "blocked_layers": {
+          "$ref": "#/$defs/uint64"
+        },
+        "failed_layers": {
+          "$ref": "#/$defs/uint64"
+        },
+        "blocked_sessions": {
+          "$ref": "#/$defs/uint64"
+        },
+        "failed_sessions": {
+          "$ref": "#/$defs/uint64"
+        },
+        "subject_kind": {
+          "$ref": "#/$defs/uint32"
+        },
+        "state": {
+          "$ref": "#/$defs/uint32"
+        },
+        "result": {
+          "$ref": "#/$defs/uint32"
+        },
+        "operation": {
+          "$ref": "#/$defs/uint32"
+        },
+        "recovery_action": {
+          "$ref": "#/$defs/uint32"
+        },
+        "grpc_status_present": {
+          "$ref": "#/$defs/flag"
+        },
+        "progress_known": {
+          "$ref": "#/$defs/flag"
+        },
+        "has_unconfirmed_edits": {
+          "$ref": "#/$defs/flag"
+        },
+        "grpc_status": {
+          "$ref": "#/$defs/uint32"
+        },
+        "canonical_resource": {
+          "type": "string"
+        },
+        "read_sequence": {
+          "$ref": "#/$defs/uint64"
+        },
+        "applied_sequence": {
+          "$ref": "#/$defs/uint64"
+        }
+      },
+      "required": [
+        "endpoint",
+        "session",
+        "subject_id",
+        "revision",
+        "changed_at_ms",
+        "incident_id",
+        "pending_write_count",
+        "pending_bytes",
+        "blocked_layers",
+        "failed_layers",
+        "blocked_sessions",
+        "failed_sessions",
+        "subject_kind",
+        "state",
+        "result",
+        "operation",
+        "recovery_action",
+        "grpc_status_present",
+        "progress_known",
+        "has_unconfirmed_edits"
+      ],
+      "additionalProperties": true,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "grpc_status_present": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "grpc_status"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "grpc_status"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "record": {
+      "type": "object",
+      "properties": {
+        "timestamp_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "elapsed_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "runtime_instance_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "sequence": {
+          "$ref": "#/$defs/uint64"
+        },
+        "endpoint": {
+          "$ref": "#/$defs/uint64"
+        },
+        "subject_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "incident_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "event_code": {
+          "$ref": "#/$defs/uint32"
+        },
+        "event_name": {
+          "type": "string"
+        },
+        "severity": {
+          "$ref": "#/$defs/uint32"
+        },
+        "fields": {
+          "type": "object",
+          "properties": {
+            "operation": {
+              "$ref": "#/$defs/uint64"
+            },
+            "result": {
+              "$ref": "#/$defs/uint64"
+            },
+            "grpc_status": {
+              "$ref": "#/$defs/uint64"
+            },
+            "request_id": {
+              "$ref": "#/$defs/uint64"
+            },
+            "attempt_id": {
+              "$ref": "#/$defs/uint64"
+            },
+            "stream_generation": {
+              "$ref": "#/$defs/uint64"
+            },
+            "auth_generation": {
+              "$ref": "#/$defs/uint64"
+            },
+            "challenge_id": {
+              "$ref": "#/$defs/uint64"
+            },
+            "reason": {
+              "$ref": "#/$defs/uint64"
+            },
+            "delay_ms": {
+              "$ref": "#/$defs/uint64"
+            },
+            "pending_bytes": {
+              "$ref": "#/$defs/uint64"
+            },
+            "pending_writes": {
+              "$ref": "#/$defs/uint64"
+            },
+            "duration_ms": {
+              "$ref": "#/$defs/uint64"
+            },
+            "count": {
+              "$ref": "#/$defs/uint64"
+            },
+            "state": {
+              "$ref": "#/$defs/uint64"
+            },
+            "revision": {
+              "$ref": "#/$defs/uint64"
+            },
+            "read_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "write_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "applied_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "bytes": {
+              "$ref": "#/$defs/uint64"
+            },
+            "retry_disposition": {
+              "$ref": "#/$defs/uint64"
+            },
+            "queue_depth": {
+              "$ref": "#/$defs/uint64"
+            },
+            "sample_age_ms": {
+              "$ref": "#/$defs/uint64"
+            },
+            "resume_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "work_id": {
+              "$ref": "#/$defs/uint64"
+            },
+            "session_handle": {
+              "$ref": "#/$defs/uint64"
+            },
+            "target_local_ordinal": {
+              "$ref": "#/$defs/uint64"
+            },
+            "local_retired": {
+              "$ref": "#/$defs/uint64"
+            },
+            "auth_failure_cause": {
+              "$ref": "#/$defs/uint64"
+            },
+            "struct_commands": {
+              "$ref": "#/$defs/uint64"
+            },
+            "set_fields": {
+              "$ref": "#/$defs/uint64"
+            },
+            "time_samples": {
+              "$ref": "#/$defs/uint64"
+            },
+            "limit": {
+              "$ref": "#/$defs/uint64"
+            }
+          },
+          "required": [],
+          "additionalProperties": true,
+          "description": "Known fields are exact uint64. Unknown additive fields are opaque and must not imply success."
+        },
+        "canonical_resource": {
+          "type": "string",
+          "maxLength": 512
+        }
+      },
+      "required": [
+        "timestamp_ms",
+        "elapsed_ms",
+        "runtime_instance_id",
+        "sequence",
+        "endpoint",
+        "subject_id",
+        "incident_id",
+        "event_code",
+        "event_name",
+        "severity",
+        "fields"
+      ],
+      "additionalProperties": true
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "emitted": {
+          "$ref": "#/$defs/uint64"
+        },
+        "suppressed": {
+          "$ref": "#/$defs/uint64"
+        },
+        "warning_suppressed": {
+          "$ref": "#/$defs/uint64"
+        },
+        "invalid": {
+          "$ref": "#/$defs/uint64"
+        },
+        "history_overwritten": {
+          "$ref": "#/$defs/uint64"
+        },
+        "history_dropped": {
+          "$ref": "#/$defs/uint64"
+        },
+        "sink_dropped": {
+          "$ref": "#/$defs/uint64"
+        },
+        "sink_failures": {
+          "$ref": "#/$defs/uint64"
+        },
+        "sinks_disabled": {
+          "$ref": "#/$defs/uint64"
+        },
+        "closed_incidents_evicted": {
+          "$ref": "#/$defs/uint64"
+        },
+        "rpc_attempts": {
+          "$ref": "#/$defs/uint64"
+        },
+        "rpc_completions": {
+          "$ref": "#/$defs/uint64"
+        },
+        "rpc_in_flight": {
+          "$ref": "#/$defs/uint64"
+        },
+        "scope": {
+          "const": "runtime"
+        },
+        "rpc_by_operation_result": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "$ref": "#/$defs/uint32"
+              },
+              "result": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              }
+            },
+            "required": [
+              "operation",
+              "result",
+              "count"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "operation",
+            "result"
+          ]
+        },
+        "rpc_attempts_by_operation": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              }
+            },
+            "required": [
+              "operation",
+              "count"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "operation"
+          ]
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "event_code": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              }
+            },
+            "required": [
+              "event_code",
+              "count"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "event_code"
+          ]
+        },
+        "messages_by_event": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "event_code": {
+                "$ref": "#/$defs/uint32"
+              },
+              "count": {
+                "$ref": "#/$defs/positiveCount"
+              },
+              "bytes": {
+                "$ref": "#/$defs/uint64"
+              }
+            },
+            "required": [
+              "event_code",
+              "count",
+              "bytes"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "event_code"
+          ]
+        },
+        "rpc_duration_ms": {
+          "type": "object",
+          "properties": {
+            "bounds": {
+              "$ref": "#/$defs/bounds"
+            },
+            "counts": {
+              "$ref": "#/$defs/counts"
+            }
+          },
+          "required": [
+            "bounds",
+            "counts"
+          ],
+          "additionalProperties": true
+        },
+        "rpc_duration_ms_by_operation_result": {
+          "type": "object",
+          "properties": {
+            "bounds": {
+              "$ref": "#/$defs/bounds"
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "result": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "count": {
+                    "$ref": "#/$defs/positiveCount"
+                  },
+                  "sum_ms": {
+                    "$ref": "#/$defs/uint64"
+                  },
+                  "counts": {
+                    "$ref": "#/$defs/counts"
+                  }
+                },
+                "required": [
+                  "operation",
+                  "result",
+                  "count",
+                  "sum_ms",
+                  "counts"
+                ],
+                "additionalProperties": true
+              },
+              "x-unique-dimensions": [
+                "operation",
+                "result"
+              ]
+            }
+          },
+          "required": [
+            "bounds",
+            "entries"
+          ],
+          "additionalProperties": true
+        },
+        "shutdown_duration_ms_by_phase_result": {
+          "type": "object",
+          "properties": {
+            "bounds": {
+              "$ref": "#/$defs/bounds"
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "phase": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "result": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "count": {
+                    "$ref": "#/$defs/positiveCount"
+                  },
+                  "sum_ms": {
+                    "$ref": "#/$defs/uint64"
+                  },
+                  "counts": {
+                    "$ref": "#/$defs/counts"
+                  }
+                },
+                "required": [
+                  "phase",
+                  "result",
+                  "count",
+                  "sum_ms",
+                  "counts"
+                ],
+                "additionalProperties": true
+              },
+              "x-unique-dimensions": [
+                "phase",
+                "result"
+              ]
+            }
+          },
+          "required": [
+            "bounds",
+            "entries"
+          ],
+          "additionalProperties": true
+        },
+        "save_duration_ms_by_result": {
+          "$ref": "#/$defs/resultDurations"
+        },
+        "drain_duration_ms_by_result": {
+          "$ref": "#/$defs/resultDurations"
+        },
+        "auth": {
+          "type": "object",
+          "properties": {
+            "blocked_endpoints": {
+              "$ref": "#/$defs/uint64"
+            },
+            "blocked_endpoints_high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "stale_replacements": {
+              "$ref": "#/$defs/uint64"
+            },
+            "challenges_by_reason": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "count": {
+                    "$ref": "#/$defs/positiveCount"
+                  }
+                },
+                "required": [
+                  "reason",
+                  "count"
+                ],
+                "additionalProperties": true
+              },
+              "x-unique-dimensions": [
+                "reason"
+              ]
+            },
+            "failures_by_cause": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "cause": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "count": {
+                    "$ref": "#/$defs/positiveCount"
+                  }
+                },
+                "required": [
+                  "cause",
+                  "count"
+                ],
+                "additionalProperties": true
+              },
+              "x-unique-dimensions": [
+                "cause"
+              ]
+            },
+            "credential_wait_ms_by_resolution": {
+              "$ref": "#/$defs/resolutionDurations"
+            }
+          },
+          "required": [
+            "blocked_endpoints",
+            "blocked_endpoints_high_water",
+            "stale_replacements",
+            "challenges_by_reason",
+            "failures_by_cause",
+            "credential_wait_ms_by_resolution"
+          ],
+          "additionalProperties": true
+        },
+        "subjects": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/uint32"
+              },
+              "current": {
+                "$ref": "#/$defs/uint64"
+              },
+              "high_water": {
+                "$ref": "#/$defs/uint64"
+              },
+              "admitted": {
+                "$ref": "#/$defs/uint64"
+              },
+              "detached": {
+                "$ref": "#/$defs/uint64"
+              },
+              "states": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "state": {
+                      "$ref": "#/$defs/uint32"
+                    },
+                    "current": {
+                      "$ref": "#/$defs/uint64"
+                    }
+                  },
+                  "required": [
+                    "state",
+                    "current"
+                  ],
+                  "additionalProperties": true
+                },
+                "x-unique-dimensions": [
+                  "state"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "current",
+              "high_water",
+              "admitted",
+              "detached",
+              "states"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "kind"
+          ]
+        },
+        "readiness": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/uint32"
+              },
+              "initial_waiting": {
+                "$ref": "#/$defs/uint64"
+              },
+              "recovering": {
+                "$ref": "#/$defs/uint64"
+              },
+              "initial_ms_by_resolution": {
+                "$ref": "#/$defs/resolutionDurations"
+              },
+              "recovery_ms_by_resolution": {
+                "$ref": "#/$defs/resolutionDurations"
+              }
+            },
+            "required": [
+              "kind",
+              "initial_waiting",
+              "recovering",
+              "initial_ms_by_resolution",
+              "recovery_ms_by_resolution"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "kind"
+          ]
+        },
+        "backpressure": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/uint32"
+              },
+              "current": {
+                "$ref": "#/$defs/uint64"
+              },
+              "high_water": {
+                "$ref": "#/$defs/uint64"
+              },
+              "duration_ms_by_resolution": {
+                "$ref": "#/$defs/resolutionDurations"
+              }
+            },
+            "required": [
+              "kind",
+              "current",
+              "high_water",
+              "duration_ms_by_resolution"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "kind"
+          ]
+        },
+        "applications": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/uint32"
+              },
+              "current": {
+                "$ref": "#/$defs/uint64"
+              },
+              "high_water": {
+                "$ref": "#/$defs/uint64"
+              },
+              "admitted": {
+                "$ref": "#/$defs/uint64"
+              },
+              "retired": {
+                "$ref": "#/$defs/uint64"
+              },
+              "queue_ms": {
+                "$ref": "#/$defs/duration"
+              },
+              "body_ms": {
+                "$ref": "#/$defs/duration"
+              },
+              "post_body_retention_ms": {
+                "$ref": "#/$defs/duration"
+              },
+              "lifetime_ms_by_result": {
+                "$ref": "#/$defs/resultDurations"
+              }
+            },
+            "required": [
+              "kind",
+              "current",
+              "high_water",
+              "admitted",
+              "retired",
+              "queue_ms",
+              "body_ms",
+              "post_body_retention_ms",
+              "lifetime_ms_by_result"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "kind"
+          ]
+        },
+        "jitter": {
+          "type": "object",
+          "properties": {
+            "current": {
+              "$ref": "#/$defs/uint64"
+            },
+            "high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "started": {
+              "$ref": "#/$defs/uint64"
+            },
+            "completed": {
+              "$ref": "#/$defs/uint64"
+            },
+            "frozen_generation_starts": {
+              "$ref": "#/$defs/uint64"
+            },
+            "unsampled_starts": {
+              "$ref": "#/$defs/uint64"
+            },
+            "requested_wait_ms": {
+              "$ref": "#/$defs/duration"
+            },
+            "target_hold_ms": {
+              "$ref": "#/$defs/duration"
+            },
+            "sample_age_ms": {
+              "$ref": "#/$defs/duration"
+            },
+            "observed_hold_ms_by_resolution": {
+              "$ref": "#/$defs/resolutionDurations"
+            },
+            "post_due_observation_ms_by_resolution": {
+              "$ref": "#/$defs/resolutionDurations"
+            }
+          },
+          "required": [
+            "current",
+            "high_water",
+            "started",
+            "completed",
+            "frozen_generation_starts",
+            "unsampled_starts",
+            "requested_wait_ms",
+            "target_hold_ms",
+            "sample_age_ms",
+            "observed_hold_ms_by_resolution",
+            "post_due_observation_ms_by_resolution"
+          ],
+          "additionalProperties": true
+        },
+        "apply_lag": {
+          "type": "object",
+          "properties": {
+            "current": {
+              "$ref": "#/$defs/uint64"
+            },
+            "high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "receive_to_apply_max_ms": {
+              "$ref": "#/$defs/uint64"
+            },
+            "receive_to_apply_ms": {
+              "$ref": "#/$defs/duration"
+            }
+          },
+          "required": [
+            "current",
+            "high_water",
+            "receive_to_apply_max_ms",
+            "receive_to_apply_ms"
+          ],
+          "additionalProperties": true
+        },
+        "layer_writes": {
+          "type": "object",
+          "properties": {
+            "in_flight": {
+              "$ref": "#/$defs/uint64"
+            },
+            "in_flight_high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "window_high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "window_grown": {
+              "$ref": "#/$defs/uint64"
+            },
+            "window_halved": {
+              "$ref": "#/$defs/uint64"
+            },
+            "chain_resends": {
+              "$ref": "#/$defs/uint64"
+            },
+            "resent_writes": {
+              "$ref": "#/$defs/uint64"
+            },
+            "admitted_updates": {
+              "$ref": "#/$defs/uint64"
+            },
+            "coalesced_turns": {
+              "$ref": "#/$defs/uint64"
+            },
+            "max_turns_per_update": {
+              "$ref": "#/$defs/uint64"
+            }
+          },
+          "required": [
+            "in_flight",
+            "in_flight_high_water",
+            "window_high_water",
+            "window_grown",
+            "window_halved",
+            "chain_resends",
+            "resent_writes",
+            "admitted_updates",
+            "coalesced_turns",
+            "max_turns_per_update"
+          ],
+          "additionalProperties": true
+        },
+        "capacity": {
+          "type": "object",
+          "properties": {
+            "request_slots": {
+              "type": "object",
+              "properties": {
+                "ordinary": {
+                  "$ref": "#/$defs/slots"
+                },
+                "timing": {
+                  "$ref": "#/$defs/slots"
+                }
+              },
+              "required": [
+                "ordinary",
+                "timing"
+              ],
+              "additionalProperties": true
+            },
+            "pending_bytes": {
+              "type": "object",
+              "properties": {
+                "current_bytes": {
+                  "$ref": "#/$defs/uint64"
+                },
+                "high_water_bytes": {
+                  "$ref": "#/$defs/uint64"
+                },
+                "admitted_bytes": {
+                  "$ref": "#/$defs/uint64"
+                },
+                "released_bytes": {
+                  "$ref": "#/$defs/uint64"
+                },
+                "rejected_bytes": {
+                  "$ref": "#/$defs/uint64"
+                },
+                "reservations": {
+                  "$ref": "#/$defs/slots"
+                },
+                "current_bytes_overflow": {
+                  "type": "boolean"
+                },
+                "high_water_bytes_overflow": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "current_bytes",
+                "high_water_bytes",
+                "admitted_bytes",
+                "released_bytes",
+                "rejected_bytes",
+                "reservations",
+                "current_bytes_overflow",
+                "high_water_bytes_overflow"
+              ],
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "request_slots",
+            "pending_bytes"
+          ],
+          "additionalProperties": true
+        },
+        "cq_tags": {
+          "type": "object",
+          "properties": {
+            "submitted": {
+              "$ref": "#/$defs/uint64"
+            },
+            "received_ok": {
+              "$ref": "#/$defs/uint64"
+            },
+            "received_not_ok": {
+              "$ref": "#/$defs/uint64"
+            },
+            "retired": {
+              "$ref": "#/$defs/uint64"
+            },
+            "abandoned": {
+              "$ref": "#/$defs/uint64"
+            },
+            "outstanding": {
+              "$ref": "#/$defs/uint64"
+            },
+            "outstanding_high_water": {
+              "$ref": "#/$defs/uint64"
+            },
+            "handling": {
+              "$ref": "#/$defs/uint64"
+            },
+            "retained": {
+              "$ref": "#/$defs/uint64"
+            },
+            "retained_high_water": {
+              "$ref": "#/$defs/uint64"
+            }
+          },
+          "required": [
+            "submitted",
+            "received_ok",
+            "received_not_ok",
+            "retired",
+            "abandoned",
+            "outstanding",
+            "outstanding_high_water",
+            "handling",
+            "retained",
+            "retained_high_water"
+          ],
+          "additionalProperties": true
+        },
+        "executors": {
+          "type": "object",
+          "properties": {
+            "operational": {
+              "$ref": "#/$defs/executor"
+            },
+            "diagnostic": {
+              "$ref": "#/$defs/executor"
+            }
+          },
+          "required": [
+            "operational",
+            "diagnostic"
+          ],
+          "additionalProperties": true
+        },
+        "operation_auth_waits": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "$ref": "#/$defs/uint32"
+              },
+              "current": {
+                "$ref": "#/$defs/uint64"
+              },
+              "high_water": {
+                "$ref": "#/$defs/uint64"
+              },
+              "started": {
+                "$ref": "#/$defs/uint64"
+              },
+              "completed": {
+                "$ref": "#/$defs/uint64"
+              },
+              "duration_ms_by_result": {
+                "$ref": "#/$defs/resultDurations"
+              }
+            },
+            "required": [
+              "kind",
+              "current",
+              "high_water",
+              "started",
+              "completed",
+              "duration_ms_by_result"
+            ],
+            "additionalProperties": true
+          },
+          "x-unique-dimensions": [
+            "kind"
+          ]
+        }
+      },
+      "required": [
+        "scope"
+      ],
+      "additionalProperties": true
+    },
+    "configuration": {
+      "type": "object",
+      "properties": {
+        "default_auth_wait_timeout_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_rejected_token_generations": {
+          "$ref": "#/$defs/uint32"
+        },
+        "auth_expiry_lead_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "request_timeout_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "initial_open_timeout_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "retry_initial_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "retry_maximum_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "retry_max_attempts": {
+          "$ref": "#/$defs/uint32"
+        },
+        "peer_reconciliation_grace_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_update_bytes": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_pending_bytes_per_endpoint": {
+          "$ref": "#/$defs/uint64"
+        },
+        "max_pending_messages_per_session": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_synthetic_gap": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_status_subjects": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_status_observers": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_diagnostic_records": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_diagnostic_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "max_diagnostic_sink_records": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_diagnostic_sinks": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_closed_incidents": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_requests": {
+          "$ref": "#/$defs/uint32"
+        },
+        "callback_worker_count": {
+          "$ref": "#/$defs/uint32"
+        },
+        "max_auth_callbacks": {
+          "$ref": "#/$defs/uint32"
+        },
+        "diagnostic_min_severity": {
+          "$ref": "#/$defs/uint32"
+        },
+        "diagnostic_allowed_flags": {
+          "$ref": "#/$defs/uint32"
+        },
+        "flags": {
+          "$ref": "#/$defs/uint32"
+        },
+        "diagnostic_export_limit_bytes": {
+          "$ref": "#/$defs/uint64"
+        },
+        "apply_lag_warning_threshold": {
+          "$ref": "#/$defs/uint64"
+        },
+        "reconnect_initial_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "reconnect_maximum_ms": {
+          "$ref": "#/$defs/uint32"
+        },
+        "reconnect_max_attempts": {
+          "$ref": "#/$defs/uint32"
+        }
+      },
+      "required": [],
+      "additionalProperties": true
+    },
+    "provenance": {
+      "type": "object",
+      "properties": {
+        "abi_version": {
+          "$ref": "#/$defs/uint32"
+        },
+        "proto": {
+          "type": "string"
+        },
+        "proto_sha256": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": "string"
+        },
+        "source_sha256": {
+          "type": "string"
+        },
+        "compiler": {
+          "type": "string"
+        },
+        "artifact_scope": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "abi_version",
+        "proto",
+        "proto_sha256",
+        "source_revision",
+        "source_sha256",
+        "compiler",
+        "artifact_scope"
+      ],
+      "additionalProperties": true
+    },
+    "snapshot": {
+      "type": "object",
+      "properties": {
+        "runtime_instance_id": {
+          "$ref": "#/$defs/uint64"
+        },
+        "capture_time_ms": {
+          "$ref": "#/$defs/uint64"
+        },
+        "endpoint_filter": {
+          "$ref": "#/$defs/uint64"
+        },
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        },
+        "effective_configuration": {
+          "$ref": "#/$defs/configuration"
+        },
+        "statuses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/status"
+          }
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        },
+        "closed_incidents": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/status"
+          }
+        },
+        "history": {
+          "type": "object",
+          "properties": {
+            "first_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "last_sequence": {
+              "$ref": "#/$defs/uint64"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "first_sequence",
+            "last_sequence",
+            "truncated"
+          ],
+          "additionalProperties": true
+        },
+        "recent_records": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/record"
+          }
+        }
+      },
+      "required": [
+        "runtime_instance_id",
+        "capture_time_ms",
+        "endpoint_filter",
+        "schema_version",
+        "provenance",
+        "effective_configuration",
+        "statuses",
+        "metrics",
+        "closed_incidents",
+        "history",
+        "recent_records"
+      ],
+      "additionalProperties": true
+    },
+    "currentProducer": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/snapshot"
+        },
+        {
+          "properties": {
+            "metrics": {
+              "required": [
+                "emitted",
+                "suppressed",
+                "warning_suppressed",
+                "invalid",
+                "history_overwritten",
+                "history_dropped",
+                "sink_dropped",
+                "sink_failures",
+                "sinks_disabled",
+                "closed_incidents_evicted",
+                "rpc_attempts",
+                "rpc_completions",
+                "rpc_in_flight",
+                "scope",
+                "rpc_by_operation_result",
+                "rpc_attempts_by_operation",
+                "events",
+                "messages_by_event",
+                "rpc_duration_ms",
+                "rpc_duration_ms_by_operation_result",
+                "shutdown_duration_ms_by_phase_result",
+                "save_duration_ms_by_result",
+                "drain_duration_ms_by_result",
+                "auth",
+                "subjects",
+                "readiness",
+                "backpressure",
+                "applications",
+                "jitter",
+                "apply_lag",
+                "layer_writes",
+                "capacity",
+                "cq_tags",
+                "executors",
+                "operation_auth_waits"
+              ],
+              "properties": {
+                "subjects": {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 1
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 2
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 3
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    }
+                  ],
+                  "items": {
+                    "properties": {
+                      "states": {
+                        "allOf": [
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 1
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 2
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 3
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 4
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 5
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 6
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 7
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 8
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          },
+                          {
+                            "contains": {
+                              "properties": {
+                                "state": {
+                                  "const": 9
+                                }
+                              },
+                              "required": [
+                                "state"
+                              ]
+                            },
+                            "minContains": 1,
+                            "maxContains": 1
+                          }
+                        ]
+                      }
+                    }
+                  }
+                },
+                "readiness": {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 2
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 3
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    }
+                  ]
+                },
+                "backpressure": {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 1
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 2
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 3
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    }
+                  ]
+                },
+                "applications": {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 0
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 1
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 2
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    }
+                  ]
+                },
+                "operation_auth_waits": {
+                  "allOf": [
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 0
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 1
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    },
+                    {
+                      "contains": {
+                        "properties": {
+                          "kind": {
+                            "const": 2
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ]
+                      },
+                      "minContains": 1,
+                      "maxContains": 1
+                    }
+                  ]
+                }
+              }
+            },
+            "effective_configuration": {
+              "required": [
+                "default_auth_wait_timeout_ms",
+                "max_rejected_token_generations",
+                "auth_expiry_lead_ms",
+                "request_timeout_ms",
+                "initial_open_timeout_ms",
+                "retry_initial_ms",
+                "retry_maximum_ms",
+                "retry_max_attempts",
+                "peer_reconciliation_grace_ms",
+                "max_update_bytes",
+                "max_pending_bytes_per_endpoint",
+                "max_pending_messages_per_session",
+                "max_synthetic_gap",
+                "max_status_subjects",
+                "max_status_observers",
+                "max_diagnostic_records",
+                "max_diagnostic_bytes",
+                "max_diagnostic_sink_records",
+                "max_diagnostic_sinks",
+                "max_closed_incidents",
+                "max_requests",
+                "callback_worker_count",
+                "max_auth_callbacks",
+                "apply_lag_warning_threshold",
+                "reconnect_initial_ms",
+                "reconnect_maximum_ms",
+                "reconnect_max_attempts",
+                "diagnostic_min_severity",
+                "diagnostic_allowed_flags",
+                "flags",
+                "diagnostic_export_limit_bytes"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

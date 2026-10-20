@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "package": "flatbuffers",
+  "version": "c81cf824-2-linux-x86_64",
+  "upstream": "https://github.com/google/flatbuffers",
+  "upstream_version": "1.12.0",
+  "license": "Apache-2.0",
+  "files": {
+    "LICENSE.txt": "3ddf9be5c28fe27dad143a5dc76eea25222ad1dd68934a047064e56ed2fa40c5",
+    "include/flatbuffers/base.h": "3f598de0a1ecf415ee14e383f4e53198d5e57ec956a954cc71892a138ebf6555",
+    "include/flatbuffers/flatbuffers.h": "032462f25a9d1de4abb9b63786ecdc06f50d972cb2f0d9ea3ab4f316e640a3d1",
+    "include/flatbuffers/stl_emulation.h": "ecbfc7498d525dbc64daef3ca8e34fef191f6423438db6300be787ffcc09b592"
+  },
+  "fetch_required": false
+}

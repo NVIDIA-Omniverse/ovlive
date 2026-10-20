@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "package": "omniverse.nucleus-objects.schema.linux-x86_64",
+  "version": "111.0-dev+gitlab.23672466.8b7c8579",
+  "repository": "NVIDIA Omniverse backend schema",
+  "source_pin": "Package pin recorded from the package name and version only; no manifest in this repository references it. The vendored file hashes are exact.",
+  "files": {
+    "OmniObjectDelta.fbs": "7b3b1a9ebd24ad184347dddaf4d2a16a0736d2652f0b32afcdcbffaee4c5628d",
+    "OmniObjectDelta_generated.h": "845c66f468c975c6ac55e3424ea7bb9e13428c13fb1b1ba0bef7d9b65eeb1fb9",
+    "ObjectDeltaBuilder.h": "a1a62f11f5fcc5fb01f663ba5ef7ea1c32d7bd602385025f2ec34ca0ff3ad763",
+    "ObjectMultiPartFormat.h": "d91ca53d5e140441bf7847f51efdee4844b4066a8c8269e29f1352ec3d0500c2",
+    "LICENSE.txt": "02febb31ea5cf871d005cf43fd330dd89acc657e5d1c2bad0951b07780a3d252"
+  },
+  "flatbuffers": {
+    "package": "flatbuffers",
+    "version": "c81cf824-2-linux-x86_64",
+    "header_sha256": "032462f25a9d1de4abb9b63786ecdc06f50d972cb2f0d9ea3ab4f316e640a3d1",
+    "headers": {
+      "flatbuffers.h": "032462f25a9d1de4abb9b63786ecdc06f50d972cb2f0d9ea3ab4f316e640a3d1",
+      "base.h": "3f598de0a1ecf415ee14e383f4e53198d5e57ec956a954cc71892a138ebf6555",
+      "stl_emulation.h": "ecbfc7498d525dbc64daef3ca8e34fef191f6423438db6300be787ffcc09b592"
+    }
+  },
+  "fetch_required": false,
+  "upstream_files": {
+    "OmniObjectDelta.fbs": "fe87a05630145c72703412cc8507c371c8edc831f9bc2e4e83605ff482830434",
+    "OmniObjectDelta_generated.h": "9a81fcf74e499ad8d9ca0731db272af146c9874e554136415ff7cbcc7c0abbd4",
+    "ObjectDeltaBuilder.h": "f5180eabeebba5714a1b758a6e3216e86c31f1dc494dd811c4cf0be0b7334e98",
+    "ObjectMultiPartFormat.h": "8886cd462957795cc56260eff935f2815745ace0172815819f836bef0d3dfe14",
+    "LICENSE.txt": "22c8d97037103e63b9f48d484ab1f4dffc68bc25c0866da5bc978a4fcabb2757"
+  },
+  "modifications": "NVIDIA license notices replaced with Apache-2.0 SPDX headers; source and schema bodies unchanged. files records repository bytes; upstream_files records the original package bytes."
+}

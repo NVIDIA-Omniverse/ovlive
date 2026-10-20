@@ -1,0 +1,965 @@
+{
+  "schema_version": 1,
+  "objective": "Fully execute docs/ovlive-design.md",
+  "packages": [
+    {
+      "id": "M0.1",
+      "name": "M0.1 Source manifest",
+      "work": "`tests/contracts/source-manifest.json`: upstream commit, allowlisted files with scope and state, proto hash; `source/live/wire/schema/provenance.json`: schema package identity and hashes",
+      "depends_on": [],
+      "exit_criteria": "Every file in the allowlist has a stated reason; nothing the provenance exclusion list names appears",
+      "status": "in_progress",
+      "evidence": [
+        "tests/contracts/source-manifest.json",
+        "source/live/wire/schema/provenance.json",
+        "source/live/wire/schema/LICENSE.txt"
+      ],
+      "coverage_limit": "The Live proto and the exact pinned source-only OMPF schema are vendored and hashed with their original license, and every manifest entry states its scope. The clause \"nothing the provenance exclusion list names appears\" is open: it needs reconciliation of the allowlist against the implementation provenance and the release link map."
+    },
+    {
+      "id": "M0.2",
+      "name": "M0.2 ABI draft",
+      "work": "`Live.h` reviewed as text: every function in design section 16, every struct, every result code, every unit suffix; `CreatedSession` versus listed metadata; operational status/callback, `SdfLayer::Export` recovery, endpoint ownership, and diagnostic contracts from design sections 4, 13, 17 and 18",
+      "depends_on": [],
+      "exit_criteria": "Header compiles as C and C++ with `-Wall -Wextra -pedantic`; review sign-off",
+      "status": "complete",
+      "evidence": [
+        "include/omni/usd/live/Live.h",
+        "tests/native/abi/header_contract.c",
+        "tests/harness/test_abi_draft.py",
+        "docs/ovlive-reference.md#abi-conventions"
+      ]
+    },
+    {
+      "id": "M0.3",
+      "name": "M0.3 Service contract",
+      "work": "Record schema/source-grounded semantics and conservative behavior for unresolved session uniqueness, auth-before-execution, compaction, create/replace, and identity mapping; define reference-service contracts and manual/service-owned validation handoff",
+      "depends_on": [],
+      "exit_criteria": "Explicit assumptions and source evidence attached to manifest; independent contract tests in M1/M3; no automated deployed-service lane or per-join user-name input",
+      "status": "in_progress",
+      "evidence": [
+        "docs/ovlive-reference.md#service-assumptions"
+      ],
+      "coverage_limit": "The independent contract tests of M1/M3 that exercise the recorded deployed-service assumptions (session list/create mapping, owner metadata, aggregate coverage, backend sharing) are in progress; service-owner confirmation of those assumptions belongs to the manual Kit and service-owned handoff."
+    },
+    {
+      "id": "M0.4",
+      "name": "M0.4 USD/resolver survey",
+      "work": "For USD 23.11 and every version in the CI matrix: which Ar/Sdf hooks run before `Read` for a URI asset and admit a canonical attachment before any subscribe/create; argument/cache behavior for duplicate identifiers",
+      "depends_on": [],
+      "exit_criteria": "Table per USD version with single-backing-state admission/rejection strategy",
+      "status": "in_progress",
+      "evidence": [
+        "tests/native/resolver/Plugin.cpp",
+        "tests/native/resolver/Probe.cpp",
+        "cmake/LiveResolverProbe.cmake"
+      ],
+      "coverage_limit": "The per-version table has one row: the executable isolated USD25.11 Linux hook-order probe. USD23.11, the other CI-matrix versions, service and production plugin behavior and supported host/platform variants remain unqualified."
+    },
+    {
+      "id": "M0.5",
+      "name": "M0.5 Behavior/contract catalog",
+      "work": "Map documented behavior, source findings, service answers, and observed failures to stable contract IDs and independent expected outcomes; use new focused probes where evidence is missing",
+      "depends_on": [],
+      "exit_criteria": "Catalog/scenario data under `tests/contracts/`; intended existing-layer save behavior recorded; no golden-trace dependency",
+      "status": "complete",
+      "evidence": [
+        "tests/contracts/catalog.json",
+        "tests/harness/test_doc_claims.py",
+        "docs/ovlive-design.md#11-layer-creation-save-and-replacement",
+        "tests/harness/test_build_inputs.py"
+      ]
+    },
+    {
+      "id": "M0.6",
+      "name": "M0.6 Observability contract",
+      "work": "Versioned status/event/diagnostic schemas, event catalog, metric definitions/buckets, redaction defaults, queue/history budgets, host action table, and instrumentation overhead budget",
+      "depends_on": [],
+      "exit_criteria": "Review with Kit and support/debugging consumers; fixtures cover a lost write response, auth wait, failed save, and slow diagnostic sink",
+      "status": "in_progress",
+      "evidence": [],
+      "outputs": [
+        "tests/contracts/diagnostic-catalog.json",
+        "docs/ovlive-diagnostic-catalog.md",
+        "tools/live/diagnostic_catalog.py",
+        "tests/harness/test_diagnostic_catalog.py",
+        "tests/native/runtime/diagnostics.cpp"
+      ],
+      "coverage_limit": "Version-1 consumer event catalog covers all 28 public codes, current numeric/string fields, emitter variants, severity overrides, enum domains, defaults, duration buckets and typed host-action guidance. Native generated expectations independently bind compiled mappings/defaults and all public RPC results with optional raw status evidence; foundation checks ABI completeness and rejects malformed catalog fixtures. All catalog codes have scoped production emitters: shutdown wait TIMEOUT records bounded local quiescence evidence without sink delivery. Record code 23 is reserved and never emitted. Full cleanup API coverage remains open. Full emitter instrumentation/variant coverage, complete machine-readable snapshot schema, agreed overhead/RSS budgets and Kit/support consumer review remain open."
+    },
+    {
+      "id": "M0.7",
+      "name": "M0.7 Test infrastructure design/spike",
+      "work": "Select/pin native/Python/property/fuzz tooling; define clock/executor/transport seams, independent service model, scenario/replay schema, runner/artifacts, CI matrix and budgets",
+      "depends_on": [],
+      "exit_criteria": "Disposable harness spike proves process supervision and deterministic scheduling; design reviewed with runtime/USD/Kit owners; no existing test-framework constraint",
+      "status": "in_progress",
+      "evidence": [
+        "tools/live/test.py",
+        "tools/live/test_support.py",
+        "tests/harness/test_foundation.py",
+        "tests/harness/test_runner.py"
+      ],
+      "coverage_limit": "The foundation runner proves process supervision and deterministic virtual-time scheduling. Review of the test-infrastructure design with the runtime, USD and Kit owners is open."
+    },
+    {
+      "id": "M0.8",
+      "name": "M0.8 Qualification contracts",
+      "work": "Read/edit operation and lifetime matrix per USD/Kit build; data-admission/durability boundaries; cross-backend resume/ordering assumptions; four-gate workload/fault matrix; inventory comparable performance reports of the omni.client live layer path",
+      "depends_on": [],
+      "exit_criteria": "Independent expected outcomes, measurable concurrency/progress and per-case performance budgets; missing comparative evidence labeled",
+      "status": "in_progress",
+      "evidence": [
+        "docs/ovlive-design.md#13-mutation-outcomes-retry-policy-and-recovery"
+      ],
+      "coverage_limit": "Recovery from FAILED is SdfLayer::Export of the frozen layer followed by reopen (design section 13); the exported USD file is the whole recovery artifact. Full read/edit/lifetime matrix, supported SDK/platform qualification, backend contract confirmation, per-case performance budgets and the inventory of comparable omni.client live layer performance reports remain missing."
+    },
+    {
+      "id": "M1.1",
+      "name": "M1.1 Runtime foundation",
+      "work": "`LiveRuntime`, `LiveEndpoint`, reference-counted endpoint registry keyed by authority with final-release dependency checks, channel creation with the loopback rule, CQ thread, request registry, generated process nonce and distinct endpoint-lifetime writer IDs, result codes, `GetResultString`, runtime/subject/request correlation IDs and basic structured records, exports",
+      "depends_on": [
+        "M0.2",
+        "M0.6"
+      ],
+      "exit_criteria": "dlopen smoke test resolves implemented exports; two endpoints isolated; native/Python-equivalent owners can release independently; plaintext to loopback, TLS with hostname verification elsewhere, IP literal without `tls_server_name` rejected",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveRuntime.h",
+        "source/live/runtime/LiveRuntime.cpp",
+        "source/live/runtime/LiveRuntimeApi.cpp",
+        "tests/native/runtime/runtime_foundation.cpp",
+        "cmake/LiveGrpcDependencies.cmake",
+        "docs/ovlive-reference.md#endpoints-and-authentication",
+        "source/live/runtime/LiveRequest.h",
+        "source/live/runtime/LiveRequest.cpp",
+        "tests/native/runtime/request_lifecycle.cpp",
+        "source/live/runtime/LiveUnary.h",
+        "source/live/runtime/LiveUnary.cpp",
+        "tests/native/runtime/unary_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/runtime/LiveFinite.cpp"
+      ],
+      "coverage_limit": "Lifecycle/endpoint ownership, writer identity, native CQ, bounded requests/callback executor, six private unary adapters and five public finite submission exports with auth waiting/read retries. Structured records, byte budgets, streaming and complete exports remain; M0.6 is still a prerequisite."
+    },
+    {
+      "id": "M1.2",
+      "name": "M1.2 Auth controller",
+      "work": "Generation-based token storage, `SetAccessToken` CAS, auth-required callback, expiry lead-time timer, `FailAuthRefresh`, metadata on each call",
+      "depends_on": [
+        "M1.1",
+        "M1.4"
+      ],
+      "exit_criteria": "New deterministic tests cover concurrent challenges and stale generations; stop/shutdown schedules and real threaded TSan cases pass",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveAuth.h",
+        "source/live/runtime/LiveAuth.cpp",
+        "source/live/runtime/LiveDispatch.h",
+        "source/live/runtime/LiveDispatch.cpp",
+        "source/live/runtime/LiveRuntimeApi.cpp",
+        "tests/native/runtime/auth_controller.cpp",
+        "tests/reference_service/test_native.py::NativeTests.test_native_auth_callback_rotates_metadata_without_replaying_mutation",
+        "source/live/runtime/LiveFinite.cpp",
+        "tests/native/runtime/unary_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp"
+      ],
+      "coverage_limit": "Generation CAS, shared challenge delivery, expiry/auth-wait timer, failed-refresh history, finite waiting and safe read retries. Private known-incarnation layer actors park/restart for auth and fail active idle reads on explicit refresh failure or timeout; scheduler wake epochs prevent lost concurrent auth wakes. Diagnostics, full stop schedules and TSan remain."
+    },
+    {
+      "id": "M1.3",
+      "name": "M1.3 Layer RPCs",
+      "work": "Vendor proto; `CreateLayer`, `SubscribeReadLayer` for worker delivery, `UpdateLayer`, `StatLayer`, `DeleteLayer`; header/chunk validation; autonomous Ping/jitter/ordered dispatch and bounded `WaitForPendingUpdates`; private C++ layer interface for plugin/runtime tests; sequence adapter and write FIFO initially retain provider-wide reconnect counter",
+      "depends_on": [
+        "M1.1",
+        "M1.2",
+        "M1.8"
+      ],
+      "exit_criteria": "Contract scenarios and jitter-delayed updates progress without a host pump/frame tick; M2 corrections tracked; no frame-processing or time-query API and no omni.client, Carbonite or Nucleus dependency",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerWrite.h",
+        "source/live/runtime/LiveLayerWrite.cpp",
+        "source/live/runtime/LiveRuntime.h",
+        "source/live/runtime/LiveRuntime.cpp",
+        "tests/native/runtime/layer_write_lifecycle.cpp",
+        "tests/native/runtime/unary_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/runtime/LiveLayerRead.h",
+        "source/live/runtime/LiveLayerRead.cpp",
+        "tests/native/runtime/layer_read_driver.cpp",
+        "tests/native/runtime/layer_read_lifecycle.cpp",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py",
+        "source/live/runtime/LiveDrain.h",
+        "source/live/runtime/LiveDrain.cpp",
+        "tests/native/runtime/drain.cpp"
+      ],
+      "coverage_limit": "Private one-attempt create/update/read plus known-incarnation LayerActor: bounded retained wire bytes, serialized FIFO/application, contiguous recovery cursor, auth parking and bounded read restart, freeze-and-retain uncertainty, callback quiescence. Stat/DeleteLayer use the finite controller. Unknown-incarnation bootstrap, canonical attachment registry, OMPF proofs/reconciliation, create/save integration, ordered jitter/drain, USD plugin integration and diagnostics remain. SDK frame rejection can report CANCELLED; no inferred quota cause. SceneAttachment binds native transport to atomic journal publication; typed range validation separates ordinary singleton from diff aggregate/reset and first-response readiness is an explicit service assumption. Independent root-int32 service tests compare 128 multi-writer admissions and all final scenes, and exercise backend rotation/recovery/uncertainty/overlap preservation. This bounded profile leaves general OMPF scene/conflict semantics, public Sdf attachment integration, jitter and all product gates incomplete. Native actor jitter and fixed-membership drain are implemented as component features: CQ-to-application/callback tickets, absolute deadline, timeout without cancellation, worker BUSY, terminal/unknown propagation and later-admission exclusion. Public live-file-format/Kit lifecycle integration and operational diagnostics remain incomplete."
+    },
+    {
+      "id": "M1.4",
+      "name": "M1.4 Test foundation",
+      "work": "New runner, pinned framework adapters, virtual clock/controlled executors/completions, process supervision, isolated workspaces, manifests and replay bundles; fast CI lane",
+      "depends_on": [
+        "M0.5",
+        "M0.7"
+      ],
+      "exit_criteria": "Same component case runs locally/in CI and replays deterministically; runner's own crash/hang/startup-failure/cleanup tests pass",
+      "status": "in_progress",
+      "evidence": [
+        "tools/live/ci.py",
+        "tools/live/process_guard.py",
+        "tests/harness/test_ci.py",
+        "docs/ovlive-ci.md"
+      ],
+      "coverage_limit": "Deterministic scheduler, bounded descendant supervision with separate host/workload environments, source-identified replay and fixed offline SDK CI profiles are implemented. Full GitHub SDK provisioning, wider platforms and complete release qualification remain open."
+    },
+    {
+      "id": "M1.5",
+      "name": "M1.5 URI codec and resolver",
+      "work": "`LiveUri` codec; `live://authority/session/layer`; Ar 2.0 URI resolver registered in the plugin",
+      "depends_on": [
+        "M0.4",
+        "M1.1"
+      ],
+      "exit_criteria": "Round-trip and rejection tests; `SdfLayer::FindOrOpen`/`CreateNew`/`Save`/`Export` on a live URI without another `live://` resolver on USD 23.11",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveUri.h",
+        "source/live/runtime/LiveUri.cpp",
+        "source/live/runtime/LiveUriApi.cpp",
+        "tests/runtime/test_uri.py",
+        "tests/native/runtime/uri_sanitize.cpp",
+        "CMakeLists.txt",
+        "source/live/resolver/LiveResolver.cpp",
+        "source/live/runtime/LiveMetadata.h",
+        "tests/native/resolver_runtime/driver.cpp",
+        "tests/reference_service/test_resolver.py",
+        "cmake/LiveResolverRuntime.cmake"
+      ],
+      "remaining": "Qualify production resolver integration against the reference service; integrate actual Sdf open/create/save/export and validate minimum USD 23.11 and supported host/platform matrix."
+    },
+    {
+      "id": "M1.6",
+      "name": "M1.6 Live file format",
+      "work": "File format on the in-plugin runtime with no omni.client calls; explicit result comparisons; preserve OMPF; one delegate with no selector; atomic canonical attachment registry, never an insert-or-replace cache",
+      "depends_on": [
+        "M0.8",
+        "M1.3",
+        "M1.5"
+      ],
+      "exit_criteria": "New core/USD contract cases and multi-process convergence pass with scene/commit-history assertions; concurrent/argument-varied duplicate opens cannot create a second backing state or disturb the first",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerAdmission.cpp",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/runtime/layer_admission.cpp",
+        "tests/reference_service/test_scene.py",
+        "source/live/scene/LiveSdfFileFormat.cpp",
+        "source/live/scene/SceneCreation.h",
+        "source/live/scene/SceneCreation.cpp",
+        "source/live/scene/UsdLayerCreation.h",
+        "source/live/scene/UsdLayerCreation.cpp",
+        "source/live/scene/SceneSeed.cpp",
+        "tests/reference_service/test_scene_creation.py"
+      ],
+      "coverage_limit": "Canonical reservations, production Sdf transport binding, serial publication and existing-layer save are implemented. Private owned creation retains one seed/status subject through host activation; SceneSeed provides the standalone ordinary-data compiler. Public C++ and Python creation, USD CreateNew finalization and activation after the outer call, and standard live Export are implemented with reference tests; a failed host layer stays exportable with SdfLayer::Export. Remaining structural authoring, broad many-writer and supported SDK/platform/Kit qualification remain incomplete."
+    },
+    {
+      "id": "M1.7",
+      "name": "M1.7 Build and dependency closure",
+      "work": "One CMake build with no omni.client targets, test adapters or dependency hooks and no resolver copy rules; gRPC/protobuf deps pinned; symbol hiding; export allowlist",
+      "depends_on": [
+        "M1.6"
+      ],
+      "exit_criteria": "Production/test/CI manifests contain no omni.client dependency; `ldd`/`dumpbin` show no `omniclient` or resolver import; both load orders pass",
+      "status": "in_progress",
+      "evidence": [
+        "cmake/LiveResolverRuntime.cmake",
+        "cmake/LivePlugin.cmake",
+        "include/omni/usd/live/LiveUsd.h",
+        "source/live/scene/LiveUsd.cpp",
+        "tests/native/plugin/driver.cpp",
+        "tests/native/plugin/load.cpp",
+        "tests/native/plugin/package.py",
+        "tests/reference_service/test_plugin.py",
+        "tools/live/plugin_identity.py",
+        "tools/live/build.py",
+        "tools/live/dependencies.py",
+        "tests/harness/test_live_build.py",
+        "deps/live-services-target.packman.xml",
+        "deps/live-services-host.packman.xml",
+        "docs/ovlive-build.md"
+      ],
+      "coverage_limit": "The repository has no omni.client sources or build/dependency/fetch hooks, no resolver copies and no network test targets. CMake, directly or through tools/live/build.py, builds and stages the single native shared plugin; independent host/target manifests pin native dependencies and matched generators. Staging binds members to source, configuration and SDK/tool identities and rejects a second `live` registration. Linux USD25.11/Python3.12 public-only reference consumers and relocated load probes exercise the real DSO. Full source/license/link-map audit, Python/Kit, supported variants and all product qualification gates remain open."
+    },
+    {
+      "id": "M1.8",
+      "name": "M1.8 Independent service and transport faults",
+      "work": "New reference LiveService for all ten RPCs; commit/fault ledger; isolated test control plane; real socket/TLS/reset proxy and multiple backend identities sharing authoritative state; portable plugin test driver for service-owned end-to-end integration",
+      "depends_on": [
+        "M0.3",
+        "M0.8",
+        "M1.4"
+      ],
+      "exit_criteria": "Independent semantic fixtures pass; faults prove they fired; commit-response loss and reconnect to a different backend work; reference-service schema/build identity and manual/service-owned handoff explicit",
+      "status": "in_progress",
+      "evidence": [
+        "tests/reference_service/service.py",
+        "tests/reference_service/test_service.py",
+        "tools/live/reference.py",
+        "tests/reference_service/test_native.py",
+        "tests/native/runtime/unary_driver.cpp",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py"
+      ],
+      "coverage_limit": "All ten RPC handlers, independent opaque ledger, named faults, shared-state backends, presence and TLS. Twelve Python wire self-tests and fifty-three native/reference cases cover unary/stream lifecycle and logical actor FIFO/reconnect/auth/uncertainty, including deterministic queued-read and issued-write barriers. OMPF/scene semantics, coalescing, connection/reset proxy, full plugin driver and service-owned integration remain. SceneAttachment binds native transport to atomic journal publication; typed range validation separates ordinary singleton from diff aggregate/reset and first-response readiness is an explicit service assumption. Independent root-int32 service tests compare 128 multi-writer admissions and all final scenes, and exercise backend rotation/recovery/uncertainty/overlap preservation. This bounded profile leaves general OMPF scene/conflict semantics, public Sdf attachment integration, jitter and all product gates incomplete."
+    },
+    {
+      "id": "M1.9",
+      "name": "M1.9 Core/ABI/USD suites",
+      "work": "New scene storage/delta/URI properties, C consumer/loading probes, real USD process driver and normalized scene oracle; staged-package smoke lane",
+      "depends_on": [
+        "M1.4",
+        "M1.6",
+        "M1.7",
+        "M1.8"
+      ],
+      "exit_criteria": "Coverage mapped to contract IDs; all suites run on repository-owned fixtures; packaged library verified separately from private component linkage",
+      "status": "in_progress",
+      "evidence": [
+        "cmake/LiveSceneCore.cmake",
+        "tests/native/core/lock_noalloc.cpp",
+        "tools/live/scene_identity.py",
+        "tools/live/sdk_tree_identity.py",
+        "source/live/scene/SdfSceneData.h",
+        "source/live/scene/SdfSceneData.cpp",
+        "tests/native/usd/sdf_scene.cpp",
+        "cmake/LiveWire.cmake",
+        "source/live/wire/OmpfEnvelope.cpp",
+        "tests/native/wire/envelope.cpp",
+        "tools/live/wire_identity.py",
+        "cmake/LiveUsdWire.cmake",
+        "source/live/wire/UsdValueCodec.cpp",
+        "source/live/wire/UsdValueReader.h",
+        "tests/native/wire/usd_values.cpp",
+        "source/live/wire/UsdValueWriter.h",
+        "source/live/wire/UsdValueEncode.cpp",
+        "source/live/wire/OmpfEncode.cpp",
+        "source/live/wire/UsdEnvelopeEncode.cpp",
+        "tests/native/wire/envelope_encode.cpp",
+        "tests/native/wire/usd_envelope_encode.cpp",
+        "source/live/scene/WireScene.h",
+        "source/live/scene/WireScene.cpp",
+        "tests/native/scene/wire_scene.cpp",
+        "cmake/LiveWireScene.cmake",
+        "source/live/scene/SceneJournal.h",
+        "source/live/scene/SceneJournal.cpp",
+        "tests/native/scene/scene_journal.cpp",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py",
+        "source/live/scene/FieldEditIntent.h",
+        "source/live/scene/FieldEditIntent.cpp",
+        "tests/native/scene/field_edit_intent.cpp",
+        "tests/native/scene/usd_publication.cpp",
+        "tests/native/scene/scene_publication.cpp",
+        "cmake/LivePlugin.cmake",
+        "include/omni/usd/live/LiveUsd.h",
+        "source/live/scene/LiveUsd.cpp",
+        "tests/native/plugin/driver.cpp",
+        "tests/native/plugin/load.cpp",
+        "tests/native/plugin/package.py",
+        "tests/reference_service/test_plugin.py",
+        "tools/live/plugin_identity.py",
+        "tests/reference_service/scene_graph_wire.py",
+        "tests/reference_service/scene_graph_model.py",
+        "tests/harness/test_scene_graph_wire.py",
+        "tests/harness/test_scene_graph_model.py",
+        "tests/native/scene/graph_probe.cpp",
+        "tests/native/scene/graph_reference.py",
+        "source/live/scene/SceneSeed.h",
+        "source/live/scene/SceneSeed.cpp",
+        "tests/native/scene/scene_seed.cpp"
+      ],
+      "coverage_limit": "Private core/USD/wire/journal suites, public-only plugin/reference fixtures and the bounded independent graph oracle are scoped to Linux USD25.11. Plain USD authoring captured by the host edit buffer, serial host publication, original-intent recovery and an initial shared plugin/package are implemented. Fresh captured Create and qualified Move/Erase are admitted with immutable wire replay; Move/Erase applies to the latest subtree. Scratch/cycle and suppressed removed-identity edits remain unsupported. The independent reference profile covers all eleven spec types with bounded ASCII absolute target syntax, typed path vectors/list operations and public creation fixtures; broader path/value and packaged structural qualification remains incomplete. SceneSeed compiles complete immutable USD data into an exact zero-base snapshot with all child policies and supported codec values, independent stock/data fixtures, ownership checks and aggregate quotas. Public C++ and Python creation, USD CreateNew activation and standard live Export are implemented with reference tests. Complete graph/value-service integration, broad structure/value fuzzing and shrinking beyond the bounded writer-fuzz profiles, full concurrency/performance gates and supported SDK/platform/Kit qualification remain open. This milestone remains in_progress; component tests do not establish full product readiness."
+    },
+    {
+      "id": "M2.1",
+      "name": "M2.1 Composite sequence keys",
+      "work": "Replace the object-ID-only table with `(endpoint, session, layer, object, client)` state; per-stream duplicate rejection; contiguous coverage frontier and retained hole/effect tracking replace maximum-ack cursor advancement",
+      "depends_on": [
+        "M1.3"
+      ],
+      "exit_criteria": "New generated/contract cases prove layer isolation, contiguous no-op coverage, aggregate scene correctness, and preservation of peer 11 between read 10 and acknowledged self-write 12",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerProgress.h",
+        "source/live/runtime/LiveLayerProgress.cpp",
+        "tests/native/runtime/layer_progress.cpp",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/scene/SceneJournal.h",
+        "source/live/scene/SceneJournal.cpp",
+        "tests/native/scene/scene_journal.cpp",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py"
+      ],
+      "coverage_limit": "LayerProgress owns a composite immutable identity, contiguous retained/applied frontiers, bounded semantic coverage and replay fingerprint checks. LayerActor connects it to known-incarnation native streams, computes complete-payload hashes and applies ordered retained effects. Production OMPF proof, aggregate overlap reconciliation/noop encoding, canonical attachment registry and USD integration remain. The private SceneJournal stages authoritative/visible state and work-ID intents, uses the actor publication gate after admission allocations, retires only exact confirmed owners during ordered application, and bounds aggregate replay work. Public attachment and reference-service scene integration remain incomplete. SceneAttachment binds native transport to atomic journal publication; typed range validation separates ordinary singleton from diff aggregate/reset and first-response readiness is an explicit service assumption. Independent root-int32 service tests compare 128 multi-writer admissions and all final scenes, and exercise backend rotation/recovery/uncertainty/overlap preservation. This bounded profile leaves general OMPF scene/conflict semantics, public Sdf attachment integration, jitter and all product gates incomplete."
+    },
+    {
+      "id": "M2.2",
+      "name": "M2.2 Layer-specific recovery gate",
+      "work": "Replace the provider-wide active-update counter with the per-incarnation/generation gate and internal recovery-ready signal of section 12",
+      "depends_on": [
+        "M2.1"
+      ],
+      "exit_criteria": "Quiet caught-up-only reconnect unfreezes queued writes without an external duplicate `OK_LATEST`; stale readiness cannot unfreeze a new generation; continuous authoring on layer A never blocks reconnect of layer B; no starvation under a 10 Hz write load with periodic stream resets",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerProgress.h",
+        "source/live/runtime/LiveLayerProgress.cpp",
+        "tests/native/runtime/layer_progress.cpp",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py"
+      ],
+      "coverage_limit": "Per-layer generation gate waits for issued outcomes, freezes queued writes, resumes at retained coverage and suppresses stale readiness. Reference tests prove quiet caught-up restart, queued authoring, completion backlogs and delayed issued acknowledgments. Native control tests cover unrelated-layer progress. Canonical attachment integration, independent scene oracle, jitter and full churn/load qualification remain. SceneAttachment binds native transport to atomic journal publication; typed range validation separates ordinary singleton from diff aggregate/reset and first-response readiness is an explicit service assumption. Independent root-int32 service tests compare 128 multi-writer admissions and all final scenes, and exercise backend rotation/recovery/uncertainty/overlap preservation. This bounded profile leaves general OMPF scene/conflict semantics, public Sdf attachment integration, jitter and all product gates incomplete."
+    },
+    {
+      "id": "M2.3",
+      "name": "M2.3 Retry classification",
+      "work": "Narrow retry by operation class (section 13); `OUTCOME_UNKNOWN`; halt-and-retain on uncertain mutation in the runtime and plugin; expose latched recovery state; exclude hidden gRPC mutation retries",
+      "depends_on": [
+        "M1.3"
+      ],
+      "exit_criteria": "Fault injection never produces a duplicate automatic mutation replay or loses an accepted local edit; plugin error handlers preserve uncertain edits",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerProgress.h",
+        "source/live/runtime/LiveLayerProgress.cpp",
+        "tests/native/runtime/layer_progress.cpp",
+        "source/live/runtime/LiveLayerActor.h",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "tests/reference_service/test_native.py",
+        "source/live/scene/SceneJournal.h",
+        "source/live/scene/SceneJournal.cpp",
+        "tests/native/scene/scene_journal.cpp",
+        "source/live/scene/SceneAttachment.h",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/reference_service/scene_wire.py"
+      ],
+      "coverage_limit": "LayerActor connects single-attempt mutation outcomes to the latched recovery gate and retained complete intent owners; exact uncertain/queued IDs and payloads survive close without replay. CQ-validated receipts preserve successful completion when cancellation suppresses an ordinary callback. Public plugin attachment integration and operational status remain. The private SceneJournal stages authoritative/visible state and work-ID intents, uses the actor publication gate after admission allocations, retires only exact confirmed owners during ordered application, and bounds aggregate replay work. Public attachment and reference-service scene integration remain incomplete. SceneAttachment binds native transport to atomic journal publication; typed range validation separates ordinary singleton from diff aggregate/reset and first-response readiness is an explicit service assumption. Independent root-int32 service tests compare 128 multi-writer admissions and all final scenes, and exercise backend rotation/recovery/uncertainty/overlap preservation. This bounded profile leaves general OMPF scene/conflict semantics, public Sdf attachment integration, jitter and all product gates incomplete."
+    },
+    {
+      "id": "M2.4",
+      "name": "M2.4 Bounds and backpressure",
+      "work": "Runtime options for per-update size, pending bytes, message queues, gap expansion; visible failure on exhaustion",
+      "depends_on": [
+        "M1.3"
+      ],
+      "exit_criteria": "Memory stays within budget under a flood test; oversized gap terminates with a protocol error",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveRuntime.cpp",
+        "source/live/runtime/LiveRequest.cpp",
+        "source/live/runtime/LiveDiagnostics.cpp",
+        "tests/native/runtime/runtime_foundation.cpp",
+        "tests/native/runtime/request_lifecycle.cpp",
+        "tests/native/runtime/layer_write_lifecycle.cpp",
+        "tests/native/runtime/layer_read_driver.cpp",
+        "tests/native/runtime/diagnostics_api.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "tests/reference_service/test_native.py"
+      ],
+      "notes": "Existing endpoint charged-byte admission and ordinary/auxiliary request-slot limits have runtime-wide current/high-water and admission/release/rejection observations. Tests cover concurrent quota contention, move/zero-byte/rollback accounting, slot independence and release races, retained callback/receive ownership, and reversible aggregate overflow. Charges include reserved receive capacity and retained scenes and do not measure RSS or establish a global memory bound. Full resource policy, flood/RSS budget qualification and product gates remain open. Reference/native actor fixtures hold queued local host publication with three accepted intents while paced peer updates fill either retained-work count or endpoint charged bytes. They require visible RESOURCE_EXHAUSTED, service stream cancellation, zero Update RPCs, suppressed queued publication, exact local IDs/owners/bytes/ordinals and retained peer-prefix recovery, independent-endpoint Ping progress, and zero charged reservations/request slots after owner retirement. A third reference fixture holds the first peer decode while an unpaced bounded burst fills all 32 receive slots and overflows the queue. Service cancellation and a native queued-frame snapshot precede decode release, with no byte-budget rejection. Subsequent draining also reaches retained-work capacity; exact local preservation and the peer prefix remain verified. This qualifies controlled receive-queue overflow as well as paced retained-backlog exhaustion; general unpaced load, USD memory amplification and process RSS flood qualification remain open."
+    },
+    {
+      "id": "M2.5",
+      "name": "M2.5 Shutdown ordering",
+      "work": "The shutdown sequence of design section 2; reference-counted endpoint release, dependency `BUSY`, and resumable final unregister",
+      "depends_on": [
+        "M1.1"
+      ],
+      "exit_criteria": "ASan/TSan clean under randomized stop/unregister/shutdown during traffic; two owners release in either order without cancellation; busy/timeout retry never consumes a reference twice",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveLayerActor.cpp",
+        "source/live/runtime/LiveDispatch.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "tests/native/scene/scene_publication.cpp"
+      ],
+      "coverage_limit": " Optional asynchronous ordered application retains the original effect/work/drain until one-shot result and final host-task capture retirement. One outstanding application parks without blocking workers; queued cancellation/abandonment/queue-then-throw retain failed work, close waits retirement, and nested host contexts reject blocking self-waits. Reference fixtures verify FIFO, cleanup barriers, failure ownership and unrelated Ping progress. SceneAttachment optionally dispatches journal application and its exact committed revision to an independently progressing host. Real USD replacement tests separately hold a synchronous change notice and a completed job capture, and retain journal/USD candidates plus original actor work after publication failure. Production local-admission publication, same-thread bootstrap activation, safe layer lifetime promotion, attached-stage/Kit synchronization and full qualification remain open."
+    },
+    {
+      "id": "M2.6",
+      "name": "M2.6 Save and replacement semantics",
+      "work": "Existing-layer save updates and drains without unsubscribe/create; distinguish new destination/explicit export replacement; apply terminal `OBJECT_REPLACED` behavior after the save fix",
+      "depends_on": [
+        "M1.6",
+        "M2.3"
+      ],
+      "exit_criteria": "Many clients repeatedly save with stable object IDs/subscriptions and continued convergence; intentional replacement terminates peers; uncertain save retains work",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/scene/LiveSdfFileFormat.cpp",
+        "source/live/scene/SceneCreation.cpp",
+        "source/live/scene/UsdLayerCreation.h",
+        "source/live/scene/UsdLayerCreation.cpp",
+        "tests/native/scene/scene_file_format.cpp",
+        "tests/reference_service/test_scene_creation.py"
+      ],
+      "coverage_limit": "Existing attached-layer save uses captured-work drain without implicit Create or incarnation replacement. Private explicit creation has single-attempt ownership, confirmed-object bootstrap, replacement detection and retained uncertain outcomes. Public C++ and Python creation, USD CreateNew activation and standard live Export are implemented with reference tests, and a failed host layer stays exportable with SdfLayer::Export. The many-writer repeated-save release matrix with stable object IDs and subscriptions remains unfinished."
+    },
+    {
+      "id": "M2.7",
+      "name": "M2.7 Status and observability",
+      "work": "`LiveStatus`/`LiveDiagnostics`; typed queries, callback admission/coalescing/quiescence, latched incidents; structured sink, metrics, bounded history and `CopyDiagnostics`; instrument auth/retry/queue/drain",
+      "depends_on": [
+        "M0.6",
+        "M2.3",
+        "M2.4",
+        "M2.5",
+        "M2.6",
+        "M2.9"
+      ],
+      "exit_criteria": "Terminal state queryable with sinks disabled/stalled; overflow/redaction/correlation tests pass; `SdfLayer::Export` of a failed layer retains queued, uncertain and acknowledged-but-unapplied edits across queue handoffs; overhead within budget",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveStatus.h",
+        "source/live/runtime/LiveStatus.cpp",
+        "source/live/runtime/LiveLayerActor.cpp",
+        "source/live/runtime/LiveLayerProgress.cpp",
+        "source/live/scene/SceneAttachment.cpp",
+        "tests/native/runtime/status.cpp",
+        "tests/native/runtime/layer_actor_driver.cpp",
+        "source/live/runtime/LiveDiagnostics.h",
+        "source/live/runtime/LiveDiagnostics.cpp",
+        "source/live/runtime/LiveDiagnosticsApi.cpp",
+        "tests/native/runtime/diagnostics.cpp",
+        "tests/native/runtime/diagnostics_api.cpp",
+        "tests/native/runtime/diagnostics_driver.cpp",
+        "tests/native/scene/scene_publication.cpp",
+        "docs/ovlive-design.md#17-operational-status",
+        "tests/native/scene/scene_file_format.cpp",
+        "source/live/runtime/LiveLayerAdmission.cpp",
+        "source/live/runtime/LiveRuntimeApi.cpp",
+        "tests/native/runtime/layer_admission.cpp",
+        "tests/reference_service/test_scene.py",
+        "source/live/runtime/LiveLayerStatus.cpp",
+        "tests/native/runtime/layer_status.cpp",
+        "tests/reference_service/test_scene_creation.py",
+        "tests/reference_service/test_graph_transport.py",
+        "source/live/scene/UsdCreationWorkflow.h",
+        "tests/reference_service/test_scene.py::SceneTests.test_production_sdf_export_preserves_the_host_scene_after_publication_rejection",
+        "tests/reference_service/test_plugin.py::PluginTests.test_packaged_plugin_unknown_write_exports_the_failed_layer"
+      ],
+      "coverage_limit": "Native status and bounded diagnostics remain component scope; full event/metric coverage, host adapters and overhead/RSS qualification remain incomplete. Actor read RPC completions carry stable subject/request/stream/auth correlation; read lifecycle records preserve original resume cursors and emit resumption only after validated coverage. Reference HTTP/2 CANCEL tests inspect the public snapshot before recovery coverage and after explicit close, checking no spurious reconnect and exact read attempt/completion counts. Actor update records carry the issuance read generation and retained work ID, with HTTP/2 post-commit uncertainty joined to the typed incident. Creation RPC records join the pre-bound subject and finite request without actor work IDs. Native successful/incomplete-upload and reference creation tests cover correlation. Session transport/lifecycle records correlate local session handle, monotonic attempt/stream generation and auth generation without fabricating finite request IDs. Reference cases cover actual HTTP/2 CANCEL recovery, unavailable/clean EOF, bounded cancelled bootstrap, terminal malformed/denied streams, exact completion counts and redaction. Existing-attachment save completion records capture the admission target, actual result, current progress/counts and known incident without changing save outcomes. Dirty queries are silent and save adds no RPC metrics. Publication/status callback barriers cover busy, successful and failed saves, default/forced Sdf behavior, redaction and exact pending-byte preservation through both failed saves and close. First-save creation and pre-attachment rejections remain outside this actor event. Session-message records distinguish copied admission, successful transport Write, validated receive, terminal/Leave discard and valid-session rejection. Original receipt IDs survive request release; only write/receive carry actual stream/auth generation. Runtime count/byte totals remain exact under diagnostic filtering/disablement and saturate. Reference callback/service barriers cover empty/binary queued discards, capacity rejection, happy and reconnect correlation; native virtual time covers suppression, event selection and saturation. These observations add no RPC metrics and no peer-delivery guarantee. Fixed completed-attempt RPC duration histograms separate operation/result, while actor saves and public drains have separate by-result duration histograms. Counts, millisecond sums and noncumulative inclusive buckets saturate independently and survive history disablement/filtering/warning suppression. READ/JOIN durations remain stream lifetimes; save timing excludes diagnostic queries and dirty polling. Native supplied-duration/virtual-clock tests cover boundaries, unknown dimensions and sum saturation; public export and reference RPC/save checks cover real instrumentation. First-save creation, pre-attachment failures and pre-runtime drain rejection are excluded. Auth metrics count fixed challenge reasons, valid-endpoint stale replacements and provider/deadline/rejection-limit/internal failures. Observed nonterminal credential-blocked endpoints have current/high-water gauges and monotonic durations ending in local usability, failure or final close. Proactive challenges have no wait sample; unusable replacements preserve active intervals; repeated evaluation and partial/BUSY unregister do not retire them. Native clock-controlled cases, ownership checks and replacement races cover these boundaries with history disabled, and public reference snapshots verify missing/rejected refresh, provider failure and callback-triggered supplied-clock deadline failure with redaction. Internal-failure counters are exercised directly; exhaustion of production challenge IDs is not injected. A late successful RPC honors an expired monotonic auth deadline before usable/READY publication when wall time reverses; a supplied-clock completion test fixes this ordering alongside evaluation. These metrics do not count individual auth waiters or prove server acceptance/readiness. Operational and diagnostic executors export separate fixed snapshots with enqueue/start/completion counters, queued/running gauges, queue high-water, configured/live workers, oldest ages and queue-wait/dispatch-duration histograms. Fake-clock and event-gated native tests cover concurrently requeued jobs and final-owner destruction after dispatch completion; lifecycle quiescence still waits for destruction. Public export retains both executor metrics with history disabled, and reference checks compare blocked diagnostic dispatches with actual operational progress. Counters describe jobs rather than individual callbacks or sink FIFO messages; executor/status/history captures are separate. A common CQ tag wrapper tracks submitted and received-ok/not-ok counts, outstanding/handling/retained gauges, high-water marks and retired/abandoned tags. Only actual handoffs count; reserved pre-issuance nodes do not. Receipt timestamps precede metric locking and flow to RPC/Ping handlers. Accounting continues through shutdown; derived cleanup precedes retained-tag retirement. Event-gated native tests cover handler/destructor boundaries, false receipts, forwarding and allocation rollback, and reference exports cover unary retries and session churn with disabled history. CQ ok is not an RPC result; future stream Reads may remain outstanding, and these tag counts are not total memory or quiescence proof. Fixed capacity metrics separate ordinary/timing request slots and aggregate charged PendingBytes reservations. Successful insertion/removal and reservation admission/release drive current/high-water gauges and cumulative counts/byte volumes; only configured-capacity rejections count. BUSY/duplicate releases and moved reservations change no counts. Wide byte gauges preserve overflow followed by release, exporting explicit overflow flags. Native/public/reference tests cover independent slots, concurrent release, rollback, zero-byte/moved reservations and retained callback/receive owners with disabled history. Charges include receive capacity and retained scenes, not just wire payloads; they are not RSS or a new global limit. Full lifecycle/save-workflow events, per-request auth/readiness/holdback/queue/recovery timings, capacity metrics and qualification remain open. Recovery from FAILED is SdfLayer::Export of the frozen layer followed by reopen (design section 13), with no archive, bundle or inspector. Scene, packaged-plugin, Python, graph-transport and Kit reference cases export failed layers to fresh paths and read those exports after the producer exits; installed Kit reconciliation, SDK/platform/filesystem qualification and process-memory/performance gates remain open. Public C++ creation owns the complete private workflow; Python creation and broader release qualification remain open. Fixed subject metrics count successful status-hub admissions, actual latched states and detachment by endpoint/session/layer kind. Attached CLOSED remains counted until removal; detached final notifications retained by observers do not. Native tests cover all public states, stale terminal downgrades, admission rejection, duplicate removal, retained observer slots, URI reuse and shared endpoint registration. Public reference snapshots cover finite endpoints and session Leave. History disablement and endpoint filtering retain runtime-wide counts without identity labels. These gauges do not measure free slots, memory, owner quiescence or peer convergence; duration and full M2.7 qualification remain open. Session/layer readiness metrics track current initial waits and recovery episodes with completion-duration histograms by ready/failed/closed resolution. Successful subject admission starts initial timing through auth/retry/creation handoff and initial host publication. After first READY, a nonterminal loss of readiness starts one interval across recovery/auth/blocked substates until READY/failure/close. Endpoint status is excluded; direct READY-to-terminal has no recovery episode. Status-hub fake-clock tests cover exact times and one-shot/latching behavior; public session and prepared/held host-publication fixtures cover integration. These local readiness intervals do not measure peer convergence, complete application/drain or individual RPC attempts; remaining timing and overhead/RSS qualification stays open. Actual nonterminal BLOCKED intervals have fixed endpoint/session/layer current/high-water gauges and completed duration histograms by leaving BLOCKED, failure or close. Enter/exit records use those same boundaries, including direct CLOSED/removal and terminal causes without a state change; exit records carry duration and resolution. Fake-clock tests cover continuity, repeated/latched publications, failed admission, concurrent blocked subjects, all resolution paths and zero-duration removal. Public export/event tests cover filtering, history disablement, exact event-to-metric durations and direct-close exit delivery. AUTH_WAIT and rejections without BLOCKED are excluded; leaving BLOCKED does not imply READY. Per-request wait/oldest-age, jitter/application timing and overhead/RSS qualification remain open. Application timing separates optimistic local async, ordered async and ordered sync callbacks. Fixed current/high-water/admission/retirement metrics and queue/body/post-body/lifetime-result histograms record actual run and final owner-retirement boundaries. Skipped bodies have lifetime samples only; final result recording after retirement preserves enqueue-then-throw rejection. Sync body excludes admission-metric lock wait and matches existing dispatch exception mapping. Supplied-clock actor/reference cases assert exact 13/11/17 ms async phases and 41 ms lifetime, absent run samples on cancellation/rejection, and 11 ms sync failure with correct result. Public export tests cover filtering, disabled history, zero samples, saturation and unknown result fallback. Current may include retired owners awaiting actor accounting; duration excludes that delay. Jitter holdback, pre-application backlog/oldest-age, instrumentation overhead/RSS and full product qualification remain open. Jitter metrics capture worker-observed head waiting episodes: current/high-water/start/completion counts, start-only requested wait/policy target/available sample age, and observed-hold/post-due-observation histograms by eligible/preempted/failed/closed. Prior observed deadlines classify elapsed native ticks before any new configuration applies. Local publication preempts; the same head may resume. Generation changes alone preserve tracking; frozen-generation starts omit unavailable target/sample provenance. Idempotent worker cleanup flushes before freeze/quiescence, including late external terminal changes. Pure fake-time tests cover early/late wakes, shortening/zero/extension, submillisecond accumulation and clock extremes; public export and reference failure/preemption/configuration/close cases verify wiring and retained work. Post-due observation is not pure scheduler wait, and initial bypass/immediate eligibility creates no episode. Pre-head backlog/oldest age, latency budgets, instrumentation overhead/RSS and broad qualification remain open. Matched-runtime shutdown calls record fixed phase/result timing, including nonfinal release and admission BUSY. Final/resumed TIMEOUT preserves history after diagnostics stop without scheduling sinks; other cleanup calls and full teardown latency remain outside scope. Logical credential-gate metrics separate admitted finite operations, layer actors and joined sessions; fixed current/high-water/start/completion counts and result-duration histograms survive disabled history/filtering. Gate observations resolve before logical completion/quiescence, with deterministic overlapping request/cancellation and close-versus-refresh failure tests; they are not server acceptance, per-payload waits, RSS or overhead qualification."
+    },
+    {
+      "id": "M2.8",
+      "name": "M2.8 Many-writer fuzz and edit accounting",
+      "work": "Seeded concurrent histories, independent scene/commit oracle, fresh observer, shrink/replay, parser/state fuzz, automatic master/writer seed logging before work, correlated artifacts",
+      "depends_on": [
+        "M1.9",
+        "M2.7"
+      ],
+      "exit_criteria": "Final scenes match every client and oracle; each admitted edit accounted for; missing/duplicated edits and seeded injected defects fail; nightly writer populations and fault schedules enforced",
+      "status": "in_progress",
+      "evidence": [
+        "tests/reference_service/writer_history.py",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_public_writers_account_every_edit_and_conflict",
+        "tests/harness/test_writer_history.py",
+        "tests/reference_service/writer_reduction.py",
+        "tests/harness/test_writer_reduction.py",
+        "tools/live/writer_campaign.py",
+        "tools/live/writer_fuzz.py",
+        "tests/harness/test_writer_campaign.py",
+        "tests/reference_service/test_plugin.py::PluginTests.test_public_writer_reduction_reexecutes_real_clients_and_service",
+        "docs/ovlive-support-boundary.md",
+        "tests/reference_service/structural_history.py",
+        "tests/harness/test_structural_history.py",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_seeded_structural_writers_account_deleted_and_overwritten_edits",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_structural_writers_export_unknown_and_dependent_suffix_offline",
+        "tests/reference_service/graph_reduction.py",
+        "tests/harness/test_graph_reduction.py",
+        "tests/native/scene/graph_reduce_selftest.py",
+        "tests/harness/test_graph_samples.py",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_native_sample_writers_preserve_keys_replace_maps_and_resume",
+        "tests/reference_service/sample_history.py",
+        "tests/harness/test_sample_history.py",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_seeded_sample_writers_account_repeated_and_erased_edits"
+      ],
+      "coverage_limit": "An eight-process public-plugin scenario admits 128 root int32 edits with simultaneous first-RPC barriers, complete planned/admitted/committed histories, explicit supersession lineage, late join and fresh observer. Inputs and candidate identity are recorded before workers; native publication events drive convergence. Deliberate missing-loser, duplicate, invented, FIFO, writer-identity and admission mutations validate the accounting oracle. The root-field public-plugin profile automatically reduces semantic admission/commit discrepancies through fresh client/service trials, preserves original inputs/edit IDs, and verifies the final candidate afresh. Standalone plan replay checks source, native/SDK, reference dependency, sanitizer and fixture identities. A corrupting reference-service fixture exercises the automatic failure path and proves the reduced inputs pass with the healthy service. Reduction deletes operations while retaining all original nonempty writers and the first-RPC hold recipe; convergence watchdogs, structural/sample histories, fault schedules, larger/nightly populations and the full qualification gate remain open. A four-process private-attachment structural workload adds 48 public-constructor/field/move/delete/replacement admissions, an independent high-level typed scene and exact-once/FIFO ledger oracle, late-child/ancestor-move gates and two safe backend rotations. Broad structure/value fuzzing and shrinking remain incomplete. Transport-free native graph failures have automatic bounded batch/command/field deletion and identity-checked standalone replay, qualified by an explicit native reporting defect. This does not complete multiwriter fault-schedule reduction, broad value shrinking or the full fuzz gate. The independent graph profile adds sample maps and per-key edits, 80 seeded sample transitions, exact signed-zero/type-only resume diffs, and native two-writer narrow-edit versus whole-map conflict witnesses. Sample-record reduction preserves timestamp identity; this remains bounded component qualification. A four-native-writer seeded sample workload adds 64 admissions with repeated equal payloads, no-op erases, independently validated wire effects and a wire-independent FIFO/round/lineage oracle. Complete typed semantic scenes survive A/B/A rotations and fresh observation. The common entrypoint has mandatory writer-fuzz CI/nightly profiles with fixed and derived seeds: root populations through 32 public-plugin writers, structural/sample populations through eight private-attachment writers, safe A/B/A rotations and uncertain-write recovery. Each case uses fresh processes/service state, verifies candidate/dependency provenance, records observed client population and enforces completion/cleanup/evidence checks. The profiles have bounded case/campaign watchdogs, native-client admission limits and post-completion artifact rejection thresholds. This is locally executable campaign coverage, not external CI scheduling, prolonged soaks, parser fuzzing, broad fault-schedule generation/reduction or full platform/resource qualification."
+    },
+    {
+      "id": "M2.9",
+      "name": "M2.9 Concurrent read/edit hardening",
+      "work": "Implement the design section 7 host concurrency contract and storage guard, storage lifetime, lock ordering and progress instrumentation; native threaded sanitizer/watchdog suites",
+      "depends_on": [
+        "M0.8",
+        "M1.6",
+        "M2.5"
+      ],
+      "exit_criteria": "Simultaneous native readers/editors plus remote application pass semantic/progress checks without deadlock/corruption/invalid lifetime; no GIL/global-test-lock shortcut",
+      "status": "in_progress",
+      "evidence": [
+        "tests/native/scene/scene_transport.cpp",
+        "tests/reference_service/test_scene.py",
+        "tests/native/scene/usd_publication.cpp",
+        "tests/native/scene/scene_publication.cpp",
+        "cmake/LiveLockContract.cmake",
+        "tests/native/core/lock_noalloc.cpp",
+        "tests/harness/test_lock_identity.py"
+      ],
+      "coverage_limit": "Hosts author live layers with plain USD on the serial host context; the host edit buffer captures each mutation at the backing. A USD25.11 fixture replacing streaming HostSceneProjection backings verifies content/change notices and path-based dormant/reactivated handles. Attached-stage publication, production live file-format integration, CopyFrom admission, other SDKs and full concurrency/product qualification remain open. TSan, dependency instrumentation, long churn, progress/latency qualification and the full native operation matrix remain unverified. SceneAttachment optionally dispatches journal application and its exact committed revision to an independently progressing host. Real USD replacement tests separately hold a synchronous change notice and a completed job capture, and retain journal/USD candidates plus original actor work after publication failure. Production local-admission publication, same-thread bootstrap activation, safe layer lifetime promotion, attached-stage/Kit synchronization and full qualification remain open. The SDK-independent lock-noalloc lane is mandatory in component and full SDK CI, with directly instrumented ASan/UBSan builds and source/artifact-bound replay; it covers allocation-free nested guard ownership, not the full concurrency gate."
+    },
+    {
+      "id": "M2.10",
+      "name": "M2.10 Reconnect/load-balancer hardening",
+      "work": "Design section 12 generation/routing/recovery behavior; cross-backend GOAWAY/reset/drain/outage matrix during authoring, auth, and shutdown",
+      "depends_on": [
+        "M1.8",
+        "M2.2",
+        "M2.3",
+        "M2.7",
+        "M2.9"
+      ],
+      "exit_criteria": "Safe reads resume without gaps; uncertain writes retained without replay; repeated backend churn converges or fails explicitly within budgets; reference backend/proxy contract verified and deployed assumptions documented for manual/service-owned validation",
+      "status": "in_progress",
+      "evidence": [
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_writers_resume_queued_edits_through_two_backend_rotations",
+        "tests/reference_service/test_scene.py::SceneInfrastructureTests",
+        "tests/native/plugin/driver.cpp",
+        "docs/ovlive-support-boundary.md",
+        "tests/reference_service/test_plugin.py::PluginTests.test_rotation_before_execution_retains_uncertain_and_queued_writer_intents",
+        "tests/reference_service/test_plugin.py::PluginTests.test_rotation_after_commit_retains_uncertain_and_queued_writer_intents",
+        "tests/reference_service/writer_recovery.py",
+        "tests/harness/test_writer_recovery.py",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_sample_writers_export_unknown_and_overwritten_suffix_offline",
+        "tests/reference_service/http2_proxy.py",
+        "tests/harness/test_http2_proxy.py",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_http2_cancel_reset_resumes_read_on_same_connection",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_http2_goaway_drains_read_and_routes_new_work_to_second_backend",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_http2_reset_after_commit_retains_unknown_write_without_replay",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_http2_partial_payload_reset_preserves_cursor_and_queued_edit",
+        "tests/reference_service/test_graph_service.py::GraphServiceTests.test_partial_read_gate_releases_exact_remainder"
+      ],
+      "coverage_limit": "Four public-plugin writers retain seeded queued work through safe A/B/A rotations and through TCP cuts before service execution or after commit/before response. Explicit handler cancellation distinguishes the actual service outcomes without changing client uncertainty. Each writer exports its failed layer to a fresh .usda with SdfLayer::Export; after every original process exits, the standard-library writer_recovery checker requires each export to equal its frozen host layer, contain every planned local operation, and hold at least the before-cut peer prefix with no unapplied peer value, and requires the service ledger to hold only first writes. Public UPDATE counters and service ledger prohibit resend. Three native file-format sample writers retain 18 original admissions through committed-but-unacknowledged sample/map/erase heads and peer sample edits. Exact wire effects are checked before release; after SdfLayer::Export and producer exit, each exported layer's public fields match that writer's frozen host scene, and reading the exports performs no network work. A bounded cleartext HTTP/2 proxy qualifies CANCEL stream reset on a preserved TCP connection, initial graceful GOAWAY with continued old-read progress and new work/resume on backend B, and after-commit reset retaining/exporting Unknown and Queued work. Peer-cancelled reads use bounded recovery; explicit close/terminal cancellation and mutation uncertainty remain separate. A partial-layer-payload case forwards a complete header and seven-byte chunk, proves transport receipt through DATA counts/PING fencing, then resets and resumes on backend B from the last complete cursor with an original queued edit. The service gate also has an exact-remainder release witness. This does not observe worker-internal partial consumption or interrupt within a gRPC message. Session tests reset an established JoinSession stream using real HTTP/2 CANCEL on its existing TCP connection; bounded recovery preserves unsent FIFO and peer identity without awaiting a grace timer. Repeated pre-Connected cancellation exhausts the three-attempt budget. Explicit Leave/local terminal cancellation remain excluded, and messages remain nondurable with possible replay duplication. General structure/value and mixed safe/uncertain-layer workloads, arbitrary partial-message placement, auth/shutdown combinations, additional HTTP/2 errors/TLS termination, long churn, recovery latency/memory budgets and full qualification remain open."
+    },
+    {
+      "id": "M2.11",
+      "name": "M2.11 Performance qualification",
+      "work": "Reproducible per-workload speed/resource budgets, repeated trials and regression reports; read comparable omni.client live layer measurements as data only",
+      "depends_on": [
+        "M0.7",
+        "M0.8",
+        "M2.8",
+        "M2.9",
+        "M2.10"
+      ],
+      "exit_criteria": "Every required budget/comparable-reference gate passes; tail/memory/queue costs bounded; no aggregate masking",
+      "status": "in_progress",
+      "evidence": [
+        "tools/live/benchmark.py",
+        "tests/benchmarks/scene-workloads.json",
+        "tests/native/usd/scene_benchmark.cpp",
+        "tests/harness/test_benchmark.py",
+        "docs/ovlive-benchmarks.md"
+      ],
+      "coverage_limit": "An unsanitized Release SdfSceneData characterization lane measures eight storage cases with in-process warmup, repeated fresh children, seeded histories, independent stock USD correctness and native/source/SDK/compile-command identity. Two cases exercise one writer with two/four native readers under production storage guards. Four event-driven exact-revision witnesses per reader accompany coherent-pair and monotonic-revision checks, separate writer/per-reader latency and progress, and free-read counts before epoch writer completion (not measured contention; zero counts retained). These component cases do not qualify public USD/Kit access, many writers or fairness bounds. Bounded supervisor artifacts retain raw latency/CPU/RSS/destruction observations and descriptive per-case summaries. Execution success is explicitly separate from unverified performance qualification; replay refuses changed candidate/workload/machine provenance. No comparable omni.client live layer report, frozen numerical budgets, stable-worker qualification, statistical regression/improvement gate, full concurrent/transport/convergence/recovery/idle/instrumentation matrix, allocation accounting or platform coverage is established."
+    },
+    {
+      "id": "M3.1",
+      "name": "M3.1 Session RPCs",
+      "work": "`ListSessions`, `CreateSession`, `DeleteSession`; `CreatedSession` with ID/URI only; listed metadata with creator/time; `MakeSessionUri`",
+      "depends_on": [
+        "M1.1",
+        "M1.2"
+      ],
+      "exit_criteria": "Contract tests from M0.3 pass against the independent reference service; successful create followed by failed list stays successful and issues no second create",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveFinite.cpp",
+        "tests/native/runtime/unary_driver.cpp",
+        "tests/reference_service/test_native.py"
+      ],
+      "coverage_limit": "Five public finite submissions including session create/list/delete and layer stat/delete; independent reference checks for copied metadata, semantic validation, bounded read retries and uncertain mutations without replay. Shared-library/package/Python integration, metadata byte budgets, diagnostic reporting and complete concurrency/error matrix remain."
+    },
+    {
+      "id": "M3.2",
+      "name": "M3.2 Join, presence, messages",
+      "work": "`JoinSession`/`LeaveSession` session handle with required app name and service-reported user identity; connection/peer events, peer diff with generation-bound grace timer, `SendMessage` queue semantics, one write outstanding",
+      "depends_on": [
+        "M3.1"
+      ],
+      "exit_criteria": "Same-principal joins have distinct connection IDs; rejoin produces a new Connection event before peers; stale timer cannot remove peers; unsent queue survives reconnect",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/runtime/LiveSession.cpp",
+        "source/live/runtime/LiveSessionPeers.cpp",
+        "source/live/runtime/LiveSessionApi.cpp",
+        "tests/native/runtime/session_peers.cpp",
+        "tests/native/runtime/session_api.cpp",
+        "tests/reference_service/test_session.py"
+      ],
+      "coverage_limit": "Native component implemented; reference-only automated cases cover same-principal joins, Connection ordering, grace/dedup, reconnect with retained unsent FIFO, auth, bounded admission, callback teardown and allocation rollback. Packaged/Python/Kit integration, failed in-flight delivery/duplicate qualification, full fault/concurrency matrix and product gates remain open."
+    },
+    {
+      "id": "M3.3",
+      "name": "M3.3 Python extension",
+      "work": "`_live` pybind11 module linked to the plugin; `Request`, `Session`, and per-registration endpoint ownership; callback dispatcher; GIL release around waits; new isolated-interpreter/asyncio fixtures under the common runner",
+      "depends_on": [
+        "M1.7",
+        "M1.4"
+      ],
+      "exit_criteria": "New packaged-binding cases cover callback lifetime, NUL-containing bytes, and interpreter shutdown with replay/artifact capture",
+      "status": "in_progress",
+      "evidence": [
+        "source/bindings/python/omni/usd/live/Native.cpp",
+        "source/bindings/python/omni/usd/live/__init__.py",
+        "source/bindings/python/omni/usd/live/__init__.pyi",
+        "cmake/LivePython.cmake",
+        "tools/live/python_identity.py",
+        "tests/harness/test_python_identity.py",
+        "tests/reference_service/test_python.py",
+        "tests/reference_service/test_python_sessions.py",
+        "tests/reference_service/test_python_observers.py",
+        "tests/native/python/package.py",
+        "docs/ovlive-python.md",
+        "source/bindings/python/omni/usd/live/Host.cpp",
+        "source/bindings/python/omni/usd/live/_host.py",
+        "tests/reference_service/test_python_host.py",
+        "tests/native/python/host.py",
+        "tests/harness/test_host_lifecycle.py",
+        "tests/reference_service/test_python_host.py::PythonHostTests.test_python_unknown_write_exports_every_local_edit_without_resend"
+      ],
+      "coverage_limit": "Linux CPython3.12 main-interpreter adapter links the single native plugin and is included in the repository build/stage wrapper with Python source, interpreter and pybind11 header identity checks. Owned lifecycle and all five finite operations have typed blocking/callback/async wrappers, GIL-free native callback copies, bounded retention and explicit local wait timeout/confirmed-create delivery uncertainty. Shared C/Python ownership, callback/loop/GC/teardown reference fixtures and package relocation checks are implemented. Owned session streams and finite send receipts add bounded copied event queues, terminal bridge failures, reconnect and leave/exit fixtures. Auth/status/diagnostic subscriptions use independent bounded consumers and retained native status reads acknowledged after Python callback retirement. An owned serial-host adapter bridges existing pxr.Sdf types, plain USD authoring and save; publication and editor retirement have independent bounded capacity. Started Python host tasks remain accounted through native capture retirement and USD notice callbacks during shutdown. Mutable handles remain caller-confined; losing a creator during abnormal teardown can retain bounded native-only edit state. A Python reference case with diagnostic history disabled fails a layer on an uncertain committed write with a later queued edit, keeps it locally editable, and exports it with Sdf.Layer.Export to a file that holds every local edit, is unchanged after its producer closes and issued no service operation. Full allocator/capacity/sanitizer/platform/Kit coverage, general recovery/reconciliation workflows, complete operation semantics and product qualification remain incomplete."
+    },
+    {
+      "id": "M3.4",
+      "name": "M3.4 Python wrappers",
+      "work": "Blocking/`_async`/`_with_callback` variants, type stubs, `initialize` context manager, auth helpers, typed status, and diagnostic wrappers; wire session operations into common status/metrics/history",
+      "depends_on": [
+        "M3.1",
+        "M3.2",
+        "M3.3",
+        "M2.7"
+      ],
+      "exit_criteria": "Every Python API function covered; asyncio cancellation/closed-loop tests pass; status coalescing/terminal retention survive Python dispatch; slow diagnostic callback cannot starve control callbacks",
+      "status": "in_progress",
+      "evidence": [
+        "source/bindings/python/omni/usd/live/Native.cpp",
+        "source/bindings/python/omni/usd/live/__init__.py",
+        "source/bindings/python/omni/usd/live/__init__.pyi",
+        "cmake/LivePython.cmake",
+        "tools/live/python_identity.py",
+        "tests/harness/test_python_identity.py",
+        "tests/reference_service/test_python.py",
+        "tests/reference_service/test_python_sessions.py",
+        "tests/reference_service/test_python_observers.py",
+        "tests/native/python/package.py",
+        "docs/ovlive-python.md",
+        "source/bindings/python/omni/usd/live/Host.cpp",
+        "source/bindings/python/omni/usd/live/_host.py",
+        "tests/reference_service/test_python_host.py",
+        "tests/native/python/host.py",
+        "tests/harness/test_host_lifecycle.py",
+        "tests/reference_service/test_python_host.py::PythonHostTests.test_python_unknown_write_exports_every_local_edit_without_resend"
+      ],
+      "coverage_limit": "Linux CPython3.12 main-interpreter adapter links the single native plugin and is included in the repository build/stage wrapper with Python source, interpreter and pybind11 header identity checks. Owned lifecycle and all five finite operations have typed blocking/callback/async wrappers, GIL-free native callback copies, bounded retention and explicit local wait timeout/confirmed-create delivery uncertainty. Shared C/Python ownership, callback/loop/GC/teardown reference fixtures and package relocation checks are implemented. Owned session streams and finite send receipts add bounded copied event queues, terminal bridge failures, reconnect and leave/exit fixtures. Auth/status/diagnostic subscriptions use independent bounded consumers and retained native status reads acknowledged after Python callback retirement. An owned serial-host adapter bridges existing pxr.Sdf types, plain USD authoring and save; publication and editor retirement have independent bounded capacity. Started Python host tasks remain accounted through native capture retirement and USD notice callbacks during shutdown. Mutable handles remain caller-confined; losing a creator during abnormal teardown can retain bounded native-only edit state. A Python reference case with diagnostic history disabled fails a layer on an uncertain committed write with a later queued edit, keeps it locally editable, and exports it with Sdf.Layer.Export to a file that holds every local edit, is unchanged after its producer closes and issued no service operation. Full allocator/capacity/sanitizer/platform/Kit coverage, general recovery/reconciliation workflows, complete operation semantics and product qualification remain incomplete."
+    },
+    {
+      "id": "M3.5",
+      "name": "M3.5 Samples",
+      "work": "Headless C sample and Python sample: register endpoint, create session, list metadata separately, edit a layer through `SdfLayer`, refresh token, observe errors, export diagnostics/JSON Lines, export a failed layer with `SdfLayer::Export`, leave",
+      "depends_on": [
+        "M3.4"
+      ],
+      "exit_criteria": "Samples run against the reference service in CI; documented for manual Kit and service-owned end-to-end use",
+      "status": "in_progress",
+      "evidence": [
+        "source/live/samples/diagnostics/DiagnosticLog.h",
+        "source/live/samples/diagnostics/DiagnosticLog.cpp",
+        "source/live/samples/diagnostics/main.cpp",
+        "tests/native/diagnostics_log/driver.cpp",
+        "tests/native/diagnostics_log/check.py",
+        "tests/reference_service/test_diagnostics_sample.py",
+        "docs/ovlive-support-boundary.md",
+        "source/bindings/python/omni/usd/live/sample.py",
+        "docs/ovlive-samples.md",
+        "tests/reference_service/test_python_sample.py",
+        "tests/harness/test_headless_sample.py",
+        "source/live/samples/participant/main.cpp",
+        "tests/native/participant/driver.cpp",
+        "tests/reference_service/test_native_sample.py"
+      ],
+      "coverage_limit": "Packaged native C ABI/SDK and Python headless participants implement session creation, separate metadata, guarded USD edit/save, explicit token replacement, operational status, bounded JSON Lines diagnostics/snapshot, retained request/creation continuation, failed-layer export and leave. Both run the shared reference-service workflow scenarios; native event-gated logger witnesses cover blocked/full IO and failure. Read-only C ABI diagnostic sample remains separately supported. Commands and scope are in docs/ovlive-samples.md. External CI wiring, automatic host credential policy and broader Kit/platform qualification remain open. The exported USD file is the whole recovery artifact; no automatic reconciliation or uncertain mutation replay."
+    },
+    {
+      "id": "M4.1",
+      "name": "M4.1 Kit lifecycle/host adapter",
+      "work": "Kit extension loads the plugin, registers endpoint/token, removes the live frame-pump dependency, and preserves normal host stage/composition synchronization; new fixtures and real Kit process driver",
+      "depends_on": [
+        "M1.9"
+      ],
+      "exit_criteria": "Real Kit layer opens/edits/converges without frame-driven live processing; native reader/writer safety and host composition barriers pass",
+      "status": "in_progress",
+      "evidence": [
+        "docs/ovlive-kit.md",
+        "source/kit/config/extension.toml",
+        "source/kit/python/omni/kit/live_services/_bootstrap.py",
+        "source/kit/python/omni/kit/live_services/__init__.py",
+        "source/bindings/python/omni/usd/live/_kit_host.py",
+        "tests/harness/test_kit_host.py",
+        "tests/native/python/package.py",
+        "tests/native/python/kit_bootstrap.py",
+        "tests/native/python/kit_process.py",
+        "tests/reference_service/test_kit_process.py",
+        "tests/harness/test_kit_process_fixture.py",
+        "tools/live/kit_reference.py",
+        "tests/harness/test_kit_reference_runner.py"
+      ],
+      "coverage_limit": "Real headless Kit bootstrap qualifies exact package/lifecycle selection, storage shutdown ownership and worker-to-main dispatch. The reference-process driver attaches an ordinary base/session stage with a read-only live sublayer; two clients admit 16 seeded overlapping attribute edits and independently compare live layer and composed stage with the service ledger. A separate case resumes a positive read cursor on backend B after an event-gated load-balancer rotation, without mutation replay. Explicit stage-cache ownership, close callbacks and typed host retirement prove clean exit. The startup profile enables frame-boundary USD lock release and retains close-time locking. The companion resolver registers no `.live` handler or delegate and has no packaging dependency on one; clean release staging is still required. This CPU/headless profile does not qualify Fabric/render barriers, direct-live-root attachment (Kit overrides its immutable permissions), the modified layers plugin, complete session/authoring/preservation UI, paused-frame convergence or the supported Kit matrix. M4.1 remains in progress. The bounded Kit/reference lane is available through the common runner with explicit selected-input identity, complete participant evidence and replay validation; GitHub worker provisioning/routing remains pending."
+    },
+    {
+      "id": "M4.2",
+      "name": "M4.2 Session model",
+      "work": "`LiveSyncing.cpp` on endpoint + base-layer key; ListSessions polling; owner from creator name; TOML/folder code removed",
+      "depends_on": [
+        "M3.1",
+        "M4.1"
+      ],
+      "exit_criteria": "Session list/create/join/leave UI works with no `.live` folder or TOML; metadata lookup failure after creation disables owner-dependent actions without recreating the session",
+      "status": "in_progress",
+      "evidence": [
+        "docs/ovlive-kit.md",
+        "source/bindings/python/omni/usd/live/_kit_sessions.py",
+        "source/bindings/python/omni/usd/live/_kit_host.py",
+        "tests/harness/test_kit_sessions.py",
+        "tests/reference_service/test_python_kit_catalog.py"
+      ],
+      "coverage_limit": "Bounded host-owned service catalogue provides explicit endpoint/stable base key, active-only polling, confirmed mutation receipts distinct from listed metadata and retained uncertain outcomes. Read-only host-thread projection exposes pending mutations before admission; failed projection retains receipts and can recover without RPC. Companion Kit LiveSyncing.cpp consumes copied service metadata without folder/TOML discovery or storage locks. Stable handles, retired scopes, scope generations and revisions preserve active USD state and reject stale updates. Standalone catalogue allocation/seeded tests, headless Python seams and translation-unit syntax checks do not qualify a linked/running Kit application. A bounded root owner binds the exact confirmed session receipt before native seed preparation, admits one CreateLayer, coalesces shielded waits and retains outcomes until explicit close. Companion scope checks bracket plugin-layer activation. Real Kit guarded attachment, session UI, coordinated delivery of the package and the lifecycle-only client plugin and preservation/reconciliation remain open."
+    },
+    {
+      "id": "M4.3",
+      "name": "M4.3 Presence/merge adapter",
+      "work": "`live_session_channel_manager.py` on JoinSession; merge messages with message IDs; reconnect versus terminal failure surfaced to UI",
+      "depends_on": [
+        "M3.2",
+        "M3.4"
+      ],
+      "exit_criteria": "Two Kit clients see each other, merge notice mutes peers once, duplicate messages ignored",
+      "status": "in_progress",
+      "evidence": [
+        "docs/ovlive-kit.md",
+        "source/bindings/python/omni/usd/live/_kit_host.py",
+        "tests/harness/test_kit_host.py"
+      ],
+      "coverage_limit": "Companion isolated Kit branch replaces Python channel transport with JoinSession, connection-ID peers, bounded UI delivery, merge message deduplication and typed status. Headless adapter tests cover transient failed Connection events, cancellation and allocation failures. Companion C++ session metadata supplies canonical service URIs; guarded stage attachment, coordinated delivery of the package and the lifecycle-only client plugin, preservation/authoring gating, two actual Kit clients and service-backed Kit adapter tests remain required."
+    },
+    {
+      "id": "M4.4",
+      "name": "M4.4 Composition and asset anchoring",
+      "work": "URI parsing and relative asset rebasing in Kit's attach/merge paths",
+      "depends_on": [
+        "M1.5",
+        "M4.2"
+      ],
+      "exit_criteria": "References, payloads, textures, nested live sublayers resolve in Kit",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "M4.5",
+      "name": "M4.5 Shutdown and rollout gates",
+      "work": "Kit shutdown sequence; feature flag so a layer is never driven by both runtimes",
+      "depends_on": [
+        "M4.2",
+        "M4.3"
+      ],
+      "exit_criteria": "Kit exits within the drain budget with a dead service",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "M4.6",
+      "name": "M4.6 Packaging and audit",
+      "work": "Package manifests, notices, standalone smoke test on a clean machine, platform matrix, guide for hosts moving from the omni.client live layer path, and diagnostic schema/event catalog",
+      "depends_on": [
+        "M3.5",
+        "M4.5",
+        "M4.7",
+        "M4.8"
+      ],
+      "exit_criteria": "No `omniclient`/Nucleus in build or runtime closure on any platform; required candidate-artifact contract matrix passes; docs published",
+      "status": "pending",
+      "evidence": []
+    },
+    {
+      "id": "M4.7",
+      "name": "M4.7 Kit error handling and diagnostics",
+      "work": "Typed status adapter, per-layer authoring/merge gating, preserve-and-reopen workflow, logging integration, incident details and user-triggered snapshot export",
+      "depends_on": [
+        "M2.7",
+        "M3.4",
+        "M4.2"
+      ],
+      "exit_criteria": "Lost write response produces actionable UI and preserved work; healthy layers continue; diagnostic sink disabled/stalled does not affect error handling; no log-string parsing",
+      "status": "in_progress",
+      "evidence": [
+        "tests/native/python/kit_process.py",
+        "tests/reference_service/test_kit_process.py",
+        "tests/reference_service/test_kit_process.py::KitProcessTests.test_kit_preserves_unknown_and_queued_edits_after_lost_response"
+      ],
+      "coverage_limit": "A bounded actual Kit/reference case observes typed OUTCOME_UNKNOWN after committed response loss with no diagnostic subscription, checks save refusal, exports the failed layer holding the Unknown and Queued edits, then closes the stage/cache/host. After process exit the exported USDA still matches the digest of that export, and failure handling, export and retirement issued no service work. This does not implement or qualify the complete session UI, preserve-and-reopen/reconciliation, disabled-history behavior or full platform/host release matrix. A fourth actual Kit case holds a Python diagnostic callback across failure reporting, a second live layer's edit/save/publication in the same composed stage, and export of the failed layer. Both layers share one endpoint/runtime/publication owner; service ledgers and the post-exit export check verify exact effects and no uncertain resend. This covers the held Python handler, not native executor blockage, disabled-history behavior, overflow guarantees or complete UI qualification."
+    },
+    {
+      "id": "M4.8",
+      "name": "M4.8 Test-system release readiness",
+      "work": "Full CI/platform matrix, Kit/reference-service/load-balancer-proxy contracts, staged-package runners, manual Kit checklist and service-owned plugin handoff, four-gate evidence and artifact policy",
+      "depends_on": [
+        "M2.11",
+        "M3.4",
+        "M4.5",
+        "M4.7"
+      ],
+      "exit_criteria": "Clean checkout runs all suites/replay; all four gates satisfied with comparative gaps explicit; no omni.client dependency or hidden service",
+      "status": "pending",
+      "evidence": []
+    }
+  ]
+}

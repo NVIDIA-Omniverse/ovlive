@@ -1,0 +1,28 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- Pins copied from client-library deps/target-deps.packman.xml at
+       b38701a98b16ce82ea84a8b15a2b29512639cf0d. No client SDK import.
+       Caller must supply live_services_target_platform_abi and config; see README.md. -->
+  <dependency name="live-grpc-${config}" linkPath="../_build/target-deps/grpc-${config}">
+    <package name="grpc" version="1.65.4-1-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-protobuf-${config}" linkPath="../_build/target-deps/protobuf-${config}">
+    <package name="protobuf" version="5.26.0-2-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-abseil-${config}" linkPath="../_build/target-deps/abseil-${config}">
+    <package name="abseil" version="20240116.1-1-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-re2-${config}" linkPath="../_build/target-deps/re2-${config}">
+    <package name="re2" version="20230301-1-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-c-ares-${config}" linkPath="../_build/target-deps/c-ares-${config}">
+    <package name="c-ares" version="1.34.8-0-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-openssl-${config}" linkPath="../_build/target-deps/openssl-${config}">
+    <package name="openssl" version="3.5.9-0-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+  <dependency name="live-zlib-${config}" linkPath="../_build/target-deps/zlib-${config}">
+    <package name="zlib" version="1.3.2-0-${live_services_target_platform_abi}-static-${config}" />
+  </dependency>
+</project>

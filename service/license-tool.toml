@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[overrides]
+# `smartstring` (transitive dep of `opentelemetry-prometheus-text-exporter`)
+# declares the nonstandard SPDX expression `MPL-2.0+` in its Cargo.toml. The
+# canonical license is MPL-2.0 (a weak, file-level copyleft license in this
+# repo's allowed set); the `+` operator is not a valid MPL suffix and breaks
+# both the SPDX
+# text lookup and the permissive-set check in tools/generate_attributions.py.
+# Normalize to the canonical identifier.
+smartstring = { license = "MPL-2.0" }
+# `tikv-jemalloc-sys` declares `MIT/Apache-2.0`, which covers the Rust binding
+# only. The crate also compiles jemalloc's C sources into the service binary
+# (its global allocator), and jemalloc is BSD-2-Clause. Declare the conjunction
+# so the attribution's license line covers what is actually linked;
+# tools/generate_attributions.py emits jemalloc's notice from the crate's
+# `jemalloc/COPYING` (EMBEDDED_LICENSE_FILES).
+tikv-jemalloc-sys = { license = "(MIT OR Apache-2.0) AND BSD-2-Clause" }
