@@ -84,15 +84,16 @@
 //! `from_seq + 1` (b.rrx). Link verification therefore compares
 //! `predecessor.to_seq == successor.from_seq` with **no** `+1` / `-1` anywhere.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::time::Instant;
 
+use crate::checkpoint::adapters::handle_generation_sort_key;
 use crate::checkpoint::store::{
     CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointKind, CheckpointMeta,
-    CheckpointStore,
+    CheckpointStore, LayerArtifact,
 };
 use crate::checkpoint::tail_codec::{peek_tail_header, TailHeader};
 
@@ -659,7 +660,9 @@ enum CandidateOutcome {
 /// A resumable newest-first walk over one object's restorable generations.
 ///
 /// Construct with [`gather_restore_lineage`] (which performs the single
-/// `list_layer_checkpoints`), then drive [`LineageSelection::next_restorable`].
+/// `list_layer_checkpoints`), or with [`LineageSelection::from_listing`] over a
+/// listing the caller already holds, then drive
+/// [`LineageSelection::next_restorable`].
 /// Each call returns the newest lineage that verifies **strictly below** the
 /// previously-returned candidate's head sequence, so a caller whose
 /// composition of one lineage failed `Permanent` can simply ask for the next —
@@ -965,20 +968,58 @@ pub async fn gather_restore_lineage(
     reserve: Duration,
 ) -> Result<LineageSelection<'_>, CheckpointError> {
     let listing = store.list_layer_checkpoints(object_id).await?;
-    Ok(LineageSelection {
-        store,
-        object_id,
-        listing,
-        next_index: 0,
-        facts: HashMap::new(),
-        candidate_bytes: HashMap::new(),
-        candidate_fetches: 0,
-        step_downs: Vec::new(),
-        exhaustion: None,
-        candidates_tried: 0,
-        deadline,
-        reserve,
-    })
+    Ok(LineageSelection::from_listing(
+        store, object_id, listing, deadline, reserve,
+    ))
+}
+
+/// Group one raw `layers/` enumeration
+/// ([`CheckpointStore::list_layer_artifacts`]) into each object's generation
+/// listing, in the order [`CheckpointStore::list_layer_checkpoints`] returns
+/// for that object: newest first, a base before a tail at an equal sequence
+/// (`adapters::generation_sort_key`).
+///
+/// Only a family's generation artifact makes a generation
+/// ([`LayerArtifactKind::is_generation_artifact`](crate::checkpoint::store::LayerArtifactKind::is_generation_artifact): a base's `*.ompf`, a
+/// tail's `*.tail`), exactly as the adapters' own per-object listing keys on
+/// it; a companion without its generation artifact and a write temp are left
+/// out. A duplicate entry (the enumeration permits them) yields one handle.
+///
+/// The handles carry an empty `adapter_key`: every adapter addresses a
+/// generation by `(object_id, snap_seq, kind)` and returns its own canonical
+/// key on the fetched blob ([`CheckpointStore::get_layer_checkpoint`]'s
+/// *Addressing*). The DR restore Job lists the store once this way rather
+/// than once per object (SR-9.2), and hands each group to
+/// [`LineageSelection::from_listing`].
+pub fn group_layer_generations(
+    artifacts: &[LayerArtifact],
+) -> BTreeMap<u64, Vec<CheckpointHandle>> {
+    let mut seen: HashSet<(u64, u64, CheckpointKind)> = HashSet::new();
+    let mut grouped: BTreeMap<u64, Vec<CheckpointHandle>> = BTreeMap::new();
+    for artifact in artifacts {
+        if !artifact.kind.is_generation_artifact() {
+            continue;
+        }
+        let Some(kind) = artifact.kind.generation_kind() else {
+            continue;
+        };
+        if !seen.insert((artifact.object_id, artifact.snap_seq, kind)) {
+            continue;
+        }
+        let handle = match kind {
+            CheckpointKind::Base => {
+                CheckpointHandle::base(artifact.object_id, artifact.snap_seq, String::new())
+            }
+            CheckpointKind::Tail => {
+                CheckpointHandle::tail(artifact.object_id, artifact.snap_seq, String::new())
+            }
+        };
+        grouped.entry(artifact.object_id).or_default().push(handle);
+    }
+    for handles in grouped.values_mut() {
+        handles.sort_unstable_by_key(handle_generation_sort_key);
+    }
+    grouped
 }
 
 /// Hand-written because the `&dyn CheckpointStore` field is not `Debug`, and
@@ -999,6 +1040,40 @@ impl std::fmt::Debug for LineageSelection<'_> {
 }
 
 impl<'a> LineageSelection<'a> {
+    /// Begin a newest-first restore selection for `object_id` over a listing
+    /// the caller already holds, instead of listing the store as
+    /// [`gather_restore_lineage`] does (which is this over its own
+    /// [`CheckpointStore::list_layer_checkpoints`]).
+    ///
+    /// `listing` MUST be in that method's order — newest first, a base before
+    /// a tail at an equal sequence — and is never re-sorted here; it is the
+    /// selection's single listing, exactly as the one
+    /// [`gather_restore_lineage`] takes. [`group_layer_generations`] builds
+    /// one from a raw `layers/` enumeration. `deadline` and `reserve` are
+    /// [`gather_restore_lineage`]'s, with its stated precondition.
+    pub fn from_listing(
+        store: &'a dyn CheckpointStore,
+        object_id: u64,
+        listing: Vec<CheckpointHandle>,
+        deadline: Instant,
+        reserve: Duration,
+    ) -> Self {
+        LineageSelection {
+            store,
+            object_id,
+            listing,
+            next_index: 0,
+            facts: HashMap::new(),
+            candidate_bytes: HashMap::new(),
+            candidate_fetches: 0,
+            step_downs: Vec::new(),
+            exhaustion: None,
+            candidates_tried: 0,
+            deadline,
+            reserve,
+        }
+    }
+
     /// The object this selection is for.
     pub fn object_id(&self) -> u64 {
         self.object_id
@@ -2341,6 +2416,10 @@ mod tests {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {

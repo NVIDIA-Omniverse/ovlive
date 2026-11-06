@@ -21,9 +21,11 @@
 //! pooled refresh is; with a credential due and a read in flight it sends that
 //! read a credential wake, and it sends `AUTH` on its own connection only with
 //! no read in flight. Before b.19i fred's refresh task wrote the `AUTH` to the
-//! reader's connection itself, racing the reader's `XREAD BLOCK`: it interrupted
-//! the read through `CLIENT UNBLOCK` on a backchannel (an `-UNBLOCKED` re-plan)
-//! or, losing the race, queued behind a fresh 30 s BLOCK.
+//! reader's connection itself, racing the reader's `XREAD BLOCK`: under the
+//! readers' `Blocking::Interrupt` of the time it interrupted the read through
+//! `CLIENT UNBLOCK` on a backchannel (an `-UNBLOCKED` re-plan) or, losing the
+//! race, queued behind a fresh 30 s BLOCK. Since b.9sh the readers run fred's
+//! default `Blocking::Block`, so no `CLIENT UNBLOCK` is sent at all.
 //!
 //! # Fixtures
 //!
@@ -75,7 +77,8 @@
 //! client connected; one [`SETTLE`] per polled condition, subscription start,
 //! delivery and `quit()`; fred's 5 s command timeout per one-shot command (an
 //! `XADD`, a poll's last `CLIENT LIST`); and `TestValkey`'s drop-time purge
-//! (a `SCAN` page and an `UNLINK`, 5 s each). [`busy_reader`] alone is
+//! (a wait for the walk's next key and an `UNLINK`, 5 s each).
+//! [`busy_reader`] alone is
 //! 10 + 5 + 10 + (10 + 5) = 40 s. The largest:
 //!
 //! | Test | Sum | Worst case |
@@ -262,10 +265,10 @@ async fn await_ticks_past(client: &ValkeyClient, from: u64, n: u64) {
 /// - nothing forced a reconnect, and the next update is delivered.
 ///
 /// Before b.19i fred's refresh task wrote the `AUTH` to the blocked
-/// connection: it interrupted the read through `CLIENT UNBLOCK` on a
-/// backchannel (one `-UNBLOCKED` re-plan, and a second connection's handshake
-/// `AUTH` on the wire), on a cadence read from the reader client's own
-/// provider.
+/// connection: under the readers' `Blocking::Interrupt` of the time it
+/// interrupted the read through `CLIENT UNBLOCK` on a backchannel (one
+/// `-UNBLOCKED` re-plan, and a second connection's handshake `AUTH` on the
+/// wire), on a cadence read from the reader client's own provider.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reauth_due_during_a_blocked_read_wakes_it_and_auths_between_reads() {
     const OID: u64 = 3;
@@ -320,7 +323,7 @@ async fn a_reauth_due_during_a_blocked_read_wakes_it_and_auths_between_reads() {
         wire.client_unblocks(),
         0,
         "no CLIENT UNBLOCK: nothing but the reader's own XREAD was ever queued on its \
-         connection, so fred never opened a backchannel"
+         connection, and the readers run fred's default Blocking::Block (b.9sh)"
     );
     assert_eq!(
         read_unblocked_retries(&metrics),

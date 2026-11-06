@@ -55,22 +55,34 @@ mod b_459_tests;
 // ListSessions' names read, `get_session_meta`, `load_values` — are each driven
 // by a real data-pool stall and must answer `Unavailable`, counting exactly one
 // data-pool command timeout. The inner `undo` module drives CreateSession's
-// three post-commit failures (the metadata `HSET`, the in-doubt `SISMEMBER`,
+// three post-commit failures (the metadata write, the in-doubt `SISMEMBER`,
 // and the in-doubt re-scan `SMEMBERS`, reached by letting the `SISMEMBER`
-// through a single stalled connection). The call retries only once the undo
-// has released the attempt's names member, otherwise it ends (see
-// `undo_create_attempt` / SDD §7.10). Each is driven to both undo outcomes, and
-// the failed-undo cases pin the not-released WARN; the metadata `HSET` is also
-// driven through a partial undo (names `SREM` let through alone, told apart by
-// its wire size). Two more pin the per-attempt `session_id`: the partial undo's
-// timed-out commands landing after `Ok`, and a real in-doubt `EXEC` landing
-// after its `SISMEMBER` read "absent", must each leave the call's result
-// intact. The module needs
-// `--features test-fault-injection` (the pre-dispatch hook and the verdict
-// override) and is silently compiled out without it. The converted sites this
+// through a single stalled connection). A failed metadata write is settled
+// with the metadata veto (b.2tu): `PRESENT` answers OK with the attempt's id,
+// `VETOED` retries under a new id (and a late write is refused), a failed
+// settle answers `UNAVAILABLE` (see `settle_failed_meta_write` / SDD §7.10).
+// A failed in-doubt read releases the attempt's members in one script and
+// retries, or answers `UNAVAILABLE` when the release fails, leaving both
+// members or neither. The failed cases pin their not-retrying WARN. Two more
+// pin the per-attempt `session_id`: a vetoed attempt's release landing after
+// `Ok`, and a real in-doubt `EXEC` landing after its `SISMEMBER` read
+// "absent", must each leave the call's result intact. The module needs
+// `--features test-fault-injection` (the pre-dispatch, post-commit and verdict
+// seams) and is silently compiled out without it. The converted sites this
 // file does not drive are guarded per site by `mapper_routing_test.rs`, which
-// also pins the three undo call sites.
+// also pins the settle and release call sites.
 mod b_62m_tests;
+// b.2tu — the four session scripts behind ListSessions' ghost walk and
+// CreateSession's metadata write (`session_meta_veto`, `session_meta_write`,
+// `session_index_release`, `session_path_index_reconcile`), each run directly
+// against its contract; ListSessions' reclaim of `path_index` members no
+// names member carries; the walk's failure paths (a refused veto, a refused
+// release, an unreadable `path_index`); the veto, CreateSession's settle and
+// the walk on a full store (disruptive `store_write_refusal_disruptive_*`
+// tests, a real `-OOM`); and the cluster-gated run of all four scripts
+// (`b_2tu_session_scripts_run_on_a_cluster`). The walk-vs-create race tests
+// are inline in `src/grpc/session.rs`.
+mod b_2tu_tests;
 // b.75i — one `UpdateLayer` call commits at most once. Each call mints one
 // random commit token that its commit records in `le:{oid}:obj:wtok` and that
 // every attempt checks first, so a commit whose reply was lost (a fast-path
@@ -124,8 +136,22 @@ mod b_v6d_router_test;
 // seam-driven scenarios live in an inner
 // `#[cfg(feature = "test-fault-injection")] mod seams`.
 pub(crate) mod b_ua9_tests;
+// b.myh — a reply is a cluster redirect only when it is an error frame (the
+// vendored fred's `live_edit::redirect`): the predicate's table over every
+// string-carrying RESP3 frame type, and, through `cluster_facade_support`'s
+// facade, an `ASK`-shaped stored value and status reply and a `MOVED`-shaped
+// stored value each returned to the `GET` as data with no redirect followed,
+// beside `-ASK` / `-MOVED` error replies that still are.
+mod b_myh_redirect_frame_test;
 mod b_vn4_ask_follow_test;
 mod b_vn4_tryagain_test;
+// b.9sh — a cluster sync drops the connection it opens for `CLUSTER SLOTS`
+// (vendored fred change 11): through its own two-node facade, a raw fred
+// cluster client's backchannel holds no connection after a sync on every exit
+// (success, an error reply, a timed-out request, `connect_any` failing, a
+// null reply, a reply `rebuild` cannot parse, the router aborted mid-request),
+// and its connection-id map still names a connection per primary.
+mod b_9sh_sync_connection_test;
 // b.cyu — a fred `Transaction` a cluster node redirects ("Max redirections
 // exceeded") is transient at every txn-pool call site (`DeleteSession`, both
 // redirect shapes; the `CreateLayer` materialization, including its
@@ -159,12 +185,25 @@ pub(crate) mod lua_source_scan;
 // scripts/guard-tests.sh `MODULES`. Its Rust-source helpers are shared with
 // `txn_exec_routing_guard_test`.
 mod script_migration_guard_test;
+// b.myh — the guard behind SDD §15.3's rule that a script's error text never
+// begins with data it read or was passed (a redirect-shaped error reply would
+// steer fred's `-ASK` follow): every `error_reply`, `error(…)` and `err` field
+// in a script begins with a fixed, non-redirect literal or is a listed relay
+// with its reason. Pinned in scripts/guard-tests.sh `MODULES`.
+mod script_error_reply_guard_test;
 // b.cyu — the guard that every fred `Transaction`'s `EXEC` goes through
 // `ValkeyClient::exec_txn`, which re-syncs the checkout's routing after a
 // redirect: no raw `exec` outside it (a `WatchedTxn`'s is told apart), every
 // `.multi()` site calls it, and each call passes the checkout its transaction
 // was opened on. Pinned in scripts/guard-tests.sh `MODULES`.
 mod txn_exec_routing_guard_test;
+// b.2tu — the guard that a CreateSession's metadata is written only through
+// `session_meta_write.lua` (no direct hash write in `src/storage/session.rs`)
+// and that a session's index members are removed only by `delete`'s two
+// `SREM`s and the release script's callers (the ListSessions walk's
+// veto-then-release and CreateSession's clean-ups; `src/grpc/session.rs`
+// sends no `SREM`). Pinned in scripts/guard-tests.sh `MODULES`.
+mod session_index_writer_guard_test;
 // b.atj — the read-side twin of the keyspace type-error counter. b.zvd made a
 // wrong-typed key on any of the snapshot reads fail every snapshot
 // consumer closed, but nothing ticked: `keyspace_type_error_total` is written
@@ -249,6 +288,12 @@ mod b_a4k_tests;
 // second condition is the silent one: without the feature those tests are
 // compiled out rather than red.
 mod b_289_tests;
+// The ACL user denied one command that `b_bhb_tests` (`-client`) and
+// `scan_guard_test` (`-cluster|nodes`, `-info`) provision on every primary, with the
+// guard that deletes it on every exit. Compiled only with
+// `test-fault-injection`, as both of its users are.
+#[cfg(feature = "test-fault-injection")]
+pub(crate) mod acl_user_fixture;
 // b.bhb — a watched transaction must commit only on the connection holding its
 // WATCH. fred replayed a `Transaction` onto a fresh connection after a
 // reconnect (and a fresh node after a MOVED), where the EXEC ran unwatched:
@@ -363,8 +408,10 @@ mod b_yuo_gc_tests;
 // b.yuo decider ruling 4 — the release budget read from the store's own
 // `maxmemory` (`storage::store_memory`): the test store as it is, replies
 // staged through `ScriptReplyProxy` (a limit, 0, absent, malformed, refused),
-// the refresh's effect on the gate and the GC threshold, and the cluster path
-// when `LIVE_EDIT_TEST_CLUSTER_URL` is set.
+// the refresh's effect on the gate and the GC threshold, a primary the
+// client's routing table does not list (b.xb7, staged), and the cluster path
+// when `LIVE_EDIT_TEST_CLUSTER_URL` is set (a slot moved under a stale table
+// in the disruptive job).
 mod b_yuo_store_memory_tests;
 // b.yuo part E — the commit release ring `obj:wrel`: its entry grammar on
 // every route, its type check, and that a lost reply's own-call verdict — or,
@@ -477,6 +524,12 @@ mod checkpoint_apply_test;
 mod chs_complete_tests;
 mod client_quit_timeout_test;
 mod client_test;
+// The two-node cluster facade over `ScriptReplyProxy` (A and B own the slot
+// halves, C owns none, a silent node never answers) behind `b_vn4_ask_follow_test`
+// and `b_myh_redirect_frame_test`: A answers a trapped key with an `ASK` or
+// `MOVED` text as an error reply, a status reply or the store's own reply, and
+// A and B count the `CLUSTER SLOTS` frames they answer.
+pub(crate) mod cluster_facade_support;
 // b.yxt — cluster-gated regression coverage for the live-relay subscriber path
 // (slot-bound stream readers, Timeout→force-reconnect self-heal,
 // header-derived cursor, the b.c7a terminal-error contract and its routing
@@ -511,10 +564,9 @@ mod commit_chain_tests;
 // `test-fault-injection`.
 #[cfg(feature = "test-fault-injection")]
 mod commit_charge_test;
-mod compute_diff_test;
+mod diff_read_test;
 // Harness shared by the stream-multiplexer suites and the gRPC suites that
 // inject reader faults. `pub(crate)` so the `grpc` lane can reach it.
-mod diff_read_test;
 pub(crate) mod mux_test_helpers;
 // The SR-5.5 durability-guard validator, without ever changing the server's
 // `appendonly`. Each branch test connects through a `ScriptReplyProxy` that
@@ -613,6 +665,18 @@ mod session_test;
 // Comments that mention the command do not count. Static: reads source files,
 // needs no Valkey and no feature.
 mod shared_valkey_config_fence_test;
+// The fence that keeps every read of `LIVE_EDIT_TEST_CLUSTER_URL` inside
+// `test_support::test_cluster_url`, whose name check holds each cluster-gated
+// test to CI's `test-cluster:` filterset. Static: reads source files, needs no
+// Valkey and no feature. Pinned in scripts/guard-tests.sh `MODULES`.
+mod test_cluster_url_read_guard_test;
+// The fence that keeps every test's Valkey connect from turning an unreachable
+// store into a skip: a connect is unwrapped in its own statement or goes
+// through `test_support::connect_test_client_or_skip`, which fails the test
+// when `TEST_VALKEY_URL` is set, and no line prints a reachability `SKIP:`.
+// Static: reads source files, needs no Valkey and no feature. Pinned in
+// scripts/guard-tests.sh `MODULES`.
+mod test_valkey_connect_skip_guard_test;
 // b.y3m Epic 3 Task 2 — the per-object snapshot fence's storage layer
 // (`storage::snapshot_fence`): every verdict and no-write rule of the six fence
 // and intent scripts through their wrappers, time moved by staging fields
@@ -743,8 +807,9 @@ mod stream_mux_health_test;
 // quit with connected readers, hooks armed once per client; and, through a
 // two-node cluster facade over `ScriptReplyProxy` (runs against the standalone
 // store), the slot-owner connection, the retarget on a rebind and on a real
-// `-MOVED`, supervision and hooks across retargets, node affinity, the
-// clustered reader's `CLIENT UNBLOCK` interrupt, the clustered reader's own
+// `-MOVED`, supervision and hooks across retargets, node affinity, a command
+// behind a clustered reader's timed-out read opening no second connection
+// (b.9sh), an outside `CLIENT UNBLOCK` re-planned, the clustered reader's own
 // credential re-AUTH (b.19i), fred's cluster-wide `AUTH` broadcast behind a
 // blocked read failing at the slow bound (b.zt3), another node's replies
 // counting as no evidence for a silent connection (b.zt3 T3), which replies
@@ -789,10 +854,64 @@ mod stream_mux_test;
 // the same on every route. The allowance and teardown modules drive the
 // fault-injection seams and are compiled out without `test-fault-injection`.
 #[cfg(feature = "test-fault-injection")]
+mod delete_layer_unmap_test;
+#[cfg(feature = "test-fault-injection")]
 pub(crate) mod retirement_budget_test;
 #[cfg(feature = "test-fault-injection")]
 mod retirement_teardown_test;
 mod retirement_walk_test;
+// b.r7q — the cursor pager (`storage::retirement::page_by_cursor`) on its
+// minimal case: a returned member removed before the next step leaves every
+// other member returned. Its general property is a proptest
+// (`tests/proptests.rs`, `cursor_pager`).
+mod cursor_pager_test;
+// b.gns — the serving-process guard of the periodic reconcile pass's
+// SCAN-family walks (the DR Jobs' before b.f3t; `storage::scan_guard`)
+// through its walk seam: the cursor pager ends at a
+// step whose witness names another process, retries a failed step on an
+// unchanged witness (R1) and ends on a missing witness (R3); the keyspace
+// walk returns every key, ends at a change between pages, and fails at its
+// end when its end witness names another process; and, on a cluster, every
+// shard's keys, an open slot at the end, `NotOwner` at the start and the end,
+// a pin with no fallback, a pin refused on an R1 re-read, before a start
+// `CLUSTER NODES` and before a step's send, and the third primary's end
+// witness naming another process. b.hyw added the coverage walk: no witness
+// read (T3) and, on a cluster, a forged verdict walked past or a proven
+// non-owner skipped (T7); b.87a, on a cluster, a routing-table comparison
+// forged to differ, the end re-sync of a matching table, the table check on
+// a client denied `CLUSTER NODES` by ACL, and an end map forged to change;
+// b.qgz, each guarded step in one pipeline with its witnesses: a failed first
+// pipeline resent whole, a first step whose reply alone failed keeps its
+// start witness, a witness denied `INFO` by ACL read as its own error, and
+// the bytes a stalled connection receives for a keyed, a guarded
+// keyspace and a coverage step; b.f3t, a DR Job's keyspace walk sending its
+// step alone with `COUNT 1000` and, on a cluster, an agreeing pair of Job
+// walks returning every shard's keys once with no witness read, and its walk
+// failing on an open slot, `NotOwner` at the start and the end, a pin to an unconnected
+// node, an end `SlotMap`, and a pin that resolves to no node;
+// its cluster helpers are shared with the backup repair's meta-walk tests
+// (`checkpoint::ext_backup_repair_test`), hence `pub(crate)`. Compiled only
+// with `test-fault-injection`, the seam's feature.
+#[cfg(feature = "test-fault-injection")]
+pub(crate) mod scan_guard_test;
+// b.gns — the guard on a real topology change, in CI's
+// `test-cluster-disruptive:` job (`#[ignore]`d): a slot migrated during a
+// keyed and during a keyspace walk (`slot_migration_disruptive`), and a
+// `DEBUG RESTART` of a restartable Valkey between two steps
+// (`serving_process_restart_disruptive`, on the job's `valkey-restartable`
+// service). Compiled only with `test-fault-injection`, the feature the
+// shared `SlotMigration` helper is built under.
+#[cfg(feature = "test-fault-injection")]
+mod scan_guard_disruptive_test;
+// b.gns test 16 — a keyspace walk on a client whose routing table predates a
+// slot move is `NotOwner` and refreshes the table, and the next walk returns
+// every key (`slot_migration_disruptive`, CI's `test-cluster-disruptive:`
+// job); b.hyw T8, the same for the coverage walk, which skips only the moved
+// primary; and b.87a, the coverage walk with no usable myself line, whose
+// table check finds the table out of date and re-syncs it. Its own module so
+// it can be lifted out whole.
+#[cfg(feature = "test-fault-injection")]
+mod scan_guard_stale_table_test;
 // b.dkt Epic 4 Task 2 — object retirement (`DeleteLayer`, and the old object
 // of a `CreateLayer` overwrite, on success and on their error exits) invalidates
 // the store's structural-planning cache, so a put-back by a checkout taken
@@ -963,6 +1082,13 @@ mod structural_signed_zero_test;
 // the proptest in `tests/proptests.rs` (`structural_watch_equivalence`).
 // Shares `structural_commit_test`'s fixture.
 mod structural_watch_equivalence_test;
+// b.ntm (T13a) — source fence: every `select!` in a file using the
+// `SubscribeReadLayer` response queue that races the client's disconnect
+// (`tx.closed()`) also races the subscription's live-delivery hold ending, so
+// the live-delivery budget and a waiting catch-up's stalled-holder ending can
+// end it in every wait. Static: reads source files, needs no Valkey and no
+// feature.
+mod subscription_hold_guard_test;
 mod test_valkey_test;
 // b.8jc — the reference-count reconciler's signed-zero merge, through its
 // public API: rule B's decision on planted inline and external pairs and a
@@ -1068,8 +1194,11 @@ mod write_check_cost_test;
 // `live_edit_store_write_refused_total{stage, reason}`: with the retry hint
 // and "nothing was applied, retry" at the commit script in both modes (plain,
 // outcome unknown, after a counted retry), the WATCH path's discarded
-// transaction and the external-value pre-store; plain at CreateLayer's four
-// writes. Each staged through `ScriptReplyProxy`. Its handler-level cases need `test-fault-injection`; its
+// transaction, the external-value pre-store, and CreateLayer's writes before
+// its commit marker (the allocation, the counter repair writes, the
+// materialization); plain at CreateLayer's writes after it (the overwrite's
+// `superseded` mark, a new layer's commit script). Each staged through
+// `ScriptReplyProxy`. Its handler-level cases need `test-fault-injection`; its
 // real-`-OOM` case is `#[ignore]`d and runs only in the
 // `test-cluster-disruptive:` job against that job's own Valkey. b.xd1 adds a
 // discarded transaction classified from its cause (CreateSession and the
@@ -1081,7 +1210,7 @@ mod write_check_cost_test;
 mod store_write_refusal_test;
 // The disruptive store (`LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL`) and the
 // `maxmemory` guard shared by the `store_write_refusal_disruptive_*` tests of
-// `store_write_refusal_test` and `oom_collection_test`.
+// `store_write_refusal_test`, `oom_collection_test` and `b_2tu_tests`.
 pub(crate) mod disruptive_valkey;
 // The poll for the GC's out-of-memory collection request a store write refused
 // `-OOM` writes (b.pa1), shared by `store_write_refusal_test` and
@@ -1099,6 +1228,18 @@ pub(crate) mod oom_request_support;
 // tests that run only in the `test-cluster-disruptive:` job against that
 // job's own Valkey.
 mod oom_collection_test;
+// The layer-root rule on `UpdateLayer` (SDD §9.7): a delta taking a layer from
+// at least one top-level section to none is refused `INVALID_ARGUMENT`,
+// writing nothing, on both structural commit routes (WATCH on `txn`, the
+// cached structural route on `lua`, whose entry goes back rolled back); a
+// delta keeping one, and any update of a layer stored with none, commits.
+// The rule judges each attempt's own state: a retry after another writer
+// added the root is refused (that case needs `test-fault-injection`).
+mod layer_root_update_test;
+// b.g65 — the checkpoint clean-up's `{recon}` fence scripts (writer re-arm,
+// delete-time commit, settle, orphan commit, tombstone record, re-date) and
+// the value-slot clear/confirm pair, each against its contract.
+mod recon_fence_test;
 mod update_layer_transaction_test;
 mod watch_leak_test;
 // Shortens BLOCK through the stream-mux test knobs.

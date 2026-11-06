@@ -984,8 +984,8 @@ async fn sweep_mixed_valid_and_orphan_objects_only_removes_orphans() {
 //      multi-shard Valkey Cluster, a single-connection SCAN only walks the
 //      slot range owned by the node fred's pool picked. Sibling-shard orphans
 //      would accumulate silently. The fix routes through `scan_keyspace`,
-//      which calls `scan_cluster` (fred's per-primary page form) when
-//      `client.is_clustered()`.
+//      which, on a cluster, walks every primary of a fresh slot map, each on
+//      the node that serves it (a coverage walk, `storage::scan_guard`).
 //
 //      This test runs unconditionally against the single-node test Valkey.
 //      On a single-node instance every key lives on the same "shard", so this
@@ -1075,7 +1075,7 @@ async fn sweep_cleans_orphans_spanning_many_distinct_hash_tags() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sweep_cluster_cleans_orphans_on_non_owner_shards() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -1087,8 +1087,8 @@ async fn sweep_cluster_cleans_orphans_on_non_owner_shards() {
     assert!(
         tv.client().pool.next().is_clustered(),
         "LIVE_EDIT_TEST_CLUSTER_URL must point at a clustered deployment \
-         (use `redis-cluster://...`); the scan_keyspace cluster branch is \
-         only exercised when `is_clustered()` is true"
+         (use `redis-cluster://...`); scan_keyspace walks per primary, on \
+         node pins, only when `is_clustered()` is true"
     );
 
     // Seed orphans across 32 distinct hash tags. On a ≥2-shard cluster the

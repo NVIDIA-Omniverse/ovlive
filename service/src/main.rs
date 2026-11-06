@@ -39,26 +39,41 @@ use live_edit::auth::{
 };
 use live_edit::checkpoint::{
     build_checkpoint_store, register_checkpoint_pacing_gauges_if_enabled, spawn_checkpoint_loop,
-    ext_mirror_channel_for_plan, spawn_ext_backup_repair, spawn_ext_mirror_workers,
-    CheckpointAdapter, CheckpointLoopConfig, CheckpointStore, ExtBackupRepair, ExtMirrorReceiver,
+    ext_mirror_channel_for_plan, spawn_checkpoint_cleanup, spawn_ext_backup_repair,
+    spawn_ext_mirror_workers, CheckpointAdapter, CheckpointLoopConfig, CheckpointStore,
+    CollectHeal, ExtBackupRepair, ExtMirrorReceiver,
     ExtMirrorSender, BaseBootstrap, RecoveryHook, SessionRecoveryHook, TailCaptureConfig,
     LAYER_PUBLISH_ARTIFACTS,
 };
-use live_edit::config::{AuthProtocol, Config, TracingSettings, ValkeyAuthMode};
+use live_edit::config::key_prefix::binary_key_schema_from_env;
+use live_edit::config::{
+    AuthProtocol, Config, MemoryLimitSetting, TracingSettings, ValkeyAuthMode,
+};
+use live_edit::dr::hold::{evaluate_hold_at_startup, spawn_hold_poll, HoldPollSettings, HoldWriter};
+use live_edit::dr::job::{
+    parse_job_args, run_job, AcceptLossBody, JobContext, JobMode, JobTimings, RestoreBody,
+    RestoreMemory, EXIT_USAGE, USAGE as DR_JOB_USAGE,
+};
 use live_edit::grpc::capabilities::CapabilitiesServiceImpl;
+use live_edit::grpc::hold::{
+    run_held_mode, spawn_hold_reactor, HeldMode, HoldEntryParts, HoldGate, HoldReactorSettings,
+    HoldServingPoint, HoldWriterAborts, NO_VERDICT_EXIT_CODE,
+};
 use live_edit::grpc::metrics_layer::MetricsLayer;
 use live_edit::grpc::proto::FILE_DESCRIPTOR_SET;
 use live_edit::grpc::service::LiveEditService;
-use live_edit::grpc::graceful_shutdown::{GracefulShutdown, StreamPacing};
+use live_edit::grpc::graceful_shutdown::GracefulShutdown;
 use live_edit::grpc::transport::{
-    drain_stream_tasks, end_streams_after_drain, live_service_server, minimum_termination_grace,
-    production_server_builder, serve_with_post_goaway_bound, POST_BUDGET_FLUSH_BOUND,
+    end_streams_after_drain, h2_small_frame_budget_bytes, http2_connection_window_bytes,
+    live_service_server, production_server_builder, run_post_server_sequence,
+    serve_with_post_goaway_bound, BackgroundTaskJoinReport, HTTP2_MAX_FRAME_BYTES,
+    HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS, HTTP2_STREAM_WINDOW_BYTES, POST_BUDGET_FLUSH_BOUND,
 };
 use live_edit::observability::metrics::Metrics;
 use live_edit::observability::metrics_server::serve_metrics_with_scaling;
 use live_edit::observability::scaling::{ScalingEndpoint, ServiceScalingSource};
 use live_edit::observability::trace_export::TraceExportState;
-use live_edit::observability::startup::closable_incoming;
+use live_edit::observability::startup::{closable_incoming, ShutdownSignal, StartupClaim, SIGINT};
 use live_edit::observability::{init_tracing, shutdown_tracing};
 use live_edit::storage::client::{ValkeyClient, VALKEY_TOKEN_ROTATION_FANOUT_CEILING};
 use live_edit::storage::diff_read::{
@@ -76,15 +91,39 @@ use live_edit_capabilities_proto::nvidia::omniverse::discovery::capabilities::v2
 
 #[tokio::main]
 async fn main() {
+    // The process's one SIGTERM and SIGINT listener, installed before
+    // anything that can wait (SDD §5.5): this binary runs as PID 1 in its
+    // container, and the kernel drops a signal sent to PID 1 that has no
+    // handler, so a handler installed later would lose every signal before
+    // it. Every mode but the scaler takes it — the service and the DR Jobs —
+    // and nothing else registers one. The scaler keeps its own listener,
+    // registered as eagerly (`live_edit_scaler::run`): a handler installed
+    // here would replace its signals' default action whenever it is not PID 1.
+    let mode = std::env::args().nth(1);
+    let shutdown_signal = (mode.as_deref() != Some("scaler")).then(|| {
+        ShutdownSignal::install().unwrap_or_else(|e| {
+            eprintln!("failed to install the SIGTERM and SIGINT handlers: {e}");
+            std::process::exit(1);
+        })
+    });
+
+    // The exit code of a configuration refusal the same environment repeats
+    // on every run: 1, except in a DR Job (`live-edit dr …`), where it is
+    // `EXIT_USAGE` (2), as for a refused command line, so the Job's pod
+    // failure policy (the chart's DR Job templates) fails it at once instead
+    // of retrying a refusal no retry can clear. A refusal a retry may clear
+    // (an OTLP exporter that could not be built for a valid endpoint) exits 1
+    // in every mode.
+    let dr_mode = mode.as_deref() == Some("dr");
+    let refusal_exit = if dr_mode { EXIT_USAGE } else { 1 };
+
     // The three logging variables first, so the subscriber exists before the
     // rest of the configuration loads: a line logged with no subscriber is
     // silently dropped, and `Config::from_env` logs its startup WARNs while it
     // parses. Configuration errors go to stderr, never through the
     // subscriber, so a log filter cannot hide them.
-    let tracing_settings = TracingSettings::from_env().unwrap_or_else(|e| {
-        eprintln!("configuration error: {e}");
-        std::process::exit(1);
-    });
+    let tracing_settings =
+        TracingSettings::from_env().unwrap_or_else(|e| refuse_configuration(e, refusal_exit));
 
     // `Some` only when `OTEL_EXPORTER_OTLP_ENDPOINT` enabled trace export: the
     // pipeline's loss accounting, registered as metrics in `run`, and the
@@ -98,8 +137,12 @@ async fn main() {
         &tracing_settings.trace_filter,
     )
     .unwrap_or_else(|e| {
-        eprintln!("configuration error: {e}");
-        std::process::exit(1);
+        let code = if e.is_deterministic() {
+            refusal_exit
+        } else {
+            1
+        };
+        refuse_configuration(e, code)
     });
 
     // `live-edit scaler`: the replica autoscaler, a mode of this same binary
@@ -108,17 +151,27 @@ async fn main() {
     // variables and reads only `LIVE_EDIT_SCALER_*`. A subcommand rather than
     // an environment variable because server pods load the chart's settings
     // ConfigMap into their environment wholesale: a mode carried there could
-    // turn a server pod into a scaler.
-    if std::env::args().nth(1).as_deref() == Some("scaler") {
+    // turn a server pod into a scaler. It is the one mode that installed no
+    // `shutdown_signal` above.
+    let Some(shutdown_signal) = shutdown_signal else {
         let code = live_edit_scaler::main_from_env().await;
         shutdown_tracing().await;
         std::process::exit(code);
-    }
+    };
 
-    let config = Config::from_env().unwrap_or_else(|e| {
-        eprintln!("configuration error: {e}");
-        std::process::exit(1);
-    });
+    // Every refusal here is deterministic: `from_env` reads only the
+    // environment and the cgroup memory limit, and an unreadable limit is
+    // not a refusal (it sizes the pod at the reference limit). A DR Job's
+    // memory limit comes from the chart's `dr.resources`, so in `dr` mode a
+    // memory-limit refusal or no-limit WARN names that setting, not the
+    // service's `resources.limits.memory`.
+    let memory_limit_setting = if dr_mode {
+        MemoryLimitSetting::DrJob
+    } else {
+        MemoryLimitSetting::Server
+    };
+    let config = Config::from_env_naming(memory_limit_setting)
+        .unwrap_or_else(|e| refuse_configuration(e, refusal_exit));
 
     // First line after configuration loads (only WARNs `from_env` itself
     // logged can precede it): if the test-only override let the
@@ -131,6 +184,14 @@ async fn main() {
     // step. A helper so integration tests can drive it with a synthetic
     // `Config`; this is the production call site.
     log_service_token_startup_warnings(&config);
+
+    // The one key schema this process builds every Valkey key under, passed to
+    // `run` and from there to everything that names a key: nothing below
+    // builds a `KeySchema` of its own. The production `le:` schema, except in
+    // a `test-support` build with `LIVE_EDIT_TEST_ONLY_KEY_PREFIX` set
+    // (`config::key_prefix`); a refused value is a configuration error.
+    let key_schema = binary_key_schema_from_env();
+    let key_schema = key_schema.unwrap_or_else(|e| refuse_configuration(e, refusal_exit));
 
     // The pod memory plan `Config::from_env` derived from the container's
     // memory limit: the limit and its source, every budget, the line and the
@@ -159,20 +220,211 @@ async fn main() {
         );
     }
 
+    // `live-edit dr restore|accept-loss`: the disaster-recovery Jobs, modes of
+    // this same binary like the scaler, but dispatched after the
+    // configuration loads: a Job connects to the same Valkey and backup store
+    // the service does, with the same settings (SDD SR-8.1). A configuration
+    // the steps above refused has already exited 2 (`refusal_exit`); its
+    // command line is checked before anything connects.
+    if dr_mode {
+        let code = run_dr_job(config, key_schema, shutdown_signal).await;
+        std::process::exit(code);
+    }
+
     tracing::info!("live-edit starting");
 
-    run(config, trace_export.map(|(state, _)| state)).await;
+    let trace_export = trace_export.map(|(state, _)| state);
+    run(config, trace_export, key_schema, shutdown_signal).await;
 }
 
-async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
+/// Report a configuration refusal on stderr, never through the subscriber,
+/// and exit with `code`.
+fn refuse_configuration(error: impl std::fmt::Display, code: i32) -> ! {
+    eprintln!("configuration error: {error}");
+    std::process::exit(code);
+}
+
+/// `live-edit dr …`: parse the Job's command line, refusing a bad one and a
+/// pod memory limit below the restore's minimum before connecting to
+/// anything (exit 2); build the metrics,
+/// refusing an OTLP metrics setting (exit 2) or failing on an exporter that
+/// could not be built (exit 1), and serve the metrics port; connect Valkey
+/// and build the backup store exactly as the service does; run the Job
+/// (`live_edit::dr::job`), its shutdown future resolving on the first
+/// `SIGTERM` or `SIGINT` of `shutdown_signal`, the process's listener `main`
+/// installed first thing; then stop the token providers, flush, and return
+/// the Job's exit code.
+///
+/// `main` has already refused, with exit 2, any configuration
+/// `Config::from_env_naming` refuses, a pod memory limit too small for the
+/// server's own memory plan among them, naming `dr.resources.limits.memory`.
+async fn run_dr_job(config: Config, key_schema: KeySchema, shutdown_signal: ShutdownSignal) -> i32 {
+    let args = match parse_job_args(std::env::args().skip(2)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("live-edit dr: {e}\n{DR_JOB_USAGE}");
+            return EXIT_USAGE;
+        }
+    };
+    // The Job's restore memory, before connecting: a pod memory limit below
+    // the minimum its line needs (the layers in flight, the steady-state
+    // floor and the Valkey connection buffers), is refused here, exit 2, so
+    // a Job is never OOM-killed mid-restore for want of memory it could
+    // never have. `run_job` derives it again and logs the serial-mode WARN.
+    // Defence in depth: at the chart's pools the server's memory plan, which
+    // `Config::from_env` derived, refuses first (below 2,687 MiB, 3,282 MiB
+    // with a backup store and the tail on, against this line's 930 MiB), also
+    // with exit 2.
+    if let Err(refusal) = RestoreMemory::derive(&config, args.mode) {
+        eprintln!("{refusal}");
+        tracing::error!(mode = args.mode.name(), "{refusal}");
+        return EXIT_USAGE;
+    }
+    let mode = args.mode;
+    let discard_unconfirmed = args.discard_unconfirmed;
+    // The Job's shutdown: the process's listener, whose handlers `main`
+    // registered before anything could wait, so a signal that arrived while
+    // this Job connected is acted on when the Job first polls it.
+    let mut shutdown_signal = shutdown_signal;
+    let shutdown = async move {
+        shutdown_signal.recv().await;
+    };
+    tracing::info!(
+        mode = mode.name(),
+        incident = %args.incident,
+        "live-edit dr {mode} starting"
+    );
+
+    let metrics = match Metrics::try_new(&config.service_label) {
+        Ok(metrics) => Arc::new(metrics),
+        Err(e) => {
+            eprintln!("configuration error: {e}");
+            return if e.is_deterministic() { EXIT_USAGE } else { 1 };
+        }
+    };
+    let metrics_addr: SocketAddr = format!("0.0.0.0:{}", config.metrics_port)
+        .parse()
+        .expect("invalid metrics bind address");
+    let metrics_listener = match TcpListener::bind(metrics_addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!(error = %e, port = config.metrics_port, "failed to bind metrics port");
+            return 1;
+        }
+    };
+
+    let valkey_token_cancel = CancellationToken::new();
+    let valkey_token_provider =
+        valkey_access_token_provider(&config, &metrics, &valkey_token_cancel);
+    let valkey_iam_credentials_provider = valkey_iam_credentials(&config).await;
+    let service_token_cancel = CancellationToken::new();
+    let stop_token_providers = || {
+        valkey_token_cancel.cancel();
+        service_token_cancel.cancel();
+    };
+    let valkey = match ValkeyClient::connect(
+        &config,
+        valkey_token_provider,
+        valkey_iam_credentials_provider,
+    )
+    .await
+    {
+        Ok(valkey) => valkey,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to connect to Valkey; the DR Job wrote nothing");
+            stop_token_providers();
+            return 1;
+        }
+    };
+    valkey
+        .install_observability_hooks(Arc::clone(&metrics))
+        .await;
+    let service_token_provider =
+        storage_api_token_provider(&config, &metrics, &service_token_cancel);
+    // Built as the server builds it, before the precondition: on LocalDisk
+    // this creates the root's empty `.live-edit/{layers,sessions,ext}`
+    // directories even on a not-held store (`dr::job`'s "What writes nothing
+    // leaves out").
+    let checkpoint_store = match build_checkpoint_store(
+        &config,
+        service_token_provider,
+        Some(metrics.clone()),
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "failed to construct the backup store; the DR Job wrote nothing"
+            );
+            stop_token_providers();
+            return 1;
+        }
+    };
+
+    let identity = LeaderIdentity::for_process(format!("{}/dr-{}", config.service_label, mode));
+    let context = JobContext {
+        args,
+        config: Arc::new(config),
+        valkey: valkey.clone(),
+        keys: key_schema,
+        checkpoint_store,
+        metrics: Arc::clone(&metrics),
+        metrics_listener: Some(metrics_listener),
+        timings: JobTimings::production(),
+        shutdown: Box::pin(shutdown),
+        identity,
+        // The DR Job's allocator purge, every jemalloc arena
+        // (`allocator::purge_all_arenas`), which accept-loss's value removal
+        // runs around each transaction. The only process that installs one:
+        // no serving process purges explicitly. On other targets the system
+        // allocator stays and there is none, so the value removal charges
+        // its un-purged admission, with a WARN.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        allocator_purge: Some(live_edit::storage::allocator_purge::AllocatorPurge::new(
+            allocator::purge_all_arenas,
+        )),
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        allocator_purge: None,
+    };
+    // Restore plans and writes the restore, recounts the large values'
+    // references, and un-holds or stays held; accept-loss restores the same
+    // way, then discards what is proven lost (and, with the second confirm,
+    // what could not be confirmed) before it recounts and un-holds.
+    let exit = match mode {
+        JobMode::Restore => run_job(context, RestoreBody::new()).await,
+        JobMode::AcceptLoss => run_job(context, AcceptLossBody::new(discard_unconfirmed)).await,
+    };
+    stop_token_providers();
+    flush_metrics_and_tracing(&metrics).await;
+    exit.code()
+}
+
+/// The startup parts a [`StartupClaim`] hands to whichever side acts on the
+/// first shutdown signal (the startup stop, or the serving path, normal or
+/// held): the bootstrap server's shutdown token and task (Step 0a), and the
+/// `/metrics` server's task (Step 0a-bis).
+type StartupParts = (
+    CancellationToken,
+    tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    tokio::task::JoinHandle<()>,
+);
+
+async fn run(
+    config: Config,
+    trace_export: Option<Arc<TraceExportState>>,
+    key_schema: KeySchema,
+    mut signal: ShutdownSignal,
+) {
     // The start the `/scaling/v1` snapshot reports uptime from: the autoscaler
     // ignores a replica's CPU readings while it is still warming up.
     let process_started = std::time::Instant::now();
 
     // This process's identity in every leader lock (GC, orphan sweep,
-    // ref_count reconciler, external-value backup repair, checkpoint loop,
-    // presence sweeper). Built ONCE and
-    // cloned into each task: the four `le:gc:leader` consumers ride one
+    // ref_count reconciler, external-value backup repair, checkpoint clean-up,
+    // checkpoint loop, presence sweeper). Built ONCE and
+    // cloned into each task: the five `le:gc:leader` consumers ride one
     // leadership through the lock's refresh branch, which a per-task instance
     // would break. `service_label` stays the metrics `service` label; only the
     // lock value carries the per-process instance.
@@ -278,14 +530,14 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // matches the `.tcp_keepalive(...)` the bind-based path used before.
     const GRPC_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
-    // Grace for the bootstrap server to finish in-flight requests at handoff.
-    // Its only clients are probe/discovery traffic — a kubelet gRPC health
-    // check, a Discovery `ListServices` scan, an operator's `grpcurl` — all
-    // sub-second unary calls, so 5 s is roughly two orders of magnitude of
-    // headroom while staying far inside the probe cadences. On elapse the
-    // task is aborted rather than waited on: the second descriptor still
-    // holds the socket, so an abort costs at most one probe retry and can
-    // never strand the port.
+    // Grace for the bootstrap server to finish in-flight requests at handoff,
+    // and at a stop during startup (Step 0a-ter). Its only clients are
+    // probe/discovery traffic — a kubelet gRPC health check, a Discovery
+    // `ListServices` scan, an operator's `grpcurl` — all sub-second unary
+    // calls, so 5 s is roughly two orders of magnitude of headroom while
+    // staying far inside the probe cadences. On elapse the task is aborted
+    // rather than waited on: the second descriptor still holds the socket, so
+    // an abort costs at most one probe retry and can never strand the port.
     const BOOTSTRAP_HANDOFF_BUDGET: Duration = Duration::from_secs(5);
 
     let (bootstrap_incoming, serving_incoming, bound_grpc_addr) =
@@ -343,10 +595,10 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         .expect("failed to build bootstrap reflection service");
 
     let bootstrap_shutdown = CancellationToken::new();
-    let mut bootstrap_server = {
+    let bootstrap_server = {
         let shutdown = bootstrap_shutdown.clone();
         tokio::spawn(
-            production_server_builder()
+            production_server_builder(config.upload_admission_max_waiters)
                 .layer(metrics_layer.clone())
                 .add_service(bootstrap_health_service)
                 .add_service(bootstrap_reflection_service)
@@ -358,8 +610,22 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
                 }),
         )
     };
+    // Every server (bootstrap, full-API, held mode) carries these HTTP/2
+    // settings (`production_server_builder`), and each is logged here, once:
+    // the two receive windows, the connection window following the upload
+    // admission waiter cap; the small-frame budget
+    // h2 sizes from the connection window, a figure neither tonic nor hyper
+    // exposes; the per-connection limit on streams h2 resets for a protocol
+    // error; and the maximum frame size.
+    let http2_connection_window =
+        http2_connection_window_bytes(config.upload_admission_max_waiters);
     tracing::info!(
         addr = %bound_grpc_addr,
+        http2_stream_window_bytes = HTTP2_STREAM_WINDOW_BYTES,
+        http2_connection_window_bytes = http2_connection_window,
+        h2_small_frame_budget_bytes = h2_small_frame_budget_bytes(http2_connection_window),
+        http2_max_local_error_reset_streams = HTTP2_MAX_LOCAL_ERROR_RESET_STREAMS,
+        http2_max_frame_bytes = HTTP2_MAX_FRAME_BYTES,
         "gRPC listener bound (bootstrap: health + reflection + capabilities; readiness NOT_SERVING)"
     );
 
@@ -406,6 +672,69 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         Arc::clone(&scaling_endpoint),
     ));
 
+    // ── Step 0a-ter: The startup claim and its signal watcher (SDD §5.5) ─────
+    //
+    // From here the first SIGTERM or SIGINT is acted on at once, whatever
+    // startup is waiting on: a signal that arrived since `main` installed the
+    // listener was recorded and is acted on as the watcher starts. The
+    // watcher records the signal and cancels the process shutdown request.
+    // Until the claim at Step 7 (or at the held-mode entry) it also takes the
+    // bootstrap and `/metrics` servers and runs the startup stop below, which
+    // ends the process; the step this task was waiting on is dropped with it,
+    // as at a crash at that instant, and every startup step is safe to
+    // abandon so. After the claim it only cancels the request, which the
+    // serving path drains on. The startup claim gives the parts to exactly
+    // one side, so no signal is handled twice.
+    //
+    // The startup stop, bounded at about 11 s (the 5 s bootstrap handoff
+    // budget and the 6 s flush cap): one INFO line; readiness and `""` set
+    // NOT_SERVING, which the bootstrap server answers from the same status
+    // map; the bootstrap server stopped as at the handoff; the `/metrics`
+    // server aborted; the final flush; exit 0, as for every requested stop.
+    // The background tasks startup has spawned so far are not cancelled or
+    // joined: the exit ends them, and a lease one held lapses at its TTL.
+    let startup_claim: StartupClaim<StartupParts> =
+        StartupClaim::new((bootstrap_shutdown, bootstrap_server, metrics_task));
+    let startup_stop = {
+        let health_reporter = health_reporter.clone();
+        let metrics = Arc::clone(&metrics);
+        move |signal: &'static str,
+              (bootstrap_shutdown, mut bootstrap_server, metrics_task): StartupParts| async move {
+            tracing::info!(
+                signal,
+                startup_elapsed_ms =
+                    u64::try_from(process_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "received {signal} during startup; stopping before serving"
+            );
+            health_reporter
+                .set_service_status(
+                    READINESS_SERVICE_NAME,
+                    tonic_health::ServingStatus::NotServing,
+                )
+                .await;
+            health_reporter
+                .set_service_status(
+                    live_edit::observability::health::OVERALL_SERVICE,
+                    tonic_health::ServingStatus::NotServing,
+                )
+                .await;
+            hand_over_from_bootstrap_server(
+                &bootstrap_shutdown,
+                &mut bootstrap_server,
+                BOOTSTRAP_HANDOFF_BUDGET,
+            )
+            .await;
+            metrics_task.abort();
+            let _ = metrics_task.await;
+            flush_metrics_and_tracing(&metrics).await;
+            std::process::exit(0);
+        }
+    };
+    let startup_watcher = startup_claim
+        .clone()
+        .watch(async move { signal.recv().await }, startup_stop);
+    tokio::spawn(startup_watcher);
+
     // ── Step 0b: Redis-scoped access-token-file provider (Epic 3 t3.tr5.jv) ───
     //
     // A SECOND, independent `ServiceTokenProvider` — distinct from the
@@ -432,58 +761,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // provider's `service_token_cancel` so the polling task exits within the
     // shutdown budget.
     let valkey_token_cancel = CancellationToken::new();
-    let valkey_token_provider: Option<Arc<ServiceTokenProvider>> =
-        match (config.valkey_auth_mode, &config.valkey_token_file) {
-            (ValkeyAuthMode::AccessTokenFile, Some(path)) => {
-                // Prolongation floor: `VALKEY_TOKEN_ROTATION_FANOUT_CEILING`
-                // (180 s), taken whole from its single definition site in
-                // `storage::client` rather than re-derived here. It is the
-                // worst-case latency from "the polling task caches a rotated
-                // token" to "every pooled connection has re-AUTHed with it" —
-                // two provider-tick intervals under b.7td's rotation gate, one
-                // for the first client to observe the rotation and one for the
-                // last client to take its next tick inside the fan-out window.
-                // A rotation picked up with less headroom than this before the
-                // outgoing token's expiry cannot be guaranteed to reach every
-                // live connection, so the stragglers get dropped and
-                // re-established at expiry instead of prolonged. The provider
-                // observes the real headroom per rotation and WARNs under this
-                // bound (b.is1). Passed in from here — the wiring layer —
-                // rather than read inside `auth`, so `auth` gains no dependency
-                // edge on `storage`.
-                let prolongation_floor = chrono::Duration::from_std(
-                    VALKEY_TOKEN_ROTATION_FANOUT_CEILING,
-                )
-                .expect("rotation fan-out ceiling (180 s) is representable as a chrono::Duration");
-                let provider = ServiceTokenProvider::new_with_refresh_lead_and_role(
-                    path.clone(),
-                    Duration::from_secs(config.service_token_poll_interval_secs),
-                    // `try_seconds`, not `seconds`: the latter panics past
-                    // chrono's `i64::MAX / 1_000` second bound, and the `as i64`
-                    // cast would sign-wrap a `u64` at or above `2^63` into a
-                    // negative lead. `Config::from_env` rejects both ranges, so
-                    // this cannot fail — the `expect` documents that contract
-                    // rather than defending against it (b.is1).
-                    chrono::Duration::try_seconds(config.valkey_token_refresh_lead_secs as i64)
-                        .expect(
-                            "LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS is validated for \
-                             chrono representability by Config::from_env",
-                        ),
-                    Some(prolongation_floor),
-                    ServiceTokenProvider::ROLE_VALKEY,
-                    Arc::clone(&metrics),
-                    valkey_token_cancel.clone(),
-                );
-                tracing::info!(
-                    path = %path.display(),
-                    poll_interval_secs = config.service_token_poll_interval_secs,
-                    refresh_lead_secs = config.valkey_token_refresh_lead_secs,
-                    "redis-scoped access-token-file provider initialized"
-                );
-                Some(Arc::new(provider))
-            }
-            _ => None,
-        };
+    let valkey_token_provider =
+        valkey_access_token_provider(&config, &metrics, &valkey_token_cancel);
 
     // ── Step 0c: IAM AWS credential source (Epic 4 t3.tr5.we.6w) ──────────────
     //
@@ -508,40 +787,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     //
     // `validate_valkey_auth_mode` (Epic 2) already rejects iam mode with a
     // missing region / username / cluster-host at startup, so the region
-    // `expect` below is upheld by that gate.
-    let valkey_iam_credentials_provider: Option<SharedCredentialsProvider> =
-        match config.valkey_auth_mode {
-            ValkeyAuthMode::Iam => {
-                let region = config.valkey_iam_region.clone().expect(
-                    "validate_valkey_auth_mode guarantees LIVE_EDIT_VALKEY_IAM_REGION \
-                     is set in iam auth mode",
-                );
-                let http_client = aws_smithy_http_client::Builder::new()
-                    .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
-                        aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
-                    ))
-                    .build_https();
-                let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-                    .region(aws_config::Region::new(region))
-                    .http_client(http_client)
-                    .load()
-                    .await;
-                let provider = sdk_config.credentials_provider().unwrap_or_else(|| {
-                    tracing::error!(
-                        "iam Valkey auth mode: the AWS default credential chain resolved \
-                         no credentials provider (no IRSA / environment / profile source \
-                         available); cannot AUTH to Valkey"
-                    );
-                    std::process::exit(1);
-                });
-                tracing::info!(
-                    service = ?config.valkey_iam_service,
-                    "iam Valkey AWS credential source initialized"
-                );
-                Some(provider)
-            }
-            _ => None,
-        };
+    // `expect` in `valkey_iam_credentials` is upheld by that gate.
+    let valkey_iam_credentials_provider = valkey_iam_credentials(&config).await;
 
     // ── Step 1: Connect to Valkey (SDD §5.5 step 2) ──────────────────────────
     let valkey = ValkeyClient::connect(
@@ -585,7 +832,7 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // into a crash loop or growing a second connect-sized retry loop.
     match run_snapshot_read_self_test(
         &valkey,
-        &KeySchema::default(),
+        &key_schema,
         Duration::from_millis(config.valkey_command_timeout_ms),
     )
     .await
@@ -632,7 +879,6 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // all of which are already available above. Nothing between this
     // comment and the construction site below references `session_store`
     // / `layer_store`.
-    let key_schema = KeySchema::default();
 
     // b.pa1: from here on, a store write refused `-OOM` anywhere in this
     // process requests the GC's out-of-memory collection under this replica's
@@ -714,25 +960,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // `config.service_token_file`, `config.service_token_poll_interval_secs`,
     // and `metrics` (already built above), so the reorder is safe.
     let service_token_cancel = CancellationToken::new();
-    let service_token_provider: Option<Arc<ServiceTokenProvider>> = match &config.service_token_file
-    {
-        Some(path) => {
-            let provider = ServiceTokenProvider::new_with_role(
-                path.clone(),
-                Duration::from_secs(config.service_token_poll_interval_secs),
-                ServiceTokenProvider::ROLE_STORAGE_API,
-                Arc::clone(&metrics),
-                service_token_cancel.clone(),
-            );
-            tracing::info!(
-                path = %path.display(),
-                poll_interval_secs = config.service_token_poll_interval_secs,
-                "service token provider initialized"
-            );
-            Some(Arc::new(provider))
-        }
-        None => None,
-    };
+    let service_token_provider =
+        storage_api_token_provider(&config, &metrics, &service_token_cancel);
 
     // ── Step 1b-iii: Checkpoint store (SDD SR-1.1) ────────────────────────
     //
@@ -783,6 +1012,126 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
             std::process::exit(1);
         });
 
+    // ── Step 1b-iii.3: Disaster-recovery hold (SDD SR-5, SR-2.2, SR-6) ────
+    //
+    // Before any session, layer or external-value store, dispatcher or store-
+    // or backup-writing task exists (the metrics server, the service-token
+    // providers and the bootstrap server already run, and the backup-store
+    // adapter and the mirror channel are built but unused): one bounded read
+    // of the hold marker, fail-closed — a replica that cannot tell whether the
+    // fleet is held must not serve, so it exits non-zero at once. The
+    // kubelet's restart, under its backoff, is the retry: an in-process wait
+    // here would be a boot step the startup probe's budget does not count.
+    //
+    // Held: held mode (`grpc::hold::run_held_mode`), in place of everything
+    // below. It takes the socket over from the bootstrap server and serves a
+    // refuse-all LiveService stub with health, reflection and capabilities;
+    // it runs only its own hold poll and reactor, health supervisor and
+    // scaling source, beside the metrics server and the service-token
+    // providers, and stops on the process shutdown request, which it claims
+    // at its entry (`StartupClaim::claim_serving`) as Step 7 does. It builds
+    // no store and spawns none of the store- or backup-writing tasks below
+    // (the external-value backup repair included), so it writes nothing. It
+    // exits 0 when the hold clears, keeps reading with no time limit while
+    // its reads fail, and exits non-zero if its hold poll or reactor ends
+    // early; on SIGTERM it returns, and so does this process.
+    //
+    // Serving: the hold poll, the first background task, which re-reads the
+    // marker every LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS, and the hold reactor,
+    // which acts on its verdicts (`grpc::hold`): a hold that starts before
+    // the serving point (Step 8) exits 0 at once, restarting into held mode;
+    // one that starts after it runs the hold entry routine — the LiveService
+    // gate closed, the live streams ended `SERVICE_HELD`, every task
+    // registered on `hold_writers` below aborted — and the replica exits 0,
+    // with jitter, once the hold clears. Both stop on `hold_poll_shutdown`, a
+    // child of the process shutdown request, so the first SIGTERM stops them
+    // first in every phase, during startup as after the serving point, and a
+    // SIGTERM while held runs the normal shutdown. A poll that ends before
+    // that token exits the process non-zero (the reactor's closed-channel
+    // exit), and so does a reactor that fails (the watcher
+    // `spawn_hold_reactor` runs beside it).
+    let hold_poll_settings = HoldPollSettings::from_config(&config);
+    let hold_at_startup = evaluate_hold_at_startup(&valkey, &key_schema, hold_poll_settings)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                class = e.class(),
+                "startup refused: the disaster-recovery hold marker could not be read, and a \
+                 replica that cannot tell whether the fleet is held must not serve"
+            );
+            std::process::exit(NO_VERDICT_EXIT_CODE);
+        });
+    if hold_at_startup.verdict.is_held() {
+        run_held_mode_then_exit(HeldStartup {
+            held: HeldMode {
+                valkey: valkey.clone(),
+                keys: key_schema.clone(),
+                poll: hold_poll_settings,
+                startup: hold_at_startup,
+                metrics: Arc::clone(&metrics),
+                metrics_layer,
+                health_reporter: health_reporter.clone(),
+                readiness_service_name: READINESS_SERVICE_NAME.to_string(),
+                health_probe_interval: Duration::from_millis(config.health_probe_interval_ms),
+                health_probe_timeout: Duration::from_millis(config.health_probe_timeout_ms),
+                service_token_provider: service_token_provider.clone(),
+                scaling_endpoint: Arc::clone(&scaling_endpoint),
+                process_started,
+                catchup_read_concurrency: config.catchup_snapshot_read_concurrency,
+                upload_admission_max_waiters: config.upload_admission_max_waiters,
+                reactor: HoldReactorSettings::production(),
+            },
+            serving_incoming,
+            startup_claim,
+            bootstrap_handoff_budget: BOOTSTRAP_HANDOFF_BUDGET,
+            token_cancels: [service_token_cancel, valkey_token_cancel],
+        })
+        .await;
+        return;
+    }
+    let hold_reactor_settings = HoldReactorSettings::production();
+    // The reactor's two signals: whether this replica's verdict is stale
+    // (readiness NOT_SERVING, through Step 4's health supervisor) and whether
+    // it is held (the `/scaling/v1` snapshot's `held`, the source registered
+    // in Step 6, which freezes the autoscaler; SDD SR-7a).
+    let hold_verdict_stale_rx = hold_reactor_settings.verdict_stale.subscribe();
+    let hold_held_rx = hold_reactor_settings.held.subscribe();
+    let hold_poll_shutdown = startup_claim.request();
+    let (hold_verdicts, _hold_poll) = spawn_hold_poll(
+        valkey.clone(),
+        key_schema.clone(),
+        hold_poll_settings,
+        hold_at_startup,
+        hold_poll_shutdown.clone(),
+    );
+    let hold_serving_point = HoldServingPoint::new();
+    let _hold_reactor = spawn_hold_reactor(
+        hold_verdicts.clone(),
+        hold_serving_point.clone(),
+        hold_poll_shutdown.clone(),
+        hold_reactor_settings,
+    );
+    let hold_gate = HoldGate::new(hold_verdicts);
+    // The writer inventory's handles (`dr::hold::HOLD_WRITERS`): each store-
+    // or backup-writing background task's handle and token, registered where
+    // it is spawned below, aborted at hold entry. The serving point logs any
+    // inventory entry left unregistered.
+    let hold_writers = Arc::new(HoldWriterAborts::new());
+    // The hold write fence of the on-access repairs and restores (the
+    // object-id counter repair, the layer and session recovery hooks and the
+    // external-value fetch-on-miss rewrite, built below): they run inside
+    // calls, not as tasks of their own, so a hold or a stale-verdict entry
+    // stops them through this token rather than by an abort.
+    let on_access_hold_fence = CancellationToken::new();
+    hold_writers.register_token(HoldWriter::OnAccessRepairs, on_access_hold_fence.clone());
+    // The store out-of-memory signal's collection request (armed above) goes
+    // behind the same fence: no request is sent after hold or stale-verdict
+    // entry (`storage::store_oom`).
+    valkey
+        .store_oom_signal()
+        .set_hold_fence(on_access_hold_fence.clone());
+
     // ── Step 1b-iii.4: External-value store (SDD §11 + SR-3.1 + SR-3.2) ───
     //
     // Constructed AFTER `checkpoint_store` so the `with_checkpoint_store`
@@ -827,11 +1176,15 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         // a fault (b.1jt).
         //
         // The store is read once at startup whatever is configured, for
-        // live_edit_store_memory_used_ratio too. That read decides whether
+        // live_edit_store_memory_used_ratio too, the whole read bounded by
+        // 2 x the Valkey command timeout (a term of the startup probe's
+        // budget; a read cut off resolves as a failed one). That read decides whether
         // the 60 s refresh runs: unless the budget is explicit, or when the
         // gauge can have a value. The refresh is seeded with what startup
         // read and logged, so it does not log the same reason again and its
         // first replica-acknowledgement comparison starts from startup's.
+        // After a startup read cut off at its deadline no problem is seeded,
+        // so the first refresh that still fails logs its own cause.
         let store_memory = live_edit::storage::store_memory::startup_store_memory(
             &valkey,
             config.ext_release_budget(),
@@ -886,7 +1239,13 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         // is disabled (e.g. a read-only replica that should still
         // recover from a peer's checkpoints).
         if !matches!(config.checkpoint_adapter, CheckpointAdapter::Disabled) {
-            builder = builder.with_checkpoint_store(Arc::clone(&checkpoint_store));
+            builder = builder
+                .with_checkpoint_store(Arc::clone(&checkpoint_store))
+                // SDD SR-6.2: the rewrite of a value the backup store served
+                // runs inside reads already past the gate (a deadline-exempt
+                // catch-up among them), so the on-access repairs' hold write
+                // fence stops it after a hold or stale-verdict entry.
+                .with_recovery_hold_fence(on_access_hold_fence.clone());
         }
         Arc::new(builder)
     };
@@ -897,25 +1256,38 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // threaded into both `SessionStore` and `LayerStore` below. The tracker
     // is drained during shutdown BEFORE `ValkeyClient::quit()` so in-flight
     // session-checkpoint writes don't observe a torn-down Valkey pool. The
-    // drain reuses `shutdown_task_budget` (no new env var); see the
-    // shutdown sequence below for the corresponding `close()` + `wait()`
-    // mirror of the existing `presence_cleanup_tracker` pattern.
+    // drain is bounded by the per-task shutdown budget, or less when the
+    // shared pre-`quit()` deadline is nearer (no new env var); see
+    // `run_post_server_sequence` for the `close()` + `wait()`, which mirrors
+    // the `presence_cleanup_tracker` drain.
     //
     // The trailing `enabled` flag gates the whole dispatch path on a real
     // adapter being wired, in the same `!matches!(..., Disabled)` form the
     // sibling adapter-touching wirings above use (b.443). Without it a
     // `Disabled` deployment pays a session read per lifecycle event only to
     // discard the payload at the adapter's `NotImplemented`.
+    //
+    // The tracker cannot abort, so it has an abort token, shared with the base
+    // bootstraps on the same tracker (Step 1b-iv.0): cancelled at hold entry,
+    // and by the shutdown sequence after its drain of the tracker.
     let session_checkpoint_tracker = tokio_util::task::TaskTracker::new();
-    let session_checkpoint_writer = Arc::new(live_edit::checkpoint::SessionCheckpointWriter::new(
-        Arc::clone(&checkpoint_store),
-        valkey.clone(),
-        key_schema.clone(),
-        session_checkpoint_tracker.clone(),
-        Arc::clone(&metrics),
-        config.service_label.clone(),
-        !matches!(config.checkpoint_adapter, CheckpointAdapter::Disabled),
-    ));
+    let session_checkpoint_abort = CancellationToken::new();
+    let session_checkpoint_writer = Arc::new(
+        live_edit::checkpoint::SessionCheckpointWriter::new(
+            Arc::clone(&checkpoint_store),
+            valkey.clone(),
+            key_schema.clone(),
+            session_checkpoint_tracker.clone(),
+            Arc::clone(&metrics),
+            config.service_label.clone(),
+            !matches!(config.checkpoint_adapter, CheckpointAdapter::Disabled),
+        )
+        .with_abort_token(session_checkpoint_abort.clone()),
+    );
+    hold_writers.register_token(
+        HoldWriter::SessionCheckpoints,
+        session_checkpoint_abort.clone(),
+    );
     let shutdown_session_checkpoint_tracker = session_checkpoint_tracker.clone();
     tracing::info!(
         adapter = ?config.checkpoint_adapter,
@@ -1021,12 +1393,13 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         // margin term).
         .with_retirement_budget_bytes(config.pod_memory.retirement_budget_bytes())
         // b.vn6: the delete paths record retired object ids on
-        // `le:ckpt:{recon}:dead` so the reconciliation tick reaps their
-        // checkpoint generations. Gated on the SAME predicate that decides
-        // whether the checkpoint loop — the ZSET's only consumer — is spawned
-        // at all, a few hundred lines below. Enabling it without the loop would
-        // grow the ZSET by one member per DeleteLayer forever against a
-        // `noeviction` Valkey.
+        // `le:ckpt:{recon}:dead` so the checkpoint clean-up's dead-object
+        // phase reaps their checkpoint generations. Gated on the SAME
+        // predicate that decides whether the checkpoint clean-up task — the
+        // ZSET's only consumer, spawned beside the backup repair a few hundred
+        // lines below (b.g65) — exists at all: checkpointing on with a real
+        // adapter. Enabling it without the clean-up would grow the ZSET by one
+        // member per DeleteLayer forever against a `noeviction` Valkey.
         .with_dead_object_registration(
             config.checkpoint_enabled
                 && !matches!(config.checkpoint_adapter, CheckpointAdapter::Disabled),
@@ -1076,11 +1449,13 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
                 .with_deadline_aware_wait_budget(
                     Arc::clone(&config_shared),
                     Box::new(live_edit::grpc::deadline::remaining),
-                ),
+                )
+                .with_hold_fence(on_access_hold_fence.clone()),
             ));
         }
         builder
     });
+    hold_writers.register_token(HoldWriter::LayerCleanups, layer_store.cleanup_abort_token());
 
     // ── Step 1b-iv.0: Base bootstrap (SDD SR-7.1 creation-time first base,
     // SR-3.6 post-restore gap re-base) ────────────────────────────────────
@@ -1110,16 +1485,21 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // It REUSES `session_checkpoint_tracker` rather than creating a second
     // tracker: that one is already `close()`d and `wait()`ed inside the
     // shutdown budget below, so sharing it drains in-flight bootstrap tasks
-    // before `ValkeyClient::quit()` with zero new shutdown wiring.
-    let base_bootstrap = Arc::new(BaseBootstrap::new(
-        Arc::clone(&checkpoint_store),
-        valkey.clone(),
-        key_schema.clone(),
-        session_checkpoint_tracker.clone(),
-        Arc::clone(&metrics),
-        config.service_label.clone(),
-        config.checkpoint_base_bootstrap_enabled(),
-    ));
+    // before `ValkeyClient::quit()` with zero new shutdown wiring. It takes
+    // the tracker's abort token too, so a hold aborts its runs with the
+    // session-checkpoint dispatch.
+    let base_bootstrap = Arc::new(
+        BaseBootstrap::new(
+            Arc::clone(&checkpoint_store),
+            valkey.clone(),
+            key_schema.clone(),
+            session_checkpoint_tracker.clone(),
+            Arc::clone(&metrics),
+            config.service_label.clone(),
+            config.checkpoint_base_bootstrap_enabled(),
+        )
+        .with_abort_token(session_checkpoint_abort.clone()),
+    );
 
     // ── Step 1b-iv: Recovery hook (SDD SR-2.4 / SR-2.6) ───────────────────
     //
@@ -1144,7 +1524,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
             Arc::clone(&metrics),
         )
         .with_ext_value_store(Arc::clone(&ext_value_store))
-        .with_base_bootstrap(Arc::clone(&base_bootstrap)),
+        .with_base_bootstrap(Arc::clone(&base_bootstrap))
+        .with_hold_fence(on_access_hold_fence.clone()),
     );
 
     // ── Step 1b-iv.5: Session-recovery hook (SDD SR-2.7, Epic 2) ──────────
@@ -1158,13 +1539,16 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // DeleteSession, JoinSession, SubscribeReadLayer) all funnel through
     // one wiring point. The hook is ALSO held on `LiveEditService` for
     // diagnostics / future direct call sites.
-    let session_recovery_hook = Arc::new(SessionRecoveryHook::new(
-        Arc::clone(&checkpoint_store),
-        valkey.clone(),
-        key_schema.clone(),
-        Arc::clone(&config_shared),
-        Arc::clone(&metrics),
-    ));
+    let session_recovery_hook = Arc::new(
+        SessionRecoveryHook::new(
+            Arc::clone(&checkpoint_store),
+            valkey.clone(),
+            key_schema.clone(),
+            Arc::clone(&config_shared),
+            Arc::clone(&metrics),
+        )
+        .with_hold_fence(on_access_hold_fence),
+    );
 
     // ── Step 1b-ii: Connect to external auth services ─────────────────────
     let auth_retry_config = live_edit::auth::RetryConfig {
@@ -1269,6 +1653,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         gc_cancel.clone(),
         Some(metrics.clone()),
     );
+    hold_writers.register_task(HoldWriter::ExtGc, gc_handle.abort_handle());
+    hold_writers.register_token(HoldWriter::ExtGc, gc_cancel.clone());
 
     // ── Step 1d: Orphan sweep background task (SDD §5.5 step 6) ──────────────
     let orphan_sweep_cancel = CancellationToken::new();
@@ -1281,6 +1667,8 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         orphan_sweep_cancel.clone(),
         Some(metrics.clone()),
     );
+    hold_writers.register_task(HoldWriter::OrphanSweep, orphan_sweep_handle.abort_handle());
+    hold_writers.register_token(HoldWriter::OrphanSweep, orphan_sweep_cancel.clone());
 
     // ── Step 1d-bis: External-value ref_count reconciler (b.yda) ─────────────
     //
@@ -1307,6 +1695,16 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     } else {
         None
     };
+    match &ext_reconcile_handle {
+        Some(handle) => {
+            hold_writers.register_task(HoldWriter::ExtRefReconcile, handle.abort_handle());
+            hold_writers.register_token(HoldWriter::ExtRefReconcile, ext_reconcile_cancel.clone());
+        }
+        None => hold_writers.register_not_spawned(
+            HoldWriter::ExtRefReconcile,
+            "LIVE_EDIT_EXT_RECONCILE_INTERVAL_SECS=0",
+        ),
+    }
 
     // ── Step 1e-pre: Checkpoint pacing config-echo gauges (b.ijf) ─────────
     //
@@ -1329,70 +1727,84 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // factory-built `Arc<dyn CheckpointStore>`. The
     // `Option<JoinHandle<()>>` binding lets the shutdown sequence
     // conditionally await without branching its `tokio::join!`.
-    let (checkpoint_loop_cancel, checkpoint_loop_handle) = if config.checkpoint_enabled {
-        match config.checkpoint_adapter {
-            CheckpointAdapter::Disabled => unreachable!(
-                "checkpoint_enabled=true + adapter=Disabled is refused at startup by \
+    let (checkpoint_loop_cancel, checkpoint_loop_handle, cleanup_config) =
+        if config.checkpoint_enabled {
+            match config.checkpoint_adapter {
+                CheckpointAdapter::Disabled => unreachable!(
+                    "checkpoint_enabled=true + adapter=Disabled is refused at startup by \
                  the case-2 check in validate_durability_mode; reaching this arm \
                  indicates a missing or reordered guard call"
-            ),
-            CheckpointAdapter::InMemory
-            | CheckpointAdapter::LocalDisk
-            | CheckpointAdapter::StorageApi => {
-                let cancel = CancellationToken::new();
-                let loop_config = CheckpointLoopConfig {
-                    tick: Duration::from_secs(config.checkpoint_tick_secs),
-                    interval: Duration::from_secs(config.checkpoint_interval_secs),
-                    quiesce: Duration::from_secs(config.checkpoint_quiesce_secs),
-                    retain_generations: config.checkpoint_retain_generations as usize,
-                    counters_sync: Duration::from_secs(config.checkpoint_counters_sync_secs),
-                    reconcile_interval: Duration::from_secs(
-                        config.checkpoint_reconcile_interval_secs,
-                    ),
-                    tail: TailCaptureConfig::from_config(&config),
-                    leader: leader_identity.clone(),
-                };
-                let handle = spawn_checkpoint_loop(
-                    valkey.clone(),
-                    key_schema.clone(),
-                    Arc::clone(&checkpoint_store),
-                    loop_config,
-                    Some(metrics.clone()),
-                    cancel.clone(),
-                );
-                // Derived fields (b.gg7): the configured knobs alone do not
-                // tell an operator how long one call may take, and every
-                // ceiling below is a *product* of knobs rather than a knob, so
-                // it cannot be read off the deployment manifest. Echoed on the
-                // existing line rather than a new one — a second INFO would
-                // split the checkpoint startup story across two log records for
-                // no gain.
-                let adapter_call_ceiling = config.checkpoint_adapter_call_ceiling();
-                tracing::info!(
-                    adapter = ?config.checkpoint_adapter,
-                    tick_secs = config.checkpoint_tick_secs,
-                    interval_secs = config.checkpoint_interval_secs,
-                    quiesce_secs = config.checkpoint_quiesce_secs,
-                    retain_generations = config.checkpoint_retain_generations,
-                    counters_sync_secs = config.checkpoint_counters_sync_secs,
-                    adapter_call_ceiling_secs = adapter_call_ceiling.as_secs(),
-                    layer_publish_ceiling_secs =
-                        adapter_call_ceiling.as_secs() * LAYER_PUBLISH_ARTIFACTS,
-                    reconcile_grace_secs = config.checkpoint_reconcile_grace().as_secs(),
-                    reconcile_interval_secs = config.checkpoint_reconcile_interval_secs,
-                    tail_enabled = config.checkpoint_tail_enabled,
-                    tail_max_chain = config.checkpoint_tail_max_chain,
-                    tail_max_entries = config.checkpoint_tail_max_entries,
-                    tail_max_bytes = config.checkpoint_tail_max_bytes,
-                    "checkpoint loop spawned",
-                );
-                (Some(cancel), Some(handle))
+                ),
+                CheckpointAdapter::InMemory
+                | CheckpointAdapter::LocalDisk
+                | CheckpointAdapter::StorageApi => {
+                    let cancel = CancellationToken::new();
+                    let loop_config = CheckpointLoopConfig {
+                        tick: Duration::from_secs(config.checkpoint_tick_secs),
+                        interval: Duration::from_secs(config.checkpoint_interval_secs),
+                        quiesce: Duration::from_secs(config.checkpoint_quiesce_secs),
+                        retain_generations: config.checkpoint_retain_generations as usize,
+                        counters_sync: Duration::from_secs(config.checkpoint_counters_sync_secs),
+                        reconcile_interval: Duration::from_secs(
+                            config.checkpoint_reconcile_interval_secs,
+                        ),
+                        tail: TailCaptureConfig::from_config(&config),
+                        leader: leader_identity.clone(),
+                    };
+                    // The checkpoint clean-up task (Step 1e-bis) runs on the same
+                    // cadence knob and identity, as its own task.
+                    let cleanup_config = loop_config.clone();
+                    let handle = spawn_checkpoint_loop(
+                        valkey.clone(),
+                        key_schema.clone(),
+                        Arc::clone(&checkpoint_store),
+                        loop_config,
+                        Some(metrics.clone()),
+                        cancel.clone(),
+                    );
+                    // Derived fields (b.gg7): the configured knobs alone do not
+                    // tell an operator how long one call may take, and every
+                    // ceiling below is a *product* of knobs rather than a knob, so
+                    // it cannot be read off the deployment manifest. Echoed on the
+                    // existing line rather than a new one — a second INFO would
+                    // split the checkpoint startup story across two log records for
+                    // no gain.
+                    let adapter_call_ceiling = config.checkpoint_adapter_call_ceiling();
+                    tracing::info!(
+                        adapter = ?config.checkpoint_adapter,
+                        tick_secs = config.checkpoint_tick_secs,
+                        interval_secs = config.checkpoint_interval_secs,
+                        quiesce_secs = config.checkpoint_quiesce_secs,
+                        retain_generations = config.checkpoint_retain_generations,
+                        counters_sync_secs = config.checkpoint_counters_sync_secs,
+                        adapter_call_ceiling_secs = adapter_call_ceiling.as_secs(),
+                        layer_publish_ceiling_secs =
+                            adapter_call_ceiling.as_secs() * LAYER_PUBLISH_ARTIFACTS,
+                        reconcile_grace_secs = config.checkpoint_reconcile_grace().as_secs(),
+                        reconcile_interval_secs = config.checkpoint_reconcile_interval_secs,
+                        tail_enabled = config.checkpoint_tail_enabled,
+                        tail_max_chain = config.checkpoint_tail_max_chain,
+                        tail_max_entries = config.checkpoint_tail_max_entries,
+                        tail_max_bytes = config.checkpoint_tail_max_bytes,
+                        "checkpoint loop spawned",
+                    );
+                    (Some(cancel), Some(handle), Some(cleanup_config))
+                }
             }
+        } else {
+            tracing::info!("checkpoint loop disabled (LIVE_EDIT_CHECKPOINT_ENABLED=false)");
+            (None, None, None)
+        };
+    match (&checkpoint_loop_cancel, &checkpoint_loop_handle) {
+        (Some(cancel), Some(handle)) => {
+            hold_writers.register_task(HoldWriter::CheckpointLoop, handle.abort_handle());
+            hold_writers.register_token(HoldWriter::CheckpointLoop, cancel.clone());
         }
-    } else {
-        tracing::info!("checkpoint loop disabled (LIVE_EDIT_CHECKPOINT_ENABLED=false)");
-        (None, None)
-    };
+        _ => hold_writers.register_not_spawned(
+            HoldWriter::CheckpointLoop,
+            "LIVE_EDIT_CHECKPOINT_ENABLED=false",
+        ),
+    }
 
     // ── Step 1e-bis: External-value mirror workers and backup repair (SDD §22.17)
     //
@@ -1415,11 +1827,27 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // never confirmed, through the same byte budget. It is the fourth
     // consumer of `le:gc:leader`, on its own fixed interval. Its cancel and
     // join sit beside the reconciler's in the shutdown sequence.
+    //
+    // The checkpoint clean-up (b.g65, SDD §22.17.5) is spawned beside it,
+    // under the same gate: the fifth consumer of `le:gc:leader`, every
+    // `LIVE_EDIT_CHECKPOINT_RECONCILE_INTERVAL_SECS`, with the same mirror
+    // byte budget for its heal and the same backup marks. It is not a timer
+    // of the checkpoint loop and holds no part of `le:checkpoint:leader`, so
+    // the backup loop never pauses for it (one layer's backup can still defer
+    // to a later pass when the clean-up fence refuses its publish). Its cancel
+    // and join sit beside the repair's.
     let ext_backup_repair_cancel = CancellationToken::new();
-    let (ext_mirror_cancel, ext_mirror_worker_handles, ext_backup_repair_handle): (
+    let checkpoint_cleanup_cancel = CancellationToken::new();
+    let (
+        ext_mirror_cancel,
+        ext_mirror_worker_handles,
+        ext_backup_repair_handle,
+        checkpoint_cleanup_handle,
+    ): (
         Option<CancellationToken>,
         Vec<tokio::task::JoinHandle<()>>,
-        Option<tokio::task::JoinHandle<()>>,
+        OptionalTaskHandle,
+        OptionalTaskHandle,
     ) = match mirror_rx_for_workers.zip(repair_mirror_sender) {
         Some((rx, repair_sender)) => {
             let cancel = CancellationToken::new();
@@ -1430,6 +1858,7 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
                 backup_store_id.clone(),
                 Some(metrics.clone()),
             );
+            let cleanup_heal = CollectHeal::new(repair_sender.clone(), marks.clone());
             let handles = spawn_ext_mirror_workers(
                 Arc::clone(&checkpoint_store),
                 rx,
@@ -1453,18 +1882,79 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
                 leader_identity.clone(),
                 ext_backup_repair_cancel.clone(),
             );
+            // The mirror is funded exactly when checkpointing is on with a
+            // real adapter, which is exactly when the loop's config exists.
+            let cleanup_handle = cleanup_config.map(|cleanup_config| {
+                spawn_checkpoint_cleanup(
+                    valkey.clone(),
+                    key_schema.clone(),
+                    Arc::clone(&checkpoint_store),
+                    cleanup_config,
+                    Some(cleanup_heal),
+                    Some(metrics.clone()),
+                    checkpoint_cleanup_cancel.clone(),
+                )
+            });
             tracing::info!(
                 workers = config.checkpoint_ext_mirror_workers,
                 queue_capacity = config.checkpoint_ext_mirror_queue_capacity,
                 budget_bytes = config.pod_memory.ext_mirror_bytes().unwrap_or(0),
                 backup_store_id = %backup_store_id,
                 repair_interval_secs,
-                "checkpoint ext-mirror workers and backup repair spawned",
+                checkpoint_cleanup = cleanup_handle.is_some(),
+                "checkpoint ext-mirror workers, backup repair and checkpoint clean-up spawned",
             );
-            (Some(cancel), handles, Some(repair_handle))
+            (Some(cancel), handles, Some(repair_handle), cleanup_handle)
         }
-        None => (None, Vec::new(), None),
+        None => (None, Vec::new(), None, None),
     };
+    match &ext_mirror_cancel {
+        Some(cancel) => {
+            for handle in &ext_mirror_worker_handles {
+                hold_writers.register_task(HoldWriter::ExtMirrorWorkers, handle.abort_handle());
+            }
+            hold_writers.register_token(HoldWriter::ExtMirrorWorkers, cancel.clone());
+        }
+        None => hold_writers.register_not_spawned(
+            HoldWriter::ExtMirrorWorkers,
+            "no checkpoint adapter, or LIVE_EDIT_CHECKPOINT_ENABLED=false",
+        ),
+    }
+    // The backup repair writes both stores (its confirmations on the value's
+    // meta, its re-sent copies to the backup store, and the `le:gc:leader`
+    // lease it takes), so a hold aborts it like the workers it shares a gate
+    // with.
+    match &ext_backup_repair_handle {
+        Some(handle) => {
+            hold_writers.register_task(HoldWriter::ExtBackupRepair, handle.abort_handle());
+            hold_writers.register_token(
+                HoldWriter::ExtBackupRepair,
+                ext_backup_repair_cancel.clone(),
+            );
+        }
+        None => hold_writers.register_not_spawned(
+            HoldWriter::ExtBackupRepair,
+            "no checkpoint adapter, or LIVE_EDIT_CHECKPOINT_ENABLED=false",
+        ),
+    }
+    // The checkpoint clean-up writes both stores (its `le:gc:leader` lease,
+    // its `{recon}` fence scripts and meta writes, its backup-store deletes
+    // and heal re-puts), so a hold aborts it mid-pass like the checkpoint
+    // loop: its task is aborted, so no step after the one in flight starts,
+    // and its token is cancelled (`dr::hold::writers` has the bound).
+    match &checkpoint_cleanup_handle {
+        Some(handle) => {
+            hold_writers.register_task(HoldWriter::CheckpointCleanup, handle.abort_handle());
+            hold_writers.register_token(
+                HoldWriter::CheckpointCleanup,
+                checkpoint_cleanup_cancel.clone(),
+            );
+        }
+        None => hold_writers.register_not_spawned(
+            HoldWriter::CheckpointCleanup,
+            "no checkpoint adapter, or LIVE_EDIT_CHECKPOINT_ENABLED=false",
+        ),
+    }
 
     // ── Step 2: Metrics ──────────────────────────────────────────────────────
     // (Built earlier — moved ahead of auth wiring so auth calls are
@@ -1661,6 +2151,11 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
             // receiver's `changed()`, so readiness rises on the Step 8 flip
             // rather than up to one probe interval afterwards.
             api_serving: Some(api_serving_rx),
+            // SDD SR-5.4, SR-6.5: readiness is NOT_SERVING while the hold
+            // reactor (Step 1b-iii.3) reads this replica's hold verdict as
+            // stale. Hard signal with its own wake-up arm, like
+            // `api_serving`.
+            verdict_stale: Some(hold_verdict_stale_rx),
         },
         health_supervisor_cancel.clone(),
     );
@@ -1814,10 +2309,29 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         session_revalidation,
         background_tasks_cancel.clone(),
     );
+    // The presence and session tasks, aborted together at hold entry: the
+    // presence sweeper writes (stale connections, its lease); the others
+    // share its token, and the session_tokens sweeper would otherwise cancel
+    // per-session tokens on a store whose sessions are gone. Their token also
+    // stops the structural cache's running audits.
+    for handle in [
+        &presence_subscriber_handle,
+        &sweeper_handle,
+        &session_base_path_cache_sweeper_handle,
+        &session_delete_subscriber_handle,
+        &session_tokens_sweep_handle,
+    ] {
+        hold_writers.register_task(HoldWriter::PresenceAndSessionTasks, handle.abort_handle());
+    }
+    hold_writers.register_token(
+        HoldWriter::PresenceAndSessionTasks,
+        background_tasks_cancel.clone(),
+    );
 
     // ── Step 6: Live service ──────────────────────────────────────────────────
     // `live_service_server` builds the one LiveService stack: the auth
-    // interceptor around `LiveServiceServer::new(inner)`, and outermost the
+    // interceptor around `LiveServiceServer::new(inner)`, the hold gate
+    // (Step 1b-iii.3) around that, and outermost the
     // layer that inserts the end-of-stream record CreateLayer and UpdateLayer
     // commit on (SDD §5.4) and the body-progress record the JoinSession client
     // keepalive reads (SDD §13.2). Every test server that serves the
@@ -1866,17 +2380,11 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // token: that token means the session is gone.
     let service_shutdown = GracefulShutdown::new();
     let shutdown_service_handle = service_shutdown.clone();
-    let stream_pacing = StreamPacing {
-        rate_per_sec: config.shutdown_stream_end_rate,
-        max_window: Duration::from_secs(u64::from(config.shutdown_stream_end_max_window_secs)),
-    };
+    let stream_pacing = config.shutdown_stream_pacing();
     let rpc_deadline = Duration::from_millis(config.rpc_deadline_ms);
-    let min_termination_grace = minimum_termination_grace(
-        Duration::from_secs(config.shutdown_timeout_secs),
-        rpc_deadline,
-        stream_pacing,
-        Duration::from_secs(config.shutdown_overall_budget_secs),
-    );
+    // The same bound the DR Jobs' quiet period counts for a replica already
+    // shutting down when a hold begins (`dr::job::quiet`).
+    let min_termination_grace = config.minimum_termination_grace();
     tracing::info!(
         min_termination_grace_secs = min_termination_grace.as_secs_f64(),
         drain_secs = config.shutdown_timeout_secs,
@@ -1894,7 +2402,9 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // 503). Every part it reads now exists: the counters on `metrics`, the
     // admission gate on the Valkey client, the readiness status the health
     // supervisor maintains, and the graceful-shutdown handle, whose paced
-    // stream ending having begun the snapshot reports as `shutting_down`.
+    // stream ending having begun the snapshot reports as `shutting_down`; and
+    // the hold reactor's `held` signal (Step 1b-iii.3), which the scaler
+    // freezes the replica count on.
     {
         let admission = Arc::clone(&valkey.subscriber_admission);
         let registered = scaling_endpoint.register(Arc::new(ServiceScalingSource {
@@ -1916,6 +2426,7 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
                 .limit()
                 .map_or(0, |l| u32::try_from(l).unwrap_or(u32::MAX)),
             cpu_seconds: live_edit::observability::process_cpu::cpu_seconds_total,
+            held: hold_held_rx,
         }));
         debug_assert!(registered, "the scaling source is registered exactly once");
     }
@@ -1940,7 +2451,6 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         shutdown: service_shutdown,
         metrics: Arc::clone(&metrics),
         service_label: config.service_label.clone(),
-        catchup_snapshot_enabled: config.catchup_snapshot_enabled,
         session_base_path_cache,
         recovery: recovery_hook,
         session_recovery: session_recovery_hook,
@@ -1973,7 +2483,7 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         catch_up_chunk_seam_for_test: None,
     };
 
-    let live_service = live_service_server(live_edit_service);
+    let live_service = live_service_server(live_edit_service, hold_gate.clone());
 
     // ── Step 6b: Metrics + deadline tower layer ───────────────────────────────
     // MetricsLayer wraps the full call stack (including auth) so it measures
@@ -1981,6 +2491,27 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // at Step 0a (the bootstrap server carries a clone); reused verbatim here.
 
     // ── Step 7: Graceful shutdown signal ─────────────────────────────────────
+    //
+    // The serving claim (Step 0a-ter): from here the shutdown request is the
+    // serving path's, and the startup stop can no longer run. It is taken
+    // before the bootstrap handoff, the hold's serving point and readiness
+    // (Step 8), so none of them runs once a signal has stopped startup.
+    // `None` means a signal claimed startup first: its startup stop has the
+    // bootstrap and `/metrics` servers and ends the process, so this task
+    // waits for that and never serves.
+    let Some(((bootstrap_shutdown, mut bootstrap_server, metrics_task), shutdown_request)) =
+        startup_claim.claim_serving()
+    else {
+        match std::future::pending::<std::convert::Infallible>().await {}
+    };
+    // The watcher cancels the request before it takes the claim's lock, so
+    // this claim can win with a stop already requested; a signal can also
+    // arrive during the bootstrap handoff below. Step 8 reads this copy of
+    // the request after the handoff: when a stop is requested by then, it
+    // still hands the socket over and serves the drain, but skips the hold's
+    // serving point and readiness, so readiness never reads SERVING on a
+    // replica that is already stopping.
+    let stop_requested = shutdown_request.clone();
     let shutdown_timeout = Duration::from_secs(config.shutdown_timeout_secs);
     let shutdown_signal_subscription_tracker = shutdown_subscription_tracker.clone();
 
@@ -1992,17 +2523,19 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     let drain_listener = serving_listener.clone();
 
     let shutdown_signal = async move {
-        // Wait for SIGTERM or SIGINT
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
-
-        tokio::select! {
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM");
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received SIGINT");
-            }
+        // The first SIGTERM or SIGINT, through the process shutdown request
+        // the watcher (Step 0a-ter) cancels.
+        shutdown_request.cancelled().await;
+        // The hold poll and the hold reactor stop first: from here this is a
+        // shutdown, held or not, and no verdict — a hold, its clearing, or
+        // one that stops advancing — changes how it proceeds. Their token is
+        // a child of the request, so the request has already cancelled it;
+        // this states the order rather than relying on it.
+        hold_poll_shutdown.cancel();
+        if startup_claim.cause() == Some(SIGINT) {
+            tracing::info!("received SIGINT");
+        } else {
+            tracing::info!("received SIGTERM");
         }
 
         // SDD §5.6 step 1: set health to NOT_SERVING so readiness probes fail.
@@ -2054,38 +2587,54 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     // descriptor for the same open file description, so the socket stays in
     // `LISTEN` throughout and arriving connections queue in the shared accept
     // backlog instead of being refused.
-    bootstrap_shutdown.cancel();
-    match tokio::time::timeout(BOOTSTRAP_HANDOFF_BUDGET, &mut bootstrap_server).await {
-        Ok(Ok(Ok(()))) => tracing::debug!("bootstrap gRPC server drained"),
-        Ok(Ok(Err(e))) => {
-            tracing::warn!(error = %e, "bootstrap gRPC server exited with an error")
-        }
-        Ok(Err(e)) => tracing::warn!(error = %e, "bootstrap gRPC server task failed to join"),
-        Err(_) => {
-            tracing::warn!(
-                budget_secs = BOOTSTRAP_HANDOFF_BUDGET.as_secs(),
-                "bootstrap gRPC server did not drain within the handoff budget — aborting it"
-            );
-            bootstrap_server.abort();
-        }
+    hand_over_from_bootstrap_server(
+        &bootstrap_shutdown,
+        &mut bootstrap_server,
+        BOOTSTRAP_HANDOFF_BUDGET,
+    )
+    .await;
+
+    // A stop requested by now (Step 7) skips the hold's serving point and
+    // readiness, and logs that it only drains in place of the serving line:
+    // the server below only drains. Readiness stays NOT_SERVING, since the
+    // supervisor never sees the gate open, and the hold poll and reactor stop
+    // on the request (their token is its child), so no verdict is acted on at
+    // the serving point.
+    if !stop_requested.is_cancelled() {
+        // The hold's serving point (SDD SR-6): from here a hold runs the hold
+        // entry routine on the parts handed over, instead of exiting 0. Every
+        // background task in the writer inventory is spawned and registered
+        // by now, so the routine leaves none running.
+        hold_serving_point.reach(HoldEntryParts {
+            gate: hold_gate,
+            streams: shutdown_service_handle.clone(),
+            writers: Arc::clone(&hold_writers),
+            metrics: Arc::clone(&metrics),
+        });
+
+        // Open the readiness gate created at Step 0a. This is the last step
+        // before the full-API server takes the socket: from here
+        // the accept backlog is drained by a server that carries
+        // `LiveService`, so a `SERVING` readiness verdict is finally
+        // truthful. The supervisor is `select!`ing on this receiver's
+        // `changed()`, so it re-evaluates now rather than on its next tick. A
+        // `send` error is impossible while the supervisor's receiver is alive
+        // and is harmless if it is not, so the result is deliberately
+        // discarded.
+        let _ = api_serving_tx.send(true);
+        tracing::info!(addr = %bound_grpc_addr, "gRPC server serving full API");
+    } else {
+        tracing::info!(
+            addr = %bound_grpc_addr,
+            "shutdown requested before serving; readiness stays NOT_SERVING and the full-API \
+             server takes the socket only to drain"
+        );
     }
-
-    // Open the readiness gate created at Step 0a. This is the last statement
-    // before the full-API server takes the socket: from here the accept
-    // backlog is drained by a server that carries `LiveService`, so a
-    // `SERVING` readiness verdict is finally truthful. The supervisor is
-    // `select!`ing on this receiver's `changed()`, so it re-evaluates now
-    // rather than on its next tick. A `send` error is impossible while the
-    // supervisor's receiver is alive and is harmless if it is not, so the
-    // result is deliberately discarded.
-    let _ = api_serving_tx.send(true);
-
-    tracing::info!(addr = %bound_grpc_addr, "gRPC server serving full API");
 
     // The same HTTP/2 settings as the bootstrap server; see
     // `production_server_builder` for why the TCP options live on the
     // listener instead.
-    let serve = production_server_builder()
+    let serve = production_server_builder(config.upload_admission_max_waiters)
         .layer(metrics_layer)
         .add_service(live_service)
         .add_service(health_service)
@@ -2125,80 +2674,33 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         std::process::exit(1);
     }
 
-    // ── Shutdown: bound the entire post-server shutdown sequence (b.3z7 C-2) ──
+    // ── Shutdown: the post-server sequence, under one overall budget (SDD §5.6) ──
     //
-    // Before this fix each step (layer cleanup + five background-task joins +
-    // four sequential Valkey `quit()` calls) had its own `shutdown_timeout_secs`
-    // budget, so the worst-case shutdown time was ~10 × `shutdown_timeout_secs`
-    // + 4 × 2 s ≈ 58 s — well past the default K8s
-    // `terminationGracePeriodSeconds` of 30 s. To bound total cleanup time we
-    // (1) trigger all cancellation tokens up front, (2) join the background
-    // tasks concurrently via `tokio::join!`, (3) let `ValkeyClient::quit`
-    // close all six connection sets (five pools plus the pub/sub client) in
-    // parallel internally, and (4) wrap the whole
-    // sequence in a single `tokio::time::timeout` sized to fit inside the
-    // Helm chart's `terminationGracePeriodSeconds` together with the drain,
-    // the bound on the server after GOAWAY and the final flush (80 s by
-    // default; the chart refuses a grace below the minimum, which the startup
-    // log line reports as `min_termination_grace_secs`).
-    let metrics_for_shutdown = Arc::clone(&metrics);
-    let shutdown_overall_budget = Duration::from_secs(config.shutdown_overall_budget_secs);
-    let shutdown_task_budget = Duration::from_secs(config.shutdown_timeout_secs);
-    let layer_store_for_shutdown = shutdown_layer_store;
-    let valkey_for_shutdown = valkey.clone();
-
-    let shutdown_sequence = async move {
-        tracing::info!("waiting for pending layer cleanup tasks");
-        layer_store_for_shutdown
-            .wait_for_cleanup(shutdown_task_budget)
-            .await;
-        tracing::info!("layer cleanup tasks finished");
-
-        // Drain the streaming RPCs' tasks (JoinSession and SubscribeReadLayer)
-        // BEFORE we tear down the Valkey pools, concurrently, each bounded by
-        // `shutdown_task_budget` so a single stuck task can't monopolise the
-        // overall budget. The sequence lives in the library, so the tests
-        // that pin it run the same code; see `drain_stream_tasks` for what
-        // each drain is for.
-        drain_stream_tasks(
-            &shutdown_presence_cleanup_tracker,
-            &shutdown_subscription_tracker,
-            shutdown_task_budget,
-        )
-        .await;
-
-        // Task t2.fgj.7v.p9: drain the session-checkpoint dispatcher
-        // tracker BEFORE the bulk-cancellation block below. The writer's
-        // spawned tasks depend only on the Valkey pool and the
-        // configured checkpoint adapter; both stay alive until
-        // `ValkeyClient::quit()` runs after the join block, so draining
-        // here lets in-flight session-checkpoint writes land cleanly.
-        // The drain is bounded by `shutdown_task_budget` so a stuck
-        // adapter cannot monopolise the overall shutdown window.
-        shutdown_session_checkpoint_tracker.close();
-        let session_checkpoint_drain = tokio::time::timeout(
-            shutdown_task_budget,
-            shutdown_session_checkpoint_tracker.wait(),
-        )
-        .await;
-        match session_checkpoint_drain {
-            Ok(()) => tracing::info!("session-checkpoint writes drained"),
-            Err(_) => tracing::warn!(
-                pending = shutdown_session_checkpoint_tracker.len(),
-                "timed out waiting for session-checkpoint writes; some lifecycle events may not be reflected in the checkpoint store"
-            ),
-        }
-
-        // Fire all cancellation tokens so background tasks begin unwinding in
-        // parallel — the join below is where we actually wait for them.
-        gc_cancel.cancel();
-        orphan_sweep_cancel.cancel();
+    // `run_post_server_sequence` (the library, so the tests that pin it run
+    // the same code): the layer cleanups beside the streaming RPCs' task
+    // drains, then the session-checkpoint drain, then every token below
+    // fired at once and one concurrent join of every background task, then
+    // `ValkeyClient::quit()`. Each wait before `quit()` is bounded by the
+    // per-task budget or by a deadline that leaves `quit()` its headroom,
+    // whichever is earlier, and the whole sequence by
+    // LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS, sized to fit the chart's
+    // `terminationGracePeriodSeconds` together with the drain, the bound on
+    // the server after GOAWAY and the final flush (80 s by default; the chart
+    // refuses a grace below the minimum, which the startup log line reports
+    // as `min_termination_grace_secs`).
+    let join_report = BackgroundTaskJoinReport {
+        metrics: Arc::clone(&metrics),
+        hold_writers: Arc::clone(&hold_writers),
+    };
+    let mut cancels: Vec<CancellationToken> = vec![
+        gc_cancel,
+        orphan_sweep_cancel,
         // b.yda: a mid-pass cancel stops the reconciler at the next drain-round
         // boundary and repairs nothing further. Safe to interrupt anywhere: each
         // repair member is independently owed, and the candidate ZSET is durable
         // with first-observation scores intact, so the next process's first pass
         // resumes exactly where this one stopped.
-        ext_reconcile_cancel.cancel();
+        ext_reconcile_cancel,
         // The external-value backup repair: a mid-pass cancel abandons the
         // pass, with no gauge published. Safe anywhere: every check, upload
         // and confirmation it finished stays done, and a value it did not
@@ -2206,159 +2708,97 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         // upload's byte charge returns when its bytes drop, which on LocalDisk
         // is when its write ends: that write finishes on its own blocking
         // task, and the runtime waits for it at exit.
-        ext_backup_repair_cancel.cancel();
+        ext_backup_repair_cancel,
+        // The checkpoint clean-up (b.g65): a mid-pass cancel abandons the read
+        // in flight and returns before the next member, generation or batch.
+        // Safe anywhere: a delete and its post-delete step are one unit with
+        // no cancel check between them, everything a pass finished stays done,
+        // and the `{recon}` work lists are durable, so the next leader's pass
+        // resumes.
+        checkpoint_cleanup_cancel,
         // b.yuo, b.qhk: the store-memory re-read (release budget and
         // fullness gauge), detached (no join below): it holds nothing to
         // drain.
-        ext_release_budget_refresh_cancel.cancel();
-        background_tasks_cancel.cancel();
-        health_supervisor_cancel.cancel();
-        if let Some(cancel) = &checkpoint_loop_cancel {
-            cancel.cancel();
-        }
-        // SDD SR-3.1: fire the ext-mirror workers' shared cancel ahead
-        // of the join below so each worker exits its `select!` and runs
-        // the best-effort `DRAIN_BUDGET`-bounded drain before returning.
-        if let Some(cancel) = &ext_mirror_cancel {
-            cancel.cancel();
-        }
-        // Epic t1.fgj.dp: cancel the service-token polling task. The
-        // task observes `cancel.cancelled()` in its `select!` and exits
-        // within the existing shutdown budget. No JoinHandle is awaited
-        // here — `tokio::spawn`'d handle is detached because the polling
-        // task carries no mutable state operators care about preserving
+        ext_release_budget_refresh_cancel,
+        background_tasks_cancel,
+        health_supervisor_cancel,
+        // Epic t1.fgj.dp: the service-token polling task. Detached (no
+        // join below): it carries no state operators care about preserving
         // across shutdown (the cached token is in-process only and is
         // discarded with the rest of the service state).
-        service_token_cancel.cancel();
-        // Epic 3 t3.tr5.jv: cancel the Redis-scoped access-token-file provider's
-        // polling task, mirroring the storage-api provider cancel above. A
-        // no-op in non-access-token-file modes (the token never existed, but the
-        // `CancellationToken` is always constructed so this call is
-        // unconditional and cheap).
-        valkey_token_cancel.cancel();
+        service_token_cancel,
+        // Epic 3 t3.tr5.jv: the Redis-scoped access-token-file provider's
+        // polling task, likewise. A no-op in non-access-token-file modes (the
+        // token is always constructed, so the cancel is unconditional).
+        valkey_token_cancel,
+    ];
+    cancels.extend(checkpoint_loop_cancel);
+    // SDD SR-3.1: the ext-mirror workers' shared cancel, so each worker exits
+    // its `select!` and runs its best-effort `DRAIN_BUDGET`-bounded drain
+    // before returning.
+    cancels.extend(ext_mirror_cancel);
 
-        // Join the background tasks concurrently. Each individual join still
-        // carries a per-task budget so a single runaway task can't monopolise
-        // the whole shutdown window.
-        let (
-            gc_res,
-            orphan_res,
-            presence_sub_res,
-            sweeper_res,
-            session_del_res,
-            health_sup_res,
-            base_path_cache_res,
-            session_tokens_sweep_res,
-        ) = tokio::join!(
-            tokio::time::timeout(shutdown_task_budget, gc_handle),
-            tokio::time::timeout(shutdown_task_budget, orphan_sweep_handle),
-            tokio::time::timeout(shutdown_task_budget, presence_subscriber_handle),
-            tokio::time::timeout(shutdown_task_budget, sweeper_handle),
-            tokio::time::timeout(shutdown_task_budget, session_delete_subscriber_handle),
-            tokio::time::timeout(shutdown_task_budget, health_supervisor_handle),
-            tokio::time::timeout(shutdown_task_budget, session_base_path_cache_sweeper_handle),
-            tokio::time::timeout(shutdown_task_budget, session_tokens_sweep_handle),
-        );
-
-        report_background_task_result(&metrics_for_shutdown, "gc", gc_res);
-        report_background_task_result(&metrics_for_shutdown, "orphan_sweep", orphan_res);
-        report_background_task_result(
-            &metrics_for_shutdown,
-            "presence_subscriber",
-            presence_sub_res,
-        );
-        report_background_task_result(&metrics_for_shutdown, "presence_sweeper", sweeper_res);
-        report_background_task_result(&metrics_for_shutdown, "health_supervisor", health_sup_res);
-        report_background_task_result(
-            &metrics_for_shutdown,
+    let mut background_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = vec![
+        ("gc", gc_handle),
+        ("orphan_sweep", orphan_sweep_handle),
+        ("presence_subscriber", presence_subscriber_handle),
+        ("presence_sweeper", sweeper_handle),
+        ("health_supervisor", health_supervisor_handle),
+        (
             "session_delete_subscriber",
-            session_del_res,
-        );
-        report_background_task_result(
-            &metrics_for_shutdown,
-            "session_base_path_cache_sweeper",
-            base_path_cache_res,
-        );
-        report_background_task_result(
-            &metrics_for_shutdown,
-            "session_tokens_sweeper",
-            session_tokens_sweep_res,
-        );
-
-        // b.yda: drain the ref_count reconciler only if it was spawned. Same
-        // `Option<JoinHandle>` shape and same reason as the checkpoint loop
-        // below — the `interval = 0` off switch would otherwise force an
-        // always-Some handle into the `tokio::join!` above.
-        if let Some(handle) = ext_reconcile_handle {
-            let ext_reconcile_res = tokio::time::timeout(shutdown_task_budget, handle).await;
-            report_background_task_result(
-                &metrics_for_shutdown,
-                "ext_ref_reconcile",
-                ext_reconcile_res,
-            );
-        }
-
-        // The backup repair, spawned only with the ext-mirror (Step 1e-bis).
-        if let Some(handle) = ext_backup_repair_handle {
-            let ext_backup_repair_res = tokio::time::timeout(shutdown_task_budget, handle).await;
-            report_background_task_result(
-                &metrics_for_shutdown,
-                "ext_backup_repair",
-                ext_backup_repair_res,
-            );
-        }
-
-        // Drain the checkpoint loop only if it was spawned. Folding it
-        // into the `tokio::join!` above would require an always-Some
-        // handle; the `Option` shape lets `enabled=false` builds skip
-        // the await without restructuring the join block.
-        if let Some(handle) = checkpoint_loop_handle {
-            let checkpoint_loop_res = tokio::time::timeout(shutdown_task_budget, handle).await;
-            report_background_task_result(
-                &metrics_for_shutdown,
-                "checkpoint_loop",
-                checkpoint_loop_res,
-            );
-        }
-
-        // SDD SR-3.1: drain the ext-mirror worker pool. The shared
-        // cancel fired above, so each worker is already running its
-        // `DRAIN_BUDGET`-bounded best-effort drain; we await each
-        // handle here under the same per-task budget the other
-        // background tasks use. When the last worker exits, the receiver
-        // it held discards whatever is still queued, counted as
-        // `reason="shutdown"` with one WARN (SDD §22.17); a worker abandoned
-        // at its timeout keeps the receiver, and the queue, until exit. One
-        // `report_background_task_result`
-        // call per worker (rather than aggregating) matches the
-        // surrounding per-task reporting style — workers share the
-        // `"ext_mirror_worker"` label, and operators disambiguate
-        // misbehaving workers via the `background_task_panics_total`
-        // counter delta the helper emits per panic.
-        // Empty on the skip path (`checkpoint_enabled=false` or
-        // adapter=`Disabled`), so this loop is a no-op
-        // and matches Acceptance Criterion 1.
-        for handle in ext_mirror_worker_handles {
-            let res = tokio::time::timeout(shutdown_task_budget, handle).await;
-            report_background_task_result(&metrics_for_shutdown, "ext_mirror_worker", res);
-        }
-
-        tracing::info!("closing Valkey connections");
-        valkey_for_shutdown.quit().await;
-    };
-
-    match tokio::time::timeout(shutdown_overall_budget, shutdown_sequence).await {
-        Ok(()) => tracing::info!("shutdown complete"),
-        Err(_) => tracing::warn!(
-            overall_budget_secs = config.shutdown_overall_budget_secs,
-            "shutdown overall budget exceeded; exiting anyway to fit terminationGracePeriodSeconds"
+            session_delete_subscriber_handle,
         ),
-    }
+        (
+            "session_base_path_cache_sweeper",
+            session_base_path_cache_sweeper_handle,
+        ),
+        ("session_tokens_sweeper", session_tokens_sweep_handle),
+    ];
+    // The tasks a configuration can leave unspawned (`None`): the ref-count
+    // reconciler (`LIVE_EDIT_EXT_RECONCILE_INTERVAL_SECS=0`), the backup
+    // repair and the checkpoint clean-up (only with the ext-mirror, Step
+    // 1e-bis) and the checkpoint loop (`LIVE_EDIT_CHECKPOINT_ENABLED`).
+    background_tasks.extend(ext_reconcile_handle.map(|h| ("ext_ref_reconcile", h)));
+    background_tasks.extend(ext_backup_repair_handle.map(|h| ("ext_backup_repair", h)));
+    background_tasks.extend(checkpoint_cleanup_handle.map(|h| ("checkpoint_cleanup", h)));
+    background_tasks.extend(checkpoint_loop_handle.map(|h| ("checkpoint_loop", h)));
+    // SDD SR-3.1: each ext-mirror worker, under the shared
+    // `"ext_mirror_worker"` label; none on the skip path
+    // (`checkpoint_enabled=false` or adapter=`Disabled`). When the last worker
+    // exits, the receiver it held discards whatever is still queued, counted
+    // as `reason="shutdown"` with one WARN (SDD §22.17); a worker abandoned at
+    // its timeout keeps the receiver, and the queue, until exit.
+    background_tasks.extend(
+        ext_mirror_worker_handles
+            .into_iter()
+            .map(|h| ("ext_mirror_worker", h)),
+    );
+
+    let valkey_for_shutdown = valkey.clone();
+    run_post_server_sequence(
+        Duration::from_secs(config.shutdown_overall_budget_secs),
+        Duration::from_secs(config.shutdown_timeout_secs),
+        |bound| async move {
+            let pending = shutdown_layer_store.wait_for_cleanup(bound).await;
+            // After the drain, so tracked work had its chance to finish: abort
+            // what outlived it before the Valkey pools close.
+            shutdown_layer_store.abort_cleanup_tasks();
+            pending
+        },
+        &shutdown_presence_cleanup_tracker,
+        &shutdown_subscription_tracker,
+        &shutdown_session_checkpoint_tracker,
+        &session_checkpoint_abort,
+        &cancels,
+        background_tasks,
+        &join_report,
+        async move { valkey_for_shutdown.quit().await },
+    )
+    .await;
 
     // Abort the `/metrics` axum server BEFORE the post-budget provider flush,
-    // on every path — including the budget-timeout path, where the budgeted
-    // `shutdown_sequence` future is dropped mid-execution and its trailing
-    // abort would otherwise never run. `metrics.shutdown()` below performs a
+    // whether or not the overall budget elapsed above. `metrics.shutdown()`
+    // below performs a
     // final export on the meter provider; if the server were still live a
     // concurrent scrape would call `PrometheusExporter::export()` on a provider
     // mid-shutdown (logs an error, returns HTTP 500). `abort()` is idempotent,
@@ -2368,20 +2808,26 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     let _ = metrics_task.await;
 
     // Final OTLP flush of the metrics meter provider and the tracer provider
-    // runs AFTER the budgeted `shutdown_sequence` above, so it is NOT covered by
-    // `shutdown_overall_budget` (30 s default). It is the last term of the
+    // runs AFTER the budgeted sequence above, so it is NOT covered by
+    // LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS (30 s default). It is the last term of the
     // minimum termination grace (`minimum_termination_grace`, logged at
-    // startup), so this combined flush must be bounded — neither
-    // `metrics.shutdown()` (a final OTLP export) nor `shutdown_tracing()` (a
-    // 5 s internal batch-processor join) is self-limiting enough against an
-    // unreachable collector. Cap the combined flush at
-    // `POST_BUDGET_FLUSH_BOUND` (6 s). A reachable collector finishes well
-    // inside this ceiling: each OTLP metrics export request is capped at 3 s
-    // (`otlp::OTLP_EXPORT_TIMEOUT`), the TLS handshake of an `https://`
-    // endpoint, on either exporter, at the same 3 s, and the tracer provider
-    // has its own 5 s internal timeout. TCP connect has no bound of its own:
-    // only this 6 s cap limits it. The cap only bites when the collector is
-    // unreachable, in which case we log and exit rather than risk SIGKILL.
+    // startup), so it is bounded; see `flush_metrics_and_tracing`.
+    flush_metrics_and_tracing(&metrics).await;
+}
+
+/// The final flush of the metrics meter provider and the tracer provider,
+/// bounded: neither `metrics.shutdown()` (a final OTLP export) nor
+/// `shutdown_tracing()` (a 5 s internal batch-processor join) is self-limiting
+/// enough against an unreachable collector, so the combined flush is capped at
+/// `POST_BUDGET_FLUSH_BOUND` (6 s). A reachable collector finishes well inside
+/// this ceiling: each OTLP metrics export request is capped at 3 s
+/// (`otlp::OTLP_EXPORT_TIMEOUT`), the TLS handshake of an `https://` endpoint,
+/// on either exporter, at the same 3 s, and the tracer provider has its own
+/// 5 s internal timeout. TCP connect has no bound of its own: only this 6 s
+/// cap limits it. The cap only bites when the collector is unreachable, in
+/// which case we log and exit rather than risk SIGKILL. The `/metrics` server
+/// must be aborted first, so no scrape exports from a provider mid-shutdown.
+async fn flush_metrics_and_tracing(metrics: &Arc<Metrics>) {
     let post_budget_flush = POST_BUDGET_FLUSH_BOUND;
     let flush = async {
         // Flush + shut down the metrics meter provider so the OTLP
@@ -2390,7 +2836,7 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
         // `shutdown_tracing` — the reader shutdown joins a background worker and
         // must not block a tokio worker.
         {
-            let metrics = Arc::clone(&metrics);
+            let metrics = Arc::clone(metrics);
             let _ = tokio::task::spawn_blocking(move || metrics.shutdown()).await;
         }
 
@@ -2408,28 +2854,238 @@ async fn run(config: Config, trace_export: Option<Arc<TraceExportState>>) {
     }
 }
 
-/// Classify the outcome of one background-task join during shutdown, emit the
-/// appropriate log line, and tick `background_task_panics_total{task}` when
-/// the task panicked (b.3z7 H-obs-3). Separating this into a helper keeps the
-/// `tokio::join!` block readable.
-fn report_background_task_result(
-    metrics: &live_edit::observability::metrics::Metrics,
-    task: &str,
-    result: Result<Result<(), tokio::task::JoinError>, tokio::time::error::Elapsed>,
+/// Hand the listening socket over from the bootstrap server (Step 0a): fire
+/// its shutdown token, wait up to `budget` for in-flight probe and discovery
+/// calls to finish, then abort it if it overruns. Aborting is safe and cannot
+/// strand the port: the other `TcpIncoming` holds a second descriptor for the
+/// same open file description, so the socket stays in `LISTEN` throughout and
+/// arriving connections queue in the shared accept backlog instead of being
+/// refused. Used by the full-API server (Step 8), by held mode, and by a stop
+/// during startup (Step 0a-ter), where no server takes the socket over and
+/// the bootstrap server is simply stopped.
+async fn hand_over_from_bootstrap_server(
+    shutdown: &CancellationToken,
+    server: &mut tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    budget: Duration,
 ) {
-    match result {
-        Ok(Ok(())) => tracing::info!(task = task, "background task stopped cleanly"),
-        Ok(Err(join_err)) => {
-            if join_err.is_panic() {
-                metrics.inc_background_task_panic(task);
-            }
-            tracing::error!(task = task, error = %join_err, "background task failed during shutdown");
+    shutdown.cancel();
+    match tokio::time::timeout(budget, &mut *server).await {
+        Ok(Ok(Ok(()))) => tracing::debug!("bootstrap gRPC server drained"),
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "bootstrap gRPC server exited with an error")
         }
-        Err(_elapsed) => {
+        Ok(Err(e)) => tracing::warn!(error = %e, "bootstrap gRPC server task failed to join"),
+        Err(_) => {
             tracing::warn!(
-                task = task,
-                "background task did not stop within per-task shutdown budget"
+                budget_secs = budget.as_secs(),
+                "bootstrap gRPC server did not drain within the handoff budget — aborting it"
             );
+            server.abort();
         }
+    }
+}
+
+/// What held-mode startup takes from `run`: held mode's own inputs, the
+/// serving half of the gRPC socket, the startup claim whose parts include the
+/// bootstrap server to take it over from, and what the process stops on its
+/// way out.
+struct HeldStartup {
+    held: HeldMode,
+    serving_incoming: tonic::transport::server::TcpIncoming,
+    /// The startup claim (Step 0a-ter): its parts are the bootstrap server,
+    /// its shutdown token and the `/metrics` server, aborted before the final
+    /// flush.
+    startup_claim: StartupClaim<StartupParts>,
+    bootstrap_handoff_budget: Duration,
+    /// The two service-token providers' polling tokens (storage-api and
+    /// Valkey), cancelled on the way out.
+    token_cancels: [CancellationToken; 2],
+}
+
+/// Held-mode startup (SDD SR-5): claim the startup parts and the process
+/// shutdown request, take the socket over from the bootstrap server, and run
+/// held mode until it returns; then stop the service-token providers and the
+/// `/metrics` server, flush, and return, ending the process with 0 — or exit 1
+/// if held mode failed (its server failed, or its hold reactor panicked, which
+/// would leave nothing acting on the verdict). Held mode's un-hold and
+/// closed-poll exits end the process inside it, through the `HoldExit` seam.
+///
+/// The claim comes before the handoff, as Step 7's does: from it on, a
+/// SIGTERM or SIGINT reaches held mode through the shutdown request, and a
+/// signal that arrived before it has already stopped startup (Step 0a-ter),
+/// in which case this waits for that stop to end the process and never
+/// serves (SDD SR-5.6).
+async fn run_held_mode_then_exit(startup: HeldStartup) {
+    let HeldStartup {
+        held,
+        serving_incoming,
+        startup_claim,
+        bootstrap_handoff_budget,
+        token_cancels,
+    } = startup;
+    let Some(((bootstrap_shutdown, mut bootstrap_server, metrics_task), shutdown_request)) =
+        startup_claim.claim_serving()
+    else {
+        match std::future::pending::<std::convert::Infallible>().await {}
+    };
+    let metrics = Arc::clone(&held.metrics);
+    // Held mode's shutdown signal: the process shutdown request, logged as
+    // held mode's own.
+    let shutdown_signal = async move {
+        shutdown_request.cancelled().await;
+        if startup_claim.cause() == Some(SIGINT) {
+            tracing::info!("received SIGINT in held mode");
+        } else {
+            tracing::info!("received SIGTERM in held mode");
+        }
+    };
+    hand_over_from_bootstrap_server(
+        &bootstrap_shutdown,
+        &mut bootstrap_server,
+        bootstrap_handoff_budget,
+    )
+    .await;
+    let served = run_held_mode(held, serving_incoming, shutdown_signal).await;
+    for token in &token_cancels {
+        token.cancel();
+    }
+    metrics_task.abort();
+    let _ = metrics_task.await;
+    flush_metrics_and_tracing(&metrics).await;
+    if served.is_err() {
+        // `run_held_mode` logged the error.
+        std::process::exit(1);
+    }
+}
+
+/// A background task's join handle, present only when the task was spawned.
+type OptionalTaskHandle = Option<tokio::task::JoinHandle<()>>;
+
+/// The Redis-scoped access-token-file provider of
+/// `LIVE_EDIT_VALKEY_AUTH_MODE=accessTokenFile` (Step 0b), or `None` in every
+/// other mode. The service and the DR Jobs connect to Valkey with it alike;
+/// `cancel` stops its polling task.
+fn valkey_access_token_provider(
+    config: &Config,
+    metrics: &Arc<Metrics>,
+    cancel: &CancellationToken,
+) -> Option<Arc<ServiceTokenProvider>> {
+    match (config.valkey_auth_mode, &config.valkey_token_file) {
+        (ValkeyAuthMode::AccessTokenFile, Some(path)) => {
+            // Prolongation floor: `VALKEY_TOKEN_ROTATION_FANOUT_CEILING`
+            // (180 s), taken whole from its single definition site in
+            // `storage::client` rather than re-derived here. It is two
+            // provider-tick intervals under b.7td's rotation gate: one in
+            // which every client takes its first tick after the pickup,
+            // inside the fan-out window, and one of slack that covers a busy
+            // stream reader's `AUTH` landing after its in-flight XREAD
+            // returns (const-asserted in `storage::stream_mux`'s reader) and
+            // a reader's tick running late by the inline step it is waiting
+            // out. A
+            // rotation picked up with less headroom than this before the
+            // outgoing token's expiry may not reach every live connection,
+            // and a connection it misses is dropped and re-established at
+            // expiry instead of prolonged. The provider observes the real
+            // headroom per rotation and WARNs under this bound (b.is1).
+            // Passed in from here — the wiring layer — rather than read
+            // inside `auth`, so `auth` gains no dependency edge on `storage`.
+            let prolongation_floor = chrono::Duration::from_std(
+                VALKEY_TOKEN_ROTATION_FANOUT_CEILING,
+            )
+            .expect("rotation fan-out ceiling (180 s) is representable as a chrono::Duration");
+            let provider = ServiceTokenProvider::new_with_refresh_lead_and_role(
+                path.clone(),
+                Duration::from_secs(config.service_token_poll_interval_secs),
+                // `try_seconds`, not `seconds`: the latter panics past
+                // chrono's `i64::MAX / 1_000` second bound, and the `as i64`
+                // cast would sign-wrap a `u64` at or above `2^63` into a
+                // negative lead. `Config::from_env` rejects both ranges, so
+                // this cannot fail — the `expect` documents that contract
+                // rather than defending against it (b.is1).
+                chrono::Duration::try_seconds(config.valkey_token_refresh_lead_secs as i64).expect(
+                    "LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS is validated for \
+                         chrono representability by Config::from_env",
+                ),
+                Some(prolongation_floor),
+                ServiceTokenProvider::ROLE_VALKEY,
+                Arc::clone(metrics),
+                cancel.clone(),
+            );
+            tracing::info!(
+                path = %path.display(),
+                poll_interval_secs = config.service_token_poll_interval_secs,
+                refresh_lead_secs = config.valkey_token_refresh_lead_secs,
+                "redis-scoped access-token-file provider initialized"
+            );
+            Some(Arc::new(provider))
+        }
+        _ => None,
+    }
+}
+
+/// The AWS credential source of `LIVE_EDIT_VALKEY_AUTH_MODE=iam` (Step 0c),
+/// or `None` in every other mode. The service and the DR Jobs connect to
+/// Valkey with it alike. Exits the process when the default credential chain
+/// resolves no provider.
+async fn valkey_iam_credentials(config: &Config) -> Option<SharedCredentialsProvider> {
+    match config.valkey_auth_mode {
+        ValkeyAuthMode::Iam => {
+            let region = config.valkey_iam_region.clone().expect(
+                "validate_valkey_auth_mode guarantees LIVE_EDIT_VALKEY_IAM_REGION \
+                 is set in iam auth mode",
+            );
+            let http_client = aws_smithy_http_client::Builder::new()
+                .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                    aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+                ))
+                .build_https();
+            let sdk_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .region(aws_config::Region::new(region))
+                .http_client(http_client)
+                .load()
+                .await;
+            let provider = sdk_config.credentials_provider().unwrap_or_else(|| {
+                tracing::error!(
+                    "iam Valkey auth mode: the AWS default credential chain resolved \
+                     no credentials provider (no IRSA / environment / profile source \
+                     available); cannot AUTH to Valkey"
+                );
+                std::process::exit(1);
+            });
+            tracing::info!(
+                service = ?config.valkey_iam_service,
+                "iam Valkey AWS credential source initialized"
+            );
+            Some(provider)
+        }
+        _ => None,
+    }
+}
+
+/// The storage-api service-identity token provider (Step 1b-v), when
+/// `LIVE_EDIT_SERVICE_TOKEN_FILE` is set. The service and the DR Jobs build
+/// their backup store with it alike; `cancel` stops its polling task.
+fn storage_api_token_provider(
+    config: &Config,
+    metrics: &Arc<Metrics>,
+    cancel: &CancellationToken,
+) -> Option<Arc<ServiceTokenProvider>> {
+    match &config.service_token_file {
+        Some(path) => {
+            let provider = ServiceTokenProvider::new_with_role(
+                path.clone(),
+                Duration::from_secs(config.service_token_poll_interval_secs),
+                ServiceTokenProvider::ROLE_STORAGE_API,
+                Arc::clone(metrics),
+                cancel.clone(),
+            );
+            tracing::info!(
+                path = %path.display(),
+                poll_interval_secs = config.service_token_poll_interval_secs,
+                "service token provider initialized"
+            );
+            Some(Arc::new(provider))
+        }
+        None => None,
     }
 }

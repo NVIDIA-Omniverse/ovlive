@@ -23,14 +23,14 @@
 //!
 //! 1. **Path-index walk surfaces ghosts; ghosts with a session-checkpoint
 //!    blob are recovered, restored, and the composite member is
-//!    preserved.** The pre-recovery code SREM'd every empty-HGETALL
-//!    member unconditionally; SR-2.7 changes that to "recover or SREM"
+//!    preserved.** The pre-recovery code removed every empty-HGETALL
+//!    member unconditionally; SR-2.7 changes that to "recover or remove"
 //!    based on the adapter's `get_session_checkpoint` outcome.
 //!
-//! 2. **Ghosts with NO backing checkpoint stay SREM'd** — the legacy
-//!    opportunistic-cleanup behaviour customers depending on
-//!    `checkpoint_enabled=false` still see, AND the cleanup path for a
-//!    genuinely-orphaned path-index member.
+//! 2. **Ghosts with NO backing checkpoint are retired** — vetoed, then
+//!    both index members released (`SessionStore::retire_ghost_member`,
+//!    b.2tu): the clean-up path for a genuinely-orphaned names member, and
+//!    what `checkpoint_enabled=false` deployments see for every ghost.
 //!
 //! 3. **Composite-name index membership preserved exactly** after a
 //!    recovery pass. SR-2.7 explicitly calls out `name\0session_id` as
@@ -82,7 +82,7 @@
 //! `TEST_VALKEY_URL`. Under the project sandbox the URL must include the
 //! password and `host.docker.internal` host; see CLAUDE.md.
 
-use fred::interfaces::{HashesInterface, SetsInterface};
+use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
 use tonic::Request;
 
 use live_edit::grpc::proto::{CreateSessionRequest, ListSessionsRequest};
@@ -426,28 +426,28 @@ async fn list_sessions_recovers_session_via_path_index_walk() {
 // Scenario 2 — ghost member with no checkpoint is swept.
 // =============================================================================
 
-/// Pin SR-2.7 contract #2: a path-index member whose `session_id` has
+/// Pin SR-2.7 contract #2: a names member whose `session_id` has
 /// neither a surviving `le:{sid}:sess` hash NOR a session-checkpoint
-/// blob must be SREM'd from `path_names_index` by
-/// `reconcile_ghost_members`, AND the corresponding session MUST be
-/// absent from the `ListSessions` response. The `not_recoverable`
-/// metric ticks by exactly 1.
+/// blob must be retired by `reconcile_ghost_members` — the id vetoed,
+/// then the member released from `path_names_index` — AND the
+/// corresponding session MUST be absent from the `ListSessions`
+/// response. The `not_recoverable` metric ticks by exactly 1.
 ///
 /// Why each step is load-bearing:
 ///
 /// - The synthetic ghost is `SADD`'d directly into `path_names_index`
 ///   WITHOUT going through CreateSession — there is no session_meta
 ///   hash, no checkpoint blob, no legitimate identity. This is the
-///   "truly orphaned path-index member" surface that opportunistic-
-///   cleanup is designed to retire. A test that used a wiped real
+///   "truly orphaned names member" surface the retirement exists for.
+///   A test that used a wiped real
 ///   session would mix the NoCheckpoint outcome with whatever residual
 ///   adapter blob the harness might still hold (the LocalDisk path
 ///   never went through the dispatcher because CreateSession never
 ///   ran).
 /// - The `SISMEMBER ... == 0` post-call assertion is the load-bearing
-///   SREM proof. A regression that SKIPPED the SREM (e.g., a refactor
-///   that collapsed the `NoCheckpoint` arm with the `Error` arm) would
-///   leave the ghost in the names set; the next ListSessions walk
+///   release proof. A regression that SKIPPED the release (e.g., a
+///   refactor that collapsed the `NoCheckpoint` arm with the `Error` arm)
+///   would leave the ghost in the names set; the next ListSessions walk
 ///   would hit it again and tick another `not_recoverable` — an
 ///   observable but easy-to-miss leak.
 /// - The metric assertion uses `wait_for_recovery_metric` rather than
@@ -483,8 +483,8 @@ async fn list_sessions_ghost_member_with_no_checkpoint_is_swept() {
 
     // Sanity-check: the ghost member is in the names set pre-call. A
     // failed SADD here (somehow) would make the post-call SISMEMBER==0
-    // assertion meaningless — it would pass even if the SREM never
-    // fired.
+    // assertion meaningless — it would pass even if the release never
+    // ran.
     let path_names_key = harness.tv.key_schema().path_names_index(GHOST_BASE_PATH);
     let ghost_composite = KeySchema::path_name_member(GHOST_SESSION_NAME, GHOST_SESSION_ID);
     let pre_call_member: bool = harness
@@ -498,22 +498,23 @@ async fn list_sessions_ghost_member_with_no_checkpoint_is_swept() {
         pre_call_member,
         "pre-call sanity: composite ghost member MUST be present in \
          path_names_index before the ListSessions walk; a failed SADD would \
-         make the post-call SREM assertion meaningless"
+         make the post-call release assertion meaningless"
     );
 
     // Dispatch ListSessions. reconcile_ghost_members invokes
     // try_recover_session for the ghost; the LocalDisk adapter returns
     // Ok(None) (no blob for the synthetic session_id), so the hook
-    // reports NoCheckpoint; the ghost is SREM'd and excluded from the
-    // response.
+    // reports NoCheckpoint; the ghost is vetoed, released and excluded
+    // from the response.
     let response = handle_list_sessions(&harness.svc, list_sessions_request(GHOST_BASE_PATH))
         .await
         .expect("ListSessions MUST succeed; the ghost-sweep is silent");
     let proto_sessions = response.into_inner().sessions;
 
     // The ghost is absent from the response — reconcile_ghost_members
-    // returns ONLY the `Recovered`/`AlreadyPresent` arms in its
-    // result vec; the NoCheckpoint arm SREMs and excludes.
+    // returns the `Recovered`/`AlreadyPresent` arms, and a ghost whose veto
+    // found metadata; this one's veto finds none, so it is released and
+    // excluded.
     assert!(
         proto_sessions.is_empty(),
         "ListSessions response MUST be empty when the only path-index member \
@@ -524,9 +525,9 @@ async fn list_sessions_ghost_member_with_no_checkpoint_is_swept() {
         proto_sessions.len()
     );
 
-    // SISMEMBER post-call: the ghost has been SREM'd from
-    // path_names_index. This is the load-bearing opportunistic-cleanup
-    // assertion. The Subtask body pins `SISMEMBER ... == 0` explicitly.
+    // SISMEMBER post-call: the ghost has been released from
+    // path_names_index. This is the load-bearing clean-up assertion. The
+    // Subtask body pins `SISMEMBER ... == 0` explicitly.
     let post_call_member: bool = harness
         .tv
         .client()
@@ -537,17 +538,31 @@ async fn list_sessions_ghost_member_with_no_checkpoint_is_swept() {
     assert!(
         !post_call_member,
         "post-call SISMEMBER MUST be 0 for the ghost composite member — \
-         reconcile_ghost_members's NoCheckpoint arm calls srem_ghost_member \
-         which SREMs both path_names_index and the legacy path_index. A \
-         surviving member means the SREM never fired (regression in the \
+         reconcile_ghost_members's NoCheckpoint arm retires the ghost through \
+         SessionStore::retire_ghost_member, which vetoes the id and then \
+         releases both path_names_index and the legacy path_index member. A \
+         surviving member means the release never ran (regression in the \
          NoCheckpoint arm, or the Error arm silently caught the NoCheckpoint \
-         outcome and conservatively skipped SREM)."
+         outcome and conservatively kept the members)."
+    );
+    // ...and only after the veto, so no late metadata write can complete the
+    // released id.
+    let vetoed: bool = harness
+        .tv
+        .client()
+        .pool
+        .exists(harness.tv.key_schema().session_meta_veto(GHOST_SESSION_ID))
+        .await
+        .expect("EXISTS veto probe must succeed");
+    assert!(
+        vetoed,
+        "the walk must veto the ghost's id before releasing its members"
     );
 
-    // The legacy path_index entry is also SREM'd (defense-in-depth —
-    // srem_ghost_member targets both indices). A surviving entry here
-    // would surface in the next walk's `present` arm if the composite
-    // member somehow re-appeared.
+    // The legacy path_index entry is released too (the release script
+    // removes both members at once). A surviving entry here would surface
+    // in the next walk's `present` arm if the composite member somehow
+    // re-appeared.
     let path_index_key = harness.tv.key_schema().path_index(GHOST_BASE_PATH);
     let legacy_member: bool = harness
         .tv
@@ -559,7 +574,7 @@ async fn list_sessions_ghost_member_with_no_checkpoint_is_swept() {
     assert!(
         !legacy_member,
         "post-call SISMEMBER MUST be 0 for the ghost session_id in the legacy \
-         path_index — srem_ghost_member SREMs both indices symmetrically"
+         path_index — the release removes both members at once"
     );
 
     // Metric assertion: `not_recoverable` ticked by exactly 1 (the

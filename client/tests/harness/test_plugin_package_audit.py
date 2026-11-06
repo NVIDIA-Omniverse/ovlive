@@ -42,3 +42,14 @@ class PluginPackageAuditTests(unittest.TestCase):
                 patch.object(package.subprocess, 'check_output', return_value=report.replace('libusd_sdf', 'libOmniClient')):
             with self.assertRaises(AssertionError):
                 package.check_dependency_metadata(Path('fixture.dylib'))
+
+    def test_pe_dependency_exports_come_from_linker_directives_of_the_linked_libraries(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'grpc-release/lib').mkdir(parents=True)
+            (root / 'grpc-release/lib/grpc.lib').write_bytes(
+                b'\0 /DEFAULTLIB:"MSVCRT" /EXPORT:upb_Registry_force_linkage,DATA \0 -export:other_symbol \0')
+            (root / 'zlib-release/lib').mkdir(parents=True)
+            (root / 'zlib-release/lib/zlib.lib').write_bytes(b'\0 upb_not_a_directive EXPORTS \0')
+            self.assertEqual(package.directive_exports(root), {'upb_Registry_force_linkage', 'other_symbol'})

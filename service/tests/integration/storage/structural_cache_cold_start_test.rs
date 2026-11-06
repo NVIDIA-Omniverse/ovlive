@@ -150,7 +150,7 @@ use crate::storage::snapshot_read_atomic_test::{
 use crate::storage::snapshot_read_support::{
     client_through, client_through_with_limits, client_with_limits, error_reply_script,
     monitor_fence, on_current_thread, read_too_large, test_valkey_addr, MonitorTap,
-    MonitoredCommand, ProxyAction, ProxyRule, ReplyGate, ScriptReplyProxy,
+    MonitoredCommand, ProxyAction, ProxyRule, ReplyGate, ScriptCalls, ScriptReplyProxy,
 };
 
 /// A budget no single fixture entry comes near.
@@ -334,8 +334,12 @@ async fn warm_snapshot_script(tv: &TestValkey, oid: u64) {
 }
 
 /// Load the fence scripts (acquire, release) into the store's script cache:
-/// one fenced cold start of an object of its own. For the tests whose proxy
-/// rule or `MONITOR` record must see each fence script's `EVALSHA` once.
+/// one fenced cold start of an object of its own. For the tests whose
+/// `MONITOR` record, or a reply their proxy holds, should see each fence
+/// script's `EVALSHA` run at once rather than after a `NOSCRIPT` round trip.
+/// A concurrent test's `SCRIPT FLUSH` can still empty the cache after the
+/// warm-up, so a test that counts a fence script's calls counts them with a
+/// [`ScriptCalls`] ([`counted_fence_acquire_rule`]), not by relying on it.
 async fn warm_fence_scripts(tv: &TestValkey, ls: &LayerStore, layer: &str) {
     let oid = seeded_object(tv, ls, &format!("{layer}-warm")).await;
     let client = fenced_route_client(tv, oid).await;
@@ -786,14 +790,29 @@ fn release_sha() -> String {
 /// Apply `action` to the fence acquire whose fence key (`KEYS[1]`, frame
 /// argument 3) is `fence_key`.
 fn fence_acquire_rule(fence_key: String, action: ProxyAction) -> ProxyRule {
+    counted_fence_acquire_rule(fence_key, action).0
+}
+
+/// [`fence_acquire_rule`], also counting the acquire's calls through the
+/// proxy on the returned [`ScriptCalls`]: a send answered `NOSCRIPT` and sent
+/// again after the reload is one call, though `action` applies to each send.
+/// Every acquire through the proxy must be the subject's.
+fn counted_fence_acquire_rule(
+    fence_key: String,
+    action: ProxyAction,
+) -> (ProxyRule, Arc<ScriptCalls>) {
     let sha = acquire_sha();
-    Arc::new(move |args: &[Vec<u8>]| {
+    let calls = Arc::new(ScriptCalls::new(sha.clone()));
+    let counted = Arc::clone(&calls);
+    let rule: ProxyRule = Arc::new(move |args: &[Vec<u8>]| {
+        counted.see(args);
         let name = args.first()?.to_ascii_uppercase();
         (name == b"EVALSHA"
             && args.get(1).map(Vec::as_slice) == Some(sha.as_bytes())
             && args.get(3).map(Vec::as_slice) == Some(fence_key.as_bytes()))
         .then(|| action.clone())
-    })
+    });
+    (rule, calls)
 }
 
 // ── Proxy rules ──────────────────────────────────────────────────────────────
@@ -1889,11 +1908,9 @@ async fn cold_start_fenced_reads_of_two_objects_run_one_at_a_time() {
     warm_fence_scripts(&tv, &ls, "cs-permit").await;
     let plain_items = item_bound(&tv, a).await.max(item_bound(&tv, b).await) - 1;
     let gate = ReplyGate::new();
-    let proxy = ScriptReplyProxy::start(
-        test_valkey_addr(),
-        fence_acquire_rule(fence_key(&tv, a), ProxyAction::HoldReplies(gate.clone())),
-    )
-    .await;
+    let (rule, acquires) =
+        counted_fence_acquire_rule(fence_key(&tv, a), ProxyAction::HoldReplies(gate.clone()));
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
     let client_a = client_through_with_limits(&proxy, plain_items, NO_BYTE_LIMIT).await;
     let client_b = client_with_limits(plain_items, NO_BYTE_LIMIT).await;
     let metrics_b = hooked_metrics("cs-permit-b", &[&client_b]).await;
@@ -1927,7 +1944,7 @@ async fn cold_start_fenced_reads_of_two_objects_run_one_at_a_time() {
         );
     }
     assert_eq!(
-        (fenced_reads(&metrics_b, "ok"), proxy.hits()),
+        (fenced_reads(&metrics_b, "ok"), acquires.calls()),
         (1, 1),
         "B's fenced read ran after A's; the proxy held exactly A's acquire"
     );
@@ -3002,7 +3019,10 @@ async fn fenced_cold_start_holds_no_pair_p_f_or_grant_through_a_retry_after_slee
 /// pair, `P_f` and its grant; the task is then aborted. Everything must be
 /// given back — the pair, `P_f`, the grant — and the lease released (the
 /// lease guard's background release), and a second fenced cold start on the
-/// same cache and client then loads.
+/// same cache and client then loads. The read's lease is lengthened
+/// (`lengthen_fence_leases`) and checked once the read is held, so a renewal
+/// landing late cannot end the held attempt and let an unheld retry finish
+/// the read before the abort; the hook's sizes stay production-sized.
 ///
 /// Needs `test-fault-injection` (the read's fault seam).
 #[cfg(feature = "test-fault-injection")]
@@ -3019,7 +3039,7 @@ async fn fenced_cold_start_cancelled_mid_read_gives_back_its_pair_p_f_grant_and_
     let a_cards = probed_cardinalities(&tv, a).await;
     let client = client_with_limits(plain_items, NO_BYTE_LIMIT).await;
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
-    injector.push_delay_at(
+    injector.lengthen_fence_leases(true).push_delay_at(
         ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
         FAN_OUT_DELAY,
     );
@@ -3041,6 +3061,13 @@ async fn fenced_cold_start_cancelled_mid_read_gives_back_its_pair_p_f_grant_and_
         );
         tokio::time::sleep(POLL_PAUSE).await;
     }
+    live_edit::storage::test_support::assert_fence_lease_lengthened(
+        tv.client(),
+        tv.key_schema(),
+        a,
+        &client,
+    )
+    .await;
     assert_eq!(
         fenced_capacity(&client, &cache),
         reading,
@@ -3063,11 +3090,13 @@ async fn fenced_cold_start_cancelled_mid_read_gives_back_its_pair_p_f_grant_and_
 }
 
 /// T6(d) and T9's broken half — three broken attempts. Under each of the
-/// fenced read's leases the header `seq` moves (a raw `HINCRBY` while the
-/// fault seam holds the fan-out's first command back), so every release
-/// answers `BROKEN`. After `FENCE_READ_ATTEMPTS` the read fails for this call
-/// only: `Uncacheable { FencedReadFailed }` with the layer's size, one
-/// `fenced_read_failed` tick and its DEBUG line (cause `broken`), no
+/// fenced read's leases the header `seq` moves (a raw `HINCRBY` the test
+/// issues while the fault seam's hold parks that attempt's first fan-out
+/// command, then releases it), so every release answers `BROKEN`. Each lease
+/// is lengthened (`lengthen_fence_leases`), so a renewal landing late cannot
+/// break a parked attempt first. After `FENCE_READ_ATTEMPTS` the read fails
+/// for this call only: `Uncacheable { FencedReadFailed }` with the layer's
+/// size, one `fenced_read_failed` tick and its DEBUG line (cause `broken`), no
 /// cold-start tick, no negative entry, every lease released and the pair,
 /// `P_f` and the grant given back. The next cold start loads.
 ///
@@ -3075,64 +3104,66 @@ async fn fenced_cold_start_cancelled_mid_read_gives_back_its_pair_p_f_grant_and_
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fenced_cold_start_broken_three_times_fails_for_this_call_only_and_gives_everything_back() {
+    use crate::storage::snapshot_read_support::HeldCommand;
     use live_edit::storage::diff_read::{
         ObjectSnapshotReadFaultInjector, ObjectSnapshotReadFaultTarget, ObjectSnapshotReader,
     };
     use live_edit::storage::snapshot_fence::FENCE_READ_ATTEMPTS;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    /// Long enough for the watcher, polling every [`POLL_PAUSE`], to move
-    /// the header under the lease before the fan-out reads it.
-    const FAN_OUT_DELAY: Duration = Duration::from_millis(300);
     let tv = TestValkey::setup().await;
     let ls = layer_store(&tv);
     let oid = seeded_object(&tv, &ls, "cs-broken-thrice").await;
     let cards = probed_cardinalities(&tv, oid).await;
     let client = fenced_route_client(&tv, oid).await;
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
-    for _ in 0..FENCE_READ_ATTEMPTS {
-        injector.push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-            FAN_OUT_DELAY,
-        );
-    }
+    injector.lengthen_fence_leases(true);
+    let attempts: Vec<HeldCommand> = (0..FENCE_READ_ATTEMPTS)
+        .map(|_| {
+            HeldCommand::new(
+                injector.push_hold_at(ObjectSnapshotReadFaultTarget::nth_command(
+                    ObjectSnapshotReader::FencedFanout,
+                    0,
+                )),
+            )
+        })
+        .collect();
     client.install_object_snapshot_read_fault_injector_for_test(Arc::clone(&injector));
     let metrics = hooked_metrics("cs-broken-thrice", &[&client]).await;
     let cache = StructuralCache::new(BUDGET_BYTES);
-    // The watcher: one header move per lease it sees.
-    let stop = Arc::new(AtomicBool::new(false));
-    let moved = Arc::new(StdMutex::new(std::collections::BTreeSet::<String>::new()));
-    let watcher = {
-        let (data, fence, hdr) = (
-            tv.client().clone(),
-            fence_key(&tv, oid),
-            tv.key_schema().obj_header(&oid.to_string()),
-        );
-        let (stop, moved) = (Arc::clone(&stop), Arc::clone(&moved));
-        tokio::spawn(async move {
-            while !stop.load(Ordering::SeqCst) {
-                let fields: HashMap<String, String> =
-                    data.pool.hgetall(&fence).await.expect("HGETALL fence");
-                for lease in fields.into_keys().filter(|k| k.starts_with("r:")) {
-                    if moved.lock().expect("moved").insert(lease) {
-                        let _: i64 = data
-                            .pool
-                            .hincrby(&hdr, "seq", 1)
-                            .await
-                            .expect("HINCRBY seq");
-                    }
-                }
-                tokio::time::sleep(POLL_PAUSE).await;
-            }
-        })
+    // Once per attempt, while it is parked under its live lease: move the
+    // header's seq, then let the attempt go on to its broken release. Answers
+    // the leases it moved the header under.
+    let break_every_attempt = async {
+        let hdr = tv.key_schema().obj_header(&oid.to_string());
+        let mut moved = std::collections::BTreeSet::<String>::new();
+        for (i, attempt) in attempts.iter().enumerate() {
+            let what = format!("attempt {}", i + 1);
+            attempt.parked_within(WAIT_BUDGET, &what).await;
+            live_edit::storage::test_support::assert_fence_lease_lengthened(
+                tv.client(),
+                tv.key_schema(),
+                oid,
+                &client,
+            )
+            .await;
+            moved.extend(lease_fields(&tv, oid).await);
+            let _: i64 = tv
+                .client()
+                .pool
+                .hincrby(&hdr, "seq", 1)
+                .await
+                .expect("HINCRBY seq");
+            attempt.release();
+        }
+        moved
     };
 
-    let (answer, captured) = capture_debug(tokio::time::timeout(
-        WAIT_BUDGET,
-        cold_start_probed(&client, tv.key_schema(), &cache, oid, CLIENT_ID, cards),
-    ))
-    .await;
-    stop.store(true, Ordering::SeqCst);
-    watcher.await.expect("the watcher must not panic");
+    let ((answer, captured), moved) = tokio::join!(
+        capture_debug(tokio::time::timeout(
+            WAIT_BUDGET,
+            cold_start_probed(&client, tv.key_schema(), &cache, oid, CLIENT_ID, cards),
+        )),
+        break_every_attempt
+    );
     let answer = answer.expect("the cold start must finish within the budget");
 
     let (reason, above_ceiling) = expect_uncacheable_sized(answer, "broken three times");
@@ -3144,7 +3175,7 @@ async fn fenced_cold_start_broken_three_times_fails_for_this_call_only_and_gives
     );
     assert_eq!(
         (
-            moved.lock().expect("moved").len(),
+            moved.len(),
             fenced_reads(&metrics, "fence_broken"),
             fenced_reads(&metrics, "ok")
         ),
@@ -3214,11 +3245,9 @@ async fn fenced_cold_start_reserves_the_snapshot_plus_one_window_before_its_acqu
     warm_fence_scripts(&tv, &ls, "cs-grant").await;
     let cards = probed_cardinalities(&tv, oid).await;
     let gate = ReplyGate::new();
-    let proxy = ScriptReplyProxy::start(
-        test_valkey_addr(),
-        fence_acquire_rule(fence_key(&tv, oid), ProxyAction::HoldReplies(gate.clone())),
-    )
-    .await;
+    let (rule, acquires) =
+        counted_fence_acquire_rule(fence_key(&tv, oid), ProxyAction::HoldReplies(gate.clone()));
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
     let client =
         client_through_with_limits(&proxy, item_bound(&tv, oid).await - 1, NO_BYTE_LIMIT).await;
     let cache = StructuralCache::new(BUDGET_BYTES);
@@ -3245,7 +3274,7 @@ async fn fenced_cold_start_reserves_the_snapshot_plus_one_window_before_its_acqu
          of T"
     );
     assert_eq!(
-        (loaded.route, proxy.hits()),
+        (loaded.route, acquires.calls()),
         (ColdStartRoute::Fenced, 1),
         "fixture: the held reply was the cold start's one acquire"
     );

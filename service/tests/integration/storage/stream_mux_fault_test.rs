@@ -1410,6 +1410,196 @@ async fn one_oversized_entry_into_an_empty_queue_never_ends_its_subscriber() {
     assert_eq!(overflow_kills(&metrics), (0, 1));
 }
 
+/// b.ntm (T14, T8): a subscription its backlog hard cap ends has its hold's
+/// bytes counted as pending release on the live-delivery ledger while it is
+/// still registered — they are going with it, so the budget ends no other
+/// subscription for them — and drains the entries it accepted before its
+/// `inner_watchdog` ending. Once its consumer and its hold go, the hold's
+/// counters, the pending credit and the ledger's charges are back to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_registration_its_hard_cap_ends_is_credited_as_pending_release_until_its_hold_goes() {
+    use live_edit::storage::notifications::{reserve_layer_stream, StreamCursor};
+    use live_edit::storage::stream_mux::delivery_ledger::{
+        HoldIdentity, RELAY_ENTRY_OVERHEAD_BYTES,
+    };
+
+    const OID: u64 = 16;
+    const HARD_CAP: usize = 4;
+    let tv = TestValkey::setup_with_readers(1).await;
+    let metrics = install_metrics(&tv).await;
+    tv.client().stream_mux.set_knobs_for_test(StreamMuxKnobs {
+        channel_capacity: HARD_CAP / 2,
+        backlog_hard_cap: HARD_CAP,
+        backlog_bytes: 1 << 30,
+        backlog_hard_bytes: 1 << 30,
+        send_watchdog: Duration::from_secs(60),
+        ..tv.client().stream_mux.knobs()
+    });
+    let ledger = std::sync::Arc::clone(tv.client().stream_mux.delivery_ledger());
+    let hold = ledger.register_hold(HoldIdentity::default());
+    let consumer = reserve_layer_stream(
+        tv.client(),
+        tv.key_schema(),
+        OID,
+        tokio::time::Instant::now() + SETTLE,
+    )
+    .await
+    .expect("a reader is reserved")
+    .with_hold(&hold)
+    .register(&StreamCursor::From("0-0".to_string()))
+    .expect("the stream registers");
+
+    for seq in 1..=(HARD_CAP as u64 + 2) {
+        xadd_sized(&tv, OID, seq, OMPF_BYTES).await;
+    }
+    await_series(&metrics, OVERFLOW_KILLS, &[("bound", "entries")], 1).await;
+    let held = hold.pipeline_bytes() + hold.backlog_entries() * RELAY_ENTRY_OVERHEAD_BYTES;
+    let pending = ledger.pending_release_bytes();
+    assert!(
+        pending > 0 && pending <= held,
+        "the ended registration's chargeable bytes are pending release ({pending} B of the \
+         {held} B it holds)"
+    );
+    assert_eq!(
+        hold.ending_reason(),
+        None,
+        "the hold itself is not ended: the stream's own ending reaches the subscription"
+    );
+
+    assert_eq!(
+        recv_seqs(&consumer, HARD_CAP).await,
+        (1..=HARD_CAP as u64).collect::<Vec<_>>(),
+        "the entries accepted before the ending drain first"
+    );
+    assert_ends_with(&consumer, STREAM_EXIT_INNER_WATCHDOG).await;
+    drop(consumer);
+    assert_eq!(
+        (
+            hold.pipeline_entries(),
+            hold.backlog_entries(),
+            hold.pipeline_bytes()
+        ),
+        (0, 0, 0)
+    );
+    drop(hold);
+    assert_eq!(
+        (
+            ledger.pending_release_bytes(),
+            ledger.charged_bytes(),
+            ledger.holds()
+        ),
+        (0, 0, 0),
+        "the credit leaves with the hold, and nothing is left charged"
+    );
+}
+
+/// b.ntm (T7 c): a subscriber sending one update with the next queued is
+/// lone, so the live-delivery budget never ends it, even with the budget
+/// below one entry — the pass that finds the replica over counts an
+/// overshoot instead — and a third entry is bounded by its own backlog's
+/// hard byte cap, which fits the queued one but not two: the registration
+/// is ended `inner_watchdog`, on `bytes`, never `delivery_budget`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lone_subscriber_over_the_budget_counts_an_overshoot_and_its_byte_cap_ends_the_third_entry(
+) {
+    use live_edit::storage::notifications::{reserve_layer_stream, StreamCursor};
+    use live_edit::storage::stream_mux::delivery_ledger::HoldIdentity;
+
+    const OID: u64 = 17;
+    const OVERSHOOTS: &str = "live_edit_subscriber_delivery_budget_overshoots_total";
+    let tv = TestValkey::setup_with_readers(1).await;
+    let metrics = install_metrics(&tv).await;
+    let entry = sized_entry_bytes(OID, 1, OMPF_BYTES);
+    assert_eq!(
+        sized_entry_bytes(OID, 3, OMPF_BYTES),
+        entry,
+        "fixture self-check: the three entries are one size"
+    );
+    tv.client().stream_mux.set_knobs_for_test(StreamMuxKnobs {
+        channel_capacity: 1_000,
+        backlog_hard_cap: 10_000,
+        backlog_bytes: 1 << 30,
+        // One queued entry fits; a second beside it does not.
+        backlog_hard_bytes: entry,
+        send_watchdog: Duration::from_secs(60),
+        ..tv.client().stream_mux.knobs()
+    });
+    let ledger = std::sync::Arc::clone(tv.client().stream_mux.delivery_ledger());
+    let budget = 512;
+    assert!(
+        budget < OMPF_BYTES as u64,
+        "fixture self-check: below one entry"
+    );
+    ledger.set_budget_bytes_for_test(budget);
+    let hold = ledger.register_hold(HoldIdentity::default());
+    let consumer = reserve_layer_stream(
+        tv.client(),
+        tv.key_schema(),
+        OID,
+        tokio::time::Instant::now() + SETTLE,
+    )
+    .await
+    .expect("a reader is reserved")
+    .with_hold(&hold)
+    .register(&StreamCursor::From("0-0".to_string()))
+    .expect("the stream registers");
+
+    // The first entry, received and held: the update being sent.
+    xadd_sized(&tv, OID, 1, OMPF_BYTES).await;
+    let sending = tokio::time::timeout(SETTLE, consumer.recv_held())
+        .await
+        .expect("the first entry arrives")
+        .expect("the stream is open");
+    // The second, queued behind it: the subscriber is lone, and the replica
+    // is over the budget by the queued entry.
+    xadd_sized(&tv, OID, 2, OMPF_BYTES).await;
+    await_series(&metrics, OVERSHOOTS, &[], 1).await;
+    assert_eq!(
+        (hold.pipeline_entries(), hold.backlog_entries()),
+        (2, 1),
+        "one received, one queued"
+    );
+    assert_eq!(
+        read_series(&metrics, OVERSHOOTS, &[]),
+        1,
+        "one pass found the replica over with only a lone holder: the first entry alone \
+         was within the budget, its largest copy excused"
+    );
+    assert_eq!(
+        hold.ending_reason(),
+        None,
+        "a lone holder is never ended for the budget"
+    );
+    assert_eq!(overflow_kills(&metrics), (0, 0));
+
+    // The third: its own byte cap ends the registration.
+    xadd_sized(&tv, OID, 3, OMPF_BYTES).await;
+    await_series(&metrics, OVERFLOW_KILLS, &[("bound", "bytes")], 1).await;
+    assert_eq!(overflow_kills(&metrics), (0, 1));
+    assert_eq!(
+        hold.ending_reason(),
+        None,
+        "the registration's own cap ends it, never the live-delivery budget"
+    );
+    drop(sending);
+    assert_eq!(
+        recv_seqs(&consumer, 1).await,
+        [2],
+        "the queued entry drains before the ending"
+    );
+    assert_ends_with(&consumer, STREAM_EXIT_INNER_WATCHDOG).await;
+    drop(consumer);
+    drop(hold);
+    assert_eq!(
+        (
+            ledger.pending_release_bytes(),
+            ledger.charged_bytes(),
+            ledger.holds()
+        ),
+        (0, 0, 0)
+    );
+}
+
 /// Before its first poll a subscriber is bounded by the hard caps only: a
 /// backlog past both soft thresholds (entries and bytes) outlives the
 /// watchdog, and every entry is delivered once it drains. (Its hard caps still

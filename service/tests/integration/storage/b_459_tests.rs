@@ -162,6 +162,10 @@ use oodf_ffi::{
     TimeSample as OodfTimeSample,
 };
 
+// A setup commit that creates a section a test later deletes also creates the
+// layer's root section, so the delete keeps a top-level section and is not
+// refused by the layer-root rule (SDD §9.7) before the guard under test.
+use crate::common::owned_delta::with_root;
 // The snapshot read's own counter, `live_edit_snapshot_read_type_error_total`,
 // read through b.atj's asserters rather than a copy, for the reason
 // `b_atj_tests` imports b.muu's: one definition of "only this family moved".
@@ -854,7 +858,7 @@ async fn txn_wrongtype_children_index_of_a_marked_object_is_caught_by_the_snapsh
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn txn_wrongtype_new_tombstone_key_refuses_whole_commit() {
     let fx = Fixture::new("b459-tomb", UpdateLayerBackend::Txn).await;
-    fx.update(create_section_delta(SECTION_ID, "Doomed"), 1_000)
+    fx.update(with_root(create_section_delta(SECTION_ID, "Doomed")), 1_000)
         .await
         .expect("the setup commit must land on a clean keyspace");
 
@@ -1241,7 +1245,7 @@ async fn txn_wrongtype_children_list_key_is_caught_by_the_snapshot_read_not_the_
 async fn txn_wrongtype_key_the_commit_only_dels_is_caught_by_the_snapshot_read_not_the_probe() {
     let fx = Fixture::new("b459-delonly", UpdateLayerBackend::Txn).await;
     unmark(&fx).await;
-    fx.update(create_section_delta(SECTION_ID, "Doomed"), 1_000)
+    fx.update(with_root(create_section_delta(SECTION_ID, "Doomed")), 1_000)
         .await
         .expect("the setup commit must land on a clean keyspace");
 
@@ -1373,7 +1377,7 @@ async fn txn_wrongtype_children_list_the_marked_index_does_not_name_is_healed_by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn txn_wrongtype_unindexed_leaf_list_the_commit_only_dels_is_healed_on_a_marked_object() {
     let fx = Fixture::new("b459-delonly-heal", UpdateLayerBackend::Txn).await;
-    fx.update(create_section_delta(SECTION_ID, "Doomed"), 1_000)
+    fx.update(with_root(create_section_delta(SECTION_ID, "Doomed")), 1_000)
         .await
         .expect("the setup commit must land on a clean keyspace");
     let leaf_children_key = fx
@@ -1850,7 +1854,7 @@ async fn txn_many_mutations_against_one_wrong_typed_index_refuse_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn txn_wrongtype_deleted_sections_index_is_caught_by_the_snapshot_read_not_the_probe() {
     let fx = Fixture::new("b459-dels", UpdateLayerBackend::Txn).await;
-    fx.update(create_section_delta(SECTION_ID, "Doomed"), 1_000)
+    fx.update(with_root(create_section_delta(SECTION_ID, "Doomed")), 1_000)
         .await
         .expect("the setup commit must land on a clean keyspace");
 

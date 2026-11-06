@@ -176,6 +176,16 @@ const STREAM_MUX_XREAD_REPLY_BYTES_BUCKETS: &[f64] = &[
     67_108_864.0,
 ];
 
+/// Bucket boundaries for `live_edit_checkpoint_adapter_call_duration_seconds`
+/// (seconds), 2.5 ms to 200 s. 0.005–0.025 resolve a sidecar GET; 0.25–1 a
+/// LIST page; 2.5–10 a multi-MB PUT; 32 brackets one default 30 s request
+/// timeout; 100 one auth attempt's full retry ladder (3 × 30 s plus at most
+/// 0.3 s of backoff); and 200 the 180 s default per-call ceiling, so a call cut
+/// at its ceiling lands in the (100, 200] band rather than in `+Inf`.
+const CHECKPOINT_ADAPTER_CALL_DURATION_BUCKETS: &[f64] = &[
+    0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 32.0, 100.0, 200.0,
+];
+
 /// Bucket boundaries for external auth call duration (seconds).
 const AUTH_CALL_DURATION_BUCKETS: &[f64] = &[
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -430,6 +440,14 @@ pub const CHECKPOINT_RECONCILE_OUTCOMES: &[&str] = &[
     "ext_collected",
     "ext_spared",
     "live_set_failed",
+    "ext_deferred_live",
+    "ext_deferred_rearmed",
+    "ext_healed",
+    "ext_heal_unavailable",
+    "publish_deferred",
+    "dead_retired",
+    "listed_sidecar_skipped",
+    "deferred_older_build",
 ];
 
 /// The pinned `phase` vocabulary of
@@ -542,6 +560,81 @@ pub const CHECKPOINT_ADAPTER_REDIRECT_CELLS: &[(&str, &str)] = &[
     ("put", "preflight_stale"),
 ];
 
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one artifact PUT, the redirect upload and its completion handshake included.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_PUT: &str = "put";
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one artifact payload GET — the same meaning `verb="get"` has on
+/// `live_edit_checkpoint_adapter_redirect_total`.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_GET: &str = "get";
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one page of a paginated LIST. A listing of N pages is N samples; a
+/// per-layer prefix page is one of these too.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE: &str = "list_page";
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one by-address DELETE.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_DELETE: &str = "delete";
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one existence probe — the ext-blob HEAD and the two rollback probes.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_HEAD: &str = "head";
+/// `verb` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// one upload-options pre-flight.
+pub const CHECKPOINT_ADAPTER_CALL_VERB_UPLOAD_OPTIONS: &str = "upload_options";
+
+/// The pinned `verb` vocabulary of
+/// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65). A histogram,
+/// so its cells cannot be zero-seeded; each appears on its first observation,
+/// and only on the StorageApi adapter.
+pub const CHECKPOINT_ADAPTER_CALL_VERBS: &[&str] = &[
+    CHECKPOINT_ADAPTER_CALL_VERB_PUT,
+    CHECKPOINT_ADAPTER_CALL_VERB_GET,
+    CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+    CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+    CHECKPOINT_ADAPTER_CALL_VERB_HEAD,
+    CHECKPOINT_ADAPTER_CALL_VERB_UPLOAD_OPTIONS,
+];
+
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the call answered success.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_OK: &str = "ok";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the call answered 404. Recorded before any caller remaps it, so a DELETE's
+/// idempotent 404 and a listed-then-absent sidecar both land here.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_NOT_FOUND: &str = "not_found";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the call answered 412.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_CONFLICT: &str = "conflict";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the call ended `Transient` after its whole retry ladder.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_TRANSIENT: &str = "transient";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the call ended `Permanent` (a `NotImplemented` answer maps here too; it
+/// cannot come from HTTP).
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_PERMANENT: &str = "permanent";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the per-call ceiling or a walk's clamp elapsed and the call was abandoned —
+/// the same event that ticks
+/// `live_edit_checkpoint_adapter_ceiling_elapsed_total`.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_CEILING: &str = "ceiling";
+/// `outcome` label value on `live_edit_checkpoint_adapter_call_duration_seconds`:
+/// the caller stopped waiting before the call answered (a dropped future —
+/// a deadline, a shutdown, or a sibling walk error).
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOME_CANCELLED: &str = "cancelled";
+
+/// The pinned `outcome` vocabulary of
+/// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65). The first
+/// five are an exhaustive reading of the call's `CheckpointError` answer;
+/// `ceiling` and `cancelled` are the two ways a call ends without one.
+pub const CHECKPOINT_ADAPTER_CALL_OUTCOMES: &[&str] = &[
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_OK,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_NOT_FOUND,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_CONFLICT,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_TRANSIENT,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_PERMANENT,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_CEILING,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_CANCELLED,
+];
+
 /// The pinned `outcome` vocabulary of `live_edit_object_id_counter_repair_total`
 /// (b.b2j).
 ///
@@ -607,6 +700,7 @@ pub const CHECKPOINT_TAIL_OUTCOMES: &[&str] = &[
     "refused_no_base",
     "refused_chain_full",
     "refused_lineage_unrootable",
+    "refused_cleanup_in_flight",
 ];
 
 /// The pinned `outcome` vocabulary of
@@ -814,6 +908,7 @@ pub const CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES: &[&str] = &[
     "unstamped_foreign_restore",
     "unstamped_write_error",
     "failed",
+    "deferred_cleanup",
 ];
 
 /// The pinned `site` vocabulary of `live_edit_checkpoint_base_bootstrap_total`
@@ -1002,6 +1097,45 @@ pub const EXT_VALUE_VERIFY_RESULTS: &[&str] = &[
     EXT_VALUE_VERIFY_SIZE_MISMATCH,
 ];
 
+/// `result` label on `live_edit_checkpoint_ext_recovery_total`: the checkpoint
+/// adapter served the value, and its write-back to the store returned.
+pub const EXT_RECOVERY_RECOVERED: &str = "recovered";
+/// `result` label on `live_edit_checkpoint_ext_recovery_total`: the checkpoint
+/// adapter does not hold the value.
+pub const EXT_RECOVERY_ADAPTER_MISS: &str = "adapter_miss";
+/// `result` label on `live_edit_checkpoint_ext_recovery_total`: the checkpoint
+/// adapter failed transiently; the caller answers `UNAVAILABLE`.
+pub const EXT_RECOVERY_ADAPTER_TRANSIENT: &str = "adapter_transient";
+/// `result` label on `live_edit_checkpoint_ext_recovery_total`: the checkpoint
+/// adapter failed permanently.
+pub const EXT_RECOVERY_ADAPTER_PERMANENT: &str = "adapter_permanent";
+/// `result` label on `live_edit_checkpoint_ext_recovery_total`: the checkpoint
+/// adapter answered an error its `get_ext_blob` contract never returns.
+pub const EXT_RECOVERY_ADAPTER_OTHER: &str = "adapter_other";
+/// `result` label vocabulary for `live_edit_checkpoint_ext_recovery_total`:
+/// what the checkpoint adapter answered a fetch-on-miss consult
+/// (`storage::external_values`, SDD SR-3.2). Every value is pre-registered by
+/// [`Metrics::new`], under each of [`EXT_RECOVERY_METAS`].
+pub const EXT_RECOVERY_RESULTS: &[&str] = &[
+    EXT_RECOVERY_RECOVERED,
+    EXT_RECOVERY_ADAPTER_MISS,
+    EXT_RECOVERY_ADAPTER_TRANSIENT,
+    EXT_RECOVERY_ADAPTER_PERMANENT,
+    EXT_RECOVERY_ADAPTER_OTHER,
+];
+/// `meta` label on `live_edit_checkpoint_ext_recovery_total`: the value's
+/// meta was present without its data — what a DR restore's recount leaves for
+/// a value only the backup store holds, whose fetch is the expected first read
+/// after a restore (`storage::ext_reconcile`).
+pub const EXT_RECOVERY_META_PRESENT: &str = "present";
+/// `meta` label on `live_edit_checkpoint_ext_recovery_total`: the value's
+/// meta was absent too — an unknown hash, a loss outside a restore.
+pub const EXT_RECOVERY_META_ABSENT: &str = "absent";
+/// `meta` label vocabulary for `live_edit_checkpoint_ext_recovery_total`.
+/// Every value is pre-registered by [`Metrics::new`], under each of
+/// [`EXT_RECOVERY_RESULTS`].
+pub const EXT_RECOVERY_METAS: &[&str] = &[EXT_RECOVERY_META_PRESENT, EXT_RECOVERY_META_ABSENT];
+
 /// `reason` label on `live_edit_checkpoint_ext_mirror_dropped_total`: the
 /// mirror's channel held as many items as its capacity
 /// (`LIVE_EDIT_CHECKPOINT_EXT_MIRROR_QUEUE_CAPACITY`).
@@ -1016,6 +1150,13 @@ pub const EXT_MIRROR_DROP_OVERSIZED: &str = "oversized";
 /// `reason` label on `live_edit_checkpoint_ext_mirror_dropped_total`: the
 /// value was still queued when the mirror workers stopped at shutdown.
 pub const EXT_MIRROR_DROP_SHUTDOWN: &str = "shutdown";
+/// `reason` label on `live_edit_checkpoint_ext_mirror_dropped_total`: the
+/// checkpoint collect deleted the value's backup copy within the mirror
+/// worker's reliance window, so the worker did not upload it (the clean-up
+/// fence, b.g65). Not a lost copy: no retained backup named the value when it
+/// was deleted, the deletion withdrew its confirmation, and the backup repair
+/// re-sends a value Valkey still holds once the window has passed.
+pub const EXT_MIRROR_DROP_COLLECT_FENCED: &str = "collect_fenced";
 /// `reason` label vocabulary for `live_edit_checkpoint_ext_mirror_dropped_total`.
 /// Every value is pre-registered by [`Metrics::new`].
 pub const EXT_MIRROR_DROP_REASONS: &[&str] = &[
@@ -1023,6 +1164,7 @@ pub const EXT_MIRROR_DROP_REASONS: &[&str] = &[
     EXT_MIRROR_DROP_BUDGET_FULL,
     EXT_MIRROR_DROP_OVERSIZED,
     EXT_MIRROR_DROP_SHUTDOWN,
+    EXT_MIRROR_DROP_COLLECT_FENCED,
 ];
 
 /// `state` label on `live_edit_checkpoint_ext_mirror_bytes`: charged to the
@@ -1071,6 +1213,11 @@ pub const EXT_BACKUP_REPAIR_OVERSIZED: &str = "oversized";
 /// the value is re-sent like any owed one, unless re-sending has stopped for
 /// the pass.
 pub const EXT_BACKUP_REPAIR_CONFIRMED_COPY_MISSING: &str = "confirmed_copy_missing";
+/// `outcome` label on `live_edit_checkpoint_ext_backup_repair_total`: the
+/// checkpoint collect deleted the value's backup copy within the re-send's
+/// reliance window, so the repair did not upload it and the value stays owed
+/// for a later pass (the clean-up fence, b.g65).
+pub const EXT_BACKUP_REPAIR_COLLECT_FENCED: &str = "collect_fenced";
 /// `outcome` label vocabulary for
 /// `live_edit_checkpoint_ext_backup_repair_total`. Every value is
 /// pre-registered by [`Metrics::new`].
@@ -1083,6 +1230,7 @@ pub const EXT_BACKUP_REPAIR_OUTCOMES: &[&str] = &[
     EXT_BACKUP_REPAIR_BUDGET_BUSY,
     EXT_BACKUP_REPAIR_OVERSIZED,
     EXT_BACKUP_REPAIR_CONFIRMED_COPY_MISSING,
+    EXT_BACKUP_REPAIR_COLLECT_FENCED,
 ];
 
 /// `op` label on `live_edit_checkpoint_ext_backup_mark_failed_total`: writing
@@ -1298,7 +1446,7 @@ pub const ADMISSION_RESULT_REFUSED_SATURATED: &str = "refused_saturated";
 /// without joining it (b.f4f). On `live_edit_upload_admission_total` the
 /// queue's bound is `LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS`.
 pub const ADMISSION_RESULT_REFUSED_WAITER_CAP: &str = "refused_waiter_cap";
-/// `result` label value: admission observed a cancellation, for one of three
+/// `result` label value: admission observed a cancellation, for one of four
 /// causes:
 ///
 /// - the session was deleted: `NOT_FOUND "session was deleted"`;
@@ -1307,14 +1455,21 @@ pub const ADMISSION_RESULT_REFUSED_WAITER_CAP: &str = "refused_waiter_cap";
 ///   shutdown's paced stream ending began, or cancelled in its batch of that
 ///   ending while queued — or the pool's permit semaphore was closed by
 ///   `quit`): `UNAVAILABLE "server shutting down"`;
+/// - a disaster-recovery hold (the subscription's enrolled shutdown token
+///   cancelled by the hold ending while queued, or born cancelled for a
+///   subscription that enrolled after it): `UNAVAILABLE` with `SERVICE_HELD`
+///   for a fleet hold, or with `UPSTREAM_UNAVAILABLE` for a stale hold
+///   verdict;
 /// - the session went missing from the live store with no deletion marker (or
 ///   a marker read that failed): `UNAVAILABLE` with `session_absent_status()`'s
 ///   message, so the retry can recover it.
 ///
-/// The causes are told apart on the wire (`refusal_to_status` in
-/// `grpc::subscribe`) and in the handler's refusal line, but share this one
-/// label: each means "the request went away, not the capacity", which is the
-/// distinction this counter exists to draw. Separate `shutdown` or
+/// The causes are told apart on the wire and in the handler's refusal line —
+/// the token's own cause by the handler (`StreamShutdown::ending_status` in
+/// `grpc::graceful_shutdown`: a shutdown or a hold), the session causes by
+/// `refusal_to_status` in `grpc::subscribe` — but share this one label: each
+/// means "the request went away, not the capacity", which is the distinction
+/// this counter exists to draw. Separate `shutdown`, `held` or
 /// `session_absent` values are deliberately not added.
 ///
 /// On `live_edit_upload_admission_total` it means the same thing: an upload
@@ -1327,10 +1482,13 @@ pub const ADMISSION_RESULT_CANCELLED: &str = "cancelled";
 /// `result` label vocabulary for `subscriber_admission_total`. Closed and
 /// complete over `ExclusiveCheckout::admit`'s return arms.
 ///
-/// `refused_budget` is deliberately **absent**: the per-subscriber byte budget
-/// lives in b.ntm, and a pre-registered value the shipped binary cannot emit is
-/// a permanently-zero series that dashboards bind to as real. Adding a label
-/// value later is the additive, safe direction.
+/// `refused_budget` is deliberately **absent**: no byte budget refuses
+/// admission. The live-delivery budget ends an established subscription
+/// ([`STREAM_EXIT_DELIVERY_BUDGET`]) and the catch-up payload budget refuses a
+/// catch-up in-stream ([`STREAM_EXIT_CATCHUP_CAPACITY`]), and a pre-registered
+/// value the shipped binary cannot emit is a permanently-zero series that
+/// dashboards bind to as real. Adding a label value later is the additive,
+/// safe direction.
 pub const ADMISSION_RESULTS: &[&str] = &[
     ADMISSION_RESULT_ADMITTED,
     ADMISSION_RESULT_REFUSED_SATURATED,
@@ -1339,10 +1497,13 @@ pub const ADMISSION_RESULTS: &[&str] = &[
 ];
 
 /// `result` label value on `live_edit_upload_admission_total` only: an admitted
-/// upload, still receiving its content, asked to grow its reservation and the
-/// upload budget could not hold the growth at that moment. Receive growth
-/// never waits, so the upload is refused `UNAVAILABLE` at once (stage `body`).
-/// The processing steps are never refused for capacity: they wait instead.
+/// upload, still receiving its content, asked to grow its reservation, the
+/// upload budget could not hold the growth at that moment, and the growth
+/// could not take the overflow slot instead (the slot was held, a processing
+/// step was queued for it, or the upload is a chained `UpdateLayer`). Receive
+/// growth never waits, so the upload is refused `UNAVAILABLE` at once (stage
+/// `body`). The processing steps are never refused for capacity: they wait
+/// instead.
 pub const ADMISSION_RESULT_REFUSED_GROWTH: &str = "refused_growth";
 
 /// `result` label vocabulary for `live_edit_upload_admission_total`: every
@@ -1370,9 +1531,13 @@ pub const UPLOAD_RPCS: &[&str] = &[UPLOAD_RPC_CREATE_LAYER, UPLOAD_RPC_UPDATE_LA
 
 /// `phase` label value on `live_edit_uploads_in_flight`: admitted, still
 /// receiving its content (holding its receive allowance and session slot).
+/// Also the `phase` field of the "upload runs beyond the upload budget" INFO
+/// line for an upload whose receive growth took the overflow slot.
 pub const UPLOAD_PHASE_RECEIVING: &str = "receiving";
 /// `phase` label value on `live_edit_uploads_in_flight`: content received,
-/// being parsed, stored and committed.
+/// being parsed, stored and committed. Also the `phase` field of the "upload
+/// runs beyond the upload budget" INFO line for an upload whose processing
+/// step took the overflow slot.
 pub const UPLOAD_PHASE_PROCESSING: &str = "processing";
 /// `phase` label vocabulary of `live_edit_uploads_in_flight`.
 pub const UPLOAD_PHASES: &[&str] = &[UPLOAD_PHASE_RECEIVING, UPLOAD_PHASE_PROCESSING];
@@ -1513,6 +1678,34 @@ pub const RETIREMENT_WAIT_OUTCOMES: &[&str] = &[
     RETIREMENT_WAIT_OUTCOME_CANCELLED,
 ];
 
+/// `outcome` label value on `live_edit_catchup_payload_wait_seconds`: a
+/// catch-up payload reservation (the catch-up payload budget `D_c`, a
+/// `storage::memory_budget::MemoryBudget` of its own) granted without
+/// queueing.
+pub const CATCHUP_PAYLOAD_WAIT_OUTCOME_IMMEDIATE: &str = "immediate";
+/// `outcome` label value on `live_edit_catchup_payload_wait_seconds`: a
+/// catch-up payload reservation granted after queueing for the budget to
+/// free.
+pub const CATCHUP_PAYLOAD_WAIT_OUTCOME_WAITED: &str = "waited";
+/// `outcome` label value on `live_edit_catchup_payload_wait_seconds`: a
+/// catch-up payload reservation refused when its subscription's capacity
+/// budget ran out; the subscription ends `catchup_capacity` before any
+/// content.
+pub const CATCHUP_PAYLOAD_WAIT_OUTCOME_REFUSED_TIMEOUT: &str = "refused_timeout";
+/// `outcome` label value on `live_edit_catchup_payload_wait_seconds`: a
+/// catch-up payload reservation that ended without memory: the budget closed
+/// at shutdown, or the catch-up stopped waiting (it ended by another cause).
+pub const CATCHUP_PAYLOAD_WAIT_OUTCOME_CANCELLED: &str = "cancelled";
+
+/// The complete `outcome` vocabulary of
+/// `live_edit_catchup_payload_wait_seconds`.
+pub const CATCHUP_PAYLOAD_WAIT_OUTCOMES: &[&str] = &[
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_IMMEDIATE,
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_WAITED,
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_REFUSED_TIMEOUT,
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_CANCELLED,
+];
+
 /// `role` label value on `live_edit_catchup_snapshot_flight_total`: a
 /// catch-up that created a shared snapshot-read flight
 /// (`storage::snapshot_flights`) — the first for its object on this replica,
@@ -1544,8 +1737,22 @@ pub const SUBSCRIBE_STABLE_CUT_REGIMES: &[&str] = &["brand_new", "in_window", "o
 pub const SUBSCRIBE_STABLE_CUT_OUTCOMES: &[&str] = &["verified", "unverified"];
 
 /// `reason` label value: the outer gRPC send could not complete within
-/// `OUTER_SEND_DEADLINE` because the client stopped reading (b.f4f).
+/// `OUTER_SEND_DEADLINE` because the client stopped reading (b.f4f); or, while
+/// a catch-up waited for the catch-up payload budget, the subscription's
+/// response queue held catch-up pages and nothing had been taken from it for
+/// `OUTER_SEND_DEADLINE`, which ends it with the same status and a WARN naming
+/// the waiting catch-up (SDD §12.3).
 pub const STREAM_EXIT_SLOW_READER_DEADLINE: &str = "slow_reader_deadline";
+/// `reason` label value: the replica's relay bytes held for undelivered live
+/// updates, less each layer's largest pending update, passed the
+/// live-delivery budget (derived from the pod memory limit), and this
+/// subscription held the most of them; a subscription holding at most two
+/// updates, one of them still in its stream backlog, is never ended this way
+/// (`storage::stream_mux::delivery_ledger`; SDD §12.6). The stream ends
+/// `UNAVAILABLE "this replica's live-delivery memory is full and this
+/// subscription held the most undelivered updates; reconnect to catch up"`,
+/// with its queued updates dropped, which clients retry and catch up.
+pub const STREAM_EXIT_DELIVERY_BUDGET: &str = "delivery_budget";
 /// `reason` label value: the stream reader ended the subscription because the
 /// next entry would have taken its undelivered backlog past the hard cap, in
 /// entries or bytes, or — once the subscription had started draining — the
@@ -1600,6 +1807,23 @@ pub const STREAM_EXIT_SESSION_ABSENT: &str = "session_absent";
 /// `UNAVAILABLE`, which clients retry; where the retry lands is the ingress's
 /// choice.
 pub const STREAM_EXIT_SHUTDOWN: &str = "shutdown";
+/// `reason` label value: a disaster-recovery hold — the hold ending cancelled
+/// the established subscription's enrolled shutdown token with the fleet
+/// hold's cause (SDD SR-6.3). Every live stream on a replica ends this way at
+/// once when the fleet holds; not a shutdown, so never counted under
+/// [`STREAM_EXIT_SHUTDOWN`]. The stream ends `UNAVAILABLE` with the reason
+/// `SERVICE_HELD`, which clients retry after its retry delay. A subscription
+/// that arrives after the hold ending is refused at admission and never
+/// counted here; it counts under [`ADMISSION_RESULT_CANCELLED`].
+pub const STREAM_EXIT_HELD: &str = "held";
+/// `reason` label value: this replica's hold verdict went stale — it had no
+/// successful read of the disaster-recovery hold for the stale threshold — and
+/// the hold ending cancelled the established subscription's enrolled shutdown
+/// token with that cause (SDD SR-6.5). The stream ends `UNAVAILABLE` with the
+/// reason `UPSTREAM_UNAVAILABLE`, which clients retry. A subscription that
+/// arrives after it is refused at admission and counts under
+/// [`ADMISSION_RESULT_CANCELLED`] instead.
+pub const STREAM_EXIT_STALE_VERDICT: &str = "stale_verdict";
 /// `reason` label value: the response receiver was dropped (client went away).
 pub const STREAM_EXIT_CLIENT_DISCONNECT: &str = "client_disconnect";
 /// `reason` label value: in cluster mode every stream reader stayed bound to
@@ -1625,7 +1849,11 @@ pub const STREAM_EXIT_READER_CAPACITY: &str = "reader_capacity";
 /// carries no deadline and records no `timed_out`, so that refusal shows only
 /// here, and its status names those three waits. A catch-up that leaves its
 /// flight because the read's work passed `reader_wait_max(L)` counts under
-/// [`STREAM_EXIT_FENCED_READ_WAIT_CAP`] instead.
+/// [`STREAM_EXIT_FENCED_READ_WAIT_CAP`] instead. A catch-up whose payload
+/// could not be granted the catch-up payload budget (derived from the pod
+/// memory limit) within the capacity budget counts here too, before any
+/// content, recorded as `refused_timeout` on
+/// `live_edit_catchup_payload_wait_seconds`.
 pub const STREAM_EXIT_CATCHUP_CAPACITY: &str = "catchup_capacity";
 /// `reason` label value: a catch-up attached to a shared fenced-read flight
 /// (`storage::snapshot_flights`) of a layer above the atomic-read ceilings
@@ -1665,14 +1893,19 @@ pub const STREAM_EXIT_ERROR: &str = "error";
 /// property that makes `sum by (reason)` equal total subscription exits — every
 /// exit path classifies into exactly one of these before the RPC task returns.
 ///
-/// `budget_exhausted` is deliberately absent, for the same reason
-/// `refused_budget` is absent from [`ADMISSION_RESULTS`].
+/// The live-delivery budget's ending is [`STREAM_EXIT_DELIVERY_BUDGET`]; the
+/// catch-up payload budget's refusal counts under
+/// [`STREAM_EXIT_CATCHUP_CAPACITY`] and its stalled-holder ending under
+/// [`STREAM_EXIT_SLOW_READER_DEADLINE`].
 pub const STREAM_EXIT_REASONS: &[&str] = &[
     STREAM_EXIT_SLOW_READER_DEADLINE,
+    STREAM_EXIT_DELIVERY_BUDGET,
     STREAM_EXIT_INNER_WATCHDOG,
     STREAM_EXIT_SESSION_CANCEL,
     STREAM_EXIT_SESSION_ABSENT,
     STREAM_EXIT_SHUTDOWN,
+    STREAM_EXIT_HELD,
+    STREAM_EXIT_STALE_VERDICT,
     STREAM_EXIT_CLIENT_DISCONNECT,
     STREAM_EXIT_READER_CAPACITY,
     STREAM_EXIT_CATCHUP_CAPACITY,
@@ -1698,8 +1931,8 @@ pub const DELIVERY_LAG_STAGES: &[&str] =
 
 /// `phase` label value on `live_edit_subscriber_send_stalls_total` and
 /// `live_edit_subscriber_send_wait_seconds`: a send of catch-up content or of a
-/// caught-up ack, including a steady-state re-bootstrap's and a rollback-mode
-/// in-window replay's. Multi-chunk catch-ups fill the response channel
+/// caught-up ack, including a steady-state re-bootstrap's. Multi-chunk
+/// catch-ups fill the response channel
 /// routinely, so this phase stalls in normal operation.
 pub const SEND_PHASE_CATCHUP: &str = "catchup";
 /// `phase` label value on `live_edit_subscriber_send_stalls_total` and
@@ -1802,7 +2035,7 @@ pub(crate) const SNAPSHOT_KEY_FAMILY_TIME_SAMPLE: &str = "time_sample";
 /// `le:{object_id}:obj:ext` — the object's external-value reference index
 /// (`HLEN`, `HSCAN`). No snapshot read touches it: external-value clean-up's
 /// size read and reference walk do (`storage::retirement`). A foreign value
-/// here stops none of the four snapshot reads; the clean-up skips its release
+/// here stops none of the three snapshot reads; the clean-up skips its release
 /// and removes the key, its references freed later by the reference-count
 /// reconciler. Edits refuse it on their own
 /// (`live_edit_keyspace_type_error_total`).
@@ -2131,12 +2364,9 @@ pub const STORE_WRITE_REFUSED_REASONS: &[&str] = &[
 // `SnapshotReadConsumer` / `SlimSnapshotReadConsumer` / `SnapshotReadPath`
 // enums return these constants and never mint a label of their own.
 
-/// `consumer` label: a `SubscribeReadLayer` catch-up's snapshot read.
+/// `consumer` label: a `SubscribeReadLayer` catch-up's snapshot read. The
+/// steady state never reads.
 pub(crate) const SNAPSHOT_READ_CONSUMER_CATCHUP: &str = "catchup";
-/// `consumer` label: a legacy (rollback-mode) in-window replay's per-commit
-/// read. An empty commit takes none, and the steady state never reads.
-pub(crate) const SNAPSHOT_READ_CONSUMER_CATCHUP_LEGACY_PER_COMMIT: &str =
-    "catchup_legacy_per_commit";
 /// `consumer` label: the checkpoint assembler's read.
 pub(crate) const SNAPSHOT_READ_CONSUMER_CHECKPOINT: &str = "checkpoint";
 /// `consumer` label: the structural `UpdateLayer` slow path's read.
@@ -2156,17 +2386,22 @@ pub(crate) const SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE: &str = "structural_cac
 /// (`storage::structural_cache_audit`). Its own label, so
 /// `consumer="structural_cache"` counts cold starts only.
 pub(crate) const SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE_AUDIT: &str = "structural_cache_audit";
+/// `consumer` label: the disaster-recovery restore Job's read of a surviving
+/// layer whose referenced values its coverage check found in no store, to name
+/// the prim and attribute that reference them (`dr::job::plan::coverage`). An
+/// unfenced slim read; it counts only on a DR Job's pod.
+pub(crate) const SNAPSHOT_READ_CONSUMER_DR_RESTORE: &str = "dr_restore";
 
 /// The complete `consumer` vocabulary of the `live_edit_snapshot_read_*`
 /// series.
 pub const SNAPSHOT_READ_CONSUMERS: &[&str] = &[
     SNAPSHOT_READ_CONSUMER_CATCHUP,
-    SNAPSHOT_READ_CONSUMER_CATCHUP_LEGACY_PER_COMMIT,
     SNAPSHOT_READ_CONSUMER_CHECKPOINT,
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_UPDATE,
     SNAPSHOT_READ_CONSUMER_EXT_GC,
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE,
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE_AUDIT,
+    SNAPSHOT_READ_CONSUMER_DR_RESTORE,
 ];
 
 /// `path` label: one `EVALSHA` of `object_snapshot_read.lua`.
@@ -2199,7 +2434,9 @@ pub(crate) const SNAPSHOT_READ_OUTCOME_TRANSIENT_ERROR: &str = "transient_error"
 pub(crate) const SNAPSHOT_READ_OUTCOME_PERMANENT_ERROR: &str = "permanent_error";
 /// `outcome` label: a fenced read attempt its release did not prove — its
 /// lease was lost, or a restore or cleanup changed the object during the read
-/// — so it was retried or given up, never served.
+/// — or whose pass did not read the cut's whole state (a round-1 index short
+/// of its count, `live_edit_snapshot_read_index_incomplete_total`), so it was
+/// retried or given up, never served.
 pub(crate) const SNAPSHOT_READ_OUTCOME_FENCE_BROKEN: &str = "fence_broken";
 
 /// The complete `outcome` vocabulary of `live_edit_snapshot_read_total`.
@@ -2217,12 +2454,12 @@ pub const SNAPSHOT_READ_OUTCOMES: &[&str] = &[
 /// to the unfenced fan-out: above their ceilings `too_large` is their own
 /// outcome, after which both take the fenced read (counted under
 /// `path="fenced"`; the audit only with its above-ceiling switch on). The
-/// `structural_update` and ext-GC consumers never take it: the first reads
-/// through the unfenced fan-out at every size, the second is the reference
-/// walk, an unfenced pass of its own ([`SNAPSHOT_READ_UNFENCED_CONSUMERS`]).
+/// `structural_update`, ext-GC and `dr_restore` consumers never take it: the
+/// first and the last read through the unfenced fan-out at every size, the
+/// second is the reference walk, an unfenced pass of its own
+/// ([`SNAPSHOT_READ_UNFENCED_CONSUMERS`]).
 pub const SNAPSHOT_READ_ATOMIC_CONSUMERS: &[&str] = &[
     SNAPSHOT_READ_CONSUMER_CATCHUP,
-    SNAPSHOT_READ_CONSUMER_CATCHUP_LEGACY_PER_COMMIT,
     SNAPSHOT_READ_CONSUMER_CHECKPOINT,
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE,
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE_AUDIT,
@@ -2239,13 +2476,16 @@ pub const SNAPSHOT_READ_ATOMIC_OUTCOMES: &[&str] = &[
 ];
 
 /// The consumers that record `path="unfenced"`: the structural `UpdateLayer`
-/// WATCH path (`structural_update`), through the unfenced bounded fan-out, and
+/// WATCH path (`structural_update`), through the unfenced bounded fan-out,
 /// external-value clean-up's reference walk (`ext_gc`), an unfenced pass of its
-/// own, each at every size, and no others — not `structural_cache` or
-/// `structural_cache_audit`.
+/// own, and the DR restore Job's read of a surviving layer (`dr_restore`),
+/// through the unfenced fan-out, each at every size, and no others — not
+/// `structural_cache` or `structural_cache_audit`. The `dr_restore` cells are
+/// seeded at 0 on every pod, and count only on a DR Job's pod.
 pub const SNAPSHOT_READ_UNFENCED_CONSUMERS: &[&str] = &[
     SNAPSHOT_READ_CONSUMER_STRUCTURAL_UPDATE,
     SNAPSHOT_READ_CONSUMER_EXT_GC,
+    SNAPSHOT_READ_CONSUMER_DR_RESTORE,
 ];
 
 /// The outcomes an unfenced read can record. Not `fence_broken`: it holds no
@@ -2253,9 +2493,10 @@ pub const SNAPSHOT_READ_UNFENCED_CONSUMERS: &[&str] = &[
 /// ceiling and reads every size, but a structural `UpdateLayer`'s read stops
 /// before its next window when its upload charge cannot grow to cover it
 /// (the WATCH path's allowance, SDD §5.4), and the attempt waits for that
-/// charge with its checkout returned; the ext-GC reference walk carries no
-/// allowance, so its `too_large` cell is not registered. `not_found` covers an absent
-/// header for both consumers, and for `structural_update` also a header
+/// charge with its checkout returned; the ext-GC reference walk and the
+/// `dr_restore` read carry no allowance, so their `too_large` cells are not
+/// registered. `not_found` covers an absent header for every unfenced
+/// consumer, and for `structural_update` and `dr_restore` also a header
 /// without a numeric `seq`.
 pub const SNAPSHOT_READ_UNFENCED_OUTCOMES: &[&str] = &[
     SNAPSHOT_READ_OUTCOME_OK,
@@ -2274,10 +2515,7 @@ pub const SNAPSHOT_READ_UNFENCED_OUTCOMES: &[&str] = &[
 /// (`storage::structural_cache_fenced`), for a layer above the plain ceilings
 /// or predicted over the plain byte ceiling; and the structural cache's
 /// sampled audit, through the same hook, for a layer above the plain ceilings
-/// with the above-ceiling switch on (`storage::structural_cache_audit`). A
-/// rollback-mode replay's
-/// per-commit read is never fenced: on `TOO_LARGE` the replay hands its
-/// catch-up to a flight, whose read counts under `catchup`.
+/// with the above-ceiling switch on (`storage::structural_cache_audit`).
 pub const SNAPSHOT_READ_FENCED_CONSUMERS: &[&str] = &[
     SNAPSHOT_READ_CONSUMER_CATCHUP,
     SNAPSHOT_READ_CONSUMER_CHECKPOINT,
@@ -2403,6 +2641,14 @@ pub(crate) const STRUCTURAL_CACHE_RELOAD_TOMBSTONE: &str = "tombstone";
 pub(crate) const STRUCTURAL_CACHE_RELOAD_PARSE: &str = "parse";
 /// `reason` label: a decoded stream entry did not replay onto the entry.
 pub(crate) const STRUCTURAL_CACHE_RELOAD_REPLAY_ERR: &str = "replay_err";
+/// `reason` label: a replayed stream entry's outcome can differ between the
+/// current sibling-collision rule and the earlier one (a collision beside a
+/// same-named sibling of another kind, or a same-parent rename onto an
+/// occupied name), so a replica of an earlier build may have committed
+/// another state; the entry is read again rather than trust the replay.
+/// Ticked for every such record, whichever build committed it, until no
+/// supported upgrade or rollback path crosses 0.3.0.
+pub(crate) const STRUCTURAL_CACHE_RELOAD_COLLISION_RULE: &str = "collision_rule";
 /// `reason` label: more than `STRUCTURAL_REPAIR_MAX_TOTAL` (1,024) stream
 /// entries separate the entry from the header. Only a structural call's
 /// repair ticks it (the sampled audit's repair ticks no metric), and that
@@ -2442,6 +2688,7 @@ pub const STRUCTURAL_CACHE_RELOAD_REASONS: &[&str] = &[
     STRUCTURAL_CACHE_RELOAD_TOMBSTONE,
     STRUCTURAL_CACHE_RELOAD_PARSE,
     STRUCTURAL_CACHE_RELOAD_REPLAY_ERR,
+    STRUCTURAL_CACHE_RELOAD_COLLISION_RULE,
     STRUCTURAL_CACHE_RELOAD_TOO_FAR,
     STRUCTURAL_CACHE_RELOAD_TOO_LARGE,
     STRUCTURAL_CACHE_RELOAD_DANGLING_ADOPTED,
@@ -2842,6 +3089,19 @@ pub(crate) const WATCH_VOIDED_PATH_RESTORE_RESIDUE_WIPE: &str = "restore_residue
 /// mixture-of-two-backups shape, which is silent content corruption rather than
 /// a delete.
 pub(crate) const WATCH_VOIDED_PATH_RESTORE_OBJECT_WRITE: &str = "restore_write_object";
+/// `path` label value for the restore Job's watched writes
+/// (`storage::layer::dr_restore` and `storage::dr_write`): its batches, its
+/// header and clear-flags transactions (each fenced on `obj:hdr`), and its
+/// compare-and-set mapping writes (each fenced on the layer mapping).
+///
+/// The Job is the store's only writer after its quiet period, so these
+/// fences guard against a writer the plan did not foresee rather than a
+/// racing peer. A `committed_unwatched` tick means a fenced write ran on a
+/// connection that never held its `WATCH`. The Job serves its metrics but
+/// is not scraped (its log is the record), so this cell exists for the label
+/// set's completeness and for a test or an operator reading the Job's
+/// metrics port.
+pub(crate) const WATCH_VOIDED_PATH_DR_JOB: &str = "dr_job";
 /// `disposition` label value for a watched transaction abandoned BEFORE the
 /// commit was dispatched, because the pre-dispatch connection-identity check
 /// found the `WATCH`'s connection replaced (b.bhb). Nothing was written; the
@@ -2898,14 +3158,16 @@ pub(crate) const WATCH_VOIDED_FINGERPRINT_UNAVAILABLE: &str = "fingerprint_unava
 /// `{path="restore_residue_wipe", disposition="compensated"}`, because an
 /// `UNLINK` cannot be undone at all, and neither does
 /// `{path="restore_write_object", disposition="compensated"}`, because a
-/// materialization that landed cannot be un-landed from the client — but
-/// registering the cross product keeps the alert expression uniform across
-/// paths.
+/// materialization that landed cannot be un-landed from the client, and
+/// neither does `{path="dr_job", disposition="compensated"}`, because the
+/// restore Job makes no compensating write — but registering the cross
+/// product keeps the alert expression uniform across paths.
 pub(crate) const WATCH_VOIDED_PATHS: &[&str] = &[
     WATCH_VOIDED_PATH_UPDATE_LAYER,
     WATCH_VOIDED_PATH_CREATE_SESSION,
     WATCH_VOIDED_PATH_RESTORE_RESIDUE_WIPE,
     WATCH_VOIDED_PATH_RESTORE_OBJECT_WRITE,
+    WATCH_VOIDED_PATH_DR_JOB,
 ];
 /// Dispositions of [`WATCH_VOIDED_PATHS`]; see the constants above.
 pub(crate) const WATCH_VOIDED_DISPOSITIONS: &[&str] = &[
@@ -3571,6 +3833,9 @@ fn histogram_bucket_view(inst: &Instrument) -> Option<Stream> {
             PRESENCE_STALE_REMOVAL_DELAY_BUCKETS.to_vec()
         }
         "live_edit_auth_call_duration_seconds" => AUTH_CALL_DURATION_BUCKETS.to_vec(),
+        "live_edit_checkpoint_adapter_call_duration_seconds" => {
+            CHECKPOINT_ADAPTER_CALL_DURATION_BUCKETS.to_vec()
+        }
         "live_edit_update_layer_attempts_histogram" => UPDATE_LAYER_ATTEMPTS_BUCKETS.to_vec(),
         "live_edit_update_layer_relay_bytes" => UPDATE_LAYER_RELAY_BYTES_BUCKETS.to_vec(),
         "live_edit_upload_object_state_bytes" => UPLOAD_OBJECT_STATE_BYTES_BUCKETS.to_vec(),
@@ -3589,6 +3854,7 @@ fn histogram_bucket_view(inst: &Instrument) -> Option<Stream> {
         | "live_edit_subscribe_catchup_wait_seconds"
         | "live_edit_catchup_snapshot_read_wait_seconds"
         | "live_edit_catchup_build_wait_seconds"
+        | "live_edit_catchup_payload_wait_seconds"
         | "live_edit_retirement_wait_seconds" => ADMISSION_WAIT_BUCKETS.to_vec(),
         "live_edit_stream_mux_xread_reply_bytes" => STREAM_MUX_XREAD_REPLY_BYTES_BUCKETS.to_vec(),
         // A cold start is one or two snapshot reads, plus any wait for the
@@ -3652,8 +3918,10 @@ type MeterPipeline = (
 /// An invalid `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, or a push exporter that
 /// cannot be built for it, is an `Err` naming the variable and the cause. A
 /// set compression variable is an `Err` naming that variable
-/// ([`otlp`]).
-fn build_meter_provider() -> Result<MeterPipeline, String> {
+/// ([`otlp`]). An invalid endpoint or a set compression variable is an
+/// [`otlp::OtlpSetupError::Setting`]; a push exporter that cannot be built is
+/// an [`otlp::OtlpSetupError::Exporter`].
+fn build_meter_provider() -> Result<MeterPipeline, otlp::OtlpSetupError> {
     // Prometheus scrape arm — always attached. The `without_*` knobs keep the
     // emitted wire names byte-identical to the pre-migration output.
     let prometheus_exporter = PrometheusExporter::builder()
@@ -3673,7 +3941,7 @@ fn build_meter_provider() -> Result<MeterPipeline, String> {
     // `otlp::OTLP_EXPORT_TIMEOUT`, and its failures reach the log through
     // `ReportingMetricExporter` (the SDK logs them only at DEBUG).
     let mut export_reporter = None;
-    if let Some(endpoint) = otlp_metrics_endpoint()? {
+    if let Some(endpoint) = otlp_metrics_endpoint().map_err(otlp::OtlpSetupError::Setting)? {
         let exporter = otlp::metric_exporter_for(&endpoint)?;
         let reporter = Arc::new(MetricExportReporter::new());
         let reader = PeriodicReader::builder(ReportingMetricExporter::new(
@@ -3695,6 +3963,81 @@ fn build_meter_provider() -> Result<MeterPipeline, String> {
     let meter = provider.meter("live-edit");
     Ok((provider, meter, prometheus_exporter, export_reporter))
 }
+
+// ── Disaster-recovery hold reasons (SDD SR-7) ───────────────────────────────
+//
+// The `reason` label of `live_edit_dr_hold_entered_total`, and the `reason`
+// field the hold marker's writers put in the marker (`storage::dr_hold`).
+// A marker reason outside this list, or none, is counted under
+// [`DR_HOLD_REASON_OTHER`], so the label set stays bounded whatever a marker
+// says.
+
+/// `reason` label value: the object-id counter is gone from a store that had
+/// established it — the keyspace was lost.
+pub const DR_HOLD_REASON_KEYSPACE_LOST: &str = "keyspace_lost";
+/// `reason` label value: a hash slot's sentinel is gone — that slot's keys
+/// were lost.
+pub const DR_HOLD_REASON_SLOT_LOST: &str = "slot_lost";
+/// `reason` label value: a layer mapping no longer leads to a live object —
+/// the object's header is gone, or the overwrite that fenced it rolled back.
+pub const DR_HOLD_REASON_MAPPING_LOST: &str = "mapping_lost";
+/// `reason` label value: a session's record is gone while its layer mappings
+/// remain, with no deletion marker.
+pub const DR_HOLD_REASON_SESSION_LOST: &str = "session_lost";
+/// `reason` label value: an object fenced as superseded names a successor
+/// whose header is gone.
+pub const DR_HOLD_REASON_SUCCESSOR_LOST: &str = "successor_lost";
+/// `reason` label value: a mapped object is being retired — its external
+/// values scheduled for collection — though nothing superseded it.
+pub const DR_HOLD_REASON_RETIRED_OBJECT_MAPPED: &str = "retired_object_mapped";
+/// `reason` label value: the hold marker names no reason, or one outside the
+/// six above.
+pub const DR_HOLD_REASON_OTHER: &str = "other";
+
+/// Every `reason` label value of `live_edit_dr_hold_entered_total`: the six
+/// hold reasons, then [`DR_HOLD_REASON_OTHER`].
+pub const DR_HOLD_REASONS: [&str; 7] = [
+    DR_HOLD_REASON_KEYSPACE_LOST,
+    DR_HOLD_REASON_SLOT_LOST,
+    DR_HOLD_REASON_MAPPING_LOST,
+    DR_HOLD_REASON_SESSION_LOST,
+    DR_HOLD_REASON_SUCCESSOR_LOST,
+    DR_HOLD_REASON_RETIRED_OBJECT_MAPPED,
+    DR_HOLD_REASON_OTHER,
+];
+
+/// The `reason` label for a hold marker's `reason`: the matching value of
+/// [`DR_HOLD_REASONS`], or [`DR_HOLD_REASON_OTHER`] for none or any other
+/// string. Matched exactly, so a label always names a reason a writer meant.
+pub fn dr_hold_reason_label(reason: Option<&str>) -> &'static str {
+    reason
+        .and_then(|reason| DR_HOLD_REASONS.into_iter().find(|known| *known == reason))
+        .unwrap_or(DR_HOLD_REASON_OTHER)
+}
+
+// ── Disaster-recovery restore coverage check (SDD SR-9.3) ───────────────────
+//
+// The `result` label of `live_edit_dr_restore_coverage_probes_total`: one
+// existence check of a referenced external value against the backup store
+// (`dr::job::plan::coverage`). Neither this counter nor
+// `live_edit_dr_restore_values_uncovered` is pre-initialised in
+// `Metrics::new`: the restore planner initialises both
+// (`Metrics::init_dr_restore_coverage`), so they render only on a DR Job's pod.
+
+/// `result` label value: the backup store holds the value's bytes.
+pub const DR_COVERAGE_PROBE_RESULT_PRESENT: &str = "present";
+/// `result` label value: the backup store answered that it does not.
+pub const DR_COVERAGE_PROBE_RESULT_ABSENT: &str = "absent";
+/// `result` label value: the call failed or ran past the adapter's call
+/// ceiling; the value's presence is unknown.
+pub const DR_COVERAGE_PROBE_RESULT_ERROR: &str = "error";
+
+/// Every `result` label value of `live_edit_dr_restore_coverage_probes_total`.
+pub const DR_COVERAGE_PROBE_RESULTS: [&str; 3] = [
+    DR_COVERAGE_PROBE_RESULT_PRESENT,
+    DR_COVERAGE_PROBE_RESULT_ABSENT,
+    DR_COVERAGE_PROBE_RESULT_ERROR,
+];
 
 /// OpenTelemetry metric instruments for the Live Edit service.
 ///
@@ -3757,7 +4100,7 @@ pub struct Metrics {
     /// waiting behind a blocked send reaches the counter once the
     /// subscription's loop next goes idle.
     pub subscriber_updates: Counter<u64>,
-    /// Total number of diff computations, by case (full_content/incremental/up_to_date).
+    /// Total number of diff computations, by case (full_content/incremental).
     pub diff_case_total: Counter<u64>,
     /// Duration of diff build operations in seconds.
     pub diff_build_duration_seconds: Histogram<f64>,
@@ -3766,11 +4109,9 @@ pub struct Metrics {
     /// `up_to_date`}.
     ///
     /// The label records WHY the subscriber needed catch-up, not which code
-    /// path served it: under the shipped default
-    /// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true` the `in_window` and
-    /// `out_of_window` regimes CONVERGE on the same coalesced reconstruction
-    /// and differ only in this label — the in-window-fast / out-of-window-slow
-    /// split survives only under `=false`. What the label still buys is the
+    /// path served it: the `in_window` and `out_of_window` regimes CONVERGE on
+    /// the same coalesced reconstruction and differ only in this label. What
+    /// the label still buys is the
     /// distinction between a true bootstrap (`brand_new`) and a reconnect, and
     /// between a reconnector whose gap was still on the stream (`in_window`)
     /// and one whose gap had been trimmed away (`out_of_window`) — all of which
@@ -3801,13 +4142,9 @@ pub struct Metrics {
     /// ([`SUBSCRIBE_STABLE_CUT_REGIMES`], the vocabulary of
     /// `subscribe_regime_total`), and `service` (Spec SDD SR-8.6). Incremented
     /// once per catch-up state read that is served or refused; seeded at zero.
-    /// A rollback-mode in-window replay's per-commit reads are the exception:
-    /// the replay adds to this counter only when a read regresses
-    /// (`unverified`, `in_window`), so a replay that succeeds adds +1 to
-    /// `subscribe_regime_total{regime="in_window"}` and nothing here. This
-    /// counter is therefore not 1:1 with `subscribe_regime_total`; nor is it
-    /// for a catch-up that ends on a sequence regression (`unverified`), which
-    /// counts here with no regime observation.
+    /// This counter is not 1:1 with `subscribe_regime_total` for a catch-up
+    /// that ends on a sequence regression (`unverified`), which counts here
+    /// with no regime observation.
     ///
     /// `verified` means the catch-up served a proven cut: at or below the
     /// atomic-read limits, its atomic read's own; above them, the cut of the
@@ -3817,9 +4154,8 @@ pub struct Metrics {
     /// nothing overlaps.
     /// `unverified` means a sequence regression and nothing else: the read's
     /// cut came back below the header sequence the catch-up first read (an
-    /// atomic read's, or, per attached catch-up, its flight's shared read's),
-    /// or, for a rollback-mode in-window replay's per-commit read, below the
-    /// commit it rebuilds — which only a restore with an undersized sequence
+    /// atomic read's, or, per attached catch-up, its flight's shared read's)
+    /// — which only a restore with an undersized sequence
     /// band causes — and the catch-up ended `UNAVAILABLE` before any content
     /// or ack. Alert on any increase.
     pub subscribe_stable_cut_total: Counter<u64>,
@@ -4340,24 +4676,19 @@ pub struct Metrics {
     /// the `le:` keyspace. The blast radius is wider than a refused commit,
     /// which is why it pages: the object-state reads fail closed (b.zvd), so
     /// one wrong-typed key takes down every consumer whose read touches it, up
-    /// to **five** for that object, until an operator removes the key, which
-    /// the accompanying ERROR log line names. The five, exhaustively: four
+    /// to **four** for that object, until an operator removes the key, which
+    /// the accompanying ERROR log line names. The four, exhaustively: three
     /// through `storage::diff_read::read_object_snapshot`'s key set — the
     /// structural `UpdateLayer` WATCH path
     /// (`LayerStore::update_layer_once_watch`, consumer `structural_update`)
     /// by its unfenced fan-out at every size; catch-up at every size — at or below
     /// the atomic-read limits by its atomic read, above them by the fenced
     /// read's fan-out its shared fenced-read flight runs
-    /// (`storage::snapshot_flights`; a legacy replay's coalesced route
-    /// included); the checkpoint assembler at every size — by the atomic read
-    /// at or below those limits, by a fenced read of its own above them
-    /// (`checkpoint::assembler::ValkeySnapshotLoader`); and per-commit
-    /// reconstruction (a legacy in-window replay) at or below those limits by
-    /// the atomic read. No per-commit reconstruction is left above them: a
-    /// legacy in-window replay's first per-commit atomic read answers
-    /// `TOO_LARGE`, and the replay then reads through catch-up's coalesced
-    /// route (and a live commit is never reconstructed: one without relay bytes
-    /// is an empty commit, sent with no read) — and the fifth, external-value
+    /// (`storage::snapshot_flights`); and the checkpoint assembler at every
+    /// size — by the atomic read at or below those limits, by a fenced read of
+    /// its own above them (`checkpoint::assembler::ValkeySnapshotLoader`) (a
+    /// live commit is never reconstructed: one without relay bytes is an empty
+    /// commit, sent with no read) — and the fourth, external-value
     /// clean-up's reference release (`storage::layer::schedule_old_object_ext_gc`,
     /// reached from `DeleteLayer`, the `CreateLayer` overwrite and the orphan
     /// sweep), whose counted size read (`storage::retirement`: `HGET obj:hdr
@@ -4366,7 +4697,7 @@ pub struct Metrics {
     /// clean-up, and whose reference walk (consumer `ext_gc`) reads only the
     /// header, `obj:flds` and `obj:tss`, their field and time-sample rows,
     /// and `obj:ext`. A wrong-typed header, index or entry hash stops the
-    /// four; one on the header or a field or time-sample row also stops the
+    /// three; one on the header or a field or time-sample row also stops the
     /// clean-up's release (the layer is still deleted, its references freed
     /// later by the reference-count reconciler). One on any of the five
     /// indices ticks this counter at the size read, under its own
@@ -4376,17 +4707,17 @@ pub struct Metrics {
     /// numeric, so there it ticks nothing); the teardown then stops after its
     /// first `UNLINK`, which pages them all (`obj:flds` and `obj:tss` also
     /// stop the release). The five indices and every row not yet removed
-    /// stay, and on `DeleteLayer` so does the layers-index member;
-    /// `DeleteLayer` answers `INTERNAL` with the mapping already deleted
-    /// (b.yz5). The teardown's own index pages count nothing; its failure
-    /// names the object and key.
+    /// stay; `DeleteLayer` answers `INTERNAL` with the mapping and the
+    /// layers-index member already removed by its unmap (b.yz5). The
+    /// teardown's own index pages count nothing; its failure names the
+    /// object and key.
     /// A wrong-typed `obj:ext` (`key_family="ext_index"`) stops none of the
-    /// four snapshot reads; the clean-up skips its release and removes the
+    /// three snapshot reads; the clean-up skips its release and removes the
     /// key. Edits refuse it on their own
     /// ([`Self::keyspace_type_error_total`]). On an object carrying the
     /// `chs_complete` marker the snapshot read reads `obj:chs` and only the
     /// lists it names under a live parent, so a wrong-typed `obj:chs` stops the
-    /// four at every size (the atomic read's size check reads `obj:chs` before
+    /// three at every size (the atomic read's size check reads `obj:chs` before
     /// it can answer `TOO_LARGE`), and a wrong-typed list `obj:chs` does not
     /// name stops none of them. The per-key split is spelled out on
     /// `storage::diff_read::SNAPSHOT_READ_TYPE_ERROR_REMEDIATION`.
@@ -4512,6 +4843,28 @@ pub struct Metrics {
     /// No labels: there is one reason and one consumer. Expected zero
     /// outside a resharding or a cluster failover.
     pub snapshot_read_window_fallback_total: Counter<u64>,
+    /// Object-snapshot read attempts whose bounded fan-out's round 1
+    /// collected an index short of (or past) the count its count window read
+    /// — distinct members of a set against its `SCARD`, ranks of a sorted set
+    /// against its `ZCARD` — under a proof that no writer changed the object
+    /// (SDD §10.5): a cursor continued on another serving process skipped
+    /// members. One tick per proven skip, at three sites: a fenced attempt
+    /// whose release answered `VERIFIED` and whose pass read the cut
+    /// (`storage::snapshot_fence::read`; the attempt is broken and retried, so
+    /// one fenced read ticks up to `FENCE_READ_ATTEMPTS` times), a structural
+    /// WATCH attempt whose `seq` proof held (`storage::layer`,
+    /// `read_structural_snapshot`; aborted and retried), and the DR Jobs'
+    /// uncharged unfenced read on their held store (`storage::diff_read`,
+    /// consumer `dr_restore` only; refused `Aborted`). All three go through
+    /// `storage::diff_read::report_index_shortfall`. Never on a lost lease, a
+    /// failed or `BROKEN` release, a failed `seq` proof, a charged read's stop,
+    /// another consumer's uncharged unfenced read (refused `Aborted` too, but
+    /// with no proof that no writer changed the object) or a cancel. No
+    /// labels: every consumer gets the same operator action, and the WARN
+    /// each tick logs names the consumer, key and counts. A sibling of
+    /// `live_edit_snapshot_read_total`, not an outcome there. Expected zero
+    /// outside a backing-store failover, patching or scaling event.
+    pub snapshot_read_index_incomplete_total: Counter<u64>,
     /// Object-snapshot reads by `consumer` ([`SNAPSHOT_READ_CONSUMERS`]),
     /// `path` ([`SNAPSHOT_READ_PATHS`]) and `outcome`
     /// ([`SNAPSHOT_READ_OUTCOMES`]) (Spec SDD SR-8.1), one tick per read
@@ -4522,8 +4875,11 @@ pub struct Metrics {
     /// `storage::snapshot_fence::read::read_object_snapshot_fenced` completes
     /// (`path="fenced"`: `ok` when its release verified it, `fence_broken`
     /// when the attempt was broken — its release answered `BROKEN`, a lost
-    /// lease stopped its fan-out, or its fan-out found no header that its
-    /// release then found (a restore under the read) — and was retried or
+    /// lease stopped its fan-out, its fan-out read a header other than the
+    /// cut's, its fan-out found no header that its release then found (a
+    /// restore under the read), or its pass did not read the cut's whole
+    /// state (a round-1 index short of its count; see
+    /// [`Self::snapshot_read_index_incomplete_total`]) — and was retried or
     /// given up, `not_found`,
     /// or the error that ended it; an attempt ended by the caller's wait hook,
     /// or cancelled, records nothing).
@@ -4534,8 +4890,7 @@ pub struct Metrics {
     /// checkpoint, the structural cache's cold start and its audit (with its
     /// above-ceiling switch on) — the read that path then runs is counted
     /// under its own path, the fenced read: a catch-up's
-    /// follow-up (including a per-commit replay handed over to the
-    /// out-of-window route) is its shared fenced-read flight's read
+    /// follow-up is its shared fenced-read flight's read
     /// (`storage::snapshot_flights`), one per flight however many catch-ups
     /// share it, under `consumer="catchup"`; a backup's is the checkpoint
     /// assembler's own fenced read, under `consumer="checkpoint"`; a cold
@@ -4636,6 +4991,7 @@ pub struct Metrics {
     /// | `gap` | Routine on long-idle entries (the stream window trimmed the entries the repair needs) and after a restore. |
     /// | `too_large` | Routine for layers edited with very large single uploads. |
     /// | `dangling_adopted` | Routine but rare. |
+    /// | `collision_rule` | Routine but rare: a structural edit beside a same-named sibling of another kind, or a rename onto an occupied name, replayed by another replica. |
     /// | `identity` | Expected only after a restore or a backing-store failover that lost writes; otherwise investigate. |
     /// | `regressed` | Expected only after a restore, a failover that lost writes, or during a rolling upgrade (an older build's commits); otherwise investigate. |
     /// | `tombstone`, `parse`, `replay_err` | Not expected: no writer produces them; investigate any increase. |
@@ -5028,17 +5384,12 @@ pub struct Metrics {
     ///
     /// Expected to stay at about zero in every auth mode, clustered or not
     /// (b.19i): it ticks only when something outside the service unblocks a
-    /// live reader read. No command of this process's interrupts one — fred's
-    /// periodic credential refresh no longer reaches a reader connection, and a
-    /// reader re-`AUTH`s its own connection between reads (see
-    /// `stream_mux_reauths_total`). The one case left for the readers'
-    /// `Blocking::Interrupt` (the reader's next command after a client-side
-    /// XREAD timeout that did not force a reconnect, while the old read is
-    /// still blocked on the server) interrupts that abandoned read, whose
-    /// `-UNBLOCKED` fred hands to the timed-out command's dropped caller: it
-    /// costs a backchannel connection and never ticks this counter. A non-zero
-    /// rate means something outside the service is unblocking reader
-    /// connections.
+    /// live reader read. No command of this process's interrupts one: the
+    /// readers run fred's default `Blocking::Block`, so fred sends no `CLIENT
+    /// UNBLOCK`; fred's periodic credential refresh does not reach a reader
+    /// connection, and a reader re-`AUTH`s its own connection between reads
+    /// (see `stream_mux_reauths_total`). A non-zero rate means something
+    /// outside the service is unblocking reader connections.
     pub valkey_consumer_unblocked_retries_total: Counter<u64>,
     /// Total stream-reader tear-downs caused by a **permanent** fred error, by
     /// `phase` ([`CONSUMER_PERMANENT_EXIT_PHASES`]) (b.c7a).
@@ -5185,15 +5536,17 @@ pub struct Metrics {
     /// `upload_budget_bytes`.
     pub upload_reserved_bytes: UpDownCounter<i64>,
     /// The overflow slot holder's charge in bytes right now: the one upload
-    /// running beyond the budget; 0 when the slot is free.
+    /// running beyond the budget, still receiving its content or processing
+    /// it; 0 when the slot is free.
     pub upload_overflow_bytes: Gauge<u64>,
     /// Uploads whose processing step is queued for room in the budget or for
     /// the overflow slot right now.
     pub upload_overflow_waiters: UpDownCounter<i64>,
     /// Total uploads that ran in the overflow slot, beyond the budget, by
-    /// `rpc` ([`UPLOAD_RPCS`]). Counted when a processing step takes the slot
-    /// — once per "upload runs beyond the upload budget" INFO line — never for
-    /// a slot grant a shutdown or a dropped call ended first.
+    /// `rpc` ([`UPLOAD_RPCS`]). Counted when a receive growth or a processing
+    /// step takes the slot — once per "upload runs beyond the upload budget"
+    /// INFO line — never for a slot grant a shutdown or a dropped call ended
+    /// first.
     pub upload_overflow_runs_total: Counter<u64>,
     /// Seconds an upload's processing step waited for room in the budget or
     /// for the overflow slot, by `rpc`, recorded once per waiting step that
@@ -5227,6 +5580,17 @@ pub struct Metrics {
     /// `L / 500`, a margin term), recorded at startup. Unlabelled, like
     /// [`Self::retirement_budget_reserved_bytes`], which is read against it.
     pub retirement_budget_bytes: Gauge<u64>,
+    /// The live-delivery budget `D_live` in bytes (the pod memory plan's
+    /// `(L − floor) / 100`, a line term), recorded at startup. Unlabelled, like
+    /// `live_edit_subscriber_delivery_charged_bytes` and
+    /// `live_edit_subscriber_delivery_exempt_bytes`, which are read against
+    /// it: the replica is over it when charged less exempt exceeds it.
+    pub subscriber_delivery_budget_bytes: Gauge<u64>,
+    /// The catch-up payload budget `D_c` in bytes (the pod memory plan's
+    /// `3 (L − floor) / 100`, a margin term), recorded at startup. Unlabelled,
+    /// like [`Self::catchup_payload_budget_reserved_bytes`], which is read
+    /// against it.
+    pub catchup_payload_budget_bytes: Gauge<u64>,
     /// The structural write-planning cache's resident budget in bytes,
     /// `C × (1 + φ)`, derived from the pod memory limit, by service; what
     /// `live_edit_structural_cache_weight_bytes` is bounded by. Recorded at
@@ -5258,9 +5622,7 @@ pub struct Metrics {
     pub update_layer_chain_detect_lag_seconds: Histogram<f64>,
     /// `LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS` slots currently held,
     /// one per unit of catch-up work. A catch-up of its own holds one only
-    /// across its backing-store reads and its build — and, in rollback mode
-    /// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) on a same-object
-    /// reconnect, the cluster stream-reader wait. A shared fenced-read flight
+    /// across its backing-store reads and its build. A shared fenced-read flight
     /// (`storage::snapshot_flights`) holds one from its read stage to its
     /// last attached catch-up's build, fence `RETRY_AFTER` sleeps, its
     /// permit and memory waits and its build turns included, and each of its
@@ -5284,8 +5646,8 @@ pub struct Metrics {
     /// ([`CATCHUP_SNAPSHOT_READ_CLASSES`]) (Spec SDD SR-7.1, SR-8.5). The
     /// `atomic` class is bounded by `LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY`:
     /// a read holds its permit only across its atomic read's `EVALSHA` — a
-    /// catch-up's, or one commit's of a legacy in-window replay, always inside
-    /// the catch-up slot (the steady state never reads layer state). The
+    /// catch-up's, always inside the catch-up slot (the steady state never
+    /// reads layer state). The
     /// `fenced` class is bounded by `LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY`:
     /// a shared fenced-read flight's read stage holds its permit from before a
     /// fence acquire through the fenced read, the fence's release and the
@@ -5294,9 +5656,8 @@ pub struct Metrics {
     pub catchup_snapshot_reads_in_flight: UpDownCounter<i64>,
     /// Seconds a snapshot read waited for its read permit, by `consumer`
     /// (`catchup` for a catch-up's proven read and for a shared fenced-read
-    /// flight's read; `catchup_legacy_per_commit` for a legacy in-window
-    /// replay's per-commit read, which an empty commit does not take;
-    /// `structural_cache` for the structural cache's fenced cold start;
+    /// flight's read; `structural_cache` for the structural cache's fenced
+    /// cold start;
     /// `structural_cache_audit` for its sampled audit's fenced read) and by
     /// `class` ([`CATCHUP_SNAPSHOT_READ_CLASSES`], the permit's class, so
     /// fenced waits never mix with atomic ones) (Spec SDD SR-7.1, SR-8.5),
@@ -5363,6 +5724,37 @@ pub struct Metrics {
     /// reservation, the uncontended fast path included. Not pre-registered: a
     /// histogram series appears with its first observation.
     pub retirement_wait_seconds: Histogram<f64>,
+    /// Bytes of catch-up payload reservations currently granted by the
+    /// catch-up payload budget `D_c` (`ValkeyClient::catchup_payload_budget`,
+    /// read against [`Self::catchup_payload_budget_bytes`]): each catch-up
+    /// payload's pages not yet sent, its ranged reads in flight while it is
+    /// built, and, before its layout, each batch of external values it
+    /// restores through the checkpoint adapter until their write-backs return
+    /// (`storage::ompf_payload::restore_in_batches`). In the budget's KiB unit
+    /// × 1024; reads zero once every page has been sent or dropped.
+    /// Pre-registered at zero.
+    pub catchup_payload_budget_reserved_bytes: UpDownCounter<i64>,
+    /// Bytes of forced, never-blocking top-ups the catch-up payload budget
+    /// currently carries beyond its grants: an external value a catch-up's
+    /// fill found missing and restores whole through the checkpoint adapter,
+    /// one at a time, while it holds its bytes — until they are copied into
+    /// pages its grant already covers — and the charge of a restored value's
+    /// bytes beyond its declared size, from its fetch until its write-back
+    /// returns. In the budget's KiB unit × 1024; repaid as each top-up guard
+    /// drops. Pre-registered at zero.
+    pub catchup_payload_budget_overcommit_bytes: UpDownCounter<i64>,
+    /// Seconds a catch-up payload reservation, or a catch-up's reservation
+    /// for a batch of external values it restores, waited on the catch-up
+    /// payload budget, by `outcome` ([`CATCHUP_PAYLOAD_WAIT_OUTCOMES`]), one
+    /// observation per reservation, the uncontended fast path included. Not
+    /// pre-registered: a histogram series appears with its first observation.
+    pub catchup_payload_wait_seconds: Histogram<f64>,
+    /// Passes of the live-delivery budget's enforcement that found the replica
+    /// over `D_live` with no subscription it could end: every one holding
+    /// undelivered relay bytes held at most two entries, one of them in its
+    /// stream backlog, or only its layer's largest live entry
+    /// (`storage::stream_mux::delivery_ledger`). Pre-registered at zero.
+    pub subscriber_delivery_budget_overshoots_total: Counter<u64>,
     /// Catch-up builds currently running (Spec SDD SR-8.5): the builds of
     /// catch-ups attached to a shared fenced-read flight, each counted from
     /// the moment it is given its build turn (the flight's own, or an extra
@@ -5379,12 +5771,9 @@ pub struct Metrics {
     /// of the RPC (every exit path, task abort included). The capacity signal
     /// to compare against [`Self::subscriber_max_subscriptions`]. Unlike
     /// `stream_mux_subscriptions` it also counts a subscription that holds no
-    /// stream reader: one waiting for a stream reader (cluster mode); in
-    /// rollback mode (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`), one waiting
-    /// for a catch-up slot on a same-object reconnect; and one between
-    /// consumers during a re-bootstrap. (A brand-new catch-up, and a
-    /// same-object one in the default snapshot mode, reserves its reader
-    /// before its slot wait, so both gauges count it while it waits.)
+    /// stream reader: one waiting for a stream reader (cluster mode), and one
+    /// between consumers during a re-bootstrap. (A catch-up reserves its
+    /// reader before its slot wait, so both gauges count it while it waits.)
     pub subscriber_admitted: UpDownCounter<i64>,
     /// `SubscribeReadLayer` subscriptions whose first catch-up that reads layer
     /// state — every regime except `up_to_date` — has been selected and whose
@@ -5444,10 +5833,11 @@ pub struct Metrics {
     /// task name (b.3z7 H-obs-3).
     ///
     /// It ticks only in the shutdown join (`report_background_task_result` in
-    /// `main.rs`), so a task that panics mid-run is not counted until the
-    /// process shuts down, and the count exists only for the moments before
-    /// exit: `/metrics` serves until `metrics_task.abort()`, so a scrape rarely
-    /// lands in that window, though the final OTLP flush may still export it.
+    /// `grpc::transport`, run by `run_post_server_sequence`), so a task that
+    /// panics mid-run is not counted until the process shuts down, and the
+    /// count exists only for the moments before exit: `/metrics` serves until
+    /// `metrics_task.abort()`, so a scrape rarely lands in that window, though
+    /// the final OTLP flush may still export it.
     /// No alert uses it; the `background task failed during shutdown` ERROR
     /// line is the signal.
     pub background_task_panics_total: Counter<u64>,
@@ -5680,6 +6070,13 @@ pub struct Metrics {
     ///     design, so a non-zero rate here is alertable.
     ///   - `refused_chain_full` — the chain bound was reached **and the SR-4.1
     ///     re-base that should have collapsed it did not land**. See below.
+    ///   - `refused_cleanup_in_flight` — the pre-PUT clean-up fence refused the
+    ///     tail's PUT (b.g65): the checkpoint clean-up is deleting an earlier
+    ///     copy of the same tail generation, or the re-arm that must precede
+    ///     the PUT could not be recorded in Valkey. Nothing was persisted and a
+    ///     later tick re-attempts; also ticks
+    ///     `checkpoint_reconcile_total{outcome="publish_deferred"}`. Expected
+    ///     rare; remediation is to wait.
     ///
     /// # Reading `refused_chain_full` now that re-base is live
     ///
@@ -5689,7 +6086,10 @@ pub struct Metrics {
     /// remains when that attempt did not land — SR-4.5's refusal arm, one cell
     /// for every cause (gather failure, unverifiable lineage head, compose
     /// rejection, an ext-blob backfill that could not be durably acknowledged,
-    /// or the base PUT failing). The distinctions ride the per-arm WARNs, which
+    /// or the base PUT failing — and the clean-up fence's deferral of that PUT,
+    /// b.g65, which is not a failure and also ticks
+    /// `checkpoint_reconcile_total{outcome="publish_deferred"}`). The
+    /// distinctions ride the per-arm WARNs, which
     /// is where they are actionable and where they can carry a `Display` no
     /// metric label may.
     ///
@@ -5727,7 +6127,7 @@ pub struct Metrics {
     /// Outcome of one `checkpoint::base_bootstrap::BaseBootstrap::run_once`
     /// invocation, by `outcome` and `site` (SDD SR-7 / SR-7.1 / SR-3.6).
     /// Vocabulary pinned by [`CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES`] and
-    /// [`CHECKPOINT_BASE_BOOTSTRAP_SITES`]; the full 10 × 2 grid is zero-seeded
+    /// [`CHECKPOINT_BASE_BOOTSTRAP_SITES`]; the full 11 × 2 grid is zero-seeded
     /// at construction.
     ///
     /// # The identity this family owes its consumers
@@ -5856,6 +6256,13 @@ pub struct Metrics {
     ///   `writes_total{result="error", kind="layer"}`; the per-arm WARN is what
     ///   separates them, which is the distinct-event discipline every fold in
     ///   this subsystem rests on.
+    /// - `deferred_cleanup` — the pre-PUT clean-up fence refused the base PUT
+    ///   (b.g65): the checkpoint clean-up deleted the backup copy of a large
+    ///   value the base names within the bootstrap's reliance window, or is
+    ///   deleting an earlier copy of the same generation, or the re-arm that
+    ///   must precede the PUT could not be recorded in Valkey. Nothing was
+    ///   written; the layer's next periodic tick writes its base. Also ticks
+    ///   `checkpoint_reconcile_total{outcome="publish_deferred"}`.
     ///
     /// # `unstamped_foreign_restore` is a RISK INDICATOR, not a harm count
     ///
@@ -5948,7 +6355,10 @@ pub struct Metrics {
     /// Outcome vocabulary, in the order one pass produces them:
     ///
     /// - `orphan_deferred` — a candidate stem (or temp) registered on
-    ///   `le:ckpt:{recon}:orphans` but not yet past its grace window. The
+    ///   `le:ckpt:{recon}:orphans` this pass but not acted on: not yet past its
+    ///   grace window, or not reached before the phase ended. A pass whose
+    ///   first claim never ran (the clean-up gate closed, or the claim failed)
+    ///   registers nothing and counts nothing here. The
     ///   healthy steady state for a store with a partial publish in flight;
     ///   sustained non-zero with no `orphan_deleted` following means candidates
     ///   keep healing, which is fine, or keep failing to age out, which is not.
@@ -5958,18 +6368,25 @@ pub struct Metrics {
     ///   per file.
     /// - `dead_object_reaped` — a **dead** object's checkpoint generations were
     ///   reclaimed, counted per generation deleted (b.vn6). Members of
-    ///   `le:ckpt:{recon}:dead` are minted only by the delete paths, so this
-    ///   cell is the reclamation of layers the service knows are gone — the
-    ///   general leak that existed before b.vn6, where `delete_layer_inner`
+    ///   `le:ckpt:{recon}:dead` are minted only where a death was observed —
+    ///   `DeleteLayer` after its unmap, the overwrite clean-up once the
+    ///   overwrite unmapped the old object, and the refused-stamp arms — so
+    ///   this cell is the reclamation of layers the service knows are gone —
+    ///   the general leak that existed before b.vn6, where `delete_layer_inner`
     ///   touched the checkpoint store nowhere at all. Steady non-zero on a
     ///   fleet with churny create/delete clients is the pass working.
     /// - `dead_deferred` — dead objects claimed but left registered, counted per
-    ///   object. Four provenances: a step failed part-way (a sidecar read, a
-    ///   tombstone record, a generation delete, or a liveness re-probe); the
+    ///   object. Five provenances: a step failed part-way (a sidecar read, a
+    ///   tombstone record, a generation delete, a liveness re-probe, or — for
+    ///   an object found restored — the withdrawal of its deletion
+    ///   announcements that must precede the retire, b.g65); the
     ///   object's header is still standing with `superseded=1` — a
     ///   `CreateLayer` overwrite whose old-object cleanup has not landed, which
     ///   is a dead object with an un-cleaned header rather than a resurrection,
-    ///   so it is neither reaped nor retired; the object's own listing was
+    ///   so it is neither reaped nor retired; the object's header is still
+    ///   standing without that flag but no layer mapping names it — a
+    ///   `DeleteLayer` whose store clean-up has not finished, with an INFO
+    ///   saying so (b.g65); the object's own listing was
     ///   empty on a pass whose layers-namespace enumeration listed nothing,
     ///   failed or elapsed, so "already clean" could not be told from a
     ///   misaddressed store (b.oya); or the object's own listing was empty
@@ -5978,11 +6395,14 @@ pub struct Metrics {
     ///   Durable either way: the next pass re-claims them. Sustained non-zero
     ///   with no `dead_object_reaped` means the same objects are failing every
     ///   pass — check the accompanying WARNs for a stuck adapter or a
-    ///   disagreeing listing, or the INFOs for a stuck overwrite cleanup or an
-    ///   empty layers namespace.
+    ///   disagreeing listing, or the INFOs for a stuck overwrite cleanup, an
+    ///   unfinished layer deletion (then the orphan sweep's WARNs) or an empty
+    ///   layers namespace.
     /// - `dead_spared` — a member of the dead ZSET whose `obj:hdr` was found
-    ///   LIVE and carrying **no** `superseded` flag by a liveness probe, so the
-    ///   reap stopped there and the member was retired. **Non-zero is the safety
+    ///   LIVE, carrying **no** `superseded` flag, and named by its layer
+    ///   mapping, by a liveness probe, so the
+    ///   reap stopped there and the member was retired, once the object's
+    ///   deletion announcements were withdrawn (b.g65). **Non-zero is the safety
     ///   re-check working, not a fault**: the reachable provenance is a DR
     ///   restore that resurrected a previously-deleted `object_id`, whose
     ///   generations are exactly the blobs it was restored from. Reaping them
@@ -5992,11 +6412,14 @@ pub struct Metrics {
     ///   Ticked from either of the two probes, and **what "spared" covers
     ///   differs between them**. The cheap per-object early-out runs before the
     ///   listing, so nothing was deleted at all. The per-generation probe runs
-    ///   immediately before each individual delete, so a resurrection it catches
-    ///   part-way through an object spares only the generations still standing —
-    ///   any already reaped earlier in the same pass stay reaped (and stay
-    ///   counted on `dead_object_reaped`), because each of those went while the
-    ///   object was provably dead at its own pre-delete probe. The member is
+    ///   before each generation's delete: after a base's sidecar read but
+    ///   before its tombstone record and deletion announcement, so one
+    ///   `{recon}` round trip separates the probe from a base's delete. A
+    ///   resurrection it catches part-way through an object therefore spares
+    ///   only the generations still standing — any already reaped earlier in
+    ///   the same pass stay reaped (and stay counted on `dead_object_reaped`),
+    ///   because each of those went while the object was provably dead at its
+    ///   own pre-delete probe. The member is
     ///   retired either way: the object is alive now, and a live object's
     ///   remaining generations are not this phase's to reclaim.
     /// - `ext_tombstoned` — hashes recorded on `le:ckpt:{recon}:tomb`. Ticked by
@@ -6015,20 +6438,55 @@ pub struct Metrics {
     ///   retired without deletion. **Non-zero here is the protocol working, not
     ///   a fault**: it is precisely the over-delete that the pre-b.9qd inline
     ///   cascade would have committed.
-    /// - `live_set_failed` — a live-set walk (`list_live_ext_set`) failure aborted the
-    ///   collect phase. That includes an ext-refs sidecar the walk listed and
-    ///   then read as absent, which the adapter reports as a failure rather
-    ///   than skipping (b.oya) — but only while the pass still holds the
-    ///   checkpoint lease after the walk. When a peer holds it instead, that
-    ///   peer's lease-gated retention prune explains the absence, so the phase
-    ///   ends as a lease loss (`live_edit_checkpoint_lease_total`) and does not
-    ///   tick here; it deletes nothing either way. Every other live-set failure
-    ///   (a store error, a malformed sidecar, the budget elapse) ticks here
-    ///   whoever holds the lease. Tombstones survive for the next pass, so this is
+    /// - `live_set_failed` — the collect's live-set walk (`list_live_ext_set`)
+    ///   failed or ran out of time, or it listed an ext-refs sidecar and then
+    ///   read it absent with nothing to explain the absence (b.g65: an
+    ///   explained absence is `listed_sidecar_skipped` instead); the collect
+    ///   phase deleted nothing that pass. A store error, a malformed sidecar and the budget
+    ///   elapse all tick here. Tombstones survive for the next pass, so this is
     ///   a deferral, not a leak — but sustained non-zero means nothing is ever
     ///   being reclaimed and the backlog gauge will climb. An EMPTY live set
     ///   whose own walk listed no layer artifact is not a failure and does not
     ///   tick here: the phase deletes nothing and logs an INFO instead.
+    /// - `ext_deferred_live` — tombstoned hashes the collect did not delete
+    ///   because Valkey still holds the value (`le:ext:meta:{hash}` exists), so
+    ///   a later backup can name it; the tombstone is re-dated to now (b.g65).
+    ///   Non-zero is the fence working: a value used again after its last
+    ///   backup reference was pruned.
+    /// - `ext_deferred_rearmed` — tombstoned hashes the collect did not delete
+    ///   because a backup writer named them after the collect's snapshot, so
+    ///   the snapshot may miss that writer's sidecar; the tombstone is re-dated
+    ///   to now (b.g65). Non-zero is the fence working.
+    /// - `ext_healed` — values whose backup copy the collect deleted and then
+    ///   put back from Valkey, because Valkey held the value after the delete
+    ///   (a store landed between the liveness check and the delete), or
+    ///   because an earlier delete was never settled (b.g65).
+    /// - `ext_heal_unavailable` — a kept hash had an unsettled earlier delete,
+    ///   and Valkey no longer held the value to put it back; a WARN names the
+    ///   hash (b.g65). Non-zero is worth investigating.
+    /// - `publish_deferred` — layer backups that did not write because the
+    ///   clean-up was deleting something they depend on: a large value they
+    ///   name was deleted within their reliance window, or an earlier copy of
+    ///   the same generation was being deleted (b.g65). The backup retries on
+    ///   a later tick. Also ticks when the bookkeeping that must precede the
+    ///   write could not be recorded in Valkey.
+    /// - `dead_retired` — dead objects removed from the dead-object backlog
+    ///   (`le:ckpt:{recon}:dead`) this pass: every generation reaped, already
+    ///   clean, or found alive again (b.g65). The drain rate in the backlog
+    ///   gauge's own unit.
+    /// - `listed_sidecar_skipped` — ext-refs sidecars the collect's walk
+    ///   listed and then read absent, skipped on evidence: the same listing
+    ///   named no OMPF for that backup (its publish was unfinished), or a
+    ///   deleter had announced the generation's deletion (b.g65). Routine
+    ///   while backups are written and pruned during a clean-up pass.
+    /// - `deferred_older_build` — clean-up passes (or the rest of one) skipped
+    ///   because `le:checkpoint:leader` did not carry a current build's marked
+    ///   value: the replica leading backups runs an older build, whose writers
+    ///   do not follow the clean-up's rules, or no replica holds the backup
+    ///   lock at that moment (just after startup, or while backup leadership
+    ///   fails over) (b.g65). Expected during a rolling upgrade, and as an
+    ///   occasional tick otherwise; sustained outside an upgrade means no
+    ///   replica is leading backups.
     pub checkpoint_reconcile_total: Counter<u64>,
     /// Total times a checkpoint-adapter wall-clock ceiling elapsed and the work
     /// was abandoned as `Transient`, by `(phase, service)` (b.gg7).
@@ -6078,6 +6536,20 @@ pub struct Metrics {
     /// credential in URL form (SR-6.2), so neither this counter nor the WARN
     /// beside it may name one.
     pub checkpoint_adapter_redirect_total: Counter<u64>,
+    /// `live_edit_checkpoint_adapter_call_duration_seconds{verb, outcome,
+    /// service}`: wall time of one logical StorageApi checkpoint-adapter call
+    /// (b.g65).
+    ///
+    /// One sample per call, not per attempt: retries, backoff, the 401 refresh
+    /// and redirect hops are inside it, which is the unit of the per-call
+    /// ceiling. A sample runs up to the response headers; the body read the
+    /// caller does afterwards is outside it. Vocabularies:
+    /// [`CHECKPOINT_ADAPTER_CALL_VERBS`] and
+    /// [`CHECKPOINT_ADAPTER_CALL_OUTCOMES`]. Never zero-seeded (a histogram
+    /// cannot be); the family appears with the first call and never on the
+    /// LocalDisk, InMemory or Disabled adapters. No URL, address or object id
+    /// is ever a label.
+    pub checkpoint_adapter_call_duration_seconds: Histogram<f64>,
     /// Current size of `le:ckpt:{recon}:tomb` — ext-blob hashes awaiting their
     /// grace window or a successful collect (b.9qd).
     ///
@@ -6095,12 +6567,11 @@ pub struct Metrics {
     /// own listing named no layer artifact (b.oya): that pass deletes nothing
     /// by design — an empty store, a misaddressed one, or a listing that
     /// answered a stale not-found. With neither, check
-    /// `live_edit_checkpoint_lease_total{outcome="lost"}` climbing: the collect
-    /// ended as a lease loss because its walk outlasted the lease and a peer
-    /// claimed it — including a listed ext-refs sidecar that read absent while
-    /// the peer led, which ticks no `live_set_failed` and logs only at debug.
-    /// That is the routine shape on a large multi-replica store whose walk
-    /// outlasts the lease.
+    /// `checkpoint_reconcile_total{outcome="deferred_older_build"}` climbing —
+    /// the clean-up waits while an older build, or no replica, leads backups —
+    /// and the clean-up's one summary line per pass, whose collect fields show
+    /// whether the earlier phases left the collect any time (b.g65). The pass
+    /// holds no backup lease, so a long walk no longer ends it.
     pub checkpoint_ext_tombstone_backlog: Gauge<u64>,
     /// Current size of `le:ckpt:{recon}:dead` — deleted `object_id`s whose
     /// checkpoint generations are still awaiting the reconciliation pass's
@@ -6131,7 +6602,8 @@ pub struct Metrics {
     /// deletion rate, or the phase is deferring —  cross-check
     /// `checkpoint_reconcile_total{outcome="dead_deferred"}`. Falling behind
     /// costs storage, never correctness: the ZSET is durable and every member
-    /// keeps its original `ZADD NX` first-observation score.
+    /// keeps its `ZADD NX` first-observation score, or a later one where the
+    /// phase re-dated a member it deferred (b.g65, D4).
     pub checkpoint_dead_object_backlog: Gauge<u64>,
     /// Total `CommandCreateSection` deltas silently skipped because the named
     /// `parent_id` was not in `state.sections` (b.39x item 7). Unlabeled.
@@ -6553,6 +7025,16 @@ pub struct Metrics {
     ///   releases (a `rewrite` hash already left `obj:ext` inside the commit; a
     ///   `surplus_acquire` increment is owed by no later event), so only the
     ///   reconciler drains them.
+    /// - **A checkpoint restore's releases skipped at hold or stale-verdict
+    ///   entry** — a
+    ///   restore materialisation (`LayerStore::write_restored_object`) whose
+    ///   `EXEC` committed, with its hold write fence closed before the release
+    ///   enqueue's script was sent: the enqueue is skipped (SDD SR-6.2,
+    ///   `LayerStore::enqueue_ext_releases_unless_held`), and its whole batch
+    ///   is counted per reference with an INFO line naming the object. A deliberate leak, the
+    ///   safe direction; the disaster-recovery restore Job's recount (or the
+    ///   reconciler) corrects it. Unlabeled like every other cell: the INFO
+    ///   line is what tells this case apart.
     /// - **Retirement-path obligations that could not be recorded** —
     ///   `storage::layer::schedule_old_object_ext_gc`, when its begin
     ///   (`scripts/ext_retire_begin.lua`) fails, or answers `busy` because the
@@ -6778,7 +7260,10 @@ pub struct Metrics {
     ///
     /// A confirmed deficit is an over-release that already happened. It is
     /// confirmed only on a live meta, so the value is still stored when it is
-    /// reported (meta and data are created and deleted together); but once the
+    /// reported: every store writes meta and data together and the GC deletes
+    /// them together, so the bytes are in Valkey, or, for a meta a DR
+    /// restore's recount created without data, in the backup store alone until
+    /// a read fetches them back (`storage::ext_reconcile`); but once the
     /// count reaches 0 while live objects still reference the hash, the GC
     /// collects the value under a live reference — and it may already have been
     /// collected once and stored again at too low a count (an upload of the same
@@ -6856,9 +7341,12 @@ pub struct Metrics {
     /// logs at WARN. At the reconcile site it also holds the object's
     /// mismatched hashes like `too_large`.
     pub ext_index_recount_total: Counter<u64>,
-    /// Total per-object reference-index fields corrected by a recount, by
-    /// `site` and `direction` (`under` | `over`) — see
-    /// [`EXT_INDEX_DRIFT_DIRECTIONS`].
+    /// Total per-object reference-index fields found disagreeing with the rows
+    /// that hold their hash, by `site` and `direction` (`under` | `over`) —
+    /// see [`EXT_INDEX_RECOUNT_SITES`], [`EXT_INDEX_DRIFT_ONLY_SITES`] and
+    /// [`EXT_INDEX_DRIFT_DIRECTIONS`]. The two recount sites correct the
+    /// field; `structural_settle` raises an `under` field and leaves an `over`
+    /// one for the reconciler's audit to lower.
     ///
     /// A burst on the first reconciler pass after upgrading a deployment that
     /// holds layers from before 0.1.0 (when the index did not yet exist) is
@@ -6894,7 +7382,8 @@ pub struct Metrics {
     ///
     /// `outcome` values — the page-on-first-occurrence alert covers exactly the
     /// four ERROR-level cells (`repaired_seeded`, `repaired_noop`, `failed`,
-    /// `failed_after_repair`). The other four are deliberately off the page:
+    /// `failed_after_repair`; `failed` has one INFO-level arm, the hold write
+    /// fence's refusal, described below). The other four are deliberately off the page:
     /// `wait_timeout` is a WARN-level dashboard signal with its own
     /// sustained-rate (`for: 10m`) warning rule, the two `*_initialized` cells
     /// are expected once on a fresh deployment, and `already_repaired` is
@@ -6906,17 +7395,22 @@ pub struct Metrics {
     /// - `repaired_noop` — sidecar read, but a peer had already pushed the
     ///   counter at or above the computed seed. Same evidence, no write of our
     ///   own. **Alertable**; logged at ERROR.
-    /// - `failed` — the repair attempt ran to completion without leaving a
-    ///   usable counter behind. A **catch-all, not a checkpoint-store
-    ///   reachability signal**: six distinct arms land here, so triage starts at
-    ///   the accompanying ERROR log line, which names which fired. The counter
-    ///   re-check errored; the sidecar read errored or exceeded its fetch
-    ///   budget; the sidecar was present but corrupt or unparseable
-    ///   (`SeedError::ParseFailed`); the Valkey-side conditional seed `EVAL`
-    ///   failed (`SeedError::Seed`); the establish-at-zero write failed on a
-    ///   store with no sidecar; or the attempt task ended without reporting (a
-    ///   panic, or runtime shutdown mid-attempt). The `CreateLayer` surfaced
-    ///   `UNAVAILABLE`. **Alertable**; logged at ERROR.
+    /// - `failed` — the repair left no usable counter behind. A **catch-all,
+    ///   not a checkpoint-store reachability signal**: seven distinct arms land
+    ///   here, so triage starts at the accompanying log line, which names which
+    ///   fired. Six are logged at ERROR: the counter re-check errored; the
+    ///   sidecar read errored or exceeded its fetch budget; the sidecar was
+    ///   present but corrupt or unparseable (`SeedError::ParseFailed`); the
+    ///   Valkey-side conditional seed `EVAL` failed (`SeedError::Seed`); the
+    ///   establish-at-zero write failed on a store with no sidecar; or the
+    ///   attempt task ended without reporting (a panic, or runtime shutdown
+    ///   mid-attempt). The seventh is logged at INFO: the replica's
+    ///   disaster-recovery hold write fence refused the repair — no attempt was
+    ///   started, or a running one stopped before writing the counter
+    ///   (`SeedError::Held`, or the fence found closed before the
+    ///   establish-at-zero write). It still ticks this cell, so it still trips
+    ///   the page-on-first-occurrence rule. The `CreateLayer` surfaced
+    ///   `UNAVAILABLE`. **Alertable**.
     /// - `wait_timeout` — a `CreateLayer` stopped waiting on the in-flight
     ///   repair and surfaced `UNAVAILABLE`. The effective budget is
     ///   `Config::object_id_counter_repair_wait_budget_within`: ⅔ × min(
@@ -6977,9 +7471,12 @@ pub struct Metrics {
     pub service_token_parse_errors_total: Counter<u64>,
     /// Total external values whose backup copy the mirror dropped, by `reason`
     /// ([`EXT_MIRROR_DROP_REASONS`]): its channel full, its byte budget full,
-    /// the value larger than the whole budget, or still queued at shutdown
-    /// (SDD §22.17). The backup repair re-sends a dropped copy while Valkey
-    /// holds the value, except an oversized one. Every cell is pre-registered.
+    /// the value larger than the whole budget, still queued at shutdown, or
+    /// its upload skipped by the clean-up fence because the checkpoint collect
+    /// deleted its backup copy within the worker's reliance window
+    /// (`collect_fenced`, b.g65; SDD §22.17). The backup repair re-sends a
+    /// dropped copy while Valkey holds the value, except an oversized one.
+    /// Every cell is pre-registered.
     pub checkpoint_ext_mirror_dropped_total: Counter<u64>,
     /// Bytes charged to the mirror's byte budget right now, by `state`
     /// ([`EXT_MIRROR_STATES`]), the per-item overhead allowance included.
@@ -7004,9 +7501,11 @@ pub struct Metrics {
     /// ([`EXT_BACKUP_MARK_OPS`]; `storage::ext_backup`). Every cell is
     /// pre-registered.
     pub checkpoint_ext_backup_mark_failed_total: Counter<u64>,
-    /// Total external-value `read_batch` miss recoveries via the checkpoint
-    /// adapter, by `result` (`recovered` | `adapter_miss` | `adapter_transient`
-    /// | `adapter_permanent` | `adapter_other`) (SDD SR-3.2).
+    /// Total external-value fetch-on-miss consults of the checkpoint adapter
+    /// (`read_batch`'s miss arms and `recover_value`), by `result`
+    /// ([`EXT_RECOVERY_RESULTS`]) and `meta` ([`EXT_RECOVERY_METAS`]: whether
+    /// the value's meta was present without its data, or absent too) (SDD
+    /// SR-3.2). Every cell is pre-registered.
     pub checkpoint_ext_recovery_total: Counter<u64>,
     /// External-value references checked by the CreateLayer / UpdateLayer
     /// upload content check, by `result` ([`EXT_VALUE_VERIFY_RESULTS`]), once
@@ -7090,6 +7589,38 @@ pub struct Metrics {
     /// Carries a derived duration only; never the `expires_on` timestamp and
     /// never token bytes (SR-6.2).
     pub service_token_refresh_headroom_seconds: Gauge<i64>,
+    /// `live_edit_dr_held` (SDD SR-7): 1 while this replica is held for
+    /// disaster recovery, 0 otherwise. Recorded 0 at construction, then 1 by
+    /// either of two routes: a serving replica's hold entry
+    /// ([`Self::record_dr_hold_entered`], which also ticks
+    /// `live_edit_dr_hold_entered_total`), or the start of held mode, the
+    /// replica that found the fleet held at startup ([`Self::set_dr_held`],
+    /// the gauge alone: no entry while serving happened). Either way the
+    /// replica exits rather than reopen, so it never returns to 0 in one
+    /// process. A scrape before the startup hold evaluation has answered reads
+    /// 0, because the replica does not know yet. Unlabeled.
+    dr_held: Gauge<u64>,
+    /// `live_edit_dr_hold_entered_total{reason}` (SDD SR-7): hold entries of
+    /// this serving replica, by the marker's reason in the bounded
+    /// [`DR_HOLD_REASONS`] vocabulary ([`dr_hold_reason_label`]). Every cell is
+    /// materialised at 0 at construction.
+    dr_hold_entered_total: Counter<u64>,
+    /// `live_edit_dr_hold_verdict_stale` (SDD SR-6.5): 1 while this replica's
+    /// hold verdict is stale (no successful hold read for
+    /// `dr::hold::STALE_VERDICT_THRESHOLD`), 0 otherwise. Recorded 0 at
+    /// construction; set by [`Self::set_dr_hold_verdict_stale`]. Unlabeled.
+    dr_hold_verdict_stale: Gauge<u64>,
+    /// `live_edit_dr_restore_coverage_probes_total{result}` (SDD SR-9.3): the
+    /// restore Job's existence checks of referenced external values against
+    /// the backup store, one per backup-store call, by
+    /// [`DR_COVERAGE_PROBE_RESULTS`]. Not pre-initialised here; the Job's
+    /// planner initialises it ([`Self::init_dr_restore_coverage`]).
+    dr_restore_coverage_probes_total: Counter<u64>,
+    /// `live_edit_dr_restore_values_uncovered` (SDD SR-9.3): distinct
+    /// referenced external values the restore Job found in no store, set at
+    /// the plan's end and again when the coverage check is finalised. Not
+    /// pre-initialised here, as above. Unlabeled.
+    dr_restore_values_uncovered: Gauge<u64>,
 }
 
 impl Metrics {
@@ -7115,7 +7646,7 @@ impl Metrics {
     /// An invalid `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, or a push exporter
     /// that cannot be built for it, is an `Err` naming the variable and the
     /// cause; `main` reports it as a configuration error and exits.
-    pub fn try_new(service_label: &str) -> Result<Self, String> {
+    pub fn try_new(service_label: &str) -> Result<Self, otlp::OtlpSetupError> {
         let (provider, meter, prometheus_exporter, otlp_export_reporter) = build_meter_provider()?;
 
         let endpoint_calls = meter
@@ -7186,9 +7717,7 @@ impl Metrics {
                  regime, and service. verified: the catch-up served a proven cut (its atomic \
                  read's, or above the atomic-read limits its shared fenced read's, counted once \
                  per catch-up sharing it). unverified: the cut regressed below the catch-up's \
-                 first header read, or a rollback-mode in-window replay's per-commit read \
-                 regressed below the commit it rebuilds (the only replay read counted here), and \
-                 the catch-up ended UNAVAILABLE (alert on any increase)",
+                 first header read, and the catch-up ended UNAVAILABLE (alert on any increase)",
             )
             .build();
         let presence_events_total = meter
@@ -7497,9 +8026,9 @@ impl Metrics {
                  Object-snapshot reads, plus the one obj:hdr fence write the orphan sweep issues \
                  on the same key before retiring an object. The touch fails closed, so one such \
                  key takes down, for that object, every consumer whose read touches it - \
-                 structural UpdateLayer, subscribe per-commit reconstruction, catch-up and the \
+                 structural UpdateLayer, catch-up and the \
                  checkpoint assembler for the header, an index or an entry row; on an object \
-                 marked chs_complete=1, obj:chs stops all four snapshot \
+                 marked chs_complete=1, obj:chs stops all three snapshot \
                  consumers at every layer size and a children list obj:chs does not name stops \
                  none of them - until the offending key (named in the accompanying ERROR \
                  log line) is removed. A deleted or replaced layer's clean-up skips its \
@@ -7515,7 +8044,7 @@ impl Metrics {
                  unmapped. The key deletion's own failure log names the object and the index. A \
                  foreign obj:ext \
                  (key_family ext_index) stops none of \
-                 the four; the clean-up skips its release and removes the key. Structural \
+                 the three; the clean-up skips its release and removes the key. Structural \
                  UpdateLayer reads the layer on every call on \
                  its WATCH path (backends txn and lua-watch-structural, and under lua its \
                  uncacheable objects and fallbacks), but under lua's structural cache only on a \
@@ -7543,6 +8072,18 @@ impl Metrics {
                  failover.",
             )
             .build();
+        let snapshot_read_index_incomplete_total = meter
+            .u64_counter("live_edit_snapshot_read_index_incomplete_total")
+            .with_description(
+                "Total object-snapshot read attempts whose paged index came back short of its \
+                 count (an SSCAN or ZRANGE paging that did not return exactly the SCARD or ZCARD \
+                 it read) under a proof that no writer changed the object: one tick per proven \
+                 skip, so a fenced read retried after a skip can tick once per attempt. Each \
+                 such attempt was retried or refused, never used. Expected zero outside a \
+                 backing-store failover, patching or scaling event; a non-zero reading with no \
+                 such event is a bug.",
+            )
+            .build();
         let snapshot_read_refused_total = meter
             .u64_counter("live_edit_snapshot_read_refused_total")
             .with_description(
@@ -7550,10 +8091,10 @@ impl Metrics {
                  failure, by fred error kind. Object-snapshot reads, plus the one obj:hdr fence \
                  write the orphan sweep issues on the same key before retiring an object. The \
                  touch fails closed, so every consumer whose read issues the command stops on \
-                 that object until it stops failing - structural UpdateLayer, subscribe \
-                 per-commit reconstruction, catch-up and the checkpoint assembler for the \
+                 that object until it stops failing - structural UpdateLayer, \
+                 catch-up and the checkpoint assembler for the \
                  header, an index or an entry row; on an object marked \
-                 chs_complete=1, obj:chs stops all four snapshot consumers at every layer size \
+                 chs_complete=1, obj:chs stops all three snapshot consumers at every layer size \
                  and a children list obj:chs does not name stops none of them. A deleted or \
                  replaced layer's clean-up stops whole, before it changes anything, for any \
                  command of its size read (the header, obj:ext, or the size of any of the five \
@@ -7598,9 +8139,9 @@ impl Metrics {
         let snapshot_read_total = meter
             .u64_counter("live_edit_snapshot_read_total")
             .with_description(
-                "Total object-snapshot reads, by consumer (catchup|catchup_legacy_per_commit|\
-                 checkpoint|structural_update|ext_gc|structural_cache|structural_cache_audit), \
-                 path (atomic|fenced|unfenced) and outcome \
+                "Total object-snapshot reads, by consumer (catchup|\
+                 checkpoint|structural_update|ext_gc|structural_cache|structural_cache_audit|\
+                 dr_restore), path (atomic|fenced|unfenced) and outcome \
                  (ok|not_found|too_large|transient_error|permanent_error|fence_broken). \
                  too_large counts an atomic read that answered TOO_LARGE (the layer is above the \
                  atomic-read item or byte limit), so the layer took its consumer's above-ceiling \
@@ -7674,8 +8215,8 @@ impl Metrics {
             .u64_counter("live_edit_structural_cache_reloads_total")
             .with_description(
                 "Structural write-planning cache entries dropped and read again, by reason \
-                 (identity|regressed|gap|tombstone|parse|replay_err|too_far|too_large|\
-                 dangling_adopted|diverged|uncacheable); a cold miss is not a reload",
+                 (identity|regressed|gap|tombstone|parse|replay_err|collision_rule|too_far|\
+                 too_large|dangling_adopted|diverged|uncacheable); a cold miss is not a reload",
             )
             .build();
         let structural_cache_uncacheable_total = meter
@@ -7819,14 +8360,21 @@ impl Metrics {
             .with_description(
                 "Total watched transactions whose WATCH was found or proven void, or whose \
                  void-detection layers could not be armed, by path \
-                 (update_layer|create_session) and disposition \
+                 (update_layer|create_session|restore_residue_wipe|restore_write_object|dr_job) \
+                 and disposition \
                  (aborted_pre_exec|committed_unwatched|compensated|witness_unavailable|\
-                 fingerprint_unavailable). A WATCH dies with its connection, so a reconnect \
+                 fingerprint_unavailable). restore_residue_wipe and restore_write_object are a \
+                 DR restore's wipe of an object's leftover keys and its write of the rebuilt \
+                 object; dr_job is the disaster-recovery restore Job's fenced writes (its object \
+                 batches and headers, its flag clears and its mapping compare-and-sets). A WATCH \
+                 dies with its connection, so a reconnect \
                  between WATCH and EXEC turns an optimistic commit into an unconditional one. \
                  Alert on committed_unwatched: it is the residual where the server confirms the \
                  commit ran on a connection that never held the WATCH, so a duplicate session \
-                 name (create_session) or a commit torn between materialized state and the live \
-                 stream (update_layer) may have landed. The two *_unavailable dispositions are \
+                 name (create_session), a commit torn between materialized state and the live \
+                 stream (update_layer), a wipe of a peer replica's just-restored object \
+                 (restore_residue_wipe) or a restored object mixed from two replicas' rebuilds \
+                 (restore_write_object) may have landed. The two *_unavailable dispositions are \
                  not incidents: they report that the backing store does not answer CLIENT ID in \
                  the way one detection layer needs, so that layer is disarmed and the commit ran \
                  on the remaining ones. They are near-zero or near-total by construction, and \
@@ -8100,8 +8648,11 @@ impl Metrics {
                  rpc (create_layer|update_layer) and result \
                  (admitted|refused_saturated|refused_waiter_cap|refused_growth|cancelled). The \
                  capacity refusals answer Code::Unavailable with nothing applied; no upload under \
-                 LIVE_EDIT_MAX_LAYER_SIZE is refused for its byte size. cancelled is an \
-                 admission or processing wait ended by shutdown or by a dropped call.",
+                 LIVE_EDIT_MAX_LAYER_SIZE is refused for its byte size. refused_growth is a \
+                 receive growth the upload budget could not hold and that could not take the \
+                 overflow slot: the slot was held, a processing step was queued for it, or the \
+                 upload was a chained UpdateLayer. cancelled is an admission or processing wait \
+                 ended by shutdown or by a dropped call.",
             )
             .build();
         let upload_admission_wait_seconds = meter
@@ -8123,9 +8674,8 @@ impl Metrics {
         let upload_overflow_bytes = meter
             .u64_gauge("live_edit_upload_overflow_bytes")
             .with_description(
-                "Processing memory charged to the one CreateLayer/UpdateLayer upload running in \
-                 the overflow slot, beyond live_edit_upload_budget_bytes; 0 when the slot is \
-                 free.",
+                "Memory charged to the one CreateLayer/UpdateLayer upload running in the overflow \
+                 slot, beyond live_edit_upload_budget_bytes; 0 when the slot is free.",
             )
             .build();
         let upload_overflow_waiters = meter
@@ -8197,6 +8747,26 @@ impl Metrics {
                  sweep share; read live_edit_retirement_budget_reserved_bytes against it.",
             )
             .build();
+        let subscriber_delivery_budget_bytes = meter
+            .u64_gauge("live_edit_subscriber_delivery_budget_bytes")
+            .with_description(
+                "The live-delivery memory budget in bytes, derived at startup from the pod memory \
+                 limit: the relay bytes this replica holds for its subscriptions' undelivered \
+                 updates, less each layer's largest pending update, are kept within it by ending \
+                 the subscription holding the most (reason delivery_budget); read \
+                 live_edit_subscriber_delivery_charged_bytes minus \
+                 live_edit_subscriber_delivery_exempt_bytes against it.",
+            )
+            .build();
+        let catchup_payload_budget_bytes = meter
+            .u64_gauge("live_edit_catchup_payload_budget_bytes")
+            .with_description(
+                "The catch-up payload memory budget in bytes, derived at startup from the pod \
+                 memory limit, that each catch-up payload reserves before it is built, and each \
+                 batch of external values a catch-up restores from the checkpoint store before \
+                 it is fetched; read live_edit_catchup_payload_budget_reserved_bytes against it.",
+            )
+            .build();
         let structural_cache_budget_bytes = meter
             .u64_gauge("live_edit_structural_cache_budget_bytes")
             .with_description(
@@ -8252,9 +8822,8 @@ impl Metrics {
             .with_description(
                 "SubscribeReadLayer catch-up slots currently held, bounded by \
                  LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS, never across a send: a catch-up of \
-                 its own holds one for its backing-store reads and build (in rollback mode, \
-                 LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false, a same-object reconnect also across the \
-                 cluster stream-reader wait); a shared fenced-read flight holds one from its read \
+                 its own holds one for its backing-store reads and build; a shared fenced-read \
+                 flight holds one from its read \
                  through its fence RETRY_AFTER sleeps, permit and memory waits and every attached \
                  catch-up's build turn; each of its extra builds holds one more.",
             )
@@ -8284,8 +8853,8 @@ impl Metrics {
                 "Catch-up snapshot reads currently holding a read permit, by class \
                  (atomic|fenced). atomic is bounded by \
                  LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY: a read holds its permit only across \
-                 its atomic read - a catch-up's, or one commit's of a legacy in-window replay, \
-                 always inside the catch-up slot. fenced is bounded by \
+                 its atomic read - a catch-up's, always inside the catch-up slot. fenced is \
+                 bounded by \
                  LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY: a shared fenced-read flight holds its \
                  permit from before a fence acquire through the fenced read, the fence's release \
                  and the memory adjust after it, and gives it back during fence RETRY_AFTER \
@@ -8296,12 +8865,11 @@ impl Metrics {
             .f64_histogram("live_edit_catchup_snapshot_read_wait_seconds")
             .with_description(
                 "Seconds a snapshot read waited for its read permit, by consumer \
-                 (catchup|catchup_legacy_per_commit|structural_cache|structural_cache_audit) and class \
+                 (catchup|structural_cache|structural_cache_audit) and class \
                  (atomic|fenced), \
                  recorded on every \
                  acquisition whatever its outcome, including the uncontended fast path. atomic \
-                 (LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY): one catch-up's wait - a legacy \
-                 in-window replay's per-commit waits included (an empty commit takes none) - \
+                 (LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY): one catch-up's wait, \
                  charged to its capacity budget (LIVE_EDIT_SUBSCRIBER_ADMISSION_WAIT_MS); one \
                  that runs out is refused catchup_capacity. fenced \
                  (LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY): a shared fenced-read flight's wait, \
@@ -8373,6 +8941,46 @@ impl Metrics {
                  stopped waiting.",
             )
             .build();
+        let catchup_payload_budget_reserved_bytes = meter
+            .i64_up_down_counter("live_edit_catchup_payload_budget_reserved_bytes")
+            .with_description(
+                "Bytes of catch-up payload reservations currently granted by the catch-up payload \
+                 memory budget (live_edit_catchup_payload_budget_bytes), in whole KiB: catch-up \
+                 payload pages not yet sent, a build's external-value reads in flight, and \
+                 external values a catch-up is restoring from the checkpoint store.",
+            )
+            .build();
+        let catchup_payload_budget_overcommit_bytes = meter
+            .i64_up_down_counter("live_edit_catchup_payload_budget_overcommit_bytes")
+            .with_description(
+                "Bytes of never-blocking top-ups the catch-up payload memory budget currently \
+                 carries beyond its grants (over-commit), in whole KiB: an external value a \
+                 catch-up restores from the checkpoint store while it fills its payload, and the \
+                 charge of a restored value's bytes beyond its declared size, while the catch-up \
+                 holds them.",
+            )
+            .build();
+        let catchup_payload_wait_seconds = meter
+            .f64_histogram("live_edit_catchup_payload_wait_seconds")
+            .with_description(
+                "Seconds a catch-up's payload reservation, or its reservation for a batch of \
+                 external values it restores from the checkpoint store, waited on the catch-up \
+                 payload memory budget (live_edit_catchup_payload_budget_bytes), by outcome \
+                 (immediate|waited|refused_timeout|cancelled), recorded on every reservation \
+                 including the uncontended fast path. refused_timeout: the subscription's \
+                 capacity budget ran out (the catch-up is refused catchup_capacity before any \
+                 content); cancelled: the budget closed at shutdown or the catch-up stopped \
+                 waiting.",
+            )
+            .build();
+        let subscriber_delivery_budget_overshoots_total = meter
+            .u64_counter("live_edit_subscriber_delivery_budget_overshoots_total")
+            .with_description(
+                "Times this replica's live-delivery memory was over its budget with no \
+                 subscription that could be ended for it: every holder of undelivered updates \
+                 held at most two of them, or only its layer's largest pending update.",
+            )
+            .build();
         let catchup_builds_in_progress = meter
             .i64_up_down_counter("live_edit_catchup_builds_in_progress")
             .with_description(
@@ -8412,7 +9020,7 @@ impl Metrics {
             .u64_counter("live_edit_subscriber_stream_exits_total")
             .with_description(
                 "Total SubscribeReadLayer subscriptions that ended, by reason \
-                 (slow_reader_deadline|inner_watchdog|session_cancel|session_absent|shutdown|client_disconnect|reader_capacity|catchup_capacity|fenced_read_wait_cap|stream_gap|error). \
+                 (slow_reader_deadline|delivery_budget|inner_watchdog|session_cancel|session_absent|shutdown|held|stale_verdict|client_disconnect|reader_capacity|catchup_capacity|fenced_read_wait_cap|stream_gap|error). \
                  Complete over the handler's terminal arms, so sum by (reason) equals total \
                  exits.",
             )
@@ -8548,9 +9156,14 @@ impl Metrics {
             .with_description(
                 "Checkpoint tail-capture attempts by outcome (captured|captured_capped|rebased|\
                  refused_trimmed|refused_missing_bytes|refused_sentinel|refused_seq_gap|\
-                 refused_no_base|refused_chain_full|refused_lineage_unrootable). Refusal outcomes \
-                 fire only when the sound replayable prefix is empty; captured_capped marks a \
-                 cap-bounded capture whose claimed range still equals its content. \
+                 refused_no_base|refused_chain_full|refused_lineage_unrootable|\
+                 refused_cleanup_in_flight). Refusal outcomes other than \
+                 refused_cleanup_in_flight fire only when the sound replayable prefix is empty; \
+                 refused_cleanup_in_flight means backup clean-up is deleting an earlier copy of \
+                 the same tail (or its bookkeeping could not be checked), so a later tick \
+                 retries; \
+                 captured_capped marks a cap-bounded capture whose claimed range still equals \
+                 its content. \
                  refused_no_base means the object has no durable generation at all (the \
                  post-enable rollout population); refused_lineage_unrootable means generations \
                  exist but none can root a lineage, which is checkpoint-store damage no tail knob \
@@ -8563,9 +9176,13 @@ impl Metrics {
             .u64_counter("live_edit_checkpoint_base_bootstrap_total")
             .with_description(
                 "Base-bootstrap invocations by outcome (persisted|shed|skipped_header_absent|\
-                 skipped_generation_present|skipped_untrusted_cursor|\
+                 skipped_generation_present|skipped_untrusted_cursor|unstamped_header_absent|\
                  unstamped_generation_present|unstamped_foreign_restore|unstamped_write_error|\
-                 failed) and site (creation_base|restore_rebase). Exactly one increment per \
+                 failed|deferred_cleanup) and site (creation_base|restore_rebase). \
+                 deferred_cleanup means backup clean-up deleted a large value the base names, or \
+                 is deleting an earlier copy of it (or its bookkeeping could not be checked), so \
+                 nothing was written and the layer's next periodic backup writes its base. \
+                 Exactly one increment per \
                  BaseBootstrap::run_once, so sum by (outcome) equals the invocation count — \
                  which is what makes shed/total an admission-saturation ratio and a zero total \
                  rate a producer-liveness predicate. The unstamped_* group means the base blob \
@@ -8591,9 +9208,12 @@ impl Metrics {
         let checkpoint_reconcile_total = meter
             .u64_counter("live_edit_checkpoint_reconcile_total")
             .with_description(
-                "Total checkpoint-store reconciliation-pass outcomes, by outcome \
-                 (orphan_deferred|orphan_deleted|temp_deleted|ext_tombstoned|ext_collected|\
-                 ext_spared|live_set_failed) and service.",
+                "Total checkpoint-store clean-up outcomes, by outcome \
+                 (orphan_deferred|orphan_deleted|temp_deleted|dead_object_reaped|dead_deferred|\
+                 dead_spared|ext_tombstoned|ext_collected|ext_spared|live_set_failed|\
+                 ext_deferred_live|ext_deferred_rearmed|ext_healed|ext_heal_unavailable|\
+                 publish_deferred|dead_retired|listed_sidecar_skipped|deferred_older_build) \
+                 and service.",
             )
             .build();
         let checkpoint_adapter_ceiling_elapsed_total = meter
@@ -8614,6 +9234,15 @@ impl Metrics {
                  preflight_stale) and service. verb=put is the expected path for \
                  artifacts at or above the deployment's writeBodyMaxSize; verb=get should stay at \
                  zero because reads declare download_preference=body.",
+            )
+            .build();
+        let checkpoint_adapter_call_duration_seconds = meter
+            .f64_histogram("live_edit_checkpoint_adapter_call_duration_seconds")
+            .with_description(
+                "Wall time in seconds of one storage-api checkpoint-adapter call, retries and \
+                 redirect hops included, up to the response headers, by verb \
+                 (put|get|list_page|delete|head|upload_options), outcome \
+                 (ok|not_found|conflict|transient|permanent|ceiling|cancelled) and service.",
             )
             .build();
         let checkpoint_ext_tombstone_backlog = meter
@@ -8885,7 +9514,11 @@ impl Metrics {
                  ext_gc_scheduled, so a delete_layer cascade re-run \
                  re-derives the same members and re-ticks the whole batch (bounded by \
                  LIVE_EDIT_UPDATE_LAYER_RETRY_MAX_ATTEMPTS; the other two callers do not loop). \
-                 Counted = commit-path enqueue failures after one in-line retry; and \
+                 Counted = commit-path enqueue failures after one in-line retry; a checkpoint \
+                 restore's releases skipped at hold or stale-verdict entry (a disaster-recovery \
+                 hold, or the replica losing contact with the store's hold state, closed the \
+                 replica's hold write fence after the restore's write landed, so the enqueue \
+                 was not sent; the restore Job's recount corrects these); and \
                  retirement-path obligations whose begin (recording them on the object's \
                  le:{oid}:obj:extret carrier before the enqueue) failed or found a release \
                  record already on the object id — an earlier lifecycle's carrier (the orphan \
@@ -9017,9 +9650,9 @@ impl Metrics {
                  present the same mid-pass double-count on the confirming pass and confirm a \
                  transient (per-object attribution, which would settle it, is not implemented). A \
                  recurring deficit is an over-release that already happened: the value is still \
-                 stored when reported, but will be collected under a live reference once the \
-                 count reaches 0, and may already have been collected once and stored again. A \
-                 single pass's negative surplus is not \
+                 stored when reported, in Valkey or the backup store, but will be collected under \
+                 a live reference once the count reaches 0, and may already have been collected \
+                 once and stored again. A single pass's negative surplus is not \
                  even a confirmation (the pass's phase order double-counts an obligation that \
                  transitions mid-pass, and a retire carrier whose object is live again is counted \
                  twice for one sweep interval), which is why only the confirmed figure is \
@@ -9098,8 +9731,12 @@ impl Metrics {
         let ext_index_drift_total = meter
             .u64_counter("live_edit_ext_index_drift_total")
             .with_description(
-                "Total per-object external-value reference-index fields corrected by a recount, \
-                 by site (reconcile|torn_commit) and direction (under|over). under: the index \
+                "Total per-object external-value reference-index fields found disagreeing with \
+                 the rows that hold their hash, by site (reconcile|torn_commit|structural_settle) \
+                 and direction (under|over). reconcile and torn_commit recount the object and \
+                 correct the field; structural_settle is a structural UpdateLayer commit \
+                 checking each hash it touches, which raises an under field itself and leaves \
+                 an over field for the reconciler's audit to lower. under: the index \
                  counted fewer rows than hold the hash, the direction that can release a value a \
                  live row still references; over: more, a leak. A burst on the first reconciler \
                  pass after upgrading a deployment that holds layers from before 0.1.0 is \
@@ -9133,7 +9770,10 @@ impl Metrics {
                  keyspace was lost underneath a running pod — alert. failed / \
                  failed_after_repair: the repair could not complete, or the counter was absent \
                  again right after it, and CreateLayer returned UNAVAILABLE — alert. \
-                 repaired_initialized / unhooked_initialized: counter established at 0 against a \
+                 wait_timeout: a CreateLayer stopped waiting on a repair still running and \
+                 returned UNAVAILABLE; the repair continues and records its own outcome, so \
+                 alert only on a sustained rate. repaired_initialized / \
+                 unhooked_initialized: counter established at 0 against a \
                  store holding no counters sidecar — expected once on a fresh deployment. \
                  already_repaired: benign singleflight dedup.",
             )
@@ -9152,7 +9792,9 @@ impl Metrics {
                 "Total external values whose backup copy the checkpoint mirror dropped, by reason: \
                  queue_full (the channel held its item capacity), budget_full (no room left in \
                  the byte budget), oversized (larger than the whole byte budget), shutdown \
-                 (still queued when the replica stopped). The value stays stored, and the \
+                 (still queued when the replica stopped), collect_fenced (backup clean-up deleted \
+                 the value's backup copy while this upload relied on it, so the upload was \
+                 skipped; no retained backup named the value). The value stays stored, and the \
                  backup repair re-sends its copy within minutes while the store holds it \
                  (an oversized one only once the upload size limit admits it again, or once \
                  resources.limits.memory is raised until the copy memory \
@@ -9193,7 +9835,9 @@ impl Metrics {
                  re-sending), value_gone (collected before it could be read), budget_busy (no \
                  room in the mirror's byte budget; the pass stops re-sending), oversized (larger \
                  than the whole byte budget; stays owed), confirmed_copy_missing (the daily audit \
-                 found a confirmed copy missing; re-sent unless re-sending stopped for the pass).",
+                 found a confirmed copy missing; re-sent unless re-sending stopped for the pass), \
+                 collect_fenced (backup clean-up deleted the value's backup copy while this \
+                 re-send relied on it, so it was not uploaded; stays owed for a later pass).",
             )
             .build();
         let checkpoint_ext_backup_owed = meter
@@ -9217,9 +9861,11 @@ impl Metrics {
         let checkpoint_ext_recovery_total = meter
             .u64_counter("live_edit_checkpoint_ext_recovery_total")
             .with_description(
-                "Total external-value read_batch miss recoveries via CheckpointStore::get_ext_blob, \
+                "Total external-value fetch-on-miss consults of CheckpointStore::get_ext_blob, \
                  by result (recovered|adapter_miss|adapter_transient|adapter_permanent|\
-                 adapter_other)",
+                 adapter_other) and meta (present: the value's meta was in the store without \
+                 its data, as a DR restore leaves a value only the backup store holds; absent: \
+                 the meta was missing too, a loss outside a restore)",
             )
             .build();
         let ext_value_verify_total = meter
@@ -9260,6 +9906,52 @@ impl Metrics {
                  rotation. Negative when the replacement landed after the old token had already \
                  expired. Recorded once per observed rotation by the ServiceTokenProvider polling \
                  task. Carries a derived duration only — never token bytes.",
+            )
+            .build();
+        let dr_held = meter
+            .u64_gauge("live_edit_dr_held")
+            .with_description(
+                "1 while this replica is held for disaster recovery: it refuses every LiveService \
+                 call and runs none of its background writers. 0 otherwise.",
+            )
+            .build();
+        let dr_hold_entered_total = meter
+            .u64_counter("live_edit_dr_hold_entered_total")
+            .with_description(
+                "Times this replica entered a disaster-recovery hold while serving, by the hold \
+                 marker's reason (keyspace_lost|slot_lost|mapping_lost|session_lost|\
+                 successor_lost|retired_object_mapped|other).",
+            )
+            .build();
+        let dr_hold_verdict_stale = meter
+            .u64_gauge("live_edit_dr_hold_verdict_stale")
+            .with_description(
+                "1 while this replica has had no successful disaster-recovery hold read for 30 s, \
+                 so it cannot tell whether the service is held: it reports readiness NOT_SERVING \
+                 and, unless already held, refuses every LiveService call UPSTREAM_UNAVAILABLE \
+                 and has stopped its background writers. It keeps reading, with no time \
+                 limit; a replica that is not held restarts on its next successful read. 0 \
+                 otherwise.",
+            )
+            .build();
+        let dr_restore_coverage_probes_total = meter
+            .u64_counter("live_edit_dr_restore_coverage_probes_total")
+            .with_description(
+                "Existence checks the disaster-recovery restore Job made against the backup store \
+                 for referenced external values that neither Valkey nor the restored backups \
+                 carry, by answer (present|absent|error): one count per backup-store call, which \
+                 retries inside the call. Only on the restore or accept-loss Job's pod, while it \
+                 runs.",
+            )
+            .build();
+        let dr_restore_values_uncovered = meter
+            .u64_gauge("live_edit_dr_restore_values_uncovered")
+            .with_description(
+                "External values referenced by restored or surviving layers that the \
+                 disaster-recovery restore Job found in no store: not in Valkey, not carried by a \
+                 restored backup, and absent from the backup store when checked once a cached \
+                 absence must have expired. The Job's log names each layer, prim and attribute. \
+                 Only on the Job's pod, while it runs.",
             )
             .build();
 
@@ -9305,6 +9997,13 @@ impl Metrics {
             auth_cache_misses.add(0, &[KeyValue::new("kind", kind)]);
         }
         userinfo_fallbacks_total.add(0, &[]);
+        // A serving replica reports `live_edit_dr_held` 0 from its first
+        // scrape, and every hold reason renders at 0.
+        dr_held.record(0, &[]);
+        for reason in DR_HOLD_REASONS {
+            dr_hold_entered_total.add(0, &[KeyValue::new("reason", reason)]);
+        }
+        dr_hold_verdict_stale.record(0, &[]);
         health_probe_failures_total.add(0, &[KeyValue::new("backend", "valkey")]);
         for result in ["success", "error", "skipped"] {
             for kind in CHECKPOINT_WRITE_KINDS {
@@ -9405,14 +10104,16 @@ impl Metrics {
         for result in CHECKPOINT_SESSION_PUBLISH_SUPERSEDED_RESULTS {
             checkpoint_session_publish_superseded_total.add(0, &[KeyValue::new("result", *result)]);
         }
-        for result in [
-            "recovered",
-            "adapter_miss",
-            "adapter_transient",
-            "adapter_permanent",
-            "adapter_other",
-        ] {
-            checkpoint_ext_recovery_total.add(0, &[KeyValue::new("result", result)]);
+        for result in EXT_RECOVERY_RESULTS {
+            for meta in EXT_RECOVERY_METAS {
+                checkpoint_ext_recovery_total.add(
+                    0,
+                    &[
+                        KeyValue::new("result", *result),
+                        KeyValue::new("meta", *meta),
+                    ],
+                );
+            }
         }
         for reason in EXT_MIRROR_DROP_REASONS {
             checkpoint_ext_mirror_dropped_total.add(0, &[KeyValue::new("reason", *reason)]);
@@ -9632,6 +10333,8 @@ impl Metrics {
         // Seeded so an `increase(...) > 0` alert evaluates a present series
         // from t=0.
         snapshot_read_window_fallback_total.add(0, &[]);
+        // Seeded for the same reason.
+        snapshot_read_index_incomplete_total.add(0, &[]);
         // All twelve store-write-refusal cells, so the out_of_memory page and
         // the sustained-rate rule over the other three have a series from t=0.
         for stage in STORE_WRITE_REFUSED_STAGES {
@@ -9647,12 +10350,13 @@ impl Metrics {
         }
         // Spec SDD SR-8.1 (and SDD §17.1's seeding rule): the cells the three
         // paths can emit, and no others — see `SNAPSHOT_READ_ATOMIC_CONSUMERS`
-        // for why the `structural_update` and ext-GC consumers have no atomic
-        // cell and `structural_cache` and `structural_cache_audit` no unfenced
-        // one,
+        // for why the `structural_update`, ext-GC and `dr_restore` consumers
+        // have no atomic cell and `structural_cache` and
+        // `structural_cache_audit` no unfenced one,
         // `SNAPSHOT_READ_UNFENCED_OUTCOMES` for why the unfenced path has no
         // `fence_broken` cell and only `structural_update` a `too_large` one
-        // (skipped below for ext-GC, whose read carries no allowance), and
+        // (skipped below for ext-GC and `dr_restore`, whose reads carry no
+        // allowance), and
         // `SNAPSHOT_READ_FENCED_CONSUMERS` for which consumers run the fenced
         // read.
         for (path, consumers, outcomes) in [
@@ -9837,10 +10541,10 @@ impl Metrics {
         // b.bhb: same reasoning — the `committed_unwatched` alert must have a
         // series before the first void. Registered as the full cross product
         // (see `WATCH_VOIDED_PATHS`), including the unreachable `compensated`
-        // cells — three of them, one per path that cannot compensate
-        // (`update_layer`, `restore_residue_wipe`, `restore_write_object`;
-        // only `create_session` can) — so the alert expression is identical
-        // across all four paths.
+        // cells — four of them, one per path that cannot compensate
+        // (`update_layer`, `restore_residue_wipe`, `restore_write_object`,
+        // `dr_job`; only `create_session` can) — so the alert expression is
+        // identical across all five paths.
         for path in WATCH_VOIDED_PATHS {
             for disposition in WATCH_VOIDED_DISPOSITIONS {
                 storage_watch_voided_total.add(
@@ -9974,6 +10678,12 @@ impl Metrics {
         // first clean-up reserves.
         retirement_budget_reserved_bytes.add(0, &[]);
         retirement_budget_overcommit_bytes.add(0, &[]);
+        // The catch-up payload budget's gauges and the live-delivery budget's
+        // overshoot counter, so their zeros are there before the first
+        // catch-up payload or the first overshoot.
+        catchup_payload_budget_reserved_bytes.add(0, &[]);
+        catchup_payload_budget_overcommit_bytes.add(0, &[]);
+        subscriber_delivery_budget_overshoots_total.add(0, &[]);
         for result in CATCHUP_BUILD_ADMISSION_RESULTS {
             catchup_build_admission_total.add(0, &[KeyValue::new("result", *result)]);
         }
@@ -10071,8 +10781,8 @@ impl Metrics {
                      copies / (LIVE_EDIT_VALKEY_MEMORY_BYTES x 0.8), where copies is 2 when the \
                      store's replica acknowledgement count (cmdstat_replconf) rose since the \
                      previous read and 1 when it did not move, so there the series appears at \
-                     the second read. Absent when neither applies, the latest read failed, or \
-                     the copies are not known",
+                     the second read. Absent when neither applies, the latest read failed or \
+                     could not confirm it reached every primary, or the copies are not known",
                 )
                 .with_callback(move |observer| {
                     let ratio = *cell
@@ -10141,6 +10851,7 @@ impl Metrics {
             snapshot_read_type_error_total,
             snapshot_read_refused_total,
             snapshot_read_window_fallback_total,
+            snapshot_read_index_incomplete_total,
             snapshot_read_total,
             snapshot_read_duration_seconds,
             snapshot_read_reply_bytes,
@@ -10197,6 +10908,8 @@ impl Metrics {
             pod_memory_limit_bytes,
             catchup_build_budget_bytes,
             retirement_budget_bytes,
+            subscriber_delivery_budget_bytes,
+            catchup_payload_budget_bytes,
             structural_cache_budget_bytes,
             subscriber_max_subscriptions,
             upload_overflow_bytes,
@@ -10220,6 +10933,10 @@ impl Metrics {
             retirement_budget_reserved_bytes,
             retirement_budget_overcommit_bytes,
             retirement_wait_seconds,
+            catchup_payload_budget_reserved_bytes,
+            catchup_payload_budget_overcommit_bytes,
+            catchup_payload_wait_seconds,
+            subscriber_delivery_budget_overshoots_total,
             catchup_builds_in_progress,
             catchup_snapshot_flight_total,
             subscriber_admitted,
@@ -10246,6 +10963,7 @@ impl Metrics {
             checkpoint_reconcile_total,
             checkpoint_adapter_ceiling_elapsed_total,
             checkpoint_adapter_redirect_total,
+            checkpoint_adapter_call_duration_seconds,
             checkpoint_ext_tombstone_backlog,
             checkpoint_dead_object_backlog,
             delta_create_section_skipped_missing_parent_total,
@@ -10300,6 +11018,11 @@ impl Metrics {
             service_token_available,
             service_token_expires_in_seconds,
             service_token_refresh_headroom_seconds,
+            dr_held,
+            dr_hold_entered_total,
+            dr_hold_verdict_stale,
+            dr_restore_coverage_probes_total,
+            dr_restore_values_uncovered,
         })
     }
 
@@ -10935,11 +11658,13 @@ impl Metrics {
     }
 
     /// Increment the ext-value recovery-via-adapter outcome counter (SDD SR-3.2).
-    /// `result` must be one of `recovered`, `adapter_miss`, `adapter_transient`,
-    /// `adapter_permanent`, `adapter_other`.
-    pub fn inc_ext_recovery(&self, result: &str) {
-        self.checkpoint_ext_recovery_total
-            .add(1, &[KeyValue::new("result", result.to_string())]);
+    /// `result` is one of [`EXT_RECOVERY_RESULTS`], `meta` one of
+    /// [`EXT_RECOVERY_METAS`].
+    pub fn inc_ext_recovery(&self, result: &'static str, meta: &'static str) {
+        self.checkpoint_ext_recovery_total.add(
+            1,
+            &[KeyValue::new("result", result), KeyValue::new("meta", meta)],
+        );
     }
 
     /// Add `n` checked external-value references to
@@ -11210,6 +11935,29 @@ impl Metrics {
         );
     }
 
+    /// Observe one storage-api checkpoint-adapter call's wall time on
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65).
+    ///
+    /// `verb` is one of [`CHECKPOINT_ADAPTER_CALL_VERBS`] and `outcome` one of
+    /// [`CHECKPOINT_ADAPTER_CALL_OUTCOMES`]. `service` is the adapter's own
+    /// label, as on the two sibling adapter families. One call, one sample.
+    pub fn observe_checkpoint_adapter_call_duration(
+        &self,
+        verb: &'static str,
+        outcome: &'static str,
+        service: &str,
+        secs: f64,
+    ) {
+        self.checkpoint_adapter_call_duration_seconds.record(
+            secs,
+            &[
+                KeyValue::new("verb", verb),
+                KeyValue::new("outcome", outcome),
+                KeyValue::new("service", service.to_string()),
+            ],
+        );
+    }
+
     /// Publish the ext-blob tombstone backlog observed by one reconciliation
     /// pass (b.9qd).
     ///
@@ -11341,14 +12089,17 @@ impl Metrics {
     /// 0 under every other source of
     /// [`crate::config::PodMemoryLimitSource::ALL`], so every source series
     /// exists and exactly one carries the limit, and the catch-up budget, the
-    /// retirement allowance, the structural cache's resident budget, the
-    /// subscription ceiling and the checkpoint mirror's byte budget (0 when the
-    /// plan does not fund the mirror). Each budget carries the labels of the
-    /// usage gauge it is read against: the structural cache's `service`, as
-    /// its weight gauge does; the catch-up budget, the retirement allowance and
-    /// the subscription ceiling none, as
+    /// retirement allowance, the live-delivery and catch-up payload budgets,
+    /// the structural cache's resident budget, the subscription ceiling and
+    /// the checkpoint mirror's byte budget (0 when the plan does not fund the
+    /// mirror). Each budget carries the labels of the usage gauge it is read
+    /// against: the structural cache's `service`, as its weight gauge does;
+    /// the catch-up budget, the retirement allowance, the live-delivery and
+    /// catch-up payload budgets and the subscription ceiling none, as
     /// `live_edit_catchup_build_budget_reserved_bytes`,
-    /// `live_edit_retirement_budget_reserved_bytes` and
+    /// `live_edit_retirement_budget_reserved_bytes`,
+    /// `live_edit_subscriber_delivery_charged_bytes`,
+    /// `live_edit_catchup_payload_budget_reserved_bytes` and
     /// `live_edit_subscriber_admitted` carry none. The mirror's budget is
     /// unlabelled too, and is read against the sum over `state` of
     /// `live_edit_checkpoint_ext_mirror_bytes`.
@@ -11368,6 +12119,10 @@ impl Metrics {
             .record(plan.catchup_budget_bytes(), &[]);
         self.retirement_budget_bytes
             .record(plan.retirement_budget_bytes(), &[]);
+        self.subscriber_delivery_budget_bytes
+            .record(plan.live_delivery_budget_bytes(), &[]);
+        self.catchup_payload_budget_bytes
+            .record(plan.catchup_payload_budget_bytes(), &[]);
         self.structural_cache_budget_bytes.record(
             plan.structural_cache_resident_budget_bytes(),
             std::slice::from_ref(&self.service_kv),
@@ -11453,8 +12208,10 @@ impl Metrics {
     /// Call this only where the owed batch is in hand, so `n` is the batch
     /// length: the two counted sites are `LayerStore::enqueue_ext_releases`
     /// (commit path, after its one in-line retry, so the retry itself never
-    /// doubles a tick) and `storage::layer::schedule_old_object_ext_gc`
-    /// (retirement path, only when its begin failed or answered `busy`). A
+    /// doubles a tick; under a restore's hold write fence it also counts the
+    /// batch it skips, `LayerStore::enqueue_ext_releases_unless_held`) and
+    /// `storage::layer::schedule_old_object_ext_gc` (retirement path, only
+    /// when its begin failed or answered `busy`). A
     /// caller that re-runs the whole retirement — `delete_layer`'s retry
     /// cascade — re-derives the batch and ticks again, which is the residual
     /// amplification the field doc describes. A failure earlier than either of
@@ -11786,8 +12543,7 @@ impl Metrics {
 
     /// Record one catch-up materialized-state read's cut outcome (b.vd8, Spec
     /// SDD SR-8.6; see [`Self::subscribe_stable_cut_total`] for what each
-    /// outcome means, and for the rollback-mode in-window replay, which
-    /// records only a regressed per-commit read). One counter add per call:
+    /// outcome means). One counter add per call:
     /// every catch-up read is one pass — an atomic read, or a catch-up's share
     /// of its flight's fenced read.
     ///
@@ -12380,6 +13136,15 @@ impl Metrics {
         self.snapshot_read_window_fallback_total.add(1, &[]);
     }
 
+    /// Record one object-snapshot read attempt whose round-1 index came back
+    /// short of its count under a proof that no writer changed the object
+    /// (one proven skip; `live_edit_snapshot_read_index_incomplete_total`).
+    /// Called once per proven skip, by `storage::diff_read`'s shortfall
+    /// report.
+    pub fn inc_snapshot_read_index_incomplete(&self) {
+        self.snapshot_read_index_incomplete_total.add(1, &[]);
+    }
+
     /// Record one completed object-snapshot read attempt (Spec SDD SR-8.1,
     /// SR-8.2): ticks `live_edit_snapshot_read_total{consumer, path, outcome}`
     /// and records its wall time on
@@ -12709,6 +13474,73 @@ impl Metrics {
         self.retirement_budget_overcommit_bytes.add(delta, &[]);
     }
 
+    /// Move `live_edit_catchup_payload_budget_reserved_bytes` by `delta`
+    /// bytes.
+    pub fn add_catchup_payload_budget_reserved_bytes(&self, delta: i64) {
+        self.catchup_payload_budget_reserved_bytes.add(delta, &[]);
+    }
+
+    /// Move `live_edit_catchup_payload_budget_overcommit_bytes` by `delta`
+    /// bytes.
+    pub fn add_catchup_payload_budget_overcommit_bytes(&self, delta: i64) {
+        self.catchup_payload_budget_overcommit_bytes.add(delta, &[]);
+    }
+
+    /// Record one catch-up payload reservation's wait on
+    /// `live_edit_catchup_payload_wait_seconds{outcome}`. `outcome` is one of
+    /// [`CATCHUP_PAYLOAD_WAIT_OUTCOMES`].
+    pub fn observe_catchup_payload_wait(&self, waited: Duration, outcome: &'static str) {
+        self.catchup_payload_wait_seconds
+            .record(waited.as_secs_f64(), &[KeyValue::new("outcome", outcome)]);
+    }
+
+    /// Count one live-delivery budget overshoot on
+    /// `live_edit_subscriber_delivery_budget_overshoots_total`.
+    pub fn inc_subscriber_delivery_budget_overshoot(&self) {
+        self.subscriber_delivery_budget_overshoots_total.add(1, &[]);
+    }
+
+    /// Register the live-delivery ledger's usage gauges, read at every
+    /// collection: `live_edit_subscriber_delivery_charged_bytes` (`charged`,
+    /// every relay copy the stream readers hold for subscriptions plus a
+    /// per-entry charge for each entry queued for a subscription) and
+    /// `live_edit_subscriber_delivery_exempt_bytes` (`exempt`, the charge of
+    /// each layer's largest live relay copy, which the budget excuses).
+    /// Unlabelled, read against `live_edit_subscriber_delivery_budget_bytes`:
+    /// the replica is over its budget when charged less exempt exceeds it.
+    /// Observable gauges rather than counters moved on every offer, so the
+    /// fan-out path records nothing. Called by
+    /// `ValkeyClient::install_observability_hooks`; a replica that never calls
+    /// it has neither family.
+    pub fn register_delivery_ledger_gauges<C, E>(&self, charged: C, exempt: E)
+    where
+        C: Fn() -> u64 + Send + Sync + 'static,
+        E: Fn() -> u64 + Send + Sync + 'static,
+    {
+        let _charged = self
+            .meter
+            .u64_observable_gauge("live_edit_subscriber_delivery_charged_bytes")
+            .with_description(
+                "Bytes this replica's live delivery holds for its subscriptions' undelivered \
+                 updates, as the live-delivery budget charges them: each relay copy the stream \
+                 readers made (shared by every subscription of its layer, plus a fixed overhead) \
+                 and a fixed overhead per update queued for a subscription. Read minus \
+                 live_edit_subscriber_delivery_exempt_bytes against \
+                 live_edit_subscriber_delivery_budget_bytes.",
+            )
+            .with_callback(move |observer| observer.observe(charged(), &[]))
+            .build();
+        let _exempt = self
+            .meter
+            .u64_observable_gauge("live_edit_subscriber_delivery_exempt_bytes")
+            .with_description(
+                "Bytes of live_edit_subscriber_delivery_charged_bytes the live-delivery budget \
+                 excuses: the charge of each layer's largest pending relay copy.",
+            )
+            .with_callback(move |observer| observer.observe(exempt(), &[]))
+            .build();
+    }
+
     /// Record one retirement reservation's wait on
     /// `live_edit_retirement_wait_seconds{outcome}`. `outcome` is one of
     /// [`RETIREMENT_WAIT_OUTCOMES`].
@@ -13023,8 +13855,8 @@ impl Metrics {
         self.upload_overflow_waiters.add(delta, &[]);
     }
 
-    /// One upload's processing step took the overflow slot. `rpc` must come
-    /// from [`UPLOAD_RPCS`].
+    /// One upload's receive growth or processing step took the overflow slot.
+    /// `rpc` must come from [`UPLOAD_RPCS`].
     pub fn inc_upload_overflow_runs(&self, rpc: &'static str) {
         self.upload_overflow_runs_total
             .add(1, &[KeyValue::new("rpc", rpc)]);
@@ -13111,6 +13943,61 @@ impl Metrics {
     pub fn inc_background_task_panic(&self, task: &str) {
         self.background_task_panics_total
             .add(1, &[KeyValue::new("task", task.to_string())]);
+    }
+
+    /// Record a disaster-recovery hold entry (SDD SR-7): set
+    /// `live_edit_dr_held` to 1 and tick
+    /// `live_edit_dr_hold_entered_total{reason}` once, with `reason` the hold
+    /// marker's reason mapped onto the bounded vocabulary
+    /// ([`dr_hold_reason_label`]).
+    pub fn record_dr_hold_entered(&self, reason: Option<&str>) {
+        self.dr_held.record(1, &[]);
+        self.dr_hold_entered_total
+            .add(1, &[KeyValue::new("reason", dr_hold_reason_label(reason))]);
+    }
+
+    /// Set `live_edit_dr_held` (SDD SR-7) — 1 when `held`, else 0 — and
+    /// nothing else: `live_edit_dr_hold_entered_total` counts hold entries
+    /// while serving, and is not ticked. Held-mode startup
+    /// (`grpc::hold::run_held_mode`) sets it before it serves, so a replica
+    /// that starts held reports 1 from the first scrape after its startup
+    /// hold evaluation.
+    pub fn set_dr_held(&self, held: bool) {
+        self.dr_held.record(u64::from(held), &[]);
+    }
+
+    /// Set `live_edit_dr_hold_verdict_stale` (SDD SR-6.5): 1 when `stale`,
+    /// else 0.
+    pub fn set_dr_hold_verdict_stale(&self, stale: bool) {
+        self.dr_hold_verdict_stale.record(u64::from(stale), &[]);
+    }
+
+    /// Initialise the restore coverage check's two families on this process
+    /// (SDD SR-9.3): record 0 on every
+    /// `live_edit_dr_restore_coverage_probes_total{result}` cell and on
+    /// `live_edit_dr_restore_values_uncovered`. Called by the restore planner
+    /// as it starts, so only a DR Job's pod renders them; a server never
+    /// calls it.
+    pub fn init_dr_restore_coverage(&self) {
+        for result in DR_COVERAGE_PROBE_RESULTS {
+            self.dr_restore_coverage_probes_total
+                .add(0, &[KeyValue::new("result", result)]);
+        }
+        self.dr_restore_values_uncovered.record(0, &[]);
+    }
+
+    /// Tick `live_edit_dr_restore_coverage_probes_total{result}` once: one
+    /// backup-store existence check answered `result` (a
+    /// [`DR_COVERAGE_PROBE_RESULTS`] value).
+    pub fn inc_dr_restore_coverage_probe(&self, result: &'static str) {
+        self.dr_restore_coverage_probes_total
+            .add(1, &[KeyValue::new("result", result)]);
+    }
+
+    /// Set `live_edit_dr_restore_values_uncovered` to `count`, the distinct
+    /// referenced values judged in no store.
+    pub fn set_dr_restore_values_uncovered(&self, count: u64) {
+        self.dr_restore_values_uncovered.record(count, &[]);
     }
 }
 
@@ -14588,6 +15475,117 @@ mod tests {
         );
     }
 
+    // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+    /// Every `verb` ([`CHECKPOINT_ADAPTER_CALL_VERBS`]) and `outcome`
+    /// ([`CHECKPOINT_ADAPTER_CALL_OUTCOMES`]) value of
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65) appears in
+    /// that family's row of the customer metrics reference.
+    ///
+    /// Same shape as
+    /// [`every_checkpoint_adapter_redirect_label_value_appears_in_the_metrics_guide`]:
+    /// presence only, backtick-wrapped, scoped to the family's row. Its own test
+    /// because the vocabularies would fail for their own reasons: a verb names a
+    /// kind of storage-service call (`list_page` is one page of a listing, not
+    /// one listing), an outcome names how the call ended before the adapter
+    /// remapped it, and neither can be read off a neighbouring family.
+    #[test]
+    fn every_checkpoint_adapter_call_label_value_appears_in_the_metrics_guide() {
+        assert_reference_row_names(
+            "live_edit_checkpoint_adapter_call_duration_seconds",
+            "verb",
+            CHECKPOINT_ADAPTER_CALL_VERBS,
+        );
+        assert_reference_row_names(
+            "live_edit_checkpoint_adapter_call_duration_seconds",
+            "outcome",
+            CHECKPOINT_ADAPTER_CALL_OUTCOMES,
+        );
+    }
+
+    /// The adapter-call histogram's two vocabularies are pinned exactly, it
+    /// is NOT zero-seeded (a histogram cannot be), and its first observation
+    /// lands in its `(verb, outcome, service)` cell and in the registered
+    /// bucket boundaries (b.g65).
+    ///
+    /// The bucket check reads the rendered `le` bounds: a 3 s sample is above
+    /// the `le="2.5"` bound and within `le="5"`, and the `le="200"` bound that
+    /// brackets the 180 s per-call ceiling exists. The SDK's default bucket
+    /// set has no `2.5` bound, so a family left on the defaults fails here.
+    #[test]
+    fn checkpoint_adapter_call_histogram_vocabulary_is_pinned_and_appears_on_first_observation() {
+        assert_eq!(
+            CHECKPOINT_ADAPTER_CALL_VERBS,
+            &[
+                "put",
+                "get",
+                "list_page",
+                "delete",
+                "head",
+                "upload_options"
+            ]
+        );
+        assert_eq!(
+            CHECKPOINT_ADAPTER_CALL_OUTCOMES,
+            &[
+                "ok",
+                "not_found",
+                "conflict",
+                "transient",
+                "permanent",
+                "ceiling",
+                "cancelled"
+            ]
+        );
+        let metrics = metrics_scrape_only("adapter-call-histogram-test");
+        assert!(
+            !render(&metrics).contains("live_edit_checkpoint_adapter_call_duration_seconds"),
+            "a histogram cannot be zero-seeded: the family is absent until its first call"
+        );
+
+        metrics.observe_checkpoint_adapter_call_duration(
+            CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+            CHECKPOINT_ADAPTER_CALL_OUTCOME_OK,
+            "adapter-call-histogram-test",
+            3.0,
+        );
+
+        let text = render(&metrics);
+        let labels = [
+            ("verb", "list_page"),
+            ("outcome", "ok"),
+            ("service", "adapter-call-histogram-test"),
+        ];
+        assert_eq!(
+            sample_value(
+                &text,
+                "live_edit_checkpoint_adapter_call_duration_seconds_count",
+                &labels
+            ),
+            Some(1.0),
+            "one sample in its (verb, outcome, service) cell:\n{text}"
+        );
+        let bucket = |le: &str| {
+            let mut with_le = labels.to_vec();
+            with_le.push(("le", le));
+            sample_value(
+                &text,
+                "live_edit_checkpoint_adapter_call_duration_seconds_bucket",
+                &with_le,
+            )
+        };
+        assert_eq!(
+            bucket("2.5"),
+            Some(0.0),
+            "a 3 s call is above the 2.5 s bound"
+        );
+        assert_eq!(bucket("5"), Some(1.0), "and within the 5 s bound");
+        assert_eq!(
+            bucket("200"),
+            Some(1.0),
+            "the 200 s bound — one bucket above the 180 s per-call ceiling — is registered"
+        );
+    }
+
     // ══ b.dfh Epic 3 / SDD SR-8.2: tail-capture observability surface ═══════
 
     /// Every `outcome` cell of `live_edit_checkpoint_tail_total` is zero-seeded,
@@ -14663,6 +15661,11 @@ mod tests {
         // rather than inserted beside its sibling, and zero-seeded like every
         // other member, so the addition is invisible to dashboards keyed on the
         // nine older cells.
+        //
+        // The ELEVENTH is `refused_cleanup_in_flight` (b.g65): the pre-PUT
+        // clean-up fence refused the tail's PUT while the checkpoint clean-up
+        // deletes an earlier copy of the same generation. Appended for the same
+        // reason.
         assert_eq!(
             CHECKPOINT_TAIL_OUTCOMES,
             [
@@ -14676,6 +15679,7 @@ mod tests {
                 "refused_no_base",
                 "refused_chain_full",
                 "refused_lineage_unrootable",
+                "refused_cleanup_in_flight",
             ],
             "the outcome vocabulary is pinned: sibling Tasks in this Epic map their \
              classification results onto it 1:1, so an outcome invented at a call site \
@@ -14683,9 +15687,10 @@ mod tests {
         );
         assert_eq!(
             CHECKPOINT_TAIL_OUTCOMES.len(),
-            10,
-            "ten outcomes: SR-8.2's eight, plus the chain-bound `refused_chain_full`, plus \
-             SR-7's `refused_lineage_unrootable` store-damage split"
+            11,
+            "eleven outcomes: SR-8.2's eight, plus the chain-bound `refused_chain_full`, plus \
+             SR-7's `refused_lineage_unrootable` store-damage split, plus b.g65's \
+             `refused_cleanup_in_flight` clean-up deferral"
         );
     }
 
@@ -14857,8 +15862,8 @@ mod tests {
             .collect();
         assert_eq!(
             series.len(),
-            20,
-            "the family must render exactly 20 series on a FIRST scrape — the full 10 x 2 grid, \
+            22,
+            "the family must render exactly 22 series on a FIRST scrape — the full 11 x 2 grid, \
              the two RestoreRebase-only arms seeded at `creation_base` included. Fewer means the \
              seeding loop skipped inadmissible pairs (making a stopped-seeding regression \
              invisible); more means an out-of-band cell the per-cell subset matcher above cannot \
@@ -14908,6 +15913,7 @@ mod tests {
                 "unstamped_foreign_restore",
                 "unstamped_write_error",
                 "failed",
+                "deferred_cleanup",
             ],
             "the base-bootstrap outcome vocabulary is pinned, in order: `outcome_label` indexes \
              this constant, so a reordering re-attributes every arm from that index on, and an \
@@ -14916,11 +15922,11 @@ mod tests {
         );
         assert_eq!(
             CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES.len(),
-            10,
-            "ten outcomes: `persisted`, the admission `shed`, three pre-PUT `skipped_*`, four \
+            11,
+            "eleven outcomes: `persisted`, the admission `shed`, three pre-PUT `skipped_*`, four \
              post-PUT `unstamped_*` (b.vn6 added `unstamped_header_absent`, the post-PUT half of \
-             the deleted-header race whose pre-PUT half is `skipped_header_absent`), and \
-             `failed`. The benign members are the DENOMINATOR that turns `shed` into a \
+             the deleted-header race whose pre-PUT half is `skipped_header_absent`), `failed`, \
+             and the clean-up fence's `deferred_cleanup` (b.g65). The benign members are the DENOMINATOR that turns `shed` into a \
              saturation ratio, so none of them may be folded away"
         );
 
@@ -15026,8 +16032,9 @@ mod tests {
     /// # Scope
     ///
     /// [`CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES`] × [`CHECKPOINT_BASE_BOOTSTRAP_SITES`],
-    /// `refused_lineage_unrootable` (the newest [`CHECKPOINT_TAIL_OUTCOMES`]
-    /// member, the one with a standing alert), and
+    /// `refused_cleanup_in_flight` (the newest [`CHECKPOINT_TAIL_OUTCOMES`]
+    /// member) and `refused_lineage_unrootable` (the one with a standing
+    /// alert), and
     /// [`EXT_VALUE_VERIFY_RESULTS`] of the upload content check.
     #[test]
     fn every_adjudicated_label_value_appears_in_the_metrics_guide() {
@@ -15037,10 +16044,10 @@ mod tests {
             .last()
             .expect("CHECKPOINT_TAIL_OUTCOMES is never empty");
         assert_eq!(
-            *tail_member, "refused_lineage_unrootable",
-            "this guard checks the tail vocabulary's NEWEST member by position, so an eleventh \
+            *tail_member, "refused_cleanup_in_flight",
+            "this guard checks the tail vocabulary's NEWEST member by position, so a twelfth \
              member appended later inherits the check automatically — but a member inserted \
-             ahead of `refused_lineage_unrootable` would silently move the target. Re-point this \
+             ahead of `refused_cleanup_in_flight` would silently move the target. Re-point this \
              assertion deliberately if the vocabulary grows"
         );
 
@@ -15054,7 +16061,11 @@ mod tests {
             "site",
             CHECKPOINT_BASE_BOOTSTRAP_SITES,
         );
-        assert_reference_row_names("live_edit_checkpoint_tail_total", "outcome", &[tail_member]);
+        assert_reference_row_names(
+            "live_edit_checkpoint_tail_total",
+            "outcome",
+            &["refused_lineage_unrootable", tail_member],
+        );
         // The mismatch cells are the operator's rollout check for
         // LIVE_EDIT_EXT_VALUE_VERIFY=observe, so an undocumented one cannot
         // be read.
@@ -16686,7 +17697,8 @@ mod tests {
 
     /// T7 (b.qhk): the help text names the two arms, the copies rule with its
     /// second-read absence on a store that reports no `maxmemory`, and when
-    /// the series is absent.
+    /// the series is absent — among those times, b.xb7's read that could not
+    /// confirm it reached every primary.
     #[test]
     fn store_memory_used_ratio_help_names_its_arms_and_its_absence() {
         let metrics = metrics_scrape_only("test-pod");
@@ -16703,6 +17715,7 @@ mod tests {
             "appears at the second read",
             "above 1 when the store is past its limit",
             "Absent when",
+            "could not confirm it reached every primary",
         ] {
             assert!(help.contains(phrase), "{phrase:?} in {help:?}");
         }
@@ -16836,7 +17849,13 @@ mod tests {
         let text = render(&metrics);
         assert_eq!(
             EXT_MIRROR_DROP_REASONS,
-            ["queue_full", "budget_full", "oversized", "shutdown"]
+            [
+                "queue_full",
+                "budget_full",
+                "oversized",
+                "shutdown",
+                "collect_fenced"
+            ]
         );
         assert_eq!(EXT_MIRROR_STATES, ["queued", "in_flight"]);
         for reason in EXT_MIRROR_DROP_REASONS {
@@ -16877,8 +17896,8 @@ mod tests {
 
     /// The backup repair's counters exist from the first scrape, every
     /// `outcome` and every `op` at 0, so an `increase()` alert sees the first
-    /// tick; the vocabularies are pinned (eight outcomes, two ops: the clean-up
-    /// fence and its outcome are not part of this build). The owed gauge has
+    /// tick; the vocabularies are pinned (nine outcomes, `collect_fenced`
+    /// among them, and two ops). The owed gauge has
     /// no series until a pass or a non-leader publishes one: unknown is not 0.
     /// Publishing replaces the reading per `service`, and the outcome adder
     /// ignores a 0.
@@ -16897,6 +17916,7 @@ mod tests {
                 "budget_busy",
                 "oversized",
                 "confirmed_copy_missing",
+                "collect_fenced",
             ]
         );
         assert_eq!(EXT_BACKUP_MARK_OPS, ["confirm", "clear"]);
@@ -17085,6 +18105,36 @@ mod tests {
                 vec![format!("{EXT_MIRROR_BUDGET} 0")],
                 "the chart's configuration has no backup store: the plan funds no mirror"
             );
+            // b.ntm: the live-delivery and catch-up payload budgets, each one
+            // unlabelled gauge series at the plan's value, like the usage
+            // gauges they are read against (T12, T15).
+            for (name, value, what) in [
+                (
+                    LIVE_DELIVERY_BUDGET,
+                    plan.live_delivery_budget_bytes(),
+                    "D_live",
+                ),
+                (
+                    CATCHUP_PAYLOAD_BUDGET,
+                    plan.catchup_payload_budget_bytes(),
+                    "D_c",
+                ),
+            ] {
+                assert_eq!(metric_type(&text, name).as_deref(), Some("gauge"), "{name}");
+                assert_eq!(
+                    series_lines(&text, name),
+                    vec![format!("{name} {value}")],
+                    "{what} is unlabelled, the plan's"
+                );
+            }
+            assert_eq!(
+                (
+                    plan.live_delivery_budget_bytes(),
+                    plan.catchup_payload_budget_bytes()
+                ),
+                (80 << 20, 241 << 20),
+                "D_live and D_c at 8 GiB"
+            );
         }
 
         // With a backup store the plan funds the mirror: its budget is
@@ -17114,6 +18164,110 @@ mod tests {
             series_lines(&text, EXT_MIRROR_BUDGET),
             vec![format!("{EXT_MIRROR_BUDGET} {}", 204u64 << 20)],
             "the mirror's budget is unlabelled, the plan's M_ext"
+        );
+    }
+
+    /// The live-delivery budget `D_live`'s gauge (b.ntm).
+    const LIVE_DELIVERY_BUDGET: &str = "live_edit_subscriber_delivery_budget_bytes";
+    /// The catch-up payload budget `D_c`'s gauge (b.ntm).
+    const CATCHUP_PAYLOAD_BUDGET: &str = "live_edit_catchup_payload_budget_bytes";
+
+    /// T15 (b.ntm): the delivery budgets' series follow the budget-gauge
+    /// convention. Each budget gauge has no series until the plan is recorded
+    /// ([`record_pod_memory_plan_creates_every_source_series_and_each_budget_gauge`]);
+    /// the catch-up payload budget's reserved and over-commit gauges and the
+    /// live-delivery budget's overshoot counter are seeded at 0, unlabelled;
+    /// the payload wait histogram has no series before its first observation.
+    /// The live-delivery ledger's usage gauges exist only once registered, and
+    /// read their callbacks at each collection, unlabelled. The overshoot
+    /// counter counts each overshoot.
+    #[test]
+    fn the_delivery_budgets_series_are_seeded_unlabelled_and_the_ledger_gauges_read_at_collection()
+    {
+        let metrics = metrics_scrape_only("zero-seed-test");
+        let text = render(&metrics);
+        for name in [LIVE_DELIVERY_BUDGET, CATCHUP_PAYLOAD_BUDGET] {
+            assert!(
+                series_lines(&text, name).is_empty(),
+                "{name}: no reading before the plan is recorded"
+            );
+        }
+        for (name, kind) in [
+            ("live_edit_catchup_payload_budget_reserved_bytes", "gauge"),
+            ("live_edit_catchup_payload_budget_overcommit_bytes", "gauge"),
+            (
+                "live_edit_subscriber_delivery_budget_overshoots_total",
+                "counter",
+            ),
+        ] {
+            assert_eq!(metric_type(&text, name).as_deref(), Some(kind), "{name}");
+            assert_eq!(
+                series_lines(&text, name),
+                vec![format!("{name} 0")],
+                "{name}: one unlabelled series at 0"
+            );
+        }
+        assert!(
+            !text.contains("live_edit_catchup_payload_wait_seconds"),
+            "the wait histogram appears with its first observation"
+        );
+        for name in [
+            "live_edit_subscriber_delivery_charged_bytes",
+            "live_edit_subscriber_delivery_exempt_bytes",
+        ] {
+            assert!(
+                series_lines(&text, name).is_empty(),
+                "{name} exists only once the ledger registers it"
+            );
+        }
+
+        let charged = Arc::new(std::sync::atomic::AtomicU64::new(1_234));
+        let exempt = Arc::new(std::sync::atomic::AtomicU64::new(56));
+        {
+            let (charged, exempt) = (Arc::clone(&charged), Arc::clone(&exempt));
+            metrics.register_delivery_ledger_gauges(
+                move || charged.load(std::sync::atomic::Ordering::SeqCst),
+                move || exempt.load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+        metrics.inc_subscriber_delivery_budget_overshoot();
+        metrics.observe_catchup_payload_wait(
+            Duration::from_millis(5),
+            CATCHUP_PAYLOAD_WAIT_OUTCOME_REFUSED_TIMEOUT,
+        );
+        let text = render(&metrics);
+        assert_eq!(
+            series_lines(&text, "live_edit_subscriber_delivery_charged_bytes"),
+            vec!["live_edit_subscriber_delivery_charged_bytes 1234".to_owned()]
+        );
+        assert_eq!(
+            series_lines(&text, "live_edit_subscriber_delivery_exempt_bytes"),
+            vec!["live_edit_subscriber_delivery_exempt_bytes 56".to_owned()]
+        );
+        assert_eq!(
+            sample_value(
+                &text,
+                "live_edit_subscriber_delivery_budget_overshoots_total",
+                &[]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            sample_value(
+                &text,
+                "live_edit_catchup_payload_wait_seconds_count",
+                &[("outcome", "refused_timeout")]
+            ),
+            Some(1.0)
+        );
+        charged.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            series_lines(
+                &render(&metrics),
+                "live_edit_subscriber_delivery_charged_bytes"
+            ),
+            vec!["live_edit_subscriber_delivery_charged_bytes 0".to_owned()],
+            "read at each collection"
         );
     }
 
@@ -17679,5 +18833,230 @@ mod tests {
             "scrape arm must keep working when the OTLP push arm is also attached"
         );
         metrics.shutdown();
+    }
+
+    // ── `# HELP` texts name their label vocabularies (b.g65) ─────────────
+
+    /// The `# HELP` description of every family in an exposition, and every
+    /// value each `(family, label)` pair carries in its samples. A histogram's
+    /// `_bucket` / `_sum` / `_count` samples count toward their family.
+    struct HelpAndLabels {
+        help: std::collections::BTreeMap<String, String>,
+        values: std::collections::BTreeMap<(String, String), std::collections::BTreeSet<String>>,
+    }
+
+    fn help_and_labels(text: &str) -> HelpAndLabels {
+        let mut help = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let (name, description) = rest.split_once(' ').unwrap_or((rest, ""));
+                help.insert(name.to_owned(), description.to_owned());
+            }
+        }
+        let mut values: std::collections::BTreeMap<_, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let Some((name, rest)) = line.split_once('{') else {
+                continue;
+            };
+            let family = ["", "_bucket", "_sum", "_count"]
+                .iter()
+                .filter_map(|suffix| name.strip_suffix(suffix))
+                .find(|family| help.contains_key(*family));
+            let (Some(family), Some((labels, _))) = (family, rest.rsplit_once('}')) else {
+                continue;
+            };
+            for pair in labels.split("\",") {
+                if let Some((label, value)) = pair.split_once("=\"") {
+                    values
+                        .entry((family.to_owned(), label.to_owned()))
+                        .or_default()
+                        .insert(value.trim_end_matches('"').to_owned());
+                }
+            }
+        }
+        HelpAndLabels { help, values }
+    }
+
+    /// The words of a `# HELP` description: maximal runs of ASCII letters,
+    /// digits and `_`, so `captured` is not found inside `captured_capped` and
+    /// a value counts only where the text names it whole.
+    fn help_words(help: &str) -> std::collections::BTreeSet<&str> {
+        help.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+
+    // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+    /// **F8 (b.g65).** Each checkpoint clean-up family whose vocabulary b.g65
+    /// extended names every value of its vocabulary constant in its `# HELP`
+    /// text, as rendered on `/metrics`: `refused_cleanup_in_flight` (tail),
+    /// `deferred_cleanup` (base bootstrap), `collect_fenced` (mirror drops and
+    /// repair) and the reconcile outcomes, plus the bootstrap's sites and the
+    /// backup marks' ops, whose texts list them too. The constants are what
+    /// mints the cells, so a value added to one with no word in the
+    /// description ships a series the operator's one in-band explanation does
+    /// not mention — and nothing else notices, since every other pin reads the
+    /// constant and is satisfied by the addition itself.
+    ///
+    /// Whole words of the description, never substrings (see [`help_words`]).
+    /// The families whose description enumerates a label are all checked by
+    /// [`every_help_text_that_enumerates_a_label_names_all_its_values`]; this
+    /// one reads the constants, so it holds even for a cell that is not
+    /// zero-seeded.
+    #[test]
+    fn every_value_of_a_checkpoint_clean_up_vocabulary_appears_in_its_family_help() {
+        let metrics = metrics_scrape_only("help-vocabulary-test");
+        let parsed = help_and_labels(&render(&metrics));
+        for (family, label, vocabulary) in [
+            (
+                "live_edit_checkpoint_tail_total",
+                "outcome",
+                CHECKPOINT_TAIL_OUTCOMES,
+            ),
+            (
+                "live_edit_checkpoint_base_bootstrap_total",
+                "outcome",
+                CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES,
+            ),
+            (
+                "live_edit_checkpoint_base_bootstrap_total",
+                "site",
+                CHECKPOINT_BASE_BOOTSTRAP_SITES,
+            ),
+            (
+                "live_edit_checkpoint_ext_mirror_dropped_total",
+                "reason",
+                EXT_MIRROR_DROP_REASONS,
+            ),
+            (
+                "live_edit_checkpoint_ext_backup_repair_total",
+                "outcome",
+                EXT_BACKUP_REPAIR_OUTCOMES,
+            ),
+            (
+                "live_edit_checkpoint_reconcile_total",
+                "outcome",
+                CHECKPOINT_RECONCILE_OUTCOMES,
+            ),
+            (
+                "live_edit_checkpoint_ext_backup_mark_failed_total",
+                "op",
+                EXT_BACKUP_MARK_OPS,
+            ),
+        ] {
+            let help = parsed
+                .help
+                .get(family)
+                .unwrap_or_else(|| panic!("a `# HELP` line for {family}"));
+            let words = help_words(help);
+            let missing: Vec<&str> = vocabulary
+                .iter()
+                .copied()
+                .filter(|value| !words.contains(value))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{family}'s `# HELP` text must name every `{label}` value of its vocabulary; it \
+                 omits {missing:?}. Add each to the description in `Metrics::new`: {help}"
+            );
+        }
+    }
+
+    /// Families whose `# HELP` text uses some of a label's values as ordinary
+    /// words without enumerating the label — so
+    /// [`every_help_text_that_enumerates_a_label_names_all_its_values`] does not
+    /// hold them to the rule. Each entry must still read as such a mention
+    /// (two or more values named, not all), or the test fails as stale.
+    const HELP_MENTIONS_NOT_ENUMERATIONS: &[(&str, &str)] = &[
+        // "by fred error kind": the description describes the label rather
+        // than listing it, and a few kinds occur in its prose as words.
+        ("live_edit_snapshot_read_refused_total", "kind"),
+        // "by key_family (which part of the layer's state was unreadable)":
+        // the same, with a few key families named in its prose.
+        ("live_edit_snapshot_read_type_error_total", "key_family"),
+    ];
+
+    // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+    /// **F8 (b.g65), every family.** A `# HELP` text that enumerates a label
+    /// — names two or more of the values that label carries on `/metrics` as
+    /// whole words — names all of them. The values are read off the rendered
+    /// samples (every vocabulary is zero-seeded), so a family added later is
+    /// held to the rule without being listed here.
+    ///
+    /// The one exception is a description that uses some values as ordinary
+    /// words rather than enumerating the label
+    /// ([`HELP_MENTIONS_NOT_ENUMERATIONS`]), and each of its entries must stay
+    /// true.
+    #[test]
+    fn every_help_text_that_enumerates_a_label_names_all_its_values() {
+        let metrics = metrics_scrape_only("help-enumeration-test");
+        let parsed = help_and_labels(&render(&metrics));
+        let mut violations: Vec<String> = Vec::new();
+        let mut checked: std::collections::BTreeSet<(&str, &str)> =
+            std::collections::BTreeSet::new();
+        for ((family, label), values) in &parsed.values {
+            // `service` carries the replica's name, `le` a histogram bound.
+            if label == "service" || label == "le" {
+                continue;
+            }
+            let words = help_words(&parsed.help[family]);
+            let named = values.iter().filter(|v| words.contains(v.as_str())).count();
+            let missing: Vec<&str> = values
+                .iter()
+                .map(String::as_str)
+                .filter(|v| !words.contains(v))
+                .collect();
+            let mention = HELP_MENTIONS_NOT_ENUMERATIONS
+                .iter()
+                .any(|(f, l)| *f == family.as_str() && *l == label.as_str());
+            if mention {
+                if named < 2 || missing.is_empty() {
+                    violations.push(format!(
+                        "{family} {label}: listed in HELP_MENTIONS_NOT_ENUMERATIONS but its \
+                         description names {named} of {} values; remove the stale entry",
+                        values.len()
+                    ));
+                }
+                continue;
+            }
+            if named >= 2 {
+                checked.insert((family.as_str(), label.as_str()));
+                if !missing.is_empty() {
+                    violations.push(format!(
+                        "{family} {label}: the description enumerates the label but omits \
+                         {missing:?}"
+                    ));
+                }
+            }
+        }
+        for (family, label) in HELP_MENTIONS_NOT_ENUMERATIONS {
+            if !parsed
+                .values
+                .contains_key(&((*family).to_owned(), (*label).to_owned()))
+            {
+                violations.push(format!(
+                    "{family} {label}: listed in HELP_MENTIONS_NOT_ENUMERATIONS but not rendered"
+                ));
+            }
+        }
+        for named in [
+            ("live_edit_checkpoint_tail_total", "outcome"),
+            ("live_edit_checkpoint_base_bootstrap_total", "outcome"),
+            ("live_edit_checkpoint_ext_mirror_dropped_total", "reason"),
+            ("live_edit_checkpoint_ext_backup_repair_total", "outcome"),
+            ("live_edit_checkpoint_reconcile_total", "outcome"),
+        ] {
+            assert!(
+                checked.contains(&named),
+                "fixture: {named:?} is read as an enumeration and checked; checked: {checked:?}"
+            );
+        }
+        assert!(
+            violations.is_empty(),
+            "a `# HELP` text that lists a label's values must list all of them (add each \
+             missing value to the description in `Metrics::new`):\n{}",
+            violations.join("\n")
+        );
     }
 }

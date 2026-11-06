@@ -57,10 +57,13 @@ LIVE_DECLARE_UNARY(DeleteLayer)
 #undef LIVE_DECLARE_UNARY
 // Uses the runtime's single auxiliary timing slot, never ordinary request
 // capacity. Competing probes fail admission and may skip this sampling period.
+// A caller that waited for a call unit passes its slot; without one, the Ping
+// takes a free call unit or is refused.
 struct UnaryTimingReceipt {
     std::chrono::steady_clock::time_point completed{};
     std::atomic<bool> ready{false};
 };
 std::shared_ptr<Request> submitTimingPing(Runtime& runtime, OmniUsdLiveEndpoint endpoint, const rpc::PingRequest&,
-    UnaryCallback<rpc::PingResponse>, uint32_t timeoutMs, std::shared_ptr<UnaryTimingReceipt> receipt = {});
+    UnaryCallback<rpc::PingResponse>, uint32_t timeoutMs, std::shared_ptr<UnaryTimingReceipt> receipt = {},
+    CallSlot slot = {});
 } // namespace omni::usd::live

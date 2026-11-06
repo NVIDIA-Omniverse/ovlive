@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // Integration tests for the CreateLayer handler's auth, parsing and
-// external-value pipeline.
+// external-value pipeline, and for the layer's root section it supplies to
+// content that leaves the layer empty (SDD §9.7).
 //
 // Tests call `handle_create_layer` directly with a LiveEditService backed by
 // a real Valkey (TestValkey fixture), mock auth clients, and gRPC-framed
@@ -22,17 +23,27 @@
 
 use std::sync::Arc;
 
+use fred::interfaces::KeysInterface;
+use futures::StreamExt;
 use live_edit::auth::userinfo::UserinfoClient;
 use live_edit::auth::JwtUserinfoClient;
-use live_edit::grpc::layer::{handle_create_layer, handle_stat_layer};
-use live_edit::grpc::proto::StatLayerRequest;
+use live_edit::domain::ompf::OmpfContainer;
+use live_edit::domain::types::ObjectState;
+use live_edit::grpc::layer::{handle_create_layer, handle_stat_layer, handle_update_layer};
+use live_edit::grpc::proto::{
+    subscribe_read_layer_response, StatLayerRequest, SubscribeReadLayerHeader,
+    SubscribeReadLayerRequest,
+};
+use live_edit::grpc::service::LiveEditService;
+use live_edit::grpc::subscribe::handle_subscribe_read_layer;
 use live_edit::grpc::BearerToken;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
+use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, StructCommand};
 use serde_json::json;
 use tonic::Request;
 
-use crate::common::owned_delta::{delta_to_ompf_bytes, empty_delta};
+use crate::common::owned_delta::{delta_to_ompf_bytes, empty_delta, with_root};
 
 use super::helpers::*;
 
@@ -78,10 +89,18 @@ async fn create_layer_happy_path_with_delta_returns_object_id() {
     );
 }
 
-// ── 2. Empty content (header only, no chunks) ───────────────────────────────
+// ── 2. Empty content creates the layer holding only its root (SDD §9.7) ─────
 
+/// A header with no chunks, and an empty delta, each create the layer holding
+/// only its root section: a new subscriber's catch-up message #1, at sequence
+/// 1, carries exactly `DiffChangeSection(parent 0, section 1, "", type 7,
+/// order 0)`, and the stored object holds that one row.
+///
+/// The regression test for a header-only create Kit could not open: before
+/// the layer-root rule the layer was created with no section at all, and
+/// message #1 carried no structural command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_empty_content_succeeds_with_empty_state() {
+async fn create_layer_empty_content_creates_a_layer_holding_only_its_root_section() {
     let tv = TestValkey::setup().await;
     let svc = build_service(&tv, Arc::new(AllowAllPermissions));
 
@@ -91,19 +110,56 @@ async fn create_layer_empty_content_succeeds_with_empty_state() {
         .await
         .expect("session creation must succeed");
 
-    // Header only, no data chunks — empty OMPF content.
-    let stream = streaming_create(vec![make_create_header(&session_id, "empty-layer")]);
-    let request = make_request(stream);
+    let cases = [
+        ("header only", "header-only-layer", None),
+        (
+            "empty delta",
+            "empty-delta-layer",
+            Some(delta_to_ompf_bytes(&empty_delta(), &[])),
+        ),
+    ];
+    for (case, layer, body) in cases {
+        let mut messages = vec![make_create_header(&session_id, layer)];
+        messages.extend(body.map(make_create_data));
+        let object_id = handle_create_layer(&svc, make_request(streaming_create(messages)))
+            .await
+            .unwrap_or_else(|s| panic!("{case}: empty content must create the layer: {s:?}"))
+            .into_inner()
+            .object_id;
 
-    let response = handle_create_layer(&svc, request)
-        .await
-        .expect("empty content must succeed");
+        let (header, delta) = catch_up_first_message(&svc, &session_id, layer).await;
+        assert_eq!(
+            (header.object_id, header.sequence_num),
+            (object_id, 1),
+            "{case}: message #1 is the created object at sequence 1"
+        );
+        assert_eq!(
+            delta.struct_commands,
+            vec![supplied_root()],
+            "{case}: message #1 must carry exactly the layer's root section"
+        );
+        assert!(
+            delta.set_fields.is_empty() && delta.time_samples.is_empty(),
+            "{case}: the root holds no field or time sample"
+        );
 
-    let resp = response.into_inner();
-    assert!(
-        resp.object_id > 0,
-        "empty content must still allocate a positive object_id via Valkey INCR"
-    );
+        let stored = stored_state(&tv, object_id).await;
+        assert_eq!(
+            stored
+                .sections
+                .values()
+                .map(|s| (
+                    s.section_id,
+                    s.parent_id,
+                    s.name.as_str(),
+                    s.section_type,
+                    s.section_order
+                ))
+                .collect::<Vec<_>>(),
+            [(1, 0, "", 7, 0)],
+            "{case}: the stored object holds only the root row"
+        );
+    }
 }
 
 // ── 3. Malformed OMPF → INVALID_ARGUMENT ────────────────────────────────────
@@ -695,7 +751,7 @@ async fn create_layer_with_many_siblings_persists_what_a_collecting_run_would() 
 /// This is a deterministic **source** assertion, and deliberately so. The
 /// ticket's acceptance criterion "CreateLayer must not construct a discarded
 /// mutation list" is a call-site contract with no behavioural shadow: reverting
-/// `create_layer_inner` to `apply_delta_with_stats` and dropping the returned
+/// the creation step to `apply_delta_with_stats` and dropping the returned
 /// `Vec` persists a byte-identical object, so
 /// `create_layer_with_many_siblings_persists_what_a_collecting_run_would` above
 /// — which compares persisted state against a collecting reference run, and
@@ -703,10 +759,18 @@ async fn create_layer_with_many_siblings_persists_what_a_collecting_run_would() 
 /// allocation the criterion forbids is invisible to every oracle except the
 /// code itself.
 ///
-/// It covers all three sites the ticket converted rather than the gRPC one
-/// alone: the two checkpoint decoders rebuild an `ObjectState` from a delta and
-/// likewise drop the mutations, they regress the same way, and scanning them
-/// costs two more `include_str!`s. Stream replay (`src/domain/replay.rs`) is
+/// CreateLayer's apply lives in its creation step,
+/// `domain::layer_root::build_creation_state` (`src/domain/layer_root.rs`),
+/// which the handler (`src/grpc/layer.rs`) calls for both a create and a
+/// re-send's rebuild. So the creation step is scanned as a site, and the
+/// handler is scanned for the opposite: it must build through that step and
+/// call no apply entry point of its own, or a collecting call could come back
+/// beside it.
+///
+/// It covers all three sites the ticket converted rather than the CreateLayer
+/// one alone: the two checkpoint decoders rebuild an `ObjectState` from a delta
+/// and likewise drop the mutations, they regress the same way, and scanning
+/// them costs two more `include_str!`s. Stream replay (`src/domain/replay.rs`) is
 /// here for the same reason: it rebuilds a state from committed entries and
 /// never reads the mutations, so a collecting sink there would rebuild the
 /// mutation list on every replayed entry. `src/storage/layer.rs` is
@@ -744,9 +808,11 @@ fn state_rebuilding_call_sites_still_discard_their_mutations() {
     // discarding entry point the site calls)
     let sites: &[(&str, &str, &str, &str)] = &[
         (
-            "src/grpc/layer.rs",
-            include_str!("../../../src/grpc/layer.rs"),
-            "async fn create_layer_inner(",
+            // CreateLayer's creation step: the content's apply and the apply
+            // of a supplied root both discard.
+            "src/domain/layer_root.rs",
+            include_str!("../../../src/domain/layer_root.rs"),
+            "pub fn build_creation_state(",
             "apply_delta_into(",
         ),
         (
@@ -810,6 +876,34 @@ fn state_rebuilding_call_sites_still_discard_their_mutations() {
              without the stats out-param"
         );
     }
+
+    // The CreateLayer handler builds its state only through the creation step
+    // scanned above, for a create and for a re-send's rebuild alike.
+    let path = "src/grpc/layer.rs";
+    let code = non_test_source(path, include_str!("../../../src/grpc/layer.rs"));
+    assert!(
+        code.contains("async fn create_layer_inner("),
+        "{path}: comment stripping removed real code (`async fn create_layer_inner(` is \
+         gone); the scan below would be vacuous"
+    );
+    assert_eq!(
+        code.matches("build_creation_state(").count(),
+        2,
+        "{path} must build CreateLayer's state through `build_creation_state` at both \
+         sites, the create and the re-send's rebuild"
+    );
+    for call in [
+        "apply_delta(",
+        "apply_delta_with_stats(",
+        "apply_delta_into(",
+        "apply_delta_into_mode(",
+    ] {
+        assert!(
+            !code.contains(call),
+            "{path} must not call `{call}..)` itself (b.ot3): CreateLayer applies its \
+             content only through `build_creation_state`, which discards the mutations"
+        );
+    }
 }
 
 // ── G3: wrong-length external hash → INVALID_ARGUMENT, no blob, no object ────
@@ -837,15 +931,19 @@ async fn create_layer_wrong_length_external_hash_returns_invalid_argument_and_st
         .expect("session creation must succeed");
 
     let blob = b"g3-external-blob".as_slice();
+    // The field sits on the layer's root section, which the body creates: a
+    // body leaving the field with no top-level section is refused for that
+    // instead, which would make the 32-byte control below fail for the wrong
+    // reason.
     let body = |hash: Vec<u8>| {
-        let delta = crate::common::owned_delta::delta_with_set_field_external(
+        let delta = with_root(crate::common::owned_delta::delta_with_set_field_external(
             1,
             "tex",
             hash,
             blob.len() as u64,
             1,
             0,
-        );
+        ));
         delta_to_ompf_bytes(&delta, &[blob])
     };
     let counter_key = tv.key_schema().counter_object_id();
@@ -931,5 +1029,321 @@ async fn create_layer_wrong_length_external_hash_returns_invalid_argument_and_st
         ext_store.ref_count(&content_hash),
         Some(1),
         "the control CreateLayer must store its blob under the hash it named"
+    );
+}
+
+// ── The layer's root section (SDD §9.7) ─────────────────────────────────────
+
+/// Bound on one catch-up read, from the subscribe call to message #1's last
+/// chunk: a handful of store round trips when healthy.
+const CATCH_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The root section the service supplies to a create that leaves the layer
+/// empty, as catch-up restates it.
+fn supplied_root() -> StructCommand {
+    StructCommand::DiffChangeSection(CommandDiffChangeSection {
+        parent_id: 0,
+        section_id: 1,
+        section_name: String::new(),
+        section_type: 7,
+        section_order: 0,
+    })
+}
+
+/// `object_id`'s stored state, read back from Valkey.
+async fn stored_state(tv: &TestValkey, object_id: u64) -> ObjectState {
+    let snapshot = live_edit::storage::test_support::read_object_state_for_test(
+        tv.client(),
+        tv.key_schema(),
+        &object_id.to_string(),
+    )
+    .await
+    .expect("snapshot load must succeed");
+    live_edit::storage::diff_read::snapshot_to_object_state(&snapshot)
+}
+
+/// A brand-new subscriber's catch-up of `layer`: message #1's header and its
+/// decoded delta. The whole read runs under [`CATCH_UP_BUDGET`].
+async fn catch_up_first_message(
+    svc: &LiveEditService,
+    session_id: &str,
+    layer: &str,
+) -> (SubscribeReadLayerHeader, OwnedDelta) {
+    let mut request = Request::new(SubscribeReadLayerRequest {
+        session_id: session_id.to_owned(),
+        layer_name: layer.to_owned(),
+        object_id: 0,
+        sequence_num: 0,
+        client_id: "root-reader".to_owned(),
+    });
+    request
+        .extensions_mut()
+        .insert(BearerToken::new("test-token"));
+    tokio::time::timeout(CATCH_UP_BUDGET, async {
+        let mut stream = handle_subscribe_read_layer(svc, request)
+            .await
+            .expect("the subscription must start")
+            .into_inner();
+        let header = match stream.next().await {
+            Some(Ok(message)) => match message.response_type {
+                Some(subscribe_read_layer_response::ResponseType::Header(h)) => h,
+                other => panic!("expected the catch-up's header, got {other:?}"),
+            },
+            other => panic!("expected the catch-up's header, got {other:?}"),
+        };
+        let mut body = Vec::with_capacity(header.total_size as usize);
+        while (body.len() as u64) < header.total_size {
+            match stream.next().await {
+                Some(Ok(message)) => match message.response_type {
+                    Some(subscribe_read_layer_response::ResponseType::Chunk(c)) => {
+                        body.extend_from_slice(&c.data)
+                    }
+                    other => panic!("expected a catch-up chunk, got {other:?}"),
+                },
+                other => panic!("the catch-up ended early: {other:?}"),
+            }
+        }
+        let container = OmpfContainer::parse(&body).expect("the catch-up is an OMPF");
+        let delta = if container.delta_bytes.is_empty() {
+            OwnedDelta::default()
+        } else {
+            oodf_ffi::parse_delta(container.delta_bytes).expect("the catch-up's delta parses")
+        };
+        (header, delta)
+    })
+    .await
+    .expect("the catch-up's message #1 did not arrive within its budget")
+}
+
+/// The object-id counter's raw value.
+async fn object_id_counter(tv: &TestValkey) -> Option<String> {
+    tv.client()
+        .pool
+        .get(tv.key_schema().counter_object_id())
+        .await
+        .expect("GET object-id counter must succeed")
+}
+
+/// One `CreateLayer` of `layer` carrying `body` as its one chunk, answering
+/// its object id.
+async fn create_with_body(
+    svc: &LiveEditService,
+    session_id: &str,
+    layer: &str,
+    body: Vec<u8>,
+) -> Result<u64, tonic::Status> {
+    handle_create_layer(
+        svc,
+        make_request(streaming_create(vec![
+            make_create_header(session_id, layer),
+            make_create_data(body),
+        ])),
+    )
+    .await
+    .map(|response| response.into_inner().object_id)
+}
+
+/// Content leaving only an orphan section row — a `DiffChangeSection` under a
+/// parent with no row, which the engine stores — leaves data but no top-level
+/// section: refused `INVALID_ARGUMENT` naming the rule, with nothing created.
+/// `StatLayer` answers `NOT_FOUND`, no mapping exists, and the object-id
+/// counter did not move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_orphan_only_content_is_refused_invalid_argument_and_creates_nothing() {
+    const LAYER: &str = "orphan-only-layer";
+    let tv = TestValkey::setup().await;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
+    let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+        .create("orphan-only-session", "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+    let orphan = OwnedDelta {
+        struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+            parent_id: 42,
+            section_id: 5,
+            section_name: "orphan".to_owned(),
+            section_type: 0,
+            section_order: 0,
+        })],
+        ..OwnedDelta::default()
+    };
+    let counter_before = object_id_counter(&tv).await;
+
+    let status = create_with_body(&svc, &session_id, LAYER, delta_to_ompf_bytes(&orphan, &[]))
+        .await
+        .expect_err("orphan-only content must be refused");
+
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    assert!(
+        status.message().contains("no top-level section"),
+        "the refusal must name the layer-root rule, got: {}",
+        status.message()
+    );
+    let stat = handle_stat_layer(
+        &svc,
+        stat_request_with_bearer(&session_id, LAYER, "test-token"),
+    )
+    .await
+    .expect_err("no layer may exist after the refusal");
+    assert_eq!(stat.code(), tonic::Code::NotFound);
+    let mapped: u64 = tv
+        .client()
+        .pool
+        .exists(tv.key_schema().layer_mapping(&session_id, LAYER))
+        .await
+        .expect("EXISTS layer mapping must succeed");
+    assert_eq!(mapped, 0, "no layer mapping may be written");
+    assert_eq!(
+        object_id_counter(&tv).await,
+        counter_before,
+        "a refused CreateLayer must not allocate an object_id"
+    );
+}
+
+/// The root the service supplies is exactly the root Kit creates: a
+/// header-only create and Kit's captured create content
+/// (`tools/fixtures/gze_inbound_deltas.json`, entry 1: a reset holding only
+/// the root) leave identical stored objects, apart from the object id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_header_only_stores_the_same_object_as_kits_captured_create() {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+    let tv = TestValkey::setup().await;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
+    let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+        .create("kit-parity-session", "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+    let path = format!(
+        "{}/tools/fixtures/gze_inbound_deltas.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {path}: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("parse fixture {path}: {e}"));
+    let kit_create = &fixture[1];
+    assert_eq!(kit_create["kind"], "CreateLayer", "entry 1 is Kit's create");
+    let kit_body = B64
+        .decode(
+            kit_create["b64"]
+                .as_str()
+                .expect("the entry's b64 is a string"),
+        )
+        .expect("the entry's b64 decodes");
+
+    let header_only = handle_create_layer(
+        &svc,
+        make_request(streaming_create(vec![make_create_header(
+            &session_id,
+            "header-only-layer",
+        )])),
+    )
+    .await
+    .expect("a header-only create must commit")
+    .into_inner()
+    .object_id;
+    let kit = create_with_body(&svc, &session_id, "kit-layer", kit_body)
+        .await
+        .expect("Kit's create must commit");
+
+    let mut supplied = stored_state(&tv, header_only).await;
+    let mut kits = stored_state(&tv, kit).await;
+    assert!(
+        !kits.sections.is_empty(),
+        "precondition: Kit's create holds its root"
+    );
+    supplied.object_id = 0;
+    kits.object_id = 0;
+    assert_eq!(
+        supplied, kits,
+        "a header-only create must store exactly the object Kit's own create stores"
+    );
+}
+
+/// The supplied root takes section id 1, so a client that then creates its
+/// own root as section 1 collides with it: the `UpdateLayer` is refused
+/// `INVALID_ARGUMENT` "duplicate section_id 1", and the layer stays at
+/// sequence 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_layer_create_section_1_after_an_empty_create_is_refused_duplicate_section() {
+    const LAYER: &str = "collision-layer";
+    let tv = TestValkey::setup().await;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
+    let (session_id, object_id) =
+        create_session_and_layer(&tv, &svc, "collision-session", LAYER).await;
+
+    let status = handle_update_layer(
+        &svc,
+        make_request(streaming_update(vec![
+            make_update_header(&session_id, LAYER, object_id),
+            make_update_data(delta_to_ompf_bytes(&with_root(empty_delta()), &[])),
+        ])),
+    )
+    .await
+    .expect_err("creating section 1 again must be refused");
+
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "got {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    assert!(
+        status.message().contains("duplicate section_id 1"),
+        "the refusal must name the collision, got: {}",
+        status.message()
+    );
+    assert_eq!(
+        stored_state(&tv, object_id).await.sequence_num,
+        1,
+        "nothing applied"
+    );
+}
+
+/// `CreateLayer completed` carries `root_supplied = true` when the service
+/// supplied the root, and no `root_supplied` field when the content kept its
+/// own (a `None` is left off the event, never logged `false`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_completed_line_carries_root_supplied_only_for_a_supplied_root() {
+    use super::log_capture::{assert_field, assert_field_absent, capture};
+    const COMPLETED: &str = "CreateLayer completed";
+
+    let tv = TestValkey::setup().await;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
+    let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+        .create("root-log-session", "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+
+    let (supplied, log) = capture(create_with_body(
+        &svc,
+        &session_id,
+        "supplied-layer",
+        delta_to_ompf_bytes(&empty_delta(), &[]),
+    ))
+    .await;
+    supplied.expect("an empty create must commit");
+    assert_field(log.only(COMPLETED), "root_supplied", true.into());
+
+    let (kept, log) = capture(create_with_body(
+        &svc,
+        &session_id,
+        "rooted-layer",
+        delta_to_ompf_bytes(&with_root(empty_delta()), &[]),
+    ))
+    .await;
+    kept.expect("a rooted create must commit");
+    assert_field_absent(
+        log.only(COMPLETED),
+        "root_supplied",
+        "the content kept its own root",
     );
 }

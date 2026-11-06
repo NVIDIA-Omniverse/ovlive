@@ -11,19 +11,21 @@ This directory holds the packman manifests for ovlive's native transport depende
 
 | Package | Version prefix | License |
 | --- | --- | --- |
-| grpc | 1.65.4-1 | Apache-2.0 AND BSD-3-Clause AND MPL-2.0 |
-| protobuf | 5.26.0-2 | BSD-3-Clause |
-| abseil | 20240116.1-1 | Apache-2.0 |
-| re2 | 20230301-1 | BSD-3-Clause |
-| c-ares | 1.34.8-0 | MIT |
+| grpc | 1.83.1-21 | Apache-2.0 AND BSD-3-Clause AND MPL-2.0 |
+| protobuf | 5.29.5-6 | BSD-3-Clause |
+| abseil | 20250127.0-0 | Apache-2.0 |
+| re2 | 20250722-4 | BSD-3-Clause |
+| c-ares | 1.34.9-0 | MIT |
 | openssl | 3.5.9-0 | Apache-2.0 |
 | zlib | 1.3.2-0 | Zlib |
 
-`live-services-host.packman.xml` lists the matching code generators, `bin/protoc` and `bin/grpc_cpp_plugin`, from protobuf and gRPC packages of the same version prefixes. Generator packages are always `static-release`, including for debug target builds, and only their host tools are used.
+On Linux, gRPC, protobuf, abseil and re2 are the `static-release-gcc` packages, built by GCC as the client is: they share abseil's inline code, and the default clang builds hash (on aarch64) and mangle it differently. Linux links these release builds in both configurations; Windows links the `static-${config}` package of each configuration, because MSVC cannot mix debug and release runtimes. The manifest selects each with packman's `platforms` attribute.
+
+`live-services-host.packman.xml` lists the matching code generators, `bin/protoc` and `bin/grpc_cpp_plugin`, from the protobuf and gRPC packages the target manifest links on that platform, so the generated code matches the runtime. Generator packages are always release builds (`static-release-gcc` on Linux, `static-release` on Windows), including for debug target builds, and only their host tools are used.
 
 ## Rendering the manifests
 
-Both manifests are templates. The target manifest needs `live_services_target_platform_abi` and `config` (`debug` or `release`); the host manifest needs `live_services_host_platform_abi`, the ABI of the machine that runs the generators. `tools/live/dependencies.py` substitutes both ABIs: `python3 -m tools.live.dependencies --target-abi <target-abi> --host-abi <host-abi>`, run from `client`, writes `deps/live-services-{target,host}.generated.packman.xml` and `deps/live-services-build.json` and leaves `config` for packman to expand. The ABI must match the package producer's naming and agree with the selected USD, compiler and standard library. The `linux-x86_64` platform passes `manylinux_2_35_x86_64` for both, which selects `<version>-manylinux_2_35_x86_64-static-${config}` target packages and `<version>-manylinux_2_35_x86_64-static-release` generators; the `linux-aarch64` platform passes `manylinux_2_35_aarch64` for both. These pins record NVIDIA qualification inputs. Supply matching dependency trees yourself; access to NVIDIA packages is separate from this source release.
+Both manifests are templates. The target manifest needs `live_services_target_platform_abi` and `config` (`debug` or `release`); the host manifest needs `live_services_host_platform_abi`, the ABI of the machine that runs the generators. `tools/live/dependencies.py` substitutes both ABIs: `python3 -m tools.live.dependencies --target-abi <target-abi> --host-abi <host-abi>`, run from `client`, writes `deps/live-services-{target,host}.generated.packman.xml` and `deps/live-services-build.json` and leaves `config` for packman to expand. The ABI must match the package producer's naming and agree with the selected USD, compiler and standard library. The `linux-x86_64` platform passes `manylinux_2_35_x86_64` for both, which selects `<version>-manylinux_2_35_x86_64-static-${config}` target packages, or `-static-release-gcc` for the four GCC packages, and `<version>-manylinux_2_35_x86_64-static-release-gcc` generators; the `linux-aarch64` platform passes `manylinux_2_35_aarch64` for both. These pins record NVIDIA qualification inputs. Supply matching dependency trees yourself; access to NVIDIA packages is separate from this source release.
 
 Packman links the resolved packages into the `_build` directory of the client, `client/_build` in the repository, which holds links to packman's package cache, not build output; builds and test output go under `../.cache`. The links map to the build inputs of `cmake/LiveGrpcDependencies.cmake`:
 
@@ -44,9 +46,9 @@ The native build also consumes these SDKs, which the SDK manifests above pin. `t
 
 | Input | Identity | Profile |
 | --- | --- | --- |
-| USD (stock) | OpenUSD 25.11, `pxr` namespace, split `libusd_*.so`, Python-enabled; packman `usd.py312.<abi>.stock.release` `0.25.11-gl.18041+v25.11.363a7c8d` | `stock-25.11` |
+| USD (stock) | OpenUSD 25.11, `pxr` namespace, split `libusd_*.so` (`usd_*.dll` on Windows), Python-enabled; packman `usd.py312.<abi>.stock.release` `0.25.11-gl.18041+v25.11.363a7c8d` | `stock-25.11` |
 | USD (Kit) | `usd.py312.manylinux_2_35_x86_64.ov-full-monolithic.release` `0.25.11.kit.5-gl.21209` (`ov` namespace, `libov_25.11usd_ms.so`); `usd.py312.manylinux_2_35_aarch64.ov-full-monolithic.release` of the same version on `linux-aarch64` | `kit-25.11` |
-| Python | 3.12 from the selected USD build: stock profile `python` `3.12.12+nv2-linux-x86_64` or `3.12.12+nv2-linux-aarch64`; Kit profile `python` `3.12.13+nv3-manylinux_2_35_x86_64` or `3.12.13+nv3-manylinux_2_35_aarch64` | both |
+| Python | 3.12 from the selected USD build: stock profile `python` `3.12.12+nv2-linux-x86_64`, `3.12.12+nv2-linux-aarch64` or `3.12.12+nv2-windows-x86_64`; Kit profile `python` `3.12.13+nv3-manylinux_2_35_x86_64` or `3.12.13+nv3-manylinux_2_35_aarch64` | both |
 | pybind11 | 2.11.1 headers, selected with `LIVE_PYBIND11_ROOT` | both |
 | FlatBuffers | 1.12.0 runtime headers, vendored in `source/live/wire/third_party/flatbuffers` | not an input |
 | gRPC closure | the manifests above | both |

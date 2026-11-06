@@ -20,7 +20,7 @@
 //
 // The flow, end to end:
 //   1. `read_object_snapshot` reads the WHOLE object (Spec SDD SR-1). For the
-//      catch-up, legacy per-commit and checkpoint consumers it is the proven
+//      catch-up and checkpoint consumers it is the proven
 //      read: the whole object in one atomic `EVALSHA` of
 //      `scripts/object_snapshot_read.lua` on the snapshot lane, so its state is
 //      exactly the state at the `seq` it returns, or a `TOO_LARGE` answer above
@@ -35,22 +35,29 @@
 //      lists, in rounds with the outstanding commands and reply bytes windowed
 //      (SR-4.3, SR-4.4, SR-11.3).
 //   2. `snapshot_to_object_state` turns the snapshot into an `ObjectState`;
-//      the Case 1/2/3 selection over it and the snapshot's tombstones (which
+//      the faithful plan over it and the snapshot's tombstones (which
 //      sections, fields and time samples a subscriber needs) runs in memory in
 //      `domain::diff`.
-//   3. `resolve_external_values` fetches the values the plan references in one
-//      batch, and `build_diff_payload` builds the OODF delta and packs the OMPF
-//      container. How it fetches is the caller's `ExtValueReads` (b.yuo, SDD
-//      §11.2): a catch-up builds with `ExtValueReads::PROBE` first, where a
-//      missing value builds nothing and answers `Built::Missing` — a commit
-//      after the snapshot may have released it and the GC collected it, which
-//      the catch-up resolves by re-reading under the `{gc}` read hold — and
-//      with `ExtValueReads::recover` only for a value still missing under that
-//      hold, once the store answered the hold live (the `LiveHoldProof` that
-//      constructor takes), where the checkpoint-adapter fallback runs (SDD
-//      §11) and a value still missing is `INTERNAL`, never an empty value.
-// The `compute_*_at_cut` entry points below drive steps 2 and 3 from a
-// snapshot step 1 proved.
+//   3. `resolve_external_values` probes the stored lengths of the values the
+//      plan references, `build_plan_delta` builds the OODF delta, and the
+//      payload is laid out as 1 MiB pages around them (`DiffLayout`,
+//      `storage::ompf_payload`), reading no value byte; the caller reserves
+//      the catch-up payload budget, then `DiffLayout::fill` reads the values
+//      in ranges into the pages. How values are read is the caller's
+//      `ExtValueReads` (b.yuo, SDD §11.2): a catch-up builds with
+//      `ExtValueReads::PROBE` first, where a missing value — at the probe, or
+//      read short or changed during the fill — builds nothing and answers
+//      `Built::Missing` — a commit after the snapshot may have released it
+//      and the GC collected it, which the catch-up resolves by re-reading
+//      under the `{gc}` read hold — and with `ExtValueReads::recover` only for
+//      a value still missing under that hold, once the store answered the
+//      hold live (the `LiveHoldProof` that constructor takes), where the
+//      layout answers the values still missing (`LaidOut::Restore`) for the
+//      caller to restore through the checkpoint-adapter fallback (SDD §11)
+//      in batches charged to the catch-up payload budget, and a value the
+//      adapter cannot restore is `INTERNAL`, never an empty value.
+// The `compute_*_at_cut` entry points below drive steps 2 and 3's layout from
+// a snapshot step 1 proved.
 //
 // The structural write-planning cache's cold start reads the same atomic read
 // under its own consumer, with the script's `return_dangling` flag, at the
@@ -58,7 +65,6 @@
 // takes the fenced read (`storage::snapshot_fence::read`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -91,6 +97,10 @@ use crate::storage::external_values::{hash_from_hex, ExternalValueStore, LiveHol
 use crate::storage::fanout_thread::{PassAnswer, PassLane, PassLink, PassRequest};
 use crate::storage::keys::{self, KeySchema, ROOT_PARENT_ID};
 use crate::storage::memory_budget::SnapshotMemory;
+use crate::storage::ompf_payload::{
+    OmpfPayload, OnMissing, PayloadGrant, PayloadLayout, RestoreValue, RestoredLength,
+};
+use bytes::Bytes;
 
 // ── Object-snapshot read fault-injection seam (Spec SDD SR-1.5) ─────────────
 //
@@ -139,7 +149,7 @@ use crate::storage::memory_budget::SnapshotMemory;
 // text ([`is_script_cluster_state_refusal`]) takes the read's fallback to
 // plain commands instead.
 //
-// Two more test-only levers serve the fenced read, whose lease must outlive a
+// More test-only levers serve the fenced read, whose lease must outlive a
 // slow read (Spec SDD SR-5.3): a queued **delay** holds one fan-out command
 // back for a set time before it is issued (on either fan-out; the read then
 // goes on normally), and **stalled renewals** make the fenced read's renewal
@@ -147,7 +157,15 @@ use crate::storage::memory_budget::SnapshotMemory;
 // A third, the queued **hold** ([`SnapshotReadHold`]), parks one fan-out
 // command before it is issued until the test releases it, so a test can order
 // a read against other work without a timed wait. None of the three changes
-// what a command returns.
+// what a command returns. A fourth, **lengthened leases**, makes every fenced
+// read on the client acquire its lease from
+// `FenceCoefficients::with_lease_at_least` at twice the data pool's command
+// timeout or more (`snapshot_fence::lease_coefficients`), so a renewal that a
+// loaded runner or store slows cannot end a held read: a renewal sent on
+// schedule, a quarter of the lease after the last, still has three quarters
+// of it, at least 1.5 command timeouts, to land in. Only the lease moves:
+// every size-derived value a reader's hooks compute (capacity, flight size,
+// wait caps) and every writer limit stay production-sized.
 //
 // Per-instance rather than process-global for the reason CLAUDE.md gives about
 // `APPLY_STEP_FAULT_INJECTORS`: a process-global queue is shared-static state
@@ -169,9 +187,11 @@ use crate::storage::memory_budget::SnapshotMemory;
 ///
 /// Beside the errors it holds a second queue, of **delays**
 /// ([`Self::push_delay_at`]), and a third, of **holds**
-/// ([`Self::push_hold_at`]), both consulted by the two fan-outs only, and a
+/// ([`Self::push_hold_at`]), both consulted by the two fan-outs only, a
 /// **renewal stall** switch ([`Self::stall_fence_renewals`]) the fenced read's
-/// renewal timer obeys; see the section comment above.
+/// renewal timer obeys, and a **lease lengthening** switch
+/// ([`Self::lengthen_fence_leases`]) the fenced read's acquire obeys; see the
+/// section comment above.
 #[cfg(any(test, feature = "test-fault-injection"))]
 #[derive(Debug, Default)]
 pub struct ObjectSnapshotReadFaultInjector {
@@ -186,6 +206,8 @@ pub struct ObjectSnapshotReadFaultInjector {
         )>,
     >,
     renewals_stalled: std::sync::atomic::AtomicBool,
+    /// [`Self::lengthen_fence_leases`].
+    leases_lengthened: std::sync::atomic::AtomicBool,
     /// The window recorder ([`Self::record_window_threads`]): `None` until
     /// a test starts it, then every fan-out window's [`FanoutWindowThread`]
     /// in the order the windows were issued.
@@ -377,6 +399,26 @@ impl ObjectSnapshotReadFaultInjector {
     pub fn stall_fence_renewals(&self, stalled: bool) -> &Self {
         self.renewals_stalled
             .store(stalled, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Lengthen (`true`) or stop lengthening (`false`) the lease of every
+    /// fenced read on this client that acquires from now on: while set, a
+    /// read's lease is at least `snapshot_fence::lengthened_lease_floor` —
+    /// twice the client's data-pool command timeout — instead of its
+    /// production `lease(L)`, so a test that holds the read's window open
+    /// does not depend on a renewal landing in time. Nothing else the read,
+    /// its hooks or a writer derives from the layer's size moves (section
+    /// comment above).
+    ///
+    /// Read once per acquire: a lease already granted keeps the block it was
+    /// granted under for its renewals and release, whatever the switch says
+    /// later. It belongs to this injector, so installing another one on the
+    /// client drops it; `storage::test_support::assert_fence_lease_lengthened`
+    /// tells a lengthened lease from a production one on the store.
+    pub fn lengthen_fence_leases(&self, on: bool) -> &Self {
+        self.leases_lengthened
+            .store(on, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -875,6 +917,21 @@ impl ObjectSnapshotReadFaults {
         })
     }
 
+    /// Whether a fenced read's acquire must lengthen its lease
+    /// ([`ObjectSnapshotReadFaultInjector::lengthen_fence_leases`]). Test
+    /// shape only: the release `snapshot_fence::lease_coefficients` never
+    /// asks. Reads the flag through the slot's lock without cloning the
+    /// injector's `Arc`, and allocates nothing.
+    pub(crate) fn fence_leases_lengthened(&self) -> bool {
+        self.slot.lock().is_ok_and(|slot| {
+            slot.as_ref().is_some_and(|injector| {
+                injector
+                    .leases_lengthened
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+        })
+    }
+
     /// The front error, if it names the command `cursor` just counted.
     fn take_error(
         &self,
@@ -1155,22 +1212,15 @@ pub struct ObjectSnapshot {
     pub tombstones: Vec<(u64, u64, u64)>,
 }
 
-// ── SubscriberState ─────────────────────────────────────────────────────────
-
-/// A subscriber's last-known position, used to determine the diff case.
-pub struct SubscriberState {
-    /// The object generation the subscriber last received.
-    pub have_object_id: u64,
-    /// The sequence number the subscriber last received.
-    pub have_version: u64,
-}
-
 // ── DiffResponse ───────────────────────────────────────────────────────────
 
 /// The result of a diff computation: OMPF bytes ready for streaming to the subscriber.
 pub struct DiffResponse {
-    /// Serialized OMPF container. Empty if the subscriber is up to date.
-    pub ompf_bytes: Vec<u8>,
+    /// The OMPF container, as 1 MiB pages, page `i` the stream's chunk `i`
+    /// (`storage::ompf_payload`). Never empty: even a delta with no content
+    /// is a non-empty container. A catch-up's pages each carry their share of
+    /// the catch-up payload budget until dropped.
+    pub payload: OmpfPayload,
     /// The diff case label (for metrics/logging).
     pub case: DiffCase,
     /// Number of struct command entries (sections + deleted sections) in the payload.
@@ -1187,11 +1237,9 @@ pub struct DiffResponse {
 /// variant can say "unproven".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffCut {
-    /// No cut was asked for: a per-commit payload, which is labelled with the
-    /// commit's own sequence number instead — whether it was built from an
-    /// atomic read and version-bounded by its `upper_version`
-    /// ([`compute_per_commit_diff_at_cut`]) or, for an empty commit, with no
-    /// read ([`empty_commit_payload`]).
+    /// No cut was asked for: the steady state's payload for an empty commit,
+    /// built with no read ([`empty_commit_payload`]) and labelled with the
+    /// commit's own sequence number instead.
     Unpinned,
     /// Built from a snapshot proven at its cut — [`read_object_snapshot`]'s
     /// atomic read, or the fenced read (`storage::snapshot_fence::read`) a
@@ -1212,7 +1260,6 @@ pub enum DiffCut {
 pub enum DiffCase {
     FullContent,
     Incremental,
-    UpToDate,
 }
 
 impl DiffCase {
@@ -1221,7 +1268,6 @@ impl DiffCase {
         match self {
             DiffCase::FullContent => "full_content",
             DiffCase::Incremental => "incremental",
-            DiffCase::UpToDate => "up_to_date",
         }
     }
 }
@@ -1254,21 +1300,29 @@ enum ExtReadMode {
 }
 
 impl ExtValueReads {
-    /// [`ExternalValueStore::probe_values`]: a hash that is not stored makes
-    /// the build answer [`Built::Missing`] with nothing built, nothing logged
-    /// and the checkpoint adapter never consulted. Every catch-up build reads
+    /// [`ExternalValueStore::probe_value_lengths`], then
+    /// [`ExternalValueStore::read_value_range`] in the fill: a hash that is
+    /// not stored, or is read short or changed during the fill, makes the
+    /// build answer [`Built::Missing`] with nothing built, nothing logged and
+    /// the checkpoint adapter never consulted. Every catch-up build reads
     /// this way first, because the blob of a value its snapshot holds can be
     /// gone for a benign reason: a commit after the snapshot released it and
     /// the GC collected it.
     pub const PROBE: ExtValueReads = ExtValueReads(ExtReadMode::Probe);
 
-    /// [`ExternalValueStore::read_batch_with_recovery_counter`]: a hash that
-    /// is not stored is fetched through the checkpoint adapter
-    /// (fetch-on-miss) and fails the build `INTERNAL` when that cannot restore
-    /// it. For a hash still missing when a catch-up rebuilt from a re-read
-    /// under the `{gc}` read hold, which makes it genuinely missing — which
-    /// `_live` attests: the store answered the hold live on the genuine-miss
-    /// check
+    /// [`ExternalValueStore::probe_value_lengths`], then, for the hashes
+    /// that are not stored, a layout answered as [`LaidOut::Restore`]: its
+    /// caller fetches them through the checkpoint adapter (fetch-on-miss,
+    /// [`ExternalValueStore::recover_value`], in batches charged to the
+    /// catch-up payload budget: `storage::ompf_payload::restore_in_batches`),
+    /// each written back to the store and read back in the fill, and the
+    /// build fails `INTERNAL` when the adapter cannot restore one. A value
+    /// the fill's closing check finds not stored is restored the same way,
+    /// one at a time; one still stored at another length fails the fill
+    /// `UNAVAILABLE`. For a hash
+    /// still missing when a catch-up rebuilt from a re-read under the `{gc}`
+    /// read hold, which makes it genuinely missing — which `_live` attests:
+    /// the store answered the hold live on the genuine-miss check
     /// ([`ReadHold::confirm_live`](crate::storage::external_values::ReadHold::confirm_live)).
     /// Never answers [`Built::Missing`].
     pub fn recover(_live: &LiveHoldProof<'_>) -> Self {
@@ -1315,142 +1369,26 @@ impl<T> Built<T> {
     }
 }
 
-// ── compute_diff_at_cut ─────────────────────────────────────────────────────
-
-/// The legacy version diff of a catch-up, built from its proven snapshot (Spec
-/// SDD SR-3.1): plans the diff via domain logic ([`DiffEngine::plan`]),
-/// resolves external values, builds the OMPF payload, and records metrics. It
-/// emits everything newer than `subscriber.have_version`, with no upper bound:
-/// the rollback-mode (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) brand-new
-/// and out-of-window catch-ups, from their atomic read at or below the
-/// atomic-read ceilings and from their flight's shared fenced read above them.
-/// The response's cut is [`DiffCut::Atomic`] at `snapshot.cut`. External
-/// values are read as `ext_reads` says ([`Built::Missing`] under
-/// [`ExtValueReads::PROBE`] when one is not stored).
-///
-/// `snapshot` must come from the atomic or the fenced path; an unfenced one is
-/// refused `Internal`, because its cut is not proven ([`proven_cut`]).
-pub async fn compute_diff_at_cut(
-    snapshot: &AtomicSnapshot,
-    subscriber: &SubscriberState,
-    ext_store: &dyn ExternalValueStore,
-    ext_reads: ExtValueReads,
-    metrics: Option<&SharedMetrics>,
-    service_label: &str,
-) -> Result<Built<DiffResponse>, ServiceError> {
-    let start = std::time::Instant::now();
-    let object_id = snapshot.state.object_id.to_string();
-    let cut = proven_cut(&object_id, snapshot)?;
-    build_diff(
-        &object_id,
-        &snapshot.state,
-        subscriber,
-        None,
-        cut,
-        ext_store,
-        ext_reads,
-        metrics,
-        service_label,
-        start,
-    )
-    .await
-}
-
-/// [`compute_diff_at_cut`] for one commit, built from a legacy per-commit
-/// atomic read (Spec SDD SR-3.4): a rollback-mode in-window replay's
-/// commit at or below the atomic-read ceilings. A commit without relay bytes
-/// above sequence 1 is an empty commit and takes no read at all
-/// ([`empty_commit_payload`]), in the replay and on the steady-state path
-/// alike.
-///
-/// Version-bounded by `upper_version`: the plan keeps only what changed in the
-/// half-open interval `(subscriber.have_version, upper_version]`, so commits
-/// the read's cut holds above `upper_version` are left out of this payload. The response's cut is therefore
-/// [`DiffCut::Unpinned`], acked at the commit's own sequence number, not at the
-/// read's cut.
-///
-/// `snapshot` must come from a proven path (in the service, always the atomic
-/// one: a replay hands a layer above the atomic-read ceilings to catch-up's
-/// coalesced route instead); an unfenced one is refused `Internal`
-/// ([`proven_cut`]), as for the catch-up builds.
-///
-/// **A cut below `upper_version` is refused, here, so no caller can skip the
-/// check** (Spec SDD SR-3.2's rule, applied to a per-commit read). A read
-/// taken after the commit was streamed has its cut at or above the commit,
-/// unless the layer's sequence regressed in between, as a restore with an
-/// undersized sequence band does; its state then lacks changes the commit
-/// made, and a diff built from it would be labelled `upper_version` while
-/// missing them. So nothing is built and [`PerCommitDiff::Regressed`] is
-/// returned instead. The caller owns what the refusal means for it: the
-/// subscribe rollback-mode replay (`grpc::subscribe`'s
-/// `build_per_commit_diff_at_cut`) WARNs, records an `unverified` stable cut
-/// and ends the subscription `UNAVAILABLE` before any content.
-///
-/// External values are read as `ext_reads` says: under
-/// [`ExtValueReads::PROBE`] a value that is not stored answers
-/// [`Built::Missing`] and builds nothing. A regressed read answers
-/// [`PerCommitDiff::Regressed`] before any value is read.
-pub async fn compute_per_commit_diff_at_cut(
-    snapshot: &AtomicSnapshot,
-    subscriber: &SubscriberState,
-    upper_version: u64,
-    ext_store: &dyn ExternalValueStore,
-    ext_reads: ExtValueReads,
-    metrics: Option<&SharedMetrics>,
-    service_label: &str,
-) -> Result<Built<PerCommitDiff>, ServiceError> {
-    let start = std::time::Instant::now();
-    let object_id = snapshot.state.object_id.to_string();
-    proven_cut(&object_id, snapshot)?;
-    if snapshot.cut < upper_version {
-        return Ok(Built::Ready(PerCommitDiff::Regressed {
-            cut: snapshot.cut,
-            to_version: upper_version,
-        }));
-    }
-    Ok(build_diff(
-        &object_id,
-        &snapshot.state,
-        subscriber,
-        Some(upper_version),
-        DiffCut::Unpinned,
-        ext_store,
-        ext_reads,
-        metrics,
-        service_label,
-        start,
-    )
-    .await?
-    .map(PerCommitDiff::Built))
-}
-
-/// What [`compute_per_commit_diff_at_cut`] built from a per-commit atomic read.
-pub enum PerCommitDiff {
-    /// The commit's single-version diff.
-    Built(DiffResponse),
-    /// The read's `cut` is below the commit it was asked to rebuild,
-    /// `to_version`: the layer's sequence regressed (Spec SDD SR-3.2). Nothing
-    /// was built.
-    Regressed { cut: u64, to_version: u64 },
-}
+// ── empty_commit_payload ────────────────────────────────────────────────────
 
 /// The per-commit payload for an empty commit, based at `base_version`, built
-/// with no read: the steady-state path's and the rollback-mode in-window
-/// replay's delivery for an `update` stream entry without relay bytes above
-/// sequence 1, which on a current build is an empty commit (SDD §12.2).
+/// with no read: the steady-state path's delivery for an `update` stream
+/// entry without relay bytes above sequence 1, which on a current build is an
+/// empty commit (SDD §12.2).
 ///
-/// Byte-identical to what [`compute_per_commit_diff_at_cut`] builds
-/// ([`PerCommitDiff::Built`]) for that commit from a read whose cut covers
-/// it: nothing in the layer is versioned in
-/// `(base_version, commit]`, so its plan is [`DiffPlan::Incremental`] with
-/// every list empty and no external value, and this hands
-/// [`build_diff_payload`] exactly that plan. So the subscriber still receives
-/// one message at the commit's sequence — an empty delta with `is_diff=true`
-/// and `base_version`, never zero bytes — and its sequence stays contiguous.
-/// The cut is [`DiffCut::Unpinned`], as for every per-commit payload.
+/// Nothing in the layer is versioned in `(base_version, commit]`, so the
+/// payload is a [`DiffPlan::Incremental`] with every list empty and no
+/// external value, handed to [`build_diff_payload`]. So the subscriber still
+/// receives one message at the commit's sequence — an empty delta with
+/// `is_diff=true` and `base_version`, never zero bytes — and its sequence
+/// stays contiguous. The cut is [`DiffCut::Unpinned`].
 ///
-/// `base_version` must be at least 1, which both callers guarantee: at 0 a
-/// read would plan full content ([`DiffEngine::plan`]'s Case 1), not this.
+/// `base_version` must be at least 1, which the caller guarantees (an empty
+/// commit is above sequence 1, so the commit before it is at least 1):
+/// `base_version = 0` is the from-empty reset shape, not a diff.
+///
+/// A one-page payload with no catch-up payload budget charge: a few dozen
+/// bytes, built with no read.
 pub fn empty_commit_payload(base_version: u64) -> Result<DiffResponse, ServiceError> {
     let plan = DiffPlan::Incremental {
         new_sections: Vec::new(),
@@ -1465,7 +1403,7 @@ pub fn empty_commit_payload(base_version: u64) -> Result<DiffResponse, ServiceEr
     };
     let ompf_bytes = build_diff_payload(&plan, "", base_version, &scan, &HashMap::new())?;
     Ok(DiffResponse {
-        ompf_bytes,
+        payload: OmpfPayload::from_bytes(Bytes::from(ompf_bytes)),
         case: DiffCase::Incremental,
         sections_count: 0,
         cut: DiffCut::Unpinned,
@@ -1495,117 +1433,6 @@ fn proven_cut(object_id: &str, snapshot: &AtomicSnapshot) -> Result<DiffCut, Ser
     }
 }
 
-/// The shared body of [`compute_diff_at_cut`] and
-/// [`compute_per_commit_diff_at_cut`]: plan, resolve external values, build
-/// the payload and record metrics, from a snapshot already read. Its steps are
-/// numbered from 2 because step 1 is the caller's proven read.
-#[allow(clippy::too_many_arguments)]
-async fn build_diff(
-    object_id: &str,
-    snapshot: &ObjectSnapshot,
-    subscriber: &SubscriberState,
-    upper_version: Option<u64>,
-    cut: DiffCut,
-    ext_store: &dyn ExternalValueStore,
-    ext_reads: ExtValueReads,
-    metrics: Option<&SharedMetrics>,
-    service_label: &str,
-    start: std::time::Instant,
-) -> Result<Built<DiffResponse>, ServiceError> {
-    // 2. Convert snapshot to domain types.
-    let state = snapshot_to_object_state(snapshot);
-    let tombstones = &snapshot.tombstones;
-
-    // 3. Plan the diff (pure domain logic).
-    let plan = DiffEngine::plan(
-        &state,
-        tombstones,
-        subscriber.have_object_id,
-        subscriber.have_version,
-        upper_version,
-    )?;
-
-    // 4. Scan for external values and fetch data from Valkey, as `ext_reads`
-    //    says; a probe that finds one missing builds nothing. Under
-    //    `Recover` the recovery counter is bumped from inside `read_batch`
-    //    whenever the SR-3.2 ext-value fallback successfully reconstructs a
-    //    missing blob via the configured `CheckpointStore`. We allocate
-    //    the counter here so the operator-readable INFO log below can
-    //    join `object_id` (in scope here, NOT in scope inside
-    //    `read_batch`) with the recovered count — Subtask
-    //    `t3.fgj.zc.p6.78`.
-    let recovery_counter = AtomicUsize::new(0);
-    let (scan, ext_data) = match resolve_external_values(
-        &plan,
-        ext_store,
-        ext_reads,
-        Some(&recovery_counter),
-    )
-    .await?
-    {
-        Built::Ready(resolved) => resolved,
-        Built::Missing(missing) => return Ok(Built::Missing(missing)),
-    };
-
-    // 5. Build OMPF payload with external value data. Errors propagate as
-    //    `Internal` — see `build_diff_payload` for the b.kf1 H-stor-10
-    //    rationale on why a missing external blob must surface to the
-    //    subscriber as INTERNAL rather than a silent zero-length payload.
-    let ompf_bytes = build_diff_payload(
-        &plan,
-        &snapshot.source_format,
-        subscriber.have_version,
-        &scan,
-        &ext_data,
-    )?;
-
-    // 6. Derive response metadata.
-    let (case, sections_count) = match &plan {
-        DiffPlan::UpToDate => (DiffCase::UpToDate, 0),
-        DiffPlan::FullContent { sections, .. } => (DiffCase::FullContent, sections.len()),
-        DiffPlan::Incremental {
-            new_sections,
-            modified_sections,
-            deleted_sections,
-            ..
-        } => (
-            DiffCase::Incremental,
-            new_sections.len() + modified_sections.len() + deleted_sections.len(),
-        ),
-    };
-
-    // 7. Record metrics.
-    if let Some(m) = metrics {
-        m.observe_diff_build(case.as_label(), service_label, start.elapsed());
-    }
-
-    // 8. Operator-observability INFO log (SDD SR-3.2, Subtask
-    //    `t3.fgj.zc.p6.78`). Fires only when at least one ext-value
-    //    hash was recovered via the checkpoint adapter during this
-    //    build so successful no-miss calls stay silent —
-    //    operators see the line iff a recovery actually happened, and
-    //    it correlates `object_id` (this scope) with the count tick
-    //    from inside `read_batch`. The per-outcome
-    //    `live_edit_checkpoint_ext_recovery_total` counter is the
-    //    aggregate-rate signal; this log is the per-call signal.
-    let recovered_count = recovery_counter.load(Ordering::Relaxed);
-    if recovered_count > 0 {
-        tracing::info!(
-            object_id = object_id,
-            recovered_count = recovered_count,
-            case = case.as_label(),
-            "ext-value recovery via checkpoint adapter reconstructed missing blobs"
-        );
-    }
-
-    Ok(Built::Ready(DiffResponse {
-        ompf_bytes,
-        case,
-        sections_count,
-        cut,
-    }))
-}
-
 // ── compute_faithful_full_content_at_cut ─────────────────────────────────────
 
 /// DR-independent faithful catch-up entrypoint for the brand-new / late-join
@@ -1615,34 +1442,45 @@ async fn build_diff(
 /// above them. The response's cut is [`DiffCut::Atomic`] at `snapshot.cut`;
 /// an unfenced snapshot is refused `Internal` ([`proven_cut`]).
 ///
-/// Mirrors [`compute_diff_at_cut`]'s pipeline but routes through the domain faithful
-/// builder [`DiffEngine::plan_faithful_snapshot`] instead of the version-diffing
-/// [`DiffEngine::plan`]: the emitted plan is always a `DiffPlan::FullContent`
-/// carrying net-live sections only (abandoned / unreachable prims dropped),
-/// fields stamped with their TRUE authoring `set_order`, and no tombstones — the
-/// shape a from-empty joiner needs.
+/// Plans through the domain faithful builder
+/// [`DiffEngine::plan_faithful_snapshot`]: the emitted plan is always a
+/// `DiffPlan::FullContent` carrying net-live sections only (abandoned /
+/// unreachable prims dropped), fields stamped with their TRUE authoring
+/// `set_order`, and no tombstones — the shape a from-empty joiner needs.
 ///
 /// Unlike the checkpoint assembler's `build_reset_ompf` (which is `pub(crate)`
 /// inside the optional DR module, returns `CheckpointError`, attaches no
 /// ext-value blobs, and inherits both catch-up defects), this path is always-on
 /// and independent of `LIVE_EDIT_CHECKPOINT_ENABLED` (SR-4.1): it takes NO
 /// `crate::checkpoint` dependency. A live from-empty joiner holds no external
-/// values locally, so — exactly like [`compute_diff_at_cut`] — the actual blob
-/// bytes are fetched via [`resolve_external_values`] and attached as OMPF
-/// parts, not hash refs only.
+/// values locally, so the actual blob bytes are attached as OMPF parts, not
+/// hash refs only: their lengths resolved by [`resolve_external_values`],
+/// their bytes read by [`DiffLayout::fill`].
 ///
-/// `have_version = 0` / `base_version = 0` is threaded into
-/// [`build_diff_payload`] so message #1 is a valid full-state create per SR-1.2.
+/// `have_version = 0` / `base_version = 0` is threaded into the delta
+/// ([`build_plan_delta`]) so message #1 is a valid full-state create per
+/// SR-1.2.
 ///
-/// External values are read as `ext_reads` says ([`Built::Missing`] under
-/// [`ExtValueReads::PROBE`] when one is not stored).
+/// **Two steps** (`storage::ompf_payload`). This lays the payload out: it
+/// plans, serialises the delta and probes each external value's stored
+/// length, reading no value byte, and answers the [`DiffLayout`] — or, under
+/// fetch-on-miss when the probe finds values not stored, a
+/// [`LaidOut::Restore`] holding the planned layout and the values to restore,
+/// restoring none of them itself: its caller restores them and finishes the
+/// layout from their lengths ([`RestoreLayout::finish`]).
+/// [`DiffLayout::fill`] then reads the values in ranges into the payload's
+/// pages; between the two the caller reserves the catch-up payload budget for
+/// [`DiffLayout::reservation_bytes`] (`grpc::subscribe`'s
+/// `build_catch_up_once`). External values are read as `ext_reads` says
+/// ([`Built::Missing`] under [`ExtValueReads::PROBE`] when one is not
+/// stored, from either step).
 pub async fn compute_faithful_full_content_at_cut(
     snapshot: &AtomicSnapshot,
     ext_store: &dyn ExternalValueStore,
     ext_reads: ExtValueReads,
     metrics: Option<&SharedMetrics>,
     service_label: &str,
-) -> Result<Built<DiffResponse>, ServiceError> {
+) -> Result<Built<LaidOut>, ServiceError> {
     let start = std::time::Instant::now();
     let cut = proven_cut(&snapshot.state.object_id.to_string(), snapshot)?;
     build_faithful_full_content(
@@ -1650,9 +1488,11 @@ pub async fn compute_faithful_full_content_at_cut(
         cut,
         ext_store,
         ext_reads,
-        metrics,
-        service_label,
-        start,
+        DiffBuildMetrics {
+            metrics: metrics.cloned(),
+            service_label: service_label.to_owned(),
+            start,
+        },
     )
     .await
 }
@@ -1665,10 +1505,8 @@ async fn build_faithful_full_content(
     cut: DiffCut,
     ext_store: &dyn ExternalValueStore,
     ext_reads: ExtValueReads,
-    metrics: Option<&SharedMetrics>,
-    service_label: &str,
-    start: std::time::Instant,
-) -> Result<Built<DiffResponse>, ServiceError> {
+    observe: DiffBuildMetrics,
+) -> Result<Built<LaidOut>, ServiceError> {
     // 2. Convert snapshot to domain types (carries Task 1's authoring
     //    `set_order` onto the domain `Field`s).
     let state = snapshot_to_object_state(snapshot);
@@ -1677,26 +1515,44 @@ async fn build_faithful_full_content(
     //    sections only, fields carrying true authoring order, no tombstones.
     let plan = DiffEngine::plan_faithful_snapshot(&state)?;
 
-    // 4. Resolve external values, as `ext_reads` says. A live joiner has no
-    //    local ext values, so this fetches the actual blob bytes (under
-    //    `Recover`, incl. the SR-3.2 recovery path) for attachment as OMPF
-    //    parts. Recovery-counter participation is unnecessary here (the
-    //    subscribe wiring has no per-call recovery log), so pass `None`.
-    let (scan, ext_data) = match resolve_external_values(&plan, ext_store, ext_reads, None).await? {
-        Built::Ready(resolved) => resolved,
-        Built::Missing(missing) => return Ok(Built::Missing(missing)),
-    };
+    // 4. Resolve external values' lengths, as `ext_reads` says. A live joiner
+    //    has no local ext values, so the actual blob bytes ride as OMPF parts
+    //    (under `Recover`, a missing one left for the caller to restore
+    //    through the SR-3.2 recovery path), read once the payload is
+    //    reserved.
+    let (scan, resolved, on_missing) =
+        match resolve_external_values(&plan, ext_store, ext_reads).await? {
+            Built::Ready(resolved) => resolved,
+            Built::Missing(missing) => return Ok(Built::Missing(missing)),
+        };
 
-    // 5. Build OMPF payload. `have_version = 0` → `base_version = 0` so the
-    //    payload is a valid full-state create (SR-1.2). Actual ext-value blob
-    //    bytes ride as OMPF Parts[1..N] (not hash-refs only).
-    let ompf_bytes = build_diff_payload(&plan, &snapshot.source_format, 0, &scan, &ext_data)?;
+    // 5. Build the delta, which the payload is laid out around. `have_version
+    //    = 0` → `base_version = 0` so the payload is a valid full-state create
+    //    (SR-1.2).
+    let delta = build_plan_delta(&plan, &snapshot.source_format, 0, &scan)?;
 
     // 6. Derive response metadata. `plan_faithful_snapshot` only ever returns
-    //    `FullContent`; the other arms are unreachable but handled exhaustively.
-    let (case, sections_count) = match &plan {
+    //    `FullContent`; the other arm is unreachable but handled exhaustively.
+    let (case, sections_count) = plan_case(&plan);
+
+    Ok(Built::Ready(lay_out_or_restore(
+        delta,
+        resolved,
+        on_missing,
+        LayoutMeta {
+            case,
+            sections_count,
+            cut,
+            observe,
+        },
+    )))
+}
+
+/// A plan's diff case and its struct command count (sections + deleted
+/// sections), for the response's metadata.
+fn plan_case(plan: &DiffPlan) -> (DiffCase, usize) {
+    match plan {
         DiffPlan::FullContent { sections, .. } => (DiffCase::FullContent, sections.len()),
-        DiffPlan::UpToDate => (DiffCase::UpToDate, 0),
         DiffPlan::Incremental {
             new_sections,
             modified_sections,
@@ -1706,30 +1562,333 @@ async fn build_faithful_full_content(
             DiffCase::Incremental,
             new_sections.len() + modified_sections.len() + deleted_sections.len(),
         ),
-    };
+    }
+}
 
-    // 7. Record metrics.
-    if let Some(m) = metrics {
-        m.observe_diff_build(case.as_label(), service_label, start.elapsed());
+/// Where and how a catch-up build's duration is recorded
+/// (`live_diff_build_duration_seconds`), once its payload is filled: the
+/// layout's time from `start` until it is laid out, plus the fill's own time.
+/// The catch-up payload budget wait between the two is a capacity wait, not
+/// build time, and is left out; so is the restore of the values a
+/// fetch-on-miss layout found not stored ([`RestoreLayout`]), whose batches
+/// wait on the same budget.
+struct DiffBuildMetrics {
+    metrics: Option<SharedMetrics>,
+    service_label: String,
+    start: std::time::Instant,
+}
+
+/// A catch-up payload laid out, before any external value byte is read
+/// ([`compute_faithful_full_content_at_cut`],
+/// [`compute_faithful_coalesced_at_cut`]; `storage::ompf_payload`).
+pub struct DiffLayout {
+    layout: PayloadLayout,
+    case: DiffCase,
+    sections_count: usize,
+    cut: DiffCut,
+    observe: DiffBuildMetrics,
+    /// How long the layout took, from [`DiffBuildMetrics::start`].
+    laid_out_in: std::time::Duration,
+}
+
+impl std::fmt::Debug for DiffLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffLayout")
+            .field("layout", &self.layout)
+            .field("case", &self.case)
+            .field("cut", &self.cut)
+            .finish()
+    }
+}
+
+impl DiffLayout {
+    /// The payload's length, in bytes.
+    pub fn len(&self) -> u64 {
+        self.layout.len()
     }
 
-    Ok(Built::Ready(DiffResponse {
-        ompf_bytes,
-        case,
-        sections_count,
-        cut,
-    }))
+    /// Whether the payload is empty.
+    pub fn is_empty(&self) -> bool {
+        self.layout.is_empty()
+    }
+
+    /// The catch-up payload budget the fill needs reserved first: the
+    /// payload's exact size, plus its ranged reads' replies in flight when it
+    /// has external values to read ([`PayloadLayout::reservation_bytes`]).
+    pub fn reservation_bytes(&self) -> u64 {
+        self.layout.reservation_bytes()
+    }
+
+    /// Reads the external values into the payload's pages, each page with its
+    /// share of `charge`'s grant ([`PayloadLayout::fill`]), and records the
+    /// build's duration — the layout's time plus the fill's, never the wait
+    /// for the grant between them: the payload, or [`Built::Missing`] when a
+    /// value read as missing under [`ExtValueReads::PROBE`]. `charge` is
+    /// `None` only outside a subscription's catch-up (tests and diagnostics),
+    /// which charge no budget.
+    pub async fn fill(
+        self,
+        ext_store: &dyn ExternalValueStore,
+        charge: Option<PayloadGrant>,
+    ) -> Result<Built<DiffResponse>, ServiceError> {
+        let DiffLayout {
+            layout,
+            case,
+            sections_count,
+            cut,
+            observe,
+            laid_out_in,
+        } = self;
+        let fill_started = std::time::Instant::now();
+        let payload = match layout.fill(ext_store, charge).await? {
+            Built::Ready(payload) => payload,
+            Built::Missing(missing) => return Ok(Built::Missing(missing)),
+        };
+        if let Some(m) = &observe.metrics {
+            m.observe_diff_build(
+                case.as_label(),
+                &observe.service_label,
+                laid_out_in + fill_started.elapsed(),
+            );
+        }
+        Ok(Built::Ready(DiffResponse {
+            payload,
+            case,
+            sections_count,
+            cut,
+        }))
+    }
+}
+
+/// What a catch-up build's layout step answered
+/// ([`compute_faithful_full_content_at_cut`],
+/// [`compute_faithful_coalesced_at_cut`]).
+#[derive(Debug)]
+pub enum LaidOut {
+    /// The payload laid out: reserve for it and fill it.
+    Ready(DiffLayout),
+    /// Only under [`ExtValueReads::recover`]: the length probe found values
+    /// not stored. Nothing was restored; the planned layout waits for its
+    /// caller to restore them ([`RestoreLayout::restores`]) and finish it
+    /// from their lengths ([`RestoreLayout::finish`]).
+    Restore(RestoreLayout),
+}
+
+impl LaidOut {
+    /// The layout, its values restored first when it has any to restore —
+    /// through `storage::ompf_payload::restore_in_batches` with a budget of
+    /// its own that never waits, charging one per byte — for the integration
+    /// tests that drive the builders directly (`test-support` only, never in
+    /// a production build).
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn restored_for_test(
+        self,
+        ext_store: &dyn ExternalValueStore,
+    ) -> Result<DiffLayout, ServiceError> {
+        use crate::storage::memory_budget::{MemoryBudget, CATCHUP_PAYLOAD_SERIES};
+        use crate::storage::ompf_payload::restore_in_batches;
+        use std::sync::{Arc, Mutex as StdMutex};
+        match self {
+            LaidOut::Ready(layout) => Ok(layout),
+            LaidOut::Restore(pending) => {
+                let budget = Arc::new(MemoryBudget::with_series(
+                    u64::MAX / 1024,
+                    Arc::new(StdMutex::new(None)),
+                    &CATCHUP_PAYLOAD_SERIES,
+                ));
+                let total = budget.total_bytes();
+                let restored = restore_in_batches(ext_store, &pending, 100, total, |bytes| {
+                    let budget = Arc::clone(&budget);
+                    async move {
+                        // Never closed and with no deadline, the budget
+                        // grants every reservation.
+                        budget.reserve(bytes, None).await.map_err(|_| {
+                            ServiceError::Internal(
+                                "a test restore's own budget refused it".to_owned(),
+                            )
+                        })
+                    }
+                })
+                .await?;
+                pending.finish(&restored)
+            }
+        }
+    }
+}
+
+/// A fetch-on-miss catch-up payload planned, its delta built, waiting for the
+/// values its length probe found not stored ([`LaidOut::Restore`]). It holds
+/// no value byte, and restores nothing itself: the caller restores
+/// [`Self::restores`] — a subscription's catch-up in batches charged to the
+/// catch-up payload budget (`storage::ompf_payload::restore_in_batches`) —
+/// and lays the payload out from their lengths with [`Self::finish`], so the
+/// plan is never made twice.
+///
+/// Only a fetch-on-miss layout ([`ExtValueReads::recover`], built only from a
+/// [`LiveHoldProof`]) builds one, and the restore takes this type rather than
+/// a list of values, so nothing restores a value outside the miss protocol
+/// (`restore_in_batches` says why). A `test-support` build adds
+/// [`Self::restore_for_test`] for the tests that drive the restore directly.
+pub struct RestoreLayout {
+    /// The delta the payload is laid out around.
+    delta: Vec<u8>,
+    /// Every external value of the payload in part order, with its probed
+    /// length, or `None` for one of [`Self::restores`].
+    values: Vec<([u8; 32], Option<u64>)>,
+    /// The values to restore, in part order, each with its declared size.
+    restores: Vec<RestoreValue>,
+    on_missing: OnMissing,
+    meta: LayoutMeta,
+    /// How long the layout took until now, from [`DiffBuildMetrics::start`].
+    laid_out_in: std::time::Duration,
+}
+
+impl std::fmt::Debug for RestoreLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestoreLayout")
+            .field("values", &self.values.len())
+            .field("restores", &self.restores.len())
+            .field("case", &self.meta.case)
+            .field("cut", &self.meta.cut)
+            .finish()
+    }
+}
+
+impl RestoreLayout {
+    /// The values to restore before the layout is finished: every value the
+    /// length probe found not stored, once, in part order, each with the
+    /// largest size the plan's references to it declare.
+    pub fn restores(&self) -> &[RestoreValue] {
+        &self.restores
+    }
+
+    /// A layout whose only external values are `restores` — each a hash and
+    /// its declared size, in plan order, none of them stored — around an
+    /// empty delta, with no read hold behind it, for the tests that drive
+    /// `storage::ompf_payload::restore_in_batches` directly (`test-support`
+    /// only, never in a production build).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn restore_for_test(restores: impl IntoIterator<Item = ([u8; 32], u64)>) -> Self {
+        let restores: Vec<RestoreValue> = restores
+            .into_iter()
+            .map(|(hash, declared)| RestoreValue::new(hash, declared))
+            .collect();
+        RestoreLayout {
+            delta: Vec::new(),
+            values: restores.iter().map(|value| (value.hash(), None)).collect(),
+            restores,
+            on_missing: OnMissing::Recover,
+            meta: LayoutMeta {
+                case: DiffCase::FullContent,
+                sections_count: 0,
+                cut: DiffCut::Unpinned,
+                observe: DiffBuildMetrics {
+                    metrics: None,
+                    service_label: String::new(),
+                    start: std::time::Instant::now(),
+                },
+            },
+            laid_out_in: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Lays the payload out, every value at its probed length, or at the
+    /// length `restored` answers for one of [`Self::restores`] (one this
+    /// catch-up restored is marked so, and its fill never restores it a
+    /// second time). `INTERNAL` when `restored` lacks one of them, which
+    /// [`restore_in_batches`](crate::storage::ompf_payload::restore_in_batches)
+    /// never does.
+    pub fn finish(
+        self,
+        restored: &HashMap<[u8; 32], RestoredLength>,
+    ) -> Result<DiffLayout, ServiceError> {
+        let RestoreLayout {
+            delta,
+            values,
+            restores: _,
+            on_missing,
+            meta,
+            laid_out_in,
+        } = self;
+        let values = values
+            .into_iter()
+            .map(|(hash, probed)| match (probed, restored.get(&hash)) {
+                (Some(len), _) => Ok((hash, len, false)),
+                (None, Some(found)) => Ok((hash, found.len, found.restored)),
+                (None, None) => Err(ServiceError::Internal(
+                    "an external value the plan references was neither stored nor restored"
+                        .to_owned(),
+                )),
+            })
+            .collect::<Result<Vec<ResolvedValue>, ServiceError>>()?;
+        Ok(meta.into_layout(
+            PayloadLayout::lay_out(delta, values, on_missing),
+            laid_out_in,
+        ))
+    }
+}
+
+/// A layout's response metadata and its build-time observation, from the
+/// plan.
+struct LayoutMeta {
+    case: DiffCase,
+    sections_count: usize,
+    cut: DiffCut,
+    observe: DiffBuildMetrics,
+}
+
+impl LayoutMeta {
+    fn into_layout(self, layout: PayloadLayout, laid_out_in: std::time::Duration) -> DiffLayout {
+        let LayoutMeta {
+            case,
+            sections_count,
+            cut,
+            observe,
+        } = self;
+        DiffLayout {
+            layout,
+            case,
+            sections_count,
+            cut,
+            observe,
+            laid_out_in,
+        }
+    }
+}
+
+/// The layout step's answer once the delta is built: the payload laid out
+/// around `delta` from `resolved`'s lengths, or, when values remain to
+/// restore, the planned layout waiting for them.
+fn lay_out_or_restore(
+    delta: Vec<u8>,
+    resolved: Resolved,
+    on_missing: OnMissing,
+    meta: LayoutMeta,
+) -> LaidOut {
+    let laid_out_in = meta.observe.start.elapsed();
+    match resolved {
+        Resolved::Lengths(values) => LaidOut::Ready(meta.into_layout(
+            PayloadLayout::lay_out(delta, values, on_missing),
+            laid_out_in,
+        )),
+        Resolved::Restore { values, restores } => LaidOut::Restore(RestoreLayout {
+            delta,
+            values,
+            restores,
+            on_missing,
+            meta,
+            laid_out_in,
+        }),
+    }
 }
 
 // ── compute_faithful_coalesced_at_cut ────────────────────────────────────────
 
 /// DR-independent faithful catch-up entrypoint for a reconnector — BOTH the
-/// in-window (Regime 2) and out-of-window / trimmed (Regime 3) paths under the
-/// shipped default `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true`, which converge
-/// here and differ only in their regime metric label (Plan b.msb, Task 2/3
-/// wiring in `src/grpc/subscribe.rs`). `false` reverts each regime to its
-/// legacy path (per-commit replay for Regime 2, [`compute_diff_at_cut`] for
-/// Regime 3). Built from the reconnect's proven snapshot (Spec SDD SR-3.1):
+/// in-window (Regime 2) and out-of-window / trimmed (Regime 3) paths, which
+/// converge here and differ only in their regime metric label (Plan b.msb,
+/// Task 2/3 wiring in `src/grpc/subscribe.rs`). Built from the reconnect's
+/// proven snapshot (Spec SDD SR-3.1):
 /// its atomic read at or below the atomic-read ceilings, its flight's shared
 /// fenced read above them. The response's cut is [`DiffCut::Atomic`] at
 /// `snapshot.cut`; an unfenced snapshot is refused `Internal`
@@ -1738,24 +1897,26 @@ async fn build_faithful_full_content(
 /// Mirrors [`compute_faithful_full_content_at_cut`]'s pipeline but routes
 /// through [`DiffEngine::plan_faithful_coalesced`] instead of the from-empty
 /// [`DiffEngine::plan_faithful_snapshot`], and threads `have_version` (NOT `0`)
-/// into [`build_diff_payload`] so the emitted payload is a valid coalesced
+/// into [`build_plan_delta`] so the emitted payload is a valid coalesced
 /// INCREMENTAL delta with `is_diff = true` and `base_version == have_version`.
 ///
 /// This is the load-bearing difference from the from-empty joiner: a
 /// reconnector (either regime) has `0 < have_version < current_seq` on the SAME
 /// `object_id`, so its sequence has advanced past 0 and the client REJECTS a
 /// `base_version = 0` from-empty create (SDD §12.3, §12.9). Emitting `Incremental`
-/// with `base_version = have_version` keeps the exact envelope today's legacy
-/// coalesced diff already satisfies while correcting the CONTENT: net-live prims
-/// only, plus the unified ghost-retraction set (see the domain builder).
+/// with `base_version = have_version` keeps the envelope the client accepts
+/// while the CONTENT is net-live prims only, plus the unified ghost-retraction
+/// set (see the domain builder).
 ///
 /// Like [`compute_faithful_full_content_at_cut`], this path is always-on and
 /// takes NO `crate::checkpoint` dependency (independent of
 /// `LIVE_EDIT_CHECKPOINT_ENABLED`, SR-4.1). A reconnector may not hold blobs
-/// for newly-referenced hashes, so the actual ext-value blob bytes are fetched
-/// via [`resolve_external_values`] and attached as OMPF parts, not hash-refs
-/// only, read as `ext_reads` says ([`Built::Missing`] under
-/// [`ExtValueReads::PROBE`] when one is not stored).
+/// for newly-referenced hashes, so the actual ext-value blob bytes are
+/// attached as OMPF parts, not hash-refs only: their lengths resolved by
+/// [`resolve_external_values`] and their bytes read by [`DiffLayout::fill`],
+/// as `ext_reads` says ([`Built::Missing`] under [`ExtValueReads::PROBE`]
+/// when one is not stored). The two steps are
+/// [`compute_faithful_full_content_at_cut`]'s.
 pub async fn compute_faithful_coalesced_at_cut(
     snapshot: &AtomicSnapshot,
     have_version: u64,
@@ -1763,7 +1924,7 @@ pub async fn compute_faithful_coalesced_at_cut(
     ext_reads: ExtValueReads,
     metrics: Option<&SharedMetrics>,
     service_label: &str,
-) -> Result<Built<DiffResponse>, ServiceError> {
+) -> Result<Built<LaidOut>, ServiceError> {
     let start = std::time::Instant::now();
     let cut = proven_cut(&snapshot.state.object_id.to_string(), snapshot)?;
     build_faithful_coalesced(
@@ -1772,9 +1933,11 @@ pub async fn compute_faithful_coalesced_at_cut(
         cut,
         ext_store,
         ext_reads,
-        metrics,
-        service_label,
-        start,
+        DiffBuildMetrics {
+            metrics: metrics.cloned(),
+            service_label: service_label.to_owned(),
+            start,
+        },
     )
     .await
 }
@@ -1782,17 +1945,14 @@ pub async fn compute_faithful_coalesced_at_cut(
 /// The body of [`compute_faithful_coalesced_at_cut`], from a snapshot already
 /// read. Its steps are numbered from 2 because step 1 is the caller's proven
 /// read.
-#[allow(clippy::too_many_arguments)]
 async fn build_faithful_coalesced(
     snapshot: &ObjectSnapshot,
     have_version: u64,
     cut: DiffCut,
     ext_store: &dyn ExternalValueStore,
     ext_reads: ExtValueReads,
-    metrics: Option<&SharedMetrics>,
-    service_label: &str,
-    start: std::time::Instant,
-) -> Result<Built<DiffResponse>, ServiceError> {
+    observe: DiffBuildMetrics,
+) -> Result<Built<LaidOut>, ServiceError> {
     // 2. Convert snapshot to domain types.
     let state = snapshot_to_object_state(snapshot);
     let tombstones = &snapshot.tombstones;
@@ -1804,92 +1964,90 @@ async fn build_faithful_coalesced(
     //    authoring rank (b.3pe).
     let plan = DiffEngine::plan_faithful_coalesced(&state, tombstones, have_version)?;
 
-    // 4. Resolve external values, as `ext_reads` says (fetch actual blob
-    //    bytes for OMPF parts; a reconnector may not hold blobs for
-    //    newly-referenced hashes). No per-call recovery log on the subscribe
-    //    path, so pass `None`.
-    let (scan, ext_data) = match resolve_external_values(&plan, ext_store, ext_reads, None).await? {
-        Built::Ready(resolved) => resolved,
-        Built::Missing(missing) => return Ok(Built::Missing(missing)),
-    };
+    // 4. Resolve external values' lengths, as `ext_reads` says (a reconnector
+    //    may not hold blobs for newly-referenced hashes, so their bytes ride
+    //    as OMPF parts, read once the payload is reserved; under `Recover`, a
+    //    missing one left for the caller to restore).
+    let (scan, resolved, on_missing) =
+        match resolve_external_values(&plan, ext_store, ext_reads).await? {
+            Built::Ready(resolved) => resolved,
+            Built::Missing(missing) => return Ok(Built::Missing(missing)),
+        };
 
-    // 5. Build OMPF payload. `have_version` (NOT 0) → `base_version =
-    //    have_version` so the reconnector's already-advanced sequence accepts
-    //    message #1 (no from-empty reset). Actual ext-value blob bytes ride as
-    //    OMPF Parts[1..N].
-    let ompf_bytes = build_diff_payload(
-        &plan,
-        &snapshot.source_format,
-        have_version,
-        &scan,
-        &ext_data,
-    )?;
+    // 5. Build the delta, which the payload is laid out around.
+    //    `have_version` (NOT 0) → `base_version = have_version` so the
+    //    reconnector's already-advanced sequence accepts message #1 (no
+    //    from-empty reset).
+    let delta = build_plan_delta(&plan, &snapshot.source_format, have_version, &scan)?;
 
     // 6. Derive response metadata. `plan_faithful_coalesced` only ever returns
-    //    `Incremental`; the other arms are unreachable but handled exhaustively.
-    let (case, sections_count) = match &plan {
-        DiffPlan::Incremental {
-            new_sections,
-            modified_sections,
-            deleted_sections,
-            ..
-        } => (
-            DiffCase::Incremental,
-            new_sections.len() + modified_sections.len() + deleted_sections.len(),
-        ),
-        DiffPlan::FullContent { sections, .. } => (DiffCase::FullContent, sections.len()),
-        DiffPlan::UpToDate => (DiffCase::UpToDate, 0),
-    };
+    //    `Incremental`; the other arm is unreachable but handled exhaustively.
+    let (case, sections_count) = plan_case(&plan);
 
-    // 7. Record metrics.
-    if let Some(m) = metrics {
-        m.observe_diff_build(case.as_label(), service_label, start.elapsed());
-    }
-
-    Ok(Built::Ready(DiffResponse {
-        ompf_bytes,
-        case,
-        sections_count,
-        cut,
-    }))
+    Ok(Built::Ready(lay_out_or_restore(
+        delta,
+        resolved,
+        on_missing,
+        LayoutMeta {
+            case,
+            sections_count,
+            cut,
+            observe,
+        },
+    )))
 }
 
-/// Scan a DiffPlan for external value references and fetch the data, as
-/// `ext_reads` says (b.yuo).
+/// One external value of a payload to lay out: its hash, its stored length,
+/// and whether the checkpoint adapter restored it, writing it back to the
+/// store at that length.
+type ResolvedValue = ([u8; 32], u64, bool);
+
+/// What [`resolve_external_values`] resolved of a plan's external values.
+enum Resolved {
+    /// Every value's length, in part order: the payload can be laid out.
+    Lengths(Vec<ResolvedValue>),
+    /// Only under [`ExtValueReads::recover`]: the probe found values not
+    /// stored. Every value in part order with its probed length (`None` for
+    /// one to restore), and the values to restore, each with its declared
+    /// size ([`RestoreLayout`]).
+    Restore {
+        values: Vec<([u8; 32], Option<u64>)>,
+        restores: Vec<RestoreValue>,
+    },
+}
+
+/// Scan a DiffPlan for external value references and resolve their lengths,
+/// as `ext_reads` says (b.yuo, b.ntm), reading no stored value's bytes: the
+/// payload is laid out from these lengths, and the values are read in ranges
+/// once it is reserved ([`DiffLayout::fill`]).
 ///
-/// Returns the scan result and a hash→data map. If the plan contains no
-/// external values, both are empty (no Valkey calls). Under
-/// [`ExtValueReads::PROBE`] the fetch is
-/// [`ExternalValueStore::probe_values`], and a hash that is not stored answers
-/// [`Built::Missing`] with every such hash; under [`ExtValueReads::recover`]
-/// it is [`ExternalValueStore::read_batch_with_recovery_counter`], which
-/// recovers a missing hash through the checkpoint adapter or fails.
-///
-/// `recovery_counter` is plumbed through to
-/// [`ExternalValueStore::read_batch_with_recovery_counter`] so a
-/// successful SR-3.2 checkpoint-adapter fallback bumps it per recovered
-/// hash. The version-diff builder (`build_diff`, behind
-/// [`compute_diff_at_cut`] and [`compute_per_commit_diff_at_cut`]) reads it
-/// back after the call to emit one operator-readable INFO log line per build
-/// with the `object_id` joined onto the count — Subtask `t3.fgj.zc.p6.78`. Pass
-/// `None` to skip counter participation. A probe never recovers, so it never
-/// moves the counter.
+/// Returns the scan result, every referenced value in part order with its
+/// length, and what the fill does with a value that reads as missing. If the
+/// plan contains no external values, the values are empty (no Valkey calls).
+/// Under [`ExtValueReads::PROBE`] the read is
+/// [`ExternalValueStore::probe_value_lengths`], a hash that is not stored
+/// answers [`Built::Missing`] with every such hash, and so does one that reads
+/// as missing during the fill. Under [`ExtValueReads::recover`] nothing is
+/// restored here: the hashes the probe finds missing are answered
+/// ([`Resolved::Restore`]), each with the largest size the plan's references
+/// to it declare, for the caller to restore through the checkpoint adapter
+/// ([`ExternalValueStore::recover_value`]) and to finish the layout from the
+/// restored lengths ([`RestoreLayout::finish`]); a restore writes the value
+/// back to the store, so only its length is kept and the fill reads it back
+/// in ranges like every other value. One the fill's closing check finds not
+/// stored is restored by the fill (module docs of `storage::ompf_payload`).
+/// Each adapter consult is counted on
+/// `live_edit_checkpoint_ext_recovery_total{result,meta}`. The probed or
+/// restored lengths, not the plan's declared sizes, lay the payload out: under
+/// `LIVE_EDIT_EXT_VALUE_VERIFY=observe` a part is stored whatever its length,
+/// and the payload carries it as stored. A declared size only sizes the
+/// charge a restore reserves before its fetch.
 async fn resolve_external_values(
     plan: &DiffPlan,
     ext_store: &dyn ExternalValueStore,
     ext_reads: ExtValueReads,
-    recovery_counter: Option<&AtomicUsize>,
-) -> Result<Built<(ExternalValueScan, HashMap<[u8; 32], Vec<u8>>)>, ServiceError> {
+) -> Result<Built<(ExternalValueScan, Resolved, OnMissing)>, ServiceError> {
     let (fields, time_samples): (&[Field], &[crate::domain::types::TimeSample]) = match plan {
-        DiffPlan::UpToDate => {
-            return Ok(Built::Ready((
-                ExternalValueScan {
-                    ordered_hashes: Vec::new(),
-                    hash_to_index: HashMap::new(),
-                },
-                HashMap::new(),
-            )));
-        }
         DiffPlan::FullContent {
             fields,
             time_samples,
@@ -1903,29 +2061,98 @@ async fn resolve_external_values(
     };
 
     let scan = collect_external_value_hashes(fields, time_samples);
-
-    if scan.is_empty() {
-        return Ok(Built::Ready((scan, HashMap::new())));
-    }
+    let in_order = |lengths: &HashMap<[u8; 32], u64>| -> Result<Vec<ResolvedValue>, ServiceError> {
+        scan.ordered_hashes
+            .iter()
+            .map(|hash| match lengths.get(hash) {
+                Some(len) => Ok((*hash, *len, false)),
+                None => Err(ServiceError::Internal(
+                    "an external value the plan references was neither stored nor restored"
+                        .to_owned(),
+                )),
+            })
+            .collect()
+    };
 
     match ext_reads.0 {
         ExtReadMode::Probe => {
-            let probe = ext_store.probe_values(&scan.ordered_hashes).await?;
+            if scan.is_empty() {
+                return Ok(Built::Ready((
+                    scan,
+                    Resolved::Lengths(Vec::new()),
+                    OnMissing::Answer,
+                )));
+            }
+            let probe = ext_store.probe_value_lengths(&scan.ordered_hashes).await?;
             if !probe.missing.is_empty() {
                 return Ok(Built::Missing(probe.missing));
             }
-            Ok(Built::Ready((scan, probe.found)))
+            let values = in_order(&probe.lengths)?;
+            Ok(Built::Ready((
+                scan,
+                Resolved::Lengths(values),
+                OnMissing::Answer,
+            )))
         }
         ExtReadMode::Recover => {
-            // Fetch external value data from Valkey (pipelined). The counter
-            // is bumped inside `read_batch_with_recovery_counter` per hash
-            // whose blob was reconstructed via the SR-3.2 fallback.
-            let ext_data = ext_store
-                .read_batch_with_recovery_counter(&scan.ordered_hashes, recovery_counter)
-                .await?;
-            Ok(Built::Ready((scan, ext_data)))
+            if scan.is_empty() {
+                return Ok(Built::Ready((
+                    scan,
+                    Resolved::Lengths(Vec::new()),
+                    OnMissing::Recover,
+                )));
+            }
+            // Probe the lengths. A missing blob is not restored here: it is
+            // answered with its declared size, for the caller to restore
+            // through the SR-3.2 fallback (which writes it back to the store)
+            // under its own memory charge.
+            let probe = ext_store.probe_value_lengths(&scan.ordered_hashes).await?;
+            if probe.missing.is_empty() {
+                let values = in_order(&probe.lengths)?;
+                return Ok(Built::Ready((
+                    scan,
+                    Resolved::Lengths(values),
+                    OnMissing::Recover,
+                )));
+            }
+            let declared = declared_sizes(fields, time_samples);
+            let restores = probe
+                .missing
+                .iter()
+                .map(|hash| RestoreValue::new(*hash, declared.get(hash).copied().unwrap_or(0)))
+                .collect();
+            let values = scan
+                .ordered_hashes
+                .iter()
+                .map(|hash| (*hash, probe.lengths.get(hash).copied()))
+                .collect();
+            Ok(Built::Ready((
+                scan,
+                Resolved::Restore { values, restores },
+                OnMissing::Recover,
+            )))
         }
     }
+}
+
+/// The size each external value's references declare
+/// (`FieldValue::External::size`), the largest where they differ, by hash.
+fn declared_sizes(
+    fields: &[Field],
+    time_samples: &[crate::domain::types::TimeSample],
+) -> HashMap<[u8; 32], u64> {
+    let mut sizes: HashMap<[u8; 32], u64> = HashMap::new();
+    let references = fields
+        .iter()
+        .map(|field| &field.value)
+        .chain(time_samples.iter().map(|sample| &sample.value));
+    for value in references {
+        if let FieldValue::External { hash, size, .. } = value {
+            let declared = sizes.entry(*hash).or_insert(0);
+            *declared = (*declared).max(*size);
+        }
+    }
+    sizes
 }
 
 /// Convert an `ObjectSnapshot` (storage layer) into an `ObjectState` (domain layer).
@@ -2098,7 +2325,7 @@ pub(crate) enum SnapshotKeyFamily {
     /// `le:{object_id}:obj:ext` — the external-value reference index. No
     /// snapshot read touches it: external-value clean-up's size read (`HLEN`)
     /// and reference walk (`HSCAN`) do (`storage::retirement`). A foreign value here
-    /// stops none of the four snapshot reads; the clean-up skips its release
+    /// stops none of the three snapshot reads; the clean-up skips its release
     /// and removes the key. Edits refuse it on their own
     /// (`live_edit_keyspace_type_error_total`).
     ExtIndex,
@@ -2180,23 +2407,19 @@ const _: () = assert!(
 ///
 /// Deliberately not `storage::layer`'s `KEYSPACE_TYPE_ERROR_REMEDIATION`: that
 /// one says "writes to this layer fail closed", which understates this: the
-/// key can stop up to four snapshot consumers plus external-value clean-up of
+/// key can stop up to three snapshot consumers plus external-value clean-up of
 /// a deleted or replaced layer — and that clean-up is often a background task
 /// whose only evidence is the log line this constant rides on.
 ///
 /// **One read, at every layer size, and which consumers stop depends only on
-/// the key.** Four consumers read [`read_object_snapshot`]'s key set: at or
-/// below the atomic-read limits catch-up, the checkpoint assembler and
-/// per-commit reconstruction through its atomic read; above them catch-up (a
-/// legacy replay's coalesced route included) through the fenced read's fan-out
+/// the key.** Three consumers read [`read_object_snapshot`]'s key set: at or
+/// below the atomic-read limits catch-up and the checkpoint assembler through
+/// its atomic read; above them catch-up through the fenced read's fan-out
 /// its shared fenced-read flight runs (`storage::snapshot_flights`), and the
 /// checkpoint assembler through a fenced read of its own; and the structural
 /// commit path's WATCH route through its unfenced
-/// fan-out at every size. No per-commit reconstruction is left above the
-/// limits: a legacy in-window replay's first per-commit atomic read answers
-/// `TOO_LARGE`, and the replay then reads through catch-up's coalesced route.
-/// (A live commit never reconstructs: one without relay bytes is an empty
-/// commit, sent with no read.) Under the `lua` backend a structural call that
+/// fan-out at every size. (A live commit never reconstructs: one without relay
+/// bytes is an empty commit, sent with no read.) Under the `lua` backend a structural call that
 /// commits through the structural write-planning cache reads the layer only on
 /// a cold start or reload, through the same atomic read at the cache's
 /// ceilings (`storage::structural_cache_cold_start`), so a refused key stops
@@ -2211,17 +2434,17 @@ const _: () = assert!(
 /// (`storage::structural_cache_audit`) issues that atomic read too, in a
 /// background task: its refusal is counted and stops no call. Each form reads
 /// the header, the four indices and every section, tombstone, field and
-/// time-sample hash, so a refused key there stops all four consumers. On an
+/// time-sample hash, so a refused key there stops all three consumers. On an
 /// object carrying the `chs_complete` marker it reads `obj:chs` and only the
 /// children lists it names under a live parent, so a refused `obj:chs` stops
-/// all four at every size (the atomic read's size check, `SCARD obj:chs`, runs
+/// all three at every size (the atomic read's size check, `SCARD obj:chs`, runs
 /// before it can answer `TOO_LARGE`), and a refused list `obj:chs` does not
 /// name is read by none of them; on an unmarked object it reads the lists of
-/// the root and every live section, so a refused list stops all four. The
+/// the root and every live section, so a refused list stops all three. The
 /// structural path's `HGET obj:hdr seq` proof is the one further touch, on the
 /// header, which the others already read.
 ///
-/// **The fifth consumer reads no snapshot.** External-value clean-up of a
+/// **The fourth consumer reads no snapshot.** External-value clean-up of a
 /// deleted or replaced layer (`storage::retirement`) reads only sizes and
 /// references: its size read, one pipeline of seven commands
 /// (`HGET obj:hdr ext_gc_scheduled`, `HLEN obj:ext`, and the cardinality of
@@ -2248,10 +2471,9 @@ const _: () = assert!(
 ///   `obj:secs`, `obj:dels` and `obj:chs` by `SSCAN`, then `obj:flds` and
 ///   `obj:tss` by `ZRANGE` — so a wrong-typed index (or a refusal of its
 ///   page command that persists, which the size read's count did not meet)
-///   stops it there. The five indices and every row not yet removed stay,
-///   and on `DeleteLayer` so does the layers-index member; `DeleteLayer`
-///   fails (`INTERNAL` for a wrong type) with the mapping already deleted
-///   (b.yz5).
+///   stops it there. The five indices and every row not yet removed stay;
+///   `DeleteLayer` fails (`INTERNAL` for a wrong type) with the mapping and
+///   the layers-index member already removed by its unmap (b.yz5).
 ///
 /// The teardown's index pages are not counted (b.yz5). The size read counts
 /// each index before the teardown meets it — a wrong-typed one once, under
@@ -2352,20 +2574,19 @@ const _: () = assert!(
 /// clause, since the discovery read reaches both arms.
 const SNAPSHOT_READ_TYPE_ERROR_REMEDIATION: &str =
     "reads of this layer fail closed until the named key is removed. One read loads this \
-     object's state, at every layer size, for four consumers: structural UpdateLayer commits \
+     object's state, at every layer size, for three consumers: structural UpdateLayer commits \
      (under the lua backend's structural cache, only on a cold start or reload, and its \
      sampled audit, which stops no commit; a cached commit refuses a foreign value on a record \
      or index key it writes, obj:chs included, on its own, as WRONGTYPE_KEY on \
      live_edit_keyspace_type_error_total), catch-up and the \
      checkpoint assembler (above the atomic-read limits through a fenced read, catch-up's \
-     shared by the layer's joiners) and subscribe's per-commit reconstruction (a legacy \
-     in-window replay, which above those limits reads through catch-up's shared fenced read). \
-     A fifth, the external-value clean-up of a deleted or replaced layer, first reads the \
+     shared by the layer's joiners). \
+     A fourth, the external-value clean-up of a deleted or replaced layer, first reads the \
      header's release flag and the sizes of obj:ext and the five indices (obj:secs, obj:dels, \
      obj:chs, obj:flds, obj:tss) in one size read (op names the retirement size read), then \
      reads only the header, obj:flds, obj:tss, their field and time-sample rows and obj:ext \
      for its release; its key deletion then pages all five indices. A foreign value on the \
-     header, an index or a section, tombstone, field or time-sample row stops all four. One on \
+     header, an index or a section, tombstone, field or time-sample row stops all three. One on \
      the header or a field or time-sample row also stops the clean-up's release of the layer's \
      external values (the layer is still deleted; the reference-count reconciler frees them \
      later). One on any of the five indices is counted at the clean-up's size read, under that \
@@ -2378,13 +2599,13 @@ const SNAPSHOT_READ_TYPE_ERROR_REMEDIATION: &str =
      in the session's layer list; the DeleteLayer answers INTERNAL with the layer already \
      unmapped. The key deletion's own failure line names the object and the index it stopped \
      at. A foreign value on obj:ext (key_family ext_index) stops none of the \
-     four snapshot reads; the clean-up skips its release and removes the key, its references \
+     three snapshot reads; the clean-up skips its release and removes the key, its references \
      freed later by the reference-count reconciler. Edits refuse it on their own \
      (live_edit_keyspace_type_error_total). On an object whose header \
      carries chs_complete=1 the read also reads obj:chs and only the children lists it names, \
-     so a foreign value on obj:chs stops all four at every layer size (the atomic read's size \
+     so a foreign value on obj:chs stops all three at every layer size (the atomic read's size \
      check reads obj:chs), and one on a children list obj:chs does not name stops none of \
-     them; on any other object a children list stops all four. The orphan sweep's retirement \
+     them; on any other object a children list stops all three. The orphan sweep's retirement \
      fence \
      writes the same header key. When op is HGETALL obj:hdr (orphan \
      discovery) the radius is wider than per-layer: that read aborts the rest of the \
@@ -2410,10 +2631,10 @@ const SNAPSHOT_READ_TYPE_ERROR_REMEDIATION: &str =
 /// further, so the sentence stays kind-agnostic and points at the label.
 ///
 /// The blast radius is the wrong-typed case's — the same touches fail closed,
-/// and which of the four snapshot consumers stop depends on the key (and, for
+/// and which of the three snapshot consumers stop depends on the key (and, for
 /// structural `UpdateLayer`, its route), by the split spelled out on
 /// [`SNAPSHOT_READ_TYPE_ERROR_REMEDIATION`] — with one difference, at the
-/// fifth consumer's size read: a wrong-typed key there (`obj:hdr` or
+/// fourth consumer's size read: a wrong-typed key there (`obj:hdr` or
 /// `obj:ext`, which skips the release, or a structural index, which only
 /// widens the reservation to the full page) leaves the clean-up going on and
 /// the layer still deleted, while a refusal of any of its seven commands
@@ -2425,18 +2646,17 @@ const SNAPSHOT_READ_TYPE_ERROR_REMEDIATION: &str =
 /// own.
 const SNAPSHOT_READ_REFUSAL_REMEDIATION: &str =
     "this object's state is unreadable until the named command stops failing. One read loads \
-     it, at every layer size, for four consumers: structural UpdateLayer commits (under the lua \
+     it, at every layer size, for three consumers: structural UpdateLayer commits (under the lua \
      backend's structural cache, only on a cold start or reload, and its sampled audit, which \
      stops no commit), catch-up and the checkpoint assembler \
      (above the atomic-read limits through a fenced read, catch-up's shared by the layer's \
-     joiners) and subscribe's per-commit reconstruction (a legacy in-window replay, which above \
-     those limits reads through catch-up's shared fenced read). A fifth, the external-value \
+     joiners). A fourth, the external-value \
      clean-up of a deleted or replaced layer, first reads the header's release flag and the \
      sizes of obj:ext and the five indices (obj:secs, obj:dels, obj:chs, obj:flds, obj:tss) in \
      one size read, then reads only the header, obj:flds, obj:tss, their field and time-sample \
      rows and obj:ext for its release; its key deletion then pages all five indices. A command \
      on the header, an \
-     index or a section, tombstone, field or time-sample row stops all four. Any command of \
+     index or a section, tombstone, field or time-sample row stops all three. Any command of \
      the clean-up's size read (op names the retirement size read), on the header, obj:ext or \
      any of the five indices, also stops the clean-up before it changes anything: a \
      DeleteLayer of the layer fails, and a replaced or orphaned layer's keys stay for the \
@@ -2451,9 +2671,9 @@ const SNAPSHOT_READ_REFUSAL_REMEDIATION: &str =
      deletion's own failure line names the object and the index it stopped at. On an object \
      whose \
      header carries chs_complete=1 the read also reads obj:chs and only the children lists it \
-     names, so a command on obj:chs stops all four at every layer size (the atomic read's size \
+     names, so a command on obj:chs stops all three at every layer size (the atomic read's size \
      check reads obj:chs), and one on a children list obj:chs does not name stops none of them; \
-     on any other object a children list stops all four. The orphan sweep's retirement fence writes \
+     on any other object a children list stops all three. The orphan sweep's retirement fence writes \
      the same header key. When op is HGETALL obj:hdr (orphan discovery) the radius is \
      wider than per-layer: that read aborts the rest of the orphan-sweep pass, so orphan cleanup \
      stalls for every object the pass had not yet reached, and orphaned-mapping cleanup and the \
@@ -3049,8 +3269,7 @@ struct FieldRowDecoder {
     // b.3pe: `set_order` and `version` are written by BOTH commit paths on
     // every field write, so a missing/corrupt column means a partial or corrupt
     // field hash — do not silently zero it (a zeroed `version` mis-sorts the
-    // catch-up builders' dense re-index; a zeroed `set_order` mis-orders the
-    // legacy paths that emit it verbatim). Because the trigger is all-or-nothing
+    // catch-up builders' dense re-index). Because the trigger is all-or-nothing
     // across the object's rows, the misses are TALLIED here and reported as one
     // aggregated warn line per column at `finish` rather than per field.
     set_order_misses: ColumnMissTally,
@@ -3299,15 +3518,13 @@ pub const SNAPSHOT_SELF_TEST_OBJECT_ID: &str = "snapshot-read-self-test";
 /// Each caller of [`read_object_snapshot`] names itself; the label rides on
 /// every `live_edit_snapshot_read_*` series, and the consumer decides the read
 /// path. With [`SlimSnapshotReadConsumer`] — the structural write-planning
-/// consumers, whose reads return the compact form — it makes up the closed
-/// label set [`metrics::SNAPSHOT_READ_CONSUMERS`].
+/// consumers and the DR restore Job's report read, whose reads return the
+/// compact form — it makes up the closed label set
+/// [`metrics::SNAPSHOT_READ_CONSUMERS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotReadConsumer {
-    /// A `SubscribeReadLayer` catch-up.
+    /// A `SubscribeReadLayer` catch-up. The steady-state path never reads.
     Catchup,
-    /// A legacy (rollback-mode) in-window replay's per-commit read. An empty
-    /// commit takes none, and the steady-state path never reads.
-    CatchupLegacyPerCommit,
     /// The checkpoint assembler.
     Checkpoint,
 }
@@ -3317,9 +3534,6 @@ impl SnapshotReadConsumer {
     pub fn label(self) -> &'static str {
         match self {
             Self::Catchup => metrics::SNAPSHOT_READ_CONSUMER_CATCHUP,
-            Self::CatchupLegacyPerCommit => {
-                metrics::SNAPSHOT_READ_CONSUMER_CATCHUP_LEGACY_PER_COMMIT
-            }
             Self::Checkpoint => metrics::SNAPSHOT_READ_CONSUMER_CHECKPOINT,
         }
     }
@@ -3330,17 +3544,16 @@ impl SnapshotReadConsumer {
     /// no cut, SR-4.4.) The structural consumers' rule is
     /// [`SlimSnapshotReadConsumer::takes_atomic_path`].
     pub fn takes_atomic_path(self) -> bool {
-        matches!(
-            self,
-            Self::Catchup | Self::CatchupLegacyPerCommit | Self::Checkpoint
-        )
+        matches!(self, Self::Catchup | Self::Checkpoint)
     }
 }
 
-/// The structural write-planning consumers of a snapshot read, whose reads
-/// are **slim**: their state is the compact form ([`CompactState`]: per value
-/// row, its key and its external hash), read by [`read_object_snapshot_slim`]
-/// and the fenced read. A separate type from [`SnapshotReadConsumer`], whose
+/// The consumers of a snapshot read whose reads are **slim** — the structural
+/// write-planning consumers, and the DR restore Job's report read
+/// ([`Self::DrRestore`]): their state is the compact form ([`CompactState`]:
+/// per value row, its key and its external hash), read by
+/// [`read_object_snapshot_slim`] and the fenced read. A separate type from
+/// [`SnapshotReadConsumer`], whose
 /// reads return the full [`ObjectSnapshot`], so a compact state never reaches
 /// a reader: the read's result type follows the consumer's type.
 ///
@@ -3353,7 +3566,8 @@ impl SnapshotReadConsumer {
 /// - the fenced read's pass reads each value row whole, as for every
 ///   consumer, and keeps only its key and validated external hash as it
 ///   decodes;
-/// - [`Self::StructuralUpdate`]'s unfenced fan-out reads each value row with
+/// - the unfenced fan-out of [`Self::StructuralUpdate`] and [`Self::DrRestore`]
+///   reads each value row with
 ///   two commands that transfer no inline value, its children lists by
 ///   length and then a ranged read, and a marked object's `obj:chs` in pages
 ///   ([`FanoutReplies::Bounded`]), each window of its rounds 2 and 3 in one
@@ -3404,6 +3618,22 @@ pub enum SlimSnapshotReadConsumer {
     /// starts only. With `return_dangling` set and
     /// [`AtomicSnapshotOf::structural`].
     StructuralCacheAudit,
+    /// The disaster-recovery restore and accept-loss Jobs' read of a
+    /// surviving layer, to name the prim and attribute of each referenced
+    /// value their coverage check found in no store
+    /// (`dr::job::plan::coverage`, which both Jobs' restore phase
+    /// finalises). Never a write-planning read for the service, despite
+    /// sharing this type: the compact form is all it needs, an external hash
+    /// per row. Unfenced and never atomic, like
+    /// [`Self::StructuralUpdate`], but with no upload charge: the Job reads
+    /// while the service is held, when no commit lands, so the unfenced read
+    /// sees one state, and it reads only the layers its report names (normally
+    /// none). Its read reports no structural facts. On that held store an
+    /// index whose round-1 paging came back short of its count is a cursor
+    /// that skipped members, so the read fails `Aborted` rather than return
+    /// a state missing them (one WARN and one tick of
+    /// `live_edit_snapshot_read_index_incomplete_total`).
+    DrRestore,
 }
 
 impl SlimSnapshotReadConsumer {
@@ -3413,6 +3643,7 @@ impl SlimSnapshotReadConsumer {
             Self::StructuralUpdate => metrics::SNAPSHOT_READ_CONSUMER_STRUCTURAL_UPDATE,
             Self::StructuralCache => metrics::SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE,
             Self::StructuralCacheAudit => metrics::SNAPSHOT_READ_CONSUMER_STRUCTURAL_CACHE_AUDIT,
+            Self::DrRestore => metrics::SNAPSHOT_READ_CONSUMER_DR_RESTORE,
         }
     }
 
@@ -3437,6 +3668,16 @@ impl SlimSnapshotReadConsumer {
     /// passes `'0'` before the `slim` flag.
     fn reads_structural_facts(self) -> bool {
         matches!(self, Self::StructuralCache | Self::StructuralCacheAudit)
+    }
+
+    /// Whether this consumer's uncharged unfenced read runs only on a store
+    /// no writer changes — the DR Jobs' held store — so a round-1 index short
+    /// of its count there is a proven skip, reported
+    /// ([`report_index_shortfall`]): [`Self::DrRestore`] only. Any other
+    /// uncharged unfenced read refuses a shortfall the same way but reports
+    /// nothing, having no proof that no writer changed the object.
+    fn reads_held_store(self) -> bool {
+        matches!(self, Self::DrRestore)
     }
 }
 
@@ -3500,10 +3741,19 @@ mod sealed {
         /// Whether the atomic read sets `return_dangling` and decodes
         /// [`AtomicSnapshotOf::structural`].
         fn reads_structural_facts(self) -> bool;
+
+        /// Whether an uncharged unfenced read's round-1 shortfall is a proven
+        /// skip, its store held against every writer
+        /// ([`SlimSnapshotReadConsumer::reads_held_store`]).
+        fn reads_held_store(self) -> bool;
     }
 
     impl ConsumerRules for SnapshotReadConsumer {
         fn reads_structural_facts(self) -> bool {
+            false
+        }
+
+        fn reads_held_store(self) -> bool {
             false
         }
     }
@@ -3511,6 +3761,10 @@ mod sealed {
     impl ConsumerRules for SlimSnapshotReadConsumer {
         fn reads_structural_facts(self) -> bool {
             SlimSnapshotReadConsumer::reads_structural_facts(self)
+        }
+
+        fn reads_held_store(self) -> bool {
+            SlimSnapshotReadConsumer::reads_held_store(self)
         }
     }
 
@@ -4369,11 +4623,12 @@ pub enum SnapshotReadOf<S> {
 pub type SnapshotRead = SnapshotReadOf<ObjectSnapshot>;
 
 /// Read one object's state for `consumer`, a reader (Spec SDD SR-1.5). The
-/// structural write-planning consumers read through
-/// [`read_object_snapshot_slim`] instead, the same reads decoded into the
-/// compact form; what follows describes both, by path.
+/// structural write-planning consumers and the DR restore Job's report read
+/// ([`SlimSnapshotReadConsumer`]) read through [`read_object_snapshot_slim`]
+/// instead, the same reads decoded into the compact form; what follows
+/// describes both, by path.
 ///
-/// On the atomic path — the catch-up, legacy per-commit, checkpoint and
+/// On the atomic path — the catch-up, checkpoint and
 /// structural-cache consumers — this is one `EVALSHA` of `object_snapshot_read.lua` on the
 /// snapshot lane (`ValkeyClient::acquire_snapshot`), under the client's item and
 /// byte limits (`LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS` / `…_MAX_BYTES`).
@@ -4399,10 +4654,11 @@ pub type SnapshotRead = SnapshotReadOf<ObjectSnapshot>;
 ///
 /// The structural `UpdateLayer` WATCH path's consumer
 /// ([`SlimSnapshotReadConsumer::StructuralUpdate`]) never takes the atomic
-/// path ([`SlimSnapshotReadConsumer::takes_atomic_path`]). It
+/// path ([`SlimSnapshotReadConsumer::takes_atomic_path`]), and neither does
+/// the DR restore Job's ([`SlimSnapshotReadConsumer::DrRestore`]). Each
 /// reads through the unfenced bounded fan-out at every size (Spec SDD SR-4.3),
 /// on the
-/// same snapshot lane, so for it this never answers `TooLarge`. It returns:
+/// same snapshot lane, so for them this never answers `TooLarge`. It returns:
 ///
 /// - [`SnapshotRead::Snapshot`] with `path = Unfenced` and `cut` = the header
 ///   `seq` the read's first round saw. Unproven: the fan-out holds no fence
@@ -4411,6 +4667,17 @@ pub type SnapshotRead = SnapshotReadOf<ObjectSnapshot>;
 ///   (SR-4.3);
 /// - `ServiceError::NotFound` when the header is absent, or present without
 ///   a numeric `seq`;
+/// - `ServiceError::Aborted` when an index the read's first round paged
+///   returned other than the count its count window read — distinct members
+///   of a set against its `SCARD`, ranks of a sorted set against its `ZCARD`
+///   ([`IndexShortfall`]): the read is never returned missing members. It
+///   records `outcome="transient_error"`; the DR Jobs' read
+///   ([`SlimSnapshotReadConsumer::DrRestore`]), whose store is held against
+///   every writer, also logs one WARN and ticks
+///   `live_edit_snapshot_read_index_incomplete_total`. (The structural
+///   update's charged read, `read_object_snapshot_slim_charged`, hands such
+///   a read to its caller instead, which proves its `seq` before weighing
+///   it.);
 /// - a classified error otherwise: a failed command is attributed to its own
 ///   key family and classified by [`classify_snapshot_read_err`] on the
 ///   snapshot lane's pool label (transient → `Aborted`, permanent →
@@ -4517,14 +4784,35 @@ pub async fn read_object_snapshot_with_ceilings(
 }
 
 /// The answer of a read that carried no [`FanoutAllowance`], which never
-/// stops: a stop is refused `Internal` rather than guessed at.
-fn uncharged<T>(object_id: &str, read: Result<T, u64>) -> Result<T, ServiceError> {
-    read.map_err(|_| {
-        ServiceError::Internal(format!(
+/// stops and is never handed a round-1 shortfall (an uncharged read refuses
+/// one itself, `Aborted`): either is refused `Internal` rather than guessed
+/// at.
+fn uncharged<T, S>(object_id: &str, read: Result<T, ChargedEnd<S>>) -> Result<T, ServiceError> {
+    read.map_err(|end| match end {
+        ChargedEnd::Stopped { .. } => ServiceError::Internal(format!(
             "snapshot read of object {object_id} stopped for its upload charge, which only the \
              structural update's charged read carries"
-        ))
+        )),
+        ChargedEnd::Incomplete { shortfall, .. } => ServiceError::Internal(format!(
+            "snapshot read of object {object_id} handed on a round-1 shortfall ({shortfall}), \
+             which only the structural update's charged read is handed"
+        )),
     })
+}
+
+/// How [`read_snapshot_with_ceilings`] ends besides with a plain answer: the
+/// structural update's charged read's ends, which only a read with a
+/// [`FanoutAllowance`] answers.
+enum ChargedEnd<S> {
+    /// The read stopped before a window for its upload charge.
+    Stopped { target: u64 },
+    /// The read completed, but its round 1 came back short of a count
+    /// ([`IndexShortfall`]); whether that is a skip is the caller's `seq`
+    /// proof to decide.
+    Incomplete {
+        snapshot: Box<AtomicSnapshotOf<S>>,
+        shortfall: IndexShortfall,
+    },
 }
 
 /// The slim read of one object's state for a structural write-planning
@@ -4578,6 +4866,16 @@ pub(crate) enum ChargedSnapshotRead {
     /// grow, without waiting, to cover it. `target` is the best-known whole
     /// object-state target the attempt needs (see [`FanoutAllowance`]).
     Stopped { target: u64 },
+    /// The read completed, but its round 1 came back short of a count
+    /// ([`IndexShortfall`]), so `snapshot` may be missing members of an
+    /// index. Never planned on: the caller proves its `seq` first — a failed
+    /// proof is a lost race, as for any torn read; a held one makes this a
+    /// proven skip, aborted and retried ([`report_index_shortfall`]). The
+    /// read records `outcome="ok"`, as a torn read does.
+    Incomplete {
+        snapshot: Box<AtomicSnapshotOf<CompactState>>,
+        shortfall: IndexShortfall,
+    },
 }
 
 /// The structural `UpdateLayer` WATCH path's read of one object
@@ -4634,6 +4932,11 @@ pub(crate) enum ChargedSnapshotRead {
 /// ([`FanoutAllowance::name_bytes`]), which the attempt's later charge points
 /// keep.
 ///
+/// A completed read whose round 1 came back short of a count answers
+/// [`ChargedSnapshotRead::Incomplete`], recorded `ok` as a torn read is: only
+/// the caller's `seq` proof tells a commit race from a skipped member, so the
+/// shortfall goes to it rather than being refused here.
+///
 /// Crate-internal and for that consumer only. The fenced pass carries no
 /// allowance and reads whole rows, as before.
 pub(crate) async fn read_object_snapshot_slim_charged(
@@ -4659,7 +4962,14 @@ pub(crate) async fn read_object_snapshot_slim_charged(
             "structural snapshot read of object {object_id} answered TOO_LARGE, which the \
              unfenced fan-out never answers"
         ))),
-        Err(target) => Ok(ChargedSnapshotRead::Stopped { target }),
+        Err(ChargedEnd::Stopped { target }) => Ok(ChargedSnapshotRead::Stopped { target }),
+        Err(ChargedEnd::Incomplete {
+            snapshot,
+            shortfall,
+        }) => Ok(ChargedSnapshotRead::Incomplete {
+            snapshot,
+            shortfall,
+        }),
     }
 }
 
@@ -4668,7 +4978,18 @@ pub(crate) async fn read_object_snapshot_slim_charged(
 /// [`read_object_snapshot_slim_charged`] run: `consumer` picks the path and
 /// its type the state's form, and on the unfenced fan-out its reply shape
 /// ([`FanoutReplies`]). `allowance`, the charged read's only, rides the
-/// unfenced fan-out; `Err(target)` inside the `Ok` is its stop.
+/// unfenced fan-out; an `Err` inside the `Ok` is one of its ends
+/// ([`ChargedEnd`]): its stop, or its completed read whose round 1 came back
+/// short of a count, handed on for the caller's `seq` proof to weigh (and
+/// recorded `ok`). An uncharged unfenced read has no such proof of its own
+/// and refuses a short round 1 itself: `ServiceError::Aborted`, recorded
+/// `transient_error`. Only the DR Jobs' read
+/// ([`SlimSnapshotReadConsumer::DrRestore`], in production the only
+/// uncharged unfenced read) runs on a held store, where a shortfall is a
+/// proven skip, so only it also logs one WARN and ticks
+/// `live_edit_snapshot_read_index_incomplete_total`
+/// ([`report_index_shortfall`]); any other uncharged unfenced read is
+/// refused the same way with no WARN and no tick.
 async fn read_snapshot_with_ceilings<C: SnapshotConsumer>(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -4676,7 +4997,7 @@ async fn read_snapshot_with_ceilings<C: SnapshotConsumer>(
     consumer: C,
     ceilings: SnapshotCeilings,
     allowance: Option<&mut FanoutAllowance<'_>>,
-) -> Result<Result<SnapshotReadOf<C::State>, u64>, ServiceError> {
+) -> Result<Result<SnapshotReadOf<C::State>, ChargedEnd<C::State>>, ServiceError> {
     let started = std::time::Instant::now();
     let (path, result) = if consumer.takes_atomic_path() {
         (
@@ -4692,22 +5013,68 @@ async fn read_snapshot_with_ceilings<C: SnapshotConsumer>(
             .map(Ok),
         )
     } else {
+        let charged = allowance.is_some();
         (
             SnapshotReadPath::Unfenced,
             read_object_snapshot_unfenced::<C::State>(client, keys, object_id, allowance)
                 .await
-                .map(|outcome| match outcome {
-                    FanoutOutcome::Read(snapshot) => Ok(SnapshotReadOf::Snapshot(snapshot)),
-                    FanoutOutcome::Stopped { target } => Err(target),
+                .and_then(|outcome| match outcome {
+                    FanoutOutcome::Read(snapshot, None) => {
+                        Ok(Ok(SnapshotReadOf::Snapshot(snapshot)))
+                    }
+                    // The charged read's caller proves its `seq` before it
+                    // weighs the shortfall.
+                    FanoutOutcome::Read(snapshot, Some(shortfall)) if charged => {
+                        Ok(Err(ChargedEnd::Incomplete {
+                            snapshot,
+                            shortfall,
+                        }))
+                    }
+                    // An uncharged read has no `seq` proof to weigh it
+                    // against, so it refuses the read. Only the DR Jobs' read
+                    // runs on a held store, where no writer changes the
+                    // object: there it is a proven skip, reported; any other
+                    // uncharged read reports nothing.
+                    FanoutOutcome::Read(_, Some(shortfall)) => {
+                        if consumer.reads_held_store() {
+                            report_index_shortfall(
+                                client.metrics_snapshot().as_ref(),
+                                object_id,
+                                consumer,
+                                SnapshotReadPath::Unfenced,
+                                &shortfall,
+                                None,
+                            );
+                        }
+                        Err(ServiceError::Aborted(format!(
+                            "snapshot read of object {object_id}: {shortfall}; a paged index came \
+                             back short of its count, so the read is refused"
+                        )))
+                    }
+                    FanoutOutcome::Stopped { target } => Ok(Err(ChargedEnd::Stopped { target })),
+                    // Only the fenced pass ends on a shortfall.
+                    FanoutOutcome::Incomplete { shortfall, .. } => {
+                        Err(ServiceError::Internal(format!(
+                            "unfenced snapshot read of object {object_id} ended on a round-1 \
+                             shortfall ({shortfall}), which only the fenced pass ends on"
+                        )))
+                    }
                 }),
         )
     };
     let elapsed = started.elapsed();
     let outcome = match &result {
-        Ok(Ok(SnapshotReadOf::Snapshot(_))) => metrics::SNAPSHOT_READ_OUTCOME_OK,
+        // A whole read, or the charged read's completed read whose round 1
+        // came back short, recorded as a torn read is: its caller's proof
+        // decides what it was.
+        Ok(Ok(SnapshotReadOf::Snapshot(_)) | Err(ChargedEnd::Incomplete { .. })) => {
+            metrics::SNAPSHOT_READ_OUTCOME_OK
+        }
         // A ceiling's `TOO_LARGE`, or a charged read's stop for its upload
         // charge (the structural update's unfenced read only).
-        Ok(Ok(SnapshotReadOf::TooLarge(_)) | Err(_)) => metrics::SNAPSHOT_READ_OUTCOME_TOO_LARGE,
+        Ok(Ok(SnapshotReadOf::TooLarge(_)) | Err(ChargedEnd::Stopped { .. })) => {
+            metrics::SNAPSHOT_READ_OUTCOME_TOO_LARGE
+        }
         Err(ServiceError::NotFound(_)) => metrics::SNAPSHOT_READ_OUTCOME_NOT_FOUND,
         Err(ServiceError::Aborted(_)) => metrics::SNAPSHOT_READ_OUTCOME_TRANSIENT_ERROR,
         Err(_) => metrics::SNAPSHOT_READ_OUTCOME_PERMANENT_ERROR,
@@ -4715,7 +5082,10 @@ async fn read_snapshot_with_ceilings<C: SnapshotConsumer>(
     log_snapshot_read_timing(object_id, consumer, path, outcome, elapsed);
     if let Some(m) = client.metrics_snapshot() {
         m.observe_snapshot_read(consumer.label(), path.label(), outcome, elapsed);
-        if let Ok(Ok(SnapshotReadOf::Snapshot(snapshot))) = &result {
+        if let Ok(
+            Ok(SnapshotReadOf::Snapshot(snapshot)) | Err(ChargedEnd::Incomplete { snapshot, .. }),
+        ) = &result
+        {
             m.observe_snapshot_read_size(
                 consumer.label(),
                 snapshot.reply_bytes,
@@ -5438,10 +5808,13 @@ fn reply_entries(
 // (`read_object_snapshot_fenced_pass`) differs only in what it does with what
 // it reads: a header without a numeric `seq` is always `NotFound`, indexed
 // sections without a readable hash are recorded as a corrupt index, as on the
-// atomic path, and it reports its progress — the reply bytes tallied so far,
+// atomic path, it reports its progress — the reply bytes tallied so far,
 // after round 1 and after each later window — to the fenced read's hook, which
-// tops up its memory grant from it. The unfenced fan-out reports to no one,
-// except that the structural update's charged read
+// tops up its memory grant from it, and a round-1 shortfall (an index short of
+// its count; `IndexShortfall`) ends the pass at once, after round 1, and the
+// fenced read never serves that attempt: it is broken and retried unless the
+// release finds the object gone or fails. The unfenced fan-out reports to
+// no one, except that the structural update's charged read
 // (`read_object_snapshot_slim_charged`) grows the call's upload charge after
 // round 1's count windows, before each later window and index page is issued
 // and after each, through its `FanoutAllowance`, and stops before the next
@@ -5527,7 +5900,13 @@ fn reply_entries(
 //   would be one window whose cost grows with the layer, out of the command
 //   cap's reach. On the bounded-reply read a page is also bounded in bytes:
 //   the sum of its shares × each index's per-member bound stays within
-//   `FANOUT_WINDOW_BYTES`;
+//   `FANOUT_WINDOW_BYTES`. Round 1's members are used only when every index
+//   returned exactly the count its count window read (distinct members of a
+//   set, ranks of a sorted set): an `SSCAN` cursor continued on another
+//   serving process can skip members, which no fence and no `seq` proof sees,
+//   so a mismatch is reported as an `IndexShortfall` — the fenced pass ends
+//   on it, the structural read aborts on it once its `seq` proof holds, and
+//   every uncharged read is refused `Aborted`;
 // - rounds 2 and 3 hold at most `FANOUT_WINDOW` commands outstanding — one
 //   window's;
 // - the raw replies awaiting processing are one window's: every reply is
@@ -5595,6 +5974,16 @@ impl FanoutRead {
     /// commit landing between rounds: only under the fence, where no commit
     /// can land ([`AtomicSnapshot::corrupt_section_index_members`]).
     fn records_corrupt_index(self) -> bool {
+        matches!(self, Self::Fenced)
+    }
+
+    /// Whether a round-1 [`IndexShortfall`] ends the read right after round 1
+    /// ([`FanoutOutcome::Incomplete`]) rather than riding to its end: only
+    /// the fenced pass, whose attempt is then never served, whatever its
+    /// release answers (broken and retried, unless the release finds the
+    /// object gone or fails), so rounds 2 and 3 would hold the lease — and
+    /// pause the layer's writers — for nothing.
+    fn ends_on_shortfall(self) -> bool {
         matches!(self, Self::Fenced)
     }
 }
@@ -7607,10 +7996,12 @@ async fn value_row_read(
 }
 
 /// External-value clean-up's read of one field or time-sample row
-/// (`storage::retirement`'s reference walk; `family` is
-/// [`SnapshotKeyFamily::Field`] or [`SnapshotKeyFamily::TimeSample`], `key`
-/// the row's key): the row's external hash by the readers' strict rule, and
-/// the string bytes the read received.
+/// (`storage::retirement`'s reference walk, and accept-loss's value removal,
+/// `dr::job::execute::discard`'s D5, which deletes exactly the rows this
+/// names a removed hash for; `family` is [`SnapshotKeyFamily::Field`] or
+/// [`SnapshotKeyFamily::TimeSample`], `key` the row's key): the row's
+/// external hash by the readers' strict rule, and the string bytes the read
+/// received.
 ///
 /// The row is read by the bounded value-row read ([`value_row_read`]: `HSTRLEN`
 /// and `HMGET`, with the `HEXISTS` / `EXISTS` follow-ups), so its inline value
@@ -8295,7 +8686,8 @@ impl<S: SnapshotState> FanoutEntries<S> {
 
 /// What round 1 of the bounded fan-out read: the header and the four
 /// indices' members — and on the bounded-reply read of a marked object,
-/// `obj:chs`'s — each index whole and, for the sets, without repeats.
+/// `obj:chs`'s — each index whole unless [`Self::shortfall`] says otherwise
+/// and, for the sets, without repeats.
 struct RoundOne {
     header: HashMap<String, String>,
     section_ids: Vec<String>,
@@ -8306,6 +8698,132 @@ struct RoundOne {
     /// marked object only; `None` otherwise (the whole-row read reads a
     /// marked object's `obj:chs` in round 2).
     children_index_ids: Option<Vec<String>>,
+    /// The first paged index, in round-1 order, that did not return exactly
+    /// the count its count window read ([`round_one_shortfall`]); `None` when
+    /// every index did, or the header is absent.
+    shortfall: Option<IndexShortfall>,
+}
+
+/// A round-1 index of the bounded fan-out that did not return exactly the
+/// count its count window read: a set whose distinct members collected differ
+/// from its `SCARD`, or a sorted set whose ranks returned differ from its
+/// `ZCARD` ([`round_one_shortfall`]).
+///
+/// Under a proof that no writer changed the object — a fenced attempt's
+/// `VERIFIED` release with its header at the cut, the structural read's held
+/// `seq` proof, the DR Job's held store — a key's cardinality and rank order
+/// are properties of its data, the same on whichever process answered each
+/// step, so a mismatch there means a cursor continued on another serving
+/// process skipped members (a failover, a restart, a shard moved behind an
+/// unchanged endpoint). Never served: the fenced pass ends on it
+/// ([`FanoutOutcome::Incomplete`]), the structural read aborts on it
+/// ([`ChargedSnapshotRead::Incomplete`]) and an uncharged read is refused
+/// `Aborted`. Displays as, for example, "SCARD le:{7}:obj:secs counted 600
+/// members, and the read collected 599".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IndexShortfall {
+    /// The index's key family.
+    pub(crate) family: SnapshotKeyFamily,
+    /// The index's key.
+    pub(crate) key: String,
+    /// The count command whose answer is [`Self::counted`]: `"SCARD"` for a
+    /// set, `"ZCARD"` for a sorted set.
+    pub(crate) card: &'static str,
+    /// What the count window read.
+    pub(crate) counted: u64,
+    /// What round 1 collected: distinct members of a set, ranks of a sorted
+    /// set.
+    pub(crate) returned: u64,
+}
+
+impl std::fmt::Display for IndexShortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} counted {} members, and the read collected {}",
+            self.card, self.key, self.counted, self.returned
+        )
+    }
+}
+
+/// The count command a round-1 set index's count window issues.
+const SET_CARD: &str = "SCARD";
+
+/// The count command a round-1 sorted index's count window issues.
+const SORTED_SET_CARD: &str = "ZCARD";
+
+/// Round 1's completeness rule (SDD §10.5): every index round 1 paged
+/// returned exactly the count its count window read — a set's distinct
+/// members (`members` drops repeats as it collects) its `SCARD`, a sorted
+/// set's ranks its `ZCARD`. Checked in both directions, so a set that came
+/// back past its count is flagged too; repeats never are. Answers the first
+/// index that did not, in round-1 order — `sets` then `ranks`, as round 1
+/// builds them: sections, deleted sections, the children index, fields, time
+/// samples — and `None` when every one did, or when the header is absent
+/// (`header_present` false: the read ends `NotFound` and paged nothing).
+/// Iterates every index round 1 built, so an index later added to round 1 is
+/// checked with no change here.
+fn round_one_shortfall(
+    header_present: bool,
+    sets: &[SetPages],
+    ranks: &[RankPages],
+) -> Option<IndexShortfall> {
+    if !header_present {
+        return None;
+    }
+    let set = sets
+        .iter()
+        .map(|set| (set.family, &set.key, SET_CARD, set.count, set.members.len()));
+    let rank = ranks
+        .iter()
+        .map(|r| (r.family, &r.key, SORTED_SET_CARD, r.count, r.members.len()));
+    set.chain(rank)
+        .find(|&(_, _, _, counted, returned)| returned as u64 != counted)
+        .map(|(family, key, card, counted, returned)| IndexShortfall {
+            family,
+            key: key.clone(),
+            card,
+            counted,
+            returned: returned as u64,
+        })
+}
+
+/// Report one proven round-1 skip (an [`IndexShortfall`] under a proof that no
+/// writer changed the object): one WARN naming the object, its consumer and
+/// path, and the shortfall's key and counts — with `attempt` and
+/// `max_attempts` on the fenced path — and one tick of
+/// `live_edit_snapshot_read_index_incomplete_total`. Called at exactly three
+/// sites: the fenced read's attempt whose release answered `VERIFIED` with its
+/// pass at the cut (`storage::snapshot_fence::read`), the structural update's
+/// read once its `seq` proof held (`storage::layer`), and the DR Jobs'
+/// uncharged unfenced read on their held store
+/// ([`read_snapshot_with_ceilings`], [`SlimSnapshotReadConsumer::DrRestore`]
+/// only).
+pub(crate) fn report_index_shortfall(
+    metrics: Option<&SharedMetrics>,
+    object_id: &str,
+    consumer: impl SnapshotConsumer,
+    path: SnapshotReadPath,
+    shortfall: &IndexShortfall,
+    attempt: Option<(u32, u32)>,
+) {
+    tracing::warn!(
+        object_id,
+        consumer = consumer.label(),
+        path = path.label(),
+        key_family = shortfall.family.label(),
+        key = %shortfall.key,
+        card = shortfall.card,
+        counted = shortfall.counted,
+        returned = shortfall.returned,
+        attempt = attempt.map(|(attempt, _)| attempt),
+        max_attempts = attempt.map(|(_, max)| max),
+        "snapshot read's index came back short of its count with no writer changing the object \
+         (a cursor continued on another serving process skipped members); not using the read"
+    );
+    if let Some(m) = metrics {
+        m.inc_snapshot_read_index_incomplete();
+    }
 }
 
 /// Whether `header` marks its object's `obj:chs` complete (`chs_complete`,
@@ -8352,14 +8870,21 @@ fn cap_shares_to_bytes(shares: Vec<u64>, bounds: &[u64], max_bytes: u64) -> Vec<
 struct SetPages {
     family: SnapshotKeyFamily,
     key: String,
-    /// `SCARD`'s answer: what the scan sizes its steps from.
+    /// `SCARD`'s answer: what the scan sizes its steps from, and what its
+    /// distinct members must number for round 1 to use them
+    /// ([`round_one_shortfall`]).
     count: u64,
-    /// The cursor to continue from; `None` once the scan is complete.
+    /// The cursor to continue from; `None` once the scan has ended (its
+    /// cursor returned to `0`) — which says nothing of whether it collected
+    /// every member: a cursor continued on another serving process can skip
+    /// some, which only the count check sees.
     cursor: Option<String>,
-    /// The members collected, in the order the steps returned them.
+    /// The members collected, in the order the steps returned them, each
+    /// once.
     members: Vec<String>,
     /// The members already collected: `SSCAN` may return one more than once
-    /// (when the set is rehashed between steps). Dropped with round 1.
+    /// (when the set is rehashed between steps), and a repeat is dropped, so
+    /// it never counts towards [`Self::count`] twice. Dropped with round 1.
     seen: std::collections::HashSet<String>,
 }
 
@@ -8367,7 +8892,9 @@ struct SetPages {
 struct RankPages {
     family: SnapshotKeyFamily,
     key: String,
-    /// `ZCARD`'s answer: the ranks to read are `0..count`.
+    /// `ZCARD`'s answer: the ranks to read are `0..count`, and what the
+    /// members returned must number for round 1 to use them
+    /// ([`round_one_shortfall`]).
     count: u64,
     /// The next rank to read.
     next: u64,
@@ -8416,7 +8943,15 @@ fn share_index_window(budget: u64, demands: &[u64]) -> Vec<u64> {
 ///   for a set, asked for half its share because `COUNT` is approximate (a
 ///   step can return more than it). A set repeats no member in what this
 ///   returns: a step's repeats of earlier members are dropped. A set's scan
-///   ends when its cursor returns to `0`.
+///   ends when its cursor returns to `0`; a sorted index's paging ends at its
+///   count, or at a short page (it does not ask past the index's end).
+/// - After the last page, each index is checked against its count, once
+///   ([`round_one_shortfall`]): a set's distinct members must equal its
+///   `SCARD`, a sorted index's ranks returned its `ZCARD`. The first that
+///   does not is [`RoundOne::shortfall`]. A cursor's return to `0` does not
+///   prove the scan complete: one continued on another serving process (a
+///   failover, a restart, a shard moved behind an unchanged endpoint) can
+///   skip members.
 ///
 /// On the bounded-reply read ([`FanoutReplies::Bounded`]) a marked object's
 /// `obj:chs` is counted (`SCARD`) in a window of its own after the first —
@@ -8441,10 +8976,14 @@ fn share_index_window(budget: u64, demands: &[u64]) -> Vec<u64> {
 /// set, dropped here. The fields index members' names are taken into the
 /// read's name tally as each page completes.
 ///
-/// Read under a fence, nothing changes between windows. Read unfenced, a
-/// commit landing between windows can tear the index read (a member missed
-/// or read twice); the structural consumer's header proof (SR-4.3) rejects
-/// such a read whole.
+/// Read under a fence, no commit lands between windows, but that holds of the
+/// data, not of the cursor: the store need not answer every step from the
+/// same process, so the count check above is what proves the index read
+/// whole, and the fenced pass ends on a shortfall. Read unfenced, a commit
+/// landing between windows can also tear the index read (a member missed or
+/// read twice); the structural consumer's header proof (SR-4.3) rejects such
+/// a read whole before its shortfall is looked at, so only a shortfall under
+/// a held proof counts as a skip.
 ///
 /// On a charged read the allowance grows the call's charge after the count
 /// windows, before any member is read (WA1), and before and after every
@@ -8685,9 +9224,13 @@ async fn fanout_round_one(
                         let asked = stop - start + 1;
                         let short = (members.len() as u64) < asked;
                         r.members.extend(members);
-                        // A short page: the index shrank under an unfenced
-                        // read (a torn read the caller's proof rejects). Stop
-                        // at what is there rather than ask past its end.
+                        // A short page: the index did not hold the ranks its
+                        // `ZCARD` counted — it shrank under an unfenced read,
+                        // or a page came back short. Stop at what is there
+                        // rather than ask past its end; the index then
+                        // returned fewer than its count, which the count
+                        // check after the loop reports as a shortfall, not
+                        // the end of the index.
                         r.next = if short { r.count } else { stop + 1 };
                     }
                     _ => return Err(fanout_shape_err(object_id, &command)),
@@ -8708,6 +9251,9 @@ async fn fanout_round_one(
         }
     }
 
+    // Every paged index against its count, once, before the members are
+    // taken (the absent header's read paged nothing and ends `NotFound`).
+    let shortfall = round_one_shortfall(!header.is_empty(), &sets, &ranks);
     let mut set_members = sets
         .into_iter()
         .map(|set| (set.family, set.members))
@@ -8729,6 +9275,7 @@ async fn fanout_round_one(
         field_members: fields,
         time_sample_members: time_samples,
         children_index_ids,
+        shortfall,
     }))
 }
 
@@ -8746,6 +9293,10 @@ fn collected_members(sets: &[SetPages], ranks: &[RankPages]) -> u64 {
 /// Returns the object's state with `path = Unfenced` and `cut` = the header
 /// `seq` its first round read — unproven: a commit can land between its
 /// rounds, and a caller that needs the state at one `seq` proves it itself.
+/// A round 1 that came back short of a count rides on
+/// [`FanoutOutcome::Read`] beside the state, never alone: the caller
+/// ([`read_snapshot_with_ceilings`]) refuses it or, on the charged read, hands
+/// it to the structural update, which weighs it after its `seq` proof.
 /// [`AtomicSnapshot::structural`] carries the header's `chs_complete` column
 /// and, on a marked object, the parents of the stored lists the read left
 /// out. `NotFound` when the header is absent or holds no numeric `seq`. A
@@ -8848,11 +9399,34 @@ fn answer_allowance(
 
 /// How [`fanout_snapshot_read`] ended without an error.
 enum FanoutOutcome<S: SnapshotState> {
-    /// The whole object.
-    Read(Box<AtomicSnapshotOf<S>>),
+    /// The whole object — whole unless the unfenced read's round 1 came back
+    /// short of a count, which rides here to the read's end (the fenced pass
+    /// ends at once instead, [`Self::Incomplete`]); the caller decides what a
+    /// shortfall means once it knows whether a writer changed the object.
+    Read(Box<AtomicSnapshotOf<S>>, Option<IndexShortfall>),
     /// The charged read stopped before a window ([`FanoutAllowance`]); only
     /// a read with an allowance answers it.
     Stopped { target: u64 },
+    /// The fenced pass's round 1 came back short of a count
+    /// ([`FanoutRead::ends_on_shortfall`]): the pass ended right after round
+    /// 1 and its header checks. `seq` is the header `seq` the pass read.
+    Incomplete { seq: u64, shortfall: IndexShortfall },
+}
+
+/// How one fenced pass ([`read_object_snapshot_fenced_pass`]) ended without
+/// an error.
+pub(crate) enum FencedPass<S> {
+    /// The pass read the object; whether it read the cut is the caller's
+    /// proof.
+    Read(Box<AtomicSnapshotOf<S>>),
+    /// The pass's round 1 came back short of a count, and the pass ended
+    /// there: the attempt is never served, whatever its release answers — it
+    /// is broken and retried unless the release finds the object gone
+    /// (`NotFound`) or fails (that error). `seq` is
+    /// the header `seq` the pass read, so the caller can tell a proven skip
+    /// (a `VERIFIED` release, `seq` at the cut) from a pass a writer or a lost
+    /// lease also broke.
+    Incomplete { seq: u64, shortfall: IndexShortfall },
 }
 
 /// One pass of the fenced read's fan-out (Spec SDD SR-5.3), for
@@ -8869,6 +9443,10 @@ enum FanoutOutcome<S: SnapshotState> {
 /// A failed command fails the pass, classified as on the unfenced fan-out;
 /// the test-only seam counts its commands as
 /// [`ObjectSnapshotReader::FencedFanout`] (in test-fault-injection builds).
+/// A round 1 that came back short of a count ([`IndexShortfall`]) ends the
+/// pass after round 1's progress report and its header checks, issuing
+/// nothing more: [`FencedPass::Incomplete`], with the header `seq` the pass
+/// read.
 ///
 /// Runs on the `fanout-read` thread: the caller spawns it there through
 /// [`FanoutThreads::run_pass`](crate::storage::fanout_thread::FanoutThreads::run_pass)
@@ -8884,7 +9462,7 @@ pub(crate) async fn read_object_snapshot_fenced_pass<S: SnapshotState>(
     keys: KeySchema,
     object_id: String,
     link: PassLink,
-) -> Result<AtomicSnapshotOf<S>, ServiceError> {
+) -> Result<FencedPass<S>, ServiceError> {
     match fanout_snapshot_read::<S>(
         &client,
         &keys,
@@ -8896,8 +9474,18 @@ pub(crate) async fn read_object_snapshot_fenced_pass<S: SnapshotState>(
     )
     .await?
     {
-        FanoutOutcome::Read(snapshot) => Ok(*snapshot),
-        FanoutOutcome::Stopped { .. } => uncharged(&object_id, Err(0)),
+        // The fenced pass ends on a shortfall, so its whole reads carry none.
+        FanoutOutcome::Read(snapshot, None) => Ok(FencedPass::Read(snapshot)),
+        FanoutOutcome::Read(_, Some(shortfall)) => Err(ServiceError::Internal(format!(
+            "fenced snapshot pass of object {object_id} read past a round-1 shortfall \
+             ({shortfall}), which ends the fenced pass"
+        ))),
+        FanoutOutcome::Incomplete { seq, shortfall } => {
+            Ok(FencedPass::Incomplete { seq, shortfall })
+        }
+        FanoutOutcome::Stopped { .. } => {
+            uncharged(&object_id, Err(ChargedEnd::<S>::Stopped { target: 0 }))
+        }
     }
 }
 
@@ -8910,7 +9498,10 @@ pub(crate) async fn read_object_snapshot_fenced_pass<S: SnapshotState>(
 /// read's only, reaches the caller's [`FanoutAllowance`], which grows the
 /// call's upload charge as the read goes and can stop it before a window;
 /// after a whole read the caller's allowance holds the name bytes the read
-/// retained.
+/// retained. A round-1 [`IndexShortfall`] ends the fenced pass right after
+/// round 1's progress report and its header checks
+/// ([`FanoutOutcome::Incomplete`]); the unfenced read finishes and carries it
+/// on [`FanoutOutcome::Read`].
 async fn fanout_snapshot_read<'a, S: SnapshotState>(
     client: &'a ValkeyClient,
     keys: &'a KeySchema,
@@ -8950,6 +9541,7 @@ async fn fanout_snapshot_read<'a, S: SnapshotState>(
         field_members,
         time_sample_members,
         children_index_ids,
+        shortfall,
     }) = fanout_round_one(&mut windows, keys, object_id).await?
     else {
         return Ok(stopped(&windows));
@@ -8982,6 +9574,20 @@ async fn fanout_snapshot_read<'a, S: SnapshotState>(
             "object {object_id} header partial (missing or non-numeric seq); treating as \
              not-found"
         )));
+    };
+    // A round-1 shortfall: the fenced pass ends here, its attempt never
+    // served whatever the release answers (broken and retried, unless the
+    // release finds the object gone or fails), rather than hold the lease
+    // through rounds 2 and 3. The unfenced read carries it to its end, for a
+    // caller that knows whether a writer changed the object.
+    let shortfall = match shortfall {
+        Some(shortfall) if read.ends_on_shortfall() => {
+            return Ok(FanoutOutcome::Incomplete {
+                seq: cut,
+                shortfall,
+            });
+        }
+        shortfall => shortfall,
     };
     let marked = chs_marked(&header);
     let bounded = windows.replies == FanoutReplies::Bounded;
@@ -9192,33 +9798,38 @@ async fn fanout_snapshot_read<'a, S: SnapshotState>(
         entries.value_rows,
         object_id,
     );
-    Ok(FanoutOutcome::Read(Box::new(AtomicSnapshotOf {
-        state,
-        cut,
-        last_server_ts: parse_u64_warn(&header, "last_server_ts", object_id),
-        last_client_ts: parse_u64_warn(&header, "last_client_ts", object_id),
-        reply_bytes: windows.tally.bytes,
-        item_count: windows.tally.items,
-        entry_count: windows.tally.entries,
-        path: read.path(),
-        corrupt_section_index_members: entries.corrupt_section_index_members.unwrap_or_default(),
-        structural: Some(StructuralSnapshotFacts {
-            commit_chain: header
-                .get(crate::storage::layer::HEADER_FIELD_COMMIT_CHAIN)
-                .cloned()
+    Ok(FanoutOutcome::Read(
+        Box::new(AtomicSnapshotOf {
+            state,
+            cut,
+            last_server_ts: parse_u64_warn(&header, "last_server_ts", object_id),
+            last_client_ts: parse_u64_warn(&header, "last_client_ts", object_id),
+            reply_bytes: windows.tally.bytes,
+            item_count: windows.tally.items,
+            entry_count: windows.tally.entries,
+            path: read.path(),
+            corrupt_section_index_members: entries
+                .corrupt_section_index_members
                 .unwrap_or_default(),
-            superseded: header
-                .get(crate::storage::layer::HEADER_FIELD_SUPERSEDED)
-                .cloned(),
-            chs_complete: header
-                .get(crate::storage::layer::HEADER_FIELD_CHS_COMPLETE)
-                .cloned(),
-            dangling_parents,
+            structural: Some(StructuralSnapshotFacts {
+                commit_chain: header
+                    .get(crate::storage::layer::HEADER_FIELD_COMMIT_CHAIN)
+                    .cloned()
+                    .unwrap_or_default(),
+                superseded: header
+                    .get(crate::storage::layer::HEADER_FIELD_SUPERSEDED)
+                    .cloned(),
+                chs_complete: header
+                    .get(crate::storage::layer::HEADER_FIELD_CHS_COMPLETE)
+                    .cloned(),
+                dangling_parents,
+            }),
+            memory: SnapshotMemory::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            value_row_bytes_received: entries.value_row_bytes_received,
         }),
-        memory: SnapshotMemory::default(),
-        #[cfg(any(test, feature = "test-support"))]
-        value_row_bytes_received: entries.value_row_bytes_received,
-    })))
+        shortfall,
+    ))
 }
 
 /// The charged read's stop, as [`fanout_snapshot_read`] answers it. Reached
@@ -9367,7 +9978,6 @@ pub async fn run_snapshot_read_self_test(
 
 /// Build an OMPF-wrapped FlatBuffers Delta from a DiffPlan.
 ///
-/// - `UpToDate` → empty Vec (total_size=0, no chunks per SDD §10.1 Case 3).
 /// - `FullContent` → isDiff=true, baseVersion=0, sourceFormat from header.
 /// - `Incremental` → isDiff=true, baseVersion=have_version.
 ///
@@ -9388,12 +9998,12 @@ pub fn build_diff_payload(
     // into a deserialize-as-empty-success on the subscriber side. The
     // subscriber-facing read path now sees `INTERNAL` and can retry against
     // a healthy replica or escalate, as the contract for diff payloads
-    // requires every referenced external blob to be present. Defense in
-    // depth: upstream, `resolve_external_values` answers `Built::Missing`
-    // for a probe that found a hash absent and `read_batch` returns
-    // `MetaNotFound` / `DataNotFound`, so this branch is unreachable for the
-    // production `ValkeyExternalValueStore` — the check is what makes that
-    // unreachability load-bearing instead of a comment-only invariant.
+    // requires every referenced external blob to be present. Every caller
+    // hands it values it already holds (the empty-commit payload holds none);
+    // the catch-up builds do not call it — they lay their payload out from
+    // probed lengths and fill it (`storage::ompf_payload`), where a missing
+    // value answers `Built::Missing` or is restored. The check is what makes
+    // a caller's missing value an error instead of an empty part.
     let mut ext_parts: Vec<Vec<u8>> = Vec::with_capacity(scan.ordered_hashes.len());
     for h in &scan.ordered_hashes {
         match ext_data.get(h) {
@@ -9416,64 +10026,61 @@ pub fn build_diff_payload(
     }
     let ext_refs: Vec<&[u8]> = ext_parts.iter().map(|v| v.as_slice()).collect();
 
-    let bytes = match plan {
-        DiffPlan::UpToDate => Vec::new(),
+    let delta_bytes = build_plan_delta(plan, source_format, have_version, scan)?;
+    // serialize() only fails on num_parts > u32::MAX — unreachable in
+    // practice: ext_refs holds one part per distinct external value of the
+    // layer (scan.ordered_hashes), which no per-delta limit bounds, and four
+    // billion distinct values would be far beyond any layer's memory.
+    Ok(OmpfContainer::serialize(&delta_bytes, &ext_refs).expect(
+        "OMPF part count fits in u32 — a layer's distinct external values stay far below it",
+    ))
+}
 
+/// The OODF delta of `plan`, as [`build_diff_payload`] wraps it: a
+/// `FullContent` plan with `isDiff=true`, `baseVersion=0` and `source_format`;
+/// an `Incremental` one with `baseVersion=have_version`; external values
+/// referenced by their 1-based part indices in `scan`. A catch-up lays its
+/// payload out around it (`storage::ompf_payload`).
+pub(crate) fn build_plan_delta(
+    plan: &DiffPlan,
+    source_format: &str,
+    have_version: u64,
+    scan: &ExternalValueScan,
+) -> Result<Vec<u8>, ServiceError> {
+    match plan {
         DiffPlan::FullContent {
             sections,
             fields,
             time_samples,
-        } => {
-            let delta_bytes = build_delta(&DeltaBuildParams {
-                is_diff: true,
-                base_version: 0,
-                source_format: Some(source_format),
-                new_sections: sections,
-                modified_sections: &[],
-                deleted_sections: &[],
-                fields,
-                time_samples,
-                hash_to_index: &scan.hash_to_index,
-            })?;
-            // serialize() only fails on num_parts > u32::MAX — unreachable in
-            // practice: ext_refs holds one part per distinct external value of
-            // the layer (scan.ordered_hashes), which no per-delta limit bounds,
-            // and four billion distinct values would be far beyond any layer's
-            // memory.
-            OmpfContainer::serialize(&delta_bytes, &ext_refs).expect(
-                "OMPF part count fits in u32 — a layer's distinct external values stay far below it",
-            )
-        }
-
+        } => build_delta(&DeltaBuildParams {
+            is_diff: true,
+            base_version: 0,
+            source_format: Some(source_format),
+            new_sections: sections,
+            modified_sections: &[],
+            deleted_sections: &[],
+            fields,
+            time_samples,
+            hash_to_index: &scan.hash_to_index,
+        }),
         DiffPlan::Incremental {
             new_sections,
             modified_sections,
             deleted_sections,
             changed_fields,
             changed_time_samples,
-        } => {
-            let delta_bytes = build_delta(&DeltaBuildParams {
-                is_diff: true,
-                base_version: have_version,
-                source_format: None,
-                new_sections,
-                modified_sections,
-                deleted_sections,
-                fields: changed_fields,
-                time_samples: changed_time_samples,
-                hash_to_index: &scan.hash_to_index,
-            })?;
-            // serialize() only fails on num_parts > u32::MAX — unreachable in
-            // practice: ext_refs holds one part per distinct external value of
-            // the layer (scan.ordered_hashes), which no per-delta limit bounds,
-            // and four billion distinct values would be far beyond any layer's
-            // memory.
-            OmpfContainer::serialize(&delta_bytes, &ext_refs).expect(
-                "OMPF part count fits in u32 — a layer's distinct external values stay far below it",
-            )
-        }
-    };
-    Ok(bytes)
+        } => build_delta(&DeltaBuildParams {
+            is_diff: true,
+            base_version: have_version,
+            source_format: None,
+            new_sections,
+            modified_sections,
+            deleted_sections,
+            fields: changed_fields,
+            time_samples: changed_time_samples,
+            hash_to_index: &scan.hash_to_index,
+        }),
+    }
 }
 
 /// Parameters for building a FlatBuffers Delta.
@@ -11908,6 +12515,10 @@ mod tests {
             whole_sorted(keys.obj_time_samples_index("7")).await,
             "time samples: every member, in rank order"
         );
+        assert_eq!(
+            round.shortfall, None,
+            "a quiet store's paged indices each return exactly their count: no false shortfall"
+        );
         // The counts window (5 commands), then at least two windows of pages:
         // 52,008 members do not fit one 26,855-member window.
         assert!(
@@ -11947,9 +12558,189 @@ mod tests {
             "no member is read without a header"
         );
         assert_eq!(
+            round.shortfall, None,
+            "a read without a header paged nothing, so nothing is short of its count"
+        );
+        assert_eq!(
             windows.commands_seen, 5,
             "only the counts window: the header and the four counts"
         );
+    }
+
+    // ── Round 1's completeness rule (b.o2i; SDD §10.5) ───────────────────────
+    //
+    // `round_one_shortfall` is pure: given the pages round 1 built, it names
+    // the first index that did not return exactly its count. The fan-out
+    // paths that act on it are pinned through a reply-rewriting proxy in
+    // `tests/integration/storage/snapshot_read_{fenced,unfenced}_test.rs`.
+
+    const SECS_KEY: &str = "p{7}:obj:secs";
+    const DELS_KEY: &str = "p{7}:obj:dels";
+    const CHS_KEY: &str = "p{7}:obj:chs";
+    const FLDS_KEY: &str = "p{7}:obj:flds";
+    const TSS_KEY: &str = "p{7}:obj:tss";
+
+    /// A set index whose `SCARD` read `count` and whose scan collected
+    /// `collected` distinct members, its cursor back at `0`.
+    fn set_pages(family: SnapshotKeyFamily, key: &str, count: u64, collected: u64) -> SetPages {
+        let members: Vec<String> = (1..=collected).map(|i| i.to_string()).collect();
+        SetPages {
+            family,
+            key: key.to_owned(),
+            count,
+            cursor: None,
+            seen: members.iter().cloned().collect(),
+            members,
+        }
+    }
+
+    /// A sorted index whose `ZCARD` read `count` and whose rank pages
+    /// returned `returned` members.
+    fn rank_pages(family: SnapshotKeyFamily, key: &str, count: u64, returned: u64) -> RankPages {
+        RankPages {
+            family,
+            key: key.to_owned(),
+            count,
+            next: count,
+            members: (0..returned).map(|i| format!("3:{i:02x}")).collect(),
+        }
+    }
+
+    /// Round 1 of a marked object on a quiet store, each index at its count:
+    /// `obj:secs` (600), `obj:dels` (3), `obj:chs` (4) in set order, then
+    /// `obj:flds` (100) and `obj:tss` (5).
+    fn quiet_round_one() -> (Vec<SetPages>, Vec<RankPages>) {
+        (
+            vec![
+                set_pages(SnapshotKeyFamily::SectionsIndex, SECS_KEY, 600, 600),
+                set_pages(SnapshotKeyFamily::DeletedSectionsIndex, DELS_KEY, 3, 3),
+                set_pages(SnapshotKeyFamily::ChildrenIndex, CHS_KEY, 4, 4),
+            ],
+            vec![
+                rank_pages(SnapshotKeyFamily::FieldsIndex, FLDS_KEY, 100, 100),
+                rank_pages(SnapshotKeyFamily::TimeSamplesIndex, TSS_KEY, 5, 5),
+            ],
+        )
+    }
+
+    /// Every index at its count — and empty indices, counted 0 and returning
+    /// none — is no shortfall.
+    #[test]
+    fn round_one_shortfall_of_indices_each_at_their_count_is_none() {
+        let (sets, ranks) = quiet_round_one();
+        assert_eq!(round_one_shortfall(true, &sets, &ranks), None);
+        let empty_sets = [set_pages(SnapshotKeyFamily::SectionsIndex, SECS_KEY, 0, 0)];
+        let empty_ranks = [rank_pages(SnapshotKeyFamily::FieldsIndex, FLDS_KEY, 0, 0)];
+        assert_eq!(
+            round_one_shortfall(true, &empty_sets, &empty_ranks),
+            None,
+            "an empty index returned its count of none"
+        );
+    }
+
+    /// A set whose scan collected one distinct member fewer than its `SCARD`
+    /// is the shortfall, naming its family, key, count command, the count and
+    /// what was collected; it displays as the WARN and the refusal name it.
+    #[test]
+    fn round_one_shortfall_names_a_set_one_member_short_of_its_scard() {
+        let (mut sets, ranks) = quiet_round_one();
+        sets[0] = set_pages(SnapshotKeyFamily::SectionsIndex, SECS_KEY, 600, 599);
+
+        let shortfall = round_one_shortfall(true, &sets, &ranks);
+
+        assert_eq!(
+            shortfall,
+            Some(IndexShortfall {
+                family: SnapshotKeyFamily::SectionsIndex,
+                key: SECS_KEY.to_owned(),
+                card: "SCARD",
+                counted: 600,
+                returned: 599,
+            })
+        );
+        assert_eq!(
+            shortfall.map(|s| s.to_string()).as_deref(),
+            Some("SCARD p{7}:obj:secs counted 600 members, and the read collected 599")
+        );
+    }
+
+    /// A set whose scan collected more distinct members than its `SCARD` is
+    /// a shortfall too: the rule checks both directions.
+    #[test]
+    fn round_one_shortfall_flags_a_set_past_its_scard() {
+        let (mut sets, ranks) = quiet_round_one();
+        sets[1] = set_pages(SnapshotKeyFamily::DeletedSectionsIndex, DELS_KEY, 3, 4);
+
+        assert_eq!(
+            round_one_shortfall(true, &sets, &ranks),
+            Some(IndexShortfall {
+                family: SnapshotKeyFamily::DeletedSectionsIndex,
+                key: DELS_KEY.to_owned(),
+                card: "SCARD",
+                counted: 3,
+                returned: 4,
+            })
+        );
+    }
+
+    /// A sorted index whose rank pages returned fewer members than its
+    /// `ZCARD` is a shortfall under `ZCARD`.
+    #[test]
+    fn round_one_shortfall_names_a_sorted_index_short_of_its_zcard() {
+        let (sets, mut ranks) = quiet_round_one();
+        ranks[1] = rank_pages(SnapshotKeyFamily::TimeSamplesIndex, TSS_KEY, 5, 2);
+
+        assert_eq!(
+            round_one_shortfall(true, &sets, &ranks),
+            Some(IndexShortfall {
+                family: SnapshotKeyFamily::TimeSamplesIndex,
+                key: TSS_KEY.to_owned(),
+                card: "ZCARD",
+                counted: 5,
+                returned: 2,
+            })
+        );
+    }
+
+    /// With several indices off their counts, the first in round-1 order is
+    /// reported: the sets in the order round 1 builds them, then the sorted
+    /// indices.
+    #[test]
+    fn round_one_shortfall_reports_the_first_mismatch_in_round_one_order() {
+        let first_of = |sets: &[SetPages], ranks: &[RankPages]| {
+            round_one_shortfall(true, sets, ranks).map(|s| s.family)
+        };
+        let (mut sets, mut ranks) = quiet_round_one();
+        sets[2] = set_pages(SnapshotKeyFamily::ChildrenIndex, CHS_KEY, 4, 3);
+        ranks[0] = rank_pages(SnapshotKeyFamily::FieldsIndex, FLDS_KEY, 100, 99);
+        ranks[1] = rank_pages(SnapshotKeyFamily::TimeSamplesIndex, TSS_KEY, 5, 4);
+        assert_eq!(
+            first_of(&sets, &ranks),
+            Some(SnapshotKeyFamily::ChildrenIndex),
+            "a set before any sorted index"
+        );
+        sets[1] = set_pages(SnapshotKeyFamily::DeletedSectionsIndex, DELS_KEY, 3, 2);
+        assert_eq!(
+            first_of(&sets, &ranks),
+            Some(SnapshotKeyFamily::DeletedSectionsIndex),
+            "the deleted sections before the children index"
+        );
+        let (sets, _) = quiet_round_one();
+        assert_eq!(
+            first_of(&sets, &ranks),
+            Some(SnapshotKeyFamily::FieldsIndex),
+            "the fields before the time samples"
+        );
+    }
+
+    /// An absent header ends the read `NotFound` and pages nothing, so its
+    /// counts against its (empty) members are never a shortfall.
+    #[test]
+    fn round_one_shortfall_without_a_header_is_none() {
+        let (mut sets, ranks) = quiet_round_one();
+        sets[0] = set_pages(SnapshotKeyFamily::SectionsIndex, SECS_KEY, 600, 0);
+
+        assert_eq!(round_one_shortfall(false, &sets, &ranks), None);
     }
 
     // ── b.26e Stage 2: WA1's byte window is the read's projected bound ───────

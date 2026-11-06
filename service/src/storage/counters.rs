@@ -29,9 +29,12 @@ use fred::types::SetOptions;
 
 use crate::error::ServiceError;
 use crate::observability::metrics::{SharedMetrics, STORE_WRITE_REFUSED_STAGE_CREATE_COMMIT};
+use tokio_util::sync::CancellationToken;
+
 use crate::storage::client::{
-    map_fred_err_for_grpc, refuse_store_write, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
-    POOL_LABEL_TXN,
+    evalsha_with_fenced_reload, hold_fence_closed, map_fred_err_for_grpc,
+    refuse_store_write_hinted, FencedEvalError, FredErrOrigin, ValkeyClient, HOLD_FENCE_UNSENT,
+    POOL_LABEL_DATA, POOL_LABEL_TXN,
 };
 use crate::storage::keys::KeySchema;
 
@@ -45,8 +48,9 @@ use crate::storage::keys::KeySchema;
 /// `.lua`) per Epic `t1.fgj.mh` notes — this is a one-off startup primitive
 /// and the project convention for sidecar `.lua` files is reserved for
 /// hot-path scripts. `Script::from_lua` is infallible (just hashes the
-/// source); the first `evalsha_with_reload` call sends `SCRIPT LOAD` to
-/// the server on `NOSCRIPT` before retrying.
+/// source); the first `evalsha_with_reload` call (or, under a hold write
+/// fence, `evalsha_with_fenced_reload`) sends `SCRIPT LOAD` to the server on
+/// `NOSCRIPT` before retrying.
 ///
 /// The script body's conditional-set fragment is byte-for-byte from
 /// SR-5.3; the trailing `return redis.call('GET', KEYS[1])` is the
@@ -99,9 +103,12 @@ static ALLOC_OBJECT_ID_SCRIPT: LazyLock<Script> =
 ///
 /// # Errors
 ///
-/// Implementations return [`ServiceError::Unavailable`] when the repair could
-/// not be completed — the counter is a repairable dependency state, so the
-/// caller's `CreateLayer` should be retriable rather than fatal.
+/// Implementations return an `UNAVAILABLE` when the repair could not be
+/// completed — the counter is a repairable dependency state, so the caller's
+/// `CreateLayer` should be retriable rather than fatal: a store write refusal
+/// of a repair write as [`ServiceError::UnavailableWithDetail`] carrying
+/// `STORE_WRITE_REFUSED` (its `condition` and retry hint), every other
+/// failure as a plain [`ServiceError::Unavailable`].
 #[async_trait]
 pub trait ObjectIdCounterRepair: Send + Sync {
     /// Re-establish `le:counter:object_id` at a value above every object id
@@ -140,10 +147,13 @@ const TXN_COUNTER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_m
 /// [`map_fred_err_for_grpc`] produces for `is_transient_fred_error` kinds
 /// (IO / Timeout / Canceled / Cluster / Backpressure / router misses). A
 /// corrupt-counter `Internal` is not retriable and must surface immediately.
-/// A store write refusal also answers a plain [`ServiceError::Unavailable`],
-/// but must not be retried in-process (`storage::client::store_write_refusal`),
-/// so the two writing primitives return it as a settled `Ok(Err(_))` that this
-/// loop passes straight through.
+/// A store write refusal answers [`ServiceError::UnavailableWithDetail`]
+/// carrying `STORE_WRITE_REFUSED` (`CounterStore::refused_write`),
+/// which this loop would not retry anyway, since it matches only
+/// [`ServiceError::Unavailable`]; it must not be retried in-process
+/// (`storage::client::store_write_refusal`), and the two writing primitives
+/// also return it as a settled `Ok(Err(_))` that this loop passes straight
+/// through.
 async fn retry_transient<F, Fut, T>(op: &'static str, mut attempt: F) -> Result<T, ServiceError>
 where
     F: FnMut() -> Fut,
@@ -210,12 +220,15 @@ impl CounterStore {
     /// `None` for any other error, which the caller maps as before. Each of
     /// those writes is one command or one script whose only write is its
     /// first, and Valkey refuses before that write runs, so a refused write
-    /// applied nothing; the answer is still the stage's plain `UNAVAILABLE`,
-    /// with no retry hint (`storage::client::store_write_refusal`). An `-OOM`
+    /// applied nothing. Each runs before `CreateLayer`'s commit marker (or at
+    /// startup), so the answer is the hinted refusal: `UNAVAILABLE` carrying
+    /// `STORE_WRITE_REFUSED` with its `condition` and retry hint
+    /// (`storage::client::refuse_store_write_hinted`), which the `CreateLayer`
+    /// handler's pre-commit choke point passes through unchanged. An `-OOM`
     /// is noted on the client's store out-of-memory signal whether or not a
     /// metrics handle is wired (`storage::store_oom`).
     fn refused_write(&self, e: &fred::error::Error) -> Option<ServiceError> {
-        refuse_store_write(
+        refuse_store_write_hinted(
             FredErrOrigin::metrics(
                 self.metrics.as_ref(),
                 POOL_LABEL_DATA,
@@ -254,10 +267,13 @@ impl CounterStore {
     /// permanent → `Internal`) to match the workspace-wide mapper-routing
     /// contract (b.u96), after one carve-out: a store write refusal (`-OOM`,
     /// `-MISCONF`, `-READONLY`, `-NOREPLICAS`) refused the script's `INCR`,
-    /// so no id was allocated — plain `Unavailable` with no retry hint (no
-    /// `CreateLayer` commit-stage refusal carries one), counted at
-    /// `stage="create_commit"`
-    /// (`storage::client::store_write_refusal`).
+    /// so no id was allocated — `Unavailable` carrying `STORE_WRITE_REFUSED`
+    /// with its `condition` and retry hint (`Self::refused_write`), counted at
+    /// `stage="create_commit"` (`storage::client::store_write_refusal`). The
+    /// allocation comes before `CreateLayer`'s commit marker, so the handler's
+    /// pre-commit choke point passes that detail through; any other failure
+    /// here is a plain `Unavailable` it answers carrying `UPSTREAM_UNAVAILABLE`
+    /// (`storage::client::StoreWriteRefusal::into_unhinted_service_error`).
     /// Dispatches on the data pool (`pool.next()`), matching
     /// the pre-b.b2j `INCR` and the `update_layer` fast path — this is a
     /// request-path allocation, not a maintenance write.
@@ -314,14 +330,31 @@ impl CounterStore {
     /// Dispatches through `txn_pool` — startup / repair scope, not the hot
     /// path, matching [`Self::seed_object_id_if_below`].
     ///
-    /// A store write refusal of the `SET NX` answers the plain
-    /// `create_commit` `Unavailable` (`Self::refused_write`), is
+    /// A store write refusal of the `SET NX` answers the hinted
+    /// `STORE_WRITE_REFUSED` `Unavailable` (`Self::refused_write`), is
     /// counted at `stage="create_commit"` when wired, and is not retried: a
     /// refused `SET` ran no part of itself.
     pub async fn initialize_object_id_counter_if_absent(&self) -> Result<bool, ServiceError> {
+        self.initialize_object_id_counter_if_absent_unless_held(None)
+            .await
+    }
+
+    /// [`Self::initialize_object_id_counter_if_absent`] under the object-id
+    /// counter repair's hold write fence (SDD SR-6.2; `None` is the plain
+    /// call, unchanged). The fence is checked before every attempt of the
+    /// transient retry, after its checkout and immediately before its
+    /// `SET NX`, so no attempt is sent once it is closed: the call then
+    /// answers `Unavailable` ([`HOLD_FENCE_UNSENT`]) as a settled result that
+    /// is not retried. An attempt already sent runs to its end within the
+    /// command timeout.
+    pub async fn initialize_object_id_counter_if_absent_unless_held(
+        &self,
+        hold_fence: Option<&CancellationToken>,
+    ) -> Result<bool, ServiceError> {
         // b.bhb: bounded transient retry — the `txn_pool` no longer re-issues a
         // command fred could not write. See `retry_transient`. A store write
-        // refusal settles the loop as `Ok(Err(_))`, so it is not retried.
+        // refusal settles the loop as `Ok(Err(_))`, so it is not retried; so
+        // does a hold-fence refusal.
         retry_transient("SET NX object_id counter", || async {
             // b.7td: pinned to the counter key's own slot so the checkout
             // hygiene probe reaches the node this write runs on. Re-acquired
@@ -331,6 +364,10 @@ impl CounterStore {
                 .client
                 .acquire_txn_for(&self.keys.counter_object_id())
                 .await;
+            // The hold write fence, immediately before this attempt's send.
+            if hold_fence_closed(hold_fence) {
+                return Ok(Err(ServiceError::Unavailable(HOLD_FENCE_UNSENT.to_owned())));
+            }
             // `Option<String>`, not `bool`: Valkey answers `SET ... NX` with
             // `+OK` on write and a null reply when the key already existed, so
             // presence of a reply IS the verdict. Routing a null through a bool
@@ -419,16 +456,33 @@ impl CounterStore {
     /// `le:counter:object_id` key carries no hash tag so single-slot placement
     /// on Valkey Cluster is guaranteed (no cross-slot concerns either way).
     ///
-    /// A store write refusal answers the plain `create_commit` `Unavailable`
-    /// (`Self::refused_write`), is counted at `stage="create_commit"` when
+    /// A store write refusal answers the hinted `STORE_WRITE_REFUSED`
+    /// `Unavailable` (`Self::refused_write`), is counted at `stage="create_commit"` when
     /// wired, and is not retried. The script's only write is its one `SET`,
     /// and Valkey refuses a script's write before it runs, so a refused run
     /// changed nothing.
     pub async fn seed_object_id_if_below(&self, seed: u64) -> Result<u64, ServiceError> {
+        self.seed_object_id_if_below_unless_held(seed, None).await
+    }
+
+    /// [`Self::seed_object_id_if_below`] under the object-id counter repair's
+    /// hold write fence (SDD SR-6.2; `None` is the plain call, unchanged).
+    /// The fence is checked before every send: each attempt of the transient
+    /// retry, after its checkout, and the `NOSCRIPT` reload's `SCRIPT LOAD`
+    /// and re-sent `EVALSHA` ([`evalsha_with_fenced_reload`]). Once it is
+    /// closed nothing more is sent and the call answers `Unavailable`
+    /// ([`HOLD_FENCE_UNSENT`]) as a settled result that is not retried. A
+    /// copy already sent runs to its end within the command timeout.
+    pub async fn seed_object_id_if_below_unless_held(
+        &self,
+        seed: u64,
+        hold_fence: Option<&CancellationToken>,
+    ) -> Result<u64, ServiceError> {
         // b.bhb: bounded transient retry — see `retry_transient`. Safe to
         // repeat: the script is a conditional `SET` (`if current < seed`), so a
         // second run against an already-seeded counter is a no-op. A store
-        // write refusal settles the loop as `Ok(Err(_))`, so it is not retried.
+        // write refusal settles the loop as `Ok(Err(_))`, so it is not retried;
+        // so does a hold-fence refusal.
         retry_transient("EVAL seed_object_id_if_below", || async {
             // Acquire an exclusive txn-pool slot. The returned checkout holds
             // the `valkey_pool_in_use{pool="txn"}` gauge increment and the
@@ -450,12 +504,20 @@ impl CounterStore {
             // mapper-routing contract (b.u96). The non-numeric
             // parse arm below is a legitimate corrupt-data `Internal` — the
             // EVAL succeeded but the post-script GET reply failed validation.
-            let raw: String = match SEED_OBJECT_ID_IF_BELOW_SCRIPT
-                .evalsha_with_reload::<String, _, _>(&txn_client, keys, argv)
-                .await
+            let raw: String = match evalsha_with_fenced_reload::<String, _, _>(
+                &SEED_OBJECT_ID_IF_BELOW_SCRIPT,
+                &txn_client,
+                keys,
+                argv,
+                hold_fence,
+            )
+            .await
             {
                 Ok(raw) => raw,
-                Err(e) => {
+                Err(FencedEvalError::Held) => {
+                    return Ok(Err(ServiceError::Unavailable(HOLD_FENCE_UNSENT.to_owned())));
+                }
+                Err(FencedEvalError::Fred(e)) => {
                     if let Some(refused) = self.refused_write(&e) {
                         return Ok(Err(refused));
                     }
@@ -661,7 +723,7 @@ mod tests {
         // to a single Cluster slot. A regression that accidentally added
         // a hash tag would surface as a CROSSSLOT failure here (or, worse,
         // a silent mis-route between EVAL writes and `pool.get` reads).
-        let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
             eprintln!(
                 "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)"
             );
@@ -1106,7 +1168,7 @@ mod tests {
     /// mis-routed read-back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_alloc_object_id_routes_to_single_slot() {
-        let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
             eprintln!(
                 "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)"
             );

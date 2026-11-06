@@ -7,7 +7,7 @@
 int main()
 {
     using namespace nvidia::omniverse::live::v1alpha;
-    assert(grpc::Version() == "1.65.4");
+    assert(grpc::Version() == "1.83.1");
     auto channel = grpc::CreateChannel("127.0.0.1:1", grpc::InsecureChannelCredentials());
     auto stub = LiveService::NewStub(channel);
     assert(stub);

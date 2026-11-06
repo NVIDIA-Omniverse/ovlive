@@ -21,6 +21,7 @@ mod common;
 mod auth_metrics_endpoint;
 mod auth_negative_ttl_flip;
 mod checkpoint;
+mod dr;
 mod grpc;
 mod health;
 mod health_supervisor_counter_seed_test;

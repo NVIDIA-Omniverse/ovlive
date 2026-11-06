@@ -51,17 +51,20 @@
 //!
 //! # Wait budget
 //!
-//! Every call is under [`CALL_BUDGET`] (20 s). The broken case holds each of
-//! its three attempts' first fan-out command back [`HELD_WINDOW`] (250 ms) and
-//! sleeps out the writers' gap each broken release opens (about as long), so
-//! its failing call takes under 2 s; the capacity-timeout case waits out a
-//! cap of [`CAPACITY_CAP`] (600 ms). No test makes more than three calls. All
-//! well under nextest's 120 s hang-killer.
+//! Every call is under [`CALL_BUDGET`] (20 s). The broken case parks each of
+//! its three attempts on its first fan-out command until the test has moved
+//! the header's `seq` under that attempt's lease, then releases it, and
+//! sleeps out the writers' gap each broken release opens (about as long as
+//! the attempt), so its failing call takes well under a second; the
+//! capacity-timeout case waits out a cap of [`CAPACITY_CAP`] (600 ms). No
+//! test makes more than three calls. All well under nextest's 120 s
+//! hang-killer.
 //!
-//! Only `fenced_cold_start_broken_on_every_attempt_*` and its `SeqBumper`
-//! are gated behind `test-fault-injection`: the
-//! snapshot-read delay seam exists only under that feature. Every other test
-//! here runs without it.
+//! Only `fenced_cold_start_broken_on_every_attempt_*` is gated behind
+//! `test-fault-injection`: the snapshot-read hold seam, and the lease lever
+//! it pairs with (`lengthen_fence_leases`: no renewal has to land in time
+//! while an attempt is parked), exist only under that feature. Every other
+//! test here runs without it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,16 +116,9 @@ use crate::storage::structural_cache_cold_start_test::{
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Deadline on one `update_layer` call: the healthy path is milliseconds; the
-/// broken case's failing call is under 2 s.
+/// broken case's failing call is well under a second. Also the bound on each
+/// of that case's attempts parking on its held command.
 const CALL_BUDGET: Duration = Duration::from_secs(20);
-/// How long the fault seam holds each broken attempt's first fan-out command
-/// back: long enough that the seq bumper, polling every [`BUMP_POLL`], sees
-/// the attempt's live lease before the pass reads anything.
-#[cfg(feature = "test-fault-injection")]
-const HELD_WINDOW: Duration = Duration::from_millis(250);
-/// The seq bumper's poll step.
-#[cfg(feature = "test-fault-injection")]
-const BUMP_POLL: Duration = Duration::from_millis(5);
 /// The waiting cap the capacity-timeout case leaves its cold start: the call's
 /// remaining deadline is set to `hold + S` at the estimate plus this.
 const CAPACITY_CAP: Duration = Duration::from_millis(600);
@@ -717,96 +713,77 @@ async fn hold_every_fenced_read_permit(client: &ValkeyClient) -> Vec<CatchUpRead
     held
 }
 
-/// A background task that moves the header's `seq` once for each new reader
-/// lease it sees on the fence key, while that lease is live: the attempt
-/// holding it then reads the header off its cut, or its release finds the
-/// header moved — either way the attempt is broken. Needs
-/// `test-fault-injection`, as its one user does.
-#[cfg(feature = "test-fault-injection")]
-struct SeqBumper {
-    stop: tokio_util::sync::CancellationToken,
-    task: tokio::task::JoinHandle<u64>,
-}
-
-#[cfg(feature = "test-fault-injection")]
-impl SeqBumper {
-    fn start(fx: &Fx) -> Self {
-        let stop = tokio_util::sync::CancellationToken::new();
-        let pool = fx.tv.client().pool.clone();
-        let (fence, header) = (fx.fence_key(), fx.header_key());
-        let task = tokio::spawn({
-            let stop = stop.clone();
-            async move {
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-                let mut bumps = 0;
-                while !stop.is_cancelled() {
-                    let fields: HashMap<String, String> = pool
-                        .hgetall(&fence)
-                        .await
-                        .expect("the bumper's HGETALL must succeed");
-                    for reader in fields.keys().filter(|k| k.starts_with("r:")) {
-                        if seen.insert(reader.clone()) {
-                            let _: i64 = pool
-                                .hincrby(&header, "seq", 1)
-                                .await
-                                .expect("the bumper's HINCRBY must succeed");
-                            bumps += 1;
-                        }
-                    }
-                    tokio::time::sleep(BUMP_POLL).await;
-                }
-                bumps
-            }
-        });
-        Self { stop, task }
-    }
-
-    /// Stop the task; the number of leases it broke.
-    async fn stop(self) -> u64 {
-        self.stop.cancel();
-        self.task.await.expect("the bumper must not panic")
-    }
-}
-
 // ═════════════════════════════════════════════════════════════════════════════
 // T9 — a fenced read that fails falls back to WATCH for that call only
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Three broken attempts: each attempt's first fan-out command is held back
-/// [`HELD_WINDOW`] by the fault seam, and while its lease is live the header's
-/// `seq` moves, so every attempt is broken (`fence_broken` three times, never
-/// `ok`). After `FENCE_READ_ATTEMPTS` the read is `FencedReadFailed` with
-/// cause `broken` for this call only: the call commits through the WATCH path
-/// and the next call caches the object (the seam's queue is empty by then).
+/// Three broken attempts: each attempt's first fan-out command is parked by
+/// the fault seam's hold, and while it is parked — its lease live, and
+/// lengthened so that no late renewal can end it first — the test moves the
+/// header's `seq` once and releases it, so every attempt is broken
+/// (`fence_broken` three times, never `ok`). After `FENCE_READ_ATTEMPTS` the
+/// read is `FencedReadFailed` with cause `broken` for this call only: the
+/// call commits through the WATCH path and the next call caches the object
+/// (the seam's queue is empty by then).
 ///
 /// Needs `test-fault-injection` (the read's fault seam).
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_cold_start_broken_on_every_attempt_commits_through_watch_for_that_call_only_and_the_next_call_caches(
 ) {
+    use crate::storage::snapshot_read_support::HeldCommand;
     use live_edit::storage::diff_read::{
         ObjectSnapshotReadFaultInjector, ObjectSnapshotReadFaultTarget, ObjectSnapshotReader,
     };
     use live_edit::storage::snapshot_fence::FENCE_READ_ATTEMPTS;
     let fx = Fx::new("c1-fenced-broken").await;
     let seam = Arc::new(ObjectSnapshotReadFaultInjector::new());
+    seam.lengthen_fence_leases(true);
     fx.client
         .install_object_snapshot_read_fault_injector_for_test(Arc::clone(&seam));
-    for _ in 0..FENCE_READ_ATTEMPTS {
-        seam.push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-            HELD_WINDOW,
-        );
-    }
-    let bumper = SeqBumper::start(&fx);
+    let attempts: Vec<HeldCommand> = (0..FENCE_READ_ATTEMPTS)
+        .map(|_| {
+            HeldCommand::new(
+                seam.push_hold_at(ObjectSnapshotReadFaultTarget::nth_command(
+                    ObjectSnapshotReader::FencedFanout,
+                    0,
+                )),
+            )
+        })
+        .collect();
+    // Once per attempt, while it is parked under its live lease: move the
+    // header's seq, then let the attempt go on to its broken release.
+    let break_every_attempt = async {
+        for (i, attempt) in attempts.iter().enumerate() {
+            let what = format!("attempt {}", i + 1);
+            attempt.parked_within(CALL_BUDGET, &what).await;
+            live_edit::storage::test_support::assert_fence_lease_lengthened(
+                fx.tv.client(),
+                fx.tv.key_schema(),
+                fx.oid,
+                &fx.client,
+            )
+            .await;
+            let _: i64 = fx
+                .tv
+                .client()
+                .pool
+                .hincrby(fx.header_key(), "seq", 1)
+                .await
+                .expect("HINCRBY seq must succeed");
+            attempt.release();
+        }
+    };
 
-    let (result, captured) = capture_debug(Box::pin(fx.update(NEW_SECTIONS[0]))).await;
+    let ((result, captured), ()) = tokio::join!(
+        capture_debug(Box::pin(fx.update(NEW_SECTIONS[0]))),
+        break_every_attempt
+    );
 
-    let bumps = bumper.stop().await;
     assert_eq!(
-        (bumps, seam.delays_remaining()),
-        (u64::from(FENCE_READ_ATTEMPTS), 0),
-        "fixture: every attempt was held back and had its lease's header moved"
+        seam.holds_remaining(),
+        0,
+        "fixture: every attempt was parked and had its lease's header moved"
     );
     assert_eq!(
         (fx.reads("fenced", "fence_broken"), fx.reads("fenced", "ok")),

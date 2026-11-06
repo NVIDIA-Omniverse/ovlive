@@ -66,6 +66,10 @@
 --        `LIVE_EDIT_EXT_VALUE_VERIFY=enforce`), anything else — `"0"`, or
 --        absent — otherwise. It arms only the heal described below; it changes
 --        nothing when the data key was absent.
+--   [3]  the MODE: exactly `"recover"` for fetch-on-miss's rewrite of bytes it
+--        read from the backup store (`store_recovered_values`); anything
+--        else, or absent, for every other store. See "The recover mode"
+--        below.
 --
 -- Both keys MUST share the `{hash_hex}` Cluster slot (see KeySchema::ext_meta /
 -- ext_data). The caller derives both from one `hash_hex`, so this holds by
@@ -74,11 +78,27 @@
 -- ── Return value ──────────────────────────────────────────────────────────
 --
 -- Two-element table:
---   [1] ref_count      — the integer ref_count AFTER this call's `+1`.
+--   [1] ref_count      — the integer ref_count AFTER this call's `+1` (in
+--                        the recover mode on a present meta, the count as it
+--                        stands, unchanged; 0 when the meta has none).
 --   [2] last_store_ms  — the stamp this call wrote, as the same decimal string
 --                        that is now in the hash. Returned rather than
 --                        recomputed by the caller so a test can assert the
---                        written value without a second round trip.
+--                        written value without a second round trip. The
+--                        empty string when the recover mode wrote no stamp.
+--
+-- ── The recover mode (ARGV[3] == "recover") ───────────────────────────────
+--
+-- Fetch-on-miss rewrites bytes it read from the backup store
+-- (`external_values::recover_ext_value_via_checkpoint`). On a meta that
+-- exists, its count already stands for every object referencing the hash —
+-- after a DR restore it is the restore Job's exact recount, on a meta created
+-- with no data (`storage::ext_reconcile`) — so the rewrite stores the bytes
+-- (`SET NX`) and changes nothing else: no `+1`, no stamp. A `+1` there is
+-- owed by no commit and released by none: a permanent leak. The meta check
+-- and the data write are one atomic step. On an absent meta (an earlier
+-- over-release the reference-count reconciler reports) the recover mode runs
+-- the ordinary store below: `+1` and the stamp.
 --
 -- Nothing on the write path branches on the count. The store path hands the
 -- stamp to the ext-mirror with the value's copy: the worker's confirmation of
@@ -139,9 +159,12 @@
 -- The other callers reach this script without the gate (the SR-3.4 pre-store,
 -- `try_recover_via_checkpoint`'s rewrite), pass the flag unset, and carry
 -- only bytes the gate admitted or bytes stored before it existed.
--- `try_recover_via_checkpoint` is entered only when `GET ext_data` returned
--- `None`, so `NX` writes for it exactly as an unconditional `SET` would. No
--- `XX`, no TTL and no `GET`.
+-- `try_recover_via_checkpoint` is entered only for a value the store was found
+-- not to hold — `read_batch`'s `GET ext_data` returned `None`, or the catch-up
+-- length probe's `STRLEN` / `EXISTS` found no key before `recover_value` — so
+-- `NX` writes for it exactly as an unconditional `SET` would, but for a copy
+-- another restore or upload stored since, which it leaves standing. No `XX`,
+-- no TTL and no `GET`.
 --
 -- ── Why `SET` before `HINCRBY` ────────────────────────────────────────────
 --
@@ -209,6 +232,15 @@
 local meta_key = KEYS[1]
 local data_key = KEYS[2]
 
+-- The recover mode on a present meta; see the note above. On a migrating
+-- source the opening `EXISTS` is refused for a meta that moved, before any
+-- write, and the `HGET` after the one write names that present meta.
+if ARGV[3] == "recover" and redis.call("EXISTS", meta_key) == 1 then
+    redis.call("SET", data_key, ARGV[1], "NX")
+    local count = redis.call("HGET", meta_key, "ref_count")
+    return { tonumber(count) or 0, "" }
+end
+
 -- Set only if absent; see the `SET NX` note above. A skipped write is not an
 -- error and does not skip the increment or the stamp below. `SET … NX`
 -- replies nil (Lua `false`) when it skipped the write.
@@ -232,8 +264,10 @@ if not written and ARGV[2] == "1" then
     end
 end
 
--- The pre-flight increment. Exactly one per call, per hash, whether or not the
--- `SET` above wrote or the heal replaced the key — `ref_count` counts LIVE
+-- The pre-flight increment. Exactly one per call that reaches here (every call
+-- but the recover mode's on a present meta, which returned above), per hash,
+-- whether or not the `SET` above wrote or the heal replaced the key —
+-- `ref_count` counts LIVE
 -- OBJECTS (b.qpf), not stored
 -- copies, and the surplus this pays ahead of the commit is handed back by that
 -- commit's `surplus_acquire` release.

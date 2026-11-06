@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -172,6 +173,28 @@ class EditBenchmarkMetricTests(unittest.TestCase):
         text = bench.summary(report)
         self.assertIn('peer saw 1/2 turns, 1 failed writes, not drained', text)
         self.assertIn('peer saw 1/2 turns, 0 failed writes, drain timed out', text)
+
+    def test_the_reduced_diagnostics_disable_history_and_record_only_errors(self):
+        header = (bench.ROOT / 'include/omni/usd/live/Live.h').read_text()
+        constant = lambda name: int(re.search(rf'\b{name} = (\d+)', header).group(1))
+        self.assertEqual(clients.DIAGNOSTICS, dict(default={}, reduced=dict(
+            flags=constant('OMNI_USD_LIVE_RUNTIME_DISABLE_DIAGNOSTIC_HISTORY'),
+            diagnostic_min_severity=constant('OMNI_USD_LIVE_SEVERITY_ERROR'))))
+
+    def test_the_report_records_the_diagnostics_and_each_writers_process_usage(self):
+        usage = clients.process_usage()
+        if usage is not None:
+            self.assertGreater(usage['max_rss_kib'], 0)
+            self.assertGreaterEqual(usage['cpu_s'], 0.0)
+        writer = dict(self.ovlive_writer(2, True), diagnostics='reduced', usage=dict(max_rss_kib=204800, cpu_s=3.5))
+        metrics = bench.analyze(dict(writer=writer, neutral=dict(received=[(0.5, 1, 1.0, 10)]), service={}))
+        self.assertEqual(metrics['writer']['usage'], dict(max_rss_kib=204800, cpu_s=3.5))
+        report = dict(seed=42, service='opaque', jitter_ms=2.0, diagnostics='reduced', labels={},
+                      identities=bench.identities(None, None, None, None),
+                      cases=[dict(scenario='single', rtt_ms=20, client='ovlive', metrics=metrics)])
+        text = bench.summary(report)
+        self.assertIn('ovlive diagnostics reduced', text)
+        self.assertIn('max RSS 200 MiB, CPU 3.5 s', text)
 
     def test_a_case_records_its_delivery(self):
         raw = dict(writer=dict(client='client-library', edits=[(0, 0.0), (1, 1.0)], updates=[], failures=[],

@@ -17,7 +17,7 @@
 //!
 //! Task `t2.fgj.jd.yz` Subtask `t3.fgj.jd.yz.vq`. This file is the per-adapter
 //! test-only entry point that drives every enumerated SR-1.3 conformance case
-//! (`case_01_*` … `case_42_*`, defined in [`super::conformance`]) against a
+//! (`case_01_*` … `case_44_*`, defined in [`super::conformance`]) against a
 //! freshly-built [`StorageApiCheckpointStore`] backed by a per-test
 //! `wiremock::MockServer`. The cases #19–#25 landed in sibling Subtasks
 //! `t3.fgj.jd.yz.de` and `t3.fgj.jd.yz.kw`.
@@ -198,7 +198,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(30_000);
 /// `<BASE_PATH>/.live-edit/...`. Concurrent cases (#17, #18) rely on
 /// the same base path so cross-case key collisions are impossible by
 /// construction (per-test fresh MockServer + fresh map).
-const BASE_PATH: &str = "/projects/team-a";
+pub(crate) const BASE_PATH: &str = "/projects/team-a";
 
 /// Disambiguator in the case-#27 temp's filename.
 ///
@@ -252,7 +252,7 @@ impl CheckpointStoreGuard for MockServerGuard {}
 /// state across the five method-handlers (PUT, GET, HEAD, LIST, DELETE) for
 /// one `MockServer`. Per-test isolation is preserved at the `setup` level —
 /// every call to `setup()` allocates a fresh `FakeStorageState` instance.
-type FakeStorageState = Arc<Mutex<HashMap<String, Bytes>>>;
+pub(crate) type FakeStorageState = Arc<Mutex<HashMap<String, Bytes>>>;
 
 /// `Respond` impl backing the PUT route. Records the request body in the
 /// shared map under the percent-decoded `by-address` tail, then returns 201
@@ -460,7 +460,7 @@ fn decode_data_objects_prefix_from_path(path: &str) -> Option<String> {
 /// added to the fake reaches all of them; a setup that hand-mounted its own
 /// copy is how a route goes missing from one fixture and its tests quietly
 /// read wiremock's unmatched-request `404` instead.
-async fn mount_fake_storage_routes(mock_server: &MockServer, state: &FakeStorageState) {
+pub(crate) async fn mount_fake_storage_routes(mock_server: &MockServer, state: &FakeStorageState) {
     Mock::given(method("PUT"))
         .and(path_regex(r"^/v1alpha/fileobject/by-address/"))
         .respond_with(PutHandler {
@@ -506,7 +506,7 @@ async fn mount_fake_storage_routes(mock_server: &MockServer, state: &FakeStorage
 /// and an adapter pointed at `mock_server` through it. The polling task
 /// tolerates the missing file silently per SR-6.2, and the fake never answers
 /// 401, so every request goes out without an `Authorization` header.
-fn build_fake_backed_adapter(
+pub(crate) fn build_fake_backed_adapter(
     mock_server: &MockServer,
     metrics_label: &str,
 ) -> (StorageApiCheckpointStore, tempfile::TempDir) {
@@ -1289,6 +1289,134 @@ async fn case_41_ext_blob_exists_is_true_only_for_stored_bytes() {
     conformance::case_41_ext_blob_exists_is_true_only_for_stored_bytes(setup).await;
 }
 
+// ---------------------------------------------------------------------------
+// The DR Jobs' list-route canary on this adapter (`verify_list_route`); the
+// conformance case #44 is after Group N
+// ---------------------------------------------------------------------------
+
+/// The `.live-edit/dr-canary/` subtree's address on the fake.
+fn dr_canary_root() -> String {
+    format!("{BASE_PATH}/.live-edit/dr-canary/")
+}
+
+/// Every Enumerate (`GET data-objects/`) the fake received, as the decoded
+/// prefix it listed.
+async fn listed_prefixes(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .iter()
+        .filter(|r| r.method.as_str() == "GET")
+        .filter_map(|r| decode_data_objects_prefix_from_path(r.url.path()))
+        .collect()
+}
+
+/// A passing canary lists only its own run's directory,
+/// `.../dr-canary/<uuid>/`, once through each listing helper, and never
+/// `.../dr-canary/` itself: there is no cross-run reap, because listing the
+/// parent could leave a stale cached listing that fails a later run's canary.
+/// Leftovers of earlier, killed runs under other `<uuid>/` directories are
+/// left as they are, and this run's canary is deleted again.
+#[tokio::test]
+async fn verify_list_route_lists_only_its_own_run_directory_and_leaves_other_runs_leftovers() {
+    let server = MockServer::start().await;
+    let state: FakeStorageState = Arc::new(Mutex::new(HashMap::new()));
+    mount_fake_storage_routes(&server, &state).await;
+    let leftovers = [
+        format!(
+            "{}0a1b2c3d4e5f60718293a4b5c6d7e8f9/canary",
+            dr_canary_root()
+        ),
+        format!(
+            "{}f9e8d7c6b5a4938271605f4e3d2c1b0a/canary",
+            dr_canary_root()
+        ),
+    ];
+    for leftover in &leftovers {
+        state.lock().unwrap().insert(
+            leftover.clone(),
+            Bytes::from_static(b"left by a killed run"),
+        );
+    }
+    let before = state.lock().unwrap().clone();
+    let (adapter, _token_dir) = build_fake_backed_adapter(&server, "dr-canary-own-run");
+
+    adapter
+        .verify_list_route()
+        .await
+        .expect("a working listing route passes the canary");
+
+    let prefixes = listed_prefixes(&server).await;
+    assert_eq!(
+        prefixes.len(),
+        2,
+        "one listing through each helper: {prefixes:?}"
+    );
+    assert!(
+        !prefixes.contains(&dr_canary_root()),
+        "the canary never lists dr-canary/ itself: {prefixes:?}"
+    );
+    let own_run = &prefixes[0];
+    assert!(
+        own_run.starts_with(&dr_canary_root())
+            && own_run.ends_with('/')
+            && own_run.len() > dr_canary_root().len() + 1,
+        "it lists its own run's <uuid>/ directory: {own_run}"
+    );
+    assert!(
+        prefixes.iter().all(|p| p == own_run),
+        "both listings are of the same run directory: {prefixes:?}"
+    );
+    assert!(
+        leftovers.iter().all(|l| !l.starts_with(own_run.as_str())),
+        "fixture: the run's directory is new"
+    );
+    assert_eq!(
+        *state.lock().unwrap(),
+        before,
+        "the leftovers survive, and this run's canary is deleted again"
+    );
+}
+
+/// A listing route that answers 404 while the by-address routes work: the
+/// canary written there is not listed back, so it answers `Permanent` (the
+/// Jobs' "the backup store's listing route is not working"), and the canary
+/// is still deleted again.
+#[tokio::test]
+async fn verify_list_route_with_a_listing_route_answering_404_is_permanent_and_leaves_nothing() {
+    let server = MockServer::start().await;
+    let state: FakeStorageState = Arc::new(Mutex::new(HashMap::new()));
+    mount_fake_storage_routes(&server, &state).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v1alpha/fileobject/data-objects/"))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let (adapter, _token_dir) = build_fake_backed_adapter(&server, "dr-canary-404");
+
+    let err = adapter
+        .verify_list_route()
+        .await
+        .expect_err("a listing route answering 404 fails the canary");
+
+    assert!(err.is_permanent(), "a failed canary is Permanent: {err:?}");
+    let puts = server
+        .received_requests()
+        .await
+        .expect("wiremock records requests")
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT" && r.url.path().contains("dr-canary"))
+        .count();
+    assert_eq!(puts, 1, "the canary was written");
+    assert!(
+        state.lock().unwrap().is_empty(),
+        "the canary is deleted again: {:?}",
+        state.lock().unwrap().keys().collect::<Vec<_>>()
+    );
+}
+
 #[cfg(feature = "test-checkpoint-fault-injection")]
 #[tokio::test]
 async fn case_42_dr_restore_read_methods_surface_backend_failures_as_errors() {
@@ -1314,6 +1442,37 @@ async fn case_43_list_live_ext_set_counts_its_own_listing_and_projects_to_the_li
         setup,
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Case #44 — the DR Jobs' list-route canary (`verify_list_route`)
+//
+// Rides the regular `setup` fake: the canary's by-address PUT, its two
+// Enumerate listings (one through each listing helper) and its deletes all
+// run on the fake.
+// That a passing canary lists only its own run directory, and that a 404
+// listing route fails it, are this adapter's own tests above.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed() {
+    conformance::case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed(
+        setup,
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Case #45 — the DR restore Job's one listing, grouped per object
+//
+// Rides the artifact fixture: an orphaned companion stem and a write temp,
+// planted straight into the fake's map, are enumerated beside the
+// generations.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn case_45_grouped_layer_artifacts_equal_each_objects_listing() {
+    conformance::case_45_grouped_layer_artifacts_equal_each_objects_listing(setup_artifacts).await;
 }
 
 // ---------------------------------------------------------------------------

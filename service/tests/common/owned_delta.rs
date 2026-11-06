@@ -23,7 +23,9 @@
 #![allow(dead_code)]
 
 use live_edit::domain::ompf::OmpfContainer;
-use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, SetField, StructCommand, TimeSample};
+use oodf_ffi::{
+    CommandCreateSection, CommandDiffChangeSection, OwnedDelta, SetField, StructCommand, TimeSample,
+};
 
 /// An empty OwnedDelta — `is_diff=false`, `base_version=0`, no commands or
 /// fields. Equivalent to the old `build_delta_bytes(false, 0)` fixture.
@@ -40,6 +42,29 @@ pub fn reset_delta(source_format: &str) -> OwnedDelta {
         source_format: source_format.to_string(),
         ..Default::default()
     }
+}
+
+/// The layer's root section as a client creates it: `CreateSection {
+/// parent_id: 0, section_id: 1, section_name: "", section_type: 7 }`, the
+/// shape Kit gives a layer's pseudo-root and the one the service supplies to a
+/// CreateLayer whose content leaves the layer empty (SDD §9.7). A CreateLayer
+/// whose content leaves fields or time samples but no top-level section is
+/// refused, so a fixture that puts data on section 1 of a new layer creates
+/// this first ([`with_root`]).
+pub fn root_create_section() -> StructCommand {
+    StructCommand::CreateSection(CommandCreateSection {
+        parent_id: 0,
+        section_id: 1,
+        section_name: String::new(),
+        section_type: 7,
+    })
+}
+
+/// `delta` with [`root_create_section`] ahead of its structural commands: the
+/// content of a CreateLayer that puts data on section 1.
+pub fn with_root(mut delta: OwnedDelta) -> OwnedDelta {
+    delta.struct_commands.insert(0, root_create_section());
+    delta
 }
 
 /// A diff delta that carries a single `CommandDiffChangeSection`. Use when a

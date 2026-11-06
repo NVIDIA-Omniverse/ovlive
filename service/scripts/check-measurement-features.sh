@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Fence on live-edit's measurement-only code: it must never reach a default or
-# release build.
+# Fence on live-edit's measurement- and test-only code: it must never reach a
+# default or release build.
 #
-# Two such overrides exist today, each read from an environment variable only
+# Three such overrides exist today, each read from an environment variable only
 # by a build with live-edit's test-only `test-support` feature:
 #
 # - the snapshot fan-out arena's decay override,
@@ -26,12 +26,15 @@
 #   can measure several decay values;
 # - the pod memory limit's cgroup root, MEASUREMENT_POD_MEMORY_CGROUP_ROOT
 #   (`src/config/pod_memory.rs`), so a test can start the binary on a fixture
-#   cgroup tree instead of the machine's own limit.
+#   cgroup tree instead of the machine's own limit;
+# - the Valkey key prefix, LIVE_EDIT_TEST_ONLY_KEY_PREFIX
+#   (`src/config/key_prefix.rs`), so a test can run the binary against a
+#   shared test store under its own prefix instead of the production `le:`.
 #
 # The release build (`Dockerfile`: `cargo build --locked --release
 # --workspace`, no features) must compile the compiled-in behaviour and
-# nothing that reads either variable, so `test-support` must come only from
-# the command line.
+# nothing that reads any of these variables, so `test-support` must come only
+# from the command line.
 #
 # The same two layers, and the same control, as the fence on fred's test-only
 # `live-edit-retention-report` feature in `scripts/check-vendored-fred.sh`
@@ -69,8 +72,8 @@
 #   pass because its pattern no longer matches `cargo tree`'s output.
 #
 # A third layer checks built artifacts. `--binary <path>`: the binary must not
-# contain either variable's name. `--control-binary <path>`, for a build with
-# `--features test-support`: it must contain both names, so the search is
+# contain any of the variables' names. `--control-binary <path>`, for a build
+# with `--features test-support`: it must contain every name, so the search is
 # known to find each name where its override is compiled in. Both require
 # each name's source file to declare it exactly once as a string literal (a
 # renamed variable fails here rather than leaving the search looking for a
@@ -94,11 +97,11 @@ cd "$REPO_ROOT"
 
 PACKAGE=live-edit
 FEATURE=test-support
-# Each measurement-only variable and the one source file that declares it, as
-# `NAME:path` pairs.
-ENV_NAMES="MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS:src/allocator.rs MEASUREMENT_POD_MEMORY_CGROUP_ROOT:src/config/pod_memory.rs"
+# Each measurement- or test-only variable and the one source file that declares
+# it, as `NAME:path` pairs.
+ENV_NAMES="MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS:src/allocator.rs MEASUREMENT_POD_MEMORY_CGROUP_ROOT:src/config/pod_memory.rs LIVE_EDIT_TEST_ONLY_KEY_PREFIX:src/config/key_prefix.rs"
 RELEASE_TARGETS="--target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu"
-FAIL_WHY="the measurement-only overrides would reach a default or release build"
+FAIL_WHY="the measurement- and test-only overrides would reach a default or release build"
 USAGE="usage: sh scripts/check-measurement-features.sh [--binary <path> | --control-binary <path>]"
 
 # `$1` is the failure; `$2` names its cause, and with it the guidance: `edge`
@@ -110,9 +113,9 @@ fail() {
   echo "=========================================="
   case "$2" in
     edge)
-      echo "ERROR: $PACKAGE's $FEATURE feature, which compiles in measurement-only code, could reach a default or release build." ;;
+      echo "ERROR: $PACKAGE's $FEATURE feature, which compiles in measurement- and test-only code, could reach a default or release build." ;;
     *)
-      echo "ERROR: the fence on $PACKAGE's measurement-only code ($FEATURE) could not verify the build." ;;
+      echo "ERROR: the fence on $PACKAGE's measurement- and test-only code ($FEATURE) could not verify the build." ;;
   esac
   echo ""
   echo "$1"
@@ -218,4 +221,4 @@ CONTROL_TREE=$(cargo tree --locked --workspace $RELEASE_TARGETS -e features -i "
 printf '%s\n' "$CONTROL_TREE" | grep -qF "$RESOLVED_NODE" \
   || fail "The fence's control failed: with $PACKAGE/$FEATURE, cargo tree does not list '$RESOLVED_NODE', so the release check above could not have seen it either." control
 
-echo "OK: $PACKAGE's $FEATURE feature, which compiles in the measurement-only overrides, is enabled by no manifest edge, and the no-feature workspace build does not resolve it."
+echo "OK: $PACKAGE's $FEATURE feature, which compiles in the measurement- and test-only overrides, is enabled by no manifest edge, and the no-feature workspace build does not resolve it."

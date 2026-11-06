@@ -25,8 +25,9 @@
 //! bytes, so ordinary `JoinSession` fan-out was enough to kill a whole
 //! connection and every stream on it. From 0.4.19 the
 //! budget is half the connection's initial receive window: 2.5 MiB for a tonic
-//! client on hyper's defaults and 512 KiB for the service, whose windows
-//! `production_server_builder` leaves at hyper's defaults.
+//! client on hyper's defaults and 32.5 MiB for the service at the default
+//! upload admission waiter cap, whose connection window
+//! `production_server_builder` sets from that cap.
 //!
 //! The invariant pinned here is **"a connection survives N unread small
 //! frames"**, from both ends:
@@ -128,9 +129,14 @@ const SMALL_FRAME_THRESHOLD: usize = 256;
 /// 5 MiB client connection window.
 const CLIENT_BUDGET_0419: usize = 5 * 1024 * 1024 / 2;
 
-/// h2 0.4.19's budget for the service: half of hyper's 1 MiB server connection
-/// window, which `production_server_builder` leaves unchanged.
-const SERVICE_BUDGET_0419: usize = 1024 * 1024 / 2;
+/// h2 0.4.19's budget for the service: half of the connection window
+/// `production_server_builder` sets at the waiter cap this file's server runs
+/// with, `build_service`'s default gate's.
+const SERVICE_BUDGET_0419: usize = live_edit::grpc::transport::h2_small_frame_budget_bytes(
+    live_edit::grpc::transport::http2_connection_window_bytes(
+        live_edit::grpc::upload_admission::UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT,
+    ),
+);
 
 /// Size of every `PeerMessage` payload and `SessionMessageRequest` payload:
 /// a big-endian `u32` index.
@@ -229,9 +235,12 @@ impl ProductionTransportServer {
         let server_task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = ready_tx.send(());
-            production_server_builder()
+            production_server_builder(svc.upload_admission.max_waiters())
                 .layer(metrics_layer)
-                .add_service(live_service_server(svc))
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("test server error");

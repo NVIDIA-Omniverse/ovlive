@@ -24,10 +24,10 @@ LICENSES = 'THIRD_PARTY_LICENSES.txt'
 BOM = 'BOM.json'
 # package: (license file in PACKAGE-LICENSES, SPDX expression, public upstream project)
 COMPONENTS = {
-    'grpc': ('grpc-LICENSE.txt', 'Apache-2.0 AND BSD-3-Clause AND MPL-2.0', 'https://github.com/grpc/grpc'),
-    'protobuf': ('protobuf-LICENSE.txt', 'BSD-3-Clause', 'https://github.com/protocolbuffers/protobuf'),
+    'grpc': ('grpc-LICENSE', 'Apache-2.0 AND BSD-3-Clause AND MPL-2.0', 'https://github.com/grpc/grpc'),
+    'protobuf': ('protobuf-LICENSE', 'BSD-3-Clause', 'https://github.com/protocolbuffers/protobuf'),
     'abseil': ('abseil-LICENSE.txt', 'Apache-2.0', 'https://github.com/abseil/abseil-cpp'),
-    're2': ('re2-LICENSE.txt', 'BSD-3-Clause', 'https://github.com/google/re2'),
+    're2': ('re2-LICENSE', 'BSD-3-Clause', 'https://github.com/google/re2'),
     'c-ares': ('c-ares-LICENSE.md', 'MIT', 'https://github.com/c-ares/c-ares'),
     # openssl-LICENSE (no extension) in the same directory is a build-time Perl module's license, not OpenSSL's.
     'openssl': ('openssl-LICENSE.txt', 'Apache-2.0', 'https://github.com/openssl/openssl'),

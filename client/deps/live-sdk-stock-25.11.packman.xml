@@ -1,12 +1,17 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <project toolsVersion="5.0" chroniclePath="../_build/chronicles">
-  <!-- The stock-25.11 host SDKs; tools/live/provision.py pulls them and names them in the worker configuration. -->
+  <!-- The stock-25.11 host SDKs for the host's platform_target_abi; the worker configuration names them. The USD
+       package is named by platform_target_abi, as in the Kit profile. The Python packages are the 3.12.12+nv2 builds
+       the stock USD pairs with, whose names carry a platform token other than platform_target_abi, so each platform
+       has its own package. -->
   <dependency name="live-sdk-usd" linkPath="../_build/sdk-deps/stock-25.11/usd">
-    <package name="usd.py312.manylinux_2_35_x86_64.stock.release" version="0.25.11-gl.18041+v25.11.363a7c8d" />
+    <package name="usd.py312.${platform_target_abi}.stock.release" version="0.25.11-gl.18041+v25.11.363a7c8d" />
   </dependency>
   <dependency name="live-sdk-python" linkPath="../_build/sdk-deps/stock-25.11/python">
-    <package name="python" version="3.12.12+nv2-linux-x86_64" />
+    <package name="python" version="3.12.12+nv2-linux-x86_64" platforms="manylinux_2_35_x86_64" />
+    <package name="python" version="3.12.12+nv2-linux-aarch64" platforms="manylinux_2_35_aarch64" />
+    <package name="python" version="3.12.12+nv2-windows-x86_64" platforms="windows-x86_64" />
   </dependency>
   <dependency name="live-sdk-pybind11" linkPath="../_build/sdk-deps/stock-25.11/pybind11">
     <package name="pybind11" version="2.11.1-0" />

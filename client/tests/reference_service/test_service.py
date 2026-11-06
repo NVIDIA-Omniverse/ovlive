@@ -6,7 +6,10 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
+import sys
 import unittest
+from dataclasses import replace
 
 import grpc
 from service import State, Principal, ReferenceServer, ErrorInfo, RpcStatus, pb, rpc
@@ -339,13 +342,16 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             channel = grpc.aio.insecure_channel(await proxy.start())
             self.channels.append(channel)
             stub = rpc.LiveServiceStub(channel)
-            proxy.reject_new_streams(kind)
-            ledger = len(self.state.ledger)
+            proxy.reject_new_streams(kind, 2)
+            ledger, attempts = len(self.state.ledger), dict(self.state.attempts)
             await self.error_code(stub.CreateSession(pb.CreateSessionRequest(path="base", name=kind),
                                                      metadata=WRITER, timeout=5), grpc.StatusCode.UNAUTHENTICATED)
+            # A client stream gRPC can dispatch from its header block alone; the service parks it uncounted.
+            await self.error_code(stub.UpdateLayer(metadata=WRITER, timeout=5), grpc.StatusCode.UNAUTHENTICATED)
             self.assertEqual(len(self.state.ledger), ledger)
             await stub.Ping(pb.PingRequest(), metadata=WRITER, timeout=5)  # Same connection: HPACK and windows intact.
             self.assertEqual(len(proxy.connections), 1)
+            self.assertEqual(self.state.attempts, dict(attempts, Ping=attempts.get("Ping", 0) + 1))
 
     async def test_layer_incarnations_stream_validation_and_delete(self):
         session = await self.create_session()
@@ -523,6 +529,200 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.keepalives, {busy.connection_id: 1})
         self.assertEqual(list(self.state.sessions[session].peers), [watching.connection_id])
 
+    async def owner_join(self, session, app, *, token="synthetic-writer", merge_owner=True):
+        call = self.stub.JoinSession(metadata=(("authorization", f"Bearer {token}"),), timeout=10)
+        self.calls.append(call)
+        await call.write(pb.JoinSessionRequest(header=pb.JoinSessionHeader(
+            session_id=session, user_application=app, merge_owner=merge_owner)))
+        response = await asyncio.wait_for(call.read(), 3)
+        self.assertEqual(response.WhichOneof("response_type"), "connected")
+        return call, response.connected
+
+    async def owner_request(self, call, request_id, action):
+        await call.write(pb.JoinSessionRequest(merge_owner=pb.MergeOwnerRequest(request_id=request_id, action=action)))
+
+    async def owner_answer(self, call, request_id):
+        """Reads until the answer to request_id; returns it and the unsolicited states before it, skipping
+        presence frames."""
+        before = []
+        while True:
+            response = await asyncio.wait_for(call.read(), 3)
+            if response.WhichOneof("response_type") != "merge_owner":
+                continue
+            state = response.merge_owner
+            entry = (state.request_id, pb.MergeOwnerOutcome.Name(state.outcome)[len("MERGE_OWNER_OUTCOME_"):],
+                     state.owner_connection_id, state.epoch)
+            if state.request_id == request_id:
+                return entry, before
+            before.append(entry)
+
+    async def ended(self, call, code):
+        """Reads past any queued frames until the stream ends with code; a clean end fails at once, and the whole
+        drain has a failure-only watchdog."""
+        async def drain():
+            while True:
+                if await call.read() == grpc.aio.EOF:
+                    self.fail(f"the stream ended OK, not {code}")
+        with self.assertRaises(grpc.aio.AioRpcError) as caught:
+            await asyncio.wait_for(drain(), 5)
+        self.assertEqual(caught.exception.code(), code)
+
+    async def owner_state(self, call):
+        """The join's next frame, which must be a MergeOwnerState: (request_id, outcome name, owner, epoch)."""
+        response = await asyncio.wait_for(call.read(), 3)
+        self.assertEqual(response.WhichOneof("response_type"), "merge_owner")
+        state = response.merge_owner
+        return state.request_id, pb.MergeOwnerOutcome.Name(state.outcome)[len("MERGE_OWNER_OUTCOME_"):], \
+            state.owner_connection_id, state.epoch
+
+    async def test_merge_owner_is_opt_in_negotiated_and_advertised(self):
+        session = await self.create_session()
+        # The default models a service without the lease: Connected and Ping report none, and a merge-owner frame
+        # is unknown.
+        older, connected = await self.owner_join(session, "older")
+        self.assertFalse(connected.merge_owner)
+        self.assertFalse((await self.stub.Ping(pb.PingRequest(), metadata=WRITER, timeout=5)).merge_owner)
+        await self.owner_request(older, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        await self.ended(older, grpc.StatusCode.INVALID_ARGUMENT)
+        self.state.merge_owner = True
+        self.assertTrue((await self.stub.Ping(pb.PingRequest(), metadata=WRITER, timeout=5)).merge_owner)
+        plain, unasked = await self.owner_join(session, "plain", merge_owner=False)
+        opted, asked = await self.owner_join(session, "opted")
+        self.assertEqual((unasked.merge_owner, asked.merge_owner), (False, True))
+        self.assertEqual([(j["merge_owner_requested"], j["merge_owner"]) for j in self.state.joins],
+                         [(True, False), (False, False), (True, True)])
+        # A join that did not negotiate the lease may not send a merge-owner frame either.
+        await self.owner_request(plain, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        await self.ended(plain, grpc.StatusCode.INVALID_ARGUMENT)
+        await self.owner_request(opted, 7, pb.MERGE_OWNER_ACTION_VERIFY)
+        self.assertEqual(await self.owner_answer(opted, 7), ((7, "NOT_HELD", "", 0), []))
+
+    async def test_merge_owner_grants_once_fans_out_only_to_opted_in_joins_and_hands_off(self):
+        self.state.merge_owner = True
+        session = await self.create_session()
+        plain, _ = await self.owner_join(session, "plain", merge_owner=False)
+        first, a = await self.owner_join(session, "first")
+        second, b = await self.owner_join(session, "second")
+        plain_id = self.state.joins[0]["connection"]
+        self.assertEqual([await self.event(first), await self.event(first)],
+                         [("peer_joined", plain_id), ("peer_joined", b.connection_id)])
+        self.assertEqual([await self.event(second), await self.event(second)],
+                         [("peer_joined", plain_id), ("peer_joined", a.connection_id)])
+        # Both joins of the one principal claim at once: the service serializes them and grants exactly one. The
+        # other learns of the grant before its own claim is answered.
+        await self.owner_request(first, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        await self.owner_request(second, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        answers = {a.connection_id: await self.owner_answer(first, 1), b.connection_id: await self.owner_answer(second, 1)}
+        granted = [connection for connection, (answer, _) in answers.items() if answer[1] == "GRANTED"]
+        self.assertEqual(len(granted), 1)
+        holder_id = granted[0]
+        holder, waiter = (first, second) if holder_id == a.connection_id else (second, first)
+        waiter_id = b.connection_id if holder_id == a.connection_id else a.connection_id
+        self.assertEqual(answers[holder_id], ((1, "GRANTED", holder_id, 1), []))
+        self.assertEqual(answers[waiter_id], ((1, "HELD_BY_OTHER", holder_id, 1), [(0, "HELD_BY_OTHER", holder_id, 1)]))
+        # A claim by the holder keeps its epoch; VERIFY answers only the holder GRANTED.
+        await self.owner_request(holder, 2, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(holder), (2, "GRANTED", holder_id, 1))
+        await self.owner_request(holder, 3, pb.MERGE_OWNER_ACTION_VERIFY)
+        self.assertEqual(await self.owner_state(holder), (3, "GRANTED", holder_id, 1))
+        await self.owner_request(waiter, 3, pb.MERGE_OWNER_ACTION_VERIFY)
+        self.assertEqual(await self.owner_state(waiter), (3, "NOT_HELD", holder_id, 1))
+        await self.owner_request(waiter, 4, pb.MERGE_OWNER_ACTION_RELEASE)
+        self.assertEqual(await self.owner_state(waiter), (4, "NOT_HELD", holder_id, 1))
+        # The holder's join ends: its teardown releases the lease, and the waiter can take it with a higher epoch.
+        await holder.done_writing()
+        holder.cancel()
+        self.assertEqual(await self.event(waiter), ("peer_left", holder_id))
+        self.assertEqual(await self.owner_state(waiter), (0, "RELEASED", "", 1))
+        await self.owner_request(waiter, 5, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(waiter), (5, "GRANTED", waiter_id, 2))
+        # The join that did not opt in saw presence only: no merge-owner frame ever reached it.
+        await waiter.write(pb.JoinSessionRequest(message=pb.SessionMessageRequest(data=b"marker")))
+        kinds = []
+        while not kinds or kinds[-1] != "peer_message":
+            kinds.append((await asyncio.wait_for(plain.read(), 3)).WhichOneof("response_type"))
+        self.assertNotIn("merge_owner", kinds)
+        self.assertNotIn(self.state.joins[0]["connection"], [e["connection"] for e in self.state.merge_owner_log])
+
+    async def test_merge_owner_eligibility_credentials_and_release_paths(self):
+        self.state.merge_owner = True
+        self.state.tokens["synthetic-other"] = Principal("other")
+        session = await self.create_session()
+        self.state.sessions[session].writers.add("other")
+        holder, h = await self.owner_join(session, "holder")
+        stranger, _ = await self.owner_join(session, "stranger", token="synthetic-other")
+        await self.event(holder)
+        await self.event(stranger)
+        # A non-creator with write permission may not squat on the lease.
+        await self.owner_request(stranger, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(stranger), (1, "NOT_ELIGIBLE", "", 0))
+        await self.owner_request(holder, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(holder), (1, "GRANTED", h.connection_id, 1))
+        self.assertEqual(await self.owner_state(stranger), (0, "HELD_BY_OTHER", h.connection_id, 1))
+        # An expired join credential answers a claim UNAUTHENTICATED and never revokes the lease its principal holds.
+        self.state.issue("synthetic-late", "writer")
+        late, _ = await self.owner_join(session, "late", token="synthetic-late")
+        await self.event(holder)
+        await self.event(stranger)
+        self.state.tokens["synthetic-late"] = replace(self.state.tokens["synthetic-late"], expires_us=1)
+        await self.owner_request(late, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_answer(late, 1), ((1, "UNAUTHENTICATED", h.connection_id, 1), []))
+        await late.done_writing()
+        late.cancel()
+        self.assertEqual(await self.event(holder), ("peer_left", self.state.joins[-1]["connection"]))
+        self.assertEqual(await self.event(stranger), ("peer_left", self.state.joins[-1]["connection"]))
+        # A principal the permission check rejects gets the same answer, and the lease again survives.
+        self.state.reject_principal("writer")
+        await self.owner_request(holder, 2, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(holder), (2, "UNAUTHENTICATED", h.connection_id, 1))
+        await self.owner_request(holder, 3, pb.MERGE_OWNER_ACTION_VERIFY)
+        self.assertEqual(await self.owner_state(holder), (3, "GRANTED", h.connection_id, 1))
+        self.state.merge_owner_rejections.clear()
+        # An explicit release announces the free lease.
+        await self.owner_request(holder, 4, pb.MERGE_OWNER_ACTION_RELEASE)
+        self.assertEqual(await self.owner_state(holder), (4, "RELEASED", "", 1))
+        self.assertEqual(await self.owner_state(stranger), (0, "RELEASED", "", 1))
+        await self.owner_request(holder, 5, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(holder), (5, "GRANTED", h.connection_id, 2))
+        self.assertEqual(await self.owner_state(stranger), (0, "HELD_BY_OTHER", h.connection_id, 2))
+        listed = await self.stub.ListSessions(pb.ListSessionsRequest(path="file:///base.usda?stable-identity"),
+                                              metadata=WRITER, timeout=5)
+        self.assertEqual([(s.merge_owner_user_name, s.merge_owner_epoch) for s in listed.sessions], [("writer", 2)])
+        # A sweep without the release hook leaves the lease naming the evicted join; the next claim takes it.
+        second, s2 = await self.owner_join(session, "second")
+        await self.event(stranger)
+        async with self.state.changed:
+            self.assertTrue(self.state.evict(h.connection_id, release=False))
+        await self.ended(holder, grpc.StatusCode.UNAVAILABLE)
+        self.assertEqual(self.state.sessions[session].owner, h.connection_id)
+        for _ in range(2):
+            await self.event(second)
+        self.assertEqual(await self.event(second), ("peer_left", h.connection_id))
+        await self.owner_request(second, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual(await self.owner_state(second), (1, "GRANTED", s2.connection_id, 3))
+        # A sweep with the release hook announces the release at once.
+        async with self.state.changed:
+            self.assertTrue(self.state.evict(s2.connection_id))
+        self.assertEqual(await self.event(stranger), ("peer_left", h.connection_id))
+        self.assertEqual(await self.owner_state(stranger), (0, "HELD_BY_OTHER", s2.connection_id, 3))
+        self.assertEqual(await self.event(stranger), ("peer_left", s2.connection_id))
+        self.assertEqual(await self.owner_state(stranger), (0, "RELEASED", "", 3))
+
+    async def test_merge_owner_request_without_a_known_action_or_request_id_ends_the_stream(self):
+        self.state.merge_owner = True
+        session = await self.create_session()
+        for request_id, action in ((1, pb.MERGE_OWNER_ACTION_UNSPECIFIED), (2, 99), (0, pb.MERGE_OWNER_ACTION_CLAIM)):
+            with self.subTest(request_id=request_id, action=action):
+                call, _ = await self.owner_join(session, f"malformed-{request_id}")
+                await self.owner_request(call, request_id, action)
+                await self.ended(call, grpc.StatusCode.INVALID_ARGUMENT)
+        # Nothing was granted, recorded or announced.
+        self.assertEqual((self.state.sessions[session].owner, self.state.sessions[session].epoch), ("", 0))
+        self.assertEqual((self.state.merge_owner_requests, self.state.merge_owner_log), ([], []))
+        call, _ = await self.owner_join(session, "valid")
+        await self.owner_request(call, 1, pb.MERGE_OWNER_ACTION_CLAIM)
+        self.assertEqual((await self.owner_answer(call, 1))[0][1:], ("GRANTED", self.state.joins[-1]["connection"], 1))
+
     async def test_capacity_rejection_preserves_ledger_and_unused_fault_fails(self):
         session = await self.create_session()
         self.state.max_payload = 2
@@ -630,3 +830,63 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.attempts, {"Ping": 1})
         await proxy.close()  # A client that rejects the name closes before its HTTP/2 preface: ordinary teardown.
         self.assertEqual(proxy.errors, [])
+
+
+class ServeTests(unittest.IsolatedAsyncioTestCase):
+    """`tools/live/reference.py serve` runs the reference service alone for trying the samples."""
+    async def serve(self):
+        script = Path(__file__).resolve().parents[2] / "tools/live/reference.py"
+        process = await asyncio.create_subprocess_exec(sys.executable, "-B", str(script), "serve", "--stop-on-eof",
+                                                       stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        self.addAsyncCleanup(self.reap, process)
+        serving = json.loads(await asyncio.wait_for(process.stdout.readline(), 30))  # Failure-only watchdog.
+        self.assertEqual(serving["type"], "serving")
+        self.assertTrue(serving["authority"].startswith("127.0.0.1:"))
+        self.assertIn("not a deployable service", serving["note"])
+        self.authority = serving["authority"]
+        async with grpc.aio.insecure_channel(serving["authority"]) as channel:
+            stub = rpc.LiveServiceStub(channel)
+            token = (("authorization", "Bearer " + serving["token"]),)
+            created = await stub.CreateSession(pb.CreateSessionRequest(path="serve-base", name="serve"),
+                                               metadata=token, timeout=10)
+            self.assertTrue(created.session_id)
+            with self.assertRaises(grpc.aio.AioRpcError) as refused:
+                await stub.CreateSession(pb.CreateSessionRequest(path="serve-base", name="other"),
+                                         metadata=(("authorization", "Bearer not-the-printed-token"),), timeout=10)
+            self.assertEqual(refused.exception.code(), grpc.StatusCode.UNAUTHENTICATED)
+        return process
+
+    async def reap(self, process):
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+    async def stopped(self, process):
+        self.assertEqual(json.loads(await asyncio.wait_for(process.stdout.readline(), 30)), {"type": "stopped"})
+        self.assertEqual(await asyncio.wait_for(process.wait(), 30), 0)
+
+    async def test_serve_prints_an_accepted_token_and_stops_at_the_end_of_input(self):
+        process = await self.serve()
+        process.stdin.close()
+        await self.stopped(process)
+
+    async def test_serve_refuses_a_port_another_serve_holds(self):
+        process = await self.serve()
+        port = self.authority.rsplit(":", 1)[1]
+        script = Path(__file__).resolve().parents[2] / "tools/live/reference.py"
+        second = await asyncio.create_subprocess_exec(sys.executable, "-B", str(script), "serve", "--port", port,
+                                                      stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                                                      stderr=asyncio.subprocess.DEVNULL)
+        self.addAsyncCleanup(self.reap, second)
+        output, _ = await asyncio.wait_for(second.communicate(), 30)  # Failure-only watchdog.
+        self.assertNotEqual(second.returncode, 0)
+        self.assertNotIn(b'"serving"', output)
+        process.stdin.close()
+        await self.stopped(process)
+
+    # Windows delivers Ctrl+C as KeyboardInterrupt rather than to a handler, and a lane admits no skipped test.
+    if sys.platform != "win32":
+        async def test_serve_stops_cleanly_on_interrupt(self):
+            process = await self.serve()
+            process.send_signal(signal.SIGINT)
+            await self.stopped(process)

@@ -35,7 +35,6 @@ The stream first catches you up:
 - Already current, you receive no content.
 
 A catch-up's `sectionOrder` is the child's position, from 0, among all of its parent's children, and a diff restates every child of a parent with an added, renamed, moved or reordered child.
-A deployment can turn this catch-up behaviour off; its catch-ups then carry only the changed children, each with an order value that is not its position.
 
 Every catch-up then ends with one caught-up header: `total_size` `0`, both timestamps `0`, and no chunks.
 Its `object_id` and `sequence_num` are the position you are now caught up to.
@@ -138,16 +137,18 @@ A join without keepalives is never ended for silence.
 (live-edit-api-streams-endings)=
 ## How streams end
 
-A stream ending queues behind the messages you have not read yet, so you see it only after reading them.
+A `SubscribeReadLayer` ending drops the updates the service has not yet sent you, so it arrives after only those already in transit; a `JoinSession` ending follows its unread events.
 A client that has disconnected receives no status.
 Every other ending the service makes carries a status, except a `JoinSession` whose session was deleted, which ends normally with `OK`.
 
 | Ending | Stream | Meaning | Do |
 |---|---|---|---|
 | `UNAVAILABLE` `server shutting down`, hint `SERVER_SHUTTING_DOWN` | Both | The replica is shutting down, as in a rolling restart | Reconnect after at least `retry_delay`, a minimum wait; keep your own backoff |
+| `UNAVAILABLE`, hint `SERVICE_HELD` | Both | The service is offline for disaster recovery | Reconnect after at least `retry_delay`, a minimum wait; keep your own backoff |
+| `UNAVAILABLE`, hint `UPSTREAM_UNAVAILABLE` | Both | The replica lost contact with the service's storage; your reconnect may reach another replica | Reconnect after at least `retry_delay`, a minimum wait; keep your own backoff |
 | `UNAVAILABLE`, hint `SUBSCRIPTION_CAPACITY`, `READER_CAPACITY` or `CATCHUP_CAPACITY` | Subscribe | The replica had no capacity; arrives before any content, except after a layer replacement | Retry after at least `retry_delay`; keep your own backoff |
 | `UNAVAILABLE` `session is missing from the live store; retry so it can be recovered` | Both | The service lost the session's state | Retry, then follow {ref}`After a restore from backup <live-edit-api-streams-restore>`; without a backup the retry answers `NOT_FOUND` |
-| Any other `UNAVAILABLE` | Subscribe | You did not read for 5 seconds while a message waited, your position aged out of the layer's history, or a transient failure | Resubscribe; read promptly |
+| Any other `UNAVAILABLE` | Subscribe | You did not read for 5 seconds while a message waited, you held the most undelivered updates when the replica's memory for them was full, your position aged out of the layer's history, or a transient failure | Resubscribe; read promptly |
 | Any other `UNAVAILABLE` | Join | You missed presence events, sent no data for three {ref}`keepalive <live-edit-api-streams-keepalives>` intervals, or a transient failure | Rejoin, which brings a fresh member list |
 | `NOT_FOUND` | Both | The session or layer was deleted, does not exist yet, or was lost and could not be recovered | Do not retry; subscribe again only once the layer exists |
 | `OK` | Join | The session was deleted | Do not rejoin |
@@ -173,7 +174,10 @@ Your client sees:
 - Each layer keeps its `object_id`, and its sequence numbers continue well above any number issued before the loss.
 - Edits made after the backup are lost, including ones you received or had acknowledged.
   A catch-up from your position does not remove content that only those lost edits added, so resubscribe each layer with `0` and `0` and replace your copy.
-- Records of committed `operation_id`s can be lost too, so a re-send can apply again, and a chained write can report `last_record` `absent`.
+- A restored layer keeps no record of the `operation_id`s committed on it, so a re-send of a write committed before the restore applies again, and a chained write can report `last_record` `absent`.
+
+After the service was offline for disaster recovery (hint `SERVICE_HELD`), the sessions and layers it restored are listed and open once calls succeed again, and the last three points above apply to those layers.
+A session or layer it could not restore answers `NOT_FOUND`.
 
 (live-edit-api-streams-see-next)=
 ## See next

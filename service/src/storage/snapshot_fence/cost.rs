@@ -40,6 +40,16 @@
 //! order [`FenceCoefficients::timing`] does and round each duration they store
 //! or return up to a whole millisecond.
 //!
+//! One test-only exception, compiled out of release builds: a fenced read
+//! whose client's fault injector lengthens fence leases passes its lease
+//! scripts (acquire, renew, release) the block of
+//! `FenceCoefficients::with_lease_at_least` instead, so its lease lasts at
+//! least twice the client's command timeout (`snapshot_fence::acquire_fence`).
+//! That block moves no script-visible limit but `lease` and `key_linger`, and
+//! the lease carries it from its grant to its release, so every script of
+//! that lease still sees one block. Every other caller, the readers' hooks and
+//! wait caps and the writers' intents included, keeps the recorded block.
+//!
 //! # The coefficient set is the AMR model
 //!
 //! Every cost term but `S`'s is the sandbox fit scaled by the measured AMR /
@@ -324,6 +334,38 @@ impl FenceCoefficients {
             rtt99_ms: RTT99_MS,
             w_wave_ms: W_WAVE_MS,
             s_min_items: S_MIN_ITEMS,
+        }
+    }
+
+    /// This block with the lease raised to at least `floor_ms`, for a test
+    /// that holds a fenced read's window open (the module docs' test-only
+    /// exception; `ObjectSnapshotReadFaultInjector::lengthen_fence_leases`).
+    ///
+    /// Returns `f0 + 4·floor_ms` and `s0 − 4·floor_ms`, every other
+    /// coefficient unchanged. `hold` grows by `4·floor_ms`, so
+    /// `lease = max(4·(rtt99 + Q), hold/4)` is at least `floor_ms`; `hold` and
+    /// `s0` enter `S` additively, so `S`, and with it `intent_ttl`, are
+    /// unchanged; `Q`, `join_window`, `poll` and `min_gap` read neither
+    /// coefficient. Of the limits the scripts use, only `lease` and
+    /// `key_linger` move. [`Self::timing`] on this block reports a raised
+    /// `lease`, `hold`, `epoch`, `reader_wait_max` and `key_linger`, and a
+    /// production-sized `Q`, `join_window`, `poll`, `min_gap`, `S` and
+    /// `intent_ttl`; because of the raised ones, no caller but the lease's own
+    /// scripts and renewal period may take this block.
+    ///
+    /// # Panics
+    ///
+    /// When `floor_ms` is negative or not finite.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn with_lease_at_least(&self, floor_ms: f64) -> Self {
+        assert!(
+            floor_ms.is_finite() && floor_ms >= 0.0,
+            "a lease floor must be a non-negative finite number of ms, got {floor_ms}"
+        );
+        FenceCoefficients {
+            f0_ms: self.f0_ms + 4.0 * floor_ms,
+            s0_ms: self.s0_ms - 4.0 * floor_ms,
+            ..*self
         }
     }
 
@@ -1271,6 +1313,72 @@ mod tests {
                 field.to_bits(),
                 "argv[{i}] {rendered:?} must parse back to exactly {field}"
             );
+        }
+    }
+
+    /// The test-only lease lever's block (`with_lease_at_least`), at every
+    /// recorded example size and for two floors — the test fixtures' (twice
+    /// a 5 s command timeout) and one above every example's production
+    /// `reader_wait_max` — raises the lease to at least the floor, never
+    /// lowers it, and leaves every limit a reader's hooks or a writer sizes
+    /// from the block — `Q`, `join_window`, `poll`, `min_gap`, `S` and
+    /// `intent_ttl` — equal to the recorded block's within 1e-6 ms. Its
+    /// script `ARGV` round-trips exactly, so the lease scripts see that same
+    /// block.
+    #[test]
+    fn with_lease_at_least_raises_the_lease_and_moves_no_other_reader_or_writer_limit() {
+        const UNMOVED_TOLERANCE_MS: f64 = 1e-6;
+        let recorded = shipped();
+        for floor_ms in [10_000.0, 120_000.0] {
+            let lengthened = recorded.with_lease_at_least(floor_ms);
+            let fields = [
+                lengthened.f0_ms,
+                lengthened.f1_ms_per_item,
+                lengthened.f2_ms_per_byte,
+                lengthened.s1_ms_per_item,
+                lengthened.s0_ms,
+                lengthened.ceiling_read_ms,
+                lengthened.rtt99_ms,
+                lengthened.w_wave_ms,
+                lengthened.s_min_items,
+            ];
+            for (i, (rendered, field)) in lengthened.script_argv().iter().zip(fields).enumerate() {
+                let parsed: f64 = rendered.parse().unwrap_or_else(|e| {
+                    panic!("floor {floor_ms}: argv[{i}] {rendered:?} must parse: {e}")
+                });
+                assert_eq!(
+                    parsed.to_bits(),
+                    field.to_bits(),
+                    "floor {floor_ms}: argv[{i}] {rendered:?} must parse back to exactly {field}"
+                );
+            }
+            for row in &RECORDED_ROWS {
+                let what = format!("{} at floor {floor_ms} ms", row.name);
+                let (base, long) = (recorded.timing(row.size), lengthened.timing(row.size));
+                assert!(
+                    long.lease_ms >= floor_ms && long.lease_ms >= base.lease_ms,
+                    "{what}: the lease {} must be at least the floor and the production lease {}",
+                    long.lease_ms,
+                    base.lease_ms
+                );
+                for (got, want, limit) in [
+                    (long.q_ms, base.q_ms, "Q"),
+                    (long.join_window_ms, base.join_window_ms, "join_window"),
+                    (long.poll_ms, base.poll_ms, "poll"),
+                    (long.min_gap_ms, base.min_gap_ms, "min_gap"),
+                    (
+                        long.structural_attempt_ms,
+                        base.structural_attempt_ms,
+                        "structural_attempt",
+                    ),
+                    (long.intent_ttl_ms, base.intent_ttl_ms, "intent_ttl"),
+                ] {
+                    assert!(
+                        (got - want).abs() <= UNMOVED_TOLERANCE_MS,
+                        "{what}: {limit} moved: lengthened {got}, recorded {want}"
+                    );
+                }
+            }
         }
     }
 

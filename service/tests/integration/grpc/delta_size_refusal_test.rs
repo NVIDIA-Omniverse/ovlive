@@ -51,10 +51,13 @@
 //! `TestValkey`'s drop:
 //!
 //! - its purge (`cleanup_keys`) runs `SCAN MATCH <prefix>*` with a page hint
-//!   of 100 and `UNLINK`s the matches in batches of 100, each page and each
-//!   `UNLINK` one round trip, and fails at the first step unanswered for 5 s.
-//!   `SCAN` walks the whole shared keyspace, not just this test's keys, so
-//!   the pages number about the database's key count / 100: no fixed bound.
+//!   of 5,000 (`CLEANUP_SCAN_COUNT`) and `UNLINK`s the matches in batches of
+//!   100, each page and each `UNLINK` one round trip. It fails at the first
+//!   step unanswered for 5 s, a step being each `UNLINK` and each wait for
+//!   the walk's next key, which can span many pages. `SCAN` walks the whole
+//!   shared keyspace, not just
+//!   this test's keys, so the pages number about the database's key count /
+//!   5,000: no fixed bound.
 //!   The `UNLINK`s number this test's keys / 100. The at-limit object
 //!   (`queue_object_state`, plus the create's stream) is one hash per
 //!   section, per field and per time sample (33,333 + 33,333 + 33,333 =
@@ -242,7 +245,8 @@ async fn seq_and_stream(tv: &TestValkey, object_id: u64) -> (u64, u64) {
     )
 }
 
-/// A session with [`LAYER`] created empty, at sequence 1.
+/// A session with [`LAYER`] created from empty content (holding only its
+/// root section), at sequence 1.
 async fn session_with_layer(tv: &TestValkey, svc: &LiveEditService, name: &str) -> (String, u64) {
     create_session_and_layer(tv, svc, name, LAYER).await
 }

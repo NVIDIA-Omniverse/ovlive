@@ -144,7 +144,8 @@
 //! # Placement
 //!
 //! In `storage`: everything a flight touches — the client, the gates, the
-//! budget, the fenced read, `build_diff_payload` for Epic 4's shared build —
+//! budget, the fenced read, the payload layout and fill for Epic 4's shared
+//! build —
 //! is storage's, and the module knows nothing of catch-up regimes, statuses or
 //! streams. The caller (`grpc::subscribe`) maps a [`FlightWaitError`] to its
 //! ending and races every wait here against its own endings (shutdown,

@@ -45,9 +45,13 @@ def not_executable(path):
 
 
 PINS = {
-    "grpc": "1.65.4-1", "protobuf": "5.26.0-2", "abseil": "20240116.1-1",
-    "re2": "20230301-1", "c-ares": "1.34.8-0", "openssl": "3.5.9-0", "zlib": "1.3.2-0",
+    "grpc": "1.83.1-21", "protobuf": "5.29.5-6", "abseil": "20250127.0-0",
+    "re2": "20250722-4", "c-ares": "1.34.9-0", "openssl": "3.5.9-0", "zlib": "1.3.2-0",
 }
+# Packages sharing abseil's inline code: Linux links their GCC release builds, Windows its per-configuration builds.
+GCC_PACKAGES = {"grpc", "protobuf", "abseil", "re2"}
+WINDOWS = "windows-x86_64"
+LINUX = "manylinux_2_35_x86_64 manylinux_2_35_aarch64"
 
 
 class LiveDependencyGenerationTests(unittest.TestCase):
@@ -79,12 +83,18 @@ class LiveDependencyGenerationTests(unittest.TestCase):
         self.generate()
         target = self.manifest("target")
         host = self.manifest("host")
-        target_packages = {p.attrib["name"]: p.attrib["version"] for p in target.findall("./dependency/package")}
-        host_packages = {p.attrib["name"]: p.attrib["version"] for p in host.findall("./dependency/package")}
-        self.assertEqual(target_packages, {name: f"{version}-manylinux_2_35_aarch64-static-${{config}}"
-                                           for name, version in PINS.items()})
-        self.assertEqual(host_packages, {name: f"{PINS[name]}-manylinux_2_35_x86_64-static-release"
-                                        for name in ("grpc", "protobuf")})
+        packages = lambda root: sorted((p.attrib["name"], p.attrib["version"], p.attrib.get("platforms"))
+                                       for p in root.findall("./dependency/package"))
+        expected_target = []
+        for name, version in PINS.items():
+            prefix = f"{version}-manylinux_2_35_aarch64-static-"
+            expected_target += ([(name, prefix + "${config}", WINDOWS), (name, prefix + "release-gcc", LINUX)]
+                                if name in GCC_PACKAGES else [(name, prefix + "${config}", None)])
+        self.assertEqual(packages(target), sorted(expected_target))
+        expected_host = [(name, f"{PINS[name]}-manylinux_2_35_x86_64-static-{suffix}", platforms)
+                         for name in ("grpc", "protobuf")
+                         for suffix, platforms in (("release", WINDOWS), ("release-gcc", LINUX))]
+        self.assertEqual(packages(host), sorted(expected_host))
         self.assertEqual(len(target.findall("dependency")), 7)
         self.assertEqual(len(host.findall("dependency")), 2)
         self.assertFalse(target.findall("import") or host.findall("import"))
@@ -393,7 +403,6 @@ class LivePackageStageTests(unittest.TestCase):
             "share/omni_usd_live/THIRD_PARTY_LICENSES.txt": b"synthetic third-party license texts",
             "share/omni_usd_live/BOM.json": b'{"synthetic bill of materials": true}',
             "share/omni_usd_live/provenance/live-proto.md": b"synthetic protocol provenance",
-            "share/omni_usd_live/provenance/wire-schema/provenance.json": b'{"synthetic": true}',
             "share/omni_usd_live/provenance/wire-schema/UPSTREAM-NOTICE.txt": b"synthetic schema license",
             "share/omni_usd_live/provenance/flatbuffers/LICENSE.txt": b"synthetic FlatBuffers license",
             "share/omni_usd_live/provenance/flatbuffers/provenance.json": b'{"synthetic flatbuffers": true}',
@@ -616,6 +625,60 @@ class LivePackageStageTests(unittest.TestCase):
         machine(b"\x3e\x00")
         with self.assertRaisesRegex(ValueError, "linux-aarch64 ELF"):
             build.validate_stage(self.stage)
+
+    def test_stage_identity_names_the_validated_stage_by_its_manifest(self):
+        manifest = hashlib.sha256((self.stage / "package-manifest.json").read_bytes()).hexdigest()
+        self.assertEqual(build.stage_identity(self.stage, "linux-x86_64"),
+                         {"path": str(self.stage), "manifest_sha256": manifest})
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            build.stage_identity(self.stage, "windows-x86_64")
+        sample = self.stage / "python/omni/usd/live/sample.py"
+        sample.write_bytes(self.members["python/omni/usd/live/sample.py"] + b" altered")
+        with self.assertRaisesRegex(ValueError, "hash mismatch"):
+            build.stage_identity(self.stage, "linux-x86_64")
+
+    def test_runner_refuses_an_altered_stage_before_the_package_campaign_launches(self):
+        from tools.live import platforms, test as runner
+        from tools.live.test_support import ProcessResult
+        artifacts = self.root / "runs"
+        launched = []
+
+        def process(command, **options):
+            launched.append(command)
+            return ProcessResult("failed", 1, 1, 0, False, True)
+
+        def run():
+            before = set(artifacts.iterdir()) if artifacts.exists() else set()
+            arguments = ["--suite", "writer-fuzz", "--writer-fuzz-profile", "package", "--seed", "42",
+                         "--plugin-driver", str(self.root / "live_plugin_driver"),
+                         "--scene-transport-driver", str(self.root / "live_scene_transport_driver"),
+                         "--reference-python", str(self.root / "python"), "--reference-openssl", str(self.root / "openssl"),
+                         "--staged-package", str(self.stage), "--artifact-dir", str(artifacts)]
+            with patch.object(runner, "suite_platform_error", return_value=None), \
+                    patch.object(platforms, "host", return_value=platforms.PLATFORMS["linux-x86_64"]), \
+                    patch("sys.argv", ["test.py", *arguments]), \
+                    patch.object(runner, "fingerprint", return_value="source-fingerprint"), \
+                    patch.object(runner, "identity", return_value="toolchain"), \
+                    patch.object(runner, "native_identity", return_value={"sanitizers": False}), \
+                    patch.object(runner, "run_process", side_effect=process), \
+                    patch.object(runner.platform, "platform", return_value="synthetic-platform"), \
+                    patch.object(runner.subprocess, "run",
+                                 return_value=subprocess.CompletedProcess([], 0, stdout='{"reference":"synthetic"}')), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                status = runner.main()
+            run = next(iter(set(artifacts.iterdir()) - before))
+            return status, json.loads((run / "manifest.json").read_text())["results"][0]
+
+        sample = self.stage / "python/omni/usd/live/sample.py"
+        sample.write_bytes(self.members["python/omni/usd/live/sample.py"] + b" altered")
+        status, result = run()
+        self.assertEqual((status, result["outcome"]), (2, "infrastructure_error"))
+        self.assertIn("staged package unavailable: Package member hash mismatch", result["reason"])
+        self.assertEqual(launched, [], "the package campaign launched with an altered stage")
+        sample.write_bytes(self.members["python/omni/usd/live/sample.py"])
+        run()
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched[0][launched[0].index("--staged-package") + 1], str(self.stage))
 
     def test_macos_stage_checks_native_members_and_sample_execute_permission(self):
         for source, destination in zip(build.native_files("linux-x86_64"), build.native_files("macos-arm64")):
@@ -935,6 +998,53 @@ class LiveBuildPlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build.plan(self.args)
         self.assertFalse(Path(self.args.build_dir).exists())
+
+    def test_windows_debug_plan_requires_the_sdks_debug_tbb_library(self):
+        self.args.platform, self.args.config = 'windows-x86_64', 'debug'
+        for source in (Path(self.args.usd_root) / 'lib').glob('lib*.so'):
+            source.with_name(source.name[3:-3] + '.lib').write_text('synthetic import library')
+        self.write('sdks/python_root/include/patchlevel.h', '#define PY_MAJOR_VERSION 3\n#define PY_MINOR_VERSION 12\n')
+        self.write('sdks/python_root/libs/python312.lib', 'synthetic Python import library')
+        self.write('sdks/python_root/python.exe', 'synthetic interpreter, never run').chmod(0o755)
+        with patch.object(build.platforms, 'host', return_value=build.platforms.get('windows-x86_64')):
+            with self.assertRaisesRegex(FileNotFoundError, 'tbb_debug.lib'):
+                build.plan(self.args)
+            sdk = Path(self.args.usd_root)
+            (sdk / 'lib/tbb.lib').rename(sdk / 'lib/tbb_debug.lib')
+            self.assertEqual(build.plan(self.args)['config'], 'debug')
+            self.args.config = 'release'
+            with self.assertRaisesRegex(FileNotFoundError, 'tbb.lib'):
+                build.plan(self.args)
+
+    def test_cmake_links_the_windows_tbb_variant_required_by_the_configuration(self):
+        cmake = shutil.which('cmake')
+        self.assertIsNotNone(cmake, 'Foundation requires CMake')
+        source = self.root / 'cmake-contract'
+        source.mkdir()
+        sdk = Path(self.args.usd_root)
+        (sdk / 'lib/tbb.lib').touch()
+        (sdk / 'lib/tbb_debug.lib').touch()
+        (source / 'CMakeLists.txt').write_text(
+            'cmake_minimum_required(VERSION 3.20)\nproject(TbbConfig NONE)\nset(WIN32 TRUE)\n'
+            f'set(LIVE_USD_ROOT "{sdk.as_posix()}")\n'
+            f'include("{(ROOT / "cmake/LiveUsdSdk.cmake").as_posix()}")\n'
+            'add_library(consumer INTERFACE)\nlive_link_usd(consumer INTERFACE tbb)\n'
+            'get_target_property(links consumer INTERFACE_LINK_LIBRARIES)\n'
+            'file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/definitions-$<CONFIG>.txt" '
+            'CONTENT "$<TARGET_GENEX_EVAL:consumer,$<TARGET_PROPERTY:consumer,INTERFACE_COMPILE_DEFINITIONS>>")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/links.txt" "${links}")\n')
+        for configuration, library in (('Debug', 'tbb_debug.lib'), ('Release', 'tbb.lib')):
+            output = self.root / ('cmake-' + configuration)
+            subprocess.run([cmake, '-S', str(source), '-B', str(output), '-DCMAKE_BUILD_TYPE=' + configuration],
+                           check=True, capture_output=True, text=True)
+            self.assertEqual((output / 'links.txt').read_text(), (sdk / 'lib' / library).as_posix())
+            definitions = (output / f'definitions-{configuration}.txt').read_text()
+            self.assertEqual(definitions, 'TBB_USE_DEBUG=1' if configuration == 'Debug' else '')
+        (sdk / 'lib/tbb_debug.lib').unlink()
+        rejected = subprocess.run([cmake, '-S', str(source), '-B', str(self.root / 'cmake-missing'),
+                                   '-DCMAKE_BUILD_TYPE=Debug'], capture_output=True, text=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('tbb_debug.lib', rejected.stderr)
 
     def test_plan_builds_only_for_the_host_platform(self):
         with patch.object(build.platforms, "host", return_value=build.platforms.PLATFORMS["linux-aarch64"]):

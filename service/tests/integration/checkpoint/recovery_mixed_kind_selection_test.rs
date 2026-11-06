@@ -184,7 +184,7 @@ use live_edit::grpc::layer::{handle_stat_layer, handle_update_layer};
 use live_edit::grpc::proto::StatLayerRequest;
 use live_edit::grpc::BearerToken;
 use live_edit::observability::metrics::{SharedMetrics, CHECKPOINT_RESTORE_LINEAGE_OUTCOMES};
-use oodf_ffi::{OwnedDelta, SetField};
+use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, SetField, StructCommand};
 
 use super::helpers::*;
 use crate::common::owned_delta::delta_to_ompf_bytes;
@@ -270,10 +270,21 @@ fn stat_request(session_id: &str, layer_name: &str) -> Request<StatLayerRequest>
 ///
 /// `section_id = 0` addresses the root scope that exists by construction
 /// after `CreateLayer`, so no parent section has to be materialized first.
+/// The diff is a whole-layer reset, so it restates the layer's root section
+/// (section 1 under 0, type 7, which the empty `CreateLayer` leaves): a reset
+/// without a top-level section would remove the layer's last one, which
+/// `UpdateLayer` refuses (SDD §9.7).
 fn field_update_delta(set_order: u64, marker: u8) -> OwnedDelta {
     OwnedDelta {
         is_diff: true,
         base_version: 0,
+        struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+            parent_id: 0,
+            section_id: 1,
+            section_name: String::new(),
+            section_type: 7,
+            section_order: 0,
+        })],
         set_fields: vec![SetField {
             section_id: 0,
             key_name: format!("mixed-kind-field-{set_order}"),

@@ -32,14 +32,17 @@
 //! **Its teardown.** The GC's `DEL meta data` takes the field with the meta
 //! when a value is collected, so a collected value carries no confirmation
 //! that could outlive it, and the confirm script, which never creates a meta,
-//! cannot revive one. The checkpoint collect clears it after it deletes the
-//! value's backup copy ([`clear_ext_backup`]), so the next repair pass re-sends
-//! a value Valkey still holds. The one exception, until b.g65's fence closes
-//! it: a confirmation from an upload or existence check that answered just
-//! before the delete, landing after the clear (the confirm script checks only
-//! the meta and its stamp, and the collect changes neither). It stands for a
-//! copy that no longer exists until the repair's daily audit re-checks it,
-//! about 24 h later.
+//! cannot revive one. The checkpoint collect's post-delete step
+//! ([`clear_ext_backup`], `scripts/ext_backup_clear.lua`) clears it after the
+//! collect deletes the value's backup copy, so the next repair pass re-sends a
+//! value Valkey still holds, and in the same run stamps the meta's
+//! [`BACKUP_CLEARED_MS_FIELD`] with the time of that clear. A confirmation
+//! whose caller began relying on the copy — its upload or existence check —
+//! at or before that stamp is declined (b.g65), so an upload or existence
+//! check that answered just before the delete cannot confirm the copy after
+//! the clear. Every confirming caller passes its reliance start: the mirror
+//! worker its item's `last_store_ms`, the backup repair its pass's Valkey
+//! read, the collect's heal its own read time.
 //!
 //! **The repair's Valkey reads.** The meta walk's pipelined `HMGET`
 //! ([`read_backup_marks`]), the size of a stored value ([`stored_ext_value_len`])
@@ -69,17 +72,30 @@ use crate::storage::client::{
 use crate::storage::connection_buffers::GENERAL_LIMITS;
 use crate::storage::ext_reconcile::LAST_STORE_MS_FIELD;
 use crate::storage::keys::KeySchema;
+use crate::storage::recon_fence::recon_ext_rearm;
 
 /// The `ext:meta` field holding a value's backup confirmation,
 /// `<store id>:<ms>` (module docs). The Lua writer names it literally, so the
 /// two spellings must match.
 pub const BACKED_UP_IN_FIELD: &str = "backed_up_in";
 
+/// The `ext:meta` field holding the Valkey time, in ms, at which the
+/// checkpoint collect last deleted the value's backup copy (module docs). The
+/// Lua writer and reader name it literally, so the spellings must match.
+pub const BACKUP_CLEARED_MS_FIELD: &str = "backup_cleared_ms";
+
 /// `scripts/ext_backup_confirm.lua`: write [`BACKED_UP_IN_FIELD`] only while
-/// the meta exists and carries the caller's `last_store_ms`. The script header
-/// carries the contract.
+/// the meta exists, carries the caller's `last_store_ms`, and records no
+/// backup-copy delete at or after the caller's reliance start. The script
+/// header carries the contract.
 pub static EXT_BACKUP_CONFIRM_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::from_lua(include_str!("scripts/ext_backup_confirm.lua")));
+
+/// `scripts/ext_backup_clear.lua`: on an existing meta, remove
+/// [`BACKED_UP_IN_FIELD`] and stamp [`BACKUP_CLEARED_MS_FIELD`] in one run.
+/// The script header carries the contract.
+pub static EXT_BACKUP_CLEAR_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/ext_backup_clear.lua")));
 
 /// A [`BACKED_UP_IN_FIELD`] value split into its store id and confirmation
 /// time in Valkey milliseconds, or `None` when it is not of that shape
@@ -95,10 +111,14 @@ pub fn parse_backed_up_in(raw: &str) -> Option<(&str, u64)> {
 
 /// Record that the backup store `store_id` holds the bytes of `hash_hex`: one
 /// `EVALSHA` of [`EXT_BACKUP_CONFIRM_SCRIPT`] on the data pool. `Ok(true)` when
-/// the field was written; `Ok(false)` when the meta is gone or its
+/// the field was written; `Ok(false)` when the meta is gone, its
 /// `last_store_ms` is no longer `last_store_ms` (pass `""` for a meta read
-/// with no stamp), which is not an error: the value is checked again by the
-/// next repair pass.
+/// with no stamp), or the checkpoint collect deleted the backup copy at or
+/// after `reliance_start_ms` — the Valkey time, in ms, at which the caller
+/// began relying on the copy (its upload's item stamp, its existence check's
+/// pass read). None of these is an error: the value is checked again by the
+/// next repair pass. `None` skips the delete check (an older caller's
+/// behaviour); every caller in this build passes `Some`.
 ///
 /// Call it only after the backup store answered that it holds the bytes.
 pub async fn confirm_ext_backup(
@@ -107,36 +127,50 @@ pub async fn confirm_ext_backup(
     hash_hex: &str,
     store_id: &str,
     last_store_ms: &str,
+    reliance_start_ms: Option<u64>,
 ) -> Result<bool, fred::error::Error> {
     let origin = FredErrOrigin::client(client, POOL_LABEL_DATA);
     let written: i64 = EXT_BACKUP_CONFIRM_SCRIPT
         .evalsha_with_reload::<i64, _, _>(
             client.pool.next(),
             vec![keys.ext_meta(hash_hex)],
-            vec![store_id.to_owned(), last_store_ms.to_owned()],
+            vec![
+                store_id.to_owned(),
+                last_store_ms.to_owned(),
+                reliance_start_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_default(),
+            ],
         )
         .await
         .inspect_err(|e| origin.observe_error(e))?;
     Ok(written == 1)
 }
 
-/// Remove `hash_hex`'s backup confirmation: `HDEL` of [`BACKED_UP_IN_FIELD`]
-/// on the data pool. The checkpoint collect runs it after deleting the value's
-/// backup copy, so a value Valkey still holds reads as owed and the repair
-/// re-sends it, unless a confirmation that raced the delete lands after the
-/// clear (module docs, "Its teardown"). On an absent meta it creates nothing.
+/// The checkpoint collect's post-delete step for `hash_hex`: one `EVALSHA` of
+/// [`EXT_BACKUP_CLEAR_SCRIPT`] on the data pool, run right after the backup
+/// store deleted the value's copy. On an existing meta it removes
+/// [`BACKED_UP_IN_FIELD`] — so a value Valkey still holds reads as owed and
+/// the repair re-sends it — and stamps [`BACKUP_CLEARED_MS_FIELD`], which
+/// declines every confirmation that started relying on the deleted copy
+/// (module docs, "Its teardown"), and answers `Ok(true)`: the value is live,
+/// and the collect re-puts it from Valkey. On an absent meta it writes nothing
+/// and answers `Ok(false)`.
 pub async fn clear_ext_backup(
     client: &ValkeyClient,
     keys: &KeySchema,
     hash_hex: &str,
-) -> Result<(), fred::error::Error> {
+) -> Result<bool, fred::error::Error> {
     let origin = FredErrOrigin::client(client, POOL_LABEL_DATA);
-    let _: i64 = client
-        .pool
-        .hdel(keys.ext_meta(hash_hex), BACKED_UP_IN_FIELD)
+    let live: i64 = EXT_BACKUP_CLEAR_SCRIPT
+        .evalsha_with_reload::<i64, _, _>(
+            client.pool.next(),
+            vec![keys.ext_meta(hash_hex)],
+            Vec::<String>::new(),
+        )
         .await
         .inspect_err(|e| origin.observe_error(e))?;
-    Ok(())
+    Ok(live == 1)
 }
 
 /// What one meta key's [`read_backup_marks`] reply carried, each field as
@@ -332,8 +366,10 @@ pub async fn read_ext_value_bytes(
 
 /// The stored length of the data key `key` and whether it exists: a
 /// `STRLEN`, then an `EXISTS` only when the length is 0 (an absent key and an
-/// empty value both read 0). Reads no bytes.
-async fn stored_len_and_presence(
+/// empty value both read 0). Reads no bytes. Also the catch-up payload
+/// builder's length probe
+/// (`ValkeyExternalValueStore::probe_value_lengths`).
+pub(crate) async fn stored_len_and_presence(
     client: &ValkeyClient,
     origin: &FredErrOrigin<'_>,
     key: &str,
@@ -418,6 +454,31 @@ impl ExtBackupMarks {
         &self.store_id
     }
 
+    /// The checkpoint clean-up's fence for one upload of `hash_hex`, run
+    /// immediately before the upload ([`recon_ext_rearm`] with no stem, on the
+    /// data pool): it records that the hash is referenced again, so a collect
+    /// that commits afterwards refuses to delete it, and answers `Ok(true)`
+    /// when the collect licensed the delete of its backup copy within
+    /// `lookback` — then the upload would resurrect a collected copy and must
+    /// not run. `grace` is the reconciliation grace.
+    pub async fn collect_fenced(
+        &self,
+        hash_hex: &str,
+        lookback: std::time::Duration,
+        grace: std::time::Duration,
+    ) -> Result<bool, fred::error::Error> {
+        let reply = recon_ext_rearm(
+            &self.client,
+            &self.keys,
+            &[hash_hex.to_owned()],
+            lookback,
+            grace,
+            None,
+        )
+        .await?;
+        Ok(reply.refuses())
+    }
+
     /// Confirm `hash_hex` once the backup store answered that it holds the
     /// bytes — a successful upload, or the repair's existence check that found
     /// them ([`confirm_ext_backup`]) — best effort: a failure is counted as
@@ -425,14 +486,17 @@ impl ExtBackupMarks {
     /// DEBUG and otherwise ignored, because the value then keeps whatever
     /// confirmation it had (none, for a new copy) and the repair checks it
     /// again. A declined confirmation
-    /// (`Ok(false)`) is not counted.
-    pub async fn confirm(&self, hash_hex: &str, last_store_ms: &str) {
+    /// (`Ok(false)`) is not counted. `reliance_start_ms` is the Valkey time
+    /// at which the caller began relying on the copy; a backup-copy delete at
+    /// or after it declines the confirmation.
+    pub async fn confirm(&self, hash_hex: &str, last_store_ms: &str, reliance_start_ms: u64) {
         if let Err(e) = confirm_ext_backup(
             &self.client,
             &self.keys,
             hash_hex,
             &self.store_id,
             last_store_ms,
+            Some(reliance_start_ms),
         )
         .await
         {

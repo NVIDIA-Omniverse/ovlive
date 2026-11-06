@@ -23,10 +23,26 @@ helm template suite "$chart" --set service.basePath=https://example.test/base --
 grep -q 'backoffLimit: 0' "$scratch/secret.yaml"
 grep -q 'readOnlyRootFilesystem: true' "$scratch/secret.yaml"
 grep -q 'secretName: bearer' "$scratch/secret.yaml"
+# The Job runs the suite binary of the image named by the chart, which is the
+# conformance image's own ENTRYPOINT. CI never runs the chart, so this is the
+# only check that couples the chart's command to the image it pulls.
+grep -qF 'image: "nvcr.io/nvidia/omniverse/live-edit-conformance-tests:' "$scratch/secret.yaml"
+command="$(sed -n 's/^[[:space:]]*command:[[:space:]]*//p' "$scratch/secret.yaml")"
+if [ "$command" != '["/app/live-edit-conformance"]' ]; then
+  echo "Unexpected Job command: $command" >&2; exit 1
+fi
+entrypoint="$(sed -n 's/^ENTRYPOINT[[:space:]]*//p' Dockerfile.conformance)"
+if [ "$command" != "$entrypoint" ]; then
+  echo "Job command $command is not Dockerfile.conformance's ENTRYPOINT $entrypoint" >&2; exit 1
+fi
 helm template suite "$chart" --set service.basePath=https://example.test/base --set auth.sidecar.image=identity:1 --set serviceAccountName=trusted-subject > "$scratch/sidecar.yaml"
 grep -q 'serviceAccountName: trusted-subject' "$scratch/sidecar.yaml"
 grep -q 'restartPolicy: Always' "$scratch/sidecar.yaml"
 if grep -q 'kind: ServiceAccount' "$scratch/sidecar.yaml"; then exit 1; fi
+# The image is a single Rust binary; nothing the chart renders may invoke Python.
+if grep -qi python "$scratch/secret.yaml" "$scratch/sidecar.yaml"; then
+  echo 'The rendered chart refers to Python' >&2; exit 1
+fi
 if helm template suite "$chart" --set service.basePath=https://example.test/base > "$scratch/invalid.yaml" 2>&1; then
   echo 'Chart accepted missing credentials' >&2; exit 1
 fi

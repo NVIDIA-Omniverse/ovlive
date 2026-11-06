@@ -16,8 +16,10 @@
 //! The refusal detail a status carries, decoded as a client decodes it, and
 //! the assertions every refusal test shares.
 //!
-//! A refusal that applied nothing — a load-shedding or shutdown refusal, or a
-//! `CreateLayer` / `UpdateLayer` refused before its commit
+//! A refusal that applied nothing — a load-shedding or shutdown refusal, a
+//! disaster-recovery hold's refusal or stream ending (`SERVICE_HELD`), or a
+//! `CreateLayer` / `UpdateLayer` refused before its commit, or a refusal or
+//! stream ending of a replica whose hold verdict went stale
 //! (`UPSTREAM_UNAVAILABLE`) — is `UNAVAILABLE` with its usual message plus, in
 //! `grpc-status-details-bin`, a `google.rpc.ErrorInfo` {reason, domain
 //! `nvidia.omniverse.live.v1alpha`, metadata} and a `google.rpc.RetryInfo`
@@ -40,7 +42,7 @@ use std::time::Duration;
 
 use live_edit::error::{
     refusal_metadata, refusal_reason, RefusalDetail, RetryDelayRange, ServiceError,
-    CAPACITY_RETRY_DELAY, REFUSAL_DETAIL_DOMAIN, SHUTDOWN_RETRY_DELAY,
+    CAPACITY_RETRY_DELAY, REFUSAL_DETAIL_DOMAIN, SERVICE_HELD_RETRY_DELAY, SHUTDOWN_RETRY_DELAY,
     UPSTREAM_UNAVAILABLE_RETRY_DELAY,
 };
 use tonic::{Code, Status};
@@ -124,8 +126,10 @@ pub fn assert_shutdown_status(status: &Status) {
 }
 
 /// Assert `status` is a `CreateLayer` / `UpdateLayer` refused before its
-/// commit for a dependency outage: `UNAVAILABLE` with `UPSTREAM_UNAVAILABLE`,
-/// no metadata, and a `retry_delay` in `[1 s, 3 s)`.
+/// commit for a dependency outage, or a refusal or stream ending of a replica
+/// whose disaster-recovery hold verdict went stale (SDD SR-6.5): `UNAVAILABLE`
+/// with `UPSTREAM_UNAVAILABLE`, no metadata, and a `retry_delay` in
+/// `[1 s, 3 s)`.
 #[track_caller]
 pub fn assert_upstream_unavailable(status: &Status) {
     assert_refusal_detail(
@@ -134,6 +138,43 @@ pub fn assert_upstream_unavailable(status: &Status) {
         &[],
         UPSTREAM_UNAVAILABLE_RETRY_DELAY,
     );
+}
+
+/// Assert `status` is a disaster-recovery hold's refusal or stream ending:
+/// `UNAVAILABLE "service is offline for disaster recovery (incident …)"`
+/// naming `incident` — `incident unknown` for `None` — with `SERVICE_HELD`, no
+/// metadata, and a `retry_delay` in `[30 s, 35 s)` (SDD SR-6.1).
+#[track_caller]
+pub fn assert_service_held(status: &Status, incident: Option<&str>) {
+    assert_eq!(
+        status.message(),
+        format!(
+            "service is offline for disaster recovery (incident {})",
+            incident.unwrap_or("unknown")
+        ),
+        "{status:?}"
+    );
+    assert_refusal_detail(
+        status,
+        refusal_reason::SERVICE_HELD,
+        &[],
+        SERVICE_HELD_RETRY_DELAY,
+    );
+}
+
+/// The message of a refusal or stream ending of a replica whose
+/// disaster-recovery hold verdict went stale (SDD SR-6.5).
+pub const STALE_VERDICT_MESSAGE: &str =
+    "this replica lost contact with the backing store and stopped serving until it restarts; \
+     retry";
+
+/// Assert `status` is a stale hold verdict's refusal or stream ending:
+/// [`assert_upstream_unavailable`] with [`STALE_VERDICT_MESSAGE`]. A hold's
+/// `SERVICE_HELD` status fails the reason check.
+#[track_caller]
+pub fn assert_stale_verdict(status: &Status) {
+    assert_upstream_unavailable(status);
+    assert_eq!(status.message(), STALE_VERDICT_MESSAGE, "{status:?}");
 }
 
 /// Assert `status` carries no refusal detail: no `ErrorInfo`, no `RetryInfo`,

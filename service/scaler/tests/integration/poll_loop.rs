@@ -595,6 +595,66 @@ async fn a_fleet_with_a_terminating_endpoint_gets_no_scale_down() {
     );
 }
 
+/// A pod that reports a disaster-recovery hold freezes the count (SDD
+/// SR-7a): the same idle fleet that scales down with no hold
+/// ([`an_idle_settled_fleet_scales_down_with_one_scale_patch_and_no_pod_patch`])
+/// gets no PATCH of `/scale` or of any pod, though the held pod is unready
+/// (its verdict went stale too), and the poll counts once as
+/// `decisions_total{direction="none", reason="held"}` and once as
+/// `scale_down_blocked_total{reason="held"}`.
+#[tokio::test]
+async fn a_held_pod_freezes_the_count_with_no_patch_and_counts_held() {
+    let cluster = Cluster::start(
+        &[
+            ready("server-a", idle()),
+            ready("server-b", idle()),
+            PodSpec {
+                name: "server-held",
+                ready: false,
+                terminating: false,
+                answer: with(|s| s.held = true),
+            },
+        ],
+        3,
+        3,
+    )
+    .await;
+    let (mut scaler, metrics) = cluster.scaler(config(true));
+
+    let decision = scaler.poll_once().await.expect("the API reads succeed");
+    assert_eq!(
+        (decision.action, decision.scale_down_blocked),
+        (Action::Hold, Some(BlockReason::Held))
+    );
+    assert_eq!(verbs_and_paths(&cluster.api_requests().await), poll_reads());
+    let text = render(&metrics);
+    assert_eq!(
+        sample(
+            &text,
+            "live_edit_scaler_decisions_total",
+            &[("direction", "none"), ("reason", "held")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &text,
+            "live_edit_scaler_scale_down_blocked_total",
+            &[("reason", "held")]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        sample(
+            &text,
+            "live_edit_scaler_decisions_total",
+            &[("direction", "none"), ("reason", "scale_down_blocked")]
+        ),
+        Some(0.0),
+        "a freeze is counted as held, not as an ordinary blocked scale-down"
+    );
+}
+
 /// With deletion cost on, a Ready pod that does not report holds the
 /// scale-down, so no pod is annotated and `/scale` is not patched.
 #[tokio::test]
@@ -1104,14 +1164,18 @@ impl Drop for MetricsPort {
 const CATCHUP_RATE: &str = "live_edit_scaler_catchup_rate";
 
 /// `live_edit_scaler_catchup_rate` as scraped: the fleet value (if any) and
-/// each pod's value by pod name.
+/// each pod's value by pod name, read from the `server_pod` label.
 fn catchup_rate_series(text: &str) -> (Option<f64>, HashMap<String, f64>) {
     let fleet = sample(text, CATCHUP_RATE, &[("scope", "fleet")]);
-    let pods = crate::common::label_values(text, CATCHUP_RATE, "pod")
+    let pods = crate::common::label_values(text, CATCHUP_RATE, "server_pod")
         .into_iter()
         .map(|pod| {
-            let value = sample(text, CATCHUP_RATE, &[("scope", "pod"), ("pod", &pod)])
-                .expect("a pod series has a value");
+            let value = sample(
+                text,
+                CATCHUP_RATE,
+                &[("scope", "pod"), ("server_pod", &pod)],
+            )
+            .expect("a pod series has a value");
             (pod, value)
         })
         .collect();
@@ -1138,9 +1202,9 @@ fn draining(completed: u64) -> ResponseTemplate {
 /// After each decided poll the gauge carries exactly what the decision used:
 /// `{scope="fleet"}` the λ̂ it decided with (the prior before any pod has
 /// learned one), and one `{scope="pod"}` series per reporting pod with a
-/// learned value. The state is replaced whole each poll, so a pod that leaves
-/// the EndpointSlices loses its series; and on a poll where no pod reports,
-/// both scopes are absent.
+/// learned value, naming the pod in `server_pod` (not `pod`). The state is
+/// replaced whole each poll, so a pod that leaves the EndpointSlices loses its
+/// series; and on a poll where no pod reports, both scopes are absent.
 #[tokio::test]
 async fn catchup_rate_gauge_follows_each_decided_poll_and_drops_what_is_gone() {
     let cluster = Cluster::start(
@@ -1172,11 +1236,18 @@ async fn catchup_rate_gauge_follows_each_decided_poll_and_drops_what_is_gone() {
     answer_with(&cluster.pods[0], draining(50)).await;
     answer_with(&cluster.pods[1], draining(30)).await;
     let second = scaler.poll_once().await.expect("the API reads succeed");
-    let (fleet, pods) = catchup_rate_series(&port.scrape().await);
+    let text = port.scrape().await;
+    let (fleet, pods) = catchup_rate_series(&text);
     assert_eq!(
         second.pod_catchup_rates.len(),
         2,
         "fixture self-check: both pods learned"
+    );
+    assert_eq!(
+        crate::common::label_values(&text, CATCHUP_RATE, "pod"),
+        std::collections::BTreeSet::new(),
+        "a pod series names the server pod in `server_pod`, never in `pod`, which a \
+         PodMonitor or scrape config sets to the scaler's own pod:\n{text}"
     );
     assert_close(
         fleet.expect("a fleet series"),

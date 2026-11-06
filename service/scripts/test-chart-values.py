@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Offline chart value regressions: value naming and the server's memory
-request. Requires Helm and PyYAML; never contacts a cluster.
+"""Offline chart value regressions: value naming, value checks, the server's
+memory request and the checkpoint tick's maximum. Requires Helm and PyYAML;
+never contacts a cluster.
 
 * Every value in the service chart's values.yaml is camelCase: no key holds
   an underscore.
@@ -31,8 +32,14 @@ request. Requires Helm and PyYAML; never contacts a cluster.
   fail in one message; and a `helm upgrade --reuse-values` from a chart with
   the old names fails the same way, with the `--reset-then-reuse-values`
   remedy. That case is simulated by rendering this chart's templates over
-  today's values.yaml with the 46 names put back: it models the renamed
+  today's values.yaml with the 45 names put back: it models the renamed
   values, not every other difference of an actual earlier chart.
+* `valkey.commandTimeoutMs` of 0, however it is written, fails the render
+  naming the default to set instead, as the binary refuses 0 at startup; a
+  positive value renders as set.
+* `checkpoint.notFoundCacheSecs` (read only by the DR Jobs) renders 900 by
+  default and any whole number of seconds as set, 0 included; a negative,
+  fractional or non-numeric value fails the render naming it.
 * The server container's memory request. Unset (absent, null or empty), it
   renders 70% of resources.limits.memory, rounded down to whole Mi, for every
   quantity form Kubernetes accepts: binary and decimal units, plain bytes,
@@ -48,6 +55,21 @@ request. Requires Helm and PyYAML; never contacts a cluster.
   be set" message. The CPU request, extra resources and the scaler's CPU
   request are untouched. Expected figures come from an exact rational oracle
   in this file (`quantity_bytes`), never from the chart's own output.
+* checkpoint.tick: 19 and the default 10 render, and 20 or more fails the
+  render naming the value, its maximum and the setting to change, as the
+  binary refuses a tick of 20 s or more (two thirds of the 30 s checkpoint
+  leader-lock TTL).
+* The integer rows (`IntegerRowTests`): sixteen ConfigMap rows,
+  minReadySeconds and tests.ttlSecondsAfterFinished go through the
+  nonNegativeInteger helper. Text, a fraction, a negative number, "5.0" and
+  "0x10" fail the render naming the key; surrounding space and a leading "+"
+  are accepted; a values-file million renders as digits; each row's default
+  digits are pinned. Null and "" keep each row's meaning (refused, left out,
+  derived, or `required`'s "must be set"), as do the 0 sentinels: 0 renders
+  where it means "off" or "never wait", and leaves the variable or field out
+  where it means "unset", however it is written. A tracing batch setting of 0
+  fails as below its minimum of 1. A `"` or `\\` in a text value fails naming
+  templates/configmap.yaml.
 """
 
 from fractions import Fraction
@@ -58,6 +80,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from typing import NamedTuple
 import unittest
 
 import yaml
@@ -203,7 +226,7 @@ class ChartValueNamingTests(unittest.TestCase):
         self.assertEqual(missing, [], f"{CONFIG_PAGE.name} names values the chart lacks")
 
     def test_the_renamed_list_maps_each_old_name_to_an_existing_value(self):
-        self.assertEqual(len(self.renamed), 46)
+        self.assertEqual(len(self.renamed), 45)
         for section, old, new in self.renamed:
             with self.subTest(f"{section}.{old}"):
                 self.assertEqual(new, camel(old))
@@ -262,6 +285,54 @@ class ChartValueNamingTests(unittest.TestCase):
     def test_the_default_render_passes(self):
         result = render()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+COMMAND_TIMEOUT_ZERO =("valkey.commandTimeoutMs is 0, which is no longer accepted: 0 meant "
+                        "no timeout, and the service refuses it at startup. Set a timeout in "
+                        "milliseconds, such as the default 5000")
+
+
+class ChartValueCheckTests(unittest.TestCase):
+    def test_a_zero_command_timeout_fails_the_render_naming_the_default(self):
+        # The binary refuses LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS=0 at startup;
+        # the chart refuses it first, however 0 is written.
+        for flag, value in (("--set", "0"), ("--set", "00"), ("--set-string", "0"),
+                            ("--set-string", "00"), ("--set-string", "+0")):
+            with self.subTest(f"{flag} {value}"):
+                result = render(SERVICE_CHART, flag, f"valkey.commandTimeoutMs={value}")
+                self.assertNotEqual(result.returncode, 0, "the render succeeded")
+                self.assertIn(COMMAND_TIMEOUT_ZERO, result.stderr)
+
+    def test_a_positive_command_timeout_renders_as_set(self):
+        result = render(SERVICE_CHART, "--set", "valkey.commandTimeoutMs=1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS: "1"', result.stdout)
+        self.assertNotIn(COMMAND_TIMEOUT_ZERO, result.stderr)
+
+    def test_the_not_found_cache_renders_its_default_and_any_whole_number_of_seconds(self):
+        # checkpoint.notFoundCacheSecs, read only by the DR Jobs: 900 by
+        # default, 0 allowed, as the binary takes any whole number.
+        result = render()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS: "900"',
+                      result.stdout)
+        for value in ("0", "3600"):
+            with self.subTest(value):
+                result = render(SERVICE_CHART, "--set", f"checkpoint.notFoundCacheSecs={value}")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    f'LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS: "{value}"',
+                    result.stdout)
+
+    def test_a_not_found_cache_that_is_not_a_whole_number_fails_the_render_naming_it(self):
+        # The binary refuses these at startup; the chart refuses them first.
+        for value in ("-1", "1.5", "x"):
+            with self.subTest(value):
+                result = render(SERVICE_CHART, "--set-string",
+                                f"checkpoint.notFoundCacheSecs={value}")
+                self.assertNotEqual(result.returncode, 0, "the render succeeded")
+                self.assertIn("checkpoint.notFoundCacheSecs must be a non-negative whole number "
+                              "(seconds)", result.stderr)
 
 
 class ServerMemoryRequestTests(unittest.TestCase):
@@ -504,6 +575,279 @@ class ServerMemoryRequestTests(unittest.TestCase):
                 container = yaml.safe_load(result.stdout)["spec"]["template"]["spec"]["containers"][0]
                 env = {item["name"]: item.get("value") for item in container["env"]}
                 self.assertEqual(env["LIVE_EDIT_SCALER_CPU_REQUEST"], cpu)
+
+
+class CheckpointTickTests(unittest.TestCase):
+    """checkpoint.tick at most 19: the binary refuses a tick of 20 s or more
+    at startup (two thirds of the 30 s checkpoint leader-lock TTL), and the
+    chart refuses to render one, naming the value, the maximum and the
+    setting to change."""
+
+    def configmap_tick(self, tick):
+        result = render_server("--set", f"checkpoint.tick={tick}",
+                               template="templates/configmap.yaml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return yaml.safe_load(result.stdout)["data"]["LIVE_EDIT_CHECKPOINT_TICK_SECS"]
+
+    def test_a_tick_of_19_renders(self):
+        self.assertEqual(self.configmap_tick(19), "19")
+
+    def test_the_default_tick_renders(self):
+        result = render_server(template="templates/configmap.yaml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            yaml.safe_load(result.stdout)["data"]["LIVE_EDIT_CHECKPOINT_TICK_SECS"], "10")
+
+    def test_a_tick_of_20_or_more_fails_naming_the_value(self):
+        for tick in (20, 59):
+            with self.subTest(tick=tick):
+                result = render_server("--set", f"checkpoint.tick={tick}")
+                self.assertNotEqual(result.returncode, 0, "the render succeeded")
+                self.assertIn(f"checkpoint.tick is {tick}", result.stderr)
+                self.assertIn("must be 19 or less", result.stderr)
+                self.assertIn("Set checkpoint.tick to at most 19", result.stderr)
+
+
+CONFIGMAP = "templates/configmap.yaml"
+DEPLOYMENT = "templates/deployment.yaml"
+SMOKE_TEST = "templates/tests/smoke-test.yaml"
+# What a row renders when its variable or field is left out.
+ABSENT = "<absent>"
+# The row fails the render with the nonNegativeInteger helper's message.
+REFUSED = "<refused>"
+# The row fails the render with its `required` message ("<key> must be set").
+MUST_BE_SET = "<must be set>"
+
+TRACING_ON = {"observability": {"tracing": {
+    "enabled": True, "endpoint": {"grpc": "http://otel.example.com:4317"}}}}
+SMOKE_TEST_ON = {"tests": {"enabled": True,
+                           "storageApiResourceBase": "https://storage.example.com/container/"}}
+# A grace that covers a stream-ending window of a million seconds, so the
+# termination-grace check passes whatever window a case sets.
+LONG_GRACE = {"terminationGracePeriodSeconds": 2000000}
+
+
+def env_row(var):
+    return lambda doc: doc["data"].get(var, ABSENT)
+
+
+def spec_field(name):
+    return lambda doc: doc["spec"].get(name, ABSENT)
+
+
+class IntegerRow(NamedTuple):
+    key: str
+    template: str
+    read: object
+    # The rendered form of a digit string: a ConfigMap value is a string, a
+    # Kubernetes field an integer.
+    form: object
+    default: object
+    on_null: object
+    on_empty: object
+    extra: dict = {}
+
+
+def configmap_row(key, var, default, on_null=REFUSED, on_empty=REFUSED, extra=None):
+    return IntegerRow(key, CONFIGMAP, env_row(var), str, default, on_null, on_empty,
+                      extra or {})
+
+
+# Each row with its default and what null and "" render. Shapes: refused
+# both ways (the ceilings, the tail caps, the tracing batch settings), left
+# out both ways (memoryBytes, extReleaseMaxBytes, the subscriber waiter cap,
+# the smoke-test retention), left out or derived on null but refused on ""
+# (uploadAdmissionWaitMs, minReadySeconds), and `required` (the two paced
+# stream-ending settings).
+INTEGER_ROWS = (
+    configmap_row("valkey.snapshotAtomicReadMaxItems", "LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS",
+                  "37554"),
+    configmap_row("valkey.snapshotAtomicReadMaxBytes", "LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_BYTES",
+                  "604619"),
+    configmap_row("layer.maxSize", "LIVE_EDIT_MAX_LAYER_SIZE", "104857600"),
+    configmap_row("layer.uploadAdmissionMaxWaiters", "LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS",
+                  "64"),
+    configmap_row("checkpoint.tail.maxChain", "LIVE_EDIT_CHECKPOINT_TAIL_MAX_CHAIN", "8"),
+    configmap_row("checkpoint.tail.maxEntries", "LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES", "4096"),
+    configmap_row("checkpoint.tail.maxBytes", "LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES", "67108864"),
+    configmap_row("valkey.memoryBytes", "LIVE_EDIT_VALKEY_MEMORY_BYTES", ABSENT,
+                  on_null=ABSENT, on_empty=ABSENT),
+    configmap_row("valkey.extReleaseMaxBytes", "LIVE_EDIT_EXT_RELEASE_MAX_BYTES", ABSENT,
+                  on_null=ABSENT, on_empty=ABSENT),
+    configmap_row("layer.uploadAdmissionWaitMs", "LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS", ABSENT,
+                  on_null=ABSENT),
+    configmap_row("valkey.subscriberAdmissionMaxWaiters",
+                  "LIVE_EDIT_SUBSCRIBER_ADMISSION_MAX_WAITERS", ABSENT,
+                  on_null=ABSENT, on_empty=ABSENT),
+    configmap_row("shutdown.streamEndRate", "LIVE_EDIT_SHUTDOWN_STREAM_END_RATE", "25",
+                  on_null=MUST_BE_SET, on_empty=MUST_BE_SET),
+    configmap_row("shutdown.streamEndMaxWindowSecs",
+                  "LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS", "20",
+                  on_null=MUST_BE_SET, on_empty=MUST_BE_SET, extra=LONG_GRACE),
+    configmap_row("observability.tracing.batch.maxQueueSize", "OTEL_BSP_MAX_QUEUE_SIZE", "2048",
+                  extra=TRACING_ON),
+    configmap_row("observability.tracing.batch.maxExportBatchSize",
+                  "OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "512", extra=TRACING_ON),
+    configmap_row("observability.tracing.batch.scheduleDelayMs", "OTEL_BSP_SCHEDULE_DELAY",
+                  "5000", extra=TRACING_ON),
+    # Null derives timeoutSecs + streamEndMaxWindowSecs + 5 (test-shutdown-chart.py).
+    IntegerRow("minReadySeconds", DEPLOYMENT, spec_field("minReadySeconds"), int, 30,
+               on_null=30, on_empty=REFUSED),
+    IntegerRow("tests.ttlSecondsAfterFinished", SMOKE_TEST,
+               spec_field("ttlSecondsAfterFinished"), int, 900,
+               on_null=ABSENT, on_empty=ABSENT, extra=SMOKE_TEST_ON),
+)
+ROWS = {row.key: row for row in INTEGER_ROWS}
+
+
+def merged(base, overlay):
+    """`base` with `overlay` merged in key by key (a deep copy)."""
+    result = json.loads(json.dumps(base))
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = merged(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def at_path(dotted, value):
+    """A values tree holding `value` at the dotted path."""
+    for part in reversed(dotted.split(".")):
+        value = {part: value}
+    return value
+
+
+class IntegerRowTests(unittest.TestCase):
+    """Every integer row goes through the nonNegativeInteger helper, keeping
+    the meaning of null, "" and 0 that its @param documents. Before, most of
+    them went through a bare `| int64`, which turned text or null into 0,
+    "0x10" into 16 and a fraction into its whole part, so a typo could switch
+    a limit off unseen."""
+
+    UNSET = object()
+
+    def render_row(self, row, value=UNSET, *args):
+        """The render of `row`'s template with `value` at its key in a values
+        file (written as YAML, so a number stays a number) and `args`."""
+        values = row.extra
+        if value is not self.UNSET:
+            values = merged(values, at_path(row.key, value))
+        return render_server(*args, values=yaml.safe_dump(values), template=row.template)
+
+    def rendered(self, row, value=UNSET, *args):
+        """What `row` renders: its value, or ABSENT."""
+        result = self.render_row(row, value, *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return row.read(yaml.safe_load(result.stdout))
+
+    def assert_refused(self, row, value=UNSET, *args):
+        result = self.render_row(row, value, *args)
+        self.assertNotEqual(result.returncode, 0, "the render succeeded")
+        self.assertIn(f"{row.key} must be a non-negative whole number (", result.stderr)
+
+    def assert_outcome(self, row, expected, value):
+        if expected == REFUSED:
+            self.assert_refused(row, value)
+        elif expected == MUST_BE_SET:
+            result = self.render_row(row, value)
+            self.assertNotEqual(result.returncode, 0, "the render succeeded")
+            self.assertIn(f"{row.key} must be set:", result.stderr)
+        else:
+            self.assertEqual(self.rendered(row, value), expected)
+
+    def test_each_row_renders_its_default_digits(self):
+        self.assertEqual(len(INTEGER_ROWS), 18)
+        for row in INTEGER_ROWS:
+            with self.subTest(row.key):
+                self.assertEqual(self.rendered(row), row.default)
+
+    def test_a_value_that_is_not_a_whole_number_fails_naming_the_key(self):
+        # On most rows the old chart rendered these 0, 1, -1, 5 and 16.
+        for row in INTEGER_ROWS:
+            for value in ("fast", 1.5, -1):
+                with self.subTest(row.key, values_file=value):
+                    self.assert_refused(row, value)
+            for value in ("5.0", "0x10"):
+                with self.subTest(row.key, set_string=value):
+                    self.assert_refused(row, self.UNSET, "--set-string", f"{row.key}={value}")
+
+    def test_surrounding_space_and_a_leading_plus_render_the_digits(self):
+        # The binary's integer parse accepts both; the old chart read " 64"
+        # as 0.
+        for row in INTEGER_ROWS:
+            for value in (" 64", "+64"):
+                with self.subTest(row.key, value=value):
+                    self.assertEqual(self.rendered(row, value), row.form("64"))
+
+    def test_a_million_from_a_values_file_renders_as_digits(self):
+        # Helm decodes a values-file number as float64; rendered as is, a
+        # million reads 1e+06, which the binary's integer parse refuses.
+        for row in INTEGER_ROWS:
+            with self.subTest(row.key):
+                self.assertEqual(self.rendered(row, 1000000), row.form("1000000"))
+
+    def test_null_and_empty_keep_each_rows_meaning(self):
+        for row in INTEGER_ROWS:
+            for value, expected in ((None, row.on_null), ("", row.on_empty)):
+                with self.subTest(row.key, value=value):
+                    self.assert_outcome(row, expected, value)
+
+    def test_zero_renders_where_it_is_a_setting(self):
+        # 0 turns the release budget off, never waits for an upload slot, or
+        # ends every stream at once; minReadySeconds 0 makes a pod available
+        # once Ready.
+        for key in ("valkey.extReleaseMaxBytes", "layer.uploadAdmissionWaitMs",
+                    "shutdown.streamEndRate", "shutdown.streamEndMaxWindowSecs",
+                    "minReadySeconds"):
+            row = ROWS[key]
+            with self.subTest(key, values_file=0):
+                self.assertEqual(self.rendered(row, 0), row.form("0"))
+            with self.subTest(key, set_string="0"):
+                self.assertEqual(self.rendered(row, self.UNSET, "--set-string", f"{key}=0"),
+                                 row.form("0"))
+
+    def test_a_zero_subscriber_waiter_cap_however_written_is_left_out(self):
+        # 0 means "follow the subscription ceiling", and the binary refuses an
+        # explicit 0, so the variable is left out. The old chart rendered a
+        # quoted "0" (truthy) as "0".
+        row = ROWS["valkey.subscriberAdmissionMaxWaiters"]
+        for value in (0, "0", "00", "+0", " 0"):
+            with self.subTest(value=value):
+                self.assertEqual(self.rendered(row, value), ABSENT)
+        self.assertEqual(self.rendered(row, 64), "64")
+
+    def test_a_zero_smoke_test_retention_renders_no_field(self):
+        # To Kubernetes a ttlSecondsAfterFinished of 0 deletes the Job at once;
+        # the chart's 0 keeps it.
+        row = ROWS["tests.ttlSecondsAfterFinished"]
+        for value in (0, "0"):
+            with self.subTest(value=value):
+                self.assertEqual(self.rendered(row, value), ABSENT)
+
+    def test_a_zero_tracing_batch_setting_fails_naming_its_minimum(self):
+        for key in ("maxQueueSize", "maxExportBatchSize", "scheduleDelayMs"):
+            row = ROWS[f"observability.tracing.batch.{key}"]
+            for value in (0, "00", " 0"):
+                with self.subTest(key, value=value):
+                    result = self.render_row(row, value)
+                    self.assertNotEqual(result.returncode, 0, "the render succeeded")
+                    self.assertIn(f"{row.key} must be at least 1", result.stderr)
+            with self.subTest(key, value=" 100"):
+                self.assertEqual(self.rendered(row, " 100"), "100")
+
+    def test_a_quote_or_backslash_in_a_text_value_fails_naming_the_configmap(self):
+        # A `"` or an unknown `\` escape in a double-quoted ConfigMap row stops
+        # the ConfigMap parsing as YAML; deployment.yaml reads the rendered
+        # ConfigMap and names the template rather than failing on its absence.
+        # A values file, as `--set` drops a backslash.
+        for level in ('in"fo', "info\\q"):
+            with self.subTest(level=level):
+                result = render_server(values=yaml.safe_dump(
+                    {"observability": {"logging": {"level": level}}}))
+                self.assertNotEqual(result.returncode, 0, "the render succeeded")
+                self.assertIn("templates/configmap.yaml does not render as valid YAML",
+                              result.stderr)
 
 
 if __name__ == "__main__":

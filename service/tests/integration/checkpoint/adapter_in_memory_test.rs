@@ -17,7 +17,7 @@
 //!
 //! Task `t2.fgj.ya.74` Subtask `t3.fgj.ya.74.77`. This file is the
 //! per-adapter test-only entry point that drives every enumerated SR-1.3
-//! conformance case (`case_01_*` … `case_42_*`, defined in
+//! conformance case (`case_01_*` … `case_44_*`, defined in
 //! [`super::conformance`]) against a fresh [`InMemoryCheckpointStore`]. The
 //! per-case body lives in the harness; each `#[tokio::test]` here is a
 //! single line that hands the harness a `setup` closure.
@@ -446,6 +446,21 @@ async fn case_43_list_live_ext_set_counts_its_own_listing_and_projects_to_the_li
         setup,
     )
     .await;
+}
+
+// Case #44 — the DR Jobs' list-route canary (`verify_list_route`). Rides the
+// regular `setup`: this adapter answers it with no I/O.
+#[tokio::test]
+async fn case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed() {
+    super::conformance::case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed(setup).await;
+}
+
+// Case #45 — the DR restore Job's one listing, grouped per object. Rides the
+// artifact fixture, which plants no orphan and no temp on this adapter.
+#[tokio::test]
+async fn case_45_grouped_layer_artifacts_equal_each_objects_listing() {
+    super::conformance::case_45_grouped_layer_artifacts_equal_each_objects_listing(setup_artifacts)
+        .await;
 }
 
 #[cfg(feature = "test-checkpoint-fault-injection")]

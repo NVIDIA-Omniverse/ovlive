@@ -17,9 +17,9 @@ Every profile builds Release binaries with test assertions enabled, runs the man
 
 | Profile | Sanitizers | Python adapter and `python-reference` | Writer campaign | Contract step watchdog |
 | --- | --- | --- | --- | --- |
-| `presubmit` (default) | none | yes | `ci` | 40 minutes |
+| `presubmit` (default) | none | yes | `ci`; `package` after staging | 40 minutes |
 | `asan` | ASan and UBSan with leak detection, suppressions in `tools/live/lsan.supp` | no | `ci` | 40 minutes |
-| `nightly` | none | yes | `nightly` | 90 minutes |
+| `nightly` | none | yes | `nightly`; `package` after staging | 90 minutes |
 | `tsan` | ThreadSanitizer with suppressions in `tools/live/tsan.supp`; instrumented steps run under `setarch <machine> -R`, where `<machine>` is `x86_64` or `aarch64`; `stock-25.11` only | no | `ci` | 90 minutes |
 | `soak` | none | built, not tested (no `python-reference`) | `soak` (one case) | 210 minutes |
 
@@ -45,6 +45,7 @@ The entry point runs these steps in order, each under a failure watchdog, and st
 | `stack-dump` | Checks that a native test driver answers SIGQUIT with every thread's stack, as the runner's watchdog uses it | 1 minute |
 | `install` and the two package checks | Installs the package, checks that its notices match the repository and (except in the sanitizer profiles) that its layout is exact, then checks native load order after relocation and, where the profile builds Python, the Python package from outside the checkout | 2 minutes each |
 | `package-stage`, `package-archive` and the two archive checks | In `presubmit` and `nightly`: builds the release package with `tools/live/build.py` in its own build directory, archives and checks it with `tools/release/archive.py`, then checks native load order after relocation and the Python package on the extracted `omni_usd_live` folder | 30, 5 and 2 minutes |
+| `package-samples` | In `presubmit` and `nightly`, after `package-stage`: runs the `package` writer campaign with `tools/live/test.py --suite writer-fuzz --writer-fuzz-profile package --staged-package <stage>` into the run's `package-tests/` directory, so the stage's samples run beside the build's seeded writers and the staged-samples reduction self-test runs ([testing guide](ovlive-testing.md#oracles)); the step checks that the run used the CI seed, the build's writer drivers and the stage | 20 minutes |
 
 A step whose watchdog expires captures thread stacks the same way ([testing guide](ovlive-testing.md#determinism-rules)).
 
@@ -93,25 +94,25 @@ The SDK and tool inputs are those of the [build guide](ovlive-build.md#prerequis
 
 ## Worker setup
 
-1. Use a worker of the selected build platform with the SDKs, tools and configuration described above. The release workflow selects its self-hosted workers by the platform labels in [Provision release controls](ovlive-release.md#provision-release-controls); standalone qualification uses the worker on which `tools/live/ci.py` runs.
+1. Use a worker of the selected build platform with the SDKs, tools and configuration described above; standalone qualification uses the worker on which `tools/live/ci.py` runs.
 2. Install the SDKs, tools and configuration outside the checkout and pass their paths explicitly.
 3. On Linux, install a host Python whose `os` and `signal` modules provide `pidfd_open` and `pidfd_send_signal`; the entry point uses them to contain every workload process and fails without them. Windows requires the Job Object containment described in the [testing guide](ovlive-testing.md#service-readiness-and-cleanup).
 4. Run the [entry point](#running) with the worker configuration and a fresh output directory for each attempt. Retain its plan, summary, logs and test results, including failures, as qualification evidence. Installing dependencies alone supplies no qualification result.
 
 ## Qualification campaign
 
-A release candidate needs the evidence of one qualification campaign before the [support boundary](ovlive-support-boundary.md#qualification-boundary) can claim the gates the campaign covers for that commit. The campaign runs every CI profile plus a few repeated runs that no single profile covers, and records each result against the commit it ran at. Two gates take their evidence elsewhere: Kit integration from the `kit-reference` lane on the Kit profile ([Kit guide](ovlive-kit.md#running-the-kit-reference-lane)) and the manual Kit run the open item `kit-rerun` tracks, and Performance from the [storage benchmarks](ovlive-benchmarks.md), which have no budgets to qualify (`gate-performance`). The campaign needs one worker configuration per USD profile (`usd_profile` set to `stock-25.11` and to `kit-25.11`) and the [reference interpreter](ovlive-testing.md#local-setup).
+A release candidate needs the evidence of one qualification campaign before the [support boundary](ovlive-support-boundary.md#qualification-boundary) can claim the gates the campaign covers for that commit. The campaign runs every CI profile plus a few repeated runs that no single profile covers, and records each result against the commit it ran at. Two gates take their evidence elsewhere: Kit integration from the `kit-reference` lane on the Kit profile ([Kit guide](ovlive-kit.md#running-the-kit-reference-lane)) and the manual Kit run the open item `kit-rerun` tracks, and Performance from the [work budgets](ovlive-benchmarks.md#work-budgets), which the `scene-journal` suite of every profile but `soak` checks, and the [recorded comparison](ovlive-benchmarks.md#recorded-edit-benchmark-results) with the previous client that `gate-performance` tracks. The campaign needs one worker configuration per USD profile (`usd_profile` set to `stock-25.11` and to `kit-25.11`) and the [reference interpreter](ovlive-testing.md#local-setup).
 
 Run the steps in this order. The cheap checks come first so a shape or harness failure stops the campaign before hours of worker time, and the later steps use the builds the earlier ones produce:
 
-1. Check formatting with `python3 -B tools/release/check_format.py --clang-format <clang-format 18.1.1>` and run the source tests below.
+1. Check formatting with `git diff --check` and `python3 -B tools/release/check_format.py --clang-format <clang-format 18.1.1>`; each exits 0 and reports no finding.
 2. The `foundation` suite on the host Python and on the worker configuration's `reference_python`. The campaign covers two Python versions only when that interpreter's version differs from the host Python's, so the record names both versions.
 3. `presubmit` on both USD profiles, then CTest on each profile's build directory with the `ctest` beside the worker configuration's `cmake` (`ctest --test-dir` needs CMake 3.20 or later); every CTest test passes, and the `presubmit` builds disable none (the sanitizer builds disable `live_uri_contract`).
 4. `asan` on `stock-25.11`.
 5. `nightly` on both USD profiles; each run also stages, archives and checks the release archive, and its summary records the archive name, SHA-256, source revision and dirty state; `tools/release/archive.py check --archive <archive> --against <other>` compares the archives of two runs of one commit member by member.
 6. The `nightly` writer campaign at two further master seeds chosen for the record, for example 7 and the release date as a number, with the plugin and scene transport drivers of the `nightly` run's build for that USD profile, so the campaign covers more seeded histories of the same binaries.
 7. `tsan` on `stock-25.11` only, at two seeds, each run alone, because ThreadSanitizer is timing-sensitive and other load changes which interleavings it sees; `ci.py` refuses the `kit-25.11` configuration for `tsan`.
-8. The auth-watchdog probe: the `actor-auth-timeout` native driver mode 50 times against each `presubmit` build's unary driver, each iteration against a fresh reference service; every iteration applies its edit and none reaches the auth terminal watchdog. This probes the open item `test-intermittent`.
+8. The auth-watchdog probe: the `actor-auth-timeout` native driver mode 50 times against each `presubmit` build's unary driver, each iteration against a fresh reference service; every iteration applies its edit and none reaches the auth terminal watchdog. Its repetitions give an auth watchdog expiry with no identified cause a chance to recur; an expiry logs its `auth-idle-watchdog` or `auth-terminal-watchdog` line with the actor's and endpoint's auth state and writes the driver's stack dump before the driver aborts.
 9. Two stress runs against the `presubmit` stock build's Python extension: `test_python_host.PythonHostTests.test_python_plain_usd_edits_converge_between_two_hosts` and `test_python_creation.PythonCreationTests.test_python_creation_dispatch_failure_keeps_the_host_layer_exportable`, each as 8 parallel processes of 40 iterations, to surface ordering defects that a single pass hides; every one of the 320 iterations of each test passes.
 10. The `soak` profile on `stock-25.11`, alone, because its memory and thread checks compare against its own warm-up values and other load distorts them.
 
@@ -146,3 +147,9 @@ Record every run as it finishes, one row per run:
 A record names the commit each run was taken at. When one record holds runs from more than one commit, it lists every file that differs between those commits (`git diff --name-only <commit> <commit>`), so a reader can judge whether the difference can affect the earlier runs.
 
 A failure is a result, not noise. A passing rerun does not count as evidence and does not replace the failure in the record: find the root cause, fix it, and rerun the affected profiles at the new head, which the record then names.
+
+## Windows debug qualification
+
+The optional worker field `configuration` defaults to `release`. A Windows `stock-25.11` worker provisioned with `--configuration debug` selects debug OpenUSD and debug target libraries for the `presubmit` or `nightly` profile. The selection remains explicit through native identity verification, staged samples, relocated plugin/Python loading, archive verification and packman packaging. A main candidate qualifies the stock Windows debug companion after the release package in the same Windows stock job; SDK links, output directories, portable evidence and package names distinguish the two configurations ([Windows debug hosts](ovlive-build.md#windows-debug-hosts)).
+
+The Windows debug companion excludes the four whole-heap fault-injection lanes listed in the [support boundary](ovlive-support-boundary.md#supported-configuration). Its plan, summary and portable package evidence carry `excluded_suites`; candidate verification rejects exclusions on release packages and requires the exact declared debug boundary. It retains native/Python relocation and package checks. A debug result does not establish the complete release qualification or allocation-failure containment.

@@ -164,8 +164,8 @@ async fn consume_from_cursor_starts_strictly_after_given_id() {
     // …and the cursor is exclusive at its own ID: the commit the pin was taken
     // at is NOT re-delivered. Over-delivery here is the mirror failure — it is
     // what the steady-state `sequence_num <= tracked_version` filter would then
-    // have to absorb, and the coalesced-snapshot regime has no such filter for
-    // entries its diff already folded in (`catch_up_in_window_snapshot`).
+    // have to absorb, and the in-window regime's coalesced catch-up has no such
+    // filter for entries its diff already folded in (`catch_up_in_window`).
     let extra = consumer.try_recv().await;
     assert!(
         extra.is_none(),
@@ -431,6 +431,123 @@ async fn consumer_delivers_an_entry_whose_ompf_field_is_not_valid_utf8() {
     consumer.unsubscribe().await;
 }
 
+/// b.ntm (T14, T8): the live-delivery ledger through a real stream reader. A
+/// stream registered with a subscription's hold charges each entry it is
+/// offered to that hold: in the backlog until received, then in the pipeline
+/// until the received entry drops (`recv_held`), while `recv` releases it as
+/// it returns. The entries' relay copies are charged once each, whatever the
+/// holders, and a consumer dropped with entries still in its backlog
+/// releases them: the ledger returns to zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_entry_stays_in_its_holds_pipeline_until_dropped_and_a_dropped_backlog_is_released()
+{
+    use bytes::Bytes;
+    use live_edit::storage::notifications::reserve_layer_stream;
+    use live_edit::storage::stream_mux::delivery_ledger::{
+        HoldIdentity, RELAY_BUF_OVERHEAD_BYTES, RELAY_ENTRY_OVERHEAD_BYTES,
+    };
+
+    const RELAY_BYTES: usize = 10_000;
+    let tv = TestValkey::setup().await;
+    let object_id: u64 = 4343;
+    let ledger = std::sync::Arc::clone(tv.client().stream_mux.delivery_ledger());
+    let hold = ledger.register_hold(HoldIdentity::default());
+    let consumer = reserve_layer_stream(
+        tv.client(),
+        tv.key_schema(),
+        object_id,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .await
+    .expect("a reader is reserved")
+    .with_hold(&hold)
+    .register(&StreamCursor::From("0-0".to_string()))
+    .expect("the stream registers");
+
+    let stream_key = tv.key_schema().layer_stream(object_id);
+    for seq in 1..=3u64 {
+        let fields: Vec<(&str, fred::types::Value)> = vec![
+            (
+                "payload",
+                format!("update|{object_id}|{seq}|writer|10|20").into(),
+            ),
+            (
+                "ompf",
+                fred::types::Value::Bytes(Bytes::from(vec![seq as u8; RELAY_BYTES])),
+            ),
+        ];
+        let id = format!("{seq}-0");
+        let _: String = tv
+            .client()
+            .pool
+            .xadd(&stream_key, false, None, id.as_str(), fields)
+            .await
+            .expect("XADD must succeed");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hold.backlog_entries() < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the reader offers the three entries"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let copy = RELAY_BYTES as u64 + RELAY_BUF_OVERHEAD_BYTES;
+    assert_eq!(
+        (
+            hold.pipeline_entries(),
+            hold.pipeline_bytes(),
+            ledger.charged_bytes()
+        ),
+        (3, 3 * copy, 3 * copy + 3 * RELAY_ENTRY_OVERHEAD_BYTES),
+        "three entries offered, each copy charged once and each entry queued"
+    );
+
+    let held = tokio::time::timeout(Duration::from_secs(5), consumer.recv_held())
+        .await
+        .expect("an entry arrives")
+        .expect("the consumer yields it");
+    assert_eq!(held.id, "1-0");
+    assert_eq!(
+        (hold.pipeline_entries(), hold.backlog_entries()),
+        (3, 2),
+        "a held entry leaves the backlog and stays in the pipeline"
+    );
+    drop(held);
+    let (id, _) = tokio::time::timeout(Duration::from_secs(5), consumer.recv())
+        .await
+        .expect("an entry arrives")
+        .expect("the consumer yields it");
+    assert_eq!(id, "2-0");
+    assert_eq!(
+        (hold.pipeline_entries(), hold.backlog_entries()),
+        (1, 1),
+        "dropping the held entry and `recv` both release theirs"
+    );
+
+    drop(consumer);
+    assert_eq!(
+        (
+            hold.pipeline_entries(),
+            hold.backlog_entries(),
+            hold.pipeline_bytes()
+        ),
+        (0, 0, 0),
+        "the consumer dropped with an entry in its backlog released it"
+    );
+    drop(hold);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while ledger.charged_bytes() != 0 || ledger.holds() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the ledger returns to zero: charged {} B, {} holds",
+            ledger.charged_bytes(),
+            ledger.holds()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // ── Unregistration, churn and admission (the multiplexer's lifecycle) ──────
 //
 // A subscription is an in-memory registration on a shared reader. Dropping the
@@ -449,7 +566,6 @@ async fn connect_with_subscriber_pool(
     let key_schema = KeySchema::new(&prefix);
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -531,6 +647,10 @@ async fn connect_with_subscriber_pool(
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -1270,10 +1390,11 @@ async fn connection_id_by_name(observer: &ValkeyClient, name: &str) -> i64 {
 /// error fred REALLY produces for a server-side `-UNBLOCKED` (b.9yf).
 ///
 /// The fixture reproduces, by hand, what a `CLIENT UNBLOCK` from outside the
-/// service does to a reader's live read — the same server reply fred's
-/// `Blocking::Interrupt` provokes. (Before b.19i a queued credential-refresh
-/// `AUTH` provoked it on every rotation; since b.19i a reader re-AUTHs between
-/// its reads, so in production only an outside unblock reaches a live read.)
+/// service does to a reader's live read. (Before b.19i a queued
+/// credential-refresh `AUTH` provoked it on every rotation, through the
+/// readers' `Blocking::Interrupt`; since b.19i a reader re-AUTHs between its
+/// reads, and since b.9sh every client runs fred's default `Blocking::Block`,
+/// so in production only an outside unblock reaches a live read.)
 ///
 ///   1. Take an idle stream reader client — the same pool, and so the same fred
 ///      client configuration, the multiplexed XREADs run on — with the
@@ -1302,12 +1423,13 @@ async fn is_client_unblocked_error_accepts_the_real_server_unblocked_reply() {
     const BLOCK_MS: u64 = 30_000;
 
     let tv = TestValkey::setup().await;
-    // An idle reader `PING`s its own connection on its keepalive, and a
-    // command on this client while the XREAD below is parked would `CLIENT
-    // UNBLOCK` it before the test's own unblock could. The knob seam exists
-    // only under `test-fault-injection` (which CI's runs enable); without it
-    // the production keepalive (every 200 s, from a random offset) leaves a
-    // small chance of that early unblock.
+    // An idle reader `PING`s its own connection on its keepalive. Under
+    // fred's default `Blocking::Block` such a `PING` would only queue behind
+    // the XREAD below, but the test keeps the client its own: the keepalive
+    // is turned off. The knob seam exists only under `test-fault-injection`
+    // (which CI's runs enable); without it the production keepalive (every
+    // 200 s, from a random offset) may queue one `PING` behind the read,
+    // which the unblock then lets through.
     #[cfg(feature = "test-fault-injection")]
     tv.client()
         .stream_mux
@@ -1323,9 +1445,9 @@ async fn is_client_unblocked_error_accepts_the_real_server_unblocked_reply() {
 
     // Readers connect lazily, the first time they serve a subscription:
     // connect reader 0 (standalone routing sends object 0 to it), then let the
-    // subscription go. Its read is left blocked on the server, and the command
-    // below interrupts it (`Blocking::Interrupt`); with no subscription left
-    // the reader then has nothing to read, so the client is ours.
+    // subscription go; the fixture ends the read it leaves blocked, and with
+    // no subscription left the reader has nothing to read, so the client is
+    // ours.
     super::mux_test_helpers::connect_reader_zero(tv.client()).await;
     let exclusive = tv
         .client()

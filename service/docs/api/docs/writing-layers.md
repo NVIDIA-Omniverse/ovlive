@@ -47,6 +47,7 @@ Send exactly one header message, then zero or more chunk messages carrying the c
 An upload applies only if its stream ends normally, with you closing your side after the last chunk.
 If you cancel it, or its stream is reset or its connection lost before you finish, nothing applies and the service answers `CANCELLED`.
 A header followed by a normal end is a valid empty upload.
+A `CreateLayer` whose content leaves the layer empty creates it holding only its {ref}`root section <live-edit-api-validation-root>`.
 A cancel or connection loss after you finished sending may already have applied: re-send with the same `operation_id`.
 
 (live-edit-api-writing-layers-objects)=
@@ -105,7 +106,7 @@ No part of an `UpdateLayer` carrying an `operation_id` applies after the same `c
 So a late retry of an abandoned call cannot overwrite a newer write.
 Rules 3 and 5 and this promise do not apply to chained calls.
 
-The records do not survive the loss of the service's backing store followed by a restore from backup: a re-send after one may apply again.
+The records do not survive a restore of the layer from backup after a backing-store data loss: a re-send after one may apply again.
 
 (live-edit-api-writing-layers-create-outcome)=
 ## Creating and replacing layers

@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The conformance-test image, `live-edit-conformance-tests`: the
+# `live-edit-conformance` binary (`conformance_tests/`) on the service's
+# runtime base, run by `helm/live-edit-conformance-tests/` and CI's
+# `conformance:run`. Build from the repository root (the root .dockerignore
+# applies): `docker build -f Dockerfile.conformance .`
+#
+# The builder steps, from `FROM` through `COPY . .`, are the service
+# `Dockerfile`'s, verbatim, and the runtime `FROM` is its tag and digest. The
+# suite binary links oodf-ffi's C++, so the builder supplies the same
+# third-party runtime components the service binary carries (the static
+# libstdc++, FlatBuffers, the Rust standard library), and `package_oss.py`
+# below takes their sources from that same builder. Identical builders and
+# bases are what let one OSRB component set cover both images; a CI pipeline
+# test fails when the two files' builder steps or runtime bases differ, so
+# change both together. The suite's Cargo crates are held to the
+# service's by `conformance_tests/tests/dependency_fence.rs`.
+
+# Stage 1: Build
+FROM rust:1.94-slim AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       clang \
+       curl \
+       cmake \
+       g++ \
+       git \
+       make \
+       mold \
+       python3 \
+       protobuf-compiler \
+       libprotobuf-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build flatc 24.x from source — Debian's packaged flatbuffers-compiler is too
+# old for the flatbuffers Rust crate v24, which marked Table::get as unsafe.
+# We also install the C++ headers to /usr/local/include/flatbuffers/ because
+# oodf-ffi/build.rs derives the include path from the flatc binary's prefix
+# (<prefix>/bin/flatc → <prefix>/include). The cxx-build step in oodf-ffi
+# requires flatbuffers/flatbuffers.h to be resolvable.
+RUN git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git /opt/flatbuffers-source \
+    && cmake -S /opt/flatbuffers-source -B /tmp/flatbuffers-build -DCMAKE_BUILD_TYPE=Release -DFLATBUFFERS_BUILD_TESTS=OFF \
+    && cmake --build /tmp/flatbuffers-build --target flatc -j4 \
+    && cp /tmp/flatbuffers-build/flatc /usr/local/bin/flatc \
+    && cp -r /opt/flatbuffers-source/include/flatbuffers /usr/local/include/
+
+WORKDIR /build
+COPY . .
+# Only the suite: the service image builds the service. oodf-ffi links
+# libstdc++ statically here as in the service build (see `Dockerfile`).
+RUN cargo build --locked --release -p live-edit-conformance
+
+# Package source from the same Cargo lockfile, FlatBuffers checkout and compiler
+# runtimes used above, bound to the suite binary (`--binary`). Any missing source
+# or checksum mismatch fails the build.
+RUN rustup component add rust-src \
+    && python3 tools/package_oss.py --flatbuffers /opt/flatbuffers-source \
+       --binary live-edit-conformance --output /oss-output --work /oss-work
+
+# The service `Dockerfile`'s ldd guard, on the suite binary: libstdc++ must be
+# static, glibc may be dynamic. `ldd`'s output is captured first so a failure
+# of `ldd` itself aborts the RUN under `set -eu`; a pipe into grep would let it
+# pass as no match (that Dockerfile's comment gives the full reasoning).
+RUN set -eu; \
+    LDD_OUT=$(ldd /build/target/release/live-edit-conformance); \
+    if echo "$LDD_OUT" | grep -q libstdc++; then \
+        echo "BUILD FAIL: live-edit-conformance is dynamically linked against libstdc++"; \
+        exit 1; \
+    fi; \
+    echo "ldd libstdc++ check OK"
+
+# Runtime smoke test: `--help` exits 0 without reading any configuration, so
+# with an empty environment it proves the binary loads and runs past static
+# init, the purpose of the service `Dockerfile`'s smoke test. A binary that
+# cannot load exits non-zero and fails the RUN. It runs here because the
+# distroless runtime has no shell.
+RUN env -i /build/target/release/live-edit-conformance --help >/dev/null
+
+# The report directory, owned by the runtime user below.
+RUN mkdir /reports
+
+# Stage 2: Runtime. The service image's base, same tag and digest.
+FROM nvcr.io/nvidia/distroless/cc:v4.1.7@sha256:c00b17d366579fa94e43398e9cbdc017647188491709e661104cfe69a6f283e7
+
+COPY --from=builder /build/target/release/live-edit-conformance /app/live-edit-conformance
+COPY --from=builder --chmod=0644 /oss-output/vendor.tar.gz /vendor.tar.gz
+COPY --from=builder /oss-output/licenses /licenses
+# The image contract the chart, `conformance_tests/docker-compose.yml` and
+# `docker run` users rely on, unchanged from the image's earlier Python build:
+# - the public, unsigned test token at /opt/local-test-token.jwt. It is not a
+#   credential: a service accepts it only with its test-only unvalidated-token
+#   override, which accepts any JWT-shaped string. No credential is configured
+#   by default; the run names its token in CONFORMANCE_AUTH_TOKEN_FILE.
+# - a writable /reports, the default CONFORMANCE_REPORT_DIR, that a mount or
+#   `docker cp` collects the JUnit report and summary.json from;
+# - UID/GID 65532, the user the chart's Job runs as and that owns /reports.
+#   Numeric so Kubernetes `runAsNonRoot` admission can verify it is non-root
+#   without reading /etc/passwd.
+COPY --chmod=0644 conformance_tests/local-test-token.jwt /opt/local-test-token.jwt
+COPY --from=builder --chown=65532:65532 /reports /reports
+ENV CONFORMANCE_REPORT_DIR=/reports
+
+USER 65532:65532
+
+ENTRYPOINT ["/app/live-edit-conformance"]

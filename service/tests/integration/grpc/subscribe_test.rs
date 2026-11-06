@@ -364,63 +364,29 @@ async fn subscribe_nonexistent_layer_returns_not_found() {
 // lost" — which would be just as wrong in the other direction, telling an
 // operator that a layer their own `DeleteLayer` removed had suffered state loss.
 
-// ── Both in-window catch-up builders, not just the harness default ──────────
+// ── The in-window catch-up's up-front detection site ────────────────────────
 //
-// The sentinel is detected at TWO independent sites, selected by
-// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED`:
-//
-// - `false` (the legacy rollback path, and the `build_service` harness default)
-//   reaches it from `catch_up_in_window`'s up-front scan over the entries its
-//   paged in-window replay parsed, which runs before that replay opens its
-//   consumer, computes any per-commit diff or sends anything;
-// - `true` (the SHIPPED PRODUCTION DEFAULT — see the `LIVE_EDIT_CATCHUP_
-//   SNAPSHOT_ENABLED` row in SDD §16 and in
-//   `docs/service/docs/configuration.md`) reaches it from the in-window point
-//   read's last-entry check (a `deleted` sentinel can only be the stream's last entry), which
-//   `catch_up_in_window_snapshot` acts on up front and which reconstructs no
-//   per-commit diffs.
-//
-// Two call sites, two chances to regress independently — and the production one
-// is the one an operator actually runs. Both arms below therefore assert the
-// same terminal message, at the same position; a fix applied to only one site
-// fails exactly one of them. `svc.catchup_snapshot_enabled` is set directly on
-// the built service, matching `e2e_subscribe_read_layer_recovery_test.rs`'s
-// parameterized reconnect arms, because the harness builder hardcodes `false`.
+// The in-window catch-up reaches the sentinel from its point read's
+// last-entry check (a `deleted` sentinel can only be the stream's last
+// entry), which `catch_up_in_window` acts on up front, before it reads any
+// state or sends anything.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_deleted_sentinel_terminal_status_says_the_layer_was_deleted_legacy_catchup() {
-    assert_deleted_sentinel_terminal_status_says_the_layer_was_deleted(false).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscribe_deleted_sentinel_terminal_status_says_the_layer_was_deleted_snapshot_catchup() {
-    assert_deleted_sentinel_terminal_status_says_the_layer_was_deleted(true).await;
-}
-
-/// Shared body of the two arms above. `catchup_snapshot_enabled` selects which
-/// in-window catch-up builder — and therefore which of the two sentinel
-/// detection sites — the subscriber runs through; every assertion is identical
-/// on both, which is the point.
-async fn assert_deleted_sentinel_terminal_status_says_the_layer_was_deleted(
-    catchup_snapshot_enabled: bool,
-) {
+async fn subscribe_deleted_sentinel_terminal_status_says_the_layer_was_deleted() {
     use fred::interfaces::StreamsInterface;
     use live_edit::storage::notifications::{DELETED_STREAM_PAYLOAD, NOTIFICATION_PAYLOAD_FIELD};
     use std::time::Duration;
 
     let tv = TestValkey::setup().await;
-    let mut svc = build_service(&tv, Arc::new(AllowAllPermissions));
-    svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
 
-    // Distinct per-arm session names so the two arms cannot collide on the
-    // shared Valkey when nextest runs them concurrently.
-    let session_name = if catchup_snapshot_enabled {
-        "deleted-sentinel-session-snapshot"
-    } else {
-        "deleted-sentinel-session-legacy"
-    };
-    let (session_id, object_id) =
-        create_session_and_layer(&tv, &svc, session_name, "deleted-sentinel-layer").await;
+    let (session_id, object_id) = create_session_and_layer(
+        &tv,
+        &svc,
+        "deleted-sentinel-session",
+        "deleted-sentinel-layer",
+    )
+    .await;
 
     // Arrange: append the retirement tombstone exactly as `delete_layer` and the
     // CreateLayer-overwrite path do — `XADD * payload deleted`. The mapping is
@@ -457,10 +423,9 @@ async fn assert_deleted_sentinel_terminal_status_says_the_layer_was_deleted(
         .expect("handler must return Ok — the terminal status is delivered on the stream");
 
     // Assert: the stream terminates with the deletion status. The retained
-    // window holds the seed commit AHEAD of the tombstone, and both catch-up
-    // builders act on the sentinel up front — the rollback replay from its
-    // scan of the parsed entries, the snapshot builder from the point read's
-    // last-entry check — and return before sending anything at all. The seed
+    // window holds the seed commit AHEAD of the tombstone, and the catch-up
+    // acts on the sentinel up front, from the point read's last-entry check,
+    // and returns before sending anything at all. The seed
     // commit is superseded by the deletion, and sending it first would put
     // content ahead of the ending. Drain a small
     // bounded number of Ok items looking for the terminal status, so that a
@@ -508,35 +473,27 @@ async fn assert_deleted_sentinel_terminal_status_says_the_layer_was_deleted(
         )
     });
 
-    // WHICH detection site fired. Without this, either arm is a coverage
-    // illusion: delete the up-front scan and the subscriber still terminates
+    // WHICH detection site fired. Without this, the test is a coverage
+    // illusion: delete the up-front check and the subscriber still terminates
     // with the same status — it delivers its catch-up content (the coalesced
-    // diff, or the seed commit's per-commit replay), hands over to steady
-    // state, and the steady-state loop meets the very same tombstone one entry
-    // later and acts on it there. The message assertion below cannot tell those
-    // two apart, so it would keep passing against an arm with no sentinel
-    // handling at all.
+    // diff), hands over to steady state, and the steady-state loop meets the
+    // very same tombstone one entry later and acts on it there. The message
+    // assertion below cannot tell those two apart, so it would keep passing
+    // with no catch-up sentinel handling at all.
     //
-    // Position is what separates them. The up-front scan runs BEFORE the
-    // consumer is opened and before any content is sent, so a working arm
+    // Position is what separates them. The up-front check runs BEFORE the
+    // consumer is opened and before any content is sent, so a working catch-up
     // terminates on message #1 with nothing delivered ahead of it; a
     // steady-state rescue necessarily sits behind at least the catch-up content
     // and its caught-up ack. Pinning zero drained messages therefore pins the
-    // catch-up site specifically — on the legacy arm too, whose replay no longer
-    // sends the seed commit (sequence 1, new to a `have_version=0` subscriber)
-    // ahead of the tombstone.
-    let site = if catchup_snapshot_enabled {
-        "catch_up_in_window_snapshot"
-    } else {
-        "catch_up_in_window"
-    };
+    // catch-up site specifically.
     assert_eq!(
         drained_ok, 0,
-        "`{site}` detects the sentinel in its up-front scan, which returns before opening a \
-         consumer or sending anything — so the terminal status must be the FIRST item on the \
-         stream. Having drained {drained_ok} message(s) first means the scan did not fire and \
-         the subscriber was rescued downstream (steady state meeting the same tombstone), or \
-         the replay sent content ahead of the ending, which leaves this catch-up site untested"
+        "`catch_up_in_window` detects the sentinel in its up-front check, which returns before \
+         opening a consumer or sending anything — so the terminal status must be the FIRST item \
+         on the stream. Having drained {drained_ok} message(s) first means the check did not \
+         fire and the subscriber was rescued downstream (steady state meeting the same \
+         tombstone), which leaves this catch-up site untested"
     );
 
     assert_eq!(
@@ -733,9 +690,9 @@ async fn subscribe_permanent_consumer_error_ends_the_stream_with_unavailable() {
 ///   ended the catch-up, it did not ride through it;
 /// * the injector queue is drained — the seam really fired.
 ///
-/// The in-window test covers a reconnect regime under the default
-/// `catchup_snapshot_enabled`; out-of-window takes the same proven read, so it
-/// gets no separate test. No checkpoint loop runs on these fixtures, so the
+/// The in-window test covers a reconnect regime; out-of-window takes the same
+/// proven read, so it gets no separate test. No checkpoint loop runs on these
+/// fixtures, so the
 /// one queued error can only be consumed by the catch-up's read.
 ///
 /// Feature-gated: without `--features test-fault-injection` this module is
@@ -856,17 +813,10 @@ mod transient_snapshot_read {
 
     /// Regression test: a brand-new subscriber whose catch-up snapshot read
     /// hits a transient Valkey failure. Pre-fix it ended `ABORTED`.
-    async fn assert_brand_new_transient_snapshot_read_ends_unavailable(
-        catchup_snapshot_enabled: bool,
-    ) {
-        let regime = if catchup_snapshot_enabled {
-            "brand_new/snapshot"
-        } else {
-            "brand_new/legacy"
-        };
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_brand_new_transient_snapshot_read_ends_unavailable() {
         let tv = TestValkey::setup().await;
-        let mut svc = build_service(&tv, Arc::new(AllowAllPermissions));
-        svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
+        let svc = build_service(&tv, Arc::new(AllowAllPermissions));
         let (session_id, _object_id) =
             create_session_and_layer(&tv, &svc, "b27b-brand-new", "b27b-layer").await;
 
@@ -879,19 +829,7 @@ mod transient_snapshot_read {
             .into_inner();
         let (delivered, status) = drain_to_terminal_status(&mut stream).await;
 
-        assert_ends_unavailable_from_the_snapshot_read(regime, &delivered, &status, &injector);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subscribe_brand_new_transient_snapshot_read_ends_unavailable_snapshot_catchup() {
-        assert_brand_new_transient_snapshot_read_ends_unavailable(true).await;
-    }
-
-    /// The `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false` rollback builder takes
-    /// the same atomic read, so it must answer the same.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn subscribe_brand_new_transient_snapshot_read_ends_unavailable_legacy_catchup() {
-        assert_brand_new_transient_snapshot_read_ends_unavailable(false).await;
+        assert_ends_unavailable_from_the_snapshot_read("brand_new", &delivered, &status, &injector);
     }
 
     /// A non-reset structural delta adding `section_id` under the root, so
@@ -910,9 +848,9 @@ mod transient_snapshot_read {
         }
     }
 
-    /// An in-window reconnect under the default `catchup_snapshot_enabled`
-    /// (`catch_up_in_window_snapshot`, building the coalesced diff from its
-    /// atomic read) whose state read hits a transient Valkey failure.
+    /// An in-window reconnect (`catch_up_in_window`, building the coalesced
+    /// diff from its atomic read) whose state read hits a transient Valkey
+    /// failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscribe_in_window_reconnect_transient_snapshot_read_ends_unavailable() {
         const LAYER: &str = "b27b-in-window-layer";
@@ -920,8 +858,7 @@ mod transient_snapshot_read {
         const HAVE_VERSION: u64 = 1;
 
         let tv = TestValkey::setup().await;
-        let mut svc = build_service(&tv, Arc::new(AllowAllPermissions));
-        svc.catchup_snapshot_enabled = true;
+        let svc = build_service(&tv, Arc::new(AllowAllPermissions));
         let (session_id, object_id) =
             create_session_and_layer(&tv, &svc, "b27b-in-window", LAYER).await;
 
@@ -966,11 +903,6 @@ mod transient_snapshot_read {
             .into_inner();
         let (delivered, status) = drain_to_terminal_status(&mut stream).await;
 
-        assert_ends_unavailable_from_the_snapshot_read(
-            "in_window/snapshot",
-            &delivered,
-            &status,
-            &injector,
-        );
+        assert_ends_unavailable_from_the_snapshot_read("in_window", &delivered, &status, &injector);
     }
 }

@@ -110,8 +110,8 @@
 //! `LayerStore::update_layer_with_summary` refuses a delta without non-empty
 //! relay OMPF before any store I/O, on every backend, and writes no zero-length
 //! `ompf` field. `SubscribeReadLayer` relies on the same
-//! classification: its steady state and its rollback-mode in-window replay send
-//! an ompf-less entry above sequence 1 as the empty delta, with no read.
+//! classification: its steady state sends an ompf-less entry above sequence 1
+//! as the empty delta, with no read.
 //!
 //! # The stream ID is authoritative
 //!

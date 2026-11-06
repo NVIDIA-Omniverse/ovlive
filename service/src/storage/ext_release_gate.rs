@@ -63,9 +63,10 @@
 //! counter repair's wait budget). A remaining deadline at or below the margin
 //! refuses at once a call that found the budget full. The wait does not use
 //! `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS`:
-//! that wait is short because it runs before the upload is read and holds the
-//! connection's flow-control window, while this one runs after the upload is
-//! read and parsed and holds only memory the upload budget already bounds, so
+//! that wait is short because it runs before the upload is read, with up to
+//! one stream window of its content unread in HTTP/2 and its client's deadline
+//! running, while this one runs after the upload is read and parsed and holds
+//! only memory the upload budget already bounds, so
 //! it can afford the call's whole deadline and make a refusal rare. The cost,
 //! accepted with that choice: a waiting upload keeps its upload-budget
 //! reservation — and possibly the replica's single overflow slot — for up to

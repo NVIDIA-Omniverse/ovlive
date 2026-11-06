@@ -72,7 +72,14 @@ def _json(value):
     return json.dumps(value, indent=2, sort_keys=True) + '\n'
 
 
-def create(archive_path, output_dir, *, check=archive.check, run=subprocess.run):
+def pack(args, check):
+    """Run the vendored packman launcher, which the public source distribution omits."""
+    if not PACKMAN.is_file():
+        raise ValueError(f'Packman packaging needs the vendored launcher at {PACKMAN.relative_to(ROOT).as_posix()}')
+    return subprocess.run(args, check=check)
+
+
+def create(archive_path, output_dir, *, check=archive.check, run=pack):
     """Check `archive_path`, pack its package tree with packman into `output_dir`; return the `.zip` path."""
     archive_path, output_dir = Path(archive_path), Path(output_dir)
     with tempfile.TemporaryDirectory() as work:
@@ -137,10 +144,11 @@ def check(path):
         platform = record.get('platform')
         if (record.get('schema_version') != 1 or record.get('product') != 'ovlive'
                 or record.get('extension_folder') != archive.EXTENSION_FOLDER
-                or record.get('configuration') != 'release' or not platforms.supported(platform)
+                or record.get('configuration') not in ('release', 'debug') or not platforms.supported(platform)
                 or not re.fullmatch(r'\d+\.\d+\.\d+', str(record.get('version')))
                 or record.get('usd_profile') not in build.USD_PROFILES
-                or record.get('archive_root') != archive.archive_root(record['version'], record['usd_profile'], platform)):
+                or record.get('archive_root') != archive.archive_root(record['version'], record['usd_profile'], platform,
+                                                                     record['configuration'])):
             raise ValueError('Unrecognized release manifest in ' + path.name)
         name, version = identity(record)
         if record.get('package') != dict(name=name, version=version) or path.name != asset_filename(name, version):

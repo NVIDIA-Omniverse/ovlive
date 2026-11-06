@@ -1158,6 +1158,51 @@ void deterministicWarningSuppressionAndSummaries()
     assert(snapshot.metrics.warningSuppressed == 3 && snapshot.lastSequence == 11);
     finish(registry);
 }
+// Coalesced cleanup timeouts are summarized under the delivery policy of the
+// records they repeat: a diagnostic sink's own unregistration timeouts reach
+// history only, and so does their summary, even when a deliverable timeout
+// flushes it; repeated deliverable timeouts keep their summary deliverable
+// when a sink-only timeout flushes it. The fixed clock keeps every repeat
+// inside one coalescing window.
+void cleanupTimeoutSummariesKeepTheirDelivery()
+{
+    auto now = Clock::time_point{} + std::chrono::seconds(50);
+    auto clock = [](void* context) noexcept { return *static_cast<Clock::time_point*>(context); };
+    DiagnosticsRegistry registry(options(), instance, clock, &now);
+    Sink sink;
+    const auto handle = registry.subscribe(sinkOptions(), &sink, Sink::callback);
+    constexpr uint64_t heldSink = (UINT64_C(8) << 56) | 77, request = (UINT64_C(3) << 56) | 5;
+    const auto sinkTimeout = [&] {
+        registry.observeCleanup(CleanupCall::UnregisterCallback, OMNI_USD_LIVE_TIMEOUT, 1, 1, heldSink, true);
+    };
+    const auto cancelTimeout = [&] {
+        registry.observeCleanup(CleanupCall::Cancel, OMNI_USD_LIVE_TIMEOUT, 1, 1, request);
+    };
+    sinkTimeout(); sinkTimeout();       // Sequences 1 and 2; the repeat coalesces.
+    cancelTimeout();                    // 3 is the sink-only summary, 4 the Cancel record.
+    cancelTimeout();                    // 5 coalesces into the Cancel record.
+    sinkTimeout();                      // 6 is the deliverable summary, 7 the sink record.
+    registry.emit(OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED, endpoint); // 8 marks the end of the FIFO.
+    const auto snapshot = registry.snapshot(0, 100);
+    const std::array<uint32_t, 6> history{OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT, OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED,
+        OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT, OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED,
+        OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT, OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED};
+    assert(snapshot.records.size() == history.size() && snapshot.metrics.warningSuppressed == 2);
+    for (size_t i = 0; i < history.size(); ++i) assert(snapshot.records[i].eventCode == history[i]);
+    // Records after a FIFO marker cannot precede it, so these are all the
+    // sink received.
+    sink.wait(3);
+    const auto delivered = sink.copy();
+    assert(delivered.size() == 3);
+    assert(delivered[0].sequence == 4 && delivered[0].code == OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT);
+    assert(delivered[0].fields.at("reason").number == static_cast<uint32_t>(CleanupCall::Cancel));
+    assert(delivered[1].sequence == 6 && delivered[1].code == OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED);
+    assert(delivered[1].fields.at("count").number == 1);
+    assert(delivered[1].fields.at("reason").number == OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT);
+    assert(delivered[2].sequence == 8 && delivered[2].code == OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED);
+    assert(registry.unsubscribe(handle, 3000) == OMNI_USD_LIVE_OK);
+    finish(registry);
+}
 } // namespace
 
 void operationAuthWaitMetrics()
@@ -1231,6 +1276,7 @@ void diagnosticsRegistryTests()
     selfUnsubscribeAndLeaseRetirement();
     boundedIncidentAndEndpointChurn();
     deterministicWarningSuppressionAndSummaries();
+    cleanupTimeoutSummariesKeepTheirDelivery();
     messageMetricsIgnoreHistoryFilteringAndSaturate();
     std::cout << "diagnostics registry: bounded history/sinks, metrics, filters, failures, and quiescence passed\n";
 }

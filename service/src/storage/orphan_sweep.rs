@@ -39,8 +39,9 @@
 //    keyspace SCAN the backstop needs, and runs at a cadence suited to
 //    re-driving an obligation a store hiccup left in doubt.
 //
-// Orphaned path-index entries are already handled opportunistically by
-// ListSessions (SDD section 7.13 step 6) and are not re-scanned here.
+// Orphaned path-index entries are handled by ListSessions, which vetoes and
+// removes ghost names members and reconciles stale path_index members (SDD
+// section 7.13 step 6); they are not re-scanned here.
 //
 // The sweep uses SCAN (not KEYS) for production safety. Pre-b.kf1 it ran
 // once at startup; b.kf1 H-stor-4 added periodic re-runs gated behind the
@@ -61,10 +62,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fred::clients::Client;
-use fred::interfaces::{
-    ClientLike, ClusterInterface, HashesInterface, KeysInterface, SetsInterface,
-};
-use fred::types::scan::{SScanResult, ScanResult, ScanType, Scanner, ZScanResult};
+use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
+use fred::types::scan::{SScanResult, ScanResult, Scanner, ZScanResult};
 use fred::types::Key as FredKey;
 use futures::future::Either;
 use futures::Stream;
@@ -93,6 +92,7 @@ use crate::storage::retirement::{
     read_retirement_size, RetirementPaging, RetirementReservation, RetirementWalk, Teardown,
     TeardownFailure,
 };
+use crate::storage::scan_guard::{KeyspaceWalk, WalkError};
 
 /// Default re-run interval for the periodic orphan sweep.
 ///
@@ -102,123 +102,212 @@ use crate::storage::retirement::{
 /// profile demands faster reaction.
 const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Walk every key matching `pattern` across the whole keyspace: a SCAN on every
-/// primary when the client is connected to a cluster, a single-node SCAN
-/// otherwise. The stream yields keys; it ends with an `Err` item when the walk
-/// is known to be incomplete, and ends cleanly only after a complete walk.
+/// Walk every key matching `pattern` across the whole keyspace, on every
+/// primary of the store's current slot map: a coverage walk
+/// (`storage::scan_guard::KeyspaceWalk::start_coverage`). The stream yields
+/// keys as each step lands; it ends cleanly only after a walk that reached its
+/// end with every check holding, and otherwise ends with exactly one `Err`
+/// item, always its last ([`KeyspaceWalkError`]).
 ///
-/// **Every shard.** A single-node SCAN walks exactly one primary's slot range,
-/// so on a multi-shard cluster it silently misses every key on the sibling
-/// shards. Every caller enumerates *all* matching keys, so the clustered arm
-/// uses `scan_cluster`, which starts one walk per primary (one slot per primary
-/// from the routing table) and routes each later page by that walk's slot.
+/// **Every primary, of a fresh map.** On a cluster the walk reads a fresh
+/// `CLUSTER SLOTS` map, pins each primary's steps to the node the client's
+/// routing table lists for it, and reads that node's `CLUSTER NODES` at the
+/// walk's start and end to check it serves exactly the primary's slots. fred's
+/// own cluster-wide `SCAN` planned its walks from the client's cached routing
+/// table, which nothing refreshes while keyless commands are all a pool member
+/// sends, so after a reshard or scale-out it missed a whole primary on every
+/// pass. A primary whose pinned node serves other slots (or that the table
+/// names no node for) is left unwalked, the walking client's routing table is
+/// re-synced once, and the walk ends with an error. Where a node's
+/// `CLUSTER NODES` cannot show its slots, the walk instead compares the
+/// table's per-node division of the slots with the map's per-primary one, at
+/// each end where by then such a node was found: at its start and again at
+/// its end when one was found at the start, at its end only when the first
+/// one was found there. A table that differs is re-synced the same way and
+/// ends the walk with an error; a table that matches is still re-synced at
+/// the walk's end, with no error, because the comparison cannot see a change
+/// of primary that keeps every slot set. Each walk re-syncs at most once.
+/// The re-sync freshens only that pool member's table: each maintenance-pool
+/// member keeps its own, so a stale view is cured within one such walk per
+/// member whose re-sync succeeds, and a later walk on that member is then
+/// complete; a sync that failed leaves the table stale, as can one that
+/// timed out (it keeps running in the member's router and may still finish),
+/// and the member's next walk then misses the same primary and re-syncs
+/// again. Primaries
+/// are walked one after another, each step on its node with one attempt (a
+/// transient failure is resent at the same cursor, a bounded number of
+/// times), so a step carries the client's command timeout. Standalone, the
+/// walk is a cursor walk of the one node.
 ///
-/// **Only a terminal page completes a walk.** Both arms use fred's page forms
-/// rather than the `*_buffered` ones, because only a page says whether it is the
-/// last (`has_more`); the buffered forms yield bare keys, and fred ends their
-/// stream with no error when a page's command is dropped unanswered. The page
-/// stream goes through [`complete_pages`], which turns a walk that ended before
-/// its terminal page into a final `Err` item: one terminal page standalone, one
-/// per primary `scan_cluster` started on in cluster mode. Each page's keys are
-/// taken and the page dropped before its keys are yielded — the drop is what
-/// requests the next page — so at most one page per primary is in flight.
+/// **What an error item means.** Every check that does not hold is answered
+/// after the last key, so a consumer that acts on each key as it arrives
+/// still acts on every key the walk reached; a store fault (a step that
+/// failed, a node pin the client's table no longer lists, a failed
+/// `CLUSTER SLOTS` read) ends the stream at once with that fault.
+/// [`KeyspaceWalkError::every_primary_walked`] tells the two outcomes a
+/// consumer weighs apart: `true` when every primary of the start map was
+/// walked to its end on its pin, on an unchanged map, and the walk only could
+/// not prove a pin's ownership — an open slot, or an unusable myself line or
+/// a `CLUSTER NODES` read that failed (a store that denies that command is
+/// still walked) while the routing table divided the slots as the map did;
+/// `false` when a primary's pinned node served other slots at the walk's
+/// start (the primary left unwalked) or end, the slot map changed during the
+/// walk, the walk could not prove a pin's ownership from its myself line and
+/// found the routing table out of date at its start or end, or a store fault
+/// ended it early. `true` is not proof that no key was missed: an open slot
+/// may skip keys, and the table comparison cannot see a change of primary
+/// that keeps every slot set (a failover the table missed), so an unproven
+/// pin can still be the old node; the walk's end re-sync bounds that to one
+/// pass per maintenance-pool member when the sync succeeds, and a failed or
+/// timed-out one logs a WARN (`storage::scan_guard`, *The table check*).
+/// The walk reads no serving-process witness, so a failover or restart
+/// inside one walk can skip keys for that walk only, undetected; the next
+/// walk covers them.
 ///
-/// **The routing guard.** fred pages carry no node identity, so the per-primary
-/// count can only come from the routing table. It is read before and after the
-/// walk starts; if either read finds no routing table or an empty one, or the
-/// two differ, the number of per-primary walks to wait for is unknown, and the
-/// stream is a single `ErrorKind::Cluster` error instead (transient: the
-/// caller's next pass walks again). An empty table counts as unknown because
-/// `scan_cluster` then starts no walk at all, and zero terminal pages out of
-/// zero would read as a complete walk of an empty keyspace. The decision is
-/// [`cluster_walk_count`].
+/// `pub(crate)` since b.yda so `storage::ext_reconcile` can reuse it rather
+/// than writing a walk of its own (its meta walk does); the checkpoint loop's
+/// pass 1 and the backup repair use it too. Sharing it is not a convenience: a
+/// keyspace walk that quietly covered one primary's slot range — or stopped
+/// short on one — would report a fraction of the keyspace as the whole of it,
+/// which, for a pass that decides what to decrement, is exactly the
+/// under-count that becomes an over-release.
 ///
-/// `pub(crate)` since b.yda so `storage::ext_reconcile` can reuse it rather than
-/// writing a second dispatch; the checkpoint loop's pass 1 uses it too. Sharing
-/// it is not a convenience: the b.289 source-shape fence requires every bare
-/// `SCAN` to sit inside an `is_clustered` two-arm dispatch, and a keyspace walk
-/// that quietly covered one primary's slot range — or stopped short on one —
-/// would report a fraction of the blob keyspace as the whole of it, which, for
-/// a pass that decides what to decrement, is exactly the under-count that
-/// becomes an over-release.
+/// **Not for the disaster-recovery Jobs or the reference-count reconcile
+/// pass's object and carrier walks.** With no witness, a walk here can cross
+/// a failover, a restart or a slot migration and skip keys without an error
+/// item. The DR Jobs' keyspace walks (the restore planner's, and the
+/// reference-count recount's object and carrier walks) are agreeing walks
+/// instead (`storage::scan_guard::collect_keyspace_agreed`,
+/// `KeyspaceWalk::start_job`: two walks whose key sets must be equal), and
+/// the periodic reconcile pass's object and carrier walks use the
+/// serving-process-guarded `storage::scan_guard::KeyspaceWalk::start`; each
+/// fails such a walk.
 pub(crate) fn scan_keyspace(
     client: &Client,
     pattern: &str,
-) -> std::pin::Pin<Box<dyn Stream<Item = Result<FredKey, fred::error::Error>> + Send>> {
-    const SCAN_PAGE: u32 = 100;
-    let pattern_owned = pattern.to_owned();
-    // Read OUTSIDE the dispatch so the b.289 fence's ten-line window from
-    // `is_clustered` and `scan_cluster(` to `.scan(` holds.
-    let slots_before = client
-        .cached_cluster_state()
-        .map(|routing| routing.unique_hash_slots());
-    let pages: ScanPages<ScanResult> = if client.is_clustered() {
-        Box::pin(client.scan_cluster(pattern_owned, Some(SCAN_PAGE), None::<ScanType>))
-    } else {
-        Box::pin(client.scan(pattern_owned, Some(SCAN_PAGE), None::<ScanType>))
-    };
-    let slots_after = client
-        .cached_cluster_state()
-        .map(|routing| routing.unique_hash_slots());
-    let terminal_pages = if client.is_clustered() {
-        match cluster_walk_count(pattern, slots_before, slots_after) {
-            Ok(count) => count,
-            Err(e) => return Box::pin(futures::stream::once(futures::future::ready(Err(e)))),
-        }
-    } else {
-        1
-    };
-    Box::pin(
-        complete_pages(pages, terminal_pages, pattern).flat_map(|item| match item {
-            Ok(mut page) => {
-                let keys = page.take_results().unwrap_or_default();
-                // Dropping the page is what asks fred for the next one
-                // (`ScanResult`'s `Drop`); a terminal page's drop releases its
-                // walk's sender instead, and the stream ends once every
-                // primary's walk has released its own.
-                drop(page);
-                Either::Left(futures::stream::iter(keys.into_iter().map(Ok)))
+) -> std::pin::Pin<Box<dyn Stream<Item = Result<FredKey, KeyspaceWalkError>> + Send>> {
+    /// Where the walk is: not started, walking, or answered its last item.
+    enum Walk {
+        Start(Client, String),
+        Walking(Box<KeyspaceWalk>),
+        Done,
+    }
+
+    let pages = futures::stream::unfold(
+        Walk::Start(client.clone(), pattern.to_owned()),
+        |state| async move {
+            let mut walk = match state {
+                Walk::Done => return None,
+                Walk::Walking(walk) => walk,
+                Walk::Start(client, pattern) => {
+                    match KeyspaceWalk::start_coverage(&client, &pattern).await {
+                        Ok(walk) => Box::new(walk),
+                        // A store fault before any step: nothing was walked.
+                        Err(e) => return Some((Err(KeyspaceWalkError::new(e, false)), Walk::Done)),
+                    }
+                }
+            };
+            match walk.next_page().await {
+                Ok(Some(keys)) => Some((Ok(keys), Walk::Walking(walk))),
+                Ok(None) => None,
+                Err(e) => {
+                    let every_primary_walked = walk.walked_every_primary();
+                    Some((
+                        Err(KeyspaceWalkError::new(e, every_primary_walked)),
+                        Walk::Done,
+                    ))
+                }
             }
-            Err(e) => Either::Right(futures::stream::once(futures::future::ready(Err(e)))),
-        }),
-    )
+        },
+    );
+    Box::pin(pages.flat_map(|page| match page {
+        Ok(keys) => Either::Left(futures::stream::iter(keys.into_iter().map(Ok))),
+        Err(e) => Either::Right(futures::stream::once(futures::future::ready(Err(e)))),
+    }))
 }
 
-/// `scan_keyspace`'s routing guard, as a pure decision: how many terminal pages
-/// a cluster-wide walk must see, given the per-primary slots (fred's
-/// `unique_hash_slots`, one slot per primary) read `before` and `after` the
-/// walk started.
+/// The error item that ends a [`scan_keyspace`] walk: the walk's
+/// `storage::scan_guard::WalkError` as a fred error, so every consumer's
+/// fred-error arm (`observe_error`, a pass error carrying a fred source)
+/// takes it as it is, plus whether the walk still walked every primary on
+/// its pin ([`Self::every_primary_walked`], and what it cannot prove).
 ///
-/// `Ok(n)` only when both reads found the same, non-empty set — `n` primaries,
-/// so `n` per-primary walks. Otherwise the count is unknown and the walk cannot
-/// be judged complete, so the answer is an `ErrorKind::Cluster` error naming
-/// `walk` (transient: the caller's next pass walks again):
-///
-/// - either read `None`: no routing table;
-/// - either read empty: fred stores an empty table when `CLUSTER SLOTS`
-///   returns no slots, `scan_cluster` then starts no walk, and the stream would
-///   end at once with zero terminal pages out of zero — a false "complete";
-/// - the two differ: the primaries changed while `scan_cluster` read them.
-fn cluster_walk_count(
-    walk: &str,
-    before: Option<Vec<u16>>,
-    after: Option<Vec<u16>>,
-) -> Result<usize, fred::error::Error> {
-    match (before, after) {
-        (Some(before), Some(after)) if before == after && !before.is_empty() => Ok(before.len()),
-        _ => Err(fred::error::Error::new(
-            fred::error::ErrorKind::Cluster,
-            format!(
-                "SCAN walk `{walk}` abandoned before its first page: the cluster's primaries \
-                 changed while the walk started, or the routing table was unknown or empty, so \
-                 the number of per-primary walks to wait for is unknown"
-            ),
-        )),
+/// The mapping keeps what each arm relies on, and the details are always the
+/// walk error's text. A store fault that ended the walk early (a failed step,
+/// a refused node pin, a failed `CLUSTER SLOTS` read) keeps its fred error's
+/// kind: a step that timed out stays a `Timeout`, which `observe_error`
+/// counts. Every reason the walk recorded and answered after its last key —
+/// a `ServingChange`, a `WitnessMissing`, and a failed `CLUSTER NODES` read
+/// too, whatever its own error's kind — becomes `ErrorKind::Cluster`:
+/// transient for `is_transient_fred_error`, never counted. `Display` is the
+/// fred error's.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub(crate) struct KeyspaceWalkError {
+    error: fred::error::Error,
+    every_primary_walked: bool,
+}
+
+impl KeyspaceWalkError {
+    /// `walk` as the stream's error item; `every_primary_walked` is
+    /// `KeyspaceWalk::walked_every_primary` when the walk answered it.
+    ///
+    /// A walk that walked every primary answers only a recorded reason (a
+    /// store fault ends a walk before its end, and a walk that lost coverage
+    /// answers a `NotOwner`, `SlotMap` or `StaleTable`, none a fred error),
+    /// so with `every_primary_walked` the kind is `Cluster` whatever the
+    /// reason; a recorded failed `CLUSTER NODES` read, a `WalkError::Read`
+    /// with a fred error of its own, is the case that rule exists for.
+    /// Otherwise a fred error keeps its kind (a store fault) and anything
+    /// else is `Cluster`.
+    fn new(walk: WalkError, every_primary_walked: bool) -> Self {
+        let kind = match walk.fred_error() {
+            Some(source) if !every_primary_walked => source.kind().clone(),
+            _ => fred::error::ErrorKind::Cluster,
+        };
+        Self {
+            error: fred::error::Error::new(kind, walk.to_string()),
+            every_primary_walked,
+        }
+    }
+
+    /// Whether the walk walked every primary of its start slot map to its
+    /// end on its pin, the map unchanged and no pin proven wrong: `true` when
+    /// the error only says the walk could not prove a pin served its primary
+    /// (an open slot, an unusable myself line, a `CLUSTER NODES` read that
+    /// failed) and, for the last two, the routing table divided the slots
+    /// among nodes as the map did among primaries at each end it was
+    /// compared (at the start and again at the end when such a verdict came
+    /// at the start, at the end only when the first came there); `false`
+    /// when a primary was not walked on the node that serves it (its pin
+    /// reached a node serving other slots, at the walk's start or end), the
+    /// walk could not prove a pin's ownership and found that table out of
+    /// date (it re-synced it), the slot map changed, or a store fault ended
+    /// the walk early, so keys of some primary may never have been reached.
+    ///
+    /// `true` does not prove every key was seen: an open slot may skip keys;
+    /// the table comparison cannot see a change of primary that keeps every
+    /// slot set (a failover the table missed), so a pin whose `CLUSTER NODES`
+    /// was unusable or unreadable can still be the old node, for one pass
+    /// per maintenance-pool member when the re-sync succeeds, since such a
+    /// walk re-syncs its table at its end even when the table matched
+    /// (`storage::scan_guard`, *The table check*); and with no
+    /// serving-process witness a failover or restart inside one walk can skip
+    /// keys for that walk only, undetected.
+    pub(crate) fn every_primary_walked(&self) -> bool {
+        self.every_primary_walked
+    }
+
+    /// The fred error, for a consumer's error metric or log.
+    pub(crate) fn fred(&self) -> &fred::error::Error {
+        &self.error
+    }
+
+    /// The fred error, owned, for a consumer's pass error.
+    pub(crate) fn into_fred(self) -> fred::error::Error {
+        self.error
     }
 }
-
-/// A boxed stream of fred SCAN-family pages.
-type ScanPages<P> = std::pin::Pin<Box<dyn Stream<Item = Result<P, fred::error::Error>> + Send>>;
 
 /// A page of a fred SCAN-family stream that knows whether it is its walk's
 /// last: `SCAN` (keyspace), `SSCAN` and `ZSCAN` (keyed cursors).
@@ -250,8 +339,15 @@ impl ScanStreamPage for ZScanResult {
 }
 
 /// The code home of the rule **a SCAN-family walk is complete only on its
-/// terminal page** (SDD §11.3.2): every fred `SCAN`, `SSCAN` and `ZSCAN` stream
-/// the service walks goes through here.
+/// terminal page** (SDD §11.3.2) for fred's page streams: every fred
+/// SCAN-family stream the service walks goes through here (today one, the
+/// checkpoint clean-up's `ZSCAN`, `storage::recon_fence`). The keyspace
+/// walks use no fred stream: they are explicit-cursor walks
+/// (`storage::scan_guard`): guarded against a change of serving process and
+/// of slot ownership for the periodic reference-count reconcile pass's
+/// object and carrier walks, checked for slot ownership and walked twice to
+/// agree for the DR Jobs', and checked for coverage of every primary for the
+/// rest ([`scan_keyspace`]).
 ///
 /// **Why the end of a stream proves nothing.** fred ends a SCAN-family stream
 /// when every sender of its channel is dropped, and each page command in flight
@@ -273,18 +369,16 @@ impl ScanStreamPage for ZScanResult {
 /// early `?`) simply drops the stream; nothing is checked then.
 ///
 /// `terminal_pages` is 1 for a single-node `SCAN` and for a keyed cursor (an
-/// `SSCAN` / `ZSCAN` routes by its key to one node in both modes), and the
-/// number of primaries `scan_cluster` started on for a cluster-wide walk (see
-/// `scan_keyspace`'s routing guard).
+/// `SSCAN` / `ZSCAN` routes by its key to one node in both modes), and one
+/// per walk a cluster-wide fan-out starts.
 ///
 /// `Canceled` is transient for `is_transient_fred_error` and is not counted by
-/// `observe_error`, so each consumer's existing error arm applies unchanged:
-/// the reconciler forfeits the pass, the orphan sweep warns and walks again next
-/// tick, and the checkpoint loop marks its tick truncated.
+/// `observe_error`, so a consumer's ordinary fred-error arm applies unchanged
+/// (`recon_fence::announced_stems_of_object` returns it as its error).
 ///
-/// Explicit-cursor walks (`presence::sscan_page`, `diff_read`'s `SSCAN` step)
-/// do not need this: they finish only on cursor `0` and fail visibly when a page
-/// is lost.
+/// Explicit-cursor walks (`presence::sscan_page`, `diff_read`'s `SSCAN` step,
+/// `storage::scan_guard`'s walks) do not need this: they finish only on cursor
+/// `0` and fail visibly when a page is lost.
 ///
 /// `pub` rather than `pub(crate)` so integration tests can drive it over a raw
 /// fred page stream, where fred's silent end can be pinned against a real
@@ -375,9 +469,10 @@ where
 }
 
 /// Walks the truncation seam is armed for, keyed by [`complete_pages`]'s
-/// `walk` (a SCAN pattern or a set key), each with the number of pages to pass
-/// before the walk's page stream is ended short. Keyed by walk because a test's
-/// pattern or key carries its unique prefix, so parallel tests never see each
+/// `walk` (the walked key; a keyspace pattern arms nothing, since
+/// [`scan_keyspace`] walks no fred stream), each with the number of pages to
+/// pass before the walk's page stream is ended short. Keyed by walk because a
+/// test's key carries its unique prefix, so parallel tests never see each
 /// other's arming.
 #[cfg(any(test, feature = "test-fault-injection"))]
 static SCAN_WALK_TRUNCATION: std::sync::LazyLock<
@@ -420,7 +515,7 @@ pub struct ArmedScanWalkTruncation {
 
 #[cfg(any(test, feature = "test-fault-injection"))]
 impl ArmedScanWalkTruncation {
-    /// The walk (SCAN pattern or set key) this guard keeps armed.
+    /// The walk (its key) this guard keeps armed.
     pub fn walk(&self) -> &str {
         &self.walk
     }
@@ -592,7 +687,8 @@ pub fn orphan_sweep_grace(rpc_deadline_ms: u64) -> Duration {
 /// SCAN + HGETALL pass on every interval.
 ///
 /// `leader` is the process-wide [`LeaderIdentity`] — the same one the GC
-/// task, the reconciler and the external-value backup repair hold on
+/// task, the reconciler, the external-value backup repair and the checkpoint
+/// clean-up hold on
 /// `le:gc:leader`. Its marked GC lock value
 /// ([`LeaderIdentity::gc_lock_value`]) is what the lock stores; its
 /// `service_label` alone labels this task's gauges.
@@ -913,24 +1009,23 @@ async fn sweep_unindexed_presence(
             let fred_key = match scan_result {
                 Ok(k) => k,
                 Err(e) => {
-                    // `observe_error` never fires here: fred sends every SCAN
-                    // page through `default_send_command`, which applies no
-                    // command timeout, `observe_error` counts only timeouts,
-                    // and `scan_keyspace`'s own errors are `Canceled` (a walk
-                    // that ended before its terminal page) or `Cluster` (the
-                    // routing guard). So a SCAN error here goes uncounted, and
-                    // a hung SCAN is ended only by cancellation or fred's
-                    // unresponsive-connection check (about 2.5 s while the
-                    // shard answers other connections, 45 s otherwise).
-                    // `continue` then ends the walk when the error was the
-                    // truncation item — it is always the stream's last — and
-                    // the later phases run; the next tick walks again.
+                    // `observe_error` counts only timeouts. Each step of the
+                    // walk, and its `CLUSTER SLOTS` reads, are ordinary
+                    // commands carrying the client's command timeout, so a
+                    // hung step (once its retries are spent) or map read ends
+                    // the walk as a `Timeout` and is counted here. Every
+                    // reason the walk recorded and walked past — a check it
+                    // could not prove, a `CLUSTER NODES` read that failed or
+                    // timed out included — is `Cluster` and is not.
+                    // The error is always the stream's last item, so
+                    // `continue` ends the walk and the later phases run; the
+                    // next tick walks again.
                     FredErrOrigin::metrics(
                         metrics,
                         POOL_LABEL_MAINTENANCE,
                         client.store_oom_signal(),
                     )
-                    .observe_error(&e);
+                    .observe_error(e.fred());
                     tracing::warn!(error = %e, "SCAN error during presence index backstop");
                     continue;
                 }
@@ -1124,14 +1219,15 @@ async fn sweep_retire_retry(
                         POOL_LABEL_MAINTENANCE,
                         client.store_oom_signal(),
                     )
-                    .observe_error(&e);
+                    .observe_error(e.fred());
                     // `continue`, matching the sibling phases: a partial
                     // backstop walk costs latency on the carriers it missed
                     // (they are durable and the next tick re-scans), never
-                    // correctness. That includes a walk that ended before its
-                    // terminal page: `scan_keyspace` reports it as this arm's
-                    // last item, so the WARN below is its only trace and the
-                    // walk then ends. This is deliberately NOT the fail-closed
+                    // correctness. That includes a walk that left a primary
+                    // unwalked or could not prove it reached one:
+                    // `scan_keyspace` reports it as this arm's last item, so
+                    // the WARN below is its only trace and the walk then
+                    // ends. This is deliberately NOT the fail-closed
                     // posture `storage::ext_reconcile` takes — there a partial
                     // walk would under-count references and drive an
                     // over-release, while here it can only defer work.
@@ -1636,8 +1732,8 @@ async fn sweep_orphaned_objects(
 ) -> Result<(), SweepError> {
     let prefix = keys.prefix();
     // Pattern: `le:{*}:obj:hdr` — matches all object header keys.
-    // The hash tag braces are literal in the key, so we use `*` inside them.
-    let pattern = format!("{prefix}{{*}}:obj:hdr");
+    // The hash tag braces are literal in the key, so the `*` is inside them.
+    let pattern = keys.obj_header_scan_pattern();
 
     // Maintenance pool: long SCAN + HGETALL passes go through the
     // dedicated pool so writers / readers on the data pool are not
@@ -1656,7 +1752,7 @@ async fn sweep_orphaned_objects(
             Ok(k) => k,
             Err(e) => {
                 FredErrOrigin::metrics(metrics, POOL_LABEL_MAINTENANCE, client.store_oom_signal())
-                    .observe_error(&e);
+                    .observe_error(e.fred());
                 tracing::warn!(error = %e, "SCAN error during orphaned object sweep");
                 continue;
             }
@@ -2342,17 +2438,13 @@ async fn sweep_orphaned_layers(
     let prefix = keys.prefix();
     // Pattern: `le:{*}:layer:*` — matches all layer mapping keys. The literal
     // braces are the Cluster hash tag, globbed here to span every session.
-    //
-    // This is now the SOLE copy of the layer-mapping key shape outside
-    // `KeySchema::layer_mapping` itself. It used to share a
-    // `KeySchema::layer_mapping_match_all_sessions_pattern` accessor with the
-    // checkpoint apply guard, which b.b2j retired: that guard stopped scanning
-    // and now GETs the one mapping the blob's own `(session_id, layer_name)`
-    // names, leaving this sweep the only enumerate-all-mappings caller. Kept
-    // inline rather than as a one-caller accessor — but a change to
-    // `KeySchema::layer_mapping`'s shape must be mirrored HERE, with no
-    // compiler error to catch the omission.
-    let pattern = format!("{prefix}{{*}}:layer:*");
+    // Built by `KeySchema::layer_mapping_scan_pattern`, beside the key builder
+    // it must track, and shared with the DR restore Job's planning read
+    // (`storage::dr_job`). The key parse below (`extract_hash_tag_id` and the
+    // `:layer:` suffix) still spells the shape, as does the session-id parse
+    // in `storage::dr_job::read_layer_mappings`, so a change to
+    // `KeySchema::layer_mapping` must be mirrored in both.
+    let pattern = keys.layer_mapping_scan_pattern();
 
     // `acquire_maintenance` bumps `valkey_pool_in_use{pool="maintenance"}`
     // for the duration of this sweep (b.mfn).
@@ -2367,7 +2459,7 @@ async fn sweep_orphaned_layers(
         let fred_key = match scan_result {
             Ok(k) => k,
             Err(e) => {
-                FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(&e);
+                FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(e.fred());
                 tracing::warn!(error = %e, "SCAN error during orphaned layer sweep");
                 continue;
             }
@@ -3080,7 +3172,7 @@ impl SweepError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fred::interfaces::SortedSetsInterface;
+    use fred::interfaces::{ClientLike, ClusterInterface, SortedSetsInterface};
 
     #[test]
     fn extract_hash_tag_id_obj_hdr_default_prefix() {
@@ -5903,6 +5995,30 @@ mod tests {
             self.fx.ext.probe_values(hashes).await
         }
 
+        async fn probe_value_lengths(
+            &self,
+            hashes: &[[u8; 32]],
+        ) -> Result<crate::storage::external_values::ExtValueLengths, ServiceError> {
+            self.fx.ext.probe_value_lengths(hashes).await
+        }
+
+        async fn read_value_range(
+            &self,
+            hash: &[u8; 32],
+            start: u64,
+            len: usize,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            self.fx.ext.read_value_range(hash, start, len).await
+        }
+
+        async fn recover_value(
+            &self,
+            hash: &[u8; 32],
+            on_fetched: crate::storage::external_values::OnFetched<'_>,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            self.fx.ext.recover_value(hash, on_fetched).await
+        }
+
         async fn process_pending(
             &self,
             policy: &GcPolicy,
@@ -6947,17 +7063,20 @@ mod tests {
 
     // ══ b.zt3 postcomp-1 — a walk is complete only on its terminal page ═════
     //
-    // T-W1: `complete_pages` and `scan_keyspace`'s routing guard
-    // (`cluster_walk_count`), pure, over a fake page. fred's own silent end on
-    // a real router abort is pinned in
-    // `tests/integration/storage/b_zt3_scan_walk_test.rs` (T-W0); the orphan
-    // sweep's reaction to a walk cut short is T-W4, below. Fail-on-old, by
-    // in-place perturbation: making `complete_pages`' end-of-stream check end
-    // the stream without its error turns (b) and (d) red on their `assert_eq!`
-    // of the walked items (the trailing `Err` missing), and T-W4 red on its
-    // one-WARN count (no WARN captured); dropping `cluster_walk_count`'s
-    // `!before.is_empty()` turns (e) red at its `expect_err` on the
-    // empty-table case.
+    // T-W1: `complete_pages`, pure, over a fake page; since b.hyw its one
+    // consumer is the checkpoint clean-up's keyed `ZSCAN`
+    // (`storage::recon_fence`), `scan_keyspace` walking no fred stream. fred's
+    // own silent end on a real router abort is pinned in
+    // `tests/integration/storage/b_zt3_scan_walk_test.rs` (T-W0). Fail-on-old,
+    // by in-place perturbation: making `complete_pages`' end-of-stream check
+    // end the stream without its error turns (b) and (d) red on their
+    // `assert_eq!` of the walked items (the trailing `Err` missing).
+    //
+    // `scan_keyspace` itself (b.hyw), below the T-W1 cases: its error mapping
+    // (T2, pure), a walk a failed step ends (T4), the orphan sweep's reaction
+    // to that walk (T-W4 / T6), and, cluster-gated, a clean walk and the
+    // forged verdicts' error items (b.hyw's three, b.87a's out-of-date
+    // routing table and changed end map).
 
     /// A page of a fake SCAN-family stream: its walk's last, or not.
     struct FakePage {
@@ -7084,67 +7203,15 @@ mod tests {
         );
     }
 
-    /// T-W1 (e): `scan_keyspace`'s routing guard. Only two reads of the same,
-    /// non-empty set of per-primary slots give a count; a missing routing
-    /// table, an empty one (fred's table when `CLUSTER SLOTS` returned no
-    /// slots: `scan_cluster` would start no walk, and zero terminal pages out
-    /// of zero would read as a complete walk), or primaries that changed while
-    /// the walk started are each one `ErrorKind::Cluster` error naming the
-    /// walk — transient, so the caller's next pass walks again. The stream form
-    /// (that error as the walk's only item) is not covered by any test:
-    /// reaching it needs a clustered client whose routing table changes while
-    /// a walk starts, which no test stages. The clustered arm's count on a
-    /// stable table (one terminal page per primary) is pinned by the
-    /// cluster-gated `scan_keyspace_on_a_cluster_walks_every_primary_to_its_terminal_page`
-    /// below.
-    #[test]
-    fn cluster_walk_count_counts_only_two_equal_non_empty_reads() {
-        assert_eq!(
-            cluster_walk_count(
-                "zt3-w1-e",
-                Some(vec![0, 5461, 10923]),
-                Some(vec![0, 5461, 10923])
-            )
-            .expect("the same three primaries read twice"),
-            3
-        );
-        for (before, after, case) in [
-            (None, None, "no routing table"),
-            (None, Some(vec![0]), "no routing table before"),
-            (Some(vec![0]), None, "no routing table after"),
-            (
-                Some(vec![0, 5461]),
-                Some(vec![0, 5461, 10923]),
-                "primaries changed",
-            ),
-            (
-                Some(vec![]),
-                Some(vec![]),
-                "an empty routing table, read twice",
-            ),
-            (Some(vec![]), Some(vec![0]), "an empty routing table before"),
-        ] {
-            let error = cluster_walk_count("zt3-w1-e", before, after)
-                .expect_err("the number of per-primary walks is unknown");
-            assert_eq!(*error.kind(), fred::error::ErrorKind::Cluster, "{case}");
-            assert!(error.details().contains("`zt3-w1-e`"), "{case}: {error:?}");
-            assert!(
-                crate::storage::client::is_transient_fred_error(&error),
-                "{case}"
-            );
-        }
-    }
-
     /// How many keys the cluster walk seeds, each under its own hash tag, so
     /// they spread over every primary of a multi-shard cluster.
     const CLUSTER_WALK_KEYS: usize = 64;
 
-    /// The clustered arm of `scan_keyspace`, on a real multi-shard cluster with
-    /// a stable routing table: the walk of a prefix seeded under
-    /// [`CLUSTER_WALK_KEYS`] distinct hash tags yields every seeded key and no
-    /// `Err` item. That pins `terminal_pages` to the number of primaries
-    /// `scan_cluster` starts on: one too few or too many and `complete_pages`
-    /// ends the walk with its truncation error.
+    /// `scan_keyspace` on a real multi-shard cluster with a stable routing
+    /// table: the coverage walk of a prefix seeded under
+    /// [`CLUSTER_WALK_KEYS`] distinct hash tags yields every seeded key, on
+    /// every primary, and no `Err` item (every pin's node serves exactly its
+    /// primary's slots at both ends, and the map holds still).
     ///
     /// **Cluster-gated**: skips (a `SKIP:` line) only when
     /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset. Once set, it must name a
@@ -7153,8 +7220,8 @@ mod tests {
     /// `primaries >= 2` assertion rather than skipping. CI's `test-cluster:` job
     /// runs it. In-crate because `scan_keyspace` is `pub(crate)`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn scan_keyspace_on_a_cluster_walks_every_primary_to_its_terminal_page() {
-        let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    async fn scan_keyspace_on_a_cluster_walks_every_primary_of_a_fresh_map() {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
             eprintln!(
                 "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)"
             );
@@ -7188,13 +7255,13 @@ mod tests {
         }
 
         let pattern = format!("{}{{zt3-walk-*}}:k", tv.prefix());
-        let items: Vec<Result<FredKey, fred::error::Error>> = tokio::time::timeout(
+        let items: Vec<Result<FredKey, KeyspaceWalkError>> = tokio::time::timeout(
             Duration::from_secs(30),
             scan_keyspace(client, &pattern).collect(),
         )
         .await
         .expect("the walk must end");
-        let errors: Vec<&fred::error::Error> = items
+        let errors: Vec<&KeyspaceWalkError> = items
             .iter()
             .filter_map(|item| item.as_ref().err())
             .collect();
@@ -7207,19 +7274,21 @@ mod tests {
             .filter_map(|item| item.as_ref().ok()?.as_str().map(|key| key.to_string()))
             .collect();
         assert_eq!(walked, seeded, "every seeded key, on every primary");
+        println!(
+            "CLUSTER-GATED RAN: scan_keyspace_on_a_cluster_walks_every_primary_of_a_fresh_map"
+        );
     }
 
-    /// T-W4: the orphaned-object phase reads a walk cut short before its
-    /// terminal page as a SCAN error, not as a walk of everything: one WARN
-    /// carrying the truncation text, the orphan not reaped this pass, and the
-    /// phase still `Ok` (the sweep's posture: a partial walk only defers work).
-    /// The next pass, with the walk whole, reaps it.
+    /// T-W4 (b.zt3; re-targeted by b.hyw, T6): the orphaned-object phase reads
+    /// a walk that ended with an error item as a SCAN error, not as a walk of
+    /// everything: one WARN carrying the walk's error, the orphan not reaped
+    /// this pass, and the phase still `Ok` (the sweep's posture: a partial
+    /// walk only defers work). The next pass, with the walk whole, reaps it.
     ///
-    /// The seam ends the walk's page stream before its first page, as fred
-    /// does when that page's command is dropped unanswered; a real router
-    /// abort cannot be aimed at the sweep's one walk. It is keyed by the walk's
-    /// pattern, which carries this test's prefix, so no other test's walk is
-    /// cut.
+    /// The walk seam (`storage::scan_guard`'s `StepError`) fails the walk's
+    /// first `SCAN` step on every attempt, a store fault that ends the walk
+    /// before any key. It is keyed by the walk's pattern, which carries this
+    /// test's prefix, so no other test's walk fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sweep_orphaned_objects_warns_on_a_walk_cut_short_and_reaps_on_the_next_pass() {
         const ORPHAN_OID: &str = "940301";
@@ -7246,7 +7315,13 @@ mod tests {
         let layer_store = LayerStore::new(tv.client().clone(), keys.clone(), 0);
 
         // The one guard for this walk; dropped below, before the whole pass.
-        let armed = arm_scan_walk_truncation_for_test(&pattern, 0);
+        let armed = crate::storage::scan_guard::arm_walk_fault_for_test(
+            &pattern,
+            crate::storage::scan_guard::WalkFault::StepError {
+                step: 0,
+                times: u32::MAX,
+            },
+        );
         let mut cut_short = SweepResult::default();
         let (outcome, warns) = capture_warns(sweep_orphaned_objects(
             tv.client(),
@@ -7270,10 +7345,9 @@ mod tests {
             .as_str()
             .expect("the WARN carries the error");
         assert!(
-            error.contains(&format!(
-                "SCAN walk `{pattern}` ended after 0 of 1 terminal page(s)"
-            )),
-            "the WARN must carry the truncation text: {error}"
+            error.contains(&format!("a SCAN step of {pattern} failed"))
+                && error.contains("test seam: step 0 of a SCAN walk failed before it was sent"),
+            "the WARN must carry the walk's error: {error}"
         );
         assert_eq!(
             (cut_short.objects_scanned, cut_short.orphaned_objects),
@@ -7298,5 +7372,495 @@ mod tests {
         .expect("the next pass walks the whole keyspace");
         assert_eq!(whole.orphaned_objects, 1);
         assert!(!header_exists().await, "the next pass reaps it");
+    }
+
+    // ── b.hyw — `scan_keyspace`'s coverage walk ─────────────────────────────
+
+    /// The pattern every pure T2 case names.
+    const T2_PATTERN: &str = "le:{*}:obj:hdr";
+
+    /// T2 (b.hyw): `scan_keyspace`'s error item keeps what each consumer's
+    /// fred-error arm relies on. A store fault that ended the walk keeps its
+    /// fred kind: a step that timed out stays `Timeout` (which `observe_error`
+    /// counts), a refused node pin stays `Routing`, a failed `CLUSTER SLOTS`
+    /// read keeps its own. A check that did not hold — an open slot, an
+    /// unusable myself line, a `NotOwner`, a changed slot map, an
+    /// out-of-date routing table (`StaleTable`) — is `Cluster` (transient,
+    /// never counted). Each carries the walk error's text, and
+    /// `every_primary_walked` as the walk answered it.
+    #[test]
+    fn keyspace_walk_error_keeps_a_store_faults_kind_and_makes_a_failed_check_cluster() {
+        use crate::storage::scan_guard::{
+            route_refused, MyselfLineSeen, RoutingRefresh, ServingChange, SlotSet, WalkEnd,
+            WitnessMissing, WitnessSeen,
+        };
+        use fred::error::ErrorKind;
+
+        let target: Arc<str> = Arc::from(T2_PATTERN);
+        let cases: Vec<(&str, WalkError, bool, ErrorKind)> = vec![
+            (
+                "a step that timed out",
+                WalkError::Step {
+                    walk: "SCAN",
+                    target: Arc::clone(&target),
+                    source: fred::error::Error::new(ErrorKind::Timeout, "timed out"),
+                },
+                false,
+                ErrorKind::Timeout,
+            ),
+            (
+                "a refused node pin",
+                route_refused(
+                    "SCAN",
+                    &target,
+                    &fred::types::config::Server::new("127.0.0.1", 7000),
+                ),
+                false,
+                ErrorKind::Routing,
+            ),
+            (
+                "a failed CLUSTER SLOTS read",
+                WalkError::Read {
+                    op: "CLUSTER SLOTS",
+                    source: fred::error::Error::new(ErrorKind::IO, "connection reset"),
+                },
+                false,
+                ErrorKind::IO,
+            ),
+            (
+                "an open slot",
+                WalkError::changed(ServingChange::OpenSlot {
+                    target: Arc::clone(&target),
+                    node: "127.0.0.1:7000".to_owned(),
+                    slots: "[42->-x]".to_owned(),
+                }),
+                true,
+                ErrorKind::Cluster,
+            ),
+            (
+                "an unusable myself line",
+                WalkError::WitnessMissing(WitnessMissing {
+                    walk: "SCAN",
+                    target: Arc::clone(&target),
+                    node: Some("127.0.0.1:7000".to_owned()),
+                    seen: WitnessSeen::MyselfLine(MyselfLineSeen::NoLine),
+                }),
+                true,
+                ErrorKind::Cluster,
+            ),
+            (
+                "a NotOwner",
+                WalkError::changed(ServingChange::NotOwner {
+                    target: Arc::clone(&target),
+                    primary: "127.0.0.1:7001".to_owned(),
+                    node: Some("127.0.0.1:7000".to_owned()),
+                    expected: SlotSet::from_ranges([(5461, 10922)]),
+                    served: Some(SlotSet::from_ranges([(0, 5460)])),
+                    at: WalkEnd::Start,
+                    refresh: RoutingRefresh::Refreshed,
+                }),
+                false,
+                ErrorKind::Cluster,
+            ),
+            (
+                "a changed slot map",
+                WalkError::changed(ServingChange::SlotMap {
+                    target: Arc::clone(&target),
+                    before: "0-16383@127.0.0.1:7000".to_owned(),
+                    after: "0-16383@127.0.0.1:7001".to_owned(),
+                }),
+                false,
+                ErrorKind::Cluster,
+            ),
+            (
+                "an out-of-date routing table",
+                WalkError::changed(ServingChange::StaleTable {
+                    target: Arc::clone(&target),
+                    at: WalkEnd::Start,
+                    map: "0-0@127.0.0.1:7001,1-16383@127.0.0.1:7000".to_owned(),
+                    table: "0-16383@127.0.0.1:7000".to_owned(),
+                    refresh: RoutingRefresh::Refreshed,
+                }),
+                false,
+                ErrorKind::Cluster,
+            ),
+        ];
+        for (case, walk, every_primary_walked, kind) in cases {
+            let text = walk.to_string();
+            let error = KeyspaceWalkError::new(walk, every_primary_walked);
+            assert_eq!(*error.fred().kind(), kind, "{case}: the kind");
+            assert_eq!(
+                error.fred().details(),
+                text,
+                "{case}: the walk error's text"
+            );
+            assert!(
+                error.to_string().contains(&text),
+                "{case}: Display is the fred error's: {error}"
+            );
+            assert_eq!(
+                error.every_primary_walked(),
+                every_primary_walked,
+                "{case}: as the walk answered it"
+            );
+            if kind == ErrorKind::Cluster {
+                assert!(
+                    crate::storage::client::is_transient_fred_error(error.fred()),
+                    "{case}: a failed check is transient"
+                );
+            }
+            assert_eq!(
+                *error.into_fred().kind(),
+                kind,
+                "{case}: into_fred keeps it"
+            );
+        }
+    }
+
+    /// T2 (b.hyw): a `CLUSTER NODES` read that failed at a pinned node is a
+    /// check the coverage walk could not prove and walked past (recorded,
+    /// answered after its last key with every primary walked), not a store
+    /// fault that ended the walk: it is `Cluster`, like the other unproven
+    /// checks, whatever kind the read's own error had.
+    #[test]
+    fn keyspace_walk_error_makes_a_recorded_failed_cluster_nodes_read_cluster() {
+        // A `Timeout` too: `observe_error` would count it, and a recorded
+        // check is never counted.
+        for kind in [fred::error::ErrorKind::IO, fred::error::ErrorKind::Timeout] {
+            let walk = WalkError::Read {
+                op: "CLUSTER NODES",
+                source: fred::error::Error::new(kind.clone(), "the read failed"),
+            };
+            let text = walk.to_string();
+            let error = KeyspaceWalkError::new(walk, true);
+            assert_eq!(
+                *error.fred().kind(),
+                fred::error::ErrorKind::Cluster,
+                "a recorded {kind:?} read"
+            );
+            assert_eq!(error.fred().details(), text);
+            assert!(error.every_primary_walked());
+        }
+    }
+
+    /// T4 (b.hyw): a walk whose second `SCAN` step fails on every attempt
+    /// (the walk seam's `StepError` on step 1, a transient `IO` error, so
+    /// each of the walk's attempts is spent) yields the keys its first step
+    /// returned, then exactly one error item, of the step's kind, and then
+    /// nothing: the stream ends with the error. The error reports that the
+    /// walk did not walk every primary.
+    ///
+    /// The walk runs on a database reserved for it
+    /// (`test_support::SCAN_STEP_FAULT_TEST_DATABASE`), holding only
+    /// its `KEYS` keys, so what step 0 returns does not depend on where other
+    /// tests' keys sit in the shared keyspace: a step samples about its
+    /// `COUNT` (100) elements, every one of them this test's, so step 0
+    /// returns some keys and leaves a cursor (300 keys are more than one
+    /// step's sample). Step 1 is therefore reached (the seam's text in the
+    /// error shows it was), and the keys step 0 returned must reach the
+    /// consumer before the error: a walk that dropped the keys it had on a
+    /// store fault fails `!walked.is_empty()`. Premise: no other run of this
+    /// test shares the server's database at the same moment (CI's job store
+    /// and a `remote-slot` run's store are private).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_keyspace_yields_the_keys_before_a_failed_step_then_one_error_then_nothing() {
+        const KEYS: usize = 300;
+        use crate::storage::test_support::{
+            test_valkey_url_on_database, SCAN_STEP_FAULT_TEST_DATABASE,
+        };
+        let tv = TestValkey::setup_with_url(
+            test_valkey_url_on_database(SCAN_STEP_FAULT_TEST_DATABASE),
+            4,
+        )
+        .await;
+        let prefix = format!("{}hyw-t4:", tv.prefix());
+        let mut seeded = std::collections::BTreeSet::new();
+        for i in 0..KEYS {
+            let key = format!("{prefix}{i:04}");
+            let _: () = tv
+                .client()
+                .pool
+                .set(&key, "1", None, None, false)
+                .await
+                .expect("seeding a key must succeed");
+            seeded.insert(key);
+        }
+        let pattern = format!("{prefix}*");
+
+        let armed = crate::storage::scan_guard::arm_walk_fault_for_test(
+            &pattern,
+            crate::storage::scan_guard::WalkFault::StepError {
+                step: 1,
+                times: u32::MAX,
+            },
+        );
+        let items: Vec<Result<FredKey, KeyspaceWalkError>> = tokio::time::timeout(
+            Duration::from_secs(30),
+            scan_keyspace(tv.client().pool.next(), &pattern).collect(),
+        )
+        .await
+        .expect("the walk must end");
+        drop(armed);
+
+        let (last, before) = items.split_last().expect("the walk yields its error");
+        let error = last
+            .as_ref()
+            .expect_err("the last item is the walk's error");
+        assert_eq!(
+            *error.fred().kind(),
+            fred::error::ErrorKind::IO,
+            "the failed step's own kind: {error}"
+        );
+        assert!(
+            error
+                .fred()
+                .details()
+                .contains("test seam: step 1 of a SCAN walk failed before it was sent"),
+            "the error is step 1's: {error}"
+        );
+        assert!(
+            !error.every_primary_walked(),
+            "a walk a store fault ended did not walk every primary"
+        );
+        let walked: std::collections::BTreeSet<String> = before
+            .iter()
+            .map(|item| {
+                item.as_ref()
+                    .expect("one error, and only as the last item")
+                    .as_str()
+                    .expect("a UTF-8 key")
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            walked.is_subset(&seeded),
+            "only keys the pattern matches: {walked:?}"
+        );
+        assert!(
+            !walked.is_empty(),
+            "step 0's keys reach the consumer before the store fault's error"
+        );
+        assert!(
+            walked.len() < KEYS,
+            "the walk ended at step 1, before reaching every key ({} of {KEYS})",
+            walked.len()
+        );
+    }
+
+    /// A `CLUSTER NODES` reply whose myself line lists `ranges`, then
+    /// `extra` (an open-slot marker, say).
+    fn forged_myself_line(ranges: &[(u16, u16)], extra: &str) -> String {
+        let mut fields: Vec<String> = [
+            "0000000000000000000000000000000000000001",
+            "127.0.0.1:7000@17000",
+            "myself,master",
+            "-",
+            "0",
+            "0",
+            "1",
+            "connected",
+        ]
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect();
+        fields.extend(ranges.iter().map(|&(start, end)| format!("{start}-{end}")));
+        if !extra.is_empty() {
+            fields.push(extra.to_owned());
+        }
+        fields.join(" ") + "\n"
+    }
+
+    /// b.hyw T7 at `scan_keyspace`'s level, on a real multi-shard cluster:
+    /// the walk seam forges a verdict of the coverage walk, and each walk
+    /// ends with exactly one error item, `Cluster`, after its keys, telling
+    /// whether every primary was walked (policy 3) and carrying the reason
+    /// the walk answered (each row names a fragment of it). The first three
+    /// forge the first primary's start `CLUSTER NODES` reply (read 0):
+    ///
+    /// - an open slot on the first primary's own line: every key, then the
+    ///   error, every primary walked;
+    /// - one slot fewer than the first primary's (`NotOwner`): every key but
+    ///   the first primary's, then the error, not every primary walked;
+    /// - an unusable line (no myself line): every key, then the error, every
+    ///   primary walked.
+    ///
+    /// b.87a adds two whose walks read every key but lose coverage, so not
+    /// every primary walked:
+    ///
+    /// - the same unusable line with the walk's start routing-table
+    ///   comparison forged to differ (`TablePartitionDiffers`, check 0): the
+    ///   unproven pin's table is out of date (`StaleTable`);
+    /// - the end `CLUSTER SLOTS` map (read 1) read with its first two
+    ///   primaries' names exchanged (`SlotMapPrimariesSwapped`): the map
+    ///   changed during the walk (`SlotMap`).
+    ///
+    /// The first primary's slots are read from the client's routing table,
+    /// which on a stable cluster is the walk's fresh map.
+    ///
+    /// **Cluster-gated**: skips (a `SKIP:` line) when
+    /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset; CI's `test-cluster:` job runs
+    /// it. In-crate because `scan_keyspace` is `pub(crate)`.
+    ///
+    /// Fail-on-old for b.87a's two rows (stated, not run in this sandbox,
+    /// which has no cluster): with `StaleTable` left out of
+    /// `scan_guard::loses_coverage`'s coverage-losing reasons, the held
+    /// unusable line stays the answer, so the stale-table row's error lacks
+    /// the table wording (`every_primary_walked()` stays `false`, since
+    /// `check_table` still marks coverage lost); with the
+    /// `coverage_lost = true` dropped from `check_table`, that row answers
+    /// `every_primary_walked() == true`; with the map comparison removed
+    /// from `check_coverage_end`, the end-map row's walk completes with no
+    /// error item, and `split_last`'s `expect_err` fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_keyspace_on_a_cluster_ends_a_forged_verdict_with_one_error_after_its_keys() {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
+            eprintln!(
+                "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)"
+            );
+            return;
+        };
+        let tv = TestValkey::setup_with_url(cluster_url, 1).await;
+        let client = tv.client().pool.next();
+        assert!(
+            client.is_clustered(),
+            "LIVE_EDIT_TEST_CLUSTER_URL must point at a clustered deployment"
+        );
+        let routing = client
+            .cached_cluster_state()
+            .expect("a connected cluster client has a routing table");
+        let first = routing
+            .get_server(0)
+            .cloned()
+            .expect("the table names slot 0's owner");
+        let mut first_ranges: Vec<(u16, u16)> = routing
+            .slots()
+            .iter()
+            .filter(|range| range.primary == first)
+            .map(|range| (range.start, range.end))
+            .collect();
+        first_ranges.sort_unstable();
+        let on_first = |key: &str| {
+            let slot = fred::util::redis_keyslot(key.as_bytes());
+            first_ranges
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&slot))
+        };
+
+        let mut seeded = std::collections::BTreeSet::new();
+        for i in 0..CLUSTER_WALK_KEYS {
+            let key = format!("{}{{hyw-t7-{i}}}:k", tv.prefix());
+            let _: () = tv
+                .client()
+                .pool
+                .set(&key, "v", None, None, false)
+                .await
+                .expect("seeding a key must succeed");
+            seeded.insert(key);
+        }
+        let off_first: std::collections::BTreeSet<String> = seeded
+            .iter()
+            .filter(|key| !on_first(key))
+            .cloned()
+            .collect();
+        assert!(
+            !off_first.is_empty() && off_first.len() < seeded.len(),
+            "fixture: the first primary and another hold keys"
+        );
+
+        let mut fewer = first_ranges.clone();
+        let (start, end) = fewer.pop().expect("a primary serves a slot");
+        if start < end {
+            fewer.push((start, end - 1));
+        }
+        use crate::storage::scan_guard::{arm_walk_fault_for_test, WalkFault};
+        let marker = "[42->-0000000000000000000000000000000000000002]";
+        let start_reply = |reply: String| WalkFault::ClusterNodesReply { read: 0, reply };
+        let unusable = "1 127.0.0.1:7001@17001 master - 0 0 2 connected 0-16383\n";
+        let pattern = format!("{}{{hyw-t7-*}}:k", tv.prefix());
+        for (case, faults, expected_keys, every_primary_walked, answered) in [
+            (
+                "an open slot",
+                vec![start_reply(forged_myself_line(&first_ranges, marker))],
+                &seeded,
+                true,
+                "found a slot migrating or importing",
+            ),
+            (
+                "one slot fewer",
+                vec![start_reply(forged_myself_line(&fewer, ""))],
+                &off_first,
+                false,
+                "which serves slots",
+            ),
+            (
+                "an unusable line",
+                vec![start_reply(unusable.to_owned())],
+                &seeded,
+                true,
+                "no myself line",
+            ),
+            (
+                "an unusable line and a routing table that differs from the map",
+                vec![
+                    start_reply(unusable.to_owned()),
+                    WalkFault::TablePartitionDiffers { check: 0 },
+                ],
+                &seeded,
+                false,
+                "does not divide the slots among nodes as the cluster's slot map",
+            ),
+            (
+                "an end map that differs from the start's",
+                vec![WalkFault::SlotMapPrimariesSwapped { read: 1 }],
+                &seeded,
+                false,
+                "saw the cluster's slot map change",
+            ),
+        ] {
+            let armed: Vec<_> = faults
+                .into_iter()
+                .map(|fault| arm_walk_fault_for_test(&pattern, fault))
+                .collect();
+            let items: Vec<Result<FredKey, KeyspaceWalkError>> = tokio::time::timeout(
+                Duration::from_secs(30),
+                scan_keyspace(client, &pattern).collect(),
+            )
+            .await
+            .expect("the walk must end");
+            drop(armed);
+
+            let (last, before) = items.split_last().expect("the walk yields its error");
+            let error = last
+                .as_ref()
+                .expect_err("the walk's last item is its error");
+            assert_eq!(
+                *error.fred().kind(),
+                fred::error::ErrorKind::Cluster,
+                "{case}: {error}"
+            );
+            assert_eq!(
+                error.every_primary_walked(),
+                every_primary_walked,
+                "{case}: every primary walked ({error})"
+            );
+            assert!(
+                error.to_string().contains(answered),
+                "{case}: the walk answers its reason, naming {answered:?}: {error}"
+            );
+            let walked: std::collections::BTreeSet<String> = before
+                .iter()
+                .map(|item| {
+                    item.as_ref()
+                        .expect("one error, and only as the last item")
+                        .as_str()
+                        .expect("a UTF-8 key")
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(&walked, expected_keys, "{case}: the keys walked");
+        }
+        println!(
+            "CLUSTER-GATED RAN: scan_keyspace_on_a_cluster_ends_a_forged_verdict_with_one_error_after_its_keys"
+        );
     }
 }

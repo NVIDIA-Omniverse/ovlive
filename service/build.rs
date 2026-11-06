@@ -36,6 +36,13 @@ fn main() {
         .build_server(true)
         .build_client(true)
         .file_descriptor_set_path(&descriptor_path)
+        // `SubscribeReadLayerChunk.data` is `bytes::Bytes`, not `Vec<u8>`, so
+        // a chunk is a slice of the payload it was cut from — a relay entry's
+        // shared copy, or a catch-up payload's page — instead of a copy per
+        // subscriber (`grpc::streaming::chunk_ompf_for_stream`; SDD §12.6).
+        // This field only: the upload chunks stay `Vec<u8>`. The encoded
+        // message is the same either way.
+        .bytes(".nvidia.omniverse.live.v1alpha.SubscribeReadLayerChunk.data")
         .compile_protos(
             &["proto/nvidia/omniverse/live/v1alpha/live_service.proto"],
             &["proto"],

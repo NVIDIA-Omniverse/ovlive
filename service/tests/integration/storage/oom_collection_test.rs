@@ -36,6 +36,7 @@
 //! | `refused`, by the decrement and by the upload hold, and the WARN once; a failed hold on the per-collection WARN | [`oom_collections_refused_by_the_store_count_refused_and_warn_once`] |
 //! | A refused re-claim is skipped (F1) | [`a_refused_reclaim_skips_the_member_and_the_pass_goes_on`] |
 //! | A real `-OOM` (disruptive, RT1–RT6) | the `store_write_refusal_disruptive_*` tests at the bottom |
+//! | b.g65: the checkpoint clean-up's two opener scripts on a full store (disruptive, RT7–RT8) — a backup writer's re-arm (`recon_ext_rearm.lua`) and the collect's post-delete clear (`ext_backup_clear.lua`) | [`store_write_refusal_disruptive_a_backup_writers_re_arm_lands_on_a_full_store`], [`store_write_refusal_disruptive_the_collects_clear_withdraws_a_confirmation_on_a_full_store`] |
 //!
 //! Elsewhere: the trigger's turn (one wake-up and one request per interval,
 //! the wake after the send) in `src/storage/store_oom.rs`; an `-OOM` at an
@@ -1716,4 +1717,135 @@ async fn store_write_refusal_disruptive_oom_collection_frees_a_full_store_and_th
     assert_eq!(freed_bytes_total(&m), LARGE as u64);
     retried.expect("the retried upload must land once the collection freed the store");
     assert!(!data_present(&tv, large).await);
+}
+
+/// RT7 (b.g65, P4): on a full store a backup writer's re-arm — the clean-up
+/// fence every layer publish runs before its PUT — still lands: its opener
+/// (`ZREM :rearm ":oom-gate"`) writes nothing that grows memory, after which
+/// Valkey lets the re-arm's `ZADD` and the stem's heal run. Without the opener
+/// the full store would refuse the re-arm and every layer backup would defer
+/// (fail closed) until memory was freed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, sets the server's `maxmemory` on its own \
+            Valkey (LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL)"]
+async fn store_write_refusal_disruptive_a_backup_writers_re_arm_lands_on_a_full_store() {
+    let Some((tv, admin)) = disruptive_fixture().await else {
+        return;
+    };
+    let keys = tv.key_schema();
+    let hash_hex = sha256_to_hex(&hash(0xC1));
+    let _: () = tv
+        .client()
+        .pool
+        .zadd(
+            keys.checkpoint_reconcile_tombstones(),
+            None,
+            None,
+            false,
+            false,
+            (1.0, hash_hex.as_str()),
+        )
+        .await
+        .expect("ZADD :tomb");
+    let _: () = tv
+        .client()
+        .pool
+        .zadd(
+            keys.checkpoint_reconcile_orphans(),
+            None,
+            None,
+            false,
+            false,
+            (1.0, "9100.7"),
+        )
+        .await
+        .expect("ZADD :orphans");
+
+    let full = RestoreMaxmemory::set_full(&admin).await;
+    assert_refuses_writes(&tv).await;
+    let reply = live_edit::storage::recon_fence::recon_ext_rearm(
+        tv.client(),
+        keys,
+        std::slice::from_ref(&hash_hex),
+        Duration::from_secs(60),
+        Duration::from_secs(60),
+        Some("9100.7"),
+    )
+    .await;
+    full.restore().await;
+
+    let reply = reply.expect("the re-arm must run on a full store");
+    assert!(!reply.refuses(), "{reply:?}");
+    let rearmed: Option<f64> = tv
+        .client()
+        .pool
+        .zscore(keys.checkpoint_reconcile_rearm(), hash_hex.as_str())
+        .await
+        .expect("ZSCORE :rearm");
+    assert!(
+        rearmed.is_some(),
+        "the re-arm's ZADD landed on the full store"
+    );
+    let orphan: Option<f64> = tv
+        .client()
+        .pool
+        .zscore(keys.checkpoint_reconcile_orphans(), "9100.7")
+        .await
+        .expect("ZSCORE :orphans");
+    assert_eq!(orphan, None, "and the stem's heal ran");
+}
+
+/// RT8 (b.g65, P4): on a full store the checkpoint collect's post-delete step
+/// (`ext_backup_clear.lua`) still withdraws a deleted copy's confirmation and
+/// stamps the clear: its `HDEL backed_up_in` is the memory-neutral opener,
+/// after which the `HSET backup_cleared_ms` runs. Refused, the value would keep
+/// reading as backed up with no copy until the daily audit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, sets the server's `maxmemory` on its own \
+            Valkey (LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL)"]
+async fn store_write_refusal_disruptive_the_collects_clear_withdraws_a_confirmation_on_a_full_store(
+) {
+    let Some((tv, admin)) = disruptive_fixture().await else {
+        return;
+    };
+    let m = metrics();
+    let s = store(&tv, &m);
+    let h = hash(0xC2);
+    put(&s, h, BLOB).await;
+    let hash_hex = sha256_to_hex(&h);
+    let _: u64 = tv
+        .client()
+        .pool
+        .hset(
+            tv.key_schema().ext_meta(&hash_hex),
+            vec![("backed_up_in", "0123456789abcdef:100")],
+        )
+        .await
+        .expect("HSET backed_up_in");
+
+    let full = RestoreMaxmemory::set_full(&admin).await;
+    assert_refuses_writes(&tv).await;
+    let cleared =
+        live_edit::storage::ext_backup::clear_ext_backup(tv.client(), tv.key_schema(), &hash_hex)
+            .await;
+    full.restore().await;
+
+    assert!(
+        cleared.expect("the clear must run on a full store"),
+        "the value is live"
+    );
+    let fields: Vec<Option<String>> = tv
+        .client()
+        .pool
+        .hmget(
+            tv.key_schema().ext_meta(&hash_hex),
+            vec!["backed_up_in", "backup_cleared_ms"],
+        )
+        .await
+        .expect("HMGET");
+    assert_eq!(
+        fields[0], None,
+        "the confirmation is withdrawn on the full store"
+    );
+    assert!(fields[1].is_some(), "and the clear is stamped");
 }

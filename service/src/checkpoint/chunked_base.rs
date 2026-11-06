@@ -839,14 +839,14 @@ pub(crate) mod tests {
 
     impl PlannedBase {
         fn of(state: &ObjectState) -> Self {
-            let plan = DiffEngine::plan(state, &[], 0, 0, None).expect("the fixture must plan");
+            let plan = DiffEngine::plan_full_content(state).expect("the fixture must plan");
             let DiffPlan::FullContent {
                 sections,
                 mut fields,
                 time_samples,
             } = plan
             else {
-                panic!("have_version 0 always plans FullContent");
+                panic!("plan_full_content always plans FullContent");
             };
             for f in &mut fields {
                 f.set_order = f.authoring_set_order;

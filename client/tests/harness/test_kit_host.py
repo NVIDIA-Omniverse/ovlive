@@ -6,11 +6,14 @@ from concurrent.futures import Future
 from enum import IntEnum
 import importlib.util
 import json
-from pathlib import Path
+import mmap
+from pathlib import Path, PureWindowsPath
+import struct
 import sys
 import sysconfig
 import tempfile
 import threading
+import time
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -31,6 +34,74 @@ class Result(IntEnum):
 class LiveError(RuntimeError):
     def __init__(self, result):
         self.result = result
+
+
+def maps_identity(identity):
+    """A (device, inode) pair as a /proc/self/maps line writes it."""
+    return f"{identity[0]} {identity[1]}"
+
+
+def write_elf(path, needed):
+    """Write a minimal 64-bit ELF shared object whose dynamic section lists `needed`."""
+    names = b"\0" + b"".join(name.encode() + b"\0" for name in needed)
+    offsets, position = [], 1
+    for name in needed:
+        offsets.append(position)
+        position += len(name) + 1
+    phoff, phentsize = 64, 56
+    dynamic_offset = phoff + 2 * phentsize
+    dynamic_size = (len(needed) + 2) * 16
+    strtab_offset = dynamic_offset + dynamic_size
+    dynamic = b"".join(struct.pack("<qQ", 1, offset) for offset in offsets)
+    dynamic += struct.pack("<qQ", 5, strtab_offset) + struct.pack("<qQ", 0, 0)
+    total = strtab_offset + len(names)
+    header = b"\x7fELF" + bytes([2, 1, 1]) + bytes(9) + struct.pack(
+        "<HHIQQQIHHHHHH", 3, 62, 1, 0, phoff, 0, 0, 64, phentsize, 2, 0, 0, 0)
+    load = struct.pack("<IIQQQQQQ", 1, 4, 0, 0, 0, total, total, 0x1000)
+    dyn = struct.pack("<IIQQQQQQ", 2, 4, dynamic_offset, dynamic_offset, dynamic_offset,
+                      dynamic_size, dynamic_size, 8)
+    path.write_bytes(header + load + dyn + dynamic + names)
+
+
+def pe_image(imports, delayed=(), pe32=False, delay_attributes=1):
+    """A minimal PE image, laid out as the loader maps it, whose import and delay-import directories list `imports`
+    and `delayed`."""
+    directories = 96 if pe32 else 112
+    optional_size = directories + 16 * 8
+    import_rva, delay_rva, names_rva = 0x400, 0x600, 0x800
+    names, offsets = b"", []
+    for name in (*imports, *delayed):
+        offsets.append(names_rva + len(names))
+        names += name.encode() + b"\0"
+    total = names_rva + len(names)
+    image = bytearray(total)
+    image[0:2] = b"MZ"
+    struct.pack_into("<I", image, 0x3C, 0x40)
+    image[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", image, 0x44, 0x14C if pe32 else 0x8664, 0, 0, 0, 0, optional_size, 0x2022)
+    optional = 0x58
+    struct.pack_into("<H", image, optional, 0x10B if pe32 else 0x20B)
+    struct.pack_into("<I", image, optional + 56, total)
+    struct.pack_into("<I", image, optional + directories - 4, 16)
+    if imports:
+        struct.pack_into("<II", image, optional + directories + 8 * 1, import_rva, 20 * (len(imports) + 1))
+    if delayed:
+        struct.pack_into("<II", image, optional + directories + 8 * 13, delay_rva, 32 * (len(delayed) + 1))
+    for index, offset in enumerate(offsets[:len(imports)]):
+        struct.pack_into("<IIIII", image, import_rva + 20 * index, 0, 0, 0, offset, 0)
+    for index, offset in enumerate(offsets[len(imports):]):
+        struct.pack_into("<II", image, delay_rva + 32 * index, delay_attributes, offset)
+    image[names_rva:] = names
+    return bytes(image)
+
+
+def image_reader(image):
+    """A reader of `image` for _pe_imports, which raises OSError past its end as an unreadable page does."""
+    def read(rva, size):
+        if rva + size > len(image):
+            raise OSError("unreadable")
+        return image[rva:rva + size]
+    return read
 
 
 class KitHostTests(unittest.TestCase):
@@ -56,6 +127,9 @@ class KitHostTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("kit_bootstrap_fixture", ROOT / "source/kit/python/omni/kit/live_services/_bootstrap.py")
         self.bootstrap = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.bootstrap)
+        # The fixture process loads no USD: model a Linux kit-25.11 host unless a test says otherwise.
+        self.bootstrap._verifies_host_usd = lambda: True
+        self.bootstrap._host_usd_profile = lambda: "kit-25.11"
         self.tasks = []
         def submit(coroutine):
             future = Future()
@@ -202,8 +276,13 @@ class KitHostTests(unittest.TestCase):
             profile = package / "config/live-sdk.json"
             registry = SimpleNamespace(GetAllPlugins=Mock(return_value=[]), RegisterPlugins=Mock())
             with patch.object(self.bootstrap.importlib, "import_module") as importer:
+                # A stock-25.11 package on a kit-25.11 host, an invalid schema version, an unknown profile and an
+                # extra key are all rejected before any import.
                 for value in (dict(schema_version=1, usd_profile="stock-25.11"),
-                              dict(schema_version=True, usd_profile="kit-25.11")):
+                              dict(schema_version=True, usd_profile="kit-25.11"),
+                              dict(schema_version=1, usd_profile="kit-26.0"),
+                              dict(schema_version=1, usd_profile=["kit-25.11"]),
+                              dict(schema_version=1, usd_profile="kit-25.11", extra=1)):
                     profile.write_text(json.dumps(value))
                     with self.assertRaisesRegex(RuntimeError, "kit-25.11"):
                         self.bootstrap.load_api(package, registry)
@@ -295,6 +374,239 @@ class KitHostTests(unittest.TestCase):
                 importer.assert_not_called()
                 registry.GetAllPlugins.assert_not_called()
                 registry.RegisterPlugins.assert_not_called()
+
+    def test_host_usd_profile_reads_the_one_loaded_usd_abi(self):
+        with tempfile.TemporaryDirectory() as directory:
+            maps = Path(directory) / "maps"
+            cases = (("7f00-7f01 r-xp 00000000 08:01 1 /opt/kit/lib/libusd_sdf.so\n", "stock-25.11"),
+                     ("7f00-7f01 r-xp 00000000 08:01 1 /opt/kit/plugins/libov_25.11usd_ms.so\n", "kit-25.11"),
+                     ("7f00-7f01 r-xp 00000000 08:01 1 /usr/lib/libc.so.6\n", None),
+                     # Libraries are matched by exact file name, not by a substring of the path.
+                     ("7f00-7f01 r-xp 00000000 08:01 1 /opt/kit/lib/libusd_sdf.so.bak\n", None))
+            for text, expected in cases:
+                maps.write_text(text)
+                self.assertEqual(self.probe()._mapped_usd_profile(maps), expected)
+            self.assertIsNone(self.probe()._mapped_usd_profile(Path(directory) / "missing"))
+
+            # The ELF reader finds a shim by its DT_NEEDED names, on every platform.
+            write_elf(Path(directory) / "shim.so", ["libusd_tf.so", "libusd_sdf.so"])
+            self.assertEqual(self.probe()._elf_needed(Path(directory) / "shim.so"), ("libusd_tf.so", "libusd_sdf.so"))
+            self.assertEqual(self.probe()._elf_needed(maps), ())
+            # A name with no NUL terminator before the end of the file is unverifiable.
+            library = Path(directory) / "unterminated.so"
+            write_elf(library, ["libusd_tf.so", "libusd_sdf.so"])
+            library.write_bytes(library.read_bytes()[:-1])
+            self.assertEqual(self.probe()._elf_needed(library), ())
+            # A mapped path that is not UTF-8 does not hide the USD mappings.
+            maps.write_bytes(b"7f00-7f01 r-xp 00000000 08:01 1 /opt/\xff/libc.so.6\n"
+                             b"7f02-7f03 r-xp 00000000 08:01 2 /opt/kit/lib/libusd_sdf.so\n")
+            self.assertEqual(self.probe()._mapped_usd_profile(maps), "stock-25.11")
+            # A file holding only part of an ELF header is unverifiable, not an error.
+            for header in (b"\x7fELF", b"\x7fELF\x02", b"\x7fELF\x02\x01" + bytes(32)):
+                (Path(directory) / "truncated").write_bytes(header)
+                self.assertEqual(self.probe()._elf_needed(Path(directory) / "truncated"), ())
+
+    def test_host_usd_profile_verifies_every_mapped_shim(self):
+        with tempfile.TemporaryDirectory() as directory:
+            maps = Path(directory) / "maps"
+            stock = "7f00-7f01 r-xp 00000000 08:01 1 /opt/kit/lib/libusd_sdf.so\n"
+            # Kit 111 hosts namespaced OVRTX through a USD namespace shim: a libov_25.11usd_ms.so that links the stock
+            # libusd_sdf.so forwards to the loaded stock USD, so the host is stock-25.11. A real monolithic library
+            # next to stock USD, or a shim that cannot be read, stays ambiguous.
+            shim, monolithic = Path(directory) / "shim", Path(directory) / "monolithic"
+            (shim / "lib").mkdir(parents=True)
+            (monolithic / "lib").mkdir(parents=True)
+            write_elf(shim / "lib/libov_25.11usd_ms.so", ["libusd_tf.so", "libusd_sdf.so"])
+            write_elf(monolithic / "lib/libov_25.11usd_ms.so", ["libAlembic.so.1.8"])
+            shim_library = shim / "lib/libov_25.11usd_ms.so"
+            if self.refuses_unverified_shim(maps, stock, shim_library):
+                return
+            for root, expected in ((shim, "stock-25.11"), (monolithic, None), (Path(directory) / "absent", None)):
+                library = root / "lib/libov_25.11usd_ms.so"
+                identity = self.mapped(library) if library.exists() else ("08:01", 2)
+                maps.write_text(stock + f"7f02-7f03 r-xp 00000000 {maps_identity(identity)} {library}\n")
+                self.assertEqual(self.probe()._mapped_usd_profile(maps), expected)
+            # Every mapped copy must be verified: a monolithic copy whose file was deleted still occupies the process,
+            # so it makes the host ambiguous even beside a readable shim.
+            shim_line = f"7f02-7f03 r-xp 00000000 {maps_identity(self.mapped(shim_library))} {shim_library}"
+            deleted = "7f04-7f05 r-xp 00000000 08:01 3 /mono/libov_25.11usd_ms.so (deleted)\n"
+            maps.write_text(stock + shim_line + "\n" + deleted)
+            self.assertIsNone(self.probe()._mapped_usd_profile(maps))
+            maps.write_text(stock + shim_line + " (deleted)\n")
+            self.assertIsNone(self.probe()._mapped_usd_profile(maps))
+
+    def test_host_usd_check_reads_the_file_that_was_mapped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            maps = Path(directory) / "maps"
+            stock = "7f00-7f01 r-xp 00000000 08:01 1 /opt/kit/lib/libusd_sdf.so\n"
+            library = Path(directory) / "lib/libov_25.11usd_ms.so"
+            library.parent.mkdir()
+            write_elf(library, ["libAlembic.so.1.8"])
+            if self.refuses_unverified_shim(maps, stock, library):
+                return
+            monolithic = self.mapped(library)
+            self.assertEqual(self.mapped(library), monolithic)
+            # A monolithic library is mapped, and then replaced at its path by a shim after maps is read: the check
+            # reads the shim, but the process still holds the monolithic copy.
+            replacement = Path(directory) / "replacement.so"
+            write_elf(replacement, ["libusd_tf.so", "libusd_sdf.so"])
+            replacement.replace(library)
+            self.assertNotEqual(self.mapped(library), monolithic)
+            self.assertEqual(self.probe()._elf_needed(library, monolithic), ())
+            self.assertEqual(self.probe()._elf_needed(library, self.mapped(library)), ("libusd_tf.so", "libusd_sdf.so"))
+            maps.write_text(stock + f"7f02-7f03 r-xp 00000000 {maps_identity(monolithic)} {library}\n")
+            self.assertIsNone(self.probe()._mapped_usd_profile(maps))
+            # One path names two copies when its file was replaced between loads; both must be the shim.
+            maps.write_text(stock + f"7f02-7f03 r-xp 00000000 {maps_identity(self.mapped(library))} {library}\n"
+                                    f"7f04-7f05 r-xp 00000000 {maps_identity(monolithic)} {library}\n")
+            self.assertIsNone(self.probe()._mapped_usd_profile(maps))
+            maps.write_text(stock + f"7f02-7f03 r-xp 00000000 {maps_identity(self.mapped(library))} {library}\n")
+            self.assertEqual(self.probe()._mapped_usd_profile(maps), "stock-25.11")
+
+    def refuses_unverified_shim(self, maps, stock, library):
+        """Off Linux, assert that no shim is ever verified, and return True; on Linux, return False.
+
+        Only Linux names the file behind each mapping, in /proc/self/maps, so only there can the maps reader verify a
+        shim. Elsewhere a shim beside stock USD in a maps file stays ambiguous."""
+        probe = self.probe()
+        if sys.platform.startswith("linux"):
+            return False
+        write_elf(library, ["libusd_tf.so", "libusd_sdf.so"])
+        self.assertEqual(probe._elf_needed(library), ("libusd_tf.so", "libusd_sdf.so"))
+        self.assertEqual(probe._elf_needed(library, ("08:01", 2)), ())
+        # A maps file names paths with forward slashes, as Linux writes them, whatever the platform's separator.
+        shim_line = f"7f02-7f03 r-xp 00000000 08:01 2 {library.as_posix()}\n"
+        maps.write_text(shim_line)
+        self.assertEqual(probe._mapped_usd_profile(maps), "kit-25.11")
+        maps.write_text(stock + shim_line)
+        self.assertIsNone(probe._mapped_usd_profile(maps))
+        return True
+
+    def test_pe_imports_reads_import_and_delay_import_names(self):
+        probe = self.probe()
+        image = pe_image(["KERNEL32.dll", "usd_tf.dll"], ["usd_sdf.dll"])
+        self.assertEqual(probe._pe_imports(image_reader(image)), ("KERNEL32.dll", "usd_tf.dll", "usd_sdf.dll"))
+        self.assertEqual(probe._pe_imports(image_reader(pe_image(["usd_sdf.dll"], pe32=True))), ("usd_sdf.dll",))
+        self.assertEqual(probe._pe_imports(image_reader(pe_image([]))), ())
+        # An image that cannot be read whole is unverifiable, not an error: a name with no NUL before the end of the
+        # image, a delay-import descriptor of virtual addresses, a missing header and an unreadable page.
+        self.assertEqual(probe._pe_imports(image_reader(image[:-1])), ())
+        self.assertEqual(probe._pe_imports(image_reader(pe_image([], ["usd_sdf.dll"], delay_attributes=0))), ())
+        self.assertEqual(probe._pe_imports(image_reader(b"\x7fELF" + image[4:])), ())
+        self.assertEqual(probe._pe_imports(image_reader(image[:0x40])), ())
+        self.assertEqual(probe._pe_imports(Mock(side_effect=OSError("unreadable"))), ())
+        # A directory that runs past SizeOfImage is outside the image, whatever the reader would return there.
+        truncated = bytearray(image)
+        struct.pack_into("<I", truncated, 0x58 + 56, 0x410)
+        self.assertEqual(probe._pe_imports(image_reader(bytes(truncated))), ())
+
+    def test_loaded_usd_profile_reads_the_one_loaded_usd_abi(self):
+        probe = self.probe()
+        cases = ((["C:\\Kit\\usd\\lib\\usd_sdf.dll"], "stock-25.11"),
+                 (["C:\\Kit\\usd\\lib\\USD_SDF.DLL"], "stock-25.11"),
+                 (["C:\\Kit\\usd\\lib\\ov_25.11usd_ms.dll"], "kit-25.11"),
+                 (["C:\\Windows\\System32\\KERNEL32.DLL"], None),
+                 # Modules are matched by exact file name, not by a substring of the path.
+                 (["C:\\Kit\\usd\\lib\\usd_sdf.dll.bak", "C:\\usd_sdf.dll\\other.dll"], None))
+        for paths, expected in cases:
+            with self.subTest(paths=paths):
+                modules = [(path, 0x10000 * (index + 1)) for index, path in enumerate(paths)]
+                imports = Mock(side_effect=AssertionError("one USD ABI needs no import check"))
+                self.assertEqual(probe._loaded_usd_profile(lambda: modules, imports), expected)
+        self.assertIsNone(probe._loaded_usd_profile(Mock(side_effect=OSError("cannot list")), Mock()))
+
+    def test_loaded_usd_profile_verifies_every_loaded_shim(self):
+        probe = self.probe()
+        stock = ("C:\\Kit\\usd\\lib\\usd_sdf.dll", 0x10000)
+        images = {0x20000: pe_image(["usd_tf.dll"], ["USD_SDF.dll"]), 0x30000: pe_image(["usd_sdf.dll"]),
+                  0x40000: pe_image(["tbb12.dll", "python312.dll"]), 0x50000: pe_image(["usd_sdf.dll"])[:-1]}
+        reads = []
+
+        def imports(path, base):
+            reads.append(base)
+            return probe._pe_imports(image_reader(images[base]))
+        shim = "C:\\Kit\\exts\\ovrtx\\bin\\ov_25.11usd_ms.dll"
+        # Kit 111's shim imports stock usd_sdf.dll, directly or delay-loaded, and makes the host stock-25.11. Every
+        # loaded copy must be the shim: a real monolithic DLL beside it, or a copy whose image cannot be read, is
+        # ambiguous.
+        cases = (([0x20000], "stock-25.11"), ([0x20000, 0x30000], "stock-25.11"), ([0x40000], None),
+                 ([0x20000, 0x40000], None), ([0x50000], None))
+        for bases, expected in cases:
+            with self.subTest(bases=bases):
+                reads.clear()
+                modules = [stock] + [(shim, base) for base in bases]
+                self.assertEqual(probe._loaded_usd_profile(lambda: modules, imports), expected)
+                self.assertEqual(reads, bases[:len(reads)])
+
+    def test_windows_reads_this_process_loaded_modules(self):
+        probe = self.probe()
+        # Off Windows the loaded-module reader is not used: Linux verifies through its maps file, macOS not at all.
+        if sys.platform != "win32":
+            self.assertEqual(probe._verifies_host_usd(), sys.platform.startswith("linux"))
+            return
+        self.assertTrue(probe._verifies_host_usd())
+        modules = probe._loaded_modules()
+        names = {PureWindowsPath(path).name.lower() for path, _ in modules}
+        self.assertIn("kernel32.dll", names)
+        # sys.dllhandle is the base address of the Python DLL this process loaded.
+        python = [path for path, base in modules if base == sys.dllhandle]
+        self.assertEqual(len(python), 1)
+        self.assertRegex(PureWindowsPath(python[0]).name.lower(), r"^python3\d*\.dll$")
+        self.assertIn("kernel32.dll", [name.lower() for name in probe._module_imports(python[0], sys.dllhandle)])
+        # The module read must be the one named at that base: another path, or an address inside the module that is
+        # not its base, reads as ().
+        self.assertEqual(probe._module_imports("C:\\absent\\other.dll", sys.dllhandle), ())
+        self.assertEqual(probe._module_imports(python[0], sys.dllhandle + 0x1000), ())
+        # The test process loads no USD.
+        self.assertIsNone(probe._host_usd_profile())
+
+    def mapped(self, path):
+        """The (device, inode) /proc/self/maps names for a mapping of `path`'s current file."""
+        with open(path, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_COPY) as data:
+            return self.probe()._mapping_identity(data)
+
+    def probe(self):
+        """A fresh bootstrap module whose host checks are not modelled."""
+        spec = importlib.util.spec_from_file_location("kit_bootstrap_probe",
+                                                      ROOT / "source/kit/python/omni/kit/live_services/_bootstrap.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_usd_profile_must_match_the_host_before_python_or_plugin_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            (package / "config").mkdir()
+            profile = package / "config/live-sdk.json"
+            # (package profile, host profile, platform verifies the host, accepted)
+            cases = (("stock-25.11", "stock-25.11", True, True),
+                     ("kit-25.11", "kit-25.11", True, True),
+                     ("kit-25.11", "stock-25.11", True, False),
+                     ("stock-25.11", None, True, False),
+                     ("kit-25.11", None, True, False),
+                     ("kit-25.11", None, False, True),
+                     ("stock-25.11", None, False, False))
+            for package_profile, host, verifies, accepted in cases:
+                with self.subTest(package=package_profile, host=host, verifies=verifies):
+                    profile.write_text(json.dumps(dict(schema_version=1, usd_profile=package_profile)))
+                    self.bootstrap._verifies_host_usd = lambda: verifies
+                    self.bootstrap._host_usd_profile = lambda: host
+                    with patch.object(self.bootstrap, "_check_python_abi",
+                                      side_effect=RuntimeError("profile accepted")) as python_abi, \
+                            patch.object(self.bootstrap.importlib, "import_module") as importer:
+                        expected = "profile accepted" if accepted else (
+                            "only on Linux and Windows" if not verifies else "but this Kit process loaded")
+                        with self.assertRaisesRegex(RuntimeError, expected):
+                            self.bootstrap.load_api(package, SimpleNamespace(RegisterPlugins=Mock()))
+                        self.assertEqual(python_abi.called, accepted)
+                        importer.assert_not_called()
+
+    def test_extension_starts_with_the_schema_extensions(self):
+        # OpenUSD fixes its URI-resolver dispatch at the first resolver use, so the `live` resolver must register
+        # before order-0 extensions use USD: the slot Kit's schema extensions use.
+        text = (ROOT / "source/kit/config/extension.toml").read_text()
+        core = text.split("[core]", 1)[1].split("\n[", 1)[0]
+        self.assertRegex(core, r"(?m)^order = -100$")
 
     def test_extension_depends_on_kit_omni_usd(self):
         text = (ROOT / "source/kit/config/extension.toml").read_text()
@@ -487,6 +799,33 @@ class KitHostTests(unittest.TestCase):
         instance.on_shutdown()
         self.assertIsNone(module.get_host())
         self.runtime.close.assert_called_once()
+
+    def test_extension_shutdown_gives_an_idle_host_time_to_stop(self):
+        module = self.extension_module()
+        instance = module.Extension()
+        instance.on_startup("idle")
+        # A started host stops its threads only with time left: zero answers TIMEOUT.
+        self.api._remaining = lambda deadline: 1 if deadline > time.monotonic() else 0
+        self.context.close.side_effect = lambda timeout_ms: Result.OK if timeout_ms else Result.TIMEOUT
+        with patch.object(module, "close_host", wraps=module.close_host) as close_host:
+            instance.on_shutdown()
+        close_host.assert_called_once_with(5000)
+        self.assertIsNone(module.get_host())
+        sys.modules["carb"].log_error.assert_not_called()
+        self.runtime.close.assert_called_once()
+
+    def test_extension_shutdown_reports_attached_work_without_waiting(self):
+        module = self.extension_module()
+        instance = module.Extension()
+        instance.on_startup("attached")
+        owner = module.get_host()
+        self.api._remaining = lambda deadline: 1 if deadline > time.monotonic() else 0
+        self.context.close.return_value = Result.BUSY
+        instance.on_shutdown()
+        self.assertIs(module.get_host(), owner)
+        self.runtime.close.assert_not_called()
+        message = sys.modules["carb"].log_error.call_args.args[0]
+        self.assertIn("BUSY", message)
 
     def test_session_catalogue_ownership_blocks_runtime_close(self):
         self.host.start()

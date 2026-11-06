@@ -332,8 +332,9 @@ impl CheckpointStore for NoopCheckpointStore {
     // through with the same classification. Overriding here would
     // duplicate the surface without changing observable behaviour.
     //
-    // `get_layer_checkpoint`, `list_session_checkpoint_ids` and
-    // `ext_blob_exists` are likewise intentionally NOT overridden: each trait
+    // `get_layer_checkpoint`, `list_session_checkpoint_ids`,
+    // `ext_blob_exists` and `verify_list_route` are likewise intentionally
+    // NOT overridden: each trait
     // default already returns `NotImplemented { method }` naming that method,
     // which IS the off-mode contract every other method here spells out by
     // hand. Inheriting is a bug in a real adapter, but for the off-mode shim
@@ -565,12 +566,12 @@ mod tests {
     }
 
     /// A decorator that forwards only the required `CheckpointStore` methods
-    /// over a working store, and so inherits the trait defaults of the two
-    /// DR restore Job methods.
+    /// over a working store, and so inherits the trait defaults of the three
+    /// DR Job methods.
     ///
     /// The shape the trait rustdoc warns about: a wrapper written before
-    /// `list_session_checkpoint_ids` / `ext_blob_exists` existed, or one that
-    /// forgot them.
+    /// `list_session_checkpoint_ids` / `ext_blob_exists` / `verify_list_route`
+    /// existed, or one that forgot them.
     struct RequiredOnlyDecorator {
         inner: InMemoryCheckpointStore,
     }
@@ -724,6 +725,31 @@ mod tests {
         }
     }
 
+    /// A decorator that does not forward `verify_list_route`, the DR Jobs'
+    /// list-route canary, answers `NotImplemented` naming it, though the
+    /// store behind it passes the canary (checked first). An `Ok(())` here
+    /// would vouch for a listing route nobody checked.
+    #[tokio::test]
+    async fn a_decorator_that_does_not_forward_the_list_route_canary_answers_not_implemented() {
+        let decorator = RequiredOnlyDecorator {
+            inner: InMemoryCheckpointStore::new(),
+        };
+        decorator
+            .inner
+            .verify_list_route()
+            .await
+            .expect("the inner store's listing route passes the canary");
+        match decorator.verify_list_route().await {
+            Err(CheckpointError::NotImplemented { method }) => {
+                assert_eq!(method, "verify_list_route");
+            }
+            other => panic!(
+                "a decorator that does not forward verify_list_route must answer NotImplemented, \
+                 never vouch for a listing route nobody checked; got {other:?}"
+            ),
+        }
+    }
+
     /// `build_checkpoint_store(InMemory)` must return a `CheckpointStore`
     /// whose read paths work — not a `NoopCheckpointStore`. This pins the
     /// factory's match-arm wiring so a future refactor can't silently swap
@@ -797,6 +823,17 @@ mod tests {
         assert!(
             matches!(err, CheckpointError::NotImplemented { .. }),
             "Disabled adapter must classify as NotImplemented, got {err:?}"
+        );
+        // The list-route canary too: the no-op shim vouches for no listing
+        // route.
+        assert!(
+            matches!(
+                store.verify_list_route().await,
+                Err(CheckpointError::NotImplemented {
+                    method: "verify_list_route"
+                })
+            ),
+            "Disabled adapter must answer the list-route canary NotImplemented"
         );
     }
 

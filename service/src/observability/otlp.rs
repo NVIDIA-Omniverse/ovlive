@@ -131,6 +131,39 @@ pub struct OtlpEndpoint {
     pub transport: OtlpTransport,
 }
 
+/// Why an OTLP export pipeline could not be set up at startup. Either way
+/// `main` reports the message as a configuration error and exits; the
+/// variant decides the exit code a DR Job uses (`main.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OtlpSetupError {
+    /// A variable refused on its value alone: an endpoint that is not an
+    /// `http://` or `https://` URL with a host, or a set compression
+    /// variable. The same environment is refused the same way on every run.
+    Setting(String),
+    /// The exporter could not be built for a valid endpoint: TLS to the
+    /// collector could not be set up (the trust roots are files, which a
+    /// sidecar may not have written yet), or the SDK's own build failed. A
+    /// retry may succeed.
+    Exporter(String),
+}
+
+impl OtlpSetupError {
+    /// Whether the same environment is refused the same way on every run.
+    pub fn is_deterministic(&self) -> bool {
+        matches!(self, Self::Setting(_))
+    }
+}
+
+impl std::fmt::Display for OtlpSetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Setting(message) | Self::Exporter(message) => f.write_str(message),
+        }
+    }
+}
+
+impl StdError for OtlpSetupError {}
+
 /// The remedy every endpoint error ends with.
 const ENDPOINT_REMEDY: &str =
     "use an http:// URL for plaintext or an https:// URL for TLS, or leave it unset to turn \
@@ -201,36 +234,42 @@ pub fn otlp_tls_config() -> ClientTlsConfig {
 ///
 /// The request timeout and headers stay the SDK's
 /// (`OTEL_EXPORTER_OTLP_TIMEOUT` and friends); a set compression variable is
-/// refused ([`check_compression_unset`]). An error names the variable and
-/// carries the cause.
+/// refused ([`check_compression_unset`], an [`OtlpSetupError::Setting`]). An
+/// error names the variable and carries the cause; a TLS or build failure is
+/// an [`OtlpSetupError::Exporter`].
 pub fn span_exporter_for(
     endpoint: &OtlpEndpoint,
-) -> Result<opentelemetry_otlp::SpanExporter, String> {
-    check_compression_unset(OTEL_EXPORTER_OTLP_TRACES_COMPRESSION)?;
+) -> Result<opentelemetry_otlp::SpanExporter, OtlpSetupError> {
+    check_compression_unset(OTEL_EXPORTER_OTLP_TRACES_COMPRESSION)
+        .map_err(OtlpSetupError::Setting)?;
     let builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint.url.clone());
-    with_transport(builder, endpoint)?
+    with_transport(builder, endpoint)
+        .map_err(OtlpSetupError::Exporter)?
         .build()
-        .map_err(|error| build_error(endpoint, "trace", &error))
+        .map_err(|error| OtlpSetupError::Exporter(build_error(endpoint, "trace", &error)))
 }
 
 /// Build the OTLP metrics exporter for `endpoint`, each export capped at
 /// [`OTLP_EXPORT_TIMEOUT`]; a set compression variable is refused
-/// ([`check_compression_unset`]). An error names the variable and carries
-/// the cause.
+/// ([`check_compression_unset`], an [`OtlpSetupError::Setting`]). An error
+/// names the variable and carries the cause; a TLS or build failure is an
+/// [`OtlpSetupError::Exporter`].
 pub fn metric_exporter_for(
     endpoint: &OtlpEndpoint,
-) -> Result<opentelemetry_otlp::MetricExporter, String> {
-    check_compression_unset(OTEL_EXPORTER_OTLP_METRICS_COMPRESSION)?;
+) -> Result<opentelemetry_otlp::MetricExporter, OtlpSetupError> {
+    check_compression_unset(OTEL_EXPORTER_OTLP_METRICS_COMPRESSION)
+        .map_err(OtlpSetupError::Setting)?;
     let builder = opentelemetry_otlp::MetricExporter::builder()
         .with_tonic()
         .with_protocol(Protocol::Grpc)
         .with_endpoint(endpoint.url.clone())
         .with_timeout(OTLP_EXPORT_TIMEOUT);
-    with_transport(builder, endpoint)?
+    with_transport(builder, endpoint)
+        .map_err(OtlpSetupError::Exporter)?
         .build()
-        .map_err(|error| build_error(endpoint, "metrics", &error))
+        .map_err(|error| OtlpSetupError::Exporter(build_error(endpoint, "metrics", &error)))
 }
 
 /// Refuse the compression variable the exporter would read: `signal_var` if
@@ -591,6 +630,95 @@ mod tests {
                 "{signal_var}: {other_var} belongs to the other exporter"
             );
         }
+    }
+
+    // ── OtlpSetupError: a setting refusal or an exporter failure ─────────────
+    //
+    // The variant decides a DR Job's exit code (`main.rs`): a setting refused
+    // on its value alone exits 2, an exporter that could not be built for a
+    // valid endpoint exits 1, since a retry may build it. The binary-level
+    // half is `tests/misc/dr_job_binary.rs`.
+
+    /// The error of building both exporters for `endpoint`, in order: trace,
+    /// metrics. Matched rather than unwrapped, so a built exporter needs no
+    /// `Debug` to be reported.
+    fn exporter_errors(endpoint: &OtlpEndpoint) -> [OtlpSetupError; 2] {
+        let span = match span_exporter_for(endpoint) {
+            Err(e) => e,
+            Ok(_) => panic!("the trace exporter for {} must be refused", endpoint.url),
+        };
+        let metric = match metric_exporter_for(endpoint) {
+            Err(e) => e,
+            Ok(_) => panic!("the metrics exporter for {} must be refused", endpoint.url),
+        };
+        [span, metric]
+    }
+
+    /// A set compression variable is refused by both exporters as a setting:
+    /// the same environment is refused the same way on every run.
+    #[tokio::test]
+    async fn exporters_refuse_a_set_compression_variable_as_a_setting() {
+        let endpoint = OtlpEndpoint {
+            var: OTEL_EXPORTER_OTLP_ENDPOINT,
+            url: "http://collector.example.com:4317".to_owned(),
+            transport: OtlpTransport::Plaintext,
+        };
+        let set: Vec<(&str, Option<&str>)> = NO_COMPRESSION
+            .iter()
+            .map(|(var, _)| {
+                (
+                    *var,
+                    (*var == OTEL_EXPORTER_OTLP_COMPRESSION).then_some("gzip"),
+                )
+            })
+            .collect();
+        let errors = temp_env::with_vars(set, || exporter_errors(&endpoint));
+        for error in errors {
+            assert!(
+                matches!(&error, OtlpSetupError::Setting(m)
+                    if m.starts_with(&format!("{OTEL_EXPORTER_OTLP_COMPRESSION} is set to `gzip`"))),
+                "a compression refusal is a setting; got {error:?}"
+            );
+            assert!(error.is_deterministic());
+        }
+    }
+
+    /// An exporter the SDK or the TLS connector cannot build for an endpoint
+    /// is an exporter failure, not a setting refusal, for both exporters and
+    /// both transports; its message names the endpoint's variable. (The
+    /// endpoint is built by hand: `otlp_endpoint_from` refuses this URL as a
+    /// setting before any exporter is built.)
+    #[tokio::test]
+    async fn exporters_that_cannot_be_built_for_an_endpoint_are_exporter_failures() {
+        for transport in [OtlpTransport::Plaintext, OtlpTransport::Tls] {
+            let endpoint = OtlpEndpoint {
+                var: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+                url: "http://[::bad".to_owned(),
+                transport,
+            };
+            let errors = without_compression(|| exporter_errors(&endpoint));
+            for error in errors {
+                assert!(
+                    matches!(&error, OtlpSetupError::Exporter(m)
+                        if m.starts_with(OTEL_EXPORTER_OTLP_METRICS_ENDPOINT)),
+                    "{transport:?}: an exporter that cannot be built is an exporter failure; got \
+                     {error:?}"
+                );
+                assert!(
+                    !error.is_deterministic(),
+                    "{transport:?}: a retry may build it"
+                );
+            }
+        }
+    }
+
+    /// The error prints its message alone, whichever variant carries it, so
+    /// `main`'s `configuration error:` line is unchanged by the
+    /// classification.
+    #[test]
+    fn otlp_setup_error_displays_its_message_alone() {
+        assert_eq!(OtlpSetupError::Setting("a".to_owned()).to_string(), "a");
+        assert_eq!(OtlpSetupError::Exporter("b".to_owned()).to_string(), "b");
     }
 
     // ── T1, T2, T4: the exporters against a TLS-refusing listener ────────────

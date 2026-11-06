@@ -2211,6 +2211,9 @@ async fn build_checkpoint_ompf(
         AssemblyDecision::LeaseLost => {
             panic!("the assembler was handed a keeper that never loses its lease; got LeaseLost")
         }
+        AssemblyDecision::DeferredCleanup => {
+            panic!("the clean-up fence deferred the PUT, but no clean-up runs in this fixture")
+        }
         AssemblyDecision::ShuttingDown => {
             panic!("the assembler was handed a keeper that never shuts down; got ShuttingDown")
         }

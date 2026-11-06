@@ -40,9 +40,9 @@
 //! |---|---|
 //! | 1. Acquire | `NOT_FOUND`; `started_epoch` at the header `seq`; `joined_epoch` under the stored size; `RETRY_AFTER` `epoch` / `gap` (the shared instant) / `intent` (only until `gap_until + intent_ttl(L)`); the crashed-holder gap; every wait writes nothing; `PEXPIRE` |
 //! | 2. Renew | extends a live lease, raises never lowers; `LOST` after expiry or a wipe, no revival, nothing written |
-//! | 3. Release | `VERIFIED` and the gap; `BROKEN` (seq moved, lease expired, field gone); the epoch stays open for a live joiner; the late release; nothing written after cleanup or a restore wipe; the guard's drop, and `ValkeyClient::quit` waiting for that drop's release before it closes the pools — bounded: on a stalled data pool it gives up with a WARN and closes them anyway |
+//! | 3. Release | `VERIFIED` and the gap; `BROKEN` (seq moved, lease expired, field gone); the epoch stays open for a live joiner; the late release; nothing written after cleanup or a restore wipe; the guard's drop, and `ValkeyClient::quit` waiting for that drop's release before it closes the pools — bounded: on a stalled data pool it gives up with a WARN and closes them anyway; the drop's release cut at the command timeout, its `NOSCRIPT` reload included (through a `ScriptReplyProxy`) |
 //! | 4. Probe | absent / live / closed / no stored size, read-only; the nine-element reply and its epoch marker (`epoch_start`, `gap_until`, reader count) after a grant, a join, a release under a live joiner, the epoch's last release, a late release (readers alone) and a lapse (nothing moves) |
-//! | 5. Intents | refused while fenced; `intent_ttl` of the stored size; the queue floor for a small layer; renew / `LOST`; clear and the guard's drop, and `ValkeyClient::quit` waiting for that drop's `HDEL` before it closes the pools; a crashed writer's intent; `NOT_FOUND` with no header, writing nothing |
+//! | 5. Intents | refused while fenced; `intent_ttl` of the stored size; the queue floor for a small layer; renew / `LOST`; clear and the guard's drop, and `ValkeyClient::quit` waiting for that drop's `HDEL` before it closes the pools; a renewal dropped mid-renew stops at once and sends one `HDEL`, no second after it fails (through a `ScriptReplyProxy`); a crashed writer's intent; `NOT_FOUND` with no header, writing nothing |
 //! | 6. Lua and Rust agree | the four Lua `timing` copies are one text, and each limit a script stores or returns equals `FenceCoefficients::timing` at eight sizes and a lowered ceiling |
 //! | 7. Malformed input | argument errors raised before any write; a wrong-typed fence key fails acquire; the probe and registration answer `WrongType` (fence first) with the commit paths' exact refusal |
 //! | 8. Measurement event | one `snapshot fence lease` DEBUG event per release on its own target: the grant's object, kind (`started_epoch` / `joined_epoch`) and cut, the outcome, `via` `release` / `drop`, ordered brackets that hold the store's own times, no token; a `BROKEN` release logs `broken` and a `NOT_FOUND` release `not_found`; nothing for an acquire that grants nothing; a failed release logs `error` and its guard's re-release a second event with the same acquire bracket |
@@ -58,6 +58,7 @@
 //! `snapshot_read_atomic_test.rs` and `snapshot_read_unfenced_test.rs`.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,7 +68,9 @@ use fred::types::Value;
 
 use live_edit::domain::types::ObjectState;
 use live_edit::error::ServiceError;
-use live_edit::storage::client::ValkeyClient;
+use live_edit::storage::client::{
+    with_liveness_overrides_for_test, LivenessOverrides, ValkeyClient,
+};
 use live_edit::storage::external_values::MockExternalValueStore;
 use live_edit::storage::keys::KeySchema;
 use live_edit::storage::layer::LayerStore;
@@ -80,7 +83,10 @@ use live_edit::storage::snapshot_fence::{
 };
 use live_edit::storage::test_support::{connect_test_client, TestValkey};
 
-use crate::storage::snapshot_read_support::client_with_limits;
+use crate::storage::snapshot_read_support::{
+    client_with_limits, error_reply_script, test_valkey_addr, ProxyAction, ProxyRule, ReplyGate,
+    ScriptReplyProxy,
+};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Constants
@@ -1450,6 +1456,171 @@ async fn quit_gives_up_on_a_stalled_dropped_lease_release_with_a_warn_and_closes
     live_edit::storage::test_support::release_all(stalls).await;
 }
 
+// ── The drop-path release cut at the command timeout (kl-retire F1, T8) ──────
+//
+// A dropped lease's release is a clean-up whose owner is gone, so it gives up
+// within one command timeout T of its spawn, `NOSCRIPT` reload included (the
+// module docs' # Guards; the disaster-recovery hold counts it at T). The
+// client under test runs through a `ScriptReplyProxy`, the only way to force
+// `NOSCRIPT`: the shared store's script cache is server-wide and never
+// flushed. The proxy answers the release's `EVALSHA` `-NOSCRIPT` after
+// [`CUT_RELOAD_DELAY`] and stalls the reload's `SCRIPT LOAD`, so fred's own
+// timer on the `SCRIPT LOAD` could fire only at T + the delay: a release that
+// ends at T is the cut's doing, and says so in its error.
+
+/// The command timeout T of the client a cut test runs through its proxy.
+const CUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the proxy holds the release's `NOSCRIPT`: half of T, so the
+/// stalled `SCRIPT LOAD`'s own timer would fire half a T after the cut.
+const CUT_RELOAD_DELAY: Duration = Duration::from_secs(1);
+
+/// What the proxy answers a staged script frame with.
+const NOSCRIPT_REPLY: &str = "NOSCRIPT No matching script. Please use EVAL.";
+
+/// A client of the test's own whose every connection runs through `proxy`:
+/// one data-pool connection, so a clean-up's commands share the connection
+/// the proxy acts on, command timeout [`CUT_COMMAND_TIMEOUT`], and the fast
+/// unresponsive verdict out of reach, so no verdict closes a held connection
+/// before the cut.
+async fn client_through(proxy: &ScriptReplyProxy) -> ValkeyClient {
+    let mut config = crate::common::test_config();
+    config.valkey_url = proxy.url();
+    config.valkey_pool_size = 1;
+    config.valkey_command_timeout_ms = CUT_COMMAND_TIMEOUT.as_millis() as u64;
+    with_liveness_overrides_for_test(
+        LivenessOverrides {
+            fast_timeout: Some(Duration::from_secs(60)),
+            ..LivenessOverrides::default()
+        },
+        connect_test_client(&config),
+    )
+    .await
+    .expect("a client through the proxy must connect")
+}
+
+/// The frames a cut test's proxy rule matched.
+#[derive(Default)]
+struct StagedSends {
+    /// The staged script frames: the release's `EVALSHA`s, or the intent
+    /// renewal's.
+    scripts: AtomicUsize,
+    /// `SCRIPT` frames (a `NOSCRIPT` reload's `SCRIPT LOAD`).
+    reloads: AtomicUsize,
+    /// `HDEL`s of the intent key.
+    hdels: AtomicUsize,
+}
+
+impl StagedSends {
+    fn scripts(&self) -> usize {
+        self.scripts.load(Ordering::SeqCst)
+    }
+    fn reloads(&self) -> usize {
+        self.reloads.load(Ordering::SeqCst)
+    }
+    fn hdels(&self) -> usize {
+        self.hdels.load(Ordering::SeqCst)
+    }
+}
+
+/// The first event of the WARN line whose message starts with `prefix`.
+fn warn_starting<'c>(
+    captured: &'c crate::grpc::log_capture::Captured,
+    prefix: &str,
+) -> Option<&'c serde_json::Value> {
+    captured.events.iter().find(|e| {
+        e["level"] == "WARN"
+            && e["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with(prefix))
+    })
+}
+
+/// kl-retire T8 (F1): a dropped lease's release whose `EVALSHA` is answered
+/// `NOSCRIPT`, and whose reload's `SCRIPT LOAD` never answers, is cut at the
+/// command timeout as a whole: the spawned release ends (nothing left in
+/// flight on the client), logs the drop path's WARN with the cut's error, and
+/// writes the measurement event with outcome `error`, `via` `drop`. It sends
+/// one `EVALSHA` and one `SCRIPT LOAD`, nothing more.
+///
+/// Fail-on-old: without the cut (`ReleaseVia::Drop` awaiting the call as the
+/// explicit release does), the release ends only when fred's own timer on the
+/// `SCRIPT LOAD` fires, half a T later, and its WARN carries that timeout, not
+/// the cut.
+///
+/// Current-thread runtime: the release is a spawned task (test-writing guide,
+/// a line from a spawned task).
+#[tokio::test]
+async fn a_dropped_leases_release_answered_noscript_is_cut_at_the_command_timeout() {
+    let capture = crate::grpc::log_capture::ThreadCapture::start_debug();
+    let fx = Fx::new().await;
+    let sends = Arc::new(StagedSends::default());
+    let rule: ProxyRule = {
+        let (fence_key, sends) = (fx.fence_key(), Arc::clone(&sends));
+        let noscript = error_reply_script(NOSCRIPT_REPLY);
+        Arc::new(move |args: &[Vec<u8>]| {
+            let name = args.first()?.to_ascii_uppercase();
+            if name == b"SCRIPT" {
+                sends.reloads.fetch_add(1, Ordering::SeqCst);
+                return Some(ProxyAction::Stall);
+            }
+            // The release: two keys, the fence key first. The acquire has
+            // three.
+            let release = name == b"EVALSHA"
+                && args.get(2).is_some_and(|n| n.as_slice() == b"2")
+                && args
+                    .get(3)
+                    .is_some_and(|k| k.as_slice() == fence_key.as_bytes());
+            if !release {
+                return None;
+            }
+            sends.scripts.fetch_add(1, Ordering::SeqCst);
+            Some(ProxyAction::DelayedEval(CUT_RELOAD_DELAY, noscript.clone()))
+        })
+    };
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+    let fx = fx.using(client_through(&proxy).await);
+    let lease = fx.grant(SIZE).await;
+
+    drop(lease);
+    let client = fx.client.clone();
+    eventually("the dropped lease's release to end", move || {
+        let ended = client.fence_guard_cleanups_inflight() == 0;
+        async move { ended }
+    })
+    .await;
+
+    assert_eq!(
+        (sends.scripts(), sends.reloads()),
+        (1, 1),
+        "precondition: the release's EVALSHA was answered NOSCRIPT and its reload's SCRIPT LOAD \
+         sent"
+    );
+    let captured = lease_events_eventually(&capture, 1, "the cut release's event").await;
+    let events = captured.with_message(LEASE_EVENT_MSG);
+    assert_eq!(events.len(), 1, "one event:\n{}", captured.text);
+    assert_lease_event(events[0], GrantKind::StartedEpoch, CUT, "error", "drop");
+    let warn = warn_starting(
+        &captured,
+        "best-effort release of a dropped snapshot-fence lease failed",
+    )
+    .unwrap_or_else(|| {
+        panic!(
+            "the cut release logs the drop path's WARN:\n{}",
+            captured.text
+        )
+    });
+    assert!(
+        warn["fields"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cut at the Valkey command timeout")),
+        "the release gave up at the cut, not at fred's own timer on the stalled SCRIPT LOAD \
+         (which fires half a command timeout later): {warn}"
+    );
+    drop(capture);
+    crate::grpc::log_capture::purge_keys(&fx.tv).await;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // 4. Probe (SR-5.4)
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2102,6 +2273,88 @@ async fn quit_waits_for_a_dropped_intent_renewals_removal_before_closing_the_poo
         !fx.exists(&fx.intent_key()).await,
         "the HDEL reached the store before the pools closed"
     );
+}
+
+/// kl-retire T9 (F2): an `IntentRenewal` dropped while its renew is in
+/// flight — the renew's `EVALSHA` ran on the store, its reply held by the
+/// proxy — stops at once: the stop interrupts the renew, and the task's tail
+/// sends exactly one `HDEL`. That `HDEL`'s reply is held too (the replies on
+/// the client's one connection stay held), so the clear fails at the command
+/// timeout, and no second `HDEL` follows: the guard was disarmed before the
+/// clear. The task then ends, nothing left in flight on the client, and the
+/// renew it gave up on logs no renewal failure.
+///
+/// Fail-on-old: without the stop's race against the renew, the task waits
+/// out the held renew (a "writer intent renewal failed" WARN at its command
+/// timeout), and with the guard still armed across the clear, its failed
+/// `HDEL` is followed by the guard's second one.
+///
+/// Current-thread runtime: the task and its WARNs run spawned (test-writing
+/// guide, a line from a spawned task).
+#[tokio::test]
+async fn an_intent_renewal_dropped_mid_renew_sends_one_hdel_and_no_second_after_it_fails() {
+    let capture = crate::grpc::log_capture::ThreadCapture::start();
+    let fx = Fx::new().await;
+    let sends = Arc::new(StagedSends::default());
+    let held = ReplyGate::new();
+    let rule: ProxyRule = {
+        let (intent_key, sends, held) = (fx.intent_key(), Arc::clone(&sends), held.clone());
+        Arc::new(move |args: &[Vec<u8>]| {
+            let name = args.first()?.to_ascii_uppercase();
+            let names_intent = args
+                .get(1)
+                .is_some_and(|k| k.as_slice() == intent_key.as_bytes());
+            if name == b"HDEL" && names_intent {
+                sends.hdels.fetch_add(1, Ordering::SeqCst);
+                return None;
+            }
+            // The renewal: one key, the intent key. The register has three.
+            let renew = name == b"EVALSHA"
+                && args.get(2).is_some_and(|n| n.as_slice() == b"1")
+                && args
+                    .get(3)
+                    .is_some_and(|k| k.as_slice() == intent_key.as_bytes());
+            (renew && sends.scripts.fetch_add(1, Ordering::SeqCst) == 0)
+                .then(|| ProxyAction::HoldReplies(held.clone()))
+        })
+    };
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+    let fx = fx.using(client_through(&proxy).await);
+    let renewal = IntentRenewal::start(registered(fx.register(SIZE).await));
+    held.reply_held().await;
+
+    drop(renewal);
+    let client = fx.client.clone();
+    eventually("the dropped renewal's task to end", move || {
+        let ended = client.fence_guard_cleanups_inflight() == 0;
+        async move { ended }
+    })
+    .await;
+
+    assert_eq!(
+        sends.scripts(),
+        1,
+        "precondition: one renew was in flight when the renewal was dropped"
+    );
+    assert_eq!(
+        sends.hdels(),
+        1,
+        "the task's tail sends one HDEL, and a failed one is followed by no second"
+    );
+    let captured = capture.snapshot();
+    assert!(
+        warn_starting(&captured, "clearing a writer intent failed").is_some(),
+        "precondition: the HDEL failed, its reply held past the command timeout:\n{}",
+        captured.text
+    );
+    assert!(
+        warn_starting(&captured, "writer intent renewal failed").is_none(),
+        "the stop interrupted the renew in flight instead of waiting it out:\n{}",
+        captured.text
+    );
+    held.open();
+    drop(capture);
+    crate::grpc::log_capture::purge_keys(&fx.tv).await;
 }
 
 /// A crashed writer runs no clean-up, so its intent stays until its own

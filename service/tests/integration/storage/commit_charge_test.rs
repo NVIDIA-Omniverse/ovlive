@@ -2651,7 +2651,7 @@ fn many_creates(first: u64, n: u64) -> OwnedDelta {
     }
 }
 
-/// Descendants of the cascade fixture's one child: enough that deleting it
+/// Descendants of the cascade fixture's [`CASCADE_ROOT`]: enough that deleting it
 /// projects more rows (3 per descendant, at the row price) than a WATCH
 /// read of the object leaves its plan beyond the read's own need (the
 /// read's per-command term, capped at one window of commands, and its
@@ -2661,14 +2661,23 @@ const CASCADE_DESCENDANTS: u64 = 4_000;
 /// The cascade fixture's child of the root.
 const CASCADE_ROOT: u64 = 50;
 
-/// A layer whose one child of the root, [`CASCADE_ROOT`], has
-/// [`CASCADE_DESCENDANTS`] children.
+/// The cascade fixture's other child of the root, which [`cascade_delta`]
+/// leaves: deleting [`CASCADE_ROOT`] keeps a top-level section, as an update
+/// must (SDD §9.7).
+const CASCADE_ANCHOR: u64 = 51;
+
+/// A layer whose child of the root [`CASCADE_ROOT`] has
+/// [`CASCADE_DESCENDANTS`] children, beside a childless top-level
+/// [`CASCADE_ANCHOR`].
 fn cascade_state() -> ObjectState {
     let mut state = empty_state();
     state
         .sections
         .insert(CASCADE_ROOT, section(CASCADE_ROOT, 0, 0));
-    state.children.insert(0, vec![CASCADE_ROOT]);
+    state
+        .sections
+        .insert(CASCADE_ANCHOR, section(CASCADE_ANCHOR, 0, 1));
+    state.children.insert(0, vec![CASCADE_ROOT, CASCADE_ANCHOR]);
     let ids: Vec<u64> = (1_000..1_000 + CASCADE_DESCENDANTS).collect();
     for (order, id) in ids.iter().enumerate() {
         state
@@ -4402,25 +4411,24 @@ fn child_delta(parent_id: u64, section_id: u64) -> OwnedDelta {
 /// A list that grows between the WATCH read's `LLEN` and
 /// its `LRANGE` is read at the length its `LLEN` returned, and the read is
 /// rejected. The read's two round-3 `LRANGE`s (the root's list and section
-/// 2's, after their `LLEN`s on this marked object) are held back by the
-/// fault seam while a competitor's commit adds a child to section 2 (an
-/// `RPUSH`ed list, and a `seq` that moved). The held `LRANGE` asks `0 n−1`
-/// — n ids, not the n + 1 the list now holds — and the read's `seq` proof
-/// rejects it: one `watch_read_moved` conflict; the retry ranges the grown
-/// list (`0 n`) and commits, so both children land.
+/// 2's, after their `LLEN`s on this marked object) are parked by the fault
+/// seam's holds until a competitor's commit adding a child to section 2 (an
+/// `RPUSH`ed list, and a `seq` that moved) has returned. The held `LRANGE`
+/// asks `0 n−1` — n ids, not the n + 1 the list now holds — and the read's
+/// `seq` proof rejects it: one `watch_read_moved` conflict; the retry ranges
+/// the grown list (`0 n`) and commits, so both children land.
 ///
 /// Needs `test-fault-injection` (the read's fault seam).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_read_of_a_list_grown_after_its_length_reads_that_length_and_retries_b26e() {
-    use crate::storage::snapshot_read_support::{monitor_fence, test_valkey_addr, MonitorTap};
+    use crate::storage::snapshot_read_support::{
+        monitor_fence, test_valkey_addr, HeldCommand, MonitorTap,
+    };
     use fred::interfaces::{KeysInterface, ListInterface};
     use live_edit::storage::diff_read::{
         ObjectSnapshotReadFaultInjector, ObjectSnapshotReadFaultTarget, ObjectSnapshotReader,
     };
 
-    /// How long each round-3 `LRANGE` is held back: past the competitor's
-    /// whole commit.
-    const HELD: Duration = Duration::from_secs(4);
     let fx = fixture("grown-list", UpdateLayerBackend::Txn).await;
     let oid = create_state(
         &fx.ls,
@@ -4434,34 +4442,38 @@ async fn watch_read_of_a_list_grown_after_its_length_reads_that_length_and_retri
     let list = fx.tv.key_schema().obj_children(&oid_str, "2");
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
     // The marked read's children commands: its two LLENs (round 2), then
-    // its two LRANGEs (round 3), held back.
-    for nth in [2, 3] {
-        injector.push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_of_family(
-                ObjectSnapshotReader::UnfencedFanout,
-                "children",
-                nth,
-            ),
-            HELD,
-        );
-    }
+    // its two LRANGEs (round 3), held until the competitor has committed.
+    let lranges: Vec<HeldCommand> = [2, 3]
+        .into_iter()
+        .map(|nth| {
+            HeldCommand::new(
+                injector.push_hold_at(ObjectSnapshotReadFaultTarget::nth_of_family(
+                    ObjectSnapshotReader::UnfencedFanout,
+                    "children",
+                    nth,
+                )),
+            )
+        })
+        .collect();
     fx.tv
         .client()
         .install_object_snapshot_read_fault_injector_for_test(Arc::clone(&injector));
     let mut tap = MonitorTap::start(&test_valkey_addr()).await;
 
-    let started = tokio::time::Instant::now();
     let mut held_charge = NoCommitCharge;
     let held = fx.update_on(oid, child_delta(2, 90_001), &mut held_charge);
     let competitor = async {
-        let deadline = started + STEP_BUDGET;
-        while injector.delays_remaining() > 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "fixture: the read must reach its LRANGEs"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // A window takes every hold its commands name before it parks on
+        // them, one after another: once the first LRANGE is parked, both
+        // holds are taken, and the window is parked before either is sent.
+        lranges[0]
+            .parked_within(STEP_BUDGET, "fixture: the read's first LRANGE")
+            .await;
+        assert_eq!(
+            injector.holds_remaining(),
+            0,
+            "fixture: the parked window took both LRANGEs' holds"
+        );
         let delta = Some(child_delta(2, 90_002));
         let relay = relay_for(&delta);
         let (result, _summary) = fx
@@ -4480,14 +4492,13 @@ async fn watch_read_of_a_list_grown_after_its_length_reads_that_length_and_retri
             .await;
         result.expect("the competitor commits while the LRANGEs are held");
         let grown: u64 = fx.tv.client().pool.llen(&list).await.expect("LLEN");
-        (grown, started.elapsed())
+        for lrange in &lranges {
+            lrange.release();
+        }
+        grown
     };
-    let (held_result, (grown, competitor_done)) = tokio::join!(held, competitor);
+    let (held_result, grown) = tokio::join!(held, competitor);
     let seq = held_result.expect("the held call commits on its retry");
-    assert!(
-        competitor_done < HELD,
-        "fixture: the competitor committed inside the hold ({competitor_done:?})"
-    );
     assert_eq!(
         grown,
         GROWN_LIST_KIDS + 1,

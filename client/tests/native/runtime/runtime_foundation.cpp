@@ -185,6 +185,12 @@ void abiAndConfiguration()
     options = record<OmniUsdLiveRuntimeOptions>();
     options.max_update_bytes = UINT32_MAX;
     assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+    // An endpoint call budget leaves at least one stream unit beside the two call units.
+    for (uint64_t calls : {1u, 2u}) {
+        options = record<OmniUsdLiveRuntimeOptions>();
+        options.max_calls_per_endpoint = calls;
+        assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+    }
     assert(omniUsdLiveInitialize(nullptr) == OMNI_USD_LIVE_OK);
     // Explicit defaults are semantically equivalent, including a copied nested record.
     auto defaults = RuntimeOptions::copy(nullptr);
@@ -193,6 +199,9 @@ void abiAndConfiguration()
            defaults.values.retry_max_attempts == 8);
     assert(defaults.values.reconnect_initial_ms == 1000 && defaults.values.reconnect_maximum_ms == 60000 &&
            defaults.values.reconnect_max_attempts == 10);
+    // The default per-endpoint call budget, a client-side choice.
+    assert(defaults.values.max_calls_per_endpoint == 1024 && CallBudget::callShare(1024) == 128 &&
+           CallBudget::callShare(8) == 2 && CallBudget::callShare(3) == 2);
     {
         auto reconnect = record<OmniUsdLiveRuntimeOptions>();
         reconnect.reconnect_initial_ms = 7;
@@ -453,6 +462,24 @@ void shortStructuresAndEquivalentTls()
             defaults.struct_size = split;
             assert(omniUsdLiveInitialize(&defaults) == OMNI_USD_LIVE_INVALID_ARGUMENT);
         }
+    }
+    {
+        // A caller built before max_calls_per_endpoint passes the prefix that
+        // ends before it: it keeps the reconnect options and selects the
+        // endpoint call budget's default, equal to NULL options.
+        constexpr uint32_t prefix = offsetof(OmniUsdLiveRuntimeOptions, max_calls_per_endpoint);
+        static_assert(prefix % alignof(OmniUsdLiveRuntimeOptions) == 0);
+        auto defaults = record<OmniUsdLiveRuntimeOptions>();
+        defaults.diagnostic_min_severity = OMNI_USD_LIVE_SEVERITY_INFO;
+        defaults.struct_size = prefix;
+        auto* older = memory + page - prefix;
+        std::memcpy(older, &defaults, prefix);
+        assert(omniUsdLiveInitialize(reinterpret_cast<OmniUsdLiveRuntimeOptions*>(older)) == OMNI_USD_LIVE_OK);
+        const auto& values = getRuntime()->options.values;
+        assert(values.max_calls_per_endpoint == 1024 && values.reconnect_max_attempts == 10);
+        assert(omniUsdLiveShutdown(0) == OMNI_USD_LIVE_OK); // One of two owners.
+        defaults.struct_size = prefix + 4; // Splits the appended field.
+        assert(omniUsdLiveInitialize(&defaults) == OMNI_USD_LIVE_INVALID_ARGUMENT);
     }
     OmniUsdLiveEndpoint output = 99;
     assert(omniUsdLiveRegisterEndpoint(reinterpret_cast<OmniUsdLiveEndpointOptions*>(sizeOnly), &output) ==
@@ -982,6 +1009,7 @@ void sessionPeersTests();
 void sessionApiTests();
 void layerAdmissionTests();
 void layerStatusTests();
+void grpcDnsTests();
 
 int main()
 {
@@ -1019,6 +1047,7 @@ int main()
     sessionApiTests();
     layerAdmissionTests();
     layerStatusTests();
+    grpcDnsTests();
     statusApiOwnership();
     pullStatusApiOwnership();
     std::cout << "runtime foundation: ABI, ownership, configuration, 8 native owners/80 rounds, 100 CQ tags passed\n";

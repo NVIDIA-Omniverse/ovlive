@@ -58,7 +58,7 @@
 //! | `update_layer_recovery_reissue_recharges_through_the_calls_commit_charge_b26e` | b.26e Stage 2 (the object-state hold reused by the recovery re-issue) | after a wiped object's checkpoint restore, the re-issued WATCH commit charges through the call's commit charge: with the budget full and the slot held it waits for one recharge holding no per-object permit, then commits |
 //! | `reissue_extra_copy::update_layer_recovery_reissue_holds_one_copy_of_its_external_values_for_its_pre_store_b5wb` | b.5wb (the re-issue's extra-copy charge) | the checkpoint-recovery re-issue's own pre-store grows the reservation by one copy of the stored bytes right before it, gives it back right after, before the re-issue's commit dispatch, and records one processing-wait observation |
 //! | `reissue_extra_copy::update_layer_recovery_reissue_waiting_to_hold_its_extra_copy_at_shutdown_answers_server_shutting_down_b5wb` | b.5wb | with the budget full and the slot held, that hold waits as one processing waiter; shutdown there answers the shutdown refusal verbatim (the first call made one attempt), at INFO, and the re-issue never runs |
-//! | `cancelled_upload::*` | b.682 regression tests (not a b.715 design item) | an upload stream that did not end with END_STREAM — a client's `CANCEL`, a `RST_STREAM(NO_ERROR)`, the server's keepalive `GOAWAY` — answers `CANCELLED` with nothing committed, created, mapped or stored and its reservation released, at the handler and end to end; a header followed by END_STREAM still commits an empty update or creates an empty layer; a request with no end-of-stream record is `INTERNAL` having read nothing (see that module) |
+//! | `cancelled_upload::*` | b.682 regression tests (not a b.715 design item) | an upload stream that did not end with END_STREAM — a client's `CANCEL`, a `RST_STREAM(NO_ERROR)`, the server's keepalive `GOAWAY` — answers `CANCELLED` with nothing committed, created, mapped or stored and its reservation released, at the handler and end to end; a header followed by END_STREAM still commits an empty update or creates a layer holding only its root section; a request with no end-of-stream record is `INTERNAL` having read nothing (see that module) |
 //!
 //! # Wait budget
 //!
@@ -130,7 +130,9 @@ use live_edit::observability::metrics::test_util::{render, sample_value};
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
 
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_inline, empty_delta};
+use crate::common::owned_delta::{
+    delta_to_ompf_bytes, delta_with_set_field_inline, empty_delta, with_root,
+};
 use crate::common::refusal_detail::{assert_refusal_detail, assert_shutdown_status};
 use live_edit::error::{refusal_metadata, refusal_reason, CAPACITY_RETRY_DELAY};
 
@@ -371,10 +373,26 @@ fn small_gate(wait: Duration, max_waiters: usize) -> UploadAdmissionConfig {
     }
 }
 
-/// An OMPF upload setting one inline field, distinct per `tag`.
+/// An OMPF upload setting one inline field on section 1, distinct per `tag`:
+/// an `UpdateLayer` body.
 fn field_ompf(tag: u8) -> Vec<u8> {
     delta_to_ompf_bytes(
         &delta_with_set_field_inline(1, &format!("key-{tag}"), vec![tag; 64], 0),
+        &[],
+    )
+}
+
+/// A `CreateLayer` body: the layer's root section, holding [`field_ompf`]'s
+/// field. Content setting the field with no top-level section is refused
+/// (SDD §9.7).
+fn create_ompf(tag: u8) -> Vec<u8> {
+    delta_to_ompf_bytes(
+        &with_root(delta_with_set_field_inline(
+            1,
+            &format!("key-{tag}"),
+            vec![tag; 64],
+            0,
+        )),
         &[],
     )
 }
@@ -520,9 +538,16 @@ fn assert_refused_from_the_header(
     );
 }
 
-/// An OMPF big enough to send in several frames.
+/// An OMPF big enough to send in several frames: an `UpdateLayer` body.
 fn multi_frame_ompf() -> Vec<u8> {
     let ompf = field_ompf(7);
+    assert!(ompf.len() >= 4, "fixture self-check: {} bytes", ompf.len());
+    ompf
+}
+
+/// [`multi_frame_ompf`] as a `CreateLayer` body ([`create_ompf`]).
+fn multi_frame_create_ompf() -> Vec<u8> {
+    let ompf = create_ompf(7);
     assert!(ompf.len() >= 4, "fixture self-check: {} bytes", ompf.len());
     ompf
 }
@@ -544,7 +569,7 @@ async fn create_layer_without_write_permission_is_refused_from_the_header_alone(
     let (request, feed) = sent(&create_messages(
         &session_id,
         "layer",
-        &multi_frame_ompf(),
+        &multi_frame_create_ompf(),
         CONTENT_FRAMES,
     ));
     let status = settled(deadline, "the handler", handle_create_layer(&svc, request))
@@ -568,7 +593,7 @@ async fn create_layer_on_an_unknown_session_is_refused_from_the_header_alone() {
     let (request, feed) = sent(&create_messages(
         "no-such-session",
         "layer",
-        &multi_frame_ompf(),
+        &multi_frame_create_ompf(),
         CONTENT_FRAMES,
     ));
     let status = settled(deadline, "the handler", handle_create_layer(&svc, request))
@@ -717,7 +742,7 @@ async fn create_layer_authorized_reads_every_content_frame_and_commits() {
     let (request, feed) = sent(&create_messages(
         &session_id,
         "layer",
-        &multi_frame_ompf(),
+        &multi_frame_create_ompf(),
         CONTENT_FRAMES,
     ));
     let response = settled(deadline, "the handler", handle_create_layer(&svc, request))
@@ -759,7 +784,7 @@ async fn create_layer_whose_first_frame_is_a_chunk_is_refused_before_any_permiss
     let session_id = new_session(&tv, "t1-create-chunk-first").await;
 
     let (request, _feed) = sent(&[
-        make_create_data(multi_frame_ompf()),
+        make_create_data(multi_frame_create_ompf()),
         make_create_header(&session_id, "layer"),
     ]);
     let status = settled(deadline, "the handler", handle_create_layer(&svc, request))
@@ -1741,7 +1766,7 @@ mod overflow_slot {
         let (request, _feed) = sent(&create_messages_with_operation(
             &session_id,
             OPERATION,
-            &field_ompf(1),
+            &create_ompf(1),
         ));
         let original = settled(deadline, "the original", handle_create_layer(&svc, request))
             .await
@@ -3238,8 +3263,9 @@ mod reissue_extra_copy {
     use live_edit::observability::metrics::test_util::histogram_bucket;
     use live_edit::observability::metrics::Metrics;
     use live_edit::storage::external_values::{
-        ext_content_hash, ExtRelease, ExtValueProbe, ExtValueVerify, ExternalValueStore,
-        GcBatchResult, GcPassState, GcPolicy, ReleaseAttemptOutcome, ValkeyExternalValueStore,
+        ext_content_hash, ExtRelease, ExtValueLengths, ExtValueProbe, ExtValueVerify,
+        ExternalValueStore, GcBatchResult, GcPassState, GcPolicy, ReleaseAttemptOutcome,
+        ValkeyExternalValueStore,
     };
     use live_edit::storage::layer::LayerStore;
     use tokio_util::sync::CancellationToken;
@@ -3321,6 +3347,33 @@ mod reissue_extra_copy {
 
         async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
             self.inner.probe_values(hashes).await
+        }
+
+        // The catch-up payload's reads are defaulted on the trait: an omitted
+        // arm would substitute the default (a whole-value read) for the Valkey
+        // store's own, so they are forwarded too.
+        async fn probe_value_lengths(
+            &self,
+            hashes: &[[u8; 32]],
+        ) -> Result<ExtValueLengths, ServiceError> {
+            self.inner.probe_value_lengths(hashes).await
+        }
+
+        async fn read_value_range(
+            &self,
+            hash: &[u8; 32],
+            start: u64,
+            len: usize,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            self.inner.read_value_range(hash, start, len).await
+        }
+
+        async fn recover_value(
+            &self,
+            hash: &[u8; 32],
+            on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            self.inner.recover_value(hash, on_fetched).await
         }
 
         async fn enqueue_retirement_attempt(
@@ -3963,9 +4016,12 @@ impl DeadlineServer {
         let task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = ready_tx.send(());
-            production_server_builder()
+            production_server_builder(svc.upload_admission.max_waiters())
                 .layer(metrics_layer)
-                .add_service(live_service_server(svc))
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("test server error");
@@ -4290,7 +4346,7 @@ async fn upload_admission_metrics_follow_a_handled_upload() {
         sample_value(&render(&svc.metrics), name, labels).unwrap_or(f64::NAN)
     };
 
-    let (request, _feed) = sent(&create_messages(&session_id, "layer", &field_ompf(1), 2));
+    let (request, _feed) = sent(&create_messages(&session_id, "layer", &create_ompf(1), 2));
     settled(deadline, "the handler", handle_create_layer(&svc, request))
         .await
         .expect("the upload commits");
@@ -4621,9 +4677,11 @@ mod cancelled_upload {
     }
 
     /// T4 (d), the counterpart of the two above: a header followed by
-    /// END_STREAM creates an empty layer and maps it.
+    /// END_STREAM commits, creating the layer holding only its root section
+    /// (the root the service supplies to content that leaves the layer empty,
+    /// SDD §9.7), and maps it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn create_layer_header_only_with_end_stream_creates_an_empty_layer() {
+    async fn create_layer_header_only_with_end_stream_creates_a_root_only_layer() {
         let tv = TestValkey::setup().await;
         let svc = build_service(&tv, Arc::new(AllowAllPermissions));
         let (session_id, result, mapped) =
@@ -4634,7 +4692,23 @@ mod cancelled_upload {
         assert_eq!(
             mapped,
             Some(object_id.to_string()),
-            "the empty layer is created and mapped"
+            "the layer is created and mapped"
+        );
+        let stored = live_edit::storage::test_support::read_object_state_for_test(
+            tv.client(),
+            tv.key_schema(),
+            &object_id.to_string(),
+        )
+        .await
+        .expect("the created object reads back");
+        assert_eq!(
+            stored
+                .sections
+                .values()
+                .map(|s| (s.section_id, s.parent_id, s.name.as_str(), s.section_type))
+                .collect::<Vec<_>>(),
+            [(1, 0, "", 7)],
+            "the layer holds only its root section"
         );
         assert_admitted_and_released(&svc.upload_admission, &session_id, "END_STREAM");
     }

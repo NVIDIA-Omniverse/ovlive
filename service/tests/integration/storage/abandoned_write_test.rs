@@ -29,6 +29,7 @@
 //! | [`pipeline_lost_with_its_connection_is_not_replayed_after_its_timeout`] | T4: a data-pool pipeline (commands with write attempts left) lost with its connection waits in the retry buffer; after its caller's timeout the replay is skipped |
 //! | [`transaction_cut_after_its_multi_is_closed_without_its_exec`] / [`transaction_cut_before_a_queued_command_is_closed_without_writing_it`] | T5: a fred `Transaction` whose write stalls after its `MULTI` and whose caller times out is never sent its `EXEC` — nor, when the stall falls before another queued command, that command: the connection is closed (the store discards the `MULTI`) and replaced, counted once as a `Canceled` txn error and once as a txn reconnect |
 //! | [`watched_pipeline_cut_after_its_multi_is_discarded_and_leaves_no_open_multi`] | T6: the same cut on a `WatchedTxn` pipeline: fred writes a `DISCARD` instead of the `EXEC`, so the `WatchGuard`'s `UNWATCH` is acknowledged and the next checkout's probe finds no leaked `MULTI` |
+//! | [`reconciler_aborted_at_hold_entry_while_its_lease_refresh_waits_behind_a_reconnect_never_writes_it`] | T7: a hold-inventory writer (the reference-count reconciler, registered as `main.rs` registers it) whose `le:gc:leader` refresh waits in fred's channel behind a refused reconnect is aborted by the hold's entry routine; once the store is back, no frame of the refresh is written and the lease is not refreshed, and no command timeout is counted, so the abort, not fred's timer, stopped it |
 //!
 //! What none of these can stop, and none asserts against: a frame fred had
 //! already handed to the socket before its caller gave up still reaches the
@@ -79,10 +80,12 @@
 //!
 //! # Clients
 //!
-//! Command timeout `T` = [`COMMAND_TIMEOUT`], reconnect backoff capped at
-//! [`RECONNECT_MAX_DELAY_MS`], a data pool of one member and a `txn` pool of
-//! one slot, so the connection a test cuts is the one its batch rides. The
-//! fast unresponsive verdict is moved out of reach ([`liveness`]): a paused
+//! Command timeout `T` = [`COMMAND_TIMEOUT`] ([`T7_COMMAND_TIMEOUT`] for T7,
+//! whose subject must not be stopped by fred's timer), reconnect backoff
+//! capped at [`RECONNECT_MAX_DELAY_MS`], a data pool of one member, a `txn`
+//! pool of one slot and a maintenance pool of one member, so the connection a
+//! test cuts is the one its batch rides. The fast unresponsive verdict is
+//! moved out of reach ([`liveness`]): a paused
 //! connection holds its replies for about `T`, and no test here is about a
 //! verdict closing one.
 //!
@@ -91,11 +94,13 @@
 //! Every wait in a test runs under that test's one deadline,
 //! [`SCENARIO_BUDGET`] (60 s) from its first line ([`by`], [`until`]). A
 //! healthy run waits `T` once (the caller's own timeout, which every test
-//! stages on purpose; T3's two tests wait at most [`DROP_AFTER`] instead) plus
-//! a few reconnect delays of at most [`RECONNECT_MAX_DELAY_MS`]; T5 and T6
-//! also move [`BIG_VALUE_BYTES`] through the proxy once. After the deadline
-//! comes only `TestValkey`'s drop: its purge, each round trip bounded at 5 s,
-//! and its client's quit, bounded at 10 s. So each test's worst case is
+//! stages on purpose; T3's two tests wait at most [`DROP_AFTER`] instead, and
+//! T7 neither its `T` nor its reconciler's interval, [`T7_RECONCILE_INTERVAL`])
+//! plus a few reconnect delays of at most [`RECONNECT_MAX_DELAY_MS`]; T5
+//! and T6 also move [`BIG_VALUE_BYTES`] through the proxy once. After the
+//! deadline comes only `TestValkey`'s drop: its purge, each `UNLINK` and each
+//! wait for the walk's next key bounded at 5 s, and its client's quit,
+//! bounded at 10 s. So each test's worst case is
 //! 60 + 5 + 10 = 75 s plus the purge's answered round trips, inside nextest's
 //! 120 s hang-killer.
 
@@ -116,19 +121,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Instant;
 
+use tokio_util::sync::CancellationToken;
+
 use live_edit::domain::types::ObjectState;
+use live_edit::dr::hold::HoldWriter;
 use live_edit::error::ServiceError;
+use live_edit::grpc::hold::HoldWriterAborts;
 use live_edit::observability::metrics::test_util::{render, sample_value};
 use live_edit::observability::metrics::Metrics;
 use live_edit::storage::client::{
     is_router_no_connection_error, with_liveness_overrides_for_test, LivenessOverrides,
-    ValkeyClient,
+    ValkeyClient, POOL_LABEL_MAINTENANCE,
 };
-use live_edit::storage::external_values::MockExternalValueStore;
+use live_edit::storage::ext_reconcile::{ext_reconcile_grace, spawn_ext_ref_reconcile};
+use live_edit::storage::external_values::{
+    acquire_gc_leader_lock, GcLeaderAcquire, MockExternalValueStore, GC_LEADER_TAKEOVER_BELOW_MS,
+    LEADER_LOCK_TTL_MS,
+};
 use live_edit::storage::layer::LayerStore;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::{
-    connect_test_client, exec_watched_writes_for_test, TestValkey, WatchedExecForTest,
+    command_timeout_row, command_timeouts_only_on, connect_test_client,
+    exec_watched_writes_for_test, TestValkey, WatchedExecForTest,
 };
 use live_edit::storage::watch_guard::WatchGuard;
 
@@ -615,10 +629,15 @@ fn liveness() -> LivenessOverrides {
 /// A client whose every connection runs through `proxy`, with the settings
 /// the module's *Clients* lists.
 async fn client_through(proxy: &GatedProxy) -> ValkeyClient {
+    client_through_with(proxy, COMMAND_TIMEOUT).await
+}
+
+/// [`client_through`] with command timeout `command_timeout`.
+async fn client_through_with(proxy: &GatedProxy, command_timeout: Duration) -> ValkeyClient {
     let mut config = crate::common::test_config();
     config.valkey_url = proxy.url();
     config.valkey_pool_size = 1;
-    config.valkey_command_timeout_ms = COMMAND_TIMEOUT.as_millis() as u64;
+    config.valkey_command_timeout_ms = command_timeout.as_millis() as u64;
     config.valkey_reconnect_max_delay_ms = RECONNECT_MAX_DELAY_MS;
     with_liveness_overrides_for_test(liveness(), connect_test_client(&config))
         .await
@@ -1406,5 +1425,185 @@ async fn watched_pipeline_cut_after_its_multi_is_discarded_and_leaves_no_open_mu
         ),
         (0, 0),
         "a cut pipeline closes no connection: no Canceled txn error and no txn reconnect"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// T7 — an aborted inventory writer's lease refresh behind a reconnect
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// T7's command timeout: far past everything the test waits for after the
+/// refresh queues, so fred's own timer can never be what stops the refresh.
+const T7_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The reference-count reconciler's interval in T7. Never reached: the
+/// reconciler is aborted inside the lease refresh its loop opens with, before
+/// any pass or sleep.
+const T7_RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// The lease's remaining TTL in ms, read on the fixture's own client (`-2`
+/// when the key is gone).
+async fn pttl(deadline: Instant, tv: &TestValkey, key: &str) -> i64 {
+    by(deadline, "a PTTL", tv.client().pool.next().pttl(key))
+        .await
+        .expect("PTTL on the fixture's client must succeed")
+}
+
+/// T7 (kl-retire; SDD SR-6.2, §15.3 change 9): the reference-count
+/// reconciler (`HoldWriter::ExtRefReconcile`), registered on a
+/// `HoldWriterAborts` as `main.rs` registers it, holds `le:gc:leader` (taken
+/// under its own value on the fixture's client, as a previous pass of the
+/// same process would have left it) and refreshes it on the maintenance pool.
+/// Its maintenance connection is lost and the reconnect refused before it
+/// starts, so the lease refresh its loop opens with — the `le:gc:leader`
+/// `EVALSHA` — waits in fred's channel. The hold's entry routine aborts it
+/// there (`abort_all`), and the aborted handle ends cancelled: the task owned
+/// the fred call, so its give-up guard is dropped. Once the store is back:
+///
+/// - (a) no command timeout is counted: the refresh's caller gave up at the
+///   abort, so fred's own timer cannot be what stopped it;
+/// - (b) no frame after the cut names the lease;
+/// - (c) no `EVALSHA` at all is forwarded after the cut;
+/// - (d) the lease's TTL afterwards is at most its TTL at the abort, or the
+///   key is gone: it was not refreshed.
+///
+/// So an aborted writer's write queued behind a reconnect is never written,
+/// with no reconnect or command timeout counted in: the retired `EXEC`-class
+/// known limit's single-command twin.
+///
+/// Fail-on-old (recorded in the change's evidence): (i) with `impl Drop for
+/// Guard` emptied in `vendor/fred-10.1.0/src/live_edit/abandon.rs`, a dropped
+/// call never sets its flag, so the refresh is forwarded once the gate
+/// reopens and the lease's TTL is reset to about 30 s; (ii) without the
+/// `ExtRefReconcile` registration, `abort_all` aborts nothing; (iii) with
+/// only its token registered, not its task, the refresh is not dropped: it
+/// waits out its command timeout behind the refused reconnect, which (a)
+/// counts. (a) is what tells "dropped at the abort" from "timed out": under
+/// (i) the caller is still gone, so (a) holds and (b)–(d) catch it.
+///
+/// The cut comes before the reconciler is spawned, not inside its sleep after
+/// a first pass, so no timer decides whether its refresh is queued behind the
+/// reconnect or written ahead of the cut. Staging the lease on the fixture's
+/// own client keeps every lease frame off the proxy before the cut, however
+/// many `EVALSHA`s that acquire needs (a store with the script uncached
+/// answers the first `NOSCRIPT`, and fred re-sends it after `SCRIPT LOAD`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconciler_aborted_at_hold_entry_while_its_lease_refresh_waits_behind_a_reconnect_never_writes_it(
+) {
+    let deadline = test_deadline();
+    let tv = by(deadline, "the fixture", TestValkey::setup()).await;
+    let marker = key(&tv, "t7-marker");
+    let lease = tv.key_schema().gc_leader_lock();
+    let proxy = GatedProxy::start(cut_at("GET", &marker)).await;
+    let own = by(
+        deadline,
+        "the client",
+        client_through_with(&proxy, T7_COMMAND_TIMEOUT),
+    )
+    .await;
+    let maintenance = own.acquire_maintenance().0.next().clone();
+    let metrics = Arc::new(crate::common::metrics_scrape_only("test"));
+    own.install_observability_hooks(Arc::clone(&metrics)).await;
+    let leader = crate::common::test_leader("t7-reconciler");
+
+    // The lease, held under the reconciler's own value, so the call it is
+    // aborted inside is a refresh. On the fixture's client, not the proxy's.
+    let staged = by(
+        deadline,
+        "the lease's staging",
+        acquire_gc_leader_lock(
+            tv.client(),
+            &lease,
+            &leader,
+            LEADER_LOCK_TTL_MS,
+            GC_LEADER_TAKEOVER_BELOW_MS,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(staged, Ok(GcLeaderAcquire::Acquired)),
+        "precondition: the lease is taken under the reconciler's value; got {staged:?}"
+    );
+
+    // Before the reconciler starts: lose the maintenance connection, refuse
+    // the reconnect.
+    stall_reconnects(deadline, &proxy, &maintenance, &marker).await;
+    let cut = proxy.forwarded().len();
+    assert_eq!(
+        proxy.forwarded_naming(&lease),
+        Vec::<Forwarded>::new(),
+        "precondition: no frame naming the lease reached the proxy before the cut"
+    );
+    let queued = || maintenance.inner().counters.cmd_buffer_len.load(SeqCst);
+    let before = queued();
+
+    // Registered as `main.rs` registers it: its handle and its token.
+    let writers = HoldWriterAborts::new();
+    let cancel = CancellationToken::new();
+    let handle = spawn_ext_ref_reconcile(
+        own.clone(),
+        tv.key_schema().clone(),
+        leader.clone(),
+        T7_RECONCILE_INTERVAL,
+        ext_reconcile_grace(crate::common::test_config().rpc_deadline_ms),
+        cancel.clone(),
+        Some(Arc::clone(&metrics)),
+    );
+    writers.register_task(HoldWriter::ExtRefReconcile, handle.abort_handle());
+    writers.register_token(HoldWriter::ExtRefReconcile, cancel.clone());
+
+    until(
+        deadline,
+        "the lease refresh queued in the router's channel",
+        || queued() > before,
+    )
+    .await;
+    let pttl_at_abort = pttl(deadline, &tv, &lease).await;
+    assert!(
+        pttl_at_abort > 0,
+        "precondition: the reconciler holds its lease at the abort; PTTL {pttl_at_abort}"
+    );
+
+    assert_eq!(
+        writers.abort_all(),
+        vec![HoldWriter::ExtRefReconcile],
+        "the hold's entry routine aborts the registered reconciler"
+    );
+    let ended = by(deadline, "the reconciler's handle", handle).await;
+
+    reopen_and_fence(deadline, &proxy, &maintenance, &key(&tv, "t7-fence")).await;
+
+    assert_eq!(
+        command_timeout_row(&metrics),
+        command_timeouts_only_on(POOL_LABEL_MAINTENANCE, 0),
+        "(a) the refresh's caller gave up at the abort, not at fred's own timer: no command \
+         timeout was counted"
+    );
+    assert!(
+        ended.is_err_and(|e| e.is_cancelled()),
+        "the reconciler's handle ends aborted: the task owning the queued refresh is gone"
+    );
+    let after_cut: Vec<Forwarded> = proxy.forwarded().into_iter().skip(cut).collect();
+    assert_eq!(
+        after_cut
+            .iter()
+            .filter(|f| f.names(&lease))
+            .collect::<Vec<_>>(),
+        Vec::<&Forwarded>::new(),
+        "(b) no frame after the cut names the lease: the aborted refresh is never written"
+    );
+    assert_eq!(
+        after_cut
+            .iter()
+            .filter(|f| f.name() == "EVALSHA")
+            .collect::<Vec<_>>(),
+        Vec::<&Forwarded>::new(),
+        "(c) no EVALSHA is forwarded after the cut"
+    );
+    let pttl_after = pttl(deadline, &tv, &lease).await;
+    assert!(
+        pttl_after < 0 || pttl_after <= pttl_at_abort,
+        "(d) the lease was not refreshed: {pttl_at_abort} ms at the abort, {pttl_after} ms \
+         after the barrier"
     );
 }

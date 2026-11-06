@@ -15,15 +15,26 @@
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <random>
 #include <stdexcept>
 #include <utility>
 
 namespace omni::usd::live {
 namespace {
-std::mutex globalMutex;
-std::shared_ptr<Runtime> globalRuntime;
-uint64_t runtimeOwners = 0;
+// The process-wide runtime registration. It is never destroyed: a runtime the
+// process still owns at exit stays owned for the rest of the process (Python
+// guide, teardown), so a thread that outlives static destruction, such as a
+// binding's abandoned-owner cleanup, still finds it intact.
+struct Global {
+    std::mutex mutex;
+    std::shared_ptr<Runtime> runtime;
+    uint64_t owners = 0;
+};
+Global& global() {
+    static auto* value = new Global;
+    return *value;
+}
 std::atomic<uint64_t> nextEndpoint{1}; // Never reset across runtime lifetimes.
 
 void diagnosticStatusCallbackFailure(void* context, OmniUsdLiveCallbackHandle callback, OmniUsdLiveEndpoint endpoint,
@@ -112,9 +123,10 @@ bool sameJitter(const OmniUsdLiveJitterParams& first, const OmniUsdLiveJitterPar
 template<class T> constexpr bool acceptedPrefixSize(size_t) noexcept { return false; }
 template<> constexpr bool acceptedPrefixSize<OmniUsdLiveRuntimeOptions>(size_t size) noexcept {
     return size == offsetof(OmniUsdLiveRuntimeOptions, apply_lag_warning_threshold) ||
-        size == offsetof(OmniUsdLiveRuntimeOptions, reconnect_initial_ms);
+        size == offsetof(OmniUsdLiveRuntimeOptions, reconnect_initial_ms) ||
+        size == offsetof(OmniUsdLiveRuntimeOptions, max_calls_per_endpoint);
 }
-static_assert(sizeof(OmniUsdLiveRuntimeOptions) == 160,
+static_assert(sizeof(OmniUsdLiveRuntimeOptions) == 168,
     "extend the accepted runtime option input sizes for an appended field");
 
 template<class T> void validateVersion(const T* record) {
@@ -251,6 +263,188 @@ PendingBytes::~PendingBytes() {
     reportRelease(std::move(watchers));
 }
 
+CallSlot::CallSlot(CallSlot&& other) noexcept : budget_(std::move(other.budget_)), call_(other.call_) {}
+CallSlot& CallSlot::operator=(CallSlot&& other) noexcept {
+    if (this != &other) {
+        reset();
+        budget_ = std::move(other.budget_);
+        call_ = other.call_;
+    }
+    return *this;
+}
+CallSlot::~CallSlot() { reset(); }
+void CallSlot::reset() noexcept {
+    if (auto budget = std::move(budget_)) budget->closed(call_);
+}
+StreamReservation::~StreamReservation() { budget_->releaseStream(); }
+CallSlot StreamReservation::open() noexcept {
+    CallSlot slot;
+    {
+        std::lock_guard<std::mutex> lock(budget_->mutex_);
+        budget_->opened();
+    }
+    slot.budget_ = budget_;
+    return slot;
+}
+CallWaiter::~CallWaiter() {
+    uint64_t units;
+    {
+        // The queue holds weak entries; drop this waiter's and any other
+        // expired one, so no waiter queues behind one that is gone.
+        std::lock_guard<std::mutex> lock(budget_->mutex_);
+        if (queued_) budget_->pruneExpired();
+        units = granted_;
+    }
+    if (units) budget_->releaseCalls(units);
+}
+
+CallBudget::CallBudget(uint64_t limit, DiagnosticsRegistry& diagnostics, OmniUsdLiveEndpoint endpoint) noexcept
+    : limit_(limit), calls_(callShare(limit)), streams_(limit - callShare(limit)), diagnostics_(diagnostics),
+      endpoint_(endpoint) {}
+void CallBudget::opened() noexcept {
+    ++open_;
+    peak_ = std::max(peak_, open_);
+}
+void CallBudget::closed(bool call) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --open_;
+    }
+    if (call) releaseCalls(1);
+}
+void CallBudget::releaseStream() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    --streamUnits_;
+}
+std::shared_ptr<StreamReservation> CallBudget::reserveStream(uint32_t operation) {
+    Counts refused;
+    bool full;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        full = streamUnits_ >= streams_;
+        if (full) refused = {open_, peak_, streamUnits_, callUnits_, waiters_.size()};
+        else ++streamUnits_;
+    }
+    if (full) {
+        emit(operation, kStreamRefused, refused);
+        return nullptr;
+    }
+    auto* reservation = new (std::nothrow) StreamReservation(shared_from_this());
+    if (!reservation) {
+        releaseStream();
+        throw std::bad_alloc();
+    }
+    // A failed control block deletes the reservation, which returns its unit.
+    return std::shared_ptr<StreamReservation>(reservation);
+}
+bool CallBudget::streamAvailable(uint32_t operation) noexcept {
+    Counts refused;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (streamUnits_ < streams_) return true;
+        refused = {open_, peak_, streamUnits_, callUnits_, waiters_.size()};
+    }
+    emit(operation, kStreamRefused, refused);
+    return false;
+}
+std::shared_ptr<CallWaiter> CallBudget::waiter(std::function<void()> wake) {
+    return std::shared_ptr<CallWaiter>(new CallWaiter(shared_from_this(), std::move(wake)));
+}
+void CallBudget::pruneExpired() noexcept {
+    waiters_.erase(std::remove_if(waiters_.begin(), waiters_.end(), [](const auto& entry) { return entry.expired(); }),
+        waiters_.end());
+}
+CallSlot CallBudget::acquire(CallWaiter& waiter, uint32_t operation) noexcept {
+    CallSlot slot;
+    Counts entered;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (waiter.granted_) {
+            --waiter.granted_;
+        } else if (waiters_.empty() && callUnits_ < calls_) {
+            ++callUnits_;
+        } else {
+            if (waiter.queued_) return slot;
+            try {
+                waiters_.push_back(waiter.weak_from_this());
+            } catch (...) {
+                return slot; // Unqueued: the waiter's owner retries on its next step.
+            }
+            waiter.queued_ = true;
+            if (saturated_) return slot;
+            saturated_ = true;
+            entered = {open_, peak_, streamUnits_, callUnits_, waiters_.size()};
+        }
+        if (!entered.waiting) {
+            opened();
+            slot.budget_ = shared_from_this();
+            slot.call_ = true;
+            return slot;
+        }
+    }
+    emit(operation, kCallQueued, entered);
+    return slot;
+}
+CallSlot CallBudget::tryAcquire(uint32_t operation, bool report) noexcept {
+    CallSlot slot;
+    Counts refused;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (waiters_.empty() && callUnits_ < calls_) {
+            ++callUnits_;
+            opened();
+            slot.budget_ = shared_from_this();
+            slot.call_ = true;
+            return slot;
+        }
+        refused = {open_, peak_, streamUnits_, callUnits_, waiters_.size()};
+    }
+    if (report) emit(operation, kCallRefused, refused);
+    return slot;
+}
+void CallBudget::returnGranted(CallWaiter& waiter) noexcept {
+    uint64_t units;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        units = std::exchange(waiter.granted_, 0);
+    }
+    if (units) releaseCalls(units);
+}
+void CallBudget::releaseCalls(uint64_t units) noexcept {
+    while (units) {
+        // Declared outside the lock: when it is a waiter's last owner, the
+        // waiter's destructor, which takes the mutex, runs after the wake.
+        std::shared_ptr<CallWaiter> next;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            while (!next && !waiters_.empty()) {
+                next = waiters_.front().lock();
+                waiters_.pop_front();
+            }
+            if (!next) {
+                callUnits_ -= units;
+                saturated_ = false;
+                return;
+            }
+            next->queued_ = false;
+            ++next->granted_;
+            --units;
+        }
+        if (next->wake_) next->wake_();
+    }
+}
+void CallBudget::report(uint32_t operation, uint32_t reason) noexcept { emit(operation, reason, counts()); }
+CallBudget::Counts CallBudget::counts() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {open_, peak_, streamUnits_, callUnits_, waiters_.size()};
+}
+void CallBudget::emit(uint32_t operation, uint32_t reason, const Counts& counts) noexcept {
+    // count is the calls open, limit the budget and queue_depth the waiters.
+    diagnostics_.emit(OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED, endpoint_, 0, 0,
+        {{DiagnosticKey::Operation, operation}, {DiagnosticKey::Reason, reason}, {DiagnosticKey::Count, counts.open},
+            {DiagnosticKey::Limit, limit_}, {DiagnosticKey::QueueDepth, counts.waiting}});
+}
+
 RuntimeOptions RuntimeOptions::copy(const OmniUsdLiveRuntimeOptions* supplied) {
     RuntimeOptions result;
     // Read only the caller's extent; an accepted prefix leaves later fields zero.
@@ -286,7 +480,8 @@ RuntimeOptions RuntimeOptions::copy(const OmniUsdLiveRuntimeOptions* supplied) {
         result.values.diagnostic_min_severity > OMNI_USD_LIVE_SEVERITY_ERROR ||
         (result.values.diagnostic_allowed_flags &
             ~uint32_t(OMNI_USD_LIVE_DIAGNOSTIC_RESOURCE_NAMES | OMNI_USD_LIVE_DIAGNOSTIC_SERVER_DETAIL)) ||
-        (result.values.flags & ~uint32_t(OMNI_USD_LIVE_RUNTIME_DISABLE_DIAGNOSTIC_HISTORY)))
+        (result.values.flags & ~uint32_t(OMNI_USD_LIVE_RUNTIME_DISABLE_DIAGNOSTIC_HISTORY)) ||
+        result.values.max_calls_per_endpoint < 3)
         throw std::invalid_argument("invalid runtime limits");
     return result;
 }
@@ -339,11 +534,11 @@ bool EndpointOptions::sameConfiguration(const EndpointOptions& other) const {
 }
 
 Endpoint::Endpoint(EndpointOptions supplied, OmniUsdLiveEndpoint value, std::string id,
-    OmniUsdLiveJitterParams jitterValue, uint32_t maxUpdateBytes, DiagnosticsRegistry& metrics)
+    OmniUsdLiveJitterParams jitterValue, uint32_t maxUpdateBytes, uint64_t maxCalls, DiagnosticsRegistry& metrics)
     : options(std::move(supplied)), handle(value), diagnostics(metrics), writerId(std::move(id)),
       token(std::move(options.initialToken)), tokenGeneration(token.empty() ? 0 : 1), expiresAtMs(options.expiresAtMs),
       expiresAtSteady(steadyExpiry(options.expiresAtMs, wallTimeMs(), std::chrono::steady_clock::now())),
-      jitter(jitterValue) {
+      jitter(jitterValue), calls(std::make_shared<CallBudget>(maxCalls, metrics, value)) {
     status.struct_size = sizeof(status);
     status.abi_version = OMNI_USD_LIVE_ABI_VERSION;
     status.subject_kind = OMNI_USD_LIVE_SUBJECT_ENDPOINT;
@@ -536,7 +731,8 @@ OmniUsdLiveResult Runtime::registerEndpoint(EndpointOptions configuration, OmniU
     } while (!nextEndpoint.compare_exchange_weak(ordinal, ordinal + 1));
     const auto handle = (UINT64_C(1) << 56) | ordinal;
     auto candidate = std::make_shared<Endpoint>(std::move(configuration), handle,
-        instanceNonce + ":" + std::to_string(ordinal), jitter, options.values.max_update_bytes, *diagnostics);
+        instanceNonce + ":" + std::to_string(ordinal), jitter, options.values.max_update_bytes,
+        options.values.max_calls_per_endpoint, *diagnostics);
     std::lock_guard<std::mutex> lock(mutex);
     if (closing) return OMNI_USD_LIVE_BUSY;
     auto previous = authorities.find(candidate->options.authority.canonical);
@@ -604,37 +800,40 @@ EndpointLease Runtime::acquireEndpoint(OmniUsdLiveEndpoint handle) {
 }
 
 std::shared_ptr<Runtime> getRuntime() {
-    std::lock_guard<std::mutex> lock(globalMutex);
-    return globalRuntime;
+    auto& registration = global();
+    std::lock_guard<std::mutex> lock(registration.mutex);
+    return registration.runtime;
 }
 
 OmniUsdLiveResult initialize(const OmniUsdLiveRuntimeOptions* input) {
+    auto& registration = global();
     auto options = RuntimeOptions::copy(input);
-    std::lock_guard<std::mutex> lock(globalMutex);
-    if (globalRuntime) {
-        if (globalRuntime->closing) return OMNI_USD_LIVE_BUSY;
-        if (!(globalRuntime->options == options)) return OMNI_USD_LIVE_INVALID_ARGUMENT;
-        if (runtimeOwners == std::numeric_limits<uint64_t>::max()) return OMNI_USD_LIVE_RESOURCE_EXHAUSTED;
-        ++runtimeOwners;
+    std::lock_guard<std::mutex> lock(registration.mutex);
+    if (registration.runtime) {
+        if (registration.runtime->closing) return OMNI_USD_LIVE_BUSY;
+        if (!(registration.runtime->options == options)) return OMNI_USD_LIVE_INVALID_ARGUMENT;
+        if (registration.owners == std::numeric_limits<uint64_t>::max()) return OMNI_USD_LIVE_RESOURCE_EXHAUSTED;
+        ++registration.owners;
         return OMNI_USD_LIVE_OK;
     }
-    globalRuntime = std::make_shared<Runtime>(std::move(options));
-    runtimeOwners = 1;
+    registration.runtime = std::make_shared<Runtime>(std::move(options));
+    registration.owners = 1;
     return OMNI_USD_LIVE_OK;
 }
 
 OmniUsdLiveResult shutdown(uint32_t timeoutMs) {
+    auto& registration = global();
     const auto started = std::chrono::steady_clock::now();
     std::shared_ptr<Runtime> runtime;
     auto phase = ShutdownPhase::ReferenceRelease;
     OmniUsdLiveResult result = OMNI_USD_LIVE_OK;
     bool quiescing = false;
     {
-        std::lock_guard<std::mutex> lock(globalMutex);
-        if (!globalRuntime) return OMNI_USD_LIVE_NOT_INITIALIZED;
-        runtime = globalRuntime;
-        if (runtimeOwners > 1) {
-            --runtimeOwners;
+        std::lock_guard<std::mutex> lock(registration.mutex);
+        if (!registration.runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        runtime = registration.runtime;
+        if (registration.owners > 1) {
+            --registration.owners;
         } else {
             std::lock_guard<std::mutex> registryLock(runtime->mutex);
             if (!runtime->endpoints.empty() || runtime->sessions->hasSessions() || runtime->statuses->hasObservers() ||
@@ -650,16 +849,16 @@ OmniUsdLiveResult shutdown(uint32_t timeoutMs) {
     if (quiescing) {
         if (!runtime->waitForShutdown(timeoutMs, &phase)) result = OMNI_USD_LIVE_TIMEOUT;
         else {
-            std::lock_guard<std::mutex> lock(globalMutex);
-            if (globalRuntime == runtime) {
-                globalRuntime.reset();
-                runtimeOwners = 0;
+            std::lock_guard<std::mutex> lock(registration.mutex);
+            if (registration.runtime == runtime) {
+                registration.runtime.reset();
+                registration.owners = 0;
             }
         }
     }
     const auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
-    // The pin was selected under globalMutex. Never attribute a concurrent
+    // The pin was selected under the registration mutex. Never attribute a concurrent
     // shutdown/reinitialize race to a newly installed runtime.
     runtime->diagnostics->observeShutdown(phase, result, static_cast<uint64_t>(elapsed));
     return result;

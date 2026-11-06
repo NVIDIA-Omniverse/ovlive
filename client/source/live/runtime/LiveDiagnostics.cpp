@@ -18,8 +18,8 @@ constexpr const char* eventNames[] = {"invalid", "endpoint_registered", "endpoin
     "backpressure_entered", "backpressure_exited", "save_completed", "drain_completed", "drain_timeout",
     "quiescence_failed", "retry_scheduled", "records_suppressed", "invalid", "message_accepted",
     "message_write_completed", "message_received", "message_discarded", "message_rejected", "callback_failed",
-    "flush_unsupported", "host_edits_discarded", "read_paused", "read_resumed", "apply_lag_entered",
-    "apply_lag_exited"};
+    "flush_unsupported", "host_edits_discarded", "read_paused", "read_resumed", "apply_lag_entered", "apply_lag_exited",
+    "section_replaced", "call_budget_exhausted", "cleanup_timeout"};
 static_assert(std::size(eventNames) == kDiagnosticEventCount);
 constexpr uint32_t kReservedEventCode = 23; // Reserved: never emitted or subscribable.
 constexpr const char* fieldNames[] = {"operation", "result", "grpc_status", "request_id", "attempt_id",
@@ -27,7 +27,7 @@ constexpr const char* fieldNames[] = {"operation", "result", "grpc_status", "req
     "duration_ms", "count", "state", "revision", "read_sequence", "write_sequence", "applied_sequence", "bytes",
     "retry_disposition", "queue_depth", "sample_age_ms", "resume_sequence", "work_id", "session_handle",
     "target_local_ordinal", "local_retired", "auth_failure_cause", "callback_kind", "callback_id", "struct_commands",
-    "set_fields", "time_samples", "limit"};
+    "set_fields", "time_samples", "limit", "section_id"};
 constexpr uint32_t allowedFlags = OMNI_USD_LIVE_DIAGNOSTIC_RESOURCE_NAMES | OMNI_USD_LIVE_DIAGNOSTIC_SERVER_DETAIL;
 std::atomic<uint64_t> nextSink{1};
 void increment(uint64_t& value) noexcept {
@@ -85,6 +85,9 @@ uint32_t DiagnosticsRegistry::eventSeverity(uint32_t code) noexcept {
     case OMNI_USD_LIVE_RECORD_BACKPRESSURE_ENTERED:
     case OMNI_USD_LIVE_RECORD_READ_PAUSED:
     case OMNI_USD_LIVE_RECORD_APPLY_LAG_ENTERED:
+    case OMNI_USD_LIVE_RECORD_SECTION_REPLACED:
+    case OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED:
+    case OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT:
     case OMNI_USD_LIVE_RECORD_DRAIN_TIMEOUT:
     case OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED: return OMNI_USD_LIVE_SEVERITY_WARN;
     case OMNI_USD_LIVE_RECORD_AUTH_FAILED:
@@ -150,6 +153,9 @@ struct DiagnosticsRegistry::Impl {
         Clock::time_point since{};
         uint64_t suppressed = 0;
         bool initialized = false;
+        // Whether the prior record and the warnings coalesced into it reach
+        // sinks; their summary follows the same delivery.
+        bool deliver = false;
     };
     std::array<Warning, kDiagnosticEventCount> warnings;
     uint64_t sequence = 0;
@@ -217,7 +223,7 @@ struct DiagnosticsRegistry::Impl {
             entry.eventCode != OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED) {
             auto& warning = warnings[entry.eventCode];
             if (warning.initialized && observedNow - warning.since < std::chrono::milliseconds(1000) &&
-                sameWarning(warning.prior, entry)) {
+                warning.deliver == deliver && sameWarning(warning.prior, entry)) {
                 ++sequence;
                 increment(warning.suppressed);
                 increment(metrics.warningSuppressed);
@@ -234,9 +240,10 @@ struct DiagnosticsRegistry::Impl {
                 summary.fields[0] = {DiagnosticKey::Count, warning.suppressed};
                 summary.fields[1] = {DiagnosticKey::Reason, entry.eventCode};
                 summary.fieldCount = 2;
-                publish(summary, deliver);
+                publish(summary, warning.deliver && !stopping);
             }
             warning.prior = entry;
+            warning.deliver = deliver;
             warning.since = observedNow;
             warning.suppressed = 0;
             warning.initialized = true;
@@ -423,6 +430,31 @@ void DiagnosticsRegistry::observeShutdown(ShutdownPhase phase, OmniUsdLiveResult
     // Shutdown has already stopped sink delivery. Preserve bounded local
     // evidence without scheduling any callback or reviving an executor.
     impl_->publish(entry, false);
+}
+void DiagnosticsRegistry::observeCleanup(CleanupCall call, OmniUsdLiveResult result, uint64_t durationMs,
+    uint32_t timeoutMs, uint64_t handle, bool diagnosticSink) noexcept {
+    const auto index = static_cast<size_t>(call);
+    assert(index && index < kCleanupCallCount);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->metrics.cleanupDurationByCallResult[index][resultIndex(result)].observe(durationMs);
+    if (result != OMNI_USD_LIVE_TIMEOUT || !timeoutMs) return;
+    DiagnosticEntry entry;
+    entry.eventCode = OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT;
+    entry.severity = OMNI_USD_LIVE_SEVERITY_WARN;
+    entry.fields[0] = {DiagnosticKey::Result, result};
+    entry.fields[1] = {DiagnosticKey::DurationMs, durationMs};
+    entry.fields[2] = {DiagnosticKey::Reason, index};
+    entry.fieldCount = 3;
+    switch (call) {
+    case CleanupCall::UnregisterCallback: entry.fields[entry.fieldCount++] = {DiagnosticKey::Callback, handle}; break;
+    case CleanupCall::Cancel:
+    case CleanupCall::ReleaseRequest: entry.fields[entry.fieldCount++] = {DiagnosticKey::Request, handle}; break;
+    case CleanupCall::LeaveSession: entry.fields[entry.fieldCount++] = {DiagnosticKey::Session, handle}; break;
+    case CleanupCall::UnregisterEndpoint: entry.endpoint = handle; break;
+    }
+    // Sinks stopped at shutdown never revive; a sink's own cleanup never
+    // reports through sinks.
+    impl_->publish(entry, !diagnosticSink && !impl_->stopping);
 }
 void DiagnosticsRegistry::subjectTransition(uint32_t kind, uint32_t previousState, uint32_t state, bool attached,
     const StatusTiming& timing) noexcept {

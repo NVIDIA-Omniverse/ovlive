@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
-from tools.live import build, platforms, sanitizer, stack_dump, test, writer_campaign
+from tools.live import build, platforms, provision, sanitizer, stack_dump, test, writer_campaign
 from tools.live.test_support import run_process, write_json, writer_seed
 from tools.release import archive
 
@@ -31,16 +31,23 @@ BASE_SUITES = (
     'diagnostics-schema', 'reference-service', 'native-reference', 'scene-reference',
     'resolver-reference', 'plugin-reference', 'writer-fuzz', 'resolver-probe',
 )
+# These monolithic lanes inject whole-heap faults into noexcept MSVC checked-STL constructors. The Windows debug
+# companion has no allocation-failure containment qualification; release/sanitizer coverage remains mandatory.
+DEBUG_EXCLUDED_SUITES = ('wire-scene', 'runtime-foundation', 'diagnostics-schema', 'scene-reference')
 PROFILES = ('presubmit', 'asan', 'nightly', 'tsan', 'soak')
 # Qualification requires the runner's child-process containment on these hosts.
 QUALIFICATION_PLATFORMS = ('linux-x86_64', 'linux-aarch64', 'windows-x86_64')
 # The soak runs one long writer campaign and nothing else: its suite, drivers and watchdogs.
 SOAK_SUITES = ['writer-fuzz']
-SOAK_DRIVERS = ('plugin-driver', 'scene-transport-driver')
+# The drivers a writer campaign runs: the soak's only drivers, and the package-samples step's.
+WRITER_DRIVERS = ('plugin-driver', 'scene-transport-driver')
 # Per-suite failure watchdogs: a campaign profile's own, which covers the slower suites on Windows as well.
 SOAK_SUITE_TIMEOUT_MS = writer_campaign.PROFILES['soak']['campaign_timeout_ms']
 NIGHTLY_SUITE_TIMEOUT_MS = writer_campaign.PROFILES['nightly']['campaign_timeout_ms']
 SUITE_TIMEOUT_MS = writer_campaign.PROFILES['ci']['campaign_timeout_ms']
+PACKAGE_SUITE_TIMEOUT_MS = writer_campaign.PROFILES['package']['campaign_timeout_ms']
+# The stage the package-stage step builds, relative to the run's output; package-samples runs its samples.
+STAGED_PACKAGE = 'release-stage/usd/omniverse/live'
 SOAK_CONTRACT_TIMEOUT_MS = 12_600_000
 # Profiles that build instrumented binaries, and the sanitizer kind each selects.
 SANITIZER_KINDS = {'asan': 'address', 'tsan': 'thread'}
@@ -103,13 +110,16 @@ def read_config(path):
     if len(payload) > 32768:
         raise ValueError('CI configuration exceeds 32 KiB')
     config = json.loads(payload, object_pairs_hook=unique_object)
-    if (not isinstance(config, dict) or set(config) not in ({'schema_version', 'tools', 'sdks'},
-                                                         {'schema_version', 'tools', 'sdks', 'usd_profile'})
+    if (not isinstance(config, dict) or not {'schema_version', 'tools', 'sdks'} <= set(config)
+            or set(config) - {'schema_version', 'tools', 'sdks', 'usd_profile', 'configuration'}
             or type(config['schema_version']) is not int or config['schema_version'] != 1):
-        raise ValueError('Expected schema_version=1, tools, sdks and optional usd_profile only')
+        raise ValueError('Expected schema_version=1, tools, sdks and optional usd_profile/configuration only')
     if (not isinstance(config.get('usd_profile', 'stock-25.11'), str)
             or config.get('usd_profile', 'stock-25.11') not in build.USD_PROFILES):
         raise ValueError('Unknown USD profile')
+    configuration = config.get('configuration', 'release')
+    if configuration not in ('release', 'debug'):
+        raise ValueError('Unknown build configuration')
     tools, sdks = config['tools'], config['sdks']
     if (not isinstance(tools, dict) or not isinstance(sdks, dict) or set(sdks) != SDK_KEYS
             or set(tools) not in (TOOL_KEYS | EXTRA_TOOLS | {'make'}, TOOL_KEYS | EXTRA_TOOLS | {'ninja'})):
@@ -147,7 +157,11 @@ def plan(config, output, profile, seed, parallel, fresh=True):
     if host.name not in QUALIFICATION_PLATFORMS:
         raise ValueError(f'{host.name} has no supported supervised CI qualification; '
                          'native package builds and direct component checks are separate')
-    args = SimpleNamespace(root=str(ROOT), platform=host.name, config='release',
+    configuration = config.get('configuration', 'release')
+    provision.validate_configuration(config.get('usd_profile', 'stock-25.11'), host.name, configuration)
+    if configuration == 'debug' and profile not in {'presubmit', 'nightly'}:
+        raise ValueError('Debug qualification supports presubmit and nightly only')
+    args = SimpleNamespace(root=str(ROOT), platform=host.name, config=configuration,
                            usd_profile=config.get('usd_profile', 'stock-25.11'),
                            target_dir=str(output / 'stage'), build_dir=str(output / 'build'),
                            parallel=parallel, make=tools.get('make'), ninja=tools.get('ninja'),
@@ -170,6 +184,8 @@ def plan(config, output, profile, seed, parallel, fresh=True):
     configure += [f'-D{key}={value}' for key, value in sorted(settings.items())]
     soak = profile == 'soak'
     suites = list(SOAK_SUITES if soak else BASE_SUITES)
+    excluded = list(DEBUG_EXCLUDED_SUITES) if configuration == 'debug' else []
+    suites = [suite for suite in suites if suite not in excluded]
     if kind == 'none' and not soak:
         suites += ['uri', 'python-reference']
     test_command = [sys.executable, '-B', str(ROOT / 'tools/live/test.py'), '--suite', ','.join(suites),
@@ -181,7 +197,7 @@ def plan(config, output, profile, seed, parallel, fresh=True):
     windows = host.binary_format == 'pe'
     exe = '.exe' if windows else ''
     for option, name in DRIVERS.items():
-        if not soak or option in SOAK_DRIVERS:
+        if not soak or option in WRITER_DRIVERS:
             test_command += ['--' + option, str(output / 'build' / (name + exe))]
     for key in sorted(EXTRA_TOOLS):
         test_command += ['--' + key.replace('_', '-'), tools[key]]
@@ -210,17 +226,18 @@ def plan(config, output, profile, seed, parallel, fresh=True):
         ('install', [tools['cmake'], '--install', str(output / 'build'), '--prefix', str(output / 'install')], 120000),
     ]
     commands.append(('package-native', [sys.executable, '-B', str(ROOT / 'tests/native/plugin/package.py'),
-                     str(output / 'package'), str(output / 'build' / ('live_plugin_load_probe' + exe)), str(ROOT)], 120000))
+                     str(output / 'package'), str(output / 'build' / ('live_plugin_load_probe' + exe)), str(ROOT),
+                     sdks['dependency_root']], 120000))
     if kind == 'none':
         commands.append(('package-python', [native['tools']['python'], '-B',
                          str(ROOT / 'tests/native/python/package.py'), str(output / 'package'), sdks['usd_root']], 120000))
     if profile in {'presubmit', 'nightly'}:
         # The release package: build.py in its own build directory, archived, then loaded from the extracted folder.
-        root = archive.archive_root(archive.version(), args.usd_profile, host.name)
+        root = archive.archive_root(archive.version(), args.usd_profile, host.name, configuration)
         release = output / 'release-check' / root / 'omni_usd_live'
         commands += [
             ('package-stage', [sys.executable, '-B', str(ROOT / 'tools/live/build.py'), '--platform', host.name,
-                               '--config', 'release', '--usd-profile', args.usd_profile,
+                               '--config', configuration, '--usd-profile', args.usd_profile,
                                '--target-dir', str(output / 'release-stage'), '--build-dir', str(output / 'release-build'),
                                '--parallel', str(parallel), '--usd-root', sdks['usd_root'],
                                '--python-root', sdks['python_root'], '--dependency-root', sdks['dependency_root'],
@@ -228,15 +245,29 @@ def plan(config, output, profile, seed, parallel, fresh=True):
                                *[f'--{key.replace("_", "-")}=' + tools[key]
                                  for key in ('cmake', 'cc', 'cxx', 'protoc', 'grpc_cpp_plugin')],
                                '--make' if 'make' in tools else '--ninja', tools.get('make') or tools['ninja']], 1800000),
+            # The package writer campaign: the stage's samples beside the build's seeded writers. Only these profiles
+            # stage the package, after the contracts step, so the campaign runs as its own step.
+            ('package-samples', [sys.executable, '-B', str(ROOT / 'tools/live/test.py'), '--suite', 'writer-fuzz',
+                                 '--seed', str(seed), '--artifact-dir', str(output / 'package-tests'),
+                                 '--writer-fuzz-profile', 'package', '--timeout-ms', str(PACKAGE_SUITE_TIMEOUT_MS),
+                                 *[argument for option in WRITER_DRIVERS
+                                   for argument in ('--' + option, str(output / 'build' / (DRIVERS[option] + exe)))],
+                                 '--reference-python', tools['reference_python'],
+                                 '--reference-openssl', tools['reference_openssl'],
+                                 '--staged-package', str(output / STAGED_PACKAGE)], PACKAGE_SUITE_TIMEOUT_MS + 300000),
             ('package-archive', [sys.executable, '-B', str(ROOT / 'tools/release/archive.py'), 'create',
                                  '--package', str(output / 'release-stage/usd/omniverse/live'),
                                  '--output-dir', str(output / 'release'),
                                  '--extract-to', str(output / 'release-check'), '--allow-dirty'], 300000),
             ('package-archive-native', [sys.executable, '-B', str(ROOT / 'tests/native/plugin/package.py'), str(release),
-                                        str(output / 'build' / ('live_plugin_load_probe' + exe)), str(ROOT)], 120000),
+                                        str(output / 'build' / ('live_plugin_load_probe' + exe)), str(ROOT),
+                                        sdks['dependency_root']], 120000),
             ('package-archive-python', [native['tools']['python'], '-B', str(ROOT / 'tests/native/python/package.py'),
                                         str(release), sdks['usd_root']], 120000),
         ]
+        if configuration != 'release':
+            next(command for name, command, _ in commands if name == 'package-archive').extend(
+                ['--configuration', configuration])
     if kind == 'thread' and host.system == 'Linux':
         setarch = shutil.which('setarch')
         if not setarch:
@@ -246,7 +277,7 @@ def plan(config, output, profile, seed, parallel, fresh=True):
                      else command, timeout) for name, command, timeout in commands]
     return dict(schema_version=1, boundary='linux-usd2511-ci', profile=profile,
                 usd_profile=args.usd_profile,
-                seed=seed, output=str(output), suites=suites, build_plan=native,
+                seed=seed, output=str(output), suites=suites, excluded_suites=excluded, build_plan=native,
                 config=config, source_fingerprint=test.fingerprint(),
                 runner_identity=dict(path=sys.executable, sha256=build._hash(sys.executable), version=sys.version),
                 steps=[dict(name=name, command=command, timeout_ms=timeout, state='pending')
@@ -319,14 +350,17 @@ def verify_profile(record, manifest, run):
             or manifest.get('sanitizer_runtime') != runtime or replay.get('sanitizer_runtime') != runtime):
         raise ValueError('CI seed, campaign, suites or sanitizer recipe differs')
     identities = NATIVE_IDENTITIES if sanitized else (*NATIVE_IDENTITIES, URI_IDENTITY)
+    if record['config'].get('configuration', 'release') == 'debug':
+        identities = [entry for entry in identities if entry[0] not in {'wire_scene_identity', 'runtime_identity'}]
     if soak:
-        identities = [entry for entry in NATIVE_IDENTITIES if entry[1].replace('_', '-') in SOAK_DRIVERS]
+        identities = [entry for entry in NATIVE_IDENTITIES if entry[1].replace('_', '-') in WRITER_DRIVERS]
     for key, path_key, name, boundary in identities:
         artifact = (Path(record['output']) / 'build' / build_artifact(platforms.host().name, name)).resolve()
         if replay.get(path_key) != str(artifact):
             raise ValueError('Candidate is outside the fresh CI build: ' + path_key)
         actual = test.native_identity(artifact, boundary)
-        if (actual.get('configuration') != 'Release' or actual.get('sanitizers') is not sanitized
+        if (actual.get('configuration') != record['config'].get('configuration', 'release').title()
+                or actual.get('sanitizers') is not sanitized
                 or sanitizer.kind_of(actual) != kind or manifest.get(key) != actual or replay.get(key) != actual):
             raise ValueError('Missing or different required candidate: ' + key)
     if soak:
@@ -343,6 +377,28 @@ def verify_profile(record, manifest, run):
         raise ValueError('Unexpected Python/URI ctypes candidate in the sanitizer profile')
 
 
+def verify_package_samples(record, manifest, run):
+    """The package-samples run is the package writer campaign at the run's seed, with the build's writer drivers and
+    the stage the package-stage step built."""
+    replay = json.loads((run / 'replay.json').read_text())
+    stage = str(Path(record['output']) / STAGED_PACKAGE)
+    if (replay.get('master_seed') != record['seed'] or replay.get('writer_fuzz_profile') != 'package'
+            or replay.get('suites') != ['writer-fuzz'] or replay.get('clients') != 1
+            or replay.get('source_fingerprint') != record['source_fingerprint']
+            or replay.get('staged_package') != stage
+            or not isinstance(manifest.get('staged_package_identity'), dict)
+            or manifest['staged_package_identity'].get('path') != stage
+            or replay.get('staged_package_identity') != manifest['staged_package_identity']):
+        raise ValueError('Package campaign seed, profile or stage differs')
+    for key, path_key, name, boundary in NATIVE_IDENTITIES:
+        if path_key.replace('_', '-') not in WRITER_DRIVERS:
+            continue
+        artifact = (Path(record['output']) / 'build' / build_artifact(platforms.host().name, name)).resolve()
+        actual = test.native_identity(artifact, boundary)
+        if replay.get(path_key) != str(artifact) or manifest.get(key) != actual or replay.get(key) != actual:
+            raise ValueError('Missing or different package campaign candidate: ' + key)
+
+
 
 def checkout_state():
     """The checkout record for the run summary: `state` is `clean`, `modified` or `unknown`, and `changed_files` counts modified, staged and untracked non-ignored files, or is None when git or the repository is unavailable."""
@@ -357,7 +413,8 @@ def execute(record):
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / 'plan.json', record)
     summary = dict(schema_version=1, profile=record['profile'], source_fingerprint=record['source_fingerprint'],
-                   seed=record['seed'], complete=False, passed=False, results=[])
+                   seed=record['seed'], excluded_suites=record.get('excluded_suites', []),
+                   complete=False, passed=False, results=[])
     write_json(output / 'summary.json', summary)
     environment = clean_environment()
     kind = SANITIZER_KINDS.get(record['profile'], 'none')
@@ -375,7 +432,8 @@ def execute(record):
             step['state'] = 'running'
             write_json(output / 'plan.json', record)
             # The release build keeps the configure environment and runs from the checkout.
-            package_check = step['name'].startswith('package-') and step['name'] != 'package-stage'
+            package_check = step['name'].startswith('package-') and step['name'] not in {'package-stage',
+                                                                                          'package-samples'}
             step_environment = dict(environment)
             usd, python = Path(native['sdks']['usd_root']), Path(native['sdks']['python_root'])
             if sys.platform == 'win32':
@@ -409,6 +467,11 @@ def execute(record):
                     if manifest.get(key) != json.loads((output / (name + '.log')).read_text()):
                         raise ValueError('Dependency identity changed: ' + key)
                 summary['run'] = str(run)
+            if step['name'] == 'package-samples':
+                run, manifest = verify_runner(output / 'package-tests', ['writer-fuzz'], record['source_fingerprint'],
+                                              kind)
+                verify_package_samples(record, manifest, run)
+                summary['package_run'] = str(run)
             if step['name'] == 'install':
                 package = output / 'package'
                 build.assemble_install(output / 'install', package)

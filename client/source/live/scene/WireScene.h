@@ -106,6 +106,9 @@ struct WireSceneDifference {
 // offset within USD's comparison tolerance differs, and shared array storage
 // by identity first; other values with VtValue equality.
 WireSceneDifference diffProjectedScenes(const WireScene& before, const WireScene& after);
+// Whether two values are equal as diffProjectedScenes compares them: floating
+// point by representation, other values with VtValue equality.
+bool sameWireValue(const PXR_NS::VtValue&, const PXR_NS::VtValue&);
 // Test hook, off by default: while enabled, every update a scene build applies
 // also derives the whole working scene from its sections and throws
 // std::logic_error unless the incremental derivation, children indexes and
@@ -155,6 +158,7 @@ private:
     explicit WireScene(std::unique_ptr<State>);
     std::unique_ptr<State> state_;
 };
+struct WireReplayStep;
 // Decode/validate the complete wire batch, stage graph and scene, then return
 // one complete immutable owner. A null previous scene starts with a pseudoroot.
 // Commands follow the service's conflict rules (design section 20): missing
@@ -175,13 +179,32 @@ private:
 // logarithmic factor in the scene. A structural command derives the paths of
 // the sections it moves and their subtrees again and resolves the shadowing
 // among their siblings, so it also costs those subtrees and the children
-// lists of the parents it changes.
+// lists of the parents it changes. A non-null `step` receives the build as a
+// replay step: OrdinaryUpdate builds exactly what the strict last step of
+// buildReplayedScene builds from `previous`, with the same work and figures.
+// A predicted rejection under PendingReplay reports only its work.
 WireScenePtr buildSceneCandidate(const WireScenePtr& previous, std::string_view bytes, const WireSceneLimits& = {},
-    WireSceneWorkBudget* = nullptr, WireSceneBatchPolicy = WireSceneBatchPolicy::Any);
+    WireSceneWorkBudget* = nullptr, WireSceneBatchPolicy = WireSceneBatchPolicy::Any, WireReplayStep* step = nullptr);
+// A section an update's Create replaced: the lowest live identity in the
+// Create's slot, its name within its spec type's child list of the parent,
+// which the Create deleted with its listed subtree (design section 10).
+// `path` is the occupant's last derived path, empty when it was last derived
+// hidden, as pathForSection reports it: an update derives paths and
+// visibility at its end and before each Reorder, so a section the same update
+// created or moved can report an empty or earlier path. `winner` is the
+// section the Create created in its place.
+struct WireReplacedSection {
+    uint64_t section = 0;
+    PXR_NS::SdfPath path;
+    uint64_t winner = 0;
+};
 // One delivered update and the transaction budget its own build is charged.
+// A non-null `replaced` receives every section the update's Creates replace,
+// in command order.
 struct WireSceneDelivery {
     std::string_view bytes;
     WireSceneWorkBudget* work = nullptr;
+    std::vector<WireReplacedSection>* replaced = nullptr;
 };
 // The scene that successive Delivered candidates of `updates` in order would
 // produce, building it once: each update is decoded, validated and charged as

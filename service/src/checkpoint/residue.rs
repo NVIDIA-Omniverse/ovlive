@@ -154,6 +154,8 @@ use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface, SortedSets
 use fred::types::ClusterHash;
 use std::collections::HashMap;
 
+use tokio_util::sync::CancellationToken;
+
 #[cfg(feature = "test-checkpoint-fault-injection")]
 use crate::checkpoint::adapters::CheckpointFaultInjector;
 #[cfg(feature = "test-checkpoint-fault-injection")]
@@ -178,7 +180,8 @@ use crate::storage::watched_txn::{
 };
 
 /// Everything [`wipe_restore_residue`] needs beyond the object it is wiping:
-/// the [`Config`] whose service label the counter is keyed on, and — only under
+/// the [`Config`] whose service label the counter is keyed on, the layer
+/// restore's hold write fence, and — only under
 /// `test-checkpoint-fault-injection` — the injector whose seam fires inside the
 /// `WATCH` … `EXEC` window.
 ///
@@ -191,6 +194,10 @@ use crate::storage::watched_txn::{
 #[derive(Clone, Copy)]
 pub(crate) struct ResidueWipeCtx<'a> {
     config: &'a Config,
+    /// The layer restore's hold write fence (`checkpoint::hold_fence`),
+    /// checked immediately before the wipe's `EXEC`; `None` unless
+    /// [`Self::with_hold_fence`] set it.
+    hold_fence: Option<&'a CancellationToken>,
     /// Fires once, between the post-`WATCH` header re-read and the `EXEC`. See
     /// [`crate::checkpoint::apply::RESTORE_SEAM_RESIDUE_WIPE_BEFORE_EXEC`] for
     /// the two verdicts it exists to make reachable.
@@ -202,9 +209,21 @@ impl<'a> From<&'a Config> for ResidueWipeCtx<'a> {
     fn from(config: &'a Config) -> Self {
         Self {
             config,
+            hold_fence: None,
             #[cfg(feature = "test-checkpoint-fault-injection")]
             injector: None,
         }
+    }
+}
+
+impl<'a> ResidueWipeCtx<'a> {
+    /// Set the hold write fence (`checkpoint::hold_fence`): a closed fence
+    /// refuses the wipe immediately before its `EXEC`, so a wipe sends no
+    /// `UNLINK` once a hold or stale-verdict entry has closed it.
+    /// `apply_restore` passes the layer restore's fence here.
+    pub(crate) fn with_hold_fence(mut self, hold_fence: Option<&'a CancellationToken>) -> Self {
+        self.hold_fence = hold_fence;
+        self
     }
 }
 
@@ -306,7 +325,10 @@ pub(crate) enum ResidueOutcome {
 ///    `test-checkpoint-fault-injection` the
 ///    [`RESTORE_SEAM_RESIDUE_WIPE_BEFORE_EXEC`](crate::checkpoint::apply::RESTORE_SEAM_RESIDUE_WIPE_BEFORE_EXEC)
 ///    seam fires between that check and the `EXEC` — see the module docs for
-///    the two tripped-`EXEC` verdicts it makes reachable.
+///    the two tripped-`EXEC` verdicts it makes reachable. Last, immediately
+///    before the `EXEC`, the hold write fence ([`ResidueWipeCtx::with_hold_fence`])
+///    is checked: a closed fence unwatches and returns `Transient`, sending
+///    no `UNLINK`.
 /// 5. **Observe.** WARN with the per-family breakdown; tick
 ///    `live_edit_checkpoint_restore_residue_wiped_total`, and
 ///    `storage_watch_voided_total{path="restore_residue_wipe"}` on each of the
@@ -751,6 +773,28 @@ pub(crate) async fn wipe_restore_residue<'a>(
             let _ = conn.unwatch_pinned().await;
             return Err(e);
         }
+    }
+
+    // ── The hold write fence (SDD SR-6.2), immediately before the `EXEC` ───
+    //
+    // Nothing of this transaction has reached the store yet: `MULTI` and the
+    // queued `UNLINK`s sit in the pipeline's local buffer until the `EXEC`
+    // sends them as one unit. So a fence closed (by a hold or a stale-verdict
+    // entry) anywhere in the wipe so far — the probe, the checkout, the
+    // `WATCH`, the enumerations — stops it here with nothing written. Same
+    // disposition as the L2 `Refuse` arm: unwatch, drop the unsent
+    // transaction, and answer `Transient`.
+    if crate::checkpoint::hold_fence::is_closed(ctx.hold_fence) {
+        let _ = conn.unwatch_pinned().await;
+        tracing::info!(
+            object_id,
+            "restore residue wipe stopped before its EXEC: this replica entered a \
+             disaster-recovery hold or lost contact with the store's hold state; nothing was \
+             wiped"
+        );
+        return Err(CheckpointError::Transient {
+            source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+        });
     }
 
     match txn

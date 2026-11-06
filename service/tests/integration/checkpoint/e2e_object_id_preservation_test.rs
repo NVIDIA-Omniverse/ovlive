@@ -249,7 +249,7 @@ use live_edit::grpc::layer::{handle_create_layer, handle_stat_layer, handle_upda
 use live_edit::grpc::proto::StatLayerRequest;
 use live_edit::grpc::BearerToken;
 use live_edit::storage::session::SessionStore;
-use oodf_ffi::{OwnedDelta, SetField};
+use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, SetField, StructCommand};
 
 use super::helpers::*;
 
@@ -362,15 +362,25 @@ fn stat_request(session_id: &str, layer_name: &str) -> Request<StatLayerRequest>
 //
 // `field_update_delta` emits one SetField on a deterministic key so each
 // UpdateLayer drives `seq` forward by one without colliding on the same
-// key. The fixture purposely does NOT carry a section (and uses
-// `section_id = 0`) so we don't need to materialize a parent section
-// first — the diff engine on `section_id=0` writes to the layer's "root"
-// scope which exists by construction after CreateLayer.
+// key. The field uses `section_id = 0`, so no parent section needs to be
+// materialized first — the diff engine on `section_id=0` writes to the
+// layer's "root" scope, which exists by construction after CreateLayer.
+// Each delta is a whole-layer reset, so it restates the layer's root
+// section (section 1 under 0, type 7, which the empty CreateLayer below
+// leaves): a reset without a top-level section would remove the layer's
+// last one, which UpdateLayer refuses (SDD §9.7).
 
 fn field_update_delta(set_order: u64, marker: u8) -> OwnedDelta {
     OwnedDelta {
         is_diff: true,
         base_version: 0,
+        struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+            parent_id: 0,
+            section_id: 1,
+            section_name: String::new(),
+            section_type: 7,
+            section_order: 0,
+        })],
         set_fields: vec![SetField {
             section_id: 0,
             key_name: format!("preserve-field-{set_order}"),
@@ -400,12 +410,13 @@ async fn create_session_and_layer(
         .await
         .expect("session creation must succeed");
 
-    // CreateLayer with an empty initial delta — Epic AC #9 only requires
-    // that the recovery cycle preserve `object_id`; populating sections
-    // here would not strengthen the assertion. The post-recovery
-    // assertions read `obj:hdr` directly (HGET), so an empty layer is
-    // sufficient — `obj:hdr` is still written by CreateLayer regardless
-    // of payload content.
+    // CreateLayer with an empty initial delta, which creates the layer
+    // holding only its root section — Epic AC #9 only requires that the
+    // recovery cycle preserve `object_id`; populating sections here would
+    // not strengthen the assertion. The post-recovery assertions read
+    // `obj:hdr` directly (HGET), so a root-only layer is sufficient —
+    // `obj:hdr` is still written by CreateLayer regardless of payload
+    // content.
     let ompf = delta_to_ompf_bytes(&empty_delta(), &[]);
     let stream = streaming_create(vec![
         make_create_header(&session_id, layer_name),
@@ -1559,7 +1570,7 @@ const PAYLOAD_FIELD: &str = "payload";
 const DELETED_SENTINEL: &str = "deleted";
 
 /// Gap above `snap_seq` past which the probe refuses to fold a high-water
-/// (`MAX_PLAUSIBLE_HIGH_WATER_GAP` in `src/checkpoint/recovery.rs`). Named
+/// (`MAX_PLAUSIBLE_HIGH_WATER_GAP` in `src/storage/stream_high_water.rs`). Named
 /// here rather than imported — the constant is private to the production
 /// module, and a test that re-derived it from the module under test could
 /// not detect a change to it.
@@ -2713,10 +2724,11 @@ async fn seq_floor_refuses_restore_when_the_stale_stream_unlink_cannot_be_verifi
 /// `UNLINK` fired first and destroyed the stream of a layer the guard was about
 /// to refuse. Not hypothetical: "header absent, stream present" is the NORMAL
 /// state for up to `STREAM_DELETE_GRACE_MS` (30 s) on every `DeleteLayer`,
-/// whose retirement order is DEL mapping → XADD `deleted` → UNLINK header →
-/// PEXPIRE stream. A recovery racing a delete would blow away the graced stream
-/// — the very thing that lets a parked subscriber see the `deleted` sentinel
-/// and exit cleanly — for a restore that then returns `NotFound` anyway.
+/// whose retirement order is unmap (the mapping and its layers-index member)
+/// → XADD `deleted` → PEXPIRE stream → UNLINK header. A recovery racing a
+/// delete would blow away the graced stream — the very thing that lets a
+/// parked subscriber see the `deleted` sentinel and exit cleanly — for a
+/// restore that then returns `NotFound` anyway.
 ///
 /// Modelled here by deleting the layer mapping, which is exactly what the guard
 /// consults. The hook is driven directly: with no mapping there is nothing for

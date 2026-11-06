@@ -347,8 +347,9 @@ async fn serve_metrics_scaling_v1_answers_503_with_no_snapshot_source() {
 /// `/scaling/v1` answers 503 until startup registers the production
 /// `ServiceScalingSource`, then 200 with the replica's snapshot as JSON: its
 /// counters from `Metrics` (the same calls that move the metrics they
-/// mirror), its limits, its readiness from the health reporter, and
-/// `shutting_down` once the service shutdown token fires. A second
+/// mirror), its limits, its readiness from the health reporter,
+/// `shutting_down` once the service shutdown token fires, and `held` from the
+/// hold reactor's signal, read at each snapshot (SDD SR-7a). A second
 /// registration is refused and leaves the first in place.
 #[tokio::test]
 async fn scaling_v1_answers_503_until_its_source_is_registered_then_the_live_snapshot() {
@@ -378,6 +379,8 @@ async fn scaling_v1_answers_503_until_its_source_is_registered_then_the_live_sna
 
     let (reporter, _) = live_edit::observability::health::create_health_service(READINESS).await;
     let shutdown = CancellationToken::new();
+    // The hold reactor's `held` signal, as `run` hands a receiver of it.
+    let (held_tx, held_rx) = tokio::sync::watch::channel(false);
     let source = |admission_waiters: u64| ServiceScalingSource {
         metrics: Arc::clone(&metrics),
         admission_waiters: Box::new(move || admission_waiters),
@@ -392,6 +395,7 @@ async fn scaling_v1_answers_503_until_its_source_is_registered_then_the_live_sna
         catchup_read_concurrency: 3,
         max_concurrent_catchups: 64,
         cpu_seconds: || Some(12.5),
+        held: held_rx.clone(),
     };
     assert!(
         endpoint.register(Arc::new(source(4))),
@@ -444,6 +448,7 @@ async fn scaling_v1_answers_503_until_its_source_is_registered_then_the_live_sna
             cpu_seconds_total: Some(12.5),
             catchup_read_concurrency: 3,
             max_concurrent_catchups: 64,
+            held: false,
         }
     );
 
@@ -462,6 +467,15 @@ async fn scaling_v1_answers_503_until_its_source_is_registered_then_the_live_sna
         last.ready,
         "shutting_down is reported on its own, not as readiness"
     );
+    assert!(!last.held, "not held until the reactor says so");
+
+    held_tx.send_replace(true);
+    assert!(
+        snapshot("held").await.held,
+        "held follows the hold reactor's signal, read at each snapshot"
+    );
+    held_tx.send_replace(false);
+    assert!(!snapshot("un-held").await.held);
 
     task.abort();
 }
@@ -593,6 +607,7 @@ async fn a_service_at_a_non_reference_pod_memory_limit_reports_the_budgets_deriv
         catchup_read_concurrency: config.catchup_snapshot_read_concurrency,
         max_concurrent_catchups: 8,
         cpu_seconds: || None,
+        held: tokio::sync::watch::channel(false).1,
     })));
 
     let snapshot = get(addr, "/scaling/v1")

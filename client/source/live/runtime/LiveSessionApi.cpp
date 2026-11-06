@@ -3,17 +3,22 @@
 #include "LiveSession.h"
 #include "LiveRequest.h"
 #include "LiveStatus.h"
+#include "LiveDiagnostics.h"
 #include "LiveExceptionResult.h"
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
 
 namespace {
 using namespace omni::usd::live;
-template<class T> T versioned(const T* pointer) {
+// Join options accept the 1.0 prefix that ends before flags, which then reads as zero.
+OmniUsdLiveJoinOptions joinOptions(const OmniUsdLiveJoinOptions* pointer) {
     uint32_t size = 0;
     if (pointer) std::memcpy(&size, pointer, sizeof(size));
-    if (!pointer || size < sizeof(T)) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
-    T value;
-    std::memcpy(&value, pointer, sizeof(value));
+    if (!pointer || (size < sizeof(OmniUsdLiveJoinOptions) && size != offsetof(OmniUsdLiveJoinOptions, flags)))
+        throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+    OmniUsdLiveJoinOptions value{};
+    std::memcpy(&value, pointer, std::min<size_t>(size, sizeof(value)));
     if ((value.abi_version >> 16) != (OMNI_USD_LIVE_ABI_VERSION >> 16))
         throw OmniUsdLiveResult(OMNI_USD_LIVE_UNSUPPORTED);
     return value;
@@ -35,21 +40,22 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveJoinSession(const char* uri, con
     if (output) *output = 0;
     return resultBoundary([&]() -> OmniUsdLiveResult {
         if (!output || !callback) return OMNI_USD_LIVE_INVALID_ARGUMENT;
-        const auto settings = versioned(options);
+        const auto settings = joinOptions(options);
         auto app = boundedText(settings.app_name);
         const auto parsed = parseUri(boundedText(uri));
         if (!parsed.layerName.empty()) return OMNI_USD_LIVE_INVALID_ARGUMENT;
         auto runtime = getRuntime();
         if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
-        *output = runtime->sessions->join(parsed, std::move(app), user, callback);
+        *output = runtime->sessions->join(parsed, std::move(app), user, callback, settings.flags);
         return OMNI_USD_LIVE_OK;
     });
 }
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveLeaveSession(OmniUsdLiveSession session, uint32_t timeoutMs) {
     return resultBoundary([&]() -> OmniUsdLiveResult {
         auto runtime = getRuntime();
-        return runtime ? runtime->sessions->leave(session, timeoutMs) :
-                         OmniUsdLiveResult(OMNI_USD_LIVE_NOT_INITIALIZED);
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        return observedCleanup(*runtime->diagnostics, CleanupCall::LeaveSession, session, timeoutMs,
+            [&] { return runtime->sessions->leave(session, timeoutMs); });
     });
 }
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveGetSessionStatus(OmniUsdLiveSession session,
@@ -76,6 +82,35 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveSendMessage(OmniUsdLiveSession s
         auto request = runtime->sessions->send(session, bytes, size, user, callback);
         *output = request->handle;
         return OMNI_USD_LIVE_OK;
+    });
+}
+OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveRequestMergeOwner(OmniUsdLiveSession session, uint32_t action,
+    void* user, OmniUsdLiveMergeOwnerCallback callback, OmniUsdLiveRequest* output) {
+    if (output) *output = 0;
+    return resultBoundary([&]() -> OmniUsdLiveResult {
+        if (!output || !callback) return OMNI_USD_LIVE_INVALID_ARGUMENT;
+        auto runtime = getRuntime();
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        auto request = runtime->sessions->requestMergeOwner(session, action, user, callback);
+        *output = request->handle;
+        return OMNI_USD_LIVE_OK;
+    });
+}
+OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveGetMergeOwner(OmniUsdLiveSession session,
+    OmniUsdLiveMergeOwner* output) {
+    return resultBoundary([&]() -> OmniUsdLiveResult {
+        uint32_t size = 0;
+        if (output) std::memcpy(&size, output, sizeof(size));
+        if (!output || size < sizeof(*output)) return OMNI_USD_LIVE_INVALID_ARGUMENT;
+        if ((output->abi_version >> 16) != (OMNI_USD_LIVE_ABI_VERSION >> 16)) return OMNI_USD_LIVE_UNSUPPORTED;
+        auto runtime = getRuntime();
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        OmniUsdLiveMergeOwner value{};
+        value.struct_size = size;
+        value.abi_version = OMNI_USD_LIVE_ABI_VERSION;
+        const auto result = runtime->sessions->mergeOwner(session, &value);
+        if (result == OMNI_USD_LIVE_OK) std::memcpy(output, &value, sizeof(value));
+        return result;
     });
 }
 }

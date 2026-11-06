@@ -107,7 +107,30 @@ enum {
     OMNI_USD_LIVE_EVENT_CONNECTION = 1,
     OMNI_USD_LIVE_EVENT_JOINED = 2,
     OMNI_USD_LIVE_EVENT_LEFT = 3,
-    OMNI_USD_LIVE_EVENT_MESSAGE = 4
+    OMNI_USD_LIVE_EVENT_MESSAGE = 4,
+    /* The service's merge-owner state; only on a join that set
+     * OMNI_USD_LIVE_JOIN_MERGE_OWNER and whose connection negotiated it. */
+    OMNI_USD_LIVE_EVENT_MERGE_OWNER = 5
+};
+/* OmniUsdLiveJoinOptions.flags. MERGE_OWNER asks the service for the advisory
+ * merge-owner lease on this join (design section 15). */
+enum { OMNI_USD_LIVE_JOIN_MERGE_OWNER = 1 };
+/* omniUsdLiveRequestMergeOwner actions. */
+enum {
+    OMNI_USD_LIVE_MERGE_OWNER_CLAIM = 1,
+    OMNI_USD_LIVE_MERGE_OWNER_RELEASE = 2,
+    OMNI_USD_LIVE_MERGE_OWNER_VERIFY = 3
+};
+/* The service's merge-owner outcomes, as MergeOwnerOutcome numbers them; zero
+ * on an event that carries none. Other values pass through unchanged. */
+enum {
+    OMNI_USD_LIVE_MERGE_OWNER_GRANTED = 1,
+    OMNI_USD_LIVE_MERGE_OWNER_HELD_BY_OTHER = 2,
+    OMNI_USD_LIVE_MERGE_OWNER_RELEASED = 3,
+    OMNI_USD_LIVE_MERGE_OWNER_NOT_HELD = 4,
+    OMNI_USD_LIVE_MERGE_OWNER_NOT_ELIGIBLE = 5,
+    OMNI_USD_LIVE_MERGE_OWNER_UNAUTHENTICATED = 6,
+    OMNI_USD_LIVE_MERGE_OWNER_UNAVAILABLE = 7
 };
 enum {
     OMNI_USD_LIVE_SEVERITY_TRACE = 0,
@@ -168,7 +191,17 @@ enum {
      * apply_lag_warning_threshold positions; sequences, never scene names. */
     OMNI_USD_LIVE_RECORD_APPLY_LAG_ENTERED = 34,
     /* A lagging layer's applied sequence came within half the threshold. */
-    OMNI_USD_LIVE_RECORD_APPLY_LAG_EXITED = 35
+    OMNI_USD_LIVE_RECORD_APPLY_LAG_EXITED = 35,
+    /* A peer commit's Create replaced a section this client created; a
+     * section ID and sequence, never scene names. */
+    OMNI_USD_LIVE_RECORD_SECTION_REPLACED = 36,
+    /* An endpoint's call budget is exhausted: a layer read or session join was
+     * refused, or a call waits on the client for a free call; counts, never
+     * scene names. */
+    OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED = 37,
+    /* Cancel, LeaveSession or UnregisterCallback returned TIMEOUT after a
+     * nonzero wait; the caller keeps ownership. Handles, never scene names. */
+    OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT = 38
 };
 
 typedef struct OmniUsdLiveCapabilities {
@@ -244,6 +277,19 @@ typedef struct OmniUsdLiveRuntimeOptions {
     uint32_t reconnect_initial_ms;
     uint32_t reconnect_maximum_ms;
     uint32_t reconnect_max_attempts;
+    /* gRPC calls each endpoint keeps open at once on its one connection; zero
+     * selects 1024, a client-side budget (the live edit service enforces no
+     * per-connection limit), and a nonzero value must be at least 3. Open layers and
+     * joined sessions hold at most limit - max(2, limit / 8) of them, one each
+     * until the layer closes or fails or the session leaves, across
+     * reconnects, and a layer's creation runs on its layer's one; a layer
+     * open or join past that share fails RESOURCE_EXHAUSTED before any RPC.
+     * The rest serve layer writes and finite requests, which queue on the
+     * client for a free one, and Pings, of which only the one that learns an
+     * endpoint's capabilities queues and the others are refused. Appended
+     * in 1.0: inputs accept struct_size equal to the offset of this field
+     * and then use the default. */
+    uint64_t max_calls_per_endpoint;
 } OmniUsdLiveRuntimeOptions;
 
 typedef struct OmniUsdLiveEndpointOptions {
@@ -283,6 +329,10 @@ typedef struct OmniUsdLiveJoinOptions {
     uint32_t struct_size;
     uint32_t abi_version;
     const char* app_name; /* Required; no user-name override on the wire. */
+    /* OMNI_USD_LIVE_JOIN_* bits; other bits are INVALID_ARGUMENT. Appended in
+     * 1.0: inputs accept struct_size equal to the offset of this field and then
+     * use zero. */
+    uint32_t flags;
 } OmniUsdLiveJoinOptions;
 
 typedef struct OmniUsdLiveCreatedSession {
@@ -319,7 +369,32 @@ typedef struct OmniUsdLiveSessionEvent {
     const char* app_name;
     const void* bytes;
     uint64_t size;
+    /* The join's advisory merge-owner view as of this event, on every kind:
+     * merge_owner_supported is 1 when the join set OMNI_USD_LIVE_JOIN_MERGE_OWNER
+     * and its latest Connection negotiated the lease, and stays so while it
+     * reconnects; merge_owner_held is 1 only while the join is READY and the
+     * service last named its current connection as the holder; merge_owner_epoch
+     * is the latest epoch the service reported. merge_owner_outcome is the
+     * outcome of a MERGE_OWNER event, zero on other kinds. A MERGE_OWNER event's
+     * connection_id and user_name name the holder, NULL when nobody holds the
+     * lease. Appended in 1.0: struct_size reports the record delivered. */
+    uint32_t merge_owner_supported;
+    uint32_t merge_owner_held;
+    uint32_t merge_owner_outcome;
+    uint64_t merge_owner_epoch;
 } OmniUsdLiveSessionEvent;
+
+/* omniUsdLiveGetMergeOwner output; the same view as a session event's
+ * merge_owner_* fields. owned is 1 when the service last named any live
+ * holder; it is 0 while the join is not READY. */
+typedef struct OmniUsdLiveMergeOwner {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t supported;
+    uint32_t held;
+    uint32_t owned;
+    uint64_t epoch;
+} OmniUsdLiveMergeOwner;
 
 typedef struct OmniUsdLiveStatus {
     uint32_t struct_size;
@@ -463,6 +538,10 @@ typedef void(
     OMNI_USD_LIVE_CALL* OmniUsdLiveCreateSessionCallback)(void*, OmniUsdLiveResult, const OmniUsdLiveCreatedSession*);
 typedef void(OMNI_USD_LIVE_CALL* OmniUsdLiveStatLayerCallback)(void*, OmniUsdLiveResult, const OmniUsdLiveLayerInfo*);
 typedef void(OMNI_USD_LIVE_CALL* OmniUsdLiveSessionCallback)(void*, const OmniUsdLiveSessionEvent*);
+/* The event is a MERGE_OWNER record with the answer's outcome on OK, and NULL
+ * otherwise. */
+typedef void(
+    OMNI_USD_LIVE_CALL* OmniUsdLiveMergeOwnerCallback)(void*, OmniUsdLiveResult, const OmniUsdLiveSessionEvent*);
 typedef void(OMNI_USD_LIVE_CALL* OmniUsdLiveStatusCallback)(void*, const OmniUsdLiveStatusEvent*);
 typedef void(OMNI_USD_LIVE_CALL* OmniUsdLiveDiagnosticCallback)(void*, const OmniUsdLiveDiagnosticRecord*);
 
@@ -526,6 +605,24 @@ OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveLeaveSession(
 OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveSendMessage(
     OmniUsdLiveSession session, const void* bytes, uint64_t size, void* user_data,
     OmniUsdLiveResultCallback callback, OmniUsdLiveRequest* request);
+/* Advisory merge-owner lease (design section 15). A request needs a join that
+ * set OMNI_USD_LIVE_JOIN_MERGE_OWNER: one that did not, or whose latest
+ * Connection did not negotiate the lease, fails UNSUPPORTED at once, and the
+ * host keeps its static owner rule; a join that is not READY fails UNAVAILABLE
+ * at once. The request is a control frame on the join's current connection:
+ * its callback reports OK with the service's outcome, or UNAVAILABLE when that
+ * connection ends first, or CANCELLED on Leave; it is never re-sent. The
+ * answer also arrives as a MERGE_OWNER session event. A CLAIM this call
+ * admits keeps the join's intent to own, whatever the service answers: each
+ * later connection that negotiates the lease, and each owner change that
+ * leaves the lease free, claims again until a RELEASE this call admits. VERIFY
+ * answers GRANTED only while this connection holds the lease; send it right
+ * before a merge. The lease binds only joins that opt in. */
+OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveRequestMergeOwner(
+    OmniUsdLiveSession session, uint32_t action, void* user_data, OmniUsdLiveMergeOwnerCallback callback,
+    OmniUsdLiveRequest* request);
+OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveGetMergeOwner(
+    OmniUsdLiveSession session, OmniUsdLiveMergeOwner* owner);
 OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveStatLayer(
     const char* layer_uri, void* user_data, OmniUsdLiveStatLayerCallback callback, OmniUsdLiveRequest* request);
 OMNI_USD_LIVE_API OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveDeleteLayer(

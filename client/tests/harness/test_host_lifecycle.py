@@ -5,6 +5,7 @@
 These tests exercise the real Python task wrapper with a fake native task. They
 do not qualify USD publication, native ownership, or interpreter shutdown.
 """
+import asyncio
 from enum import IntEnum
 import importlib.util
 from pathlib import Path
@@ -255,6 +256,75 @@ class HostLifecycleTests(unittest.TestCase):
         self.assertEqual(context._failure, Result.OK)
         self.assertFalse(context._disarmed)
 
+
+    def test_close_does_not_wait_on_a_dispatch_loop_that_is_not_running(self):
+        # Kit's shutdown hook closes on the main thread, so the loop that its
+        # dispatcher submits to cannot run until close returns. A job still
+        # queued there keeps the native context in use, and close answers BUSY
+        # without waiting for its timeout; once the loop has run the job, close
+        # stops the consumer without waiting either.
+        self.api._WAIT_FOREVER_MS = 0xffffffff
+        self.api._local = threading.local()
+        self.api._timeout = lambda value: value
+        self.api._remaining = lambda deadline: max(0, int((deadline - time.monotonic()) * 1000))
+        self.api._log_failure = lambda message: None
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+
+        class Native:
+            """Hands out one task. Like the native context, close answers BUSY
+            while a task it handed out has not run."""
+            def __init__(self):
+                self.outstanding, self.handed, self.woken = 0, False, threading.Event()
+
+            def next_task(self, timeout):
+                if not self.handed:
+                    self.handed = True
+                    self.outstanding += 1
+                    return Result.OK, SimpleNamespace(run=self.run)
+                # interrupt_wait ends the wait; the 10 s bound is a failure watchdog only.
+                return (Result.CANCELLED if self.woken.wait(10) else Result.TIMEOUT), None
+
+            def run(self):
+                self.outstanding -= 1
+                return Result.OK
+
+            def interrupt_wait(self):
+                self.woken.set()
+
+            def close(self):
+                return Result.BUSY if self.outstanding else Result.OK
+
+        submitted = []
+
+        def dispatch(task):
+            # As the Kit extension does: queue onto the loop, never wait for it.
+            async def apply():
+                task()
+            submitted.append(asyncio.run_coroutine_threadsafe(apply(), loop))
+
+        runtime = SimpleNamespace(_condition=threading.Condition(), _hosts=set(), _disarmed=False)
+        errors = []
+        context = self.host.PublicationContext(runtime, dispatch, errors.append)
+        context._native = Native()
+        runtime._hosts.add(context)
+        context._thread.start()
+        context._admitted.set()
+        deadline = time.monotonic() + 10
+        while not submitted and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(submitted), 1)
+        start = time.monotonic()
+        self.assertEqual(context.close(5000), Result.BUSY)
+        self.assertLess(time.monotonic() - start, 1)
+        loop.run_until_complete(asyncio.wrap_future(submitted[0], loop=loop))  # The loop runs again.
+        start = time.monotonic()
+        self.assertEqual(context.close(5000), Result.OK)
+        self.assertLess(time.monotonic() - start, 1)
+        context._thread.join(10)
+        self.assertFalse(context._thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(context._failure, Result.OK)
 
 if __name__ == "__main__":
     unittest.main()

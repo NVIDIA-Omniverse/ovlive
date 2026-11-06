@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import struct
+import sys
 import tempfile
 import unittest
 
@@ -14,6 +16,51 @@ RECORD = b"x" * 13000 + b" end\n"
 
 
 class ExitFlushTests(unittest.TestCase):
+    def test_assertions_and_termination_reach_stderr_and_still_fail(self):
+        compiler = shutil.which("cl" if os.name == "nt" else "c++")
+        self.assertIsNotNone(compiler, "required native toolchain unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            source = directory / "failure_report.cpp"
+            source.write_text('#include <cassert>\n#include <new>\n#include <cstring>\n'
+                              'int main(int, char** argv) { if (std::strcmp(argv[1], "assert") == 0) '
+                              '{ assert(false && "crt-assert-probe"); } else { throw std::bad_alloc(); } }\n')
+            executable = directory / "failure_report.exe"
+            support = str(ROOT / "tests/native/support/StackDump.cpp")
+            if os.name == "nt":
+                command = [compiler, "/nologo", "/MDd", "/EHsc", "/std:c++17", "/UNDEBUG",
+                           source.name, support, "dbghelp.lib", f"/Fe{executable}", f"/Fo{directory}\\"]
+                # _wassert writes UTF-16LE to the binary stderr stream; the terminate handler writes narrow text.
+                markers = (("assert", "crt-assert-probe".encode("utf-16-le")), ("throw", b"native test terminated"))
+            else:
+                command = [compiler, "-std=c++17", "-pthread", "-UNDEBUG", source.name, support, "-o", str(executable)]
+                markers = (("assert", b"crt-assert-probe"), ("throw", b"std::bad_alloc"))
+            built = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=120)
+            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+            for mode, marker in markers:
+                done = subprocess.run([str(executable), mode], stdin=subprocess.DEVNULL,
+                                      capture_output=True, timeout=15)
+                self.assertNotEqual(done.returncode, 0, mode)
+                self.assertIn(marker, done.stderr, (mode, done.stderr))
+                if os.name == "nt" and mode == "throw":
+                    self.assertIn(b"native test failure stack:", done.stderr)
+            if os.name == 'nt':
+                child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read(1)'], stdin=subprocess.PIPE)
+                try:
+                    dump = directory / 'waiting-child.dmp'
+                    collector = subprocess.run([sys.executable, '-B', str(ROOT / 'tools/live/windows_dump.py'),
+                                                str(child.pid), str(dump)], capture_output=True, timeout=20)
+                    self.assertEqual(collector.returncode, 0, collector.stdout + collector.stderr)
+                    content = dump.read_bytes()
+                    self.assertEqual(content[:4], b'MDMP')
+                    streams, offset = struct.unpack_from('<II', content, 8)
+                    directory_entries = [struct.unpack_from('<III', content, offset + 12 * i) for i in range(streams)]
+                    threads = next(entry for entry in directory_entries if entry[0] == 3)
+                    self.assertGreater(struct.unpack_from('<I', content, threads[2])[0], 0)
+                finally:
+                    child.kill()
+                    child.communicate(timeout=15)
+
     def build(self, directory):
         sources = [str(PROBE / "exit_flush.cpp"), str(ROOT / "tests/native/support/StackDump.cpp")]
         include = str(ROOT / "source/live/samples/diagnostics")
@@ -24,7 +71,7 @@ class ExitFlushTests(unittest.TestCase):
             commands = [[compiler, "/nologo", "/MD", "/W4", "/WX", str(PROBE / "exit_lock.cpp"), "/LD",
                          f"/Fe{directory / 'live_exit_lock.dll'}", f"/Fo{directory}\\"],
                         [compiler, "/nologo", "/MD", "/EHsc", "/std:c++17", "/W3", "/I", include, *sources,
-                         str(directory / "live_exit_lock.lib"), f"/Fe{directory / 'exit_flush.exe'}",
+                         str(directory / "live_exit_lock.lib"), "dbghelp.lib", f"/Fe{directory / 'exit_flush.exe'}",
                          f"/Fo{directory}\\"]]
             executable = directory / "exit_flush.exe"
         else:

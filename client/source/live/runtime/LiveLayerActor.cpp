@@ -20,6 +20,8 @@ std::atomic<void (*)(void*) noexcept> beforeCloseQuiescent{nullptr};
 std::atomic<void*> beforeCloseQuiescentContext{nullptr};
 std::atomic<bool (*)(void*, size_t) noexcept> beforeSettleWrites{nullptr};
 std::atomic<void*> beforeSettleWritesContext{nullptr};
+std::atomic<void (*)(void*, Request&, bool) noexcept> betweenReadObservations{nullptr};
+std::atomic<void*> betweenReadObservationsContext{nullptr};
 uint64_t applicationElapsedMs(std::chrono::steady_clock::time_point start,
     std::chrono::steady_clock::time_point end) noexcept {
     if (end <= start) return 0;
@@ -179,16 +181,20 @@ LayerActor::LayerActor(std::shared_ptr<Runtime> runtime, EndpointLease endpoint,
     pendingDrains_.reserve(kMaxBatch);
     writes_.reserve(kMaxWindow);
     if (!timingTimeoutMs_) throw std::invalid_argument("zero timing probe test timeout");
-    makeLayerUri(makeSessionUri(endpoint_->options.authority.canonical, progress_.identity.session),
+    uri_ = makeLayerUri(makeSessionUri(endpoint_->options.authority.canonical, progress_.identity.session),
         progress_.identity.layer);
     std::lock_guard<std::mutex> lock(endpoint_->mutex);
-    if (bufferedEdits_) {
+    if (bufferedEdits_ || options.releaseWatcher) {
         auto& watchers = endpoint_->pendingByteWatchers;
         watchers.erase(
             std::remove_if(watchers.begin(), watchers.end(), [](const auto& watcher) { return watcher.expired(); }),
             watchers.end());
-        watchers.push_back(bufferedEdits_);
-        watchingPendingBytes_ = true;
+        watchers.reserve(watchers.size() + 2);
+        if (options.releaseWatcher) watchers.push_back(options.releaseWatcher);
+        if (bufferedEdits_) {
+            watchers.push_back(bufferedEdits_);
+            watchingPendingBytes_ = true;
+        }
     }
     authFailure_ = attachmentAuthFailure_ = endpoint_->authFailureSerial;
     waitingAuth_ = !runtime_->auth->usable(*endpoint_, wallTimeMs());
@@ -273,6 +279,13 @@ void LayerActor::setBeforeSettleWritesForTest(bool (*hook)(void*, size_t) noexce
     if (!hook) beforeSettleWrites.store(nullptr, std::memory_order_release);
     beforeSettleWritesContext.store(context, std::memory_order_release);
     if (hook) beforeSettleWrites.store(hook, std::memory_order_release);
+}
+
+void LayerActor::setBetweenReadObservationsForTest(void (*hook)(void*, Request&, bool) noexcept,
+    void* context) noexcept {
+    if (!hook) betweenReadObservations.store(nullptr, std::memory_order_release);
+    betweenReadObservationsContext.store(context, std::memory_order_release);
+    if (hook) betweenReadObservations.store(hook, std::memory_order_release);
 }
 
 void LayerActor::expireOpenForTest() noexcept {
@@ -512,7 +525,10 @@ void LayerActor::dispatch() noexcept {
         if (activityAdmission_ != OMNI_USD_LIVE_OK && !closing_ && !terminalGate(progress_.snapshot().gate)) {
             failReadStream(activityAdmission_);
             next = Clock::now();
-        } else next = step();
+        } else {
+            callAcquired_ = false;
+            next = step();
+        }
     } catch (OmniUsdLiveResult result) {
         terminal(result);
         next = Clock::now();
@@ -525,6 +541,13 @@ void LayerActor::dispatch() noexcept {
     } catch (...) {
         terminal(OMNI_USD_LIVE_INTERNAL_ERROR);
         next = Clock::now();
+    }
+    if (callWaiter_) {
+        // A call unit the budget handed over serves another call unless this
+        // pass asked for one: a pass that cannot issue never keeps it. A
+        // closing or failed layer issues nothing more and leaves the queue.
+        if (closing_ || terminalGate(progress_.snapshot().gate)) callWaiter_.reset();
+        else if (!callAcquired_) endpoint_->calls->returnGranted(*callWaiter_);
     }
     // External close/failure never touches the worker-owned jitter tracker.
     // Flush before publishing stopped/frozen state, including exception exits.
@@ -572,6 +595,10 @@ void LayerActor::dispatch() noexcept {
             pendingApplied_.empty() && pendingDrains_.empty() && !readEndDrain_ && !receivedDrainCount_ &&
             !resendPending_)
             terminalFrozen_ = true;
+        // A stopped or frozen actor has no call open and opens none again, so
+        // its stream unit returns here, before close() reports quiescence,
+        // even while the host keeps the layer for export.
+        if ((stopped_ || terminalFrozen_) && admission_) admission_->returnStream();
         if (stopped_ || terminalFrozen_) closed_.notify_all();
         // Publish while holding the ingress mutex so an event racing dispatch
         // cannot have its immediate wake overwritten by this future deadline.
@@ -1108,6 +1135,7 @@ void LayerActor::pollPing(Clock::time_point now, Clock::time_point& next) {
         next = std::min(next, nextPing_);
         return;
     }
+    bool capabilitiesKnown;
     {
         std::lock_guard<std::mutex> lock(endpoint_->mutex);
         // Timing is optional: it must not create an extra auth challenge, and
@@ -1128,6 +1156,16 @@ void LayerActor::pollPing(Clock::time_point now, Clock::time_point& next) {
             next = std::min(next, nextPing_);
             return;
         }
+        capabilitiesKnown = known;
+    }
+    // The Ping that learns the endpoint's capabilities, which chained writes
+    // and re-sends depend on, waits for a call unit in FIFO order like a
+    // write; the hand-over wakes the actor. A later timing Ping never waits.
+    CallSlot slot;
+    if (!capabilitiesKnown) {
+        slot = acquireCall(std::weak_ptr<LayerActor>(std::static_pointer_cast<LayerActor>(shared_from_this())),
+            OMNI_USD_LIVE_OPERATION_PING);
+        if (!slot) return;
     }
     std::shared_ptr<PingOutcome> outcome;
     try {
@@ -1157,7 +1195,7 @@ void LayerActor::pollPing(Clock::time_point now, Clock::time_point& next) {
             outcome->completed.store(true, std::memory_order_release);
             if (auto actor = weak.lock()) actor->wake();
         }},
-            timingTimeoutMs_, receipt);
+            timingTimeoutMs_, receipt, std::move(slot));
     } catch (...) {
         // Optional clock sampling must not reject an accepted scene edit when
         // the request registry is full or allocation/transport setup fails;
@@ -1289,6 +1327,10 @@ void LayerActor::reportFlushUnsupported(uint32_t reason) noexcept {
     } catch (...) { /* Diagnostics never change the layer's failure. */
     }
 }
+void LayerActor::reportSectionReplaced(uint64_t section, uint64_t sequence) noexcept {
+    runtime_->diagnostics->emit(OMNI_USD_LIVE_RECORD_SECTION_REPLACED, endpoint_->handle, subject_, 0,
+        {{DiagnosticKey::Section, section}, {DiagnosticKey::AppliedSequence, sequence}});
+}
 void LayerActor::reportDiscardedHostEdits() noexcept {
     // A closing actor admits nothing, so the shared buffer's records are never
     // issued; the CLOSED status keeps their count.
@@ -1405,9 +1447,18 @@ void LayerActor::settleAppliedEffects() {
 
 void LayerActor::settleApplied() {
     // In application order. Each ID leaves once its bookkeeping holds, so a
-    // throw from progress keeps only the unsettled ones.
+    // resource failure from progress keeps only the unsettled ones. A typed
+    // result has stopped the layer with its work retained: none of them
+    // settles, and the actor can freeze.
     while (!pendingApplied_.empty()) {
-        if (const auto result = adoptAbsorbed(progress_.applied(pendingApplied_.front())); result != OMNI_USD_LIVE_OK) {
+        std::vector<std::shared_ptr<const void>> owners;
+        try {
+            owners = progress_.applied(pendingApplied_.front());
+        } catch (OmniUsdLiveResult) {
+            pendingApplied_.clear();
+            throw;
+        }
+        if (const auto result = adoptAbsorbed(std::move(owners)); result != OMNI_USD_LIVE_OK) {
             pendingApplied_.clear();
             throw result;
         }
@@ -1997,6 +2048,20 @@ void LayerActor::abandonResend(Clock::time_point now) {
     settleAttempt(writeId_, authFailure_, OMNI_USD_LIVE_OUTCOME_UNKNOWN, error, 0, now);
 }
 
+// A read completes only after it has queued every frame it delivered, so its
+// completion is observed before the queue: an empty queue then holds none of
+// the ended read's frames, which the actor consumes before the read settles.
+bool LayerActor::observeRead(Request* read, bool& queuedFrames) {
+    const bool ended = read && read->wait(0) == OMNI_USD_LIVE_OK;
+    if (read) {
+        if (const auto hook = betweenReadObservations.load(std::memory_order_acquire))
+            hook(betweenReadObservationsContext.load(std::memory_order_acquire), *read, ended);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    queuedFrames = !events_.empty();
+    return ended;
+}
+
 // Settles an ended read: releases it, then reconnects, waits for credentials
 // or fails the layer by the read's result.
 void LayerActor::settleRead(std::shared_ptr<Request>& read, Clock::time_point now) {
@@ -2134,6 +2199,7 @@ bool LayerActor::startRead(const std::weak_ptr<LayerActor>& weak, Clock::time_po
     options.streamGeneration = cursor.generation;
     options.drain = drain_;
     options.flow = readFlow_;
+    options.stream = admission_->stream(); // Kept across every reconnect of the layer.
     readAuthFailure_ = authFailure_;
     readCompletionPending_ = false;
     try {
@@ -2235,13 +2301,23 @@ bool LayerActor::issueWrites(const std::weak_ptr<LayerActor>& weak, Clock::time_
             progress_.deferWrite(work.id);
             return true;
         }
+        // Each write attempt holds a unit of the endpoint's call budget. A
+        // layer waits for one in FIFO order behind the endpoint's other calls,
+        // so under contention its window shrinks to the units it holds; the
+        // write stays queued and unissued, so it never times out meanwhile.
+        auto slot = acquireCall(weak, OMNI_USD_LIVE_OPERATION_UPDATE);
+        if (!slot) {
+            progress_.deferWrite(work.id);
+            return true;
+        }
         if (work.id == probeId_) {
             probeId_ = 0;
             probeOrdinal_ = work.localOrdinal;
         }
         InFlight write;
         try {
-            write = submitWrite(weak, effect, work.id, work.localOrdinal, chained, debt || (chained && noWait_));
+            write = submitWrite(weak, effect, work.id, work.localOrdinal, chained, std::move(slot),
+                debt || (chained && noWait_));
         } catch (OmniUsdLiveResult result) {
             progress_.deferWrite(work.id);
             if (result != OMNI_USD_LIVE_UNAUTHENTICATED) throw;
@@ -2269,8 +2345,17 @@ bool LayerActor::issueWrites(const std::weak_ptr<LayerActor>& weak, Clock::time_
 // Submits one attempt of a local write with its bytes, operation ID and, when
 // chained, its predecessor and no_wait; the attempt's completion wakes the
 // actor.
+CallSlot LayerActor::acquireCall(const std::weak_ptr<LayerActor>& weak, uint32_t operation) {
+    callAcquired_ = true;
+    if (!callWaiter_)
+        callWaiter_ = endpoint_->calls->waiter([weak] {
+            if (auto actor = weak.lock()) actor->wake();
+        });
+    return endpoint_->calls->acquire(*callWaiter_, operation);
+}
+
 LayerActor::InFlight LayerActor::submitWrite(const std::weak_ptr<LayerActor>& weak,
-    std::shared_ptr<const Effect> effect, uint64_t id, uint64_t ordinal, bool chained, bool noWait) {
+    std::shared_ptr<const Effect> effect, uint64_t id, uint64_t ordinal, bool chained, CallSlot slot, bool noWait) {
     const auto object = progress_.objectId();
     if (!objectWritten_) {
         // A later layer of this endpoint on the object cannot name this
@@ -2288,7 +2373,7 @@ LayerActor::InFlight LayerActor::submitWrite(const std::weak_ptr<LayerActor>& we
         outcome->completed.store(true, std::memory_order_release);
         if (auto actor = weak.lock()) actor->wake();
     }, 0, nullptr, outcome->receipt, {subject_, readGeneration_, id}, effect->reservation, effect->operationId,
-        chained ? &effect->previousOperationId : nullptr, noWait);
+        chained ? &effect->previousOperationId : nullptr, noWait, std::move(slot));
     write.id = id;
     write.ordinal = ordinal;
     write.authFailure = authFailure_;
@@ -2365,9 +2450,16 @@ LayerActor::Resend LayerActor::resendWrite(Clock::time_point now, const OmniUsdL
 // Any other submission failure leaves the outcome unknown.
 LayerActor::Resend LayerActor::issueResend(Clock::time_point now) {
     const auto weak = std::weak_ptr<LayerActor>(std::static_pointer_cast<LayerActor>(shared_from_this()));
+    // The re-send waits for a call unit as a write does, with no request in
+    // flight; step() issues it once the endpoint's budget hands one over.
+    auto slot = acquireCall(weak, OMNI_USD_LIVE_OPERATION_UPDATE);
+    if (!slot) {
+        resendPending_ = true;
+        return Resend::AwaitingCall;
+    }
     InFlight write;
     try {
-        write = submitWrite(weak, writeEffect_, writeId_, writeOrdinal_, false);
+        write = submitWrite(weak, writeEffect_, writeId_, writeOrdinal_, false, std::move(slot));
     } catch (OmniUsdLiveResult result) {
         if (result == OMNI_USD_LIVE_UNAUTHENTICATED) {
             if (!resendPending_) {
@@ -2496,12 +2588,9 @@ LayerActor::Clock::time_point LayerActor::step() {
     resolveBreak(now);
     if (read) resubscribeAfterSettle();
     bool queuedFrames;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queuedFrames = !events_.empty();
-    }
+    const bool readEnded = observeRead(read.get(), queuedFrames);
     if (queuedFrames) next = now;
-    if (read && !queuedFrames && read->wait(0) == OMNI_USD_LIVE_OK) settleRead(read, now);
+    if (readEnded && !queuedFrames) settleRead(read, now);
     if (!closing_) checkReadDeadline(bool(read), queuedFrames, now, next);
     // A read this actor cancelled has no completion callback; poll it until it ends.
     if (read && (readCompletionPending_.load(std::memory_order_acquire) || settleReconnect_ || readTimedOut_))
@@ -2551,12 +2640,13 @@ LayerActor::Clock::time_point LayerActor::step() {
             abandonResend(now);
             return now;
         }
-        if (issueResend(now) == Resend::NotOffered) {
+        const auto resend = issueResend(now);
+        if (resend == Resend::NotOffered) {
             auto error = resendEvidence_;
             error.result = OMNI_USD_LIVE_OUTCOME_UNKNOWN;
             settleAttempt(writeId_, authFailure_, OMNI_USD_LIVE_OUTCOME_UNKNOWN, error, 0, now);
         }
-        return now;
+        return resend == Resend::AwaitingCall ? next : now;
     }
     const auto weak = std::weak_ptr<LayerActor>(std::static_pointer_cast<LayerActor>(shared_from_this()));
     if (!read && !writing && !state.uncertain && now >= retryAt_) { // Settle first (design section 12).

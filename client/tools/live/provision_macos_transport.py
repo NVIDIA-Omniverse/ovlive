@@ -12,15 +12,15 @@ from pathlib import Path
 import subprocess
 import time
 
-# Immutable upstream Git objects matching deps/live-services-target.packman.xml.
+# Immutable upstream Git objects (release tags) of the versions deps/live-services-target.packman.xml pins.
 PINS = {
-    'abseil': ('https://github.com/abseil/abseil-cpp.git', '2f9e432cce407ce0ae50676696666f33a77d42ac'),
+    'abseil': ('https://github.com/abseil/abseil-cpp.git', '9ac7062b1860d895fb5a8cbf58c3e9ef8f674b5f'),
     'zlib': ('https://github.com/madler/zlib.git', '216c70c020aa53f0c40920d155f808b6b59c9acb'),
     'openssl': ('https://github.com/openssl/openssl.git', '45e844fa2a14ec92d146bd8f5778ac130b6625fb'),
-    'c-ares': ('https://github.com/c-ares/c-ares.git', '63a4c4c71b86e448bcc1c55287c35aa4aa0f4246'),
-    're2': ('https://github.com/google/re2.git', '241e2e430836e80f93d704d1f06cd3e7fe3100f5'),
-    'protobuf': ('https://github.com/protocolbuffers/protobuf.git', 'c50d883be6f800682a6d2a54ce88b763aabf44a5'),
-    'grpc': ('https://github.com/grpc/grpc.git', 'c3407b728428b84f4c0b8c1b653094903fe2f462'),
+    'c-ares': ('https://github.com/c-ares/c-ares.git', '0b88066f79ac9745d6819899f1794df91b73c873'),
+    're2': ('https://github.com/google/re2.git', '4fe134adfc3d42cb728f2fbe1be0d89396361975'),
+    'protobuf': ('https://github.com/protocolbuffers/protobuf.git', '2c32dede124c41fc815db054a8efe45c624ee1cb'),
+    'grpc': ('https://github.com/grpc/grpc.git', 'aae267021b1ac256f8b9038d0ef528c3798cc137'),
 }
 
 
@@ -130,21 +130,6 @@ def provision(root, cmake, jobs, arch, *, reuse_only=False):
             build.rename(retired / f'{name}-build-{time.time_ns()}')
         build.mkdir(parents=True, exist_ok=True)
         path_map = f'-ffile-prefix-map={root.resolve()}=transport'
-        extra = []
-        if name == 'abseil':
-            # CMake deduplicates repeated -Xarch flags unless each pair is grouped.
-            fix = build / 'macos_arch_flags.cmake'
-            fix.write_text('''function(live_abseil_arch_flags)
-  foreach(target random_internal_randen_hwaes random_internal_randen_hwaes_impl)
-  get_target_property(opts ${target} COMPILE_OPTIONS)
-  list(JOIN opts ";" joined)
-  string(REGEX REPLACE "-Xarch_([^;]+);([^;]+)" [=[SHELL:-Xarch_\\1 \\2]=] grouped "${joined}")
-  set_property(TARGET ${target} PROPERTY COMPILE_OPTIONS "${grouped}")
-  endforeach()
-endfunction()
-cmake_language(DEFER CALL live_abseil_arch_flags)
-''')
-            extra = [f'-DCMAKE_PROJECT_absl_INCLUDE={fix}']
         if name == 'openssl':
             target = 'darwin64-arm64-cc'
             # Runtime defaults use a logical system prefix; DESTDIR stages the SDK privately.
@@ -164,7 +149,7 @@ cmake_language(DEFER CALL live_abseil_arch_flags)
                  f'-DCMAKE_C_FLAGS={path_map}', f'-DCMAKE_CXX_FLAGS={path_map}',
                  f'-DCMAKE_OSX_ARCHITECTURES={arch}', '-DCMAKE_OSX_DEPLOYMENT_TARGET=13.0',
                  f'-DCMAKE_INSTALL_PREFIX={install}', f'-DCMAKE_PREFIX_PATH={prefixes}',
-                 *cmake_options(name, root), *extra])
+                 *cmake_options(name, root)])
             run([cmake, '--build', build, '--parallel', str(jobs)])
             run([cmake, '--install', build])
         completed = dict(identity=identity, artifacts=installed_artifacts(install, name))

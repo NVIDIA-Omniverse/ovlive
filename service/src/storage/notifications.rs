@@ -34,6 +34,7 @@ use crate::observability::metrics::{STREAM_EXIT_ERROR, STREAM_EXIT_STREAM_GAP};
 use crate::storage::client::ValkeyClient;
 use crate::storage::keys::KeySchema;
 use crate::storage::stream_mux::core::StreamId;
+use crate::storage::stream_mux::delivery_ledger::PipelineEntry;
 use crate::storage::stream_mux::{Delivery, Registration};
 
 pub use crate::storage::stream_mux::{ConsumeError, ReservedStream};
@@ -74,10 +75,9 @@ pub const DELETED_STREAM_PAYLOAD: &str = "deleted";
 /// supplied non-empty OMPF; absent on `deleted` sentinels, on CreateLayer's
 /// `1-0` seed entry, and on pre-b.gze entries still inside the retention
 /// window. So on a current build an `update` entry without this field above
-/// sequence 1 is an empty commit: a subscriber sends it as the empty delta at
-/// its sequence with no read, in steady state and in the rollback-mode
-/// in-window replay alike (`grpc::subscribe`), as checkpoint tail capture
-/// classifies it. Pre-b.gze entries are excluded by upgrade precondition, not
+/// sequence 1 is an empty commit: a steady-state subscriber sends it as the
+/// empty delta at its sequence with no read (`grpc::subscribe`), as checkpoint
+/// tail capture classifies it. Pre-b.gze entries are excluded by upgrade precondition, not
 /// told apart here.
 pub const RELAY_OMPF_FIELD: &str = "ompf";
 
@@ -252,9 +252,9 @@ impl StreamCursor {
 /// `LIVE_EDIT_LAYER_STREAM_MAXLEN`, the stream's entry cap, so a fresh
 /// subscriber's in-window window cannot by itself trip the entry threshold.
 /// In bytes the retained window can exceed [`CONSUMER_BACKLOG_BYTES`] (the
-/// relay byte budget, `LIVE_EDIT_LAYER_STREAM_MAX_BYTES`, defaults to 128 MiB),
-/// which is why the rollback-mode in-window replay reads the window itself, in
-/// pages, rather than leaving it to the backlog.
+/// relay byte budget, `LIVE_EDIT_LAYER_STREAM_MAX_BYTES`, defaults to 128 MiB);
+/// no catch-up leaves that window to the backlog: each registers its stream
+/// at its proven read's cut, after the commits its snapshot folded in.
 pub const CONSUMER_CHANNEL_CAPACITY: usize = 4096;
 
 /// Undelivered bytes at which a draining consumer's delivery watchdog arms
@@ -276,10 +276,13 @@ pub const CONSUMER_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
 pub const CONSUMER_SEND_WATCHDOG: Duration = Duration::from_secs(5);
 
 /// Per-send bound on the **outer** gRPC hand-off in `grpc::subscribe` (the
-/// response channel's 32 delivery slots; the 33rd is reserved for the terminal
-/// trailer). It must not exceed [`CONSUMER_SEND_WATCHDOG`], or the inner
+/// response queue's 32 data slots; the terminal trailer's slot is apart from
+/// them). It must not exceed [`CONSUMER_SEND_WATCHDOG`], or the inner
 /// watchdog would always fire first and `slow_reader_deadline` would be
-/// unreachable. Tests override it via
+/// unreachable. Also how long a subscription's response queue may hold
+/// catch-up pages with nothing taken before a catch-up waiting for catch-up
+/// payload memory ends it, and how often that wait looks
+/// (`storage::stream_mux::delivery_ledger`). Tests override it via
 /// `LiveEditService::outer_send_deadline_for_test`.
 pub const OUTER_SEND_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -403,11 +406,27 @@ struct Queue {
 
 /// What one received item means to a poll.
 enum Received {
-    Entry(String, LayerNotification),
+    Entry(ReceivedEntry),
     /// A trim marker the floor covers; the poll moves on to the next item.
     Covered,
     /// The stream ended, or a trim marker recorded `stream_gap`.
     End,
+}
+
+/// One entry received from a consumer's backlog ([`LayerStreamConsumer::recv_held`]):
+/// its stream id, its notification, and its place in the subscription's
+/// live-delivery pipeline, which stays counted until this guard drops — the
+/// subscription task drops it unsent, or puts it on the delivery's last
+/// response message so it drops when the stream takes that message
+/// (`storage::stream_mux::delivery_ledger`).
+#[derive(Debug)]
+pub struct ReceivedEntry {
+    /// The stream entry id.
+    pub id: String,
+    /// The entry's notification.
+    pub notification: LayerNotification,
+    /// The entry's pipeline place, released when dropped.
+    pub pipeline: PipelineEntry,
 }
 
 /// A consumer's undelivered backlog at one instant
@@ -495,14 +514,20 @@ impl LayerStreamConsumer {
                 id,
                 notification,
                 bytes,
+                mut pipeline,
             }) => {
                 self.backlog.fetch_sub(1, Ordering::AcqRel);
                 self.backlog_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                pipeline.received();
                 // The reader offers only entries whose id parsed.
                 if let Some(entry) = StreamId::parse(&id) {
                     queue.position = entry;
                 }
-                Received::Entry(id, notification)
+                Received::Entry(ReceivedEntry {
+                    id,
+                    notification,
+                    pipeline,
+                })
             }
             Some(Delivery::Trimmed(resumes_at)) => {
                 let floor = StreamId {
@@ -528,8 +553,15 @@ impl LayerStreamConsumer {
     /// — including on a trim its floor does not cover (see the type's
     /// "Trimmed stream"). Marks the consumer draining. Cancel-safe: an item is
     /// consumed only when this returns it, except a covered trim marker, which
-    /// is dropped either way.
+    /// is dropped either way. The entry leaves the live-delivery pipeline as
+    /// it is returned; [`Self::recv_held`] keeps it there.
     pub async fn recv(&self) -> Option<(String, LayerNotification)> {
+        self.recv_held().await.map(|e| (e.id, e.notification))
+    }
+
+    /// [`Self::recv`], keeping the entry in the subscription's live-delivery
+    /// pipeline until the returned [`ReceivedEntry`] drops.
+    pub async fn recv_held(&self) -> Option<ReceivedEntry> {
         self.draining.store(true, Ordering::Release);
         let mut queue = self.rx.lock().await;
         loop {
@@ -538,7 +570,7 @@ impl LayerStreamConsumer {
             }
             let item = queue.rx.recv().await;
             match self.observe(&mut queue, item) {
-                Received::Entry(id, notification) => return Some((id, notification)),
+                Received::Entry(entry) => return Some(entry),
                 Received::Covered => continue,
                 Received::End => return None,
             }
@@ -560,7 +592,7 @@ impl LayerStreamConsumer {
                 Err(mpsc::error::TryRecvError::Disconnected) => None,
             };
             match self.observe(&mut queue, item) {
-                Received::Entry(id, notification) => return Some((id, notification)),
+                Received::Entry(entry) => return Some((entry.id, entry.notification)),
                 Received::Covered => continue,
                 Received::End => return None,
             }

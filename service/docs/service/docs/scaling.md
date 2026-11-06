@@ -60,7 +60,7 @@ The memory limit is required, and it sizes the replica: at startup the service d
 A larger limit never gives less of any of these amounts, so you can size the limit to any value at or above the minimum below.
 The startup line `pod memory budgets derived from the pod memory limit` and the gauges in {ref}`Is it saturated? <live-edit-metrics-reference-capacity>` show the limit read and the amounts in force.
 
-At the chart's other defaults the smallest limit that starts is `2709Mi` on any CPU count without a backup store, and `2809Mi` on any CPU count with one ({ref}`Enable checkpoints <live-edit-durability-enable-checkpoints>`).
+At the chart's other defaults the smallest limit that starts is `2687Mi` on any CPU count without a backup store, and `3282Mi` on any CPU count with one ({ref}`Enable checkpoints <live-edit-durability-enable-checkpoints>`).
 With backups on, each replica also sets aside memory, sized from the limit, for large values waiting to be copied to the backup store: 102 MiB at `4Gi`, 128 MiB at `5Gi` and 204 MiB at `8Gi`.
 Raising a connection pool (`valkey.poolSize`, `valkey.subscriberPoolSize`, `valkey.maintenancePoolSize` or `valkey.snapshotPoolSize`), `valkey.subscriberMaxConcurrentCatchups`, `valkey.catchupFencedReadConcurrency`, `layer.uploadAdmissionMaxWaiters`, `layer.maxSize` or `valkey.snapshotAtomicReadMaxBytes` raises that minimum, and takes memory from catching up large layers.
 A pod below the minimum for its settings exits at startup with `configuration error:` naming the smallest limit it needs, and during an upgrade the old pods keep serving.
@@ -84,6 +84,8 @@ What to expect in both modes:
 - Scale-up is immediate.
 - Scale-down waits for 10 minutes of lower demand, then removes one pod per minute; each removal reconnects that pod's clients.
 - In `scaler` mode, scale-down also waits while a rollout runs or any pod is unready.
+- In `scaler` mode, the replica count stays where it is while the service is held for disaster recovery ({ref}`Held for disaster recovery <live-edit-monitoring-held>`).
+  After the hold clears, scale-down waits a full window (10 minutes by default), so the fleet does not shrink while every client reconnects.
 - A fresh install starts at one replica until the autoscaler raises it to `minReplicas`.
 - If the scaler stops, the replica count stays where it is; alert on it ({ref}`Monitoring <live-edit-monitoring>`).
 
@@ -132,15 +134,11 @@ Until old pods finish shutting down, up to twice the replica count holds backing
   With no concurrent edits, the failures start at roughly 69,000 placed assets.
   Stores with higher network latency, such as managed services, and prims with more attributes reach it at smaller sizes.
   Split very large scenes across several layers.
-- **Deleting and replacing many layers at once.** Each replica cleans up deleted and replaced layers a few at a time, within memory that grows with `resources.limits.memory`.
-  Clean-ups of all but very small layers (a handful of prims and large values) run at most four at a time per replica at `5Gi`, and two at the smallest limit.
-  Large values lower that: layers of about 1,000 large values each are cleaned up two at a time at `5Gi`, and one at a time at the smallest limit.
-  Once its layer holds more than about 5,100 large values at `5Gi`, or any large value at the smallest limit, such a clean-up runs beside very small layers' clean-ups only.
-  Above about 7,600 large values at `5Gi`, or 2,500 at the smallest limit, it runs alone.
-  Clean-ups start in arrival order, so a delete of any layer can wait behind earlier deletes, replacements and background clean-ups, for seconds.
+- **Deleting and replacing many layers at once.** Each replica cleans up deleted and replaced layers a few at a time, fewer for layers holding thousands of large values; a larger `resources.limits.memory` allows more at once.
+  A delete can wait behind earlier clean-ups for seconds.
   A `DeleteLayer` still waiting at its deadline fails `DEADLINE_EXCEEDED` with nothing changed, and a `DeleteSession` can stop partway the same way; clients retry them as {ref}`Status codes <live-edit-api-errors-status-codes>` describes.
-  A replacement's clean-up waits after `CreateLayer` has answered, so the replaced layer's storage is freed later.
-  Watch `live_edit_retirement_wait_seconds`; a larger memory limit gives clean-ups more room.
+  A replaced layer's storage is freed after `CreateLayer` answers.
+  Watch `live_edit_retirement_wait_seconds`; if clean-ups wait for seconds, raise the memory limit.
 - **Replicas per deployment.** See {ref}`the 10-replica rule <live-edit-scaling-read-concurrency>`.
 
 All scaling and capacity settings: {ref}`Autoscaling settings <live-edit-configuration-autoscaling>` and {ref}`Capacity settings <live-edit-configuration-capacity>`.

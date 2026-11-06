@@ -5,6 +5,7 @@
 #include "LiveDispatch.h"
 #include "LiveStatus.h"
 #include "LiveJitter.h"
+#include "LiveExceptionResult.h"
 #include <array>
 #include <chrono>
 #include <initializer_list>
@@ -51,6 +52,7 @@ enum class DiagnosticKey : uint32_t {
     SetFields,
     TimeSamples,
     Limit,
+    Section,
     CountKeys
 };
 // The live edit service's refusal of a layer write or creation over its entry
@@ -75,7 +77,7 @@ struct DiagnosticEntry {
     std::array<DiagnosticValue, 16> fields{};
     std::array<char, 513> resource{};
 };
-inline constexpr size_t kDiagnosticEventCount = OMNI_USD_LIVE_RECORD_APPLY_LAG_EXITED + 1;
+inline constexpr size_t kDiagnosticEventCount = OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT + 1;
 enum class CallbackKind : uint32_t { Request = 0, Auth = 1, Status = 2, Session = 3 };
 enum class AuthWaitResolution : uint32_t { Usable = 0, Failed = 1, Closed = 2 };
 enum class AuthFailureCause : uint32_t { Provider = 0, Deadline = 1, RejectionLimit = 2, Internal = 3 };
@@ -96,6 +98,16 @@ enum class ShutdownPhase : uint32_t {
     Diagnostics = 7,
     Complete = 8
 };
+// The public cleanup calls whose results the cleanup metrics count; the
+// cleanup_timeout record's reason. Runtime shutdown has its own phases.
+enum class CleanupCall : uint32_t {
+    UnregisterCallback = 1,
+    Cancel = 2,
+    ReleaseRequest = 3,
+    LeaveSession = 4,
+    UnregisterEndpoint = 5
+};
+inline constexpr size_t kCleanupCallCount = 6; // Slot zero is unused.
 struct DiagnosticApplicationMetrics {
     uint64_t current = 0, highWater = 0, admitted = 0, retired = 0;
     MetricDuration queue, body, postBodyRetention;
@@ -198,6 +210,9 @@ struct DiagnosticMetrics {
     std::array<MetricDuration, 23> saveDurationByResult{}, drainDurationByResult{};
     // Whole matched-runtime shutdown calls classified by ending phase/result.
     std::array<std::array<MetricDuration, 23>, 9> shutdownDurationByPhaseResult{};
+    // Each public cleanup call that reached an initialized runtime, by call
+    // and result; index zero of the call dimension is unused.
+    std::array<std::array<MetricDuration, 23>, kCleanupCallCount> cleanupDurationByCallResult{};
     uint64_t authBlockedEndpoints = 0, authBlockedEndpointsHighWater = 0, authStaleReplacements = 0;
     // Challenge reason 1..3; index0 groups unknown reasons. Failure/resolution
     // dimensions are the fixed private diagnostic enums above, not public results.
@@ -307,6 +322,14 @@ public:
     // Records even after beginShutdown, without enqueueing any diagnostic sink.
     // Only TIMEOUT emits quiescence_failed; reference release/BUSY/success are metrics.
     void observeShutdown(ShutdownPhase phase, OmniUsdLiveResult result, uint64_t durationMs) noexcept;
+    // Counts one public cleanup call by call and result. A TIMEOUT after a
+    // nonzero timeoutMs also emits cleanup_timeout, carrying `handle` under
+    // the call's handle key; a zero timeout is a poll and only counts. A
+    // diagnostic sink's unregistration records to history and metrics only,
+    // never to sinks, as sink failures never report through sinks. Records
+    // even after beginShutdown, without enqueueing any sink.
+    void observeCleanup(CleanupCall call, OmniUsdLiveResult result, uint64_t durationMs, uint32_t timeoutMs,
+        uint64_t handle, bool diagnosticSink = false) noexcept;
     void retainClosedIncident(OmniUsdLiveEndpoint endpoint, std::string_view canonicalResource,
         const OmniUsdLiveStatus& status) noexcept;
     // History uses sizeof(DiagnosticEntry) per reserved slot; its capacity is
@@ -351,4 +374,18 @@ private:
     Clock::time_point started_{};
     bool active_ = false;
 };
+// Runs one public cleanup call on an initialized runtime and returns its
+// result, after observeCleanup counts the result and the call's duration; an
+// escaping exception counts as the public result it becomes.
+template<class Action>
+OmniUsdLiveResult observedCleanup(DiagnosticsRegistry& diagnostics, CleanupCall call, uint64_t handle,
+    uint32_t timeoutMs, Action&& action, bool diagnosticSink = false) noexcept {
+    const auto started = std::chrono::steady_clock::now();
+    const auto result = resultBoundary(std::forward<Action>(action));
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    diagnostics.observeCleanup(call, result, elapsed < 0 ? 0 : static_cast<uint64_t>(elapsed), timeoutMs, handle,
+        diagnosticSink);
+    return result;
+}
 } // namespace omni::usd::live

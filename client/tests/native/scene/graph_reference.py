@@ -210,14 +210,18 @@ def scenarios(seed):
     yield 'max_order', Delta(True, 0, (C(5, 2, 1, 'last', 6, 2**32-1),))
     yield 'exhausted_order', Delta(commands=(C(1, 3, 1, 'overflow', 6),))
     yield 'duplicate_sibling_reset', Delta(True)
-    yield 'duplicate_sibling_setup', Delta(commands=(C(1, 2, 1, 'P', 6), C(1, 3, 2, 'A', 6), C(1, 4, 2, 'B', 6),
-        C(1, 5, 4, 'Child', 6), C(1, 6, 2, 'C', 6)), fields=(F(4, 'value', 4),))
-    yield 'duplicate_sibling_rename', Delta(commands=(C(3, 4, 2, 'A', old_parent=2),))
+    # A store that keeps both siblings of a rename onto an occupied name restates both in a catch-up.
+    yield 'duplicate_sibling_setup', Delta(True, 0, (C(5, 2, 1, 'P', 6, 0), C(5, 3, 2, 'A', 6, 0), C(5, 4, 2, 'A', 6, 1),
+        C(5, 5, 4, 'Child', 6, 0), C(5, 6, 2, 'C', 6, 2), C(5, 7, 2, 'D', 6, 3)), (F(4, 'value', 4),))
     yield 'duplicate_sibling_hidden_field', Delta(fields=(F(4, 'value', 5), F(5, 'value', 6)))
-    yield 'duplicate_sibling_reorder', Delta(commands=(C(4, 2, children=(6, 4, 3)),))
-    yield 'duplicate_sibling_separate', Delta(commands=(C(3, 3, 2, 'Z', old_parent=2),))
-    yield 'duplicate_sibling_rejoin', Delta(commands=(C(3, 3, 2, 'A', old_parent=2),))
-    yield 'duplicate_sibling_reveal', Delta(commands=(C(2, 3, 2),))
+    yield 'duplicate_sibling_reorder', Delta(commands=(C(4, 2, children=(7, 6, 4, 3)),))
+    # A rename onto the shared name replaces the lower duplicate and joins the other.
+    yield 'duplicate_sibling_rename_onto_pair', Delta(commands=(C(3, 6, 2, 'A', old_parent=2),))
+    yield 'duplicate_sibling_separate', Delta(commands=(C(3, 4, 2, 'Z', old_parent=2),))
+    yield 'duplicate_sibling_same_name', Delta(commands=(C(3, 6, 2, 'A', old_parent=2),))
+    yield 'duplicate_sibling_rejoin', Delta(commands=(C(3, 4, 2, 'A', old_parent=2),))
+    yield 'duplicate_sibling_rename_onto_sibling', Delta(commands=(C(3, 7, 2, 'A', old_parent=2),))
+    yield 'duplicate_sibling_reveal', Delta(commands=(C(2, 7, 2),))
     yield 'random_reset', Delta(True)
     rng, identities, next_id = random.Random(seed), [], 100
     for step in range(160):

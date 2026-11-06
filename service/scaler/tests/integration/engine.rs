@@ -1077,6 +1077,205 @@ fn a_poll_that_observed_nothing_restarts_the_window() {
     }
 }
 
+// ── The disaster-recovery freeze (SDD SR-7a) ───────────────────────────────
+
+/// `idle_snapshot()` reporting a disaster-recovery hold.
+fn held() -> ScalingSnapshot {
+    snap(|s| s.held = true)
+}
+
+/// A backlog that asks for more replicas: 1 000 pending catch-ups at the
+/// prior rate need ceil(1 000 ÷ 70) = 15, clamped to 10.
+fn backlog() -> ScalingSnapshot {
+    snap(|s| s.catchups_pending = 1_000)
+}
+
+/// One held pod freezes the count both ways. The same engine and fleet that
+/// would scale down (an idle fleet past its window) holds `held`, and so
+/// does a backlog that would scale up; `desired` still reports what the
+/// terms asked for. The moment no pod reports `held`, the same backlog
+/// scales up again, so the freeze is the held flag's doing.
+#[test]
+fn a_held_pod_freezes_the_count_against_a_scale_down_and_a_scale_up() {
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let mut fleet = idle_fleet(3);
+    fleet[1].report = PodReport::Snapshot(held());
+    let d = engine.decide(&observe(t, 3, fleet));
+    assert_eq!(d.desired, 1, "the terms asked for fewer");
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "a held pod freezes a scale-down"
+    );
+
+    let mut fleet = idle_fleet(3);
+    fleet[0].report = PodReport::Snapshot(backlog());
+    fleet[1].report = PodReport::Snapshot(held());
+    let d = engine.decide(&observe(t + POLL, 3, fleet));
+    assert_eq!(d.desired, 10, "the terms asked for more");
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "a held pod freezes a scale-up"
+    );
+
+    let mut fleet = idle_fleet(3);
+    fleet[0].report = PodReport::Snapshot(backlog());
+    let d = engine.decide(&observe(t + POLL * 2, 3, fleet));
+    assert!(
+        matches!(d.action, Action::ScaleUp { .. }),
+        "with no held pod the same backlog scales up, got {:?}",
+        d.action
+    );
+}
+
+/// The freeze reads every polled pod, not only the fleet: a held pod that is
+/// unready (its hold verdict went stale too) freezes the count as well. When
+/// no pod is in the fleet at all, a held pod still freezes it rather than
+/// leaving the poll at `no_data`, with `desired` the current count. A Ready
+/// held pod that is the only pod, or the only Ready one beside unready pods,
+/// freezes it too.
+#[test]
+fn a_held_pod_outside_the_fleet_or_alone_in_it_freezes_the_count_too() {
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let mut pods = idle_fleet(3);
+    pods.push(pod("held-unready", false, PodReport::Snapshot(held())));
+    let d = engine.decide(&observe(t, 4, pods));
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "an unready held pod freezes the count"
+    );
+
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let pods = vec![
+        pod("held-unready", false, PodReport::Snapshot(held())),
+        pod("not-reporting", true, PodReport::Unreachable),
+    ];
+    let d = engine.decide(&observe(t, 2, pods));
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "with no pod in the fleet a held pod still freezes, not no_data"
+    );
+    assert_eq!(d.desired, 2, "desired is the current count");
+    assert_eq!(d.terms, Terms::default());
+
+    // A Ready held pod that is the only pod, and one beside unready pods
+    // only: the fleet is that one held pod. Without the freeze the first
+    // holds with no reason (desired equals the count) and the second holds
+    // `unsettled`.
+    let t0 = Instant::now();
+    let d =
+        Engine::new(config(), t0).decide(&observe(t0, 1, vec![reporting("held-ready", held())]));
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "a Ready held pod alone freezes the count"
+    );
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let pods = vec![
+        reporting("held-ready", held()),
+        pod("unready-a", false, PodReport::Snapshot(idle_snapshot())),
+        pod("unready-b", false, PodReport::Snapshot(idle_snapshot())),
+    ];
+    let d = engine.decide(&observe(t, 3, pods));
+    assert_eq!(
+        outcome(&d),
+        (Action::Hold, Some(BlockReason::Held)),
+        "a Ready held pod beside unready pods only freezes the count"
+    );
+}
+
+/// A fleet whose every pod started held (a fleet-wide restart while held,
+/// each pod in held mode: Ready, `held`, carrying nothing) freezes the
+/// count at every poll, where the same idle fleet past its window would
+/// scale down; once the hold clears, the first poll waits out a fresh
+/// window rather than scaling down as the clients reconnect.
+#[test]
+fn a_fleet_that_started_held_freezes_the_count_at_every_poll_until_the_hold_clears() {
+    let all_held = || -> Vec<PodObservation> {
+        (0..3)
+            .map(|i| reporting(&format!("held-{i}"), held()))
+            .collect()
+    };
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let mut at = t;
+    for poll in 0..5 {
+        let d = engine.decide(&observe(at, 3, all_held()));
+        assert_eq!(
+            outcome(&d),
+            (Action::Hold, Some(BlockReason::Held)),
+            "poll {poll} of an all-held fleet"
+        );
+        at += POLL;
+    }
+    assert_eq!(
+        outcome(&engine.decide(&observe(at, 3, idle_fleet(3)))),
+        (Action::Hold, Some(BlockReason::Window)),
+        "the first poll after the hold waits a fresh window"
+    );
+}
+
+/// A pod that reports `held: false` — every pod outside a hold, and every
+/// pod of an older build, which sends no `held` — changes no decision: the
+/// baselines that scale down and up are unchanged with the field set
+/// explicitly.
+#[test]
+fn no_held_pod_leaves_the_decisions_unchanged() {
+    let not_held = || -> Vec<PodObservation> {
+        (0..3)
+            .map(|i| reporting(&format!("p{i}"), snap(|s| s.held = false)))
+            .collect()
+    };
+    let (mut engine, t) = engine_past_window(config(), 3, &not_held());
+    assert_eq!(
+        outcome(&engine.decide(&observe(t, 3, not_held()))),
+        (scale_down(2), None)
+    );
+    let t0 = Instant::now();
+    let mut pods = not_held();
+    pods[0].report = PodReport::Snapshot(snap(|s| {
+        s.held = false;
+        s.catchups_pending = 1_000;
+    }));
+    let d = Engine::new(config(), t0).decide(&observe(t0, 3, pods));
+    assert!(matches!(d.action, Action::ScaleUp { .. }), "{:?}", d.action);
+}
+
+/// A frozen poll's demand is not recorded and restarts the window (decider
+/// C1): after the hold clears, the first scale-down rests on a full window
+/// of polls taken after it, so the fleet does not shrink just as every
+/// client reconnects. Every poll of that window holds `window`; the poll a
+/// full window later scales down.
+#[test]
+fn the_freeze_restarts_the_window_so_a_scale_down_after_it_waits_a_full_window() {
+    let (mut engine, t) = engine_past_window(config(), 3, &idle_fleet(3));
+    let mut fleet = idle_fleet(3);
+    fleet[2].report = PodReport::Snapshot(held());
+    assert_eq!(
+        outcome(&engine.decide(&observe(t, 3, fleet))),
+        (Action::Hold, Some(BlockReason::Held))
+    );
+
+    let mut at = t + POLL;
+    while at < t + POLL + WINDOW {
+        let d = engine.decide(&observe(at, 3, idle_fleet(3)));
+        assert_eq!(
+            outcome(&d),
+            (Action::Hold, Some(BlockReason::Window)),
+            "{:?} after the hold cleared",
+            at - t
+        );
+        at += POLL;
+    }
+    assert_eq!(
+        outcome(&engine.decide(&observe(at, 3, idle_fleet(3)))),
+        (scale_down(2), None),
+        "a full window of polls after the hold"
+    );
+}
+
 // ── Read budget ────────────────────────────────────────────────────────────
 
 /// `maxReplicas × catch-up read concurrency` above the fleet's budget of 10

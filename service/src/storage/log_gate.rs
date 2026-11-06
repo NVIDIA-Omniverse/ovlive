@@ -20,6 +20,13 @@
 //! gate — `client`'s steady-state auth hint and `watched_txn`'s two
 //! "a defence layer is disarmed on this store" warnings — so the mechanism
 //! lives here once and each site supplies its own interval.
+//!
+//! One user gates more than a line: `storage::checkout`'s `RoutingEpochs`
+//! uses the same semantics (first call passes, then at most once per
+//! interval, on the tokio clock) to bound how often the `txn_pool`'s cluster
+//! routing is marked stale. There a poisoned lock suppresses the mark, which
+//! the next mark, or the `CreateLayer` commit's own sync before a repeated
+//! run, covers.
 
 use std::sync::Mutex;
 use std::time::Duration;

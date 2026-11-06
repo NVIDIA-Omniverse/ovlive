@@ -1,0 +1,97 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The public-wire LiveService conformance suite: a library (`main_from_env`)
+# plus a thin `live-edit-conformance` executable that only starts a runtime and
+# calls it. It ships as its own image (`Dockerfile.conformance`), never inside
+# the service binary. The suite checks a service from outside, over the
+# published contract only, so it stays independent of the service in both
+# directions:
+#
+# - It depends on no `live-edit`, `live-edit-scaler` or
+#   `live-edit-capabilities-proto` code. Its only workspace dependency is
+#   `oodf-ffi`'s public API (the OODF decoder and builder), declared exactly
+#   as `live-edit` declares it, so never with the `internal-bridge` feature
+#   (see the fence below), and it compiles the public
+#   `proto/nvidia/omniverse/live/v1alpha/live_service.proto` itself
+#   (`build.rs`, client only) rather than sharing the service's generated code.
+# - No `live-edit` code depends on it: the service binary does not carry the
+#   suite.
+# - It adds no third-party crate the service does not already ship, so its
+#   image needs no third-party component the service image does not have.
+# - Every dependency below is declared exactly as `live-edit` declares it
+#   (same version requirement, same `default-features`, same features). That
+#   matters beyond this crate: the service image's release build
+#   (`cargo build --release --workspace`) compiles this crate too and unifies
+#   its features with the service's, so a feature asked for only here would
+#   change the shipped service binary. Keep the crate's own `[features]`
+#   empty for the same reason. `reqwest` keeps `default-features = false`
+#   with `rustls-tls`, so the single `ring` rustls crypto provider invariant
+#   (`scripts/check-crypto-provider-invariant.sh`) is unchanged.
+#
+# The guard test `tests/dependency_fence.rs` (pinned in
+# `scripts/guard-tests.sh`) fences all of this on the release image's
+# linux-gnu targets: this crate reaches no workspace package but `oodf-ffi`,
+# `live-edit`'s tree does not contain this crate, every third-party package
+# this crate reaches is in `live-edit`'s tree, and every normal or build
+# dependency declared here, `oodf-ffi` included, is either declared by
+# `live-edit` or `live-edit-scaler` with the same kind, the same
+# `default-features` and at least the same features, or declared here with
+# `default-features = false` and no features. Adding a dependency here means
+# first showing the service already ships it, as declared here.
+[package]
+name = "live-edit-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+name = "live_edit_conformance"
+path = "src/lib.rs"
+
+[[bin]]
+name = "live-edit-conformance"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+futures = "0.3"
+http = "1"
+oodf-ffi = { path = "../oodf-ffi" }
+percent-encoding = "2"
+prost = "0.14"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1.53.3", features = ["full"] }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-health = "0.14"
+tonic-prost = "0.14"
+tonic-types = "0.14"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+# Test-only, and like the dependencies above already in the workspace's
+# `Cargo.lock` through `live-edit`: `wiremock` stands in for the Storage API in
+# the provisioning tests, `tempfile` holds token files and report directories,
+# and tokio's `test-util` pauses time for the deadline and timeout tests.
+tempfile = "3"
+tokio = { version = "1.53.3", features = ["full", "test-util"] }
+wiremock = "0.6"

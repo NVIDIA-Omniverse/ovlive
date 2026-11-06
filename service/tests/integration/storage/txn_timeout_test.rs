@@ -94,10 +94,13 @@
 //! deadline). After it comes only `TestValkey`'s drop:
 //!
 //! - its purge (`cleanup_keys`) runs `SCAN MATCH <prefix>*` with a page hint
-//!   of 100 and `UNLINK`s the matches in batches of 100, each page and each
-//!   `UNLINK` one round trip, and fails at the first step unanswered for 5 s.
-//!   `SCAN` walks the whole shared keyspace, not just this test's keys, so
-//!   the pages number about the database's key count / 100: no fixed bound.
+//!   of 5,000 (`CLEANUP_SCAN_COUNT`) and `UNLINK`s the matches in batches of
+//!   100, each page and each `UNLINK` one round trip. It fails at the first
+//!   step unanswered for 5 s, a step being each `UNLINK` and each wait for
+//!   the walk's next key, which can span many pages. `SCAN` walks the whole
+//!   shared keyspace, not just
+//!   this test's keys, so the pages number about the database's key count /
+//!   5,000: no fixed bound.
 //!   The `UNLINK`s number this test's keys / 100. The largest object here is
 //!   T10's (`queue_object_state`, plus the create's stream): one hash per
 //!   section (30,000) and per field (20,000), plus the header, the sections
@@ -955,9 +958,12 @@ async fn serve(
     let task = tokio::spawn(async move {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
         let _ = ready_tx.send(());
-        production_server_builder()
+        production_server_builder(svc.upload_admission.max_waiters())
             .layer(metrics_layer)
-            .add_service(live_service_server(svc))
+            .add_service(live_service_server(
+                svc,
+                live_edit::grpc::hold::HoldGate::always_open(),
+            ))
             .serve_with_incoming(incoming)
             .await
             .expect("test server error");

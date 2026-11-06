@@ -235,7 +235,7 @@ struct SessionInfo {
     uint64_t created = 0;
 };
 struct RequestState final : Cleanup {
-    enum class Kind { List, Create, Stat, ResultOnly };
+    enum class Kind { List, Create, Stat, ResultOnly, MergeOwner };
     explicit RequestState(Kind value) : kind(value) {}
     ~RequestState() override { retainedReplyBytes.fetch_sub(payloadCharge, std::memory_order_relaxed); }
     Kind kind;
@@ -247,12 +247,16 @@ struct RequestState final : Cleanup {
     std::string id, uri;
     uint64_t created = 0, modified = 0;
     uint64_t payloadCharge = 0;
+    // A merge-owner answer: the owner's connection ID and user name are id and uri.
+    uint32_t ownerOutcome = 0, ownerSupported = 0, ownerHeld = 0;
+    uint64_t ownerEpoch = 0;
+    bool ownerPresent = false;
     Result outcome(Result native) {
         if (native != code::OK) return native;
         std::lock_guard<std::mutex> lock(payloadMutex);
         if (delivered) return delivery;
         if (kind == Kind::Create) return code::OUTCOME_UNKNOWN;
-        if (kind == Kind::List || kind == Kind::Stat) return code::CANCELLED;
+        if (kind == Kind::List || kind == Kind::Stat || kind == Kind::MergeOwner) return code::CANCELLED;
         return native;
     }
     Result release() noexcept {
@@ -348,6 +352,22 @@ void OMNI_USD_LIVE_CALL statCallback(void* user, Result result, const OmniUsdLiv
         if (!value) throw std::runtime_error("Missing stat result");
         state.created = value->created_time_ms;
         state.modified = value->modified_time_ms;
+    });
+}
+void OMNI_USD_LIVE_CALL mergeOwnerCallback(void* user, Result result, const OmniUsdLiveSessionEvent* value) noexcept {
+    deliver(user, result, [&](RequestState& state) {
+        if (!value) throw std::runtime_error("Missing merge-owner result");
+        uint64_t bytes = 0;
+        countText(bytes, value->connection_id);
+        countText(bytes, value->user_name);
+        reserveReply(state, bytes);
+        state.ownerPresent = value->connection_id != nullptr;
+        state.id = nonnull(value->connection_id);
+        state.uri = nonnull(value->user_name);
+        state.ownerOutcome = value->merge_owner_outcome;
+        state.ownerSupported = value->merge_owner_supported;
+        state.ownerHeld = value->merge_owner_held;
+        state.ownerEpoch = value->merge_owner_epoch;
     });
 }
 void OMNI_USD_LIVE_CALL resultCallback(void* user, Result result) noexcept {
@@ -469,6 +489,13 @@ public:
         } else if (state->kind == RequestState::Kind::Stat) {
             out["created_time_ms"] = state->created;
             out["modified_time_ms"] = state->modified;
+        } else if (state->kind == RequestState::Kind::MergeOwner) {
+            out["outcome"] = state->ownerOutcome;
+            out["owner_connection_id"] = state->ownerPresent ? py::cast(state->id) : py::none();
+            out["owner_user_name"] = state->ownerPresent ? py::cast(state->uri) : py::none();
+            out["epoch"] = state->ownerEpoch;
+            out["supported"] = state->ownerSupported != 0;
+            out["held"] = state->ownerHeld != 0;
         } else return py::make_tuple(state->delivery, py::none());
         return py::make_tuple(state->delivery, out);
     }
@@ -536,6 +563,8 @@ struct OwnedSessionEvent {
     Result result = code::OK;
     std::string connection, user, app, bytes;
     bool connectionPresent = false, userPresent = false, appPresent = false;
+    uint32_t ownerSupported = 0, ownerHeld = 0, ownerOutcome = 0;
+    uint64_t ownerEpoch = 0;
     uint64_t charge = 0;
 };
 struct SessionState final : Cleanup {
@@ -552,6 +581,9 @@ struct SessionState final : Cleanup {
     std::size_t head = 0, count = 0;
     uint64_t maxBytes = 0, queuedBytes = 0, ringCharge = 0;
     bool terminalPending = false, terminalDelivered = false, nativeStopped = false;
+    // The latest merge-owner view a native event carried, under eventMutex; the synthetic terminal event repeats it.
+    uint32_t lastOwnerSupported = 0;
+    uint64_t lastOwnerEpoch = 0;
     ~SessionState() override { retainedReplyBytes.fetch_sub(ringCharge + queuedBytes, std::memory_order_relaxed); }
     void initialize(uint32_t capacity, uint64_t bytes) {
         const auto charge = static_cast<uint64_t>(capacity) * sizeof(OwnedSessionEvent);
@@ -639,6 +671,10 @@ struct SessionState final : Cleanup {
             uint64_t reserved = 0;
             try {
                 if (!value) throw std::runtime_error("Missing session event");
+                if (value->struct_size >= sizeof(*value)) {
+                    lastOwnerSupported = value->merge_owner_supported;
+                    lastOwnerEpoch = value->merge_owner_epoch;
+                }
                 if (count == ring.size() || value->size > maxBytes) throw std::bad_alloc();
                 uint64_t charge = value->size;
                 countText(charge, value->connection_id);
@@ -659,6 +695,12 @@ struct SessionState final : Cleanup {
                 copied.app = nonnull(value->app_name);
                 if (value->size)
                     copied.bytes.assign(static_cast<const char*>(value->bytes), static_cast<std::size_t>(value->size));
+                if (value->struct_size >= sizeof(*value)) {
+                    copied.ownerSupported = value->merge_owner_supported;
+                    copied.ownerHeld = value->merge_owner_held;
+                    copied.ownerOutcome = value->merge_owner_outcome;
+                    copied.ownerEpoch = value->merge_owner_epoch;
+                }
                 copied.charge = charge;
                 ring[(head + count) % ring.size()] = std::move(copied);
                 ++count;
@@ -688,6 +730,10 @@ py::dict sessionEventDict(const OwnedSessionEvent& value) {
     out["user_name"] = value.userPresent ? py::cast(value.user) : py::none();
     out["app_name"] = value.appPresent ? py::cast(value.app) : py::none();
     out["bytes"] = py::bytes(value.bytes);
+    out["merge_owner_supported"] = value.ownerSupported != 0;
+    out["merge_owner_held"] = value.ownerHeld != 0;
+    out["merge_owner_outcome"] = value.ownerOutcome;
+    out["merge_owner_epoch"] = value.ownerEpoch;
     return out;
 }
 class Session {
@@ -720,6 +766,23 @@ public:
             return state->owned ? omniUsdLiveGetSessionStatus(state->handle, value) : code::INVALID_HANDLE;
         });
     }
+    py::tuple mergeOwner() const {
+        auto value = initRecord<OmniUsdLiveMergeOwner>();
+        Result result;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(state->lifeMutex);
+            result = state->owned ? omniUsdLiveGetMergeOwner(state->handle, &value) : code::INVALID_HANDLE;
+        }
+        py::dict out;
+        if (result == code::OK) {
+            out["supported"] = value.supported != 0;
+            out["held"] = value.held != 0;
+            out["owned"] = value.owned != 0;
+            out["epoch"] = value.epoch;
+        }
+        return py::make_tuple(result, out);
+    }
     py::tuple next(uint32_t timeout) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout);
         if (!state->acquireConsumer()) return py::make_tuple(code::BUSY, py::none());
@@ -736,6 +799,8 @@ public:
         std::unique_lock<std::mutex> lock;
         bool canceled = false, queued = false, terminal = false, closed = false;
         std::size_t index = 0;
+        uint32_t ownerSupported = 0;
+        uint64_t ownerEpoch = 0;
         {
             py::gil_scoped_release release;
             lock = std::unique_lock<std::mutex>(state->eventMutex);
@@ -748,6 +813,8 @@ public:
             terminal = state->terminalPending;
             closed = state->nativeStopped || state->terminalDelivered;
             index = state->head;
+            ownerSupported = state->lastOwnerSupported;
+            ownerEpoch = state->lastOwnerEpoch;
             lock.unlock();
         }
         if (canceled) return py::make_tuple(code::CANCELLED, py::none());
@@ -772,6 +839,9 @@ public:
         if (terminal) {
             OwnedSessionEvent failure;
             failure.result = deliveryStatus();
+            // Delivery stops, so the join reports no held lease; whether the lease is in force stays as last seen.
+            failure.ownerSupported = ownerSupported;
+            failure.ownerEpoch = ownerEpoch;
             auto result = py::make_tuple(code::OK, sessionEventDict(failure));
             {
                 py::gil_scoped_release release;
@@ -785,7 +855,8 @@ public:
     }
     std::shared_ptr<SessionState> state;
 };
-py::tuple joinSession(const std::string& uri, const std::string& app, uint32_t capacity, uint64_t bytes) {
+py::tuple joinSession(const std::string& uri, const std::string& app, uint32_t capacity, uint64_t bytes,
+    bool mergeOwner) {
     text(uri);
     text(app);
     if (!capacity || capacity > 4096 || !bytes || bytes > ReplyByteLimit)
@@ -800,6 +871,7 @@ py::tuple joinSession(const std::string& uri, const std::string& app, uint32_t c
     if (!owners.add(state)) return py::make_tuple(code::RESOURCE_EXHAUSTED, py::none());
     auto options = initRecord<OmniUsdLiveJoinOptions>();
     options.app_name = app.c_str();
+    options.flags = mergeOwner ? OMNI_USD_LIVE_JOIN_MERGE_OWNER : 0;
     Result result;
     {
         py::gil_scoped_release release;
@@ -1209,7 +1281,7 @@ py::tuple initialize(const py::dict& input) {
             "max_diagnostic_records", "max_diagnostic_bytes", "max_diagnostic_sink_records", "max_diagnostic_sinks",
             "max_closed_incidents", "diagnostic_min_severity", "diagnostic_allowed_flags", "flags", "default_jitter",
             "max_requests", "callback_worker_count", "max_auth_callbacks", "apply_lag_warning_threshold",
-            "reconnect_initial_ms", "reconnect_maximum_ms", "reconnect_max_attempts"});
+            "reconnect_initial_ms", "reconnect_maximum_ms", "reconnect_max_attempts", "max_calls_per_endpoint"});
 #define RUNTIME_FIELD(name) option(input, #name, value.name)
     RUNTIME_FIELD(default_auth_wait_timeout_ms);
     RUNTIME_FIELD(max_rejected_token_generations);
@@ -1241,6 +1313,7 @@ py::tuple initialize(const py::dict& input) {
     RUNTIME_FIELD(reconnect_initial_ms);
     RUNTIME_FIELD(reconnect_maximum_ms);
     RUNTIME_FIELD(reconnect_max_attempts);
+    RUNTIME_FIELD(max_calls_per_endpoint);
 #undef RUNTIME_FIELD
     auto delay = initRecord<OmniUsdLiveJitterParams>();
     if (input.contains("default_jitter") && !input["default_jitter"].is_none()) {
@@ -1435,6 +1508,7 @@ static void bindLive(py::module_& module) {
         .def("leave", &Session::leave, py::arg("timeout_ms") = 0)
         .def("interrupt_wait", &Session::interrupt)
         .def("status", &Session::status)
+        .def("merge_owner", &Session::mergeOwner)
         .def("delivery_status", &Session::deliveryStatus);
     py::class_<Subscription, std::shared_ptr<Subscription>>(module, "Subscription")
         .def_property_readonly("handle", &Subscription::handle)
@@ -1457,7 +1531,17 @@ static void bindLive(py::module_& module) {
     }, py::arg("endpoint") = nullptr, py::arg("options") = py::dict{}, py::arg("max_records") = 256,
         py::arg("max_bytes") = 1024 * 1024);
     module.def("join_session", &joinSession, py::arg("uri"), py::arg("app_name"), py::arg("max_events") = 256,
-        py::arg("max_bytes") = 1024 * 1024);
+        py::arg("max_bytes") = 1024 * 1024, py::arg("merge_owner") = false);
+    module.def("request_merge_owner", [](const Session& session, uint32_t action) {
+        return submit(RequestState::Kind::MergeOwner, [&](void* user, uint64_t* request) -> Result {
+            std::lock_guard<std::mutex> lock(session.state->lifeMutex);
+            const auto failure = session.state->delivery.load(std::memory_order_acquire);
+            if (failure != code::OK) return failure;
+            if (!session.state->owned) return code::INVALID_HANDLE;
+            if (session.state->stop.load(std::memory_order_acquire)) return code::CANCELLED;
+            return omniUsdLiveRequestMergeOwner(session.state->handle, action, user, mergeOwnerCallback, request);
+        });
+    });
     module.def("send_message", [](const Session& session, const py::bytes& bytes) {
         char* data = nullptr;
         Py_ssize_t size = 0;

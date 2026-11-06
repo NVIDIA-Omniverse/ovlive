@@ -28,8 +28,8 @@
 //!   Each subscriber
 //!   applies everything it is sent to a local model with the domain
 //!   `apply_delta` — the server's own engine — and every model applies cleanly
-//!   and ends equal to the server's final state, in both catch-up modes, and
-//!   both below the atomic-read ceiling (each joiner's own atomic read) and
+//!   and ends equal to the server's final state, both below the atomic-read
+//!   ceiling (each joiner's own atomic read) and
 //!   above it (each joiner's layer's shared fenced read, [`Ceiling::ForcedLow`]).
 //!   A commit delivered twice fails that: a re-applied `CreateSection` is a
 //!   `DuplicateSection`.
@@ -65,7 +65,8 @@
 //! atomic read); nothing else had to change to compile. The logs of these runs
 //! were not retained, so the results below are their only record:
 //!
-//! * the double-apply test failed in both modes, on every run (two each):
+//! * the double-apply test failed in both of that commit's catch-up modes, on
+//!   every run (two each):
 //!   parked after P′ and its registration, every joiner's held pair landed
 //!   above P′, the field writer defeated its proof, and the pair came back
 //!   live — its `CreateSection` failed `DuplicateSection`. (Load alone does
@@ -163,9 +164,8 @@
 //!
 //! The double-apply test holds catch-ups with the `CatchUpStateReadSeam`, so it
 //! exists only under the **`test-fault-injection`** cargo feature: without it
-//! all four of its tests (`..._snapshot_mode` and `..._rollback_mode`, at each
-//! ceiling) are compiled out and the run reports four tests fewer, not a
-//! failure.
+//! both of its tests (one at each ceiling) are compiled out and the run
+//! reports two tests fewer, not a failure.
 //!
 //! # Load, not timing
 //!
@@ -184,14 +184,28 @@
 //! [`SETTLE`] (10 s) bounds each wait for writer progress, each park, each
 //! release and each catch-up, except the large-layer test's wait after every
 //! joiner has reported, which [`backlog_wait`] scales with the followers'
-//! backlog up to [`FOLLOW_BUDGET`]; [`FOLLOW_BUDGET`] (60 s) bounds each
-//! follower from its subscribe to the sentinel, all followers running at once.
-//! A stalled run fails at its first exhausted bound; the heaviest healthy waits
-//! sum far below nextest's 120 s hang-killer. The healthy path is a debug
-//! build's layer creation and structural commits (each structural commit reads
-//! and applies the whole layer): the double-apply test takes about 10 s (about
-//! 20 s above the ceiling, where each joiner's fenced read holds the writers
-//! off for its epoch), the large-layer test about 20 s.
+//! backlog up to [`FOLLOW_BUDGET`]. [`FOLLOW_BUDGET`] (60 s) is each
+//! follower's hang guard, not a latency claim: it bounds the follower's
+//! catch-up, from its subscribe to its caught-up ack, and from the ack on the
+//! wait for each next live commit. It is not one budget from the subscribe
+//! to the sentinel: the double-apply test joins its followers one after
+//! another, so joiner 0 follows the stream through every later joiner's
+//! setup, and a slow host would spend a fixed budget on that setup rather
+//! than on anything joiner 0 does. A stalled run fails at its first exhausted
+//! bound. A run that keeps progressing, however slowly, is bounded only by
+//! nextest's kill deadline: 240 s for the fenced-layer double-apply test
+//! (its override in `.config/nextest.toml`), the global 120 s for the rest.
+//! The healthy path is a debug build's layer creation and structural commits
+//! (each structural commit reads and applies the whole layer): the
+//! double-apply test takes about 10 s (about 20 s above the ceiling, where
+//! each joiner's fenced read holds the writers off for its epoch), the
+//! large-layer test about 20 s, on CI's x86 runners. A debug build on an
+//! aarch64 development sandbox runs these tests 3–7× slower; a budget sized
+//! for CI's figures alone would read that slowness as a hang.
+//! There, at four test threads, the fenced-layer double-apply tests of the
+//! time (one per catch-up mode) took 38–115 s (2026-10-16), the slowest 5 s
+//! short of the global 120 s hang-killer, which is why the remaining one's
+//! override raises it to 240 s.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -235,7 +249,12 @@ use super::helpers::{
 /// Upper bound on one wait for writer progress, one park or one catch-up.
 const SETTLE: Duration = Duration::from_secs(10);
 
-/// Upper bound on one follower, from its subscribe to the sentinel commit.
+/// A follower's hang guard, not a latency claim: the bound on its catch-up
+/// (subscribe to caught-up ack), and then, from the ack on, on the wait for
+/// each next live commit. A follower that keeps receiving commits never runs
+/// out of it, however long the later joiners take to set up; the whole test
+/// is bounded by nextest's kill deadline instead (240 s for the fenced-layer
+/// double-apply test, `.config/nextest.toml`).
 const FOLLOW_BUDGET: Duration = Duration::from_secs(60);
 
 /// Structural writes between two joins of the double-apply test: one
@@ -320,8 +339,8 @@ impl Fixture {
         }
     }
 
-    /// A service over the fixture in the given catch-up mode.
-    fn service(&self, catchup_snapshot_enabled: bool) -> LiveEditService {
+    /// A service over the fixture.
+    fn service(&self) -> LiveEditService {
         let layer_store = Arc::new(live_edit::storage::layer::LayerStore::new(
             self.client.clone(),
             self.key_schema.clone(),
@@ -342,7 +361,6 @@ impl Fixture {
             Arc::clone(&metrics),
         ));
         LiveEditService {
-            catchup_snapshot_enabled,
             session_store: Arc::new(SessionStore::new(
                 self.client.clone(),
                 self.key_schema.clone(),
@@ -1525,28 +1543,52 @@ async fn follow(
 ) -> Result<Followed, String> {
     let mut caught_up = CaughtUpReport(Some(caught_up));
     let run = async {
-        let mut model = ObjectState::default();
-        let (content, body) = next_message(&mut stream).await?;
-        if content.total_size == 0 {
-            return Err(format!("the first message was not content: {content:?}"));
-        }
-        apply(&mut model, &body).map_err(|e| {
-            format!(
-                "the catch-up content (seq {}) did not apply: {e}",
-                content.sequence_num
-            )
-        })?;
-        let (ack, _) = next_message(&mut stream).await?;
-        if ack.total_size != 0 {
-            return Err(format!(
-                "the catch-up sent more than one content message: {ack:?}"
-            ));
-        }
+        // The catch-up: its content and its ack, under one hang guard from
+        // the subscribe (the test's own `await_caught_up` bounds it tighter).
+        let catch_up = async {
+            let mut model = ObjectState::default();
+            let (content, body) = next_message(&mut stream).await?;
+            if content.total_size == 0 {
+                return Err(format!("the first message was not content: {content:?}"));
+            }
+            apply(&mut model, &body).map_err(|e| {
+                format!(
+                    "the catch-up content (seq {}) did not apply: {e}",
+                    content.sequence_num
+                )
+            })?;
+            let (ack, _) = next_message(&mut stream).await?;
+            if ack.total_size != 0 {
+                return Err(format!(
+                    "the catch-up sent more than one content message: {ack:?}"
+                ));
+            }
+            Ok((model, content, ack))
+        };
+        let (mut model, content, ack) = tokio::time::timeout(FOLLOW_BUDGET, catch_up)
+            .await
+            .unwrap_or_else(|_| {
+                Err(format!(
+                    "did not catch up within {FOLLOW_BUDGET:?} of its subscribe"
+                ))
+            })?;
         caught_up.send();
         let mut last = ack.sequence_num;
         let mut first_live = None;
         loop {
-            let (live, body) = next_message(&mut stream).await?;
+            // A hang guard, not a latency claim: from the caught-up ack on,
+            // each next live commit must arrive within [`FOLLOW_BUDGET`] of
+            // the one before (or of the ack). A follower that keeps receiving
+            // commits while later joiners are set up never runs out of it.
+            let (live, body) = tokio::time::timeout(FOLLOW_BUDGET, next_message(&mut stream))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "received nothing for {FOLLOW_BUDGET:?} after seq {last} (caught up at \
+                         seq {}): the stream hung before the sentinel",
+                        ack.sequence_num
+                    ))
+                })?;
             if live.sequence_num != last + 1 {
                 return Err(format!(
                     "live commit {} arrived after {last}: every commit after the ack must arrive \
@@ -1574,14 +1616,7 @@ async fn follow(
             }
         }
     };
-    tokio::time::timeout(FOLLOW_BUDGET, run)
-        .await
-        .unwrap_or_else(|_| {
-            Err(format!(
-                "did not reach the sentinel within {FOLLOW_BUDGET:?}"
-            ))
-        })
-        .map_err(|e| format!("[{client_id}] {e}"))
+    run.await.map_err(|e| format!("[{client_id}] {e}"))
 }
 
 /// Wait (bounded by [`SETTLE`]) for one follower's report. A follower that
@@ -1620,15 +1655,15 @@ async fn server_state(fx: &Fixture, object_id: u64) -> ObjectState {
 /// Assert `model` has the server's sections — ids, parents and names — and
 /// each parent's children in the server's order.
 ///
-/// A model places its catch-up content by the order each row carries (sibling
-/// indexes in snapshot mode, stored keys in rollback mode) and then applies
-/// every live commit, where a created section and a section moved under a new
-/// parent append. The server stores them the same way (b.xje), so the model
-/// must end with the server's list, in order, under every parent: a commit
-/// applied twice or missed changes membership or a parent, and a create or
-/// move placed anywhere but last changes the order. `section_order` itself is
-/// not compared — a snapshot-mode model holds sibling indexes where the server
-/// holds its own keys, and only the order the keys produce is the contract.
+/// A model places its catch-up content by the sibling index each row carries
+/// and then applies every live commit, where a created section and a section
+/// moved under a new parent append. The server stores them the same way
+/// (b.xje), so the model must end with the server's list, in order, under
+/// every parent: a commit applied twice or missed changes membership or a
+/// parent, and a create or move placed anywhere but last changes the order.
+/// `section_order` itself is not compared — the model holds sibling indexes
+/// where the server holds its own keys, and only the order the keys produce
+/// is the contract.
 fn assert_model_matches(who: &str, model: &ObjectState, server: &ObjectState) {
     let shape = |s: &ObjectState| -> HashMap<u64, (u64, String)> {
         s.sections
@@ -1765,25 +1800,24 @@ const DOUBLE_APPLY_SECTIONS: u64 = 2_000;
 ///
 /// Run at the shipped ceiling (each joiner's own atomic read) and above it
 /// ([`Ceiling::ForcedLow`]: each joiner's flight's fenced read, which holds the
-/// writers off for its epoch rather than racing them), in both modes.
+/// writers off for its epoch rather than racing them).
 ///
-/// Fails at e1220ea0 in both modes (module header): each joiner, registered
+/// Fails at e1220ea0 (module header): each joiner, registered
 /// and parked after its re-read P′, is sent the held pair again, and its
 /// re-applied `CreateSection` fails `DuplicateSection`. On this code, a
 /// catch-up that acks and registers at P while serving its read's state fails
 /// it the same way, at either ceiling.
 #[cfg(feature = "test-fault-injection")]
-async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
-    catchup_snapshot_enabled: bool,
+async fn assert_structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
     ceiling: Ceiling,
 ) {
-    let case = format!("snapshot={catchup_snapshot_enabled} / {ceiling:?}");
+    let case = format!("{ceiling:?}");
     let fx = Fixture::setup(ceiling).await;
-    let mut svc = fx.service(catchup_snapshot_enabled);
+    let mut svc = fx.service();
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_full_state());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let svc = Arc::new(svc);
-    let layer = format!("double-apply-{catchup_snapshot_enabled}-{ceiling:?}");
+    let layer = format!("double-apply-{ceiling:?}");
     let (session_id, object_id) =
         create_large_layer(&fx, &svc, &layer, DOUBLE_APPLY_SECTIONS, 0).await;
 
@@ -1902,9 +1936,8 @@ async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscribe
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_snapshot_mode() {
-    structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
-        true,
+async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber() {
+    assert_structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
         Ceiling::Shipped,
     )
     .await;
@@ -1912,31 +1945,9 @@ async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscribe
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_rollback_mode() {
-    structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
-        false,
-        Ceiling::Shipped,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_of_a_fenced_layer_snapshot_mode(
+async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_of_a_fenced_layer(
 ) {
-    structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
-        true,
-        Ceiling::ForcedLow,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_of_a_fenced_layer_rollback_mode(
-) {
-    structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
-        false,
+    assert_structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber(
         Ceiling::ForcedLow,
     )
     .await;
@@ -1961,11 +1972,12 @@ const APPLY_ALLOWANCE: Duration = Duration::from_millis(60);
 /// for followers with at most `backlog` live commits still to apply: the
 /// writer's commits slow while the followers apply their backlogs on the
 /// runtime it shares (module header), so the wait is [`SETTLE`] plus an
-/// [`APPLY_ALLOWANCE`] per backlog commit. It never exceeds
-/// [`FOLLOW_BUDGET`]: no follower can reach the sentinel during this wait
-/// (the writer commits it only at [`Writer::finish`], afterwards), and each
-/// follower's own budget started at its subscribe, before this wait, so a
-/// longer wait could only end with every follower already failed.
+/// [`APPLY_ALLOWANCE`] per backlog commit, capped at [`FOLLOW_BUDGET`]. The
+/// cap is a fixed bound on this one wait, for the writer's next
+/// [`FIELD_COMMITS_PER_JOIN`] commits: it reuses the constant's 60 s, and is
+/// not derived from the followers' guard, which bounds the wait for
+/// each next commit, not for a run of them, so a slow but progressing writer
+/// can fail this wait while every follower is still within its guard.
 fn backlog_wait(backlog: u64) -> Duration {
     let allowance = APPLY_ALLOWANCE.saturating_mul(u32::try_from(backlog).unwrap_or(u32::MAX));
     SETTLE.saturating_add(allowance).min(FOLLOW_BUDGET)
@@ -1987,7 +1999,7 @@ fn backlog_wait(backlog: u64) -> Duration {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn brand_new_catch_ups_of_a_large_layer_under_writers_all_end_verified_at_their_atomic_cut() {
     let fx = Fixture::setup(Ceiling::Shipped).await;
-    let svc = Arc::new(fx.service(true));
+    let svc = Arc::new(fx.service());
     let layer = "large-under-writers";
     let (session_id, object_id) = create_large_layer(&fx, &svc, layer, LARGE_SECTIONS, 1).await;
 

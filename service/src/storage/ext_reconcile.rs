@@ -182,8 +182,9 @@
 // ── Fail closed, absolutely ───────────────────────────────────────────────
 //
 // Any error in the object walk, the carrier walk, the owed walk or the meta
-// walk — a per-object read, a SCAN stream error, an undecodable hash the walk
-// cannot attribute, a budget elapse, a CANCELLATION — aborts the whole pass with
+// walk — a per-object read, a SCAN-family step error, a walk that crossed a
+// change of serving process, an undecodable hash the walk cannot attribute, a
+// budget elapse, a CANCELLATION — aborts the whole pass with
 // NO repair at all and NO gauge publish. The orphan sweep's
 // `continue`-on-SCAN-error posture is deliberately NOT copied: a partial object
 // walk UNDER-counts `referenced`, and an under-counted `referenced` reads as
@@ -198,15 +199,45 @@
 // observation pinned from a truncated walk would sit on the ZSET at an amount
 // that was never real, waiting for a future pass to confirm it.
 //
-// A walk is complete only on its terminal page. fred ends a SCAN-family stream
-// with no error when a page's command is dropped unanswered (its client's
-// router ended, or was aborted, with the page in flight), so the end of a
-// stream proves nothing. Every walk here goes through
-// `orphan_sweep::scan_keyspace` (keyspace walks) or
-// `orphan_sweep::complete_pages` (the `pending` and `inflight` cursors), which
-// turn a walk that ended short — or, for a keyspace walk on a cluster, one that
-// started while the routing table was unknown, empty or changing — into a final
-// stream error, and that forfeits the pass like any other.
+// A walk of this pass is complete only on its terminal step, and only when
+// one server process served every step of it. The object, carrier and owed
+// walks are guarded (`storage::scan_guard`): explicit-cursor steps that end
+// only on cursor `0` or with an error (a step lost in flight fails visibly, where
+// fred's SCAN-family streams end with no error), each sent with one attempt
+// and retried in place only after a transient error and while the serving
+// process's `run_id` reads unchanged (a deterministic error ends the walk on
+// its first attempt), and each step's keys or members used only once the
+// witness sent after it in its pipeline matched the walk's start. A keyspace
+// walk on a cluster also sends each primary's commands to one named node,
+// compares its slot map and every primary's witness at its start and end, and
+// refuses an open slot or a node whose own myself line does not list exactly
+// its primary's slots (the client's routing table was out of date: the walk
+// re-syncs it, then fails).
+// A walk that crossed a change of serving process or slot map, whose node
+// pin missed its primary's slots, or whose `INFO server` reports no usable
+// run_id (or `CLUSTER NODES` no usable myself line), ends with an error, and
+// that forfeits the pass like any other. A stale table would make the same
+// skip on every pass, which guard 1 cannot catch. On Azure Managed Redis the
+// run_id is a node endpoint's, and a primary shard that moves behind an
+// unchanged endpoint and slot map keeps it [tested, SDD §11.3.2]: guard 1's
+// two observations absorb one such missed walk, unless an earlier, unrelated
+// observation of the same hash happened to record exactly the inflated
+// amount (`act_on_candidate` recomputes from the current pass's walks). The
+// restore Job's recount reads no witness ("The restore Job's authoritative
+// recount", below). The meta walk goes through
+// `orphan_sweep::scan_keyspace`, a coverage walk: every primary of a fresh
+// slot map on a node pin, its owner checked at the walk's start and end, but
+// no serving-process witness. Any error it ends with — a store fault, a
+// primary left unwalked or an unproven pin's routing table found out of date
+// (after either it re-syncs the walking pool member's routing table, so a
+// later pass on that member is complete once its re-sync succeeds; a failed
+// or timed-out sync leaves the miss in place, and each maintenance-pool
+// member keeps its own table), a changed map, an ownership it could not
+// prove — forfeits the pass like any other. A change of serving
+// process inside one walk can still skip metas undetected; that is safe by
+// direction: a meta it misses is never evaluated, so it is never registered
+// or repaired, and the miss can only leave a surplus standing (a leak) for
+// that pass.
 //
 // ── Deficit is confirmed, then observed, and never repaired ───────────────
 //
@@ -338,15 +369,163 @@
 // needed for correctness (readers already resolve a pair by the same rule),
 // so a failure is counted, logged, and retried on the next pass.
 //
-// SDD §11.3.
+// ── The restore Job's authoritative recount (SDD SR-9.8) ──────────────────
+//
+// `recount_authoritative` is the second mode of this module, used only by the
+// DR restore Job (`dr::job::finish`), after its last write and while the
+// fleet is held. It walks the same three families — objects, retirement
+// carriers, owed releases — each by the DR Jobs' completeness proofs rather
+// than the serving-process guard (below), and then SETS each named hash's
+// `ref_count` to exactly `refs + owed` (`scripts/ext_ref_count_set.lua`, one
+// atomic call per hash on its meta key alone), where:
+//
+// * `refs(h)` is the number of object headers whose rows ∪ `obj:ext` name h,
+//   once per object, over EVERY `{*}:obj:hdr` — live, unmapped and superseded
+//   objects alike, since each releases its references once when it retires;
+// * `owed(h)` is its retirement-carrier members plus its `{gc}:pending` and
+//   `{gc}:inflight` members.
+//
+// Every hash in referenced ∪ owed gets a meta: a value whose bytes only the
+// backup store holds gets a meta with no data, and a hash only an owed
+// release names gets one at `owed`, which the GC then drains to 0. The count
+// is exact — lowered as well as raised — and so is never below what names the
+// hash and never 0 while anything names it. The recount deletes no meta, and
+// leaves a meta that nothing names as it is (a bounded leak the periodic pass
+// above drains). It writes nothing else: the object walk runs in its
+// `Authoritative` mode, which skips the signed-zero merge and the index audit
+// (both writes), and the meta walk, the two observations, the stamp gate, the
+// repair cap and the drain gate are not run at all. The periodic pass is
+// unchanged.
+//
+// **Why none of those guards is needed.** The guards above exist for writers
+// running concurrently with a walk. The recount runs while the fleet is held,
+// after the Job's quiet period has bounded every writer the hold aborted and
+// after the Job's own last write, so nothing writes the keyspace the walks
+// read: a complete walk is an exact snapshot. Each walk is shown complete on
+// the held store or fails (`storage::scan_guard`, *The DR Jobs' walks*),
+// whichever server process answered each step, and no `INFO server` is read:
+//
+// * the object and carrier walks are agreeing keyspace walks: each pattern
+//   is walked twice, the second walk after the first ends, and its result
+//   used only when both returned the same set (the object walk counts each
+//   object once as its first walk meets it, then a headers-only second walk
+//   must return exactly the objects counted);
+// * each object's `obj:flds` and `obj:tss`, and `inflight`, are read by
+//   ascending rank pages with `ZCARD` in each page's pipeline, complete only
+//   when the pages returned the start `ZCARD` and the end `ZCARD` equals it;
+// * each object's `obj:ext` and `pending` are read by counted cursor walks,
+//   `HLEN` / `SCARD` in each step's pipeline, their members de-duplicated
+//   exactly, complete only when the distinct count equals the cardinality
+//   read with the first and the last step.
+//
+// A proof that does not hold fails the recount, exit 1 (the store changed
+// while the Job read it), as does a slot map that changed or a node pin
+// that missed its primary's slots; an unusable myself line fails it, exit 3.
+// Every decode fails closed, and a double count (a retiring object counted
+// as a reference and through its carrier or release) only errs high, a leak.
+// Nothing reads a count — GC, collect, backup repair, this pass — until the
+// un-hold, which takes the recount's receipt and so runs only after every
+// assignment succeeded.
+//
+// **Bounded per object.** The recount reads each object's `obj:flds` and
+// `obj:tss` by `ZRANGE` pages of `ROW_HASH_CHUNK_ROWS`, each page's rows'
+// hashes read in one pipeline and folded into the object's hash set before
+// the next page, then its `obj:ext` by counted `HSCAN` steps: one page, one
+// chunk and one `HSCAN` step at a time, whatever the object's size
+// (`object_referenced_hashes_paged`). What grows is one entry per distinct
+// hash: the object's set and the pass's `referenced` and `owed` maps (and
+// one entry per distinct `obj:ext` field, by its text, in that index's
+// de-duplication set, and per distinct member in `pending`'s). Rank pages
+// need no de-duplication, so the
+// row indices hold nothing per row. The periodic pass keeps its whole
+// listings, which its signed-zero merge needs.
+//
+// **No silent omission.** A recount that lowers anything may never come from
+// a walk that left an object out. Every arm by which a periodic walk skips,
+// forfeits or holds an object, and what the authoritative mode does instead
+// (exit 1: the Job's store fault or a walk not shown complete, retried;
+// exit 3: a corrupt record or a missing myself line, the service stays
+// held):
+//
+// | Walk | Periodic arm | Authoritative |
+// |---|---|---|
+// | objects, carriers, owed | cancellation forfeits the pass | never fires (a token nothing cancels); the Job stops by dropping the recount, with no receipt and so no un-hold |
+// | objects, carriers, owed | the pass budget elapses: forfeit | no budget |
+// | objects, carriers, owed | a SCAN / SSCAN / ZSCAN step that failed transiently on every attempt or with a deterministic error on one, an `INFO server`, `CLUSTER SLOTS` or `CLUSTER NODES` read of the walk's guard that errs, or, for a keyspace walk on a cluster, a node pin the client's routing table no longer lists as a primary (refused before a step, a witness or a `CLUSTER NODES` read is sent): forfeit | a SCAN step that failed the same way, a `ZRANGE` page, `HSCAN` / `SSCAN` step or cardinality read that errs, a `CLUSTER SLOTS` or `CLUSTER NODES` read that errs, or a refused node pin: fails the recount, exit 1 |
+// | objects, carriers, owed | a walk that crossed a change of serving process (a step's `run_id` differs from the walk's first), or, for a keyspace walk on a cluster, whose slot map changed, which met an open slot, or whose pinned node's myself line does not list exactly its primary's slots, or for which the client's table names no node (the routing table is re-synced first): forfeit | a keyspace walk whose slot map changed, which met an open slot, or whose node pin missed its primary's slots; two keyspace walks that returned different keys; a rank or counted walk whose count check did not hold: fails the recount, exit 1, before any count is set |
+// | objects, carriers, owed | an `INFO server` reporting no usable run_id (not 40 hex characters, or all zeros), or, for a keyspace walk on a cluster, a `CLUSTER NODES` with no myself line, a myself line short of its 8 fixed fields, or a slot field outside the `N` / `A-B` grammar: forfeit | no `INFO server` is read; an unusable myself line fails, exit 3 |
+// | objects | an index read (`ZRANGE` / `HGETALL` in the periodic pass; a `ZRANGE` page or `HSCAN` step in the recount) that errs: forfeit | fails, exit 1; a `WRONGTYPE` reply fails, exit 3 |
+// | objects | — | an `HSCAN` step answering an odd number of elements (a protocol error): fails, exit 1 |
+// | objects, carriers, owed | any other store error (a read, a pipeline, a reply decode): forfeit | fails, exit 1; a `WRONGTYPE` reply (a key of the wrong type) fails, exit 3 |
+// | objects | an `obj:hdr` key that is not text, or names no object id: forfeit | fails, exit 3 |
+// | objects | a row-hash pipeline answering the wrong number of replies: forfeit | fails, exit 3 |
+// | objects | a row `hash` column `hash_from_hex` rejects: forfeit | fails, exit 3 |
+// | objects | an `obj:ext` field that is not a hash: forfeit | fails, exit 3 |
+// | objects | index drift (`obj:ext` disagrees with the rows): the index recount (a write), and when it cannot repair, the hash is held from the surplus arms for the pass | no recount and no hold: the object's references are counted as rows ∪ `obj:ext`, so a hash either side names is counted |
+// | objects | an `obj:ext` field whose count is not a positive decimal: an index mismatch, as above | the field still names its hash, which is counted |
+// | objects | an index recount that fails: forfeit | not run |
+// | objects | the signed-zero merge (a write that never forfeits) | not run; a `-0.0` row and its `+0.0` twin are both read, and their hashes counted once for the object |
+// | objects | a row with no `hash` column: nothing to count | the same: such a row holds no external value |
+// | objects | an object id that is not decimal: used only as text | counted; only the counter's surviving term passes over it (no allocated id is non-decimal) |
+// | carriers | a carrier of type `none` (deleted since the SCAN saw it): nothing owed | the same; nothing deletes one while held |
+// | carriers | a carrier of a type other than hash or set: forfeit | fails, exit 3 |
+// | carriers, owed | a member that is not text, or whose hash does not decode: forfeit | fails, exit 3 |
+// | metas (phases 4–5) | recent or unreadable stamp, index-drift hold, two observations, repair cap, deficit confirmation | not run: every named hash is set exactly |
+// | the per-hash set | — | a meta of the wrong type fails, exit 3; any other error, exit 1 |
+//
+// Rows with no header are walked in neither mode: they never release (a
+// retirement writes its carrier first, which is counted as owed).
+//
+// In the authoritative mode a failure reading one object's references also
+// names the object, and the key when the failing read names one
+// (`in_object`), so the Job's exit-3 or exit-1 line says what support must
+// look at. The periodic mode's errors are unchanged.
+//
+// ── The meta-without-data shape, and every reader of it ───────────────────
+//
+// The recount creates a shape nothing else creates: `le:ext:meta:{h}` with
+// `ref_count` N ≥ 1 and no stamp or backup field, and `le:ext:data:{h}`
+// absent — a value whose bytes only the backup store holds. Outside the held
+// Job nothing creates it: the GC deletes meta and data together, and every
+// store writes both. It ends three ways: fetch-on-miss stores the bytes, a
+// client upload stores them (`SET NX`), or the GC deletes both keys at 0. No
+// client write can reference such a value without uploading its bytes: every
+// external row's `ext_value_index` must resolve to a part of the same upload,
+// or the call is refused before anything is stored
+// (`external_values::collect_external_values`). Every reader of the pair:
+//
+// | Reader | On a meta without data | Verdict |
+// |---|---|---|
+// | GC decrement (`gc_decrement_and_collect.lua`, via `gc_member`) | `HINCRBY -1`; at 0 the `STRLEN` (a `pcall`) reads 0, `DEL meta data`, freed 0 | correct, unchanged |
+// | GC out-of-memory collection (the same script) | frees 0 bytes for it, which is accurate | unchanged |
+// | release ledger size (`read_release_blob_size`) | `STRLEN` 0 bytes | unchanged (true Valkey bytes) |
+// | pre-flight store (`ext_store_value.lua`, `store_values_with`) | `SET NX` writes the bytes, `+1`, stamp: the shape becomes normal | unchanged |
+// | fetch-on-miss rewrite (`store_recovered_values`, the script's `recover` mode) | stores the bytes and keeps the count: no `+1` and no stamp on a present meta | CHANGED: it paid `+1`, a permanent leak |
+// | Recover (`recover_value`, the catch-up's restore, and `read_batch`, data absent and meta present; both through `recover_miss`) | DEBUG before the fetch, and the recovery counter's `meta="present"`; an ERROR only when the value could not be fetched, never on a transient `UNAVAILABLE` | CHANGED: it logged an integrity ERROR on every first read after a restore |
+// | probe reads (`load_values`, `probe_values`) | the data `GET` misses: a normal answer | unchanged |
+// | length probe (`probe_value_lengths`) | `STRLEN` 0, then `EXISTS` false: missing, a normal answer | unchanged |
+// | ranged read (`read_value_range`) | an empty `GETRANGE`: read as missing | unchanged |
+// | catch-up (`diff_read::resolve_external_values`, `storage::ompf_payload`) | length-probe miss, read hold, re-read, genuine miss, Recover through `recover_value` (fetch-on-miss) before the layout, in batches of at most 4 charged to the catch-up payload budget, each batch re-probed first; a value gone by the closing check is restored the same way, one at a time | CHANGED (D1): restored one value per call, in charged batches, not all at once uncharged |
+// | this pass's meta walk and candidate re-read | reads `ref_count` and `last_store_ms` only; after an exact recount the surplus is 0, and an absent stamp is eligible | unchanged |
+// | this pass's `obj:ext` audit | reads neither meta nor data | n/a |
+// | checkpoint collect R4 (`recon_fence::ext_values_live`) | `EXISTS meta`: live, so the value is deferred and its tombstone re-dated | unchanged: this is what keeps the collect from deleting the backup copy |
+// | collect R5 (`clear_ext_backup` and its heal) | needs a meta without data created between R4 and the delete; outside the held Job nothing creates one | unreachable; unchanged |
+// | collect R6 heal-on-keep (`heal_from_valkey`) | the read finds no bytes; the copy is probed, and only a copy absent too is reported | CHANGED: it reported every such value unavailable for up to 24 h |
+// | collect R3 fence (`recon_ext_commit.lua`) | reads `{recon}` only | n/a |
+// | backup repair (`checkpoint::ext_backup_repair`) | owed; probed: a present copy is confirmed (`already_stored`); an absent one reads `STRLEN` 0, `value_gone`, nothing written | unchanged; one existence check per recount meta |
+// | mirror confirm (`ext_backup_confirm.lua`) | runs only after a store, and no mirror item exists for a recount meta | n/a |
+// | restore coverage (`storage::dr_job::ext_value_stored`) | `EXISTS data` is false, so a re-run probes the backup store | unchanged |
+// | restore backfill (`dr::job::execute::object`) | `SET NX` writes the tail bytes, `+1`; the recount then makes the count exact | unchanged |
+//
+// SDD §11.3, §22.22.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use fred::interfaces::{
     ClientLike, HashesInterface, KeysInterface, SetsInterface, SortedSetsInterface,
 };
-use fred::types::scan::Scanner;
 use fred::types::{ClusterHash, CustomCommand, Value};
 use futures::StreamExt;
 use tokio::task::JoinHandle;
@@ -361,15 +540,24 @@ use crate::observability::metrics::{
     EXT_RECONCILE_OUTCOME_SKIPPED_RECENT_STORE, EXT_RECONCILE_OUTCOME_SKIPPED_UNREADABLE_STAMP,
     EXT_REF_RELEASE_REASON_RECONCILE,
 };
-use crate::storage::client::{FredErrOrigin, ValkeyClient, POOL_LABEL_MAINTENANCE};
+use crate::storage::client::{
+    is_wrongtype_reply, FredErrOrigin, ValkeyClient, POOL_LABEL_MAINTENANCE,
+};
 use crate::storage::ext_index_audit::{recount_ext_index, RecountOutcome};
 use crate::storage::external_values::{
     enqueue_ext_releases, hash_from_hex, pending_member_hash_hex, recon_claim_expired,
     recon_retire, try_acquire_gc_leader, ExtRelease,
 };
-use crate::storage::keys::KeySchema;
+use crate::storage::keys::{sha256_to_hex, KeySchema};
 use crate::storage::leader_lease::LeaderIdentity;
-use crate::storage::orphan_sweep::{complete_pages, scan_keyspace};
+use crate::storage::lua::EXT_REF_COUNT_SET_SCRIPT;
+use crate::storage::orphan_sweep::scan_keyspace;
+use crate::storage::retirement::{page_by_cursor, scan_step_firsts, CursorPageReader};
+use crate::storage::scan_guard::{
+    collect_keyspace_agreed, keyspace_walks_agree, page_by_rank_counted, walk_counted, CountedScan,
+    CountedStepTaker, GuardedStep, KeyedWalk, KeyspaceWalk, RankPageTaker, RankWalk, ServingChange,
+    WalkError, WalkIncomplete, Witness, WitnessMissing, WALK_STEP_ATTEMPTS,
+};
 use crate::storage::time_sample_merge::{merge_signed_zero_rows, negative_zero_sections};
 
 /// `COUNT` hint for every cursored enumeration in the pass. Matches the orphan
@@ -509,6 +697,58 @@ enum PassError {
     /// handled per-candidate rather than per-pass — the member keeps its
     /// first-observation score and is re-claimed next pass.
     Repair(String),
+    /// A failure reading one object's references, in the authoritative walk
+    /// only ([`in_object`]): `source`, with the object it was reading and,
+    /// where the failing read names one key, that key. The periodic walk
+    /// returns `source` bare.
+    InObject {
+        object_id: String,
+        key: Option<String>,
+        source: Box<PassError>,
+    },
+    /// A guarded walk crossed a change of serving process (the periodic
+    /// pass's) or of the slot map, or its node pin missed its primary's slots
+    /// (`storage::scan_guard`): its result may have skipped members. Not a
+    /// fred error, so never counted on `valkey_errors_total`. The periodic
+    /// pass forfeits; the restore Job's recount fails, exit 1. Boxed: the
+    /// `NotOwner` case carries two slot sets.
+    ServingChanged(Box<ServingChange>),
+    /// A guarded walk's `INFO server` reported no usable run_id (the
+    /// periodic pass's walks), or a keyspace walk's `CLUSTER NODES` no
+    /// usable myself line (`storage::scan_guard`): the walk cannot be
+    /// checked. Not a fred error. The periodic pass forfeits; the recount
+    /// fails, exit 3.
+    WitnessMissing(WitnessMissing),
+    /// One of the recount's walks whose completeness proof did not hold
+    /// (`storage::scan_guard`, *The DR Jobs' walks*): the store changed while
+    /// the Job read it. Not a fred error. Only the recount's walks make it;
+    /// the recount fails, exit 1, before any count is set. Boxed, as
+    /// `WalkError` boxes it.
+    Incomplete(Box<WalkIncomplete>),
+}
+
+/// A guarded walk's error ([`WalkError`]) as the pass's: a step that failed
+/// transiently on every attempt, or deterministically on its first, is
+/// `step_op`'s store fault, a guard read's failure its own
+/// command's, both counted by [`valkey_err`]; a change, a missing witness or
+/// an incomplete walk keeps its own variant and is not counted.
+fn walk_err(client: &ValkeyClient, step_op: &'static str, e: WalkError) -> PassError {
+    match e {
+        WalkError::Step { source, .. } => valkey_err(client, step_op, source),
+        WalkError::Read { op, source } => valkey_err(client, op, source),
+        WalkError::Changed(change) => PassError::ServingChanged(change),
+        WalkError::WitnessMissing(missing) => PassError::WitnessMissing(missing),
+        WalkError::Incomplete(incomplete) => PassError::Incomplete(incomplete),
+    }
+}
+
+/// `object {id}`, or `{key} (object {id})` when the key is known: what a
+/// [`PassError::InObject`] names.
+fn object_label(object_id: &str, key: Option<&str>) -> String {
+    match key {
+        Some(key) => format!("{key} (object {object_id})"),
+        None => format!("object {object_id}"),
+    }
 }
 
 impl std::fmt::Display for PassError {
@@ -525,6 +765,14 @@ impl std::fmt::Display for PassError {
                 write!(f, "could not decode {what}: {text:?}")
             }
             PassError::Repair(msg) => write!(f, "could not publish a repair: {msg}"),
+            PassError::InObject {
+                object_id,
+                key,
+                source,
+            } => write!(f, "{source} ({})", object_label(object_id, key.as_deref())),
+            PassError::ServingChanged(change) => write!(f, "{change}"),
+            PassError::WitnessMissing(missing) => write!(f, "{missing}"),
+            PassError::Incomplete(incomplete) => write!(f, "{incomplete}"),
         }
     }
 }
@@ -547,7 +795,8 @@ pub fn ext_reconcile_grace(rpc_deadline_ms: u64) -> Duration {
 ///
 /// Runs one pass immediately on start, then every `interval`. Each tick is gated
 /// on the shared `le:gc:leader` lease — the same lease the GC sweep, the
-/// orphan sweep and the external-value backup repair take, each on its own
+/// orphan sweep, the external-value backup repair and the checkpoint clean-up
+/// take, each on its own
 /// interval (SDD §22.7.2's precedent: independent cadences, one lease). The GC loop's once-a-second pass is far too
 /// frequent for a keyspace walk, which is why this does not ride it as a step.
 ///
@@ -564,7 +813,8 @@ pub fn ext_reconcile_grace(rpc_deadline_ms: u64) -> Duration {
 /// phase 5 is not a hazard, and leaving the remainder for the next pass is free.
 ///
 /// `leader` is the process-wide [`LeaderIdentity`] — the same one the GC task,
-/// the orphan sweep and the external-value backup repair hold on
+/// the orphan sweep, the external-value backup repair and the checkpoint
+/// clean-up hold on
 /// `le:gc:leader`. Its marked GC lock value
 /// ([`LeaderIdentity::gc_lock_value`]) is what the lock stores; its
 /// `service_label` alone labels this task's gauges.
@@ -824,13 +1074,16 @@ async fn run_pass(
     //
     // The audit repairs, or gates, every object whose `obj:ext` disagrees with
     // its rows BEFORE phases 4 and 5 can drain anything — see `walk_objects`.
-    let (referenced, audit) = walk_objects(
+    let ObjectWalk {
+        referenced, audit, ..
+    } = walk_objects(
         client,
         keys,
         budget,
         started,
         cancel,
         metrics.map(|m| m.as_ref()),
+        WalkMode::Periodic,
     )
     .await?;
 
@@ -1090,6 +1343,22 @@ async fn valkey_time_ms(client: &ValkeyClient) -> Result<u64, PassError> {
 /// the audit see the merged rows. The merge's own failures are counted and
 /// logged inside it and never forfeit the pass; the second listing, like
 /// every read of this walk, does.
+///
+/// # The authoritative mode
+///
+/// [`WalkMode::Authoritative`] (the restore Job's recount,
+/// [`recount_authoritative`]) writes nothing: it runs neither the
+/// signed-zero merge nor the index audit, and so holds no hash on drift. It
+/// counts each object's references exactly as the periodic mode does — rows
+/// ∪ `obj:ext` — and fails on every arm the periodic mode forfeits on (module
+/// header, "No silent omission"). It also records the largest decimal object
+/// id it walked, for the counter floor's surviving term. Its header walk is
+/// the first of an agreeing pair (`storage::scan_guard`, *The DR Jobs'
+/// walks*): it counts each object once, however often the walk returns its
+/// header, and records the ids it counted; once it ends, a second walk of
+/// the headers, reading only keys, must return exactly those ids, or the
+/// walk fails ([`PassError::Incomplete`]) before the caller sets any count.
+#[allow(clippy::too_many_arguments)]
 async fn walk_objects(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -1097,45 +1366,82 @@ async fn walk_objects(
     started: Instant,
     cancel: &CancellationToken,
     metrics: Option<&Metrics>,
-) -> Result<(HashMap<[u8; 32], u64>, IndexAudit), PassError> {
+    mode: WalkMode,
+) -> Result<ObjectWalk, PassError> {
     let prefix = keys.prefix();
     // Same population and the same key shape the orphan sweep enumerates. The
     // braces are the literal Cluster hash tag, so the glob goes inside them.
-    let pattern = format!("{prefix}{{*}}:obj:hdr");
+    let pattern = keys.obj_header_scan_pattern();
 
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let scan_client = maint_pool.next();
-    let mut stream = scan_keyspace(scan_client, &pattern);
+    const PHASE: &str = "the object walk";
+    // The periodic pass's guarded keyspace walk
+    // (`storage::scan_guard::KeyspaceWalk::start`): each primary's commands
+    // go to one named node, every step's keys come back only once the
+    // witness sent in its pipeline matched its primary's start, and the walk
+    // ends only once its end fingerprint matched its start's. The recount's
+    // is the first of an agreeing pair (`KeyspaceWalk::start_job`: the pins
+    // and ownership checks, no witness), its result checked against a second
+    // walk below. A change of serving process or slot map, or a node pin that
+    // missed its primary's slots, ends either with an error, which forfeits
+    // the pass (or fails the recount) like any walk error.
+    let start_walk = async {
+        match mode {
+            WalkMode::Periodic => KeyspaceWalk::start(scan_client, &pattern).await,
+            WalkMode::Authoritative => KeyspaceWalk::start_job(scan_client, &pattern).await,
+        }
+    };
+    let mut walk = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(PassError::Cancelled { phase: PHASE }),
+        walk = start_walk => {
+            walk.map_err(|e| walk_err(client, OP_SCAN_HEADERS, e))?
+        }
+    };
+    let mut page = Vec::new().into_iter();
 
     let mut referenced: HashMap<[u8; 32], u64> = HashMap::new();
     let mut audit = IndexAudit::default();
+    let mut objects: u64 = 0;
+    let mut max_object_id: Option<u64> = None;
+    // The recount's: every object id it counted, once each, for the second
+    // walk to agree with.
+    let mut counted: HashSet<String> = HashSet::new();
 
     loop {
         // Cancellation forfeits rather than truncating — a short walk omits
         // every hash the objects it never reached reference, and an omitted
         // reference reads as surplus on each of them.
-        let next = tokio::select! {
-            // `biased` so a cancel that arrives while pages are still
-            // streaming is taken on the first boundary after it, not on a
-            // coin-flip: "cancellation aborts the whole pass" is a claim the
-            // module header makes without qualification, and random branch
-            // selection would make it a claim about the average case.
-            biased;
-            () = cancel.cancelled() => return Err(PassError::Cancelled {
-                phase: "the object walk",
-            }),
-            item = stream.next() => item,
+        let Some(fred_key) = page.next() else {
+            let next = tokio::select! {
+                // `biased` so a cancel that arrives while a step is in flight
+                // is taken at once, not on a coin-flip: "cancellation aborts
+                // the whole pass" is a claim the module header makes without
+                // qualification, and random branch selection would make it a
+                // claim about the average case.
+                biased;
+                () = cancel.cancelled() => return Err(PassError::Cancelled { phase: PHASE }),
+                next = walk.next_page() => next,
+            };
+            // NOT `continue` on an error — see the module header. A skipped
+            // object omits every hash it references, which reads as surplus
+            // on each of them.
+            match next.map_err(|e| walk_err(client, OP_SCAN_HEADERS, e))? {
+                Some(keys) => {
+                    page = keys.into_iter();
+                    continue;
+                }
+                None => break,
+            }
         };
-        let Some(scan_result) = next else { break };
-
-        if started.elapsed() > budget {
-            return Err(PassError::BudgetElapsed {
-                phase: "the object walk",
-            });
+        // And at every key between two steps.
+        if cancel.is_cancelled() {
+            return Err(PassError::Cancelled { phase: PHASE });
         }
-        // NOT `continue` — see the module header. A skipped object omits every
-        // hash it references, which reads as surplus on each of them.
-        let fred_key = scan_result.map_err(|e| valkey_err(client, "SCAN obj:hdr", e))?;
+        if started.elapsed() > budget {
+            return Err(PassError::BudgetElapsed { phase: PHASE });
+        }
         let Some(key) = fred_key.as_str() else {
             return Err(PassError::Undecodable {
                 what: "an obj:hdr key",
@@ -1150,28 +1456,62 @@ async fn walk_objects(
                 text: key.to_string(),
             });
         };
-
-        // The signed-zero merge, before the object's references are read:
-        // a legacy `-0.0` time-sample row is folded into the `+0.0` key
-        // (`storage::time_sample_merge`), and the object is listed again, so
-        // the reference read and the index audit below see the merged rows.
-        // Never forfeits the pass: its failures are counted and logged inside
-        // the merge, and the walk goes on with the fresh listing.
-        let mut members = list_value_members(client, keys, &object_id).await?;
-        let legacy_sections = negative_zero_sections(&members.time_samples);
-        if !legacy_sections.is_empty() {
-            let merge =
-                merge_signed_zero_rows(client, keys, &object_id, &legacy_sections, metrics).await;
-            audit.time_sample_rows_merged += merge.rows_merged();
-            members = list_value_members(client, keys, &object_id).await?;
+        // The recount counts each object once: a header the walk returns
+        // again (a SCAN may repeat a key) is skipped. The periodic pass keeps
+        // its double count, which only errs high (a leak).
+        if mode == WalkMode::Authoritative && !counted.insert(object_id.clone()) {
+            continue;
         }
 
-        let refs = object_referenced_hashes(client, keys, &object_id, &members).await?;
+        let refs = match mode {
+            // The restore Job's recount: the object's indices are read by
+            // rank pages and counted `HSCAN` steps, each folded before the
+            // next, so what it holds per object is one page, one row chunk
+            // and one `HSCAN` step, however many rows it has
+            // ([`object_referenced_hashes_paged`]). No
+            // signed-zero merge (a write): it reads both rows of a `-0.0` /
+            // `+0.0` pair, and its hash set counts their hashes once. A
+            // failure reading the references names the object, and the key
+            // where the failing read names one, for the Job's ERROR.
+            WalkMode::Authoritative => {
+                object_referenced_hashes_paged(client, keys, &object_id, ROW_HASH_CHUNK_ROWS)
+                    .await
+                    .map_err(|e| in_object(keys, &object_id, e))?
+            }
+            // The periodic pass keeps its whole listings: the signed-zero
+            // merge needs the whole time-sample list. The merge runs before
+            // the object's references are read: a legacy `-0.0` time-sample
+            // row is folded into the `+0.0` key
+            // (`storage::time_sample_merge`), and the object is listed again,
+            // so the reference read and the index audit below see the merged
+            // rows. Never forfeits the pass: its failures are counted and
+            // logged inside the merge, and the walk goes on with the fresh
+            // listing.
+            WalkMode::Periodic => {
+                let mut members = list_value_members(client, keys, &object_id).await?;
+                let legacy_sections = negative_zero_sections(&members.time_samples);
+                if !legacy_sections.is_empty() {
+                    let merge =
+                        merge_signed_zero_rows(client, keys, &object_id, &legacy_sections, metrics)
+                            .await;
+                    audit.time_sample_rows_merged += merge.rows_merged();
+                    members = list_value_members(client, keys, &object_id).await?;
+                }
+                object_referenced_hashes(client, keys, &object_id, &members).await?
+            }
+        };
         for hash in &refs.hashes {
             *referenced.entry(*hash).or_insert(0) += 1;
         }
+        objects += 1;
+        if let Ok(id) = object_id.parse::<u64>() {
+            max_object_id = Some(max_object_id.map_or(id, |max| max.max(id)));
+        }
 
-        if refs.index_mismatch.is_empty() {
+        // The index audit is a write, and its drift gate guards a drain the
+        // authoritative mode never makes: that mode counts the object's
+        // references as rows ∪ `obj:ext` above and moves on.
+        if mode == WalkMode::Authoritative || refs.index_mismatch.is_empty() {
             continue;
         }
         audit.mismatched_objects += 1;
@@ -1228,7 +1568,74 @@ async fn walk_objects(
         }
     }
 
-    Ok((referenced, audit))
+    // The recount's second walk of the headers, started only now that the
+    // first has answered its end (`storage::scan_guard`, *The DR Jobs'
+    // walks*): it reads only keys, and must return exactly the objects the
+    // first counted before any count is set. Each page's object ids go
+    // straight into `walked`, so the walk holds its id set and one page.
+    if mode == WalkMode::Authoritative {
+        let mut second = KeyspaceWalk::start_job(scan_client, &pattern)
+            .await
+            .map_err(|e| walk_err(client, OP_SCAN_HEADERS, e))?;
+        let mut walked: HashSet<String> = HashSet::with_capacity(counted.len());
+        // `None` only once the walk's end checks held.
+        while let Some(page) = second
+            .next_page()
+            .await
+            .map_err(|e| walk_err(client, OP_SCAN_HEADERS, e))?
+        {
+            for fred_key in page {
+                let Some(key) = fred_key.as_str() else {
+                    return Err(PassError::Undecodable {
+                        what: "an obj:hdr key",
+                        text: format!("{fred_key:?}"),
+                    });
+                };
+                let Some(object_id) =
+                    crate::storage::orphan_sweep::extract_hash_tag_id(key, prefix, ":obj:hdr")
+                else {
+                    return Err(PassError::Undecodable {
+                        what: "an object_id from an obj:hdr key",
+                        text: key.to_string(),
+                    });
+                };
+                walked.insert(object_id);
+            }
+        }
+        keyspace_walks_agree(&pattern, &counted, &walked)
+            .map_err(|e| walk_err(client, OP_SCAN_HEADERS, e))?;
+    }
+
+    Ok(ObjectWalk {
+        referenced,
+        audit,
+        objects,
+        max_object_id,
+    })
+}
+
+/// Which pass the object walk serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkMode {
+    /// The periodic reconcile pass: the signed-zero merge and the index audit
+    /// run, and the audit's drift gate is filled.
+    Periodic,
+    /// The restore Job's recount ([`recount_authoritative`]): read-only, no
+    /// merge, no audit, no gate.
+    Authoritative,
+}
+
+/// What the object walk read.
+#[derive(Debug, Default)]
+struct ObjectWalk {
+    /// Per hash, how many objects reference it (rows ∪ `obj:ext`).
+    referenced: HashMap<[u8; 32], u64>,
+    /// The index audit's findings (periodic mode only; empty otherwise).
+    audit: IndexAudit,
+    /// How many object headers the walk read.
+    objects: u64,
+    /// The largest decimal object id among them.
+    max_object_id: Option<u64>,
 }
 
 /// What phase 2's per-object index audit found, for the drain gate and the
@@ -1253,7 +1660,55 @@ struct IndexAudit {
     time_sample_rows_merged: u64,
 }
 
-/// An object's value-row index members, as the walk lists them.
+/// The object walk's per-object reads, by the `op` or `what` its
+/// [`PassError`] carries: the periodic pass's whole listings and index read,
+/// and the restore Job's recount's rank pages (`ZRANGE`, as the listings)
+/// and `HSCAN` steps, whose failures [`in_object`] locates at their key.
+const OP_LIST_FIELDS: &str = "ZRANGE obj:flds";
+const OP_LIST_TIME_SAMPLES: &str = "ZRANGE obj:tss";
+const OP_READ_EXT_INDEX: &str = "HGETALL obj:ext";
+const OP_DECODE_EXT_INDEX: &str = "decode HGETALL obj:ext";
+const OP_SCAN_EXT_INDEX: &str = "HSCAN obj:ext";
+/// The keyspace walks' and the owed walks' steps, by the `op` their
+/// [`PassError`] carries: the periodic pass's `ZSCAN` of `inflight`, the
+/// recount's `ZRANGE` pages of it.
+const OP_SCAN_HEADERS: &str = "SCAN obj:hdr";
+const OP_SCAN_CARRIERS: &str = "SCAN obj:extret";
+const OP_SCAN_PENDING: &str = "SSCAN ext_pending";
+const OP_SCAN_INFLIGHT: &str = "ZSCAN ext_inflight";
+const OP_PAGE_INFLIGHT: &str = "ZRANGE ext_inflight";
+const WHAT_EXT_INDEX_FIELD: &str = "an obj:ext field during the reconcile object walk";
+
+/// The authoritative walk's failure reading `object_id`'s references: the
+/// error with the object and, where the failing read names one key, that key
+/// ([`PassError::InObject`]): a `ZRANGE` page of `obj:flds` or `obj:tss`, an
+/// `HSCAN` step of `obj:ext`, or an `obj:ext` field that is not a hash. The
+/// row-hash pipelines' failures (a server error on any row, a reply that
+/// does not decode, a wrong arity, a row `hash` column that is not a hash)
+/// name the object alone: a pipeline answers for all its keys at once. A
+/// count check that did not hold ([`PassError::Incomplete`]) names its key
+/// itself.
+fn in_object(keys: &KeySchema, object_id: &str, source: PassError) -> PassError {
+    let key = match &source {
+        PassError::Valkey { op, .. } => match *op {
+            OP_LIST_FIELDS => Some(keys.obj_fields_index(object_id)),
+            OP_LIST_TIME_SAMPLES => Some(keys.obj_time_samples_index(object_id)),
+            OP_SCAN_EXT_INDEX => Some(keys.obj_ext_index(object_id)),
+            _ => None,
+        },
+        PassError::Undecodable { what, .. } if *what == WHAT_EXT_INDEX_FIELD => {
+            Some(keys.obj_ext_index(object_id))
+        }
+        _ => None,
+    };
+    PassError::InObject {
+        object_id: object_id.to_owned(),
+        key,
+        source: Box::new(source),
+    }
+}
+
+/// An object's value-row index members, as the periodic walk lists them.
 struct ValueMembers {
     /// `obj:flds` members, `{section_id}:{hex(key_name)}`.
     fields: Vec<String>,
@@ -1261,7 +1716,10 @@ struct ValueMembers {
     time_samples: Vec<String>,
 }
 
-/// List an object's `obj:flds` and `obj:tss` members.
+/// List an object's `obj:flds` and `obj:tss` members, each whole in one
+/// `ZRANGE 0 -1`: the periodic pass's listing, which its signed-zero merge
+/// needs whole. The restore Job's recount pages them instead
+/// ([`object_referenced_hashes_paged`]).
 async fn list_value_members(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -1281,7 +1739,7 @@ async fn list_value_members(
             false,
         )
         .await
-        .map_err(|e| valkey_err(client, "ZRANGE obj:flds", e))?;
+        .map_err(|e| valkey_err(client, OP_LIST_FIELDS, e))?;
     let time_samples: Vec<String> = conn
         .zrange::<Vec<String>, _, _, _>(
             keys.obj_time_samples_index(object_id),
@@ -1293,7 +1751,7 @@ async fn list_value_members(
             false,
         )
         .await
-        .map_err(|e| valkey_err(client, "ZRANGE obj:tss", e))?;
+        .map_err(|e| valkey_err(client, OP_LIST_TIME_SAMPLES, e))?;
     Ok(ValueMembers {
         fields,
         time_samples,
@@ -1309,7 +1767,8 @@ struct ObjectReferences {
     /// raw `hash` column names it: a field absent for a hash some row holds, a
     /// field present for a hash no row holds, a stored count that differs, or a
     /// stored value that is not a positive decimal count. Empty when the index
-    /// agrees with the rows.
+    /// agrees with the rows, and always in the restore Job's recount, which
+    /// runs no index audit ([`object_referenced_hashes_paged`]).
     ///
     /// Compared on the RAW `hash` column, at no read beyond the union's own,
     /// while the index counts by the decoder's rule (a row with a `value`
@@ -1320,87 +1779,160 @@ struct ObjectReferences {
     index_mismatch: Vec<[u8; 32]>,
 }
 
-/// The distinct external hashes one object references — rows ∪ `obj:ext` —
-/// and the hashes whose index field disagrees with the rows, for the rows
-/// `members` lists ([`list_value_members`]).
+/// The most row-hash reads one pipeline of the object walk queues
+/// ([`fold_row_hash_chunk`]): 1,024 rows. Every pipelined command holds
+/// client memory until the pipeline's replies are read, about 2.5 KB each
+/// [measured: the recount held 1,707 MiB of heap reading a 194,000-spec
+/// object's 719,922 rows in one pipeline, record
+/// `restore-memory-envelope-tv3-20261022`], so a chunk holds about 2.5 MB
+/// whatever the object's size. The cost is one round trip per chunk: 704 for
+/// that object (⌈719,922 / 1,024⌉).
+///
+/// In the restore Job's recount it is also the page: each `ZRANGE` page of
+/// `obj:flds` and `obj:tss` (and of `inflight`) spans this many ranks, so a
+/// page's rows are one chunk, and each `HSCAN` of `obj:ext` asks for this
+/// many elements ([`object_referenced_hashes_paged`]). The periodic pass's
+/// two listings stay whole ([`list_value_members`]): its signed-zero merge
+/// needs the whole time-sample list.
+pub const ROW_HASH_CHUNK_ROWS: usize = 1_024;
+
+/// The objects whose row-hash chunks lose their last reply, by their `obj:ext`
+/// key ([`arm_row_hash_reply_drop_for_test`]). Compiled out of release builds.
+#[cfg(any(test, feature = "test-support"))]
+static ROW_HASH_REPLY_DROP: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Test seam: every row-hash chunk the walk reads for the object whose
+/// `obj:ext` key is `ext_index_key` loses its last reply, as a misaligned
+/// pipeline reply would, until the returned guard drops; so a test can see
+/// the walk's arity check fail closed. Keyed by the prefixed key, so tests
+/// sharing a process do not reach each other's objects. Compiled out of
+/// release builds.
+#[cfg(any(test, feature = "test-support"))]
+pub fn arm_row_hash_reply_drop_for_test(ext_index_key: &str) -> ArmedRowHashReplyDrop {
+    ROW_HASH_REPLY_DROP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(ext_index_key.to_owned());
+    ArmedRowHashReplyDrop {
+        ext_index_key: ext_index_key.to_owned(),
+    }
+}
+
+/// The armed seam of [`arm_row_hash_reply_drop_for_test`]; disarms its
+/// object when dropped. Bind it (`let _armed = …`) for as long as the walk
+/// should be cut. Compiled out of release builds.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use = "the seam is disarmed when this guard drops"]
+#[derive(Debug)]
+pub struct ArmedRowHashReplyDrop {
+    ext_index_key: String,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ArmedRowHashReplyDrop {
+    fn drop(&mut self) {
+        let mut armed = ROW_HASH_REPLY_DROP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = armed.iter().position(|key| *key == self.ext_index_key) {
+            armed.swap_remove(at);
+        }
+    }
+}
+
+/// `replies` less its last reply when the seam is armed for the object whose
+/// `obj:ext` key is `ext_index_key`; `replies` unchanged otherwise.
+#[cfg(any(test, feature = "test-support"))]
+fn drop_a_row_hash_reply_if_armed(ext_index_key: &str, mut replies: Vec<Value>) -> Vec<Value> {
+    let armed = ROW_HASH_REPLY_DROP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|key| key == ext_index_key);
+    if armed {
+        replies.pop();
+    }
+    replies
+}
+
+/// The periodic pass's read of one object's references: the distinct
+/// external hashes it references — rows ∪ `obj:ext` — and the hashes whose
+/// index field disagrees with the rows, for the rows `members` lists
+/// ([`list_value_members`]), the rows read [`ROW_HASH_CHUNK_ROWS`] at a time
+/// ([`object_referenced_hashes_in_chunks`]).
 async fn object_referenced_hashes(
     client: &ValkeyClient,
     keys: &KeySchema,
     object_id: &str,
     members: &ValueMembers,
 ) -> Result<ObjectReferences, PassError> {
+    object_referenced_hashes_in_chunks(client, keys, object_id, members, ROW_HASH_CHUNK_ROWS).await
+}
+
+/// [`object_referenced_hashes`], the rows read `chunk_rows` at a time
+/// ([`fold_row_hash_chunk`]), each chunk folded into the hash set and the raw
+/// per-hash row counts before the next is queued, so the client holds one
+/// chunk's commands and replies at once, not the object's. Then the index's
+/// `HGETALL`, alone, once every row is counted: the reads are no more atomic
+/// with each other than the one pipeline they replace was.
+///
+/// What the periodic walk still holds per object grows with it, all of it far
+/// below the pipeline it replaces: the two index listings
+/// ([`list_value_members`]), the index reply, one field per distinct hash the
+/// index names, and the hash set and the per-hash row counts, one entry per
+/// distinct hash. The restore Job's recount holds none of the per-row terms
+/// ([`object_referenced_hashes_paged`]).
+async fn object_referenced_hashes_in_chunks(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    object_id: &str,
+    members: &ValueMembers,
+    chunk_rows: usize,
+) -> Result<ObjectReferences, PassError> {
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let conn = maint_pool.next();
-
-    let mut row_keys: Vec<String> =
-        Vec::with_capacity(members.fields.len() + members.time_samples.len());
-    for member in &members.fields {
-        row_keys.push(keys.obj_field_from_member(object_id, member));
-    }
-    for member in &members.time_samples {
-        row_keys.push(keys.obj_ts_from_member(object_id, member));
-    }
 
     let mut hashes: HashSet<[u8; 32]> = HashSet::new();
     // Raw per-hash row counts, for the index audit below.
     let mut row_counts: HashMap<[u8; 32], u64> = HashMap::new();
 
-    // One pipelined `HGET <row> hash` per row plus the index `HGETALL`, so an
-    // object costs one round trip for its rows however many it has.
-    let pipeline = conn.pipeline();
-    for row_key in &row_keys {
-        let _: () = pipeline
-            .hget(row_key.as_str(), "hash")
-            .await
-            .map_err(|e| valkey_err(client, "queue HGET row hash", e))?;
+    // Each chunk's row keys, built as the chunk is queued: the field rows',
+    // then the time-sample rows'.
+    let mut rows = members
+        .fields
+        .iter()
+        .map(|member| keys.obj_field_from_member(object_id, member))
+        .chain(
+            members
+                .time_samples
+                .iter()
+                .map(|member| keys.obj_ts_from_member(object_id, member)),
+        );
+    loop {
+        let chunk: Vec<String> = rows.by_ref().take(chunk_rows.max(1)).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        fold_row_hash_chunk(
+            client,
+            conn,
+            keys,
+            object_id,
+            chunk,
+            &mut hashes,
+            Some(&mut row_counts),
+        )
+        .await?;
     }
-    let _: () = pipeline
+
+    // The index: one field per distinct hash the object's index names.
+    let index_reply: Value = conn
         .hgetall(keys.obj_ext_index(object_id))
         .await
-        .map_err(|e| valkey_err(client, "queue HGETALL obj:ext", e))?;
-    let mut replies: Vec<Value> = pipeline
-        .all()
-        .await
-        .map_err(|e| valkey_err(client, "HGET row hashes + HGETALL obj:ext", e))?;
-
-    // The index reply is the last queued command's frame. A misaligned reply
-    // vector would attribute one row's hash to another row, so the length is
-    // checked rather than assumed — same posture as `read_ext_pre_image`.
-    let index_reply = replies.pop().unwrap_or(Value::Null);
-    if replies.len() != row_keys.len() {
-        return Err(PassError::Undecodable {
-            what: "a row-hash pipeline reply of the expected arity",
-            text: format!("{} frames for {} rows", replies.len(), row_keys.len()),
-        });
-    }
-
-    for reply in replies {
-        let hash_hex: Option<String> = reply
-            .convert()
-            .map_err(|e| valkey_err(client, "decode HGET row hash", e))?;
-        let Some(hash_hex) = hash_hex else { continue };
-        match hash_from_hex(&hash_hex) {
-            Some(hash) => {
-                hashes.insert(hash);
-                *row_counts.entry(hash).or_insert(0) += 1;
-            }
-            // Fail closed. A row whose hash cannot be named is a reference this
-            // walk would silently omit, and an omitted reference reads as
-            // surplus on the blob it points at. Forfeiting the pass leaves the
-            // surplus standing, which is the safe direction; the WARN in
-            // `run_one_pass` names the failure so the corruption is visible.
-            None => {
-                return Err(PassError::Undecodable {
-                    what: "a value row's hash column during the reconcile object walk",
-                    text: hash_hex,
-                })
-            }
-        }
-    }
-
+        .map_err(|e| valkey_err(client, OP_READ_EXT_INDEX, e))?;
     let raw_index: HashMap<String, String> = index_reply
         .convert()
-        .map_err(|e| valkey_err(client, "decode HGETALL obj:ext", e))?;
+        .map_err(|e| valkey_err(client, OP_DECODE_EXT_INDEX, e))?;
     let mut index_mismatch: Vec<[u8; 32]> = Vec::new();
     let mut indexed: HashSet<[u8; 32]> = HashSet::with_capacity(raw_index.len());
     for (hash_hex, stored) in &raw_index {
@@ -1417,7 +1949,7 @@ async fn object_referenced_hashes(
             }
             None => {
                 return Err(PassError::Undecodable {
-                    what: "an obj:ext field during the reconcile object walk",
+                    what: WHAT_EXT_INDEX_FIELD,
                     text: hash_hex.clone(),
                 })
             }
@@ -1434,6 +1966,275 @@ async fn object_referenced_hashes(
         hashes,
         index_mismatch,
     })
+}
+
+/// Fold one chunk of an object's row keys, `row_keys`, into `hashes`: one
+/// pipelined `HGET <row> hash` per row on `conn`, its replies folded before
+/// the caller queues the next chunk, and, with `row_counts`, each hash's raw
+/// row count (the periodic pass's index audit). The one chunk fold of both
+/// walk modes ([`object_referenced_hashes_in_chunks`],
+/// [`object_referenced_hashes_paged`]).
+///
+/// The raw `hash` column decides: a row with no `hash` holds no external
+/// value, and a dual-shape row's `hash` is counted (a high count only leaks).
+/// The reply's arity is checked, and a column `hash_from_hex` rejects fails
+/// closed.
+async fn fold_row_hash_chunk(
+    client: &ValkeyClient,
+    conn: &fred::clients::Client,
+    keys: &KeySchema,
+    object_id: &str,
+    row_keys: Vec<String>,
+    hashes: &mut HashSet<[u8; 32]>,
+    mut row_counts: Option<&mut HashMap<[u8; 32], u64>>,
+) -> Result<(), PassError> {
+    let rows = row_keys.len();
+    let pipeline = conn.pipeline();
+    for row_key in row_keys {
+        let _: () = pipeline
+            .hget(row_key, "hash")
+            .await
+            .map_err(|e| valkey_err(client, "queue HGET row hash", e))?;
+    }
+    let replies: Vec<Value> = pipeline
+        .all()
+        .await
+        .map_err(|e| valkey_err(client, "HGET row hashes", e))?;
+    #[cfg(any(test, feature = "test-support"))]
+    let replies = drop_a_row_hash_reply_if_armed(&keys.obj_ext_index(object_id), replies);
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = (keys, object_id);
+
+    // A misaligned reply vector would attribute one row's hash to another
+    // row, so each chunk's length is checked rather than assumed — same
+    // posture as `read_ext_pre_image`.
+    if replies.len() != rows {
+        return Err(PassError::Undecodable {
+            what: "a row-hash pipeline reply of the expected arity",
+            text: format!("{} frames for {rows} rows", replies.len()),
+        });
+    }
+
+    for reply in replies {
+        let hash_hex: Option<String> = reply
+            .convert()
+            .map_err(|e| valkey_err(client, "decode HGET row hash", e))?;
+        let Some(hash_hex) = hash_hex else { continue };
+        match hash_from_hex(&hash_hex) {
+            Some(hash) => {
+                hashes.insert(hash);
+                if let Some(counts) = row_counts.as_deref_mut() {
+                    *counts.entry(hash).or_insert(0) += 1;
+                }
+            }
+            // Fail closed. A row whose hash cannot be named is a reference
+            // this walk would silently omit, and an omitted reference reads
+            // as surplus on the blob it points at. Forfeiting the pass leaves
+            // the surplus standing, which is the safe direction; the WARN in
+            // `run_one_pass` names the failure so the corruption is visible.
+            // The recount fails, exit 3.
+            None => {
+                return Err(PassError::Undecodable {
+                    what: "a value row's hash column during the reconcile object walk",
+                    text: hash_hex,
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The restore Job's recount's read of one object's references: the distinct
+/// external hashes it references, rows ∪ `obj:ext`, with no index audit
+/// (`index_mismatch` stays empty). `obj:flds` then `obj:tss` are read by
+/// ascending `ZRANGE` pages of `page` ranks with `ZCARD` in each page's
+/// pipeline (`storage::scan_guard::page_by_rank_counted`), each page's
+/// members turned into row keys and read in chunks of at most `page` rows
+/// ([`fold_row_hash_chunk`]), so one chunk a page; then `obj:ext` by counted
+/// `HSCAN … COUNT page` steps with `HLEN` in each step's pipeline
+/// (`storage::scan_guard::walk_counted`), each field de-duplicated by its
+/// text and decoded as a hash. Every page and step is folded into the object's
+/// hash set before the next is issued, on the maintenance pool: the three
+/// walks on one client of it, the row chunks on any client.
+///
+/// Complete because the Job runs it on a held, quiet store, where rank order
+/// and cardinality are the same on any process (`storage::scan_guard`, *The
+/// DR Jobs' walks*): each index is complete only when its pages returned the
+/// `ZCARD` read with the first page and the last page's `ZCARD` equals it,
+/// and `obj:ext` only when its distinct fields equal the `HLEN` read with
+/// its first and its last step; otherwise the read fails
+/// ([`PassError::Incomplete`]) before the caller sets any count.
+///
+/// What it holds per object, whatever the object's row count: one page's
+/// members, one chunk's commands and replies, and one `HSCAN` step; beside
+/// them, one entry per distinct hash in the object's set and the pass's
+/// maps, and one per distinct `obj:ext` field in its fields' set. A step
+/// whose reply does not pair, a
+/// page's or a step's error, a row hash or an `obj:ext` field that does not
+/// decode fails the read closed; the caller names the object and, for a
+/// page or a step, its key ([`in_object`]).
+async fn object_referenced_hashes_paged(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    object_id: &str,
+    page: usize,
+) -> Result<ObjectReferences, PassError> {
+    let (maint_pool, _maint_token) = client.acquire_maintenance();
+    // The one client every walk of this object holds for its pages and
+    // steps.
+    let walk_client = maint_pool.next();
+    let page = page.max(1);
+    let mut hashes: HashSet<[u8; 32]> = HashSet::new();
+    for (index_key, time_samples, op) in [
+        (keys.obj_fields_index(object_id), false, OP_LIST_FIELDS),
+        (
+            keys.obj_time_samples_index(object_id),
+            true,
+            OP_LIST_TIME_SAMPLES,
+        ),
+    ] {
+        page_by_rank_counted(
+            &RankWalk::new(walk_client, &index_key, false),
+            page as u64,
+            &mut RecountRowPages {
+                client,
+                pool: maint_pool,
+                keys,
+                object_id,
+                time_samples,
+                op,
+                chunk: page,
+                hashes: &mut hashes,
+            },
+        )
+        .await?;
+    }
+    walk_counted(
+        &CountedScan::hash(walk_client, &keys.obj_ext_index(object_id)),
+        page as u64,
+        &mut RecountExtFields {
+            client,
+            fields: HashSet::new(),
+            hashes: &mut hashes,
+        },
+    )
+    .await?;
+    Ok(ObjectReferences {
+        hashes,
+        index_mismatch: Vec::new(),
+    })
+}
+
+/// The recount's pages of one value index ([`object_referenced_hashes_paged`]):
+/// each page's members become row keys, read `chunk` rows to a pipeline.
+struct RecountRowPages<'w> {
+    client: &'w ValkeyClient,
+    /// The maintenance pool, for the row chunks.
+    pool: &'w fred::clients::Pool,
+    keys: &'w KeySchema,
+    object_id: &'w str,
+    /// `obj:tss` (else `obj:flds`): how a member names its row.
+    time_samples: bool,
+    op: &'static str,
+    chunk: usize,
+    hashes: &'w mut HashSet<[u8; 32]>,
+}
+
+/// The pass's error for a guarded keyed walk whose witness changed from
+/// `start` to `later` (the cursor pager's [`CursorPageReader::changed`]).
+fn changed_error(walk: &KeyedWalk<'_>, start: &Witness, later: &Witness) -> PassError {
+    PassError::ServingChanged(Box::new(walk.change(start, later)))
+}
+
+impl RankPageTaker for RecountRowPages<'_> {
+    type Error = PassError;
+
+    fn walk_error(&self, e: WalkError) -> PassError {
+        walk_err(self.client, self.op, e)
+    }
+
+    async fn take_page(&mut self, members: Vec<Value>) -> Result<(), PassError> {
+        let members: Vec<String> = Value::Array(members)
+            .convert()
+            .map_err(|e| valkey_err(self.client, self.op, e))?;
+        let (keys, object_id) = (self.keys, self.object_id);
+        let time_samples = self.time_samples;
+        // The page's members become its row keys, each member dropped as its
+        // key is built.
+        let mut rows = members.into_iter().map(|member| {
+            if time_samples {
+                keys.obj_ts_from_member(object_id, &member)
+            } else {
+                keys.obj_field_from_member(object_id, &member)
+            }
+        });
+        loop {
+            let chunk: Vec<String> = rows.by_ref().take(self.chunk.max(1)).collect();
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            fold_row_hash_chunk(
+                self.client,
+                self.pool.next(),
+                keys,
+                object_id,
+                chunk,
+                self.hashes,
+                None,
+            )
+            .await?;
+        }
+    }
+}
+
+/// The recount's counted steps over `obj:ext`
+/// ([`object_referenced_hashes_paged`]): each `HSCAN` step's fields,
+/// de-duplicated by their exact text into `fields` (whose size the count
+/// check compares with `HLEN`, which counts fields by their text), each
+/// decoded as a hash and folded into the object's set. A hash `obj:ext`
+/// holds in two letter cases (`hash_from_hex` accepts either) is two fields
+/// and one hash.
+struct RecountExtFields<'w> {
+    client: &'w ValkeyClient,
+    /// The distinct fields taken, by their text.
+    fields: HashSet<String>,
+    hashes: &'w mut HashSet<[u8; 32]>,
+}
+
+impl CountedStepTaker for RecountExtFields<'_> {
+    type Error = PassError;
+
+    fn walk_error(&self, e: WalkError) -> PassError {
+        walk_err(self.client, OP_SCAN_EXT_INDEX, e)
+    }
+
+    async fn take_step(&mut self, members: Vec<Value>) -> Result<(), PassError> {
+        let fields: Vec<String> = Value::Array(members)
+            .convert()
+            .map_err(|e| valkey_err(self.client, OP_SCAN_EXT_INDEX, e))?;
+        for field in fields {
+            match hash_from_hex(&field) {
+                Some(hash) => {
+                    self.hashes.insert(hash);
+                    self.fields.insert(field);
+                }
+                // A field the recount cannot name is a reference it would
+                // omit: exit 3. The field's count is not read; a field whose
+                // count is `0` or not decimal still names its hash.
+                None => {
+                    return Err(PassError::Undecodable {
+                        what: WHAT_EXT_INDEX_FIELD,
+                        text: field,
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn distinct(&self) -> u64 {
+        self.fields.len() as u64
+    }
 }
 
 /// Phase 2b — fold the retirement intents' carriers into `owed`.
@@ -1524,62 +2325,112 @@ async fn walk_retire_carriers(
 
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let conn = maint_pool.next();
-    let mut stream = scan_keyspace(conn, &pattern);
+    const PHASE: &str = "the retire-carrier walk";
+    // The guarded keyspace walk, as in the object walk.
+    let mut walk = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(PassError::Cancelled { phase: PHASE }),
+        walk = KeyspaceWalk::start(conn, &pattern) => {
+            walk.map_err(|e| walk_err(client, OP_SCAN_CARRIERS, e))?
+        }
+    };
+    let mut page = Vec::new().into_iter();
 
     loop {
-        let next = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(PassError::Cancelled {
-                phase: "the retire-carrier walk",
-            }),
-            item = stream.next() => item,
-        };
-        let Some(scan_result) = next else { break };
-
-        if started.elapsed() > budget {
-            return Err(PassError::BudgetElapsed {
-                phase: "the retire-carrier walk",
-            });
-        }
-        let fred_key = scan_result.map_err(|e| valkey_err(client, "SCAN obj:extret", e))?;
-        let Some(carrier_key) = fred_key.as_str() else {
-            return Err(PassError::Undecodable {
-                what: "an obj:extret key",
-                text: format!("{fred_key:?}"),
-            });
-        };
-
-        // TYPE dispatch (b.1jt): this build's carriers are HASHes (member →
-        // 1), an older build's are SETs, and both are owed. A carrier deleted
-        // since the SCAN saw it (cleared, cancelled or dropped) owes nothing
-        // more. Any other type is not a carrier this walk can read, and an
-        // unread carrier would under-count `owed`, so it forfeits the pass.
-        let kind: String = conn
-            .r#type(carrier_key.to_string())
-            .await
-            .map_err(|e| valkey_err(client, "TYPE obj:extret", e))?;
-        let members: Vec<Value> = match kind.as_str() {
-            "hash" => conn
-                .hkeys(carrier_key.to_string())
-                .await
-                .map_err(|e| valkey_err(client, "HKEYS obj:extret", e))?,
-            "set" => conn
-                .smembers(carrier_key.to_string())
-                .await
-                .map_err(|e| valkey_err(client, "SMEMBERS obj:extret", e))?,
-            "none" => Vec::new(),
-            _ => {
-                return Err(PassError::Undecodable {
-                    what: "an obj:extret carrier of a type other than hash or set",
-                    text: format!("{carrier_key} is a {kind}"),
-                })
+        let Some(fred_key) = page.next() else {
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(PassError::Cancelled { phase: PHASE }),
+                next = walk.next_page() => next,
+            };
+            match next.map_err(|e| walk_err(client, OP_SCAN_CARRIERS, e))? {
+                Some(keys) => {
+                    page = keys.into_iter();
+                    continue;
+                }
+                None => break,
             }
         };
-        for value in &members {
-            tally_owed_member(value, owed)?;
+        if cancel.is_cancelled() {
+            return Err(PassError::Cancelled { phase: PHASE });
         }
+        if started.elapsed() > budget {
+            return Err(PassError::BudgetElapsed { phase: PHASE });
+        }
+        tally_carrier(client, conn, &fred_key, owed).await?;
     }
 
+    Ok(())
+}
+
+/// The restore Job's recount's carrier walk: the carriers' keys by an
+/// agreeing keyspace walk (`storage::scan_guard::collect_keyspace_agreed`:
+/// two walks of the pattern, the second after the first ends, used only
+/// when both returned the same set), then each carrier read whole into
+/// `owed` as the periodic walk reads it ([`tally_carrier`]). Two walks that
+/// disagree fail it ([`PassError::Incomplete`]) before any carrier is read.
+/// No budget and no cancellation: the Job ends the recount by dropping it.
+async fn walk_retire_carriers_agreed(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    owed: &mut HashMap<[u8; 32], u64>,
+) -> Result<(), PassError> {
+    let pattern = format!("{}{{*}}:obj:extret", keys.prefix());
+    let (maint_pool, _maint_token) = client.acquire_maintenance();
+    let conn = maint_pool.next();
+    let carriers = collect_keyspace_agreed(conn, &pattern)
+        .await
+        .map_err(|e| walk_err(client, OP_SCAN_CARRIERS, e))?;
+    for carrier in &carriers {
+        tally_carrier(client, conn, carrier, owed).await?;
+    }
+    Ok(())
+}
+
+/// Read one retirement carrier whole (`TYPE`, then `HKEYS` or `SMEMBERS` on
+/// `conn`) and tally its members into `owed` ([`tally_owed_member`]).
+///
+/// TYPE dispatch (b.1jt): this build's carriers are HASHes (member → 1), an
+/// older build's are SETs, and both are owed. A carrier deleted since the
+/// SCAN saw it (cleared, cancelled or dropped) owes nothing more. Any other
+/// type is not a carrier a walk can read, and an unread carrier would
+/// under-count `owed`, so it fails closed, as a key that is not text does.
+async fn tally_carrier(
+    client: &ValkeyClient,
+    conn: &fred::clients::Client,
+    fred_key: &fred::types::Key,
+    owed: &mut HashMap<[u8; 32], u64>,
+) -> Result<(), PassError> {
+    let Some(carrier_key) = fred_key.as_str() else {
+        return Err(PassError::Undecodable {
+            what: "an obj:extret key",
+            text: format!("{fred_key:?}"),
+        });
+    };
+    let kind: String = conn
+        .r#type(carrier_key.to_string())
+        .await
+        .map_err(|e| valkey_err(client, "TYPE obj:extret", e))?;
+    let members: Vec<Value> = match kind.as_str() {
+        "hash" => conn
+            .hkeys(carrier_key.to_string())
+            .await
+            .map_err(|e| valkey_err(client, "HKEYS obj:extret", e))?,
+        "set" => conn
+            .smembers(carrier_key.to_string())
+            .await
+            .map_err(|e| valkey_err(client, "SMEMBERS obj:extret", e))?,
+        "none" => Vec::new(),
+        _ => {
+            return Err(PassError::Undecodable {
+                what: "an obj:extret carrier of a type other than hash or set",
+                text: format!("{carrier_key} is a {kind}"),
+            })
+        }
+    };
+    for value in &members {
+        tally_owed_member(value, owed)?;
+    }
     Ok(())
 }
 
@@ -1592,7 +2443,7 @@ async fn walk_retire_carriers(
 /// protocol has ever written — the legacy bare `{hash_hex}`, b.qpf's
 /// `{hash_hex}:{object_id}:{event}`, and b.yda's own `{hash_hex}:0:rec{n}`.
 ///
-/// **The two blocks below are ordered, not merely sequenced.** A member moves
+/// **The two walks below are ordered, not merely sequenced.** A member moves
 /// pending → inflight when the GC claims it, so pending must be walked first: a
 /// member that moves mid-pass is then seen by both walks (counted twice, surplus
 /// under-stated, leak direction), where the reverse order would have it seen by
@@ -1600,7 +2451,9 @@ async fn walk_retire_carriers(
 /// placement; see the module header.
 ///
 /// Accumulates into the caller's `owed` rather than returning its own map, so
-/// the carrier walk's tally and these two share one total.
+/// the carrier walk's tally and these two share one total. The periodic
+/// pass's; the restore Job's recount reads the same two keys by its own
+/// proofs ([`walk_owed_counted`]).
 async fn walk_owed(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -1612,77 +2465,226 @@ async fn walk_owed(
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let conn = maint_pool.next();
 
-    {
-        // 3a — pending. FIRST, because members flow pending → inflight.
-        // `Box::pin` because the stream is `!Unpin`: fred's `sscan` / `zscan`
-        // hold their filter future inline, and `complete_pages` is an unfold.
-        // `complete_pages` with one terminal page: a keyed cursor routes by its
-        // key to one node in both modes, and a walk that ends before cursor 0
-        // (a page dropped unanswered) ends with an error rather than silently.
-        let pending_key = keys.ext_pending();
-        let mut stream = Box::pin(complete_pages(
-            conn.sscan(pending_key.as_str(), "*", Some(SCAN_PAGE)),
-            1,
-            &pending_key,
-        ));
-        loop {
-            // Cancellation forfeits at every page boundary, exactly as in the
-            // object walk. A truncated `owed` tally is worse than a truncated
-            // object walk, not better: an omitted obligation OVER-states the
-            // surplus, which is the over-release direction the pass exists to
-            // refuse.
-            let next = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(PassError::Cancelled {
-                    phase: "the pending walk",
-                }),
-                item = stream.next() => item,
-            };
-            let Some(page) = next else { break };
-            if started.elapsed() > budget {
-                return Err(PassError::BudgetElapsed {
-                    phase: "the pending walk",
-                });
-            }
-            let mut page = page.map_err(|e| valkey_err(client, "SSCAN ext_pending", e))?;
-            for value in page.take_results().unwrap_or_default() {
-                tally_owed_member(&value, owed)?;
-            }
-        }
-    }
-
-    {
-        // 3b — inflight. SECOND, and only second. The score is not read, so
-        // this build's encoded claims (claim ms + `GC_CLAIM_SCORE_OFFSET_MS`)
-        // and an older build's bare ones count alike (b.1jt).
-        let inflight_key = keys.ext_inflight();
-        let mut stream = Box::pin(complete_pages(
-            conn.zscan(inflight_key.as_str(), "*", Some(SCAN_PAGE)),
-            1,
-            &inflight_key,
-        ));
-        loop {
-            let next = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(PassError::Cancelled {
-                    phase: "the inflight walk",
-                }),
-                item = stream.next() => item,
-            };
-            let Some(page) = next else { break };
-            if started.elapsed() > budget {
-                return Err(PassError::BudgetElapsed {
-                    phase: "the inflight walk",
-                });
-            }
-            let mut page = page.map_err(|e| valkey_err(client, "ZSCAN ext_inflight", e))?;
-            for (value, _score) in page.take_results().unwrap_or_default() {
-                tally_owed_member(&value, owed)?;
-            }
-        }
+    // 3a — pending, then 3b — inflight. Each is a guarded walk through the
+    // cursor pager (`storage::retirement::page_by_cursor` over a
+    // `storage::scan_guard::KeyedWalk` on `conn`): explicit-cursor steps to
+    // cursor `0`, so a walk ends only on its terminal step or with an error
+    // (a step lost in flight fails visibly), and a step's members are tallied
+    // only once its witness, sent in one pipeline with the step, matched the
+    // walk's start. A keyed cursor routes by its key to one node.
+    for (kind, key, command, op, phase) in [
+        // FIRST, because members flow pending → inflight.
+        (
+            OwedKind::Pending,
+            keys.ext_pending(),
+            "SSCAN",
+            OP_SCAN_PENDING,
+            "the pending walk",
+        ),
+        // SECOND, and only second. The score is not read, so this build's
+        // encoded claims (claim ms + `GC_CLAIM_SCORE_OFFSET_MS`) and an
+        // older build's bare ones count alike (b.1jt).
+        (
+            OwedKind::Inflight,
+            keys.ext_inflight(),
+            "ZSCAN",
+            OP_SCAN_INFLIGHT,
+            "the inflight walk",
+        ),
+    ] {
+        page_by_cursor(&mut OwedSteps {
+            client,
+            walk: KeyedWalk::new(conn, command, &key),
+            kind,
+            op,
+            phase,
+            owed: &mut *owed,
+            budget,
+            started,
+            cancel,
+        })
+        .await?;
     }
 
     Ok(())
+}
+
+/// The restore Job's recount's owed walks (`storage::scan_guard`, *The DR
+/// Jobs' walks*), pending first and inflight second as in [`walk_owed`]:
+/// `pending` by a counted `SSCAN` walk, `SCARD` in each step's pipeline,
+/// each distinct member tallied once (a member a step repeats is not counted
+/// twice), complete only when the distinct members equal the `SCARD` read
+/// with the first and the last step; then `inflight` by ascending `ZRANGE`
+/// pages of [`ROW_HASH_CHUNK_ROWS`] with `ZCARD` in each page's pipeline,
+/// complete only when the pages returned the first page's `ZCARD` and the
+/// last page's equals it. A proof that does not hold fails the walk
+/// ([`PassError::Incomplete`]) before any count is set. Holds one step or
+/// page, the tally, and `pending`'s distinct members. No budget and no
+/// cancellation: the Job ends the recount by dropping it.
+async fn walk_owed_counted(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    owed: &mut HashMap<[u8; 32], u64>,
+) -> Result<(), PassError> {
+    let (maint_pool, _maint_token) = client.acquire_maintenance();
+    let conn = maint_pool.next();
+    // FIRST, because members flow pending → inflight.
+    walk_counted(
+        &CountedScan::set(conn, &keys.ext_pending()),
+        u64::from(SCAN_PAGE),
+        &mut CountedPending {
+            client,
+            seen: HashSet::new(),
+            owed: &mut *owed,
+        },
+    )
+    .await?;
+    // SECOND. The score is not read, so this build's encoded claims and an
+    // older build's bare ones count alike (b.1jt).
+    page_by_rank_counted(
+        &RankWalk::new(conn, &keys.ext_inflight(), false),
+        ROW_HASH_CHUNK_ROWS as u64,
+        &mut InflightPages {
+            client,
+            owed: &mut *owed,
+        },
+    )
+    .await
+}
+
+/// The recount's counted steps over `pending` ([`walk_owed_counted`]): each
+/// distinct member tallied once into `owed`.
+struct CountedPending<'w> {
+    client: &'w ValkeyClient,
+    /// The distinct members taken, by their bytes.
+    seen: HashSet<String>,
+    owed: &'w mut HashMap<[u8; 32], u64>,
+}
+
+impl CountedStepTaker for CountedPending<'_> {
+    type Error = PassError;
+
+    fn walk_error(&self, e: WalkError) -> PassError {
+        walk_err(self.client, OP_SCAN_PENDING, e)
+    }
+
+    async fn take_step(&mut self, members: Vec<Value>) -> Result<(), PassError> {
+        for value in &members {
+            // A member that is not text is `tally_owed_member`'s undecodable
+            // record; a text member a step repeats is tallied once.
+            let repeated = value
+                .as_str()
+                .is_some_and(|member| !self.seen.insert(member.into_owned()));
+            if !repeated {
+                tally_owed_member(value, self.owed)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn distinct(&self) -> u64 {
+        self.seen.len() as u64
+    }
+}
+
+/// The recount's rank pages over `inflight` ([`walk_owed_counted`]): each
+/// member tallied into `owed`.
+struct InflightPages<'w> {
+    client: &'w ValkeyClient,
+    owed: &'w mut HashMap<[u8; 32], u64>,
+}
+
+impl RankPageTaker for InflightPages<'_> {
+    type Error = PassError;
+
+    fn walk_error(&self, e: WalkError) -> PassError {
+        walk_err(self.client, OP_PAGE_INFLIGHT, e)
+    }
+
+    async fn take_page(&mut self, members: Vec<Value>) -> Result<(), PassError> {
+        for value in &members {
+            tally_owed_member(value, self.owed)?;
+        }
+        Ok(())
+    }
+}
+
+/// Which owed walk an [`OwedSteps`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwedKind {
+    /// `SSCAN le:ext:{gc}:pending`: every element is a member.
+    Pending,
+    /// `ZSCAN le:ext:{gc}:inflight`: members and scores interleaved.
+    Inflight,
+}
+
+/// One owed walk's steps ([`walk_owed`]): each step's members tallied into
+/// `owed`. Cancellation forfeits at every step, in flight or between two,
+/// exactly as in the object walk, and so does the pass budget. A truncated
+/// `owed` tally is worse than a truncated object walk, not better: an
+/// omitted obligation OVER-states the surplus, which is the over-release
+/// direction the pass exists to refuse.
+struct OwedSteps<'w> {
+    client: &'w ValkeyClient,
+    walk: KeyedWalk<'w>,
+    kind: OwedKind,
+    op: &'static str,
+    phase: &'static str,
+    owed: &'w mut HashMap<[u8; 32], u64>,
+    budget: Duration,
+    started: Instant,
+    cancel: &'w CancellationToken,
+}
+
+impl CursorPageReader for OwedSteps<'_> {
+    type Error = PassError;
+    /// The reply's own `Value`, so a member that is not text is
+    /// [`tally_owed_member`]'s undecodable record, as from a carrier.
+    type Member = Value;
+
+    /// The step, its witnesses in its pipeline, raced against the pass's
+    /// cancellation.
+    async fn read_step(
+        &mut self,
+        cursor: &str,
+        start: Option<&Witness>,
+    ) -> Result<GuardedStep<Value>, PassError> {
+        let step = tokio::select! {
+            biased;
+            () = self.cancel.cancelled() => {
+                return Err(PassError::Cancelled { phase: self.phase })
+            }
+            step = self
+                .walk
+                .step(cursor, u64::from(SCAN_PAGE), start, WALK_STEP_ATTEMPTS) => step,
+        };
+        let step = step.map_err(|e| walk_err(self.client, self.op, e))?;
+        match self.kind {
+            OwedKind::Pending => Ok(step),
+            OwedKind::Inflight => step
+                .try_map_members(|elements| {
+                    scan_step_firsts(self.walk.command(), self.walk.key(), elements)
+                })
+                .map_err(|e| valkey_err(self.client, self.op, e)),
+        }
+    }
+
+    fn changed(&self, start: &Witness, later: &Witness) -> PassError {
+        changed_error(&self.walk, start, later)
+    }
+
+    async fn take_page(&mut self, members: Vec<Value>) -> Result<(), PassError> {
+        if self.cancel.is_cancelled() {
+            return Err(PassError::Cancelled { phase: self.phase });
+        }
+        if self.started.elapsed() > self.budget {
+            return Err(PassError::BudgetElapsed { phase: self.phase });
+        }
+        for value in &members {
+            tally_owed_member(value, self.owed)?;
+        }
+        Ok(())
+    }
 }
 
 /// Add one owed-side member to the tally — from a retry carrier (phase 2b),
@@ -1804,7 +2806,8 @@ async fn walk_metas(
                     phase: "the meta walk",
                 });
             }
-            let fred_key = scan_result.map_err(|e| valkey_err(client, "SCAN ext:meta", e))?;
+            let fred_key =
+                scan_result.map_err(|e| valkey_err(client, "SCAN ext:meta", e.into_fred()))?;
             let Some(key) = fred_key.as_str() else {
                 return Err(PassError::Undecodable {
                     what: "an ext:meta key",
@@ -2154,9 +3157,12 @@ async fn act_on_candidate(
     //
     // Only a live meta confirms. A meta the GC has deleted reads `None`
     // above, so `fresh_surplus` is `None`, never equal to the claimed amount,
-    // and the candidate is cleared. Meta and data are created and deleted
-    // together, so a confirmed deficit's value is still stored when it is
-    // reported (SDD §11.3.2).
+    // and the candidate is cleared. Every store writes meta and data together
+    // and the GC deletes them together, so a confirmed deficit's value is
+    // still stored when it is reported (SDD §11.3.2): in Valkey, or, for a
+    // meta a DR restore's recount created (module header, "The
+    // meta-without-data shape"), in the backup store alone until a read
+    // fetches it back.
     if claimed_amount < 0 {
         if fresh_surplus != Some(claimed_amount) {
             retire_member(client, &recon_key, member).await;
@@ -2170,10 +3176,10 @@ async fn act_on_candidate(
             owed = queued,
             "ext:meta ref_count stands BELOW the live-object reference count and has done for a \
              full grace at the same amount; an over-release already happened. The value is still \
-             stored, but it will be collected while live objects reference it once the count \
-             reaches 0, and it may already have been collected once and stored again. Reported \
-             only — never repaired, because incrementing could resurrect a meta whose blob the GC \
-             deletes in between"
+             stored, in Valkey or the backup store, but it will be collected while live objects \
+             reference it once the count reaches 0, and it may already have been collected once \
+             and stored again. Reported only — never repaired, because incrementing could \
+             resurrect a meta whose blob the GC deletes in between"
         );
         // Retired once counted, so the alertable gauge reads what THIS pass
         // confirmed. A deficit that is still there re-registers on the next
@@ -2298,6 +3304,283 @@ async fn retire_member(client: &ValkeyClient, recon_key: &str, member: &str) {
             "could not retire a ref_count reconcile candidate; it stays claimable and the next \
              pass re-checks it against a fresh count"
         );
+    }
+}
+
+// ── The restore Job's authoritative recount ─────────────────────────────────
+
+/// How many per-hash count sets the recount runs at once; `before_write` is
+/// awaited before each group of this many.
+pub(crate) const RECOUNT_WRITE_CHUNK: usize = 64;
+
+/// What the restore Job's recount did ([`recount_authoritative`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecountReport {
+    /// The distinct hashes whose count it set: every hash referenced or owed.
+    pub values: u64,
+    /// The object headers it walked.
+    pub objects: u64,
+    /// Metas it created, with no data (`created`).
+    pub created: u64,
+    /// Counts it raised.
+    pub raised: u64,
+    /// Counts it lowered.
+    pub lowered: u64,
+    /// Counts that already held the target.
+    pub unchanged: u64,
+    /// Counts that were absent or unreadable, rewritten.
+    pub repaired: u64,
+    /// Of `values`, the hashes only an owed release names (no object
+    /// references them): metas the GC drains to 0.
+    pub owed_only: u64,
+    /// The largest decimal object id among the headers walked: the counter
+    /// floor's surviving term.
+    pub max_object_id: Option<u64>,
+}
+
+/// Proof that an authoritative recount completed without error: the only
+/// way to obtain one is [`recount_authoritative`]'s `Ok`. The un-hold takes
+/// it by reference (`storage::dr_hold::unhold`), so no un-hold that has not
+/// recounted compiles. Not `Clone`, with no public constructor; lives for the
+/// process that made it.
+#[derive(Debug)]
+pub(crate) struct RecountReceipt {
+    report: RecountReport,
+}
+
+impl RecountReceipt {
+    /// What the recount did.
+    pub(crate) fn report(&self) -> &RecountReport {
+        &self.report
+    }
+}
+
+/// Why an authoritative recount did not complete. Any of them leaves the
+/// counts partly set and the fleet held: no receipt was made.
+#[derive(Debug)]
+pub(crate) enum RecountError<E> {
+    /// A store or transport fault, or a keyspace walk whose slot map changed
+    /// or whose node pin missed its primary's slots (`storage::scan_guard`):
+    /// worth a retry of the whole Job, which walks again from the start with
+    /// a fresh routing table.
+    Store(String),
+    /// A walk whose completeness proof did not hold (`storage::scan_guard`,
+    /// *The DR Jobs' walks*): the store changed while the Job read it. The
+    /// text names the walk (its command and its key or pattern) and the
+    /// counts it compared. Worth a retry of the whole Job, which walks the
+    /// store as it then is.
+    Incomplete(String),
+    /// A keyspace walk's `CLUSTER NODES` gave no usable myself line
+    /// (`storage::scan_guard::WitnessMissing`), so the walk cannot be shown
+    /// to reach the node that serves its primary: the text names the
+    /// command, the walk, the node and what was seen. A retry would read it
+    /// again.
+    WitnessMissing(String),
+    /// A record the recount cannot read: a key, field or member that does
+    /// not decode, or a key of the wrong type. A retry reads it again.
+    Corrupt {
+        /// What the record is.
+        what: String,
+        /// The record: its key, or the text that did not decode, led by the
+        /// object and its key when the object walk located the failure.
+        key: String,
+    },
+    /// `before_write` refused.
+    Stopped(E),
+}
+
+impl<E> RecountError<E> {
+    /// The recount's reading of a walk's failure (module header, "No silent
+    /// omission"): an undecodable record or a `WRONGTYPE` reply is corrupt,
+    /// a missing myself line and an incomplete walk are their own cases, and
+    /// anything else — a changed slot map among them — a store fault. A
+    /// failure the object walk located ([`PassError::InObject`]) leads `key`
+    /// with the object, and its key when known, so the Job's line names what
+    /// support must look at.
+    fn from_walk(e: PassError) -> Self {
+        match e {
+            PassError::InObject {
+                object_id,
+                key,
+                source,
+            } => {
+                let located = object_label(&object_id, key.as_deref());
+                match Self::from_walk(*source) {
+                    Self::Corrupt { what, key: detail } => Self::Corrupt {
+                        what,
+                        key: format!("{located}: {detail}"),
+                    },
+                    Self::Store(why) => Self::Store(format!("{why} ({located})")),
+                    Self::Incomplete(why) => Self::Incomplete(format!("{why} ({located})")),
+                    Self::WitnessMissing(why) => Self::WitnessMissing(format!("{why} ({located})")),
+                    stopped @ Self::Stopped(_) => stopped,
+                }
+            }
+            PassError::Incomplete(incomplete) => Self::Incomplete(incomplete.to_string()),
+            PassError::WitnessMissing(missing) => Self::WitnessMissing(missing.to_string()),
+            PassError::Undecodable { what, text } => Self::Corrupt {
+                what: what.to_owned(),
+                key: text,
+            },
+            PassError::Valkey { op, source } if is_wrongtype_reply(&source) => Self::Corrupt {
+                what: format!("a key of the wrong type ({op})"),
+                key: source.details().to_string(),
+            },
+            other => Self::Store(other.to_string()),
+        }
+    }
+}
+
+/// How one hash's count set ended.
+enum CountSet {
+    Created,
+    Raised,
+    Lowered,
+    Unchanged,
+    Repaired,
+}
+
+/// The restore Job's authoritative recount (SDD SR-9.8; module header, "The
+/// restore Job's authoritative recount"): set every referenced or owed
+/// hash's `ref_count` to exactly its object references (rows ∪ `obj:ext`,
+/// over every object header) plus its owed releases (retirement carriers,
+/// `{gc}:pending`, `{gc}:inflight`), creating a meta with no data where none
+/// exists. Deletes no meta, and leaves one nothing names alone.
+///
+/// Call it only while the fleet is held and after the caller's last other
+/// write: it reads no guard. The walks write nothing; the sets run
+/// [`RECOUNT_WRITE_CHUNK`] at a time, each group after `before_write`
+/// resolved `Ok` (the restore Job passes its write permit's `begin_unit`, so
+/// storage takes no dependency on the Job).
+///
+/// `Ok` carries the [`RecountReceipt`] the un-hold needs. An error leaves the
+/// counts it already set (each exact, so a re-run sets the same values) and
+/// makes no receipt.
+pub(crate) async fn recount_authoritative<E, F, Fut>(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    mut before_write: F,
+) -> Result<RecountReceipt, RecountError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<(), E>>,
+{
+    // No budget and no cancellation: the Job ends the recount by dropping
+    // it. A walk forfeits only on an error, which fails the recount.
+    let never = CancellationToken::new();
+    let started = Instant::now();
+    let budget = Duration::MAX;
+
+    let walk = walk_objects(
+        client,
+        keys,
+        budget,
+        started,
+        &never,
+        None,
+        WalkMode::Authoritative,
+    )
+    .await
+    .map_err(RecountError::from_walk)?;
+    let mut owed: HashMap<[u8; 32], u64> = HashMap::new();
+    walk_retire_carriers_agreed(client, keys, &mut owed)
+        .await
+        .map_err(RecountError::from_walk)?;
+    walk_owed_counted(client, keys, &mut owed)
+        .await
+        .map_err(RecountError::from_walk)?;
+
+    let mut report = RecountReport {
+        objects: walk.objects,
+        max_object_id: walk.max_object_id,
+        ..RecountReport::default()
+    };
+    let mut targets: Vec<([u8; 32], u64)> = walk
+        .referenced
+        .iter()
+        .map(|(hash, refs)| {
+            (
+                *hash,
+                refs.saturating_add(owed.get(hash).copied().unwrap_or(0)),
+            )
+        })
+        .collect();
+    for (hash, owed_count) in &owed {
+        if !walk.referenced.contains_key(hash) {
+            targets.push((*hash, *owed_count));
+            report.owed_only += 1;
+        }
+    }
+    targets.sort_unstable();
+    report.values = targets.len() as u64;
+
+    for chunk in targets.chunks(RECOUNT_WRITE_CHUNK) {
+        before_write().await.map_err(RecountError::Stopped)?;
+        let sets = chunk
+            .iter()
+            .map(|(hash, target)| set_ref_count(client, keys, hash, *target));
+        for outcome in futures::future::join_all(sets).await {
+            match outcome? {
+                CountSet::Created => report.created += 1,
+                CountSet::Raised => report.raised += 1,
+                CountSet::Lowered => report.lowered += 1,
+                CountSet::Unchanged => report.unchanged += 1,
+                CountSet::Repaired => report.repaired += 1,
+            }
+        }
+    }
+
+    Ok(RecountReceipt { report })
+}
+
+/// One `EVALSHA` of `scripts/ext_ref_count_set.lua`: `hash`'s count set to
+/// `target`, on its meta key alone, on the data pool.
+async fn set_ref_count<E>(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    hash: &[u8; 32],
+    target: u64,
+) -> Result<CountSet, RecountError<E>> {
+    if target == 0 {
+        // Unreachable: a hash is a target only when something names it.
+        return Err(RecountError::Store(format!(
+            "the recount computed a count of 0 for {}, which it never sets",
+            sha256_to_hex(hash)
+        )));
+    }
+    let meta_key = keys.ext_meta(&sha256_to_hex(hash));
+    let reply: (String, String) = EXT_REF_COUNT_SET_SCRIPT
+        .evalsha_with_reload::<(String, String), _, _>(
+            client.pool.next(),
+            vec![meta_key.clone()],
+            vec![target.to_string()],
+        )
+        .await
+        .map_err(|e| {
+            FredErrOrigin::client(client, crate::storage::client::POOL_LABEL_DATA)
+                .observe_error(&e);
+            if is_wrongtype_reply(&e) {
+                RecountError::Corrupt {
+                    what: "an external-value meta of the wrong type".to_owned(),
+                    key: meta_key.clone(),
+                }
+            } else {
+                RecountError::Store(format!("EVALSHA ext_ref_count_set on {meta_key}: {e}"))
+            }
+        })?;
+    match reply.0.as_str() {
+        "created" => Ok(CountSet::Created),
+        "raised" => Ok(CountSet::Raised),
+        "lowered" => Ok(CountSet::Lowered),
+        "unchanged" => Ok(CountSet::Unchanged),
+        "repaired" => Ok(CountSet::Repaired),
+        "wrong_type" => Err(RecountError::Corrupt {
+            what: format!("an external-value meta of type {}, not a hash", reply.1),
+            key: meta_key,
+        }),
+        other => Err(RecountError::Store(format!(
+            "ext_ref_count_set answered {other:?} for {meta_key}, outside its contract"
+        ))),
     }
 }
 
@@ -4128,29 +5411,44 @@ mod tests {
         );
     }
 
-    // ── b.zt3 postcomp-1 — a walk cut short before its terminal page ────────
+    // ── b.gns — an object or owed walk that crosses a change of serving process ─
     //
-    // fred ends a SCAN-family stream with no error when a page's command is
-    // dropped unanswered (its client's router ended with the page in flight;
-    // pinned on a real router abort in
-    // `tests/integration/storage/b_zt3_scan_walk_test.rs`). Every walk here goes
-    // through `orphan_sweep::complete_pages`, which turns that end into an error
-    // item, so the pass forfeits like any other stream error. These two arms cut
-    // a walk short through `orphan_sweep`'s scan-walk truncation seam, keyed by
-    // the walk's pattern or key (each carries this test's prefix, so no other
-    // test's walk is cut), and pin the forfeit on the two walks whose
-    // under-count becomes an over-release: the object walk (`referenced`) and
-    // the owed walks (`owed`: the `pending` SSCAN and the `inflight` ZSCAN).
-    // Fail-on-old, by in-place perturbation: with `complete_pages`'
-    // end-of-stream check ending the stream without its error, T-W2 and both
-    // T-W3 cases go red on their first `enumeration_failed` assertion (0, not
-    // 1), each pass reading the walk cut short as complete — the reading that
-    // registers the over-stated surplus the GC would act on. With the
-    // `complete_pages` wrap removed from `walk_owed`'s `inflight` ZSCAN alone,
-    // the `inflight` case goes red on the same assertion (the seam never
-    // fires on an unwrapped stream).
+    // The pass's object walk (`storage::scan_guard::KeyspaceWalk`) and its owed
+    // walks (the `pending` SSCAN and the `inflight` ZSCAN, each a
+    // `scan_guard::KeyedWalk` driven by the cursor pager) read a witness, the
+    // serving process's run_id, at their start (the object walk alone, the
+    // owed walks in their first step's pipeline) and with every step (in one
+    // pipeline with it), and end with `PassError::ServingChanged` when it
+    // changes: a
+    // cursor continued on another server process can skip members. These
+    // arms forge that change through the walk seam
+    // (`scan_guard::arm_walk_fault_for_test`, keyed by the walk's pattern or
+    // key, each carrying this test's prefix, so no other test's walk is
+    // touched): the walk's first witness read reports one run_id and its
+    // second another, so the walk ends after its first step. They pin the
+    // forfeit on the two walks whose under-count becomes an over-release: the
+    // object walk (`referenced`) and the owed walks (`owed`).
+    //
+    // Fail-on-old, by in-place perturbation (red, then green once restored):
+    // with the guard's comparisons removed (`scan_guard::changed_between`
+    // answering no change, and the cursor pager's run_id comparison never
+    // true), T-W2 and both T-W3 cases go red on their first
+    // `enumeration_failed` assertion (0, not 1): each pass reads the crossed
+    // walk as complete.
 
-    use crate::storage::orphan_sweep::arm_scan_walk_truncation_for_test;
+    use crate::storage::scan_guard::{
+        arm_walk_fault_for_test, forge_process_change_for_test, ArmedWalkFault, WalkFault,
+        TEST_RUN_ID_A as FORGED_RUN_A, TEST_RUN_ID_B as FORGED_RUN_B,
+    };
+
+    /// Forge a change of serving process on every walk of `target` (a key,
+    /// or a keyspace walk's pattern) that starts while the guard is held:
+    /// its first witness read reports [`FORGED_RUN_A`] and its second
+    /// [`FORGED_RUN_B`], so a standalone walk ends after its first step,
+    /// whatever the server's own run_id is.
+    fn forge_process_change(target: &str) -> ArmedWalkFault {
+        forge_process_change_for_test(target, 1)
+    }
 
     /// The one call these arms make to the GC, under
     /// [`GcPolicy::IMMEDIATE`](crate::storage::external_values::GcPolicy::IMMEDIATE),
@@ -4164,20 +5462,22 @@ mod tests {
         .await
     }
 
-    /// T-W2 (rider 7): an object walk cut short before its terminal page, on
-    /// both passes a grace apart, forfeits both — so a hash a live object
-    /// references, at its true count, is never repaired and its meta and data
-    /// survive the GC.
+    /// T-W2 (rider 7, b.gns): an object walk that crosses a change of serving
+    /// process, on both passes a grace apart, forfeits both — so a hash a live
+    /// object references, at its true count, is never repaired and its meta
+    /// and data survive the GC.
     ///
-    /// The live data-loss path this closes: a truncated object walk
-    /// under-counts `referenced`, which over-states the surplus; two truncated
-    /// passes that agree on the amount would pass the confirm, enqueue a
-    /// release, and the GC would delete a meta and data the live object still
-    /// references. The walk is cut before its first page on both passes; the
-    /// control pass at the end, with the walk whole, sees no surplus at all.
+    /// The live data-loss path this closes: a walk whose cursor was continued
+    /// on another process can skip objects, which under-counts `referenced`
+    /// and over-states the surplus; two such passes that agree on the amount
+    /// would pass the confirm, enqueue a release, and the GC would delete a
+    /// meta and data the live object still references. The change is forged
+    /// after the walk's first step on both passes; the control pass at the
+    /// end, with the seam disarmed, sees no surplus at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_object_walk_cut_short_forfeits_both_passes_and_the_gc_keeps_the_referenced_blob() {
-        const REPLICA: &str = "zt3-recon-object-walk-cut";
+    async fn an_object_walk_that_crosses_a_process_change_forfeits_both_passes_and_the_gc_keeps_the_blob(
+    ) {
+        const REPLICA: &str = "gns-recon-object-walk-crossed";
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema();
         let metrics = Arc::new(metrics_scrape_only(REPLICA));
@@ -4192,20 +5492,19 @@ mod tests {
         set_stamp(&tv, &hex, now_ms(&tv).await - OLD_STAMP_LAG_MS).await;
         assert_eq!(ref_count(&tv, &hex).await, Some(1));
 
-        // The one guard for the object walk, held for both passes and dropped
+        // The guards for the object walk, held for both passes and dropped
         // before the control pass.
-        let object_walk =
-            arm_scan_walk_truncation_for_test(&format!("{}{{*}}:obj:hdr", keys.prefix()), 0);
+        let object_walk = forge_process_change(&keys.obj_header_scan_pattern());
 
         one_pass(&tv, &metrics, REPLICA).await;
         assert_eq!(
             outcome(&metrics, EXT_RECONCILE_OUTCOME_ENUMERATION_FAILED),
             1,
-            "pass 1 forfeits on the walk cut short"
+            "pass 1 forfeits on the walk that crossed a change of serving process"
         );
         assert!(
             candidates(&tv).await.is_empty(),
-            "no first observation from a walk that saw none of the objects"
+            "no first observation from a walk whose result cannot be used"
         );
         assert_eq!(gauges(&metrics, REPLICA), None, "and nothing is published");
 
@@ -4240,7 +5539,7 @@ mod tests {
             "the meta and the data a live object references both survive"
         );
 
-        // Control: with the walk whole, the same keyspace has no surplus.
+        // Control: with the seam disarmed, the same keyspace has no surplus.
         drop(object_walk);
         one_pass(&tv, &metrics, REPLICA).await;
         assert_eq!(
@@ -4251,15 +5550,22 @@ mod tests {
         assert!(candidates(&tv).await.is_empty());
     }
 
-    /// T-W3: an owed walk cut short before its terminal page — the `pending`
-    /// `SSCAN` or the `inflight` `ZSCAN`, whichever holds the owed release —
-    /// forfeits the pass rather than under-counting `owed`. The fixture's true
-    /// surplus is zero: `ref_count` 2, one live object, and the other
-    /// reference's release already owed from `stage`. Read as a complete walk,
-    /// the cut-short walk would leave that release uncounted and register a
-    /// surplus of one.
-    async fn an_owed_walk_cut_short_forfeits_the_pass_and_registers_nothing(stage: OwedStage) {
-        let replica = format!("zt3-recon-owed-walk-cut-{}", stage.label());
+    /// T-W3 (b.gns), and PM 4 (b.f3t): an owed walk the pass cannot show is
+    /// complete — the `pending` `SSCAN` or the `inflight` `ZSCAN`, whichever
+    /// holds the owed release, under the walk seam's fault `arm` armed on
+    /// it (`fault` names it, for the replica and the messages) — forfeits
+    /// the pass rather than tally an `owed` it cannot show is complete. The
+    /// fixture's true surplus is zero: `ref_count` 2, one live object, and
+    /// the other reference's release already owed from `stage`. A walk whose
+    /// cursor was continued on another process can skip that release, which
+    /// would register a surplus of one. Every event the pass logged
+    /// ([`capture_events`]), for a caller that pins its forfeit line.
+    async fn an_owed_walk_under_a_fault_forfeits_the_pass_and_registers_nothing(
+        stage: OwedStage,
+        fault: &str,
+        arm: fn(&str) -> ArmedWalkFault,
+    ) -> Vec<serde_json::Value> {
+        let replica = format!("gns-recon-owed-walk-{fault}-{}", stage.label());
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema();
         let metrics = Arc::new(metrics_scrape_only(&replica));
@@ -4308,32 +5614,172 @@ mod tests {
         };
         assert_eq!(ref_count(&tv, &hex).await, Some(2));
 
-        // The one guard for this walk, held for the whole pass.
-        let _armed = arm_scan_walk_truncation_for_test(&walk, 0);
-        one_pass(&tv, &metrics, &replica).await;
+        // The guards for this walk, held for the whole pass.
+        let armed = arm(&walk);
+        let events = capture_events(one_pass(&tv, &metrics, &replica)).await;
+        drop(armed);
 
         assert_eq!(
             outcome(&metrics, EXT_RECONCILE_OUTCOME_ENUMERATION_FAILED),
             1,
-            "the pass forfeits on the {} walk cut short",
+            "the pass forfeits on the {} walk under {fault}",
             stage.label()
         );
         assert!(
             candidates(&tv).await.is_empty(),
-            "no surplus is registered from an `owed` that missed the {} release",
+            "no surplus is registered from an `owed` the {} walk cannot show is complete",
             stage.label()
         );
         assert_eq!(gauges(&metrics, &replica), None);
+        events
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pending_walk_cut_short_forfeits_the_pass_and_registers_nothing() {
-        an_owed_walk_cut_short_forfeits_the_pass_and_registers_nothing(OwedStage::Pending).await;
+    async fn a_pending_walk_that_crosses_a_process_change_forfeits_the_pass_and_registers_nothing()
+    {
+        an_owed_walk_under_a_fault_forfeits_the_pass_and_registers_nothing(
+            OwedStage::Pending,
+            "crossed",
+            forge_process_change,
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_inflight_walk_cut_short_forfeits_the_pass_and_registers_nothing() {
-        an_owed_walk_cut_short_forfeits_the_pass_and_registers_nothing(OwedStage::Inflight).await;
+    async fn an_inflight_walk_that_crosses_a_process_change_forfeits_the_pass_and_registers_nothing(
+    ) {
+        an_owed_walk_under_a_fault_forfeits_the_pass_and_registers_nothing(
+            OwedStage::Inflight,
+            "crossed",
+            forge_process_change,
+        )
+        .await;
+    }
+
+    /// A writer appending every formatted log line to a shared buffer.
+    #[derive(Clone)]
+    struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Drive `future` under a capturing JSON subscriber at INFO and return
+    /// every event it logged, parsed.
+    ///
+    /// `WithSubscriber` rather than `set_default`: the pass awaits Valkey on
+    /// a multi-thread runtime, and a thread-local dispatcher would stop
+    /// capturing at the first `.await` that resumes on another worker. A
+    /// second, recording-nothing dispatcher stays registered for the
+    /// process, so a callsite another test thread hits first is not cached
+    /// as `Interest::never` while this capture is live (the same reasoning
+    /// as `storage::layer`'s `capture_info_events`).
+    async fn capture_events<F>(future: F) -> Vec<serde_json::Value>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use tracing::instrument::WithSubscriber;
+
+        static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(LogCapture(Arc::clone(&buf)))
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        future
+            .with_subscriber(tracing::Dispatch::new(subscriber))
+            .await;
+        let text =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|p| p.into_inner())).into_owned();
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("a captured line is JSON ({e}): {line}"))
+            })
+            .collect()
+    }
+
+    /// PM 4 (b.f3t; policy 5, kept): the periodic pass still reads the
+    /// serving-process witness on its owed walks, and forfeits on a store
+    /// whose `INFO server` reports no usable run_id. On the owed-walk
+    /// fixture with the release owed in `pending`, with `pending`'s walk
+    /// forged to read a placeholder run_id (`"0"`), or no `run_id` line, at
+    /// its first witness read (the walk seam's `RunId`), the pass forfeits
+    /// (`enumeration_failed` ticks once, no gauge is published, nothing is
+    /// registered: the shared helper's assertions) and logs one WARN, the
+    /// forfeit, whose error names `INFO server` and what it read.
+    ///
+    /// Fail-on-old (in-place perturbation, red then green once restored):
+    /// with `scan_guard::parse_run_id` reading every reply as a usable
+    /// run_id, the pass completes and `enumeration_failed` stays 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_walk_whose_store_reports_no_usable_run_id_forfeits_the_pass_and_registers_nothing(
+    ) {
+        type Arm = fn(&str) -> ArmedWalkFault;
+        let cases: [(&str, &str, Arm); 2] = [
+            ("run_id \"0\"", "no-run-id-0", |walk| {
+                arm_walk_fault_for_test(
+                    walk,
+                    WalkFault::RunId {
+                        read: 0,
+                        run_id: Some("0".to_owned()),
+                    },
+                )
+            }),
+            ("no run_id line", "no-run-id-line", |walk| {
+                arm_walk_fault_for_test(
+                    walk,
+                    WalkFault::RunId {
+                        read: 0,
+                        run_id: None,
+                    },
+                )
+            }),
+        ];
+        for (seen, fault, arm) in cases {
+            let events = an_owed_walk_under_a_fault_forfeits_the_pass_and_registers_nothing(
+                OwedStage::Pending,
+                fault,
+                arm,
+            )
+            .await;
+            let warns: Vec<&serde_json::Value> =
+                events.iter().filter(|e| e["level"] == "WARN").collect();
+            assert_eq!(warns.len(), 1, "{seen}: one WARN: {warns:?}");
+            assert_eq!(
+                warns[0]["fields"]["message"],
+                "external-value ref_count reconcile pass forfeited; no repair was made",
+                "{seen}"
+            );
+            let error = warns[0]["fields"]["error"].as_str().unwrap_or_default();
+            for part in ["`INFO server`", seen, "SSCAN walk of"] {
+                assert!(
+                    error.contains(part),
+                    "{seen}: the WARN names {part:?}: {error}"
+                );
+            }
+        }
     }
 
     /// A pass that runs out of BUDGET forfeits exactly as an unreadable object
@@ -6135,73 +7581,6 @@ mod tests {
                 );
             }
 
-            /// A writer appending every formatted log line to a shared buffer.
-            #[derive(Clone)]
-            struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-                type Writer = LogCapture;
-                fn make_writer(&'a self) -> Self::Writer {
-                    self.clone()
-                }
-            }
-
-            impl std::io::Write for LogCapture {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-
-            /// Drive `future` under a capturing JSON subscriber at INFO and
-            /// return every event it logged, parsed.
-            ///
-            /// `WithSubscriber` rather than `set_default`: the pass awaits
-            /// Valkey on a multi-thread runtime, and a thread-local dispatcher
-            /// would stop capturing at the first `.await` that resumes on
-            /// another worker. A second, recording-nothing dispatcher stays
-            /// registered for the process, so a callsite another test thread
-            /// hits first is not cached as `Interest::never` while this
-            /// capture is live (the same reasoning as `storage::layer`'s
-            /// `capture_info_events`).
-            async fn capture_events<F>(future: F) -> Vec<serde_json::Value>
-            where
-                F: std::future::Future<Output = ()>,
-            {
-                use tracing::instrument::WithSubscriber;
-
-                static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-                SECOND.get_or_init(|| {
-                    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
-                });
-
-                let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
-                let subscriber = tracing_subscriber::fmt()
-                    .json()
-                    .with_writer(LogCapture(Arc::clone(&buf)))
-                    .with_max_level(tracing::Level::INFO)
-                    .with_ansi(false)
-                    .finish();
-                future
-                    .with_subscriber(tracing::Dispatch::new(subscriber))
-                    .await;
-                let text = String::from_utf8_lossy(&buf.lock().unwrap_or_else(|p| p.into_inner()))
-                    .into_owned();
-                text.lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| {
-                        serde_json::from_str(line)
-                            .unwrap_or_else(|e| panic!("a captured line is JSON ({e}): {line}"))
-                    })
-                    .collect()
-            }
-
             /// The captured events whose message contains `needle`.
             fn events_with<'a>(
                 events: &'a [serde_json::Value],
@@ -6327,6 +7706,3027 @@ mod tests {
                     "the walk audited the other object: its over-count is lowered"
                 );
                 assert_eq!(drift(&metrics, EXT_INDEX_DRIFT_DIRECTION_OVER), 1);
+            }
+        }
+
+        // ══ The restore Job's authoritative recount (SDD SR-9.8) ═══════════
+        //
+        // `recount_authoritative` against a hand-staged keyspace, with a
+        // `before_write` that never refuses: the Job's permit and kill point
+        // are its caller's (`dr::job::finish`), pinned end to end in
+        // `tests/integration/dr/restore_finish_test.rs`. Nested in
+        // `index_audit` for its row, header and index staging helpers.
+        //
+        // Fail-on-old, each by an in-place perturbation of the recount
+        // (red, then green once restored):
+        //
+        // * the two PD-1 condition-2 pins: with the walk's rows no longer
+        //   inserted into the union, the index-drift pin reads 1, not 2 (a
+        //   live row's reference lowered away); with the authoritative walk
+        //   skipping an object whose index disagrees with its rows, the
+        //   skipped-object pin reads 1, not 2;
+        // * "fails if the guards are left on": with the count sets replaced by
+        //   one periodic pass (the candidate path), the fresh-stamped surplus
+        //   stays at 5.
+        mod authoritative_recount {
+            use super::*;
+
+            use crate::storage::ext_backup::{BACKED_UP_IN_FIELD, BACKUP_CLEARED_MS_FIELD};
+
+            /// The recount with a `before_write` that never refuses.
+            async fn recount(tv: &TestValkey) -> Result<RecountReceipt, RecountError<()>> {
+                recount_authoritative(tv.client(), tv.key_schema(), || async { Ok::<(), ()>(()) })
+                    .await
+            }
+
+            /// [`recount`], which must complete; its report.
+            async fn recounted(tv: &TestValkey) -> RecountReport {
+                recount(tv)
+                    .await
+                    .expect("the recount completes")
+                    .report()
+                    .clone()
+            }
+
+            /// `hash_hex`'s meta, every field.
+            async fn meta(tv: &TestValkey, hash_hex: &str) -> HashMap<String, String> {
+                tv.client()
+                    .pool
+                    .hgetall(tv.key_schema().ext_meta(hash_hex))
+                    .await
+                    .expect("HGETALL ext:meta must succeed")
+            }
+
+            /// Whether `hash_hex`'s bytes are in the store.
+            async fn data_exists(tv: &TestValkey, hash_hex: &str) -> bool {
+                tv.client()
+                    .pool
+                    .exists::<bool, _>(tv.key_schema().ext_data(hash_hex))
+                    .await
+                    .expect("EXISTS ext:data must succeed")
+            }
+
+            /// Stage one release of `hash`, owed by object `oid`, where
+            /// `stage` holds it.
+            async fn owe(tv: &TestValkey, stage: OwedStage, hash: [u8; 32], oid: u64) {
+                let keys = tv.key_schema();
+                let member = ExtRelease::retirement(hash, oid).member();
+                let carrier = keys.obj_ext_retire_carrier(&oid.to_string());
+                match stage {
+                    OwedStage::Pending => {
+                        let _: u64 = tv
+                            .client()
+                            .pool
+                            .sadd(keys.ext_pending(), member.as_str())
+                            .await
+                            .expect("seeding pending must succeed");
+                    }
+                    OwedStage::Inflight | OwedStage::InflightEncoded => {
+                        let _: i64 = tv
+                            .client()
+                            .pool
+                            .zadd(
+                                keys.ext_inflight(),
+                                None,
+                                None,
+                                false,
+                                false,
+                                (1.0, member.as_str()),
+                            )
+                            .await
+                            .expect("seeding inflight must succeed");
+                    }
+                    OwedStage::RetireCarrier => {
+                        let _: () = tv
+                            .client()
+                            .pool
+                            .hset(carrier, [(member.as_str(), "1")])
+                            .await
+                            .expect("seeding the retire carrier must succeed");
+                    }
+                    OwedStage::LegacyRetireCarrier => {
+                        let _: u64 = tv
+                            .client()
+                            .pool
+                            .sadd(carrier, member.as_str())
+                            .await
+                            .expect("seeding the older build's carrier must succeed");
+                    }
+                }
+            }
+
+            /// A meta as a store and a confirmed backup copy leave it: data,
+            /// `ref_count` 1, a stamp, `backed_up_in` and `backup_cleared_ms`.
+            async fn stored_and_confirmed(tv: &TestValkey, hash_byte: u8) {
+                pre_store(&store(tv), hash_byte).await;
+                let _: () = tv
+                    .client()
+                    .pool
+                    .hset(
+                        tv.key_schema().ext_meta(&hex_of(hash_byte)),
+                        [
+                            (BACKED_UP_IN_FIELD, "0123456789abcdef:1"),
+                            (BACKUP_CLEARED_MS_FIELD, "7"),
+                        ],
+                    )
+                    .await
+                    .expect("seeding the backup fields must succeed");
+            }
+
+            /// The recount sets each hash's count to exactly its object
+            /// references plus every owed release, wherever the release
+            /// waits: `pending`, `inflight`, a retirement carrier (a HASH) and
+            /// an older build's SET carrier. It raises an existing count,
+            /// creates a missing meta with `ref_count` alone and no data, and
+            /// writes no field but `ref_count`: the stamp and both backup
+            /// fields stay as they were. Its report counts each outcome and
+            /// the largest object id it walked.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_sets_each_count_to_its_references_plus_every_owed_release() {
+                let tv = TestValkey::setup().await;
+                let (h, k) = (hex_of(0xA1), hex_of(0xA2));
+                seed_object_referencing(&tv, "960101", &h).await;
+                seed_object_referencing(&tv, "960102", &h).await;
+                seed_object_referencing(&tv, "960102", &k).await;
+                let stages = [
+                    OwedStage::Pending,
+                    OwedStage::Inflight,
+                    OwedStage::RetireCarrier,
+                    OwedStage::LegacyRetireCarrier,
+                ];
+                for (i, stage) in stages.into_iter().enumerate() {
+                    owe(&tv, stage, hash_of(0xA1), 960_201 + i as u64).await;
+                }
+                stored_and_confirmed(&tv, 0xA1).await;
+                let before = meta(&tv, &h).await;
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(6),
+                    "h: two referencing objects plus one release in each of the four owed places"
+                );
+                let after = meta(&tv, &h).await;
+                for field in [
+                    LAST_STORE_MS_FIELD,
+                    BACKED_UP_IN_FIELD,
+                    BACKUP_CLEARED_MS_FIELD,
+                ] {
+                    assert_eq!(
+                        after.get(field),
+                        before.get(field),
+                        "h: the recount writes `ref_count` only, never `{field}`"
+                    );
+                }
+                assert_eq!(
+                    meta(&tv, &k).await,
+                    HashMap::from([(REF_COUNT_FIELD.to_owned(), "1".to_owned())]),
+                    "k had no meta: one is created with its count and nothing else"
+                );
+                assert!(
+                    !data_exists(&tv, &k).await,
+                    "the created meta has no data: the meta-without-data shape"
+                );
+                assert_eq!(
+                    report,
+                    RecountReport {
+                        values: 2,
+                        objects: 2,
+                        created: 1,
+                        raised: 1,
+                        lowered: 0,
+                        unchanged: 0,
+                        repaired: 0,
+                        owed_only: 0,
+                        max_object_id: Some(960_102),
+                    }
+                );
+            }
+
+            /// Every object header counts (Q2), not only mapped ones: an
+            /// object a layer mapping names, one no mapping names
+            /// (`LiveUnmapped`, a delete's teardown not finished) and one an
+            /// overwrite superseded each hold a reference, because each
+            /// releases it once when the sweep retires it after the un-hold.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_counts_unmapped_and_superseded_objects_too() {
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema();
+                let h = hex_of(0xA3);
+                let (mapped, unmapped, superseded) = ("960301", "960302", "960303");
+                for oid in [mapped, unmapped, superseded] {
+                    seed_object_referencing(&tv, oid, &h).await;
+                }
+                let _: () = tv
+                    .client()
+                    .pool
+                    .hset(
+                        keys.obj_header(mapped),
+                        [("session_id", "s-mapped"), ("layer_name", "l.usda")],
+                    )
+                    .await
+                    .expect("seeding the mapped header's identity must succeed");
+                let _: () = tv
+                    .client()
+                    .pool
+                    .set(
+                        keys.layer_mapping("s-mapped", "l.usda"),
+                        mapped,
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("seeding the mapping must succeed");
+                let _: () = tv
+                    .client()
+                    .pool
+                    .hset(keys.obj_header(superseded), [("superseded", "1")])
+                    .await
+                    .expect("flagging the header superseded must succeed");
+
+                recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(3),
+                    "the mapped, the unmapped and the superseded object each count once"
+                );
+            }
+
+            /// PD-1: an over-count is LOWERED to exactly references plus
+            /// owed, never below what names the hash and never deleted.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_lowers_an_over_count_to_exactly_its_references_and_owed() {
+                let tv = TestValkey::setup().await;
+                let h = hex_of(0xA4);
+                pre_store(&store(&tv), 0xA4).await;
+                set_ref_count(&tv, &h, 9).await;
+                seed_object_referencing(&tv, "960401", &h).await;
+                owe(&tv, OwedStage::Pending, hash_of(0xA4), 960_402).await;
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(2),
+                    "one object plus one pending release"
+                );
+                assert!(data_exists(&tv, &h).await, "the value itself is untouched");
+                assert_eq!((report.lowered, report.raised), (1, 0));
+            }
+
+            /// ADD 10: a meta nothing names — no object, no owed release —
+            /// keeps its count and its data: the recount never deletes a
+            /// meta, and leaves an unnamed one to the periodic pass. A named
+            /// hash beside it is set, so the recount ran.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_leaves_a_meta_nothing_names_as_it_is() {
+                let tv = TestValkey::setup().await;
+                let (unnamed, named) = (hex_of(0xA5), hex_of(0xA6));
+                pre_store(&store(&tv), 0xA5).await;
+                set_ref_count(&tv, &unnamed, 4).await;
+                let before = meta(&tv, &unnamed).await;
+                seed_object_referencing(&tv, "960501", &named).await;
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(
+                    meta(&tv, &unnamed).await,
+                    before,
+                    "the unnamed meta is not touched"
+                );
+                assert!(data_exists(&tv, &unnamed).await);
+                assert_eq!(ref_count(&tv, &named).await, Some(1), "control");
+                assert_eq!(report.values, 1, "only the named hash is a target");
+            }
+
+            /// A hash only an owed release names gets a meta at the owed
+            /// count, with no data, so the GC's decrement finds a meta and
+            /// drains it to 0, deleting it, rather than missing it.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_gives_a_hash_only_a_release_names_a_meta_the_gc_drains() {
+                let tv = TestValkey::setup().await;
+                let h = hex_of(0xA7);
+                owe(&tv, OwedStage::Pending, hash_of(0xA7), 960_601).await;
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(ref_count(&tv, &h).await, Some(1));
+                assert!(!data_exists(&tv, &h).await);
+                assert_eq!((report.owed_only, report.created), (1, 1));
+
+                let stats = run_gc(&store(&tv)).await;
+                assert_eq!(stats.deleted, 1, "the GC drains the release to 0");
+                assert!(
+                    meta(&tv, &h).await.is_empty(),
+                    "and deletes the meta it reached"
+                );
+            }
+
+            /// A meta whose `ref_count` is not a decimal integer, or absent,
+            /// is rewritten to the target (`repaired`).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_rewrites_an_unreadable_or_absent_count() {
+                let tv = TestValkey::setup().await;
+                let (garbled, absent) = (hex_of(0xA8), hex_of(0xA9));
+                for (byte, hex) in [(0xA8, &garbled), (0xA9, &absent)] {
+                    pre_store(&store(&tv), byte).await;
+                    seed_object_referencing(&tv, &format!("9607{byte:02x}"), hex).await;
+                }
+                let _: () = tv
+                    .client()
+                    .pool
+                    .hset(
+                        tv.key_schema().ext_meta(&garbled),
+                        [(REF_COUNT_FIELD, "abc")],
+                    )
+                    .await
+                    .expect("garbling the count must succeed");
+                let _: u64 = tv
+                    .client()
+                    .pool
+                    .hdel(tv.key_schema().ext_meta(&absent), REF_COUNT_FIELD)
+                    .await
+                    .expect("removing the count must succeed");
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(ref_count(&tv, &garbled).await, Some(1));
+                assert_eq!(ref_count(&tv, &absent).await, Some(1));
+                assert_eq!(report.repaired, 2);
+            }
+
+            /// A meta key of the wrong type is a corrupt record (PD-4): the
+            /// recount fails naming the key, and makes no receipt.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_fails_corrupt_on_a_meta_of_the_wrong_type() {
+                let tv = TestValkey::setup().await;
+                let h = hex_of(0xAA);
+                let meta_key = tv.key_schema().ext_meta(&h);
+                let _: () = tv
+                    .client()
+                    .pool
+                    .set(&meta_key, "not-a-hash", None, None, false)
+                    .await
+                    .expect("staging a string meta must succeed");
+                seed_object_referencing(&tv, "960801", &h).await;
+
+                match recount(&tv).await {
+                    Err(RecountError::Corrupt { key, .. }) => assert_eq!(key, meta_key),
+                    other => panic!("a wrong-type meta is a corrupt record, got {other:?}"),
+                }
+            }
+
+            /// Which reference record [`the_recount_fails_corrupt_on_an_undecodable_reference_record_and_sets_nothing`]
+            /// garbles.
+            #[derive(Clone, Copy, Debug)]
+            enum Garbled {
+                /// An `obj:ext` field that is not a hash.
+                IndexField,
+                /// A value row's `hash` column that is not a hash.
+                RowHash,
+                /// A `{gc}:pending` member that does not decode.
+                PendingMember,
+                /// A `{gc}:inflight` member that does not decode.
+                InflightMember,
+                /// A member of this build's retirement carrier (a HASH) that
+                /// does not decode.
+                HashCarrierMember,
+                /// A member of an older build's retirement carrier (a SET)
+                /// that does not decode.
+                SetCarrierMember,
+            }
+
+            /// A reference record the walks cannot decode — an `obj:ext`
+            /// field, a row's `hash` column, an owed member wherever it waits
+            /// (`pending`, `inflight`, either carrier type) — fails the
+            /// recount as corrupt (PD-4, exit 3 in the Job) before any count
+            /// is set: a hash another object names cleanly gets no meta.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_fails_corrupt_on_an_undecodable_reference_record_and_sets_nothing()
+            {
+                for garbled in [
+                    Garbled::IndexField,
+                    Garbled::RowHash,
+                    Garbled::PendingMember,
+                    Garbled::InflightMember,
+                    Garbled::HashCarrierMember,
+                    Garbled::SetCarrierMember,
+                ] {
+                    let tv = TestValkey::setup().await;
+                    let clean = hex_of(0xAB);
+                    seed_object_referencing(&tv, "960901", &clean).await;
+                    const OID: &str = "960902";
+                    seed_live_header(&tv, OID).await;
+                    match garbled {
+                        Garbled::IndexField => seed_index(&tv, OID, &[("not-a-hash", "1")]).await,
+                        Garbled::RowHash => {
+                            seed_row(
+                                &tv,
+                                OID,
+                                Family::Field,
+                                "a",
+                                &[("hash", "zz"), ("size", "1")],
+                            )
+                            .await;
+                        }
+                        Garbled::PendingMember => {
+                            let _: u64 = tv
+                                .client()
+                                .pool
+                                .sadd(tv.key_schema().ext_pending(), "not-a-release")
+                                .await
+                                .expect("seeding a garbled pending member must succeed");
+                        }
+                        Garbled::InflightMember => {
+                            let _: i64 = tv
+                                .client()
+                                .pool
+                                .zadd(
+                                    tv.key_schema().ext_inflight(),
+                                    None,
+                                    None,
+                                    false,
+                                    false,
+                                    (1.0, "not-a-release"),
+                                )
+                                .await
+                                .expect("seeding a garbled inflight member must succeed");
+                        }
+                        Garbled::HashCarrierMember => {
+                            let _: () = tv
+                                .client()
+                                .pool
+                                .hset(
+                                    tv.key_schema().obj_ext_retire_carrier(OID),
+                                    [("not-a-release", "1")],
+                                )
+                                .await
+                                .expect("seeding a garbled carrier member must succeed");
+                        }
+                        Garbled::SetCarrierMember => {
+                            let _: u64 = tv
+                                .client()
+                                .pool
+                                .sadd(tv.key_schema().obj_ext_retire_carrier(OID), "not-a-release")
+                                .await
+                                .expect("seeding a garbled legacy carrier member must succeed");
+                        }
+                    }
+
+                    let result = recount(&tv).await;
+
+                    assert!(
+                        matches!(result, Err(RecountError::Corrupt { .. })),
+                        "{garbled:?}: an undecodable record is corrupt, got {result:?}"
+                    );
+                    assert!(
+                        meta(&tv, &clean).await.is_empty(),
+                        "{garbled:?}: no count is set from a walk that failed"
+                    );
+                }
+            }
+
+            /// Which reference key
+            /// [`the_recount_fails_corrupt_on_a_reference_key_of_the_wrong_type_and_sets_nothing`]
+            /// stages as a STRING.
+            #[derive(Clone, Copy, Debug)]
+            enum WrongType {
+                /// A retirement carrier: neither a HASH nor a SET.
+                Carrier,
+                /// An object's `obj:ext` index.
+                ExtIndex,
+                /// An object's `obj:flds` row index.
+                FieldsIndex,
+            }
+
+            /// A reference key of the wrong type — a retirement carrier that
+            /// is neither a HASH nor a SET, an `obj:ext` or an `obj:flds` that
+            /// is a STRING — fails the recount as corrupt (PD-4, exit 3 in the
+            /// Job), never as a store fault, and before any count is set.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_fails_corrupt_on_a_reference_key_of_the_wrong_type_and_sets_nothing(
+            ) {
+                for wrong in [
+                    WrongType::Carrier,
+                    WrongType::ExtIndex,
+                    WrongType::FieldsIndex,
+                ] {
+                    let tv = TestValkey::setup().await;
+                    let keys = tv.key_schema();
+                    let clean = hex_of(0xAF);
+                    seed_object_referencing(&tv, "961401", &clean).await;
+                    const OID: &str = "961402";
+                    seed_live_header(&tv, OID).await;
+                    let key = match wrong {
+                        WrongType::Carrier => keys.obj_ext_retire_carrier(OID),
+                        WrongType::ExtIndex => keys.obj_ext_index(OID),
+                        WrongType::FieldsIndex => keys.obj_fields_index(OID),
+                    };
+                    let _: () = tv
+                        .client()
+                        .pool
+                        .set(&key, "not-a-collection", None, None, false)
+                        .await
+                        .expect("staging a STRING must succeed");
+
+                    let result = recount(&tv).await;
+
+                    assert!(
+                        matches!(result, Err(RecountError::Corrupt { .. })),
+                        "{wrong:?}: a key of the wrong type is corrupt, got {result:?}"
+                    );
+                    assert!(
+                        meta(&tv, &clean).await.is_empty(),
+                        "{wrong:?}: no count is set from a walk that failed"
+                    );
+                }
+            }
+
+            /// The recount's failure reading one object's references names the
+            /// object, and the key when the failing read names one, ahead of
+            /// what it could not read, so the Job's exit-3 line says what
+            /// support must look at: an `obj:ext` field that is not a hash
+            /// names `obj:ext`; a row `hash` column that is not a hash, read
+            /// in a row pipeline that answers for every key of its chunk at
+            /// once, names the object alone. (A wrong-typed index's step:
+            /// [`the_recount_names_each_value_index_whose_step_meets_the_wrong_type`].)
+            ///
+            /// Fail-on-old (in-place perturbation of the object walk, red then
+            /// green once restored): with the walk's locator passing every
+            /// error through bare in both modes, the key reads `not-a-hash`
+            /// with no object.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_names_the_object_and_its_key_when_a_reference_read_fails() {
+                const OID: &str = "961501";
+                let index_key = |tv: &TestValkey| tv.key_schema().obj_ext_index(OID);
+
+                let tv = TestValkey::setup().await;
+                seed_live_header(&tv, OID).await;
+                seed_index(&tv, OID, &[("not-a-hash", "1")]).await;
+                match recount(&tv).await {
+                    Err(RecountError::Corrupt { what, key }) => {
+                        assert_eq!(what, WHAT_EXT_INDEX_FIELD);
+                        assert_eq!(
+                            key,
+                            format!("{} (object {OID}): not-a-hash", index_key(&tv))
+                        );
+                    }
+                    other => panic!("a garbled obj:ext field is corrupt, got {other:?}"),
+                }
+
+                let tv = TestValkey::setup().await;
+                seed_live_header(&tv, OID).await;
+                seed_row(
+                    &tv,
+                    OID,
+                    Family::Field,
+                    "a",
+                    &[("hash", "zz"), ("size", "1")],
+                )
+                .await;
+                match recount(&tv).await {
+                    Err(RecountError::Corrupt { key, .. }) => {
+                        assert_eq!(key, format!("object {OID}: zz"));
+                    }
+                    other => panic!("a garbled row hash is corrupt, got {other:?}"),
+                }
+            }
+
+            /// Each value index the recount walks, staged as a STRING, fails
+            /// the recount corrupt at its own read's label — its rank pages,
+            /// `ZRANGE obj:flds` and `ZRANGE obj:tss`, and its counted
+            /// `HSCAN obj:ext` — and names that key and the object, then the
+            /// store's `WRONGTYPE`. Each index is its own case on its own
+            /// store, and every case is checked before the test fails, so a
+            /// regression names every index it reaches.
+            ///
+            /// Fail-on-old (in-place perturbation of `in_object`, the three
+            /// labels no longer mapped to their keys; re-run for the rank
+            /// pages' and the counted walk's labels): all three cases fail,
+            /// each naming the object alone.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_names_each_value_index_whose_step_meets_the_wrong_type() {
+                const OID: &str = "961502";
+                /// An index's key in the schema.
+                type KeyOf = fn(&KeySchema) -> String;
+                let cases: [(&str, KeyOf); 3] = [
+                    (OP_LIST_FIELDS, |keys| keys.obj_fields_index(OID)),
+                    (OP_LIST_TIME_SAMPLES, |keys| {
+                        keys.obj_time_samples_index(OID)
+                    }),
+                    (OP_SCAN_EXT_INDEX, |keys| keys.obj_ext_index(OID)),
+                ];
+                let mut failures: Vec<String> = Vec::new();
+                for (op, key_of) in cases {
+                    let tv = TestValkey::setup().await;
+                    seed_live_header(&tv, OID).await;
+                    let index = key_of(tv.key_schema());
+                    let _: () = tv
+                        .client()
+                        .pool
+                        .set(&index, "not-a-collection", None, None, false)
+                        .await
+                        .expect("staging a STRING index must succeed");
+                    match recount(&tv).await {
+                        Err(RecountError::Corrupt { what, key }) => {
+                            let located = format!("{index} (object {OID}): ");
+                            if what != format!("a key of the wrong type ({op})")
+                                || !key.starts_with(&located)
+                                || !key[located.len()..].starts_with("WRONGTYPE")
+                            {
+                                failures.push(format!(
+                                    "{op}: want the step's label and `{located}WRONGTYPE…`, got \
+                                     what {what:?}, key {key:?}"
+                                ));
+                            }
+                        }
+                        other => failures.push(format!("{op}: want Corrupt, got {other:?}")),
+                    }
+                }
+                assert!(failures.is_empty(), "{}", failures.join("\n"));
+            }
+
+            /// An `HSCAN obj:ext` step answering an odd number of elements,
+            /// which cannot be paired (`retirement::scan_step_firsts`), fails
+            /// the recount as a store fault (exit 1 in the Job), located at
+            /// the index it stepped, never as a corrupt record: the reply is
+            /// the server's protocol, not stored data. Pure: the walk's error
+            /// is built by hand from the pairing's own error.
+            #[test]
+            fn an_index_step_that_cannot_be_paired_fails_the_recount_as_a_store_fault() {
+                let keys = KeySchema::new("le:");
+                let index = keys.obj_ext_index("42");
+                let unpaired = crate::storage::retirement::scan_step_firsts(
+                    "HSCAN",
+                    &index,
+                    vec!["m".to_owned(), "1".to_owned(), "n".to_owned()],
+                )
+                .expect_err("three elements cannot be paired");
+                let walk_error = PassError::Valkey {
+                    op: OP_SCAN_EXT_INDEX,
+                    source: unpaired,
+                };
+                match RecountError::<()>::from_walk(in_object(&keys, "42", walk_error)) {
+                    RecountError::Store(why) => {
+                        assert!(
+                            why.starts_with(&format!("{OP_SCAN_EXT_INDEX} failed: ")),
+                            "{why}"
+                        );
+                        assert!(why.contains("answered 3 elements"), "{why}");
+                        assert!(why.ends_with(&format!("({index} (object 42))")), "{why}");
+                    }
+                    other => panic!("an unpaired step is a store fault, got {other:?}"),
+                }
+            }
+
+            /// A store fault, not a corrupt record, located in an object: the
+            /// recount's reading of the walk's error is `Store` (exit 1 in the
+            /// Job), its text the fault's, led by nothing and ended by the
+            /// object and key. A `WRONGTYPE` reply at the same read is
+            /// `Corrupt`. Pure: the walk's errors are built by hand.
+            #[test]
+            fn a_located_store_fault_is_a_store_error_and_a_located_wrongtype_is_corrupt() {
+                let keys = KeySchema::new("le:");
+                let fault = PassError::Valkey {
+                    op: OP_LIST_FIELDS,
+                    source: fred::error::Error::new(fred::error::ErrorKind::IO, "connection reset"),
+                };
+                match RecountError::<()>::from_walk(in_object(&keys, "42", fault)) {
+                    RecountError::Store(why) => assert_eq!(
+                        why,
+                        format!(
+                            "{OP_LIST_FIELDS} failed: IO Error: connection reset ({} (object 42))",
+                            keys.obj_fields_index("42")
+                        )
+                    ),
+                    other => panic!("a located IO fault is a store fault, got {other:?}"),
+                }
+
+                let wrongtype = PassError::Valkey {
+                    op: OP_LIST_FIELDS,
+                    source: fred::error::Error::new(
+                        fred::error::ErrorKind::InvalidArgument,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ),
+                };
+                assert!(matches!(
+                    RecountError::<()>::from_walk(in_object(&keys, "42", wrongtype)),
+                    RecountError::Corrupt { .. }
+                ));
+            }
+
+            /// An `obj:ext` field whose stored count is `0` or not a decimal,
+            /// with no row naming its hash, still names the hash: the
+            /// recount counts it once for its object (the periodic pass
+            /// would call it drift and rewrite the index; the recount writes
+            /// no index, which stays as it is).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_counts_an_index_field_whose_count_is_zero_or_not_decimal() {
+                let tv = TestValkey::setup().await;
+                let (zero, garbled) = ("961601", "961602");
+                let (hz, hg) = (hex_of(0xC1), hex_of(0xC2));
+                seed_live_header(&tv, zero).await;
+                seed_index(&tv, zero, &[(hz.as_str(), "0")]).await;
+                seed_live_header(&tv, garbled).await;
+                seed_index(&tv, garbled, &[(hg.as_str(), "x")]).await;
+
+                let report = recounted(&tv).await;
+
+                assert_eq!(
+                    (ref_count(&tv, &hz).await, ref_count(&tv, &hg).await),
+                    (Some(1), Some(1)),
+                    "each field names its hash, whatever count it stores"
+                );
+                assert_eq!(report.values, 2);
+                assert_eq!(
+                    (
+                        index_sorted(&tv, zero).await,
+                        index_sorted(&tv, garbled).await
+                    ),
+                    (
+                        vec![(hz.clone(), "0".to_owned())],
+                        vec![(hg.clone(), "x".to_owned())]
+                    ),
+                    "the index is left as it is"
+                );
+            }
+
+            /// The authoritative walk writes nothing: a legacy `-0.0`
+            /// time-sample row beside its `+0.0` twin, and an `obj:ext` that
+            /// disagrees with the rows, are left exactly as they are (the
+            /// periodic pass's merge and audit would rewrite both, pinned by
+            /// `signed_zero_merge` and the drift tests above). Each hash the
+            /// object's rows ∪ index names is counted once for the object.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_leaves_a_negative_zero_row_and_a_drifted_index_as_they_are() {
+                const OID: &str = "961001";
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema();
+                let (plus, minus, field) = (hex_of(0xAC), hex_of(0xAD), hex_of(0xAE));
+                seed_live_header(&tv, OID).await;
+                seed_row(
+                    &tv,
+                    OID,
+                    Family::TimeSample,
+                    "0",
+                    &[("hash", plus.as_str()), ("size", "1")],
+                )
+                .await;
+                seed_row(
+                    &tv,
+                    OID,
+                    Family::TimeSample,
+                    "-0",
+                    &[("hash", minus.as_str()), ("size", "1")],
+                )
+                .await;
+                seed_row(
+                    &tv,
+                    OID,
+                    Family::Field,
+                    "a",
+                    &[("hash", field.as_str()), ("size", "1")],
+                )
+                .await;
+                // `minus` has no field and `field` is over-counted: drift
+                // both ways.
+                seed_index(&tv, OID, &[(plus.as_str(), "1"), (field.as_str(), "3")]).await;
+                let tss = |tv: &TestValkey| {
+                    let (pool, key) = (tv.client().pool.clone(), keys.obj_time_samples_index(OID));
+                    async move {
+                        let mut members: Vec<String> = pool
+                            .zrange(key, 0, -1, None, false, None, false)
+                            .await
+                            .expect("ZRANGE obj:tss must succeed");
+                        members.sort();
+                        members
+                    }
+                };
+                let header = |tv: &TestValkey| {
+                    let (pool, key) = (tv.client().pool.clone(), keys.obj_header(OID));
+                    async move {
+                        pool.hgetall::<HashMap<String, String>, _>(key)
+                            .await
+                            .expect("HGETALL obj:hdr must succeed")
+                    }
+                };
+                let (tss_before, index_before, header_before) = (
+                    tss(&tv).await,
+                    index_sorted(&tv, OID).await,
+                    header(&tv).await,
+                );
+                assert_eq!(tss_before.len(), 2, "fixture: the -0.0 and +0.0 rows");
+
+                recounted(&tv).await;
+
+                assert_eq!(tss(&tv).await, tss_before, "no merge: both rows stay");
+                assert_eq!(
+                    index_sorted(&tv, OID).await,
+                    index_before,
+                    "no audit: the drifted index stays"
+                );
+                assert_eq!(header(&tv).await, header_before, "no repair stamp");
+                for hex in [&plus, &minus, &field] {
+                    assert_eq!(
+                        ref_count(&tv, hex).await,
+                        Some(1),
+                        "{hex}: counted once for the one object, whichever side names it"
+                    );
+                }
+            }
+
+            /// **PD-1 condition 2 (a), index drift.** Object A's live row
+            /// names h while A's `obj:ext` omits h; object B names h in both.
+            /// h's meta is over-counted at 7. The recount lowers it to
+            /// exactly rows ∪ `obj:ext` — 2, one per object — never past A's
+            /// row. Fail-on-old: with the walk's row hashes left out of the
+            /// union, the count reads 1, lowered past A's live reference.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_counts_a_live_row_its_objects_index_omits() {
+                const DRIFTED: &str = "961101";
+                let tv = TestValkey::setup().await;
+                let (h, other) = (hex_of(0xB1), hex_of(0xB2));
+                pre_store(&store(&tv), 0xB1).await;
+                set_ref_count(&tv, &h, 7).await;
+                seed_live_header(&tv, DRIFTED).await;
+                seed_row(
+                    &tv,
+                    DRIFTED,
+                    Family::Field,
+                    "a",
+                    &[("hash", h.as_str()), ("size", "1")],
+                )
+                .await;
+                seed_row(
+                    &tv,
+                    DRIFTED,
+                    Family::Field,
+                    "b",
+                    &[("hash", other.as_str()), ("size", "1")],
+                )
+                .await;
+                seed_index(&tv, DRIFTED, &[(other.as_str(), "1")]).await;
+                seed_object_referencing(&tv, "961102", &h).await;
+
+                recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(2),
+                    "lowered from 7 to rows ∪ obj:ext: A's row and B's reference"
+                );
+            }
+
+            /// **PD-1 condition 2 (b), skipped object.** Object A is one the
+            /// periodic pass holds: its `obj:ext` disagrees with its rows and
+            /// one row's `hash` column is UPPERCASE, which the index recount
+            /// reports malformed, so the periodic pass holds h from every
+            /// surplus drain (`a_malformed_row_holds_the_hash_whatever_the_recount_answers`).
+            /// Object B names h cleanly. h's meta is over-counted at 9 with an
+            /// old stamp. The periodic pass holds h (the precondition, with
+            /// the stored index `"4"` it withholds rather than rewrites); the
+            /// recount then counts A, setting h to exactly 2. Fail-on-old:
+            /// with the authoritative walk skipping an object whose index
+            /// disagrees with its rows, h reads 1, lowered past A.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_counts_an_object_the_periodic_pass_holds_for_index_drift() {
+                const REPLICA: &str = "tv3-recount-held-object";
+                const HELD: &str = "961201";
+                let tv = TestValkey::setup().await;
+                let metrics = Arc::new(metrics_scrape_only(REPLICA));
+                let h = hex_of(0xB3);
+                pre_store(&store(&tv), 0xB3).await;
+                set_ref_count(&tv, &h, 9).await;
+                set_stamp(&tv, &h, now_ms(&tv).await - OLD_STAMP_LAG_MS).await;
+                seed_live_header(&tv, HELD).await;
+                seed_row(
+                    &tv,
+                    HELD,
+                    Family::Field,
+                    "a",
+                    &[("hash", h.as_str()), ("size", "1")],
+                )
+                .await;
+                seed_row(
+                    &tv,
+                    HELD,
+                    Family::Field,
+                    "b",
+                    &[("hash", h.to_uppercase().as_str()), ("size", "1")],
+                )
+                .await;
+                seed_index(&tv, HELD, &[(h.as_str(), "4")]).await;
+                seed_object_referencing(&tv, "961202", &h).await;
+
+                one_pass(&tv, &metrics, REPLICA).await;
+                assert_eq!(
+                    outcome(&metrics, EXT_RECONCILE_OUTCOME_SKIPPED_INDEX_DRIFT),
+                    1,
+                    "precondition: the periodic pass holds h for A's drift"
+                );
+                assert_eq!(ref_count(&tv, &h).await, Some(9), "and lowers nothing");
+
+                recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(2),
+                    "the recount counts A (once) and B: never lowered past the held object"
+                );
+            }
+
+            /// **"Fails if the guards are left on."** The periodic pass would
+            /// leave a surplus on a meta stamped moments ago (the
+            /// `last_store_ms` gate) and would need two observations a grace
+            /// apart even on an old one. The recount runs neither: one call
+            /// sets the freshly stamped count of 5 to exactly 1 and registers
+            /// no candidate. Fail-on-old: with the count sets replaced by one
+            /// periodic pass (the candidate path), the count stays 5.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_sets_a_freshly_stamped_surplus_at_once_with_no_guard() {
+                let tv = TestValkey::setup().await;
+                let h = hex_of(0xB4);
+                pre_store(&store(&tv), 0xB4).await;
+                set_ref_count(&tv, &h, 5).await;
+                set_stamp(&tv, &h, now_ms(&tv).await).await;
+                seed_object_referencing(&tv, "961301", &h).await;
+
+                recounted(&tv).await;
+
+                assert_eq!(
+                    ref_count(&tv, &h).await,
+                    Some(1),
+                    "set exactly in one call, its fresh stamp notwithstanding"
+                );
+                assert!(candidates(&tv).await.is_empty(), "no candidate path");
+            }
+
+            /// **R-recon.** A periodic pass right after the recount finds
+            /// nothing to do: no candidate, surplus 0 and deficit 0, for a
+            /// recount-created meta without data (no stamp) and a lowered
+            /// over-count alike. The control, the same keyspace before the
+            /// recount, registers the over-count's surplus.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_periodic_pass_right_after_the_recount_registers_no_candidate() {
+                const REPLICA: &str = "tv3-recount-then-pass";
+                let tv = TestValkey::setup().await;
+                let metrics = Arc::new(metrics_scrape_only(REPLICA));
+                let (over, created) = (hex_of(0xB5), hex_of(0xB6));
+                pre_store(&store(&tv), 0xB5).await;
+                set_ref_count(&tv, &over, 3).await;
+                set_stamp(&tv, &over, now_ms(&tv).await - OLD_STAMP_LAG_MS).await;
+                seed_object_referencing(&tv, "961401", &over).await;
+                seed_object_referencing(&tv, "961402", &created).await;
+
+                one_pass(&tv, &metrics, REPLICA).await;
+                assert_eq!(
+                    candidates(&tv).await,
+                    vec![format!("{over}:2")],
+                    "control: before the recount the over-count is a surplus"
+                );
+                let _: i64 = tv
+                    .client()
+                    .pool
+                    .del(tv.key_schema().ext_recon_candidates())
+                    .await
+                    .expect("clearing the candidates must succeed");
+
+                recounted(&tv).await;
+                one_pass(&tv, &metrics, REPLICA).await;
+
+                assert!(candidates(&tv).await.is_empty());
+                assert_eq!(
+                    gauges(&metrics, REPLICA),
+                    Some((2.0, 2.0, 0.0, 0.0)),
+                    "two metas, two referenced hashes, no surplus, no deficit"
+                );
+                assert!(
+                    !data_exists(&tv, &created).await,
+                    "fixture: a meta without data"
+                );
+            }
+
+            // ══ b.f3t — the recount's completeness proofs; b.gns — the ═══════
+            // ══ periodic pass's serving-process guard ═════════════════════════
+            //
+            // The recount reads no serving-process witness (`storage::scan_guard`,
+            // *The DR Jobs' walks*). Each of its walks is shown complete on the
+            // held store by its own proof — the object and carrier walks by an
+            // agreeing second walk, `obj:flds`, `obj:tss` and `inflight` by
+            // `ZCARD`-checked rank pages, `obj:ext` and `pending` by
+            // `HLEN` / `SCARD`-checked cursor walks — and a proof that does not
+            // hold fails the recount (`RecountError::Incomplete`, exit 1 in the
+            // Job) before any count is set. A skip is forged through the walk
+            // seam's `DropMember` (`scan_guard::arm_walk_fault_for_test`), keyed
+            // by the walk's key or pattern, which carries the test's prefix; a
+            // header the object walk returns twice through its `RepeatMember`;
+            // a member added under a rank walk, or repeated by a counted one,
+            // by a wrapper around the recount's own page or step taker. A placeholder
+            // run_id, or a change of one, no longer stops the recount.
+            //
+            // The periodic pass keeps the serving-process guard on its owed
+            // walks: the owed readers' test below forges a change of serving
+            // process through the same seam. The cluster-gated arms forge a
+            // pinned node's `CLUSTER NODES` reply on a real three-shard cluster,
+            // which the recount's keyspace walks still check.
+            //
+            // Fail-on-old, by in-place perturbation (red, then green once
+            // restored): with `scan_guard::keyspace_walks_agree` answering `Ok`
+            // whatever the two sets, the object and carrier drops complete and
+            // set their counts; with `scan_guard::check_count` answering `Ok`
+            // whatever the counts, the index, `obj:ext`, `pending` and
+            // `inflight` drops and the added members complete (those two run
+            // together, each case caught only by its own walk's check); with
+            // `KeyspaceWalk::start_job` beginning a guarded walk again (its
+            // `INFO server` witness put back), the unusable and changing run_id
+            // cases fail. The repeat and letter-case pins name their own.
+            mod serving_process_guard {
+                use super::*;
+
+                use fred::interfaces::ClusterInterface;
+
+                use crate::storage::scan_guard::{RoutingRefresh, SlotSet, WalkEnd};
+
+                /// The fixture's object, which references [`Fixture::h`].
+                const OID: &str = "960901";
+
+                /// The object whose retirement carrier [`seed`] stages.
+                const CARRIER_OID: u64 = 960_902;
+
+                /// What [`seed`] staged: `h`, referenced by [`OID`] through a
+                /// field row, a time-sample row and its `obj:ext`, and
+                /// over-counted at 9, and `k`, which only owed releases name
+                /// (a carrier, `pending` and `inflight`), with no meta. A
+                /// recount that completes lowers `h` to 1 and creates `k` at
+                /// 3, so every count reading as before shows none was set.
+                struct Fixture {
+                    h: String,
+                    k: String,
+                }
+
+                async fn seed(tv: &TestValkey) -> Fixture {
+                    let h = hex_of(0xB1);
+                    pre_store(&store(tv), 0xB1).await;
+                    set_ref_count(tv, &h, 9).await;
+                    seed_object_referencing(tv, OID, &h).await;
+                    seed_row(
+                        tv,
+                        OID,
+                        Family::TimeSample,
+                        "0.5",
+                        &[("hash", h.as_str()), ("size", "1")],
+                    )
+                    .await;
+                    for (stage, oid) in [
+                        (OwedStage::RetireCarrier, CARRIER_OID),
+                        (OwedStage::Pending, 960_903),
+                        (OwedStage::Inflight, 960_904),
+                    ] {
+                        owe(tv, stage, hash_of(0xB2), oid).await;
+                    }
+                    Fixture { h, k: hex_of(0xB2) }
+                }
+
+                /// Both metas, every field.
+                async fn metas(
+                    tv: &TestValkey,
+                    fixture: &Fixture,
+                ) -> (HashMap<String, String>, HashMap<String, String>) {
+                    (meta(tv, &fixture.h).await, meta(tv, &fixture.k).await)
+                }
+
+                /// Drop `key` from walk number `walk` of `pattern`, whichever
+                /// step returns it: a keyspace walk of a shared store answers
+                /// the test's key at a step no test can know in advance, so the
+                /// seam's `DropMember` names the key on every step of the walk
+                /// (`step: None`). A drop that never fires leaves the walks
+                /// agreeing, and the test that expects them to disagree fails.
+                fn drop_key(pattern: &str, walk: usize, key: &str) -> ArmedWalkFault {
+                    arm_walk_fault_for_test(
+                        pattern,
+                        WalkFault::DropMember {
+                            walk,
+                            step: None,
+                            member: Some(key.to_owned()),
+                        },
+                    )
+                }
+
+                /// Drop the first member of the first reply of a walk of the
+                /// one key `target`, which holds one member in the fixture.
+                fn drop_first(target: &str) -> ArmedWalkFault {
+                    arm_walk_fault_for_test(
+                        target,
+                        WalkFault::DropMember {
+                            walk: 0,
+                            step: Some(0),
+                            member: None,
+                        },
+                    )
+                }
+
+                /// One skip the recount's proofs must catch: what is skipped,
+                /// the walk's key or pattern, for a keyspace walk the walk's
+                /// number and the key it skips (else the first member of the
+                /// key's first reply, [`drop_first`]), and what the
+                /// `RecountError::Incomplete` text must name.
+                struct Skip {
+                    what: &'static str,
+                    target: String,
+                    key: Option<(usize, String)>,
+                    names: String,
+                }
+
+                impl Skip {
+                    /// Arm the skip; it holds while the guard is held.
+                    fn arm(&self) -> ArmedWalkFault {
+                        match &self.key {
+                            Some((walk, key)) => drop_key(&self.target, *walk, key),
+                            None => drop_first(&self.target),
+                        }
+                    }
+                }
+
+                /// Every walk of the recount, each with one member skipped:
+                /// [`OID`]'s header from the first object walk (so the object
+                /// is never counted) and from the second (so the counted set
+                /// has an object the second walk did not return); its
+                /// `obj:flds`, `obj:tss` and `obj:ext`; [`CARRIER_OID`]'s
+                /// carrier from each carrier walk; `pending` and `inflight`.
+                fn skips(keys: &KeySchema) -> Vec<Skip> {
+                    let headers = keys.obj_header_scan_pattern();
+                    let carriers = format!("{}{{*}}:obj:extret", keys.prefix());
+                    let header = keys.obj_header(OID);
+                    let carrier = keys.obj_ext_retire_carrier(&CARRIER_OID.to_string());
+                    let one_of = |walk: &str, key: &str, card: &str| {
+                        format!(
+                            "the {walk} walk of {key} returned 0 members, and {card} read 1 at \
+                             its start and 1 at its end"
+                        )
+                    };
+                    let (flds, tss, ext) = (
+                        keys.obj_fields_index(OID),
+                        keys.obj_time_samples_index(OID),
+                        keys.obj_ext_index(OID),
+                    );
+                    let (pending, inflight) = (keys.ext_pending(), keys.ext_inflight());
+                    let disagree = |pattern: &str| {
+                        format!("two SCAN walks of {pattern} returned different keys")
+                    };
+                    vec![
+                        Skip {
+                            what: "the first object walk",
+                            names: disagree(&headers),
+                            target: headers.clone(),
+                            key: Some((0, header.clone())),
+                        },
+                        Skip {
+                            what: "the second object walk",
+                            names: disagree(&headers),
+                            target: headers,
+                            key: Some((1, header)),
+                        },
+                        Skip {
+                            what: "obj:flds",
+                            names: one_of("ZRANGE", &flds, "ZCARD"),
+                            target: flds,
+                            key: None,
+                        },
+                        Skip {
+                            what: "obj:tss",
+                            names: one_of("ZRANGE", &tss, "ZCARD"),
+                            target: tss,
+                            key: None,
+                        },
+                        Skip {
+                            what: "obj:ext",
+                            names: one_of("HSCAN", &ext, "HLEN"),
+                            target: ext,
+                            key: None,
+                        },
+                        Skip {
+                            what: "the first carrier walk",
+                            names: disagree(&carriers),
+                            target: carriers.clone(),
+                            key: Some((0, carrier.clone())),
+                        },
+                        Skip {
+                            what: "the second carrier walk",
+                            names: disagree(&carriers),
+                            target: carriers,
+                            key: Some((1, carrier)),
+                        },
+                        Skip {
+                            what: "pending",
+                            names: one_of("SSCAN", &pending, "SCARD"),
+                            target: pending,
+                            key: None,
+                        },
+                        Skip {
+                            what: "inflight",
+                            names: one_of("ZRANGE", &inflight, "ZCARD"),
+                            target: inflight,
+                            key: None,
+                        },
+                    ]
+                }
+
+                /// T1–T4 for the recount (b.f3t). One member skipped from
+                /// each walk of the recount in turn ([`skips`]) — a header
+                /// from either object walk, a member of each value index, a
+                /// carrier from either carrier walk, a `pending` and an
+                /// `inflight` release — fails the recount with
+                /// `RecountError::Incomplete` (exit 1 in the Job) whose text
+                /// names the walk and the counts or key sets it compared, and
+                /// every meta reads exactly as before: no count was set. The
+                /// control, with no seam armed, sets both counts.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_recount_whose_walk_skips_a_member_fails_incomplete_and_sets_no_count() {
+                    let cases = skips(&KeySchema::new("count-only:")).len();
+                    let mut failures: Vec<String> = Vec::new();
+                    for index in 0..cases {
+                        let tv = TestValkey::setup().await;
+                        let fixture = seed(&tv).await;
+                        let before = metas(&tv, &fixture).await;
+                        let skip = skips(tv.key_schema()).swap_remove(index);
+                        let (what, names) = (skip.what, skip.names.as_str());
+
+                        let armed = skip.arm();
+                        let result = recount(&tv).await;
+                        drop(armed);
+
+                        match result {
+                            Err(RecountError::Incomplete(why)) if why.contains(names) => {}
+                            Err(RecountError::Incomplete(why)) => {
+                                failures.push(format!("{what}: the text names {names:?}: {why}"))
+                            }
+                            other => failures.push(format!(
+                                "{what}: a skipped member fails the recount as incomplete, got \
+                                 {:?}",
+                                other.map(|receipt| receipt.report().clone())
+                            )),
+                        }
+                        if metas(&tv, &fixture).await != before {
+                            failures.push(format!("{what}: a count was set"));
+                        }
+                    }
+                    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+                    let tv = TestValkey::setup().await;
+                    let fixture = seed(&tv).await;
+                    recounted(&tv).await;
+                    assert_eq!(
+                        (
+                            ref_count(&tv, &fixture.h).await,
+                            ref_count(&tv, &fixture.k).await
+                        ),
+                        (Some(1), Some(3)),
+                        "control: unarmed, the recount lowers h and creates k"
+                    );
+                }
+
+                /// Every key or pattern the recount walks.
+                fn recount_targets(keys: &KeySchema) -> Vec<String> {
+                    vec![
+                        keys.obj_header_scan_pattern(),
+                        keys.obj_fields_index(OID),
+                        keys.obj_time_samples_index(OID),
+                        keys.obj_ext_index(OID),
+                        format!("{}{{*}}:obj:extret", keys.prefix()),
+                        keys.ext_pending(),
+                        keys.ext_inflight(),
+                    ]
+                }
+
+                /// T6 for the recount (b.f3t). The recount reads no
+                /// serving-process witness, so a store whose `INFO server`
+                /// reports a placeholder run_id (`"0"`) or no `run_id` line,
+                /// or whose run_id changes between two reads, no longer stops
+                /// it: with each forged through the walk seam on every walk of
+                /// the recount ([`recount_targets`]: a `RunId` fault on the
+                /// first witness read, or a change of serving process at the
+                /// second), the recount completes, lowering `h` to 1 and
+                /// creating `k` at 3. A missing myself line still fails it
+                /// (the cluster-gated test below).
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_recount_runs_on_a_store_whose_run_id_is_unusable_or_changes() {
+                    type Forge = fn(&str) -> ArmedWalkFault;
+                    let cases: [(&str, Forge); 3] = [
+                        ("run_id \"0\"", |target| {
+                            arm_walk_fault_for_test(
+                                target,
+                                WalkFault::RunId {
+                                    read: 0,
+                                    run_id: Some("0".to_owned()),
+                                },
+                            )
+                        }),
+                        ("no run_id line", |target| {
+                            arm_walk_fault_for_test(
+                                target,
+                                WalkFault::RunId {
+                                    read: 0,
+                                    run_id: None,
+                                },
+                            )
+                        }),
+                        ("a change of run_id", forge_process_change),
+                    ];
+                    let mut failures: Vec<String> = Vec::new();
+                    for (case, forge) in cases {
+                        let tv = TestValkey::setup().await;
+                        let fixture = seed(&tv).await;
+                        let armed: Vec<ArmedWalkFault> = recount_targets(tv.key_schema())
+                            .iter()
+                            .map(|target| forge(target.as_str()))
+                            .collect();
+                        let result = recount(&tv).await;
+                        drop(armed);
+
+                        if let Err(e) = result {
+                            failures.push(format!("{case}: the recount completes, got {e:?}"));
+                            continue;
+                        }
+                        let counts = (
+                            ref_count(&tv, &fixture.h).await,
+                            ref_count(&tv, &fixture.k).await,
+                        );
+                        if counts != (Some(1), Some(3)) {
+                            failures.push(format!(
+                                "{case}: the recount lowers h to 1 and creates k at 3, got \
+                                 {counts:?}"
+                            ));
+                        }
+                    }
+                    assert!(failures.is_empty(), "{}", failures.join("\n"));
+                }
+
+                /// T4's letter case (b.f3t). `obj:ext` holding one hash under
+                /// two fields, its hex in lower and in upper case (the recount
+                /// decodes either): `HLEN` counts two fields, and the recount
+                /// de-duplicates `obj:ext` by each field's exact text, so its
+                /// count check holds and the recount completes, counting the
+                /// object's one reference to the hash once (`ref_count` 1).
+                ///
+                /// Fail-on-old (in-place perturbation, red then green once
+                /// restored): with `RecountExtFields` keeping each field
+                /// lower-cased, so de-duplicated by the hash it decodes to, the
+                /// walk returns one distinct field where `HLEN` read two, and
+                /// the recount fails incomplete.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_recount_counts_a_hash_obj_ext_holds_in_two_letter_cases_once() {
+                    const CASED: &str = "960905";
+                    let tv = TestValkey::setup().await;
+                    let hash = hex_of(0xBC);
+                    pre_store(&store(&tv), 0xBC).await;
+                    set_ref_count(&tv, &hash, 7).await;
+                    seed_live_header(&tv, CASED).await;
+                    let upper = hash.to_ascii_uppercase();
+                    assert_ne!(upper, hash, "fixture: the hex has letters to case");
+                    seed_index(&tv, CASED, &[(hash.as_str(), "1"), (upper.as_str(), "1")]).await;
+
+                    recounted(&tv).await;
+
+                    assert_eq!(
+                        ref_count(&tv, &hash).await,
+                        Some(1),
+                        "one object references the hash once"
+                    );
+                }
+
+                /// T2's repeat (b.f3t; PM 1). The recount's first object walk
+                /// returning [`OID`]'s header twice — the walk seam's
+                /// `RepeatMember`, a copy of the header right after it in the
+                /// step that returns it, as a SCAN may return a key again —
+                /// counts the object once: the recount completes, its report
+                /// counts one object, and `h`, which the object references
+                /// once, is set to 1 (`k`, owed only, to 3). The second walk,
+                /// unarmed, returns the header once, so the two walks'
+                /// de-duplicated sets agree.
+                ///
+                /// Fail-on-old (in-place perturbation, red then green once
+                /// restored): with `walk_objects` no longer skipping an object
+                /// it already counted (its `counted.insert` check), the report
+                /// counts two objects and `h` is set to 2.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_recount_counts_an_object_whose_header_its_walk_returns_twice_once() {
+                    let tv = TestValkey::setup().await;
+                    let fixture = seed(&tv).await;
+                    let keys = tv.key_schema();
+
+                    let armed = arm_walk_fault_for_test(
+                        &keys.obj_header_scan_pattern(),
+                        WalkFault::RepeatMember {
+                            walk: 0,
+                            step: None,
+                            member: Some(keys.obj_header(OID)),
+                        },
+                    );
+                    let report = recounted(&tv).await;
+                    drop(armed);
+
+                    assert_eq!(report.objects, 1, "the object is counted once: {report:?}");
+                    assert_eq!(
+                        (
+                            ref_count(&tv, &fixture.h).await,
+                            ref_count(&tv, &fixture.k).await
+                        ),
+                        (Some(1), Some(3)),
+                        "h counts its one reference once"
+                    );
+                }
+
+                /// A page taker that hands every page to the recount's own
+                /// taker it wraps and, once its first page is taken, runs
+                /// `after_first` on the store: a member added between a
+                /// walk's first page and its last.
+                struct AddingAfterFirstPage<'t, T> {
+                    inner: T,
+                    tv: &'t TestValkey,
+                    after_first: Option<AddMember>,
+                }
+
+                /// A member to add under a rank walk: `obj:flds`'s field row
+                /// `name` naming `hash` (its row and its index member), or a
+                /// release of `hash` into `inflight`.
+                enum AddMember {
+                    FieldRow { name: &'static str, hash: String },
+                    Inflight { hash: [u8; 32], oid: u64 },
+                }
+
+                impl<T: RankPageTaker> RankPageTaker for AddingAfterFirstPage<'_, T> {
+                    type Error = T::Error;
+
+                    fn walk_error(&self, e: WalkError) -> T::Error {
+                        self.inner.walk_error(e)
+                    }
+
+                    async fn take_page(&mut self, members: Vec<Value>) -> Result<(), T::Error> {
+                        self.inner.take_page(members).await?;
+                        match self.after_first.take() {
+                            Some(AddMember::FieldRow { name, hash }) => {
+                                seed_row(
+                                    self.tv,
+                                    OID,
+                                    Family::Field,
+                                    name,
+                                    &[("hash", hash.as_str()), ("size", "1")],
+                                )
+                                .await;
+                            }
+                            Some(AddMember::Inflight { hash, oid }) => {
+                                owe(self.tv, OwedStage::Inflight, hash, oid).await;
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    }
+                }
+
+                /// T3 (b.f3t), a member added under a rank walk. The
+                /// recount's rank pages of `obj:flds` (its row taker,
+                /// `RecountRowPages`) and of `inflight` (`InflightPages`),
+                /// each over three members by pages of 2, with a member added
+                /// once the first page is taken: the walk returns four members
+                /// where its first page's `ZCARD` read three, and its last
+                /// page's `ZCARD` reads four, so it fails
+                /// (`PassError::Incomplete`, a `CountMismatch` naming the key,
+                /// `ZCARD` 3 at its start and 4 at its end) — before the
+                /// recount sets any count, since every set follows every walk
+                /// (`a_recount_whose_walk_skips_a_member_fails_incomplete_and_sets_no_count`).
+                /// Each control, with nothing added, completes.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn the_recounts_rank_pages_fail_when_a_member_is_added_between_its_first_and_last_page(
+                ) {
+                    const PAGE: u64 = 2;
+                    let mut failures: Vec<String> = Vec::new();
+                    for (index, add) in [
+                        ("obj:flds", true),
+                        ("obj:flds", false),
+                        ("inflight", true),
+                        ("inflight", false),
+                    ] {
+                        let case = format!("{index}, a member added: {add}");
+                        let tv = TestValkey::setup().await;
+                        let keys = tv.key_schema();
+                        let h = hex_of(0xB4);
+                        let (pool, _token) = tv.client().acquire_maintenance();
+                        let conn = pool.next();
+                        let mut hashes: HashSet<[u8; 32]> = HashSet::new();
+                        let mut owed: HashMap<[u8; 32], u64> = HashMap::new();
+                        let (key, result) = if index == "obj:flds" {
+                            for name in ["f1", "f2", "f3"] {
+                                seed_row(
+                                    &tv,
+                                    OID,
+                                    Family::Field,
+                                    name,
+                                    &[("hash", h.as_str()), ("size", "1")],
+                                )
+                                .await;
+                            }
+                            let key = keys.obj_fields_index(OID);
+                            let mut taker = AddingAfterFirstPage {
+                                inner: RecountRowPages {
+                                    client: tv.client(),
+                                    pool,
+                                    keys,
+                                    object_id: OID,
+                                    time_samples: false,
+                                    op: OP_LIST_FIELDS,
+                                    chunk: PAGE as usize,
+                                    hashes: &mut hashes,
+                                },
+                                tv: &tv,
+                                after_first: add.then(|| AddMember::FieldRow {
+                                    name: "f9",
+                                    hash: h.clone(),
+                                }),
+                            };
+                            let result = page_by_rank_counted(
+                                &RankWalk::new(conn, &key, false),
+                                PAGE,
+                                &mut taker,
+                            )
+                            .await;
+                            (key, result)
+                        } else {
+                            for oid in [961_101, 961_102, 961_103] {
+                                owe(&tv, OwedStage::Inflight, hash_of(0xB4), oid).await;
+                            }
+                            let key = keys.ext_inflight();
+                            let mut taker = AddingAfterFirstPage {
+                                inner: InflightPages {
+                                    client: tv.client(),
+                                    owed: &mut owed,
+                                },
+                                tv: &tv,
+                                after_first: add.then_some(AddMember::Inflight {
+                                    hash: hash_of(0xB4),
+                                    oid: 961_109,
+                                }),
+                            };
+                            let result = page_by_rank_counted(
+                                &RankWalk::new(conn, &key, false),
+                                PAGE,
+                                &mut taker,
+                            )
+                            .await;
+                            (key, result)
+                        };
+                        match (add, result) {
+                            (false, Ok(())) => {}
+                            (true, Err(PassError::Incomplete(incomplete))) => {
+                                let want = WalkIncomplete::CountMismatch {
+                                    walk: "ZRANGE",
+                                    target: Arc::from(key.as_str()),
+                                    card: "ZCARD",
+                                    at_start: 3,
+                                    returned: 4,
+                                    at_end: 4,
+                                    expected_end: 3,
+                                };
+                                if *incomplete != want {
+                                    failures.push(format!("{case}: {incomplete:?}, want {want:?}"));
+                                }
+                            }
+                            (_, other) => failures.push(format!("{case}: got {other:?}")),
+                        }
+                    }
+                    assert!(failures.is_empty(), "{}", failures.join("\n"));
+                }
+
+                /// A step taker that hands every step to the recount's own
+                /// taker it wraps, each step after the first with the first
+                /// step's members again: a member a counted cursor walk
+                /// returns twice, as a rehash between two steps can make it.
+                struct Repeating<T> {
+                    inner: T,
+                    first: Option<Vec<Value>>,
+                    /// The steps handed on with a repeat.
+                    repeats: usize,
+                }
+
+                impl<T: CountedStepTaker> CountedStepTaker for Repeating<T> {
+                    type Error = T::Error;
+
+                    fn walk_error(&self, e: WalkError) -> T::Error {
+                        self.inner.walk_error(e)
+                    }
+
+                    async fn take_step(&mut self, mut members: Vec<Value>) -> Result<(), T::Error> {
+                        match &self.first {
+                            None => self.first = Some(members.clone()),
+                            Some(first) => {
+                                members.extend(first.iter().cloned());
+                                self.repeats += 1;
+                            }
+                        }
+                        self.inner.take_step(members).await
+                    }
+
+                    fn distinct(&self) -> u64 {
+                        self.inner.distinct()
+                    }
+                }
+
+                /// More members than the store keeps in a compact encoding of
+                /// `setting` (`*-max-listpack-entries`, read, never set), so a
+                /// cursor step answers about its `COUNT` and a walk takes many
+                /// steps.
+                async fn past_compact_limit(tv: &TestValkey, setting: &str) -> usize {
+                    use fred::interfaces::ConfigInterface;
+
+                    let limit: HashMap<String, String> = tv
+                        .client()
+                        .pool
+                        .config_get(setting)
+                        .await
+                        .unwrap_or_else(|e| panic!("CONFIG GET {setting}: {e}"));
+                    limit
+                        .get(setting)
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .unwrap_or_else(|| panic!("the store reports {setting}"))
+                        .max(128)
+                        + 72
+                }
+
+                /// T4 (b.f3t), a repeated member. The recount's counted
+                /// cursor walks of a table-encoded `obj:ext` (its field taker,
+                /// `RecountExtFields`) and `pending` (`CountedPending`), by
+                /// steps of 10, each step after the first handed on with the
+                /// first step's members again ([`Repeating`]): each walk
+                /// completes — its distinct members still equal `HLEN` /
+                /// `SCARD` — reading every field's hash once, and tallying
+                /// each `pending` release once (the tally equals the
+                /// releases staged).
+                ///
+                /// Fail-on-old (in-place perturbations, red then green once
+                /// restored): with `RecountExtFields::distinct` counting every
+                /// field it was handed, repeats included, the `obj:ext` walk
+                /// fails incomplete; with `CountedPending` tallying a repeated
+                /// member again, the `pending` tally passes the releases
+                /// staged.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn the_recounts_counted_walks_count_a_member_a_step_repeats_once() {
+                    const STEP: u64 = 10;
+                    let tv = TestValkey::setup().await;
+                    let keys = tv.key_schema();
+                    let (pool, _token) = tv.client().acquire_maintenance();
+                    let conn = pool.next();
+
+                    let fields = past_compact_limit(&tv, "hash-max-listpack-entries").await;
+                    let ext = keys.obj_ext_index(OID);
+                    let index: Vec<(String, String)> = (0..fields)
+                        .map(|i| (sha256_to_hex(&many_hash(0x63, i)), "1".to_owned()))
+                        .collect();
+                    let _: () = tv
+                        .client()
+                        .pool
+                        .hset(&ext, index)
+                        .await
+                        .expect("seeding obj:ext must succeed");
+                    let mut hashes = HashSet::new();
+                    let mut taker = Repeating {
+                        inner: RecountExtFields {
+                            client: tv.client(),
+                            fields: HashSet::new(),
+                            hashes: &mut hashes,
+                        },
+                        first: None,
+                        repeats: 0,
+                    };
+                    walk_counted(&CountedScan::hash(conn, &ext), STEP, &mut taker)
+                        .await
+                        .unwrap_or_else(|e| panic!("obj:ext: the walk completes, got {e:?}"));
+                    assert!(taker.repeats > 0, "fixture: obj:ext: a step was repeated");
+                    assert_eq!(hashes.len(), fields, "obj:ext: every field's hash, once");
+
+                    let releases = past_compact_limit(&tv, "set-max-listpack-entries").await;
+                    let members: Vec<String> = (0..releases)
+                        .map(|i| ExtRelease::retirement(many_hash(0x64, i), 961_200).member())
+                        .collect();
+                    let _: u64 = tv
+                        .client()
+                        .pool
+                        .sadd(keys.ext_pending(), members)
+                        .await
+                        .expect("seeding pending must succeed");
+                    let mut owed: HashMap<[u8; 32], u64> = HashMap::new();
+                    let mut taker = Repeating {
+                        inner: CountedPending {
+                            client: tv.client(),
+                            seen: HashSet::new(),
+                            owed: &mut owed,
+                        },
+                        first: None,
+                        repeats: 0,
+                    };
+                    walk_counted(
+                        &CountedScan::set(conn, &keys.ext_pending()),
+                        STEP,
+                        &mut taker,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("pending: the walk completes, got {e:?}"));
+                    assert!(taker.repeats > 0, "fixture: pending: a step was repeated");
+                    assert_eq!(
+                        owed.values().sum::<u64>(),
+                        releases as u64,
+                        "pending: each release tallied once"
+                    );
+                }
+
+                /// A cursor-pager reader that counts the steps it took
+                /// ([`CursorPageReader::take_page`]) and passes everything
+                /// else to the reader it wraps.
+                struct Counting<R> {
+                    inner: R,
+                    pages: usize,
+                }
+
+                impl<R: CursorPageReader> CursorPageReader for Counting<R> {
+                    type Error = R::Error;
+                    type Member = R::Member;
+
+                    async fn read_step(
+                        &mut self,
+                        cursor: &str,
+                        start: Option<&Witness>,
+                    ) -> Result<GuardedStep<R::Member>, R::Error> {
+                        self.inner.read_step(cursor, start).await
+                    }
+
+                    fn changed(&self, start: &Witness, later: &Witness) -> R::Error {
+                        self.inner.changed(start, later)
+                    }
+
+                    async fn take_page(&mut self, members: Vec<R::Member>) -> Result<(), R::Error> {
+                        self.pages += 1;
+                        self.inner.take_page(members).await
+                    }
+                }
+
+                /// Forge the walk of `target`'s witness reads `0..=steps` as
+                /// [`FORGED_RUN_A`] and read `steps + 1` as
+                /// [`FORGED_RUN_B`]: the walk's first `steps` steps match its
+                /// start, and the next one's witness does not.
+                fn forge_change_after(target: &str, steps: usize) -> ArmedWalkFault {
+                    forge_process_change_for_test(target, steps + 1)
+                }
+
+                /// `change` is a change of serving process on the `walk` walk
+                /// of `target`, from [`FORGED_RUN_A`] to [`FORGED_RUN_B`].
+                fn assert_process_change(change: &ServingChange, walk: &str, target: &str) {
+                    match change {
+                        ServingChange::Process {
+                            walk: w,
+                            target: t,
+                            before,
+                            after,
+                            ..
+                        } => assert_eq!(
+                            (*w, &**t, before.as_str(), after.as_str()),
+                            (walk, target, FORGED_RUN_A, FORGED_RUN_B)
+                        ),
+                        other => panic!("a change of serving process, got {other:?}"),
+                    }
+                }
+
+                /// Distinct hashes, told apart by `i`.
+                fn many_hash(byte: u8, i: usize) -> [u8; 32] {
+                    let mut hash = [byte; 32];
+                    hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    hash
+                }
+
+                /// Test 1 for the periodic pass's owed readers (b.gns; the
+                /// recount reads the same keys by its own proofs, above):
+                /// `SSCAN` of `pending` and `ZSCAN` of `inflight`, each
+                /// holding 400 releases (a
+                /// table, so a step of 100 answers about 100). A change
+                /// forged in the witness after the second step ends each walk
+                /// with the change, naming the key and both run_ids, and the
+                /// reader tallied only the first step. Each control walk,
+                /// unarmed, takes more than one step and tallies all 400.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn the_owed_readers_take_only_the_steps_before_a_process_change() {
+                    const RELEASES: usize = 400;
+                    for (kind, command, op) in [
+                        (OwedKind::Pending, "SSCAN", OP_SCAN_PENDING),
+                        (OwedKind::Inflight, "ZSCAN", OP_SCAN_INFLIGHT),
+                    ] {
+                        let tv = TestValkey::setup().await;
+                        let keys = tv.key_schema();
+                        let members: Vec<String> = (0..RELEASES)
+                            .map(|i| ExtRelease::retirement(many_hash(0x62, i), 961_000).member())
+                            .collect();
+                        let key = match kind {
+                            OwedKind::Pending => {
+                                let _: u64 = tv
+                                    .client()
+                                    .pool
+                                    .sadd(keys.ext_pending(), members)
+                                    .await
+                                    .expect("seeding pending must succeed");
+                                keys.ext_pending()
+                            }
+                            OwedKind::Inflight => {
+                                let scored: Vec<(f64, String)> =
+                                    members.into_iter().map(|m| (1.0, m)).collect();
+                                let _: i64 = tv
+                                    .client()
+                                    .pool
+                                    .zadd(keys.ext_inflight(), None, None, false, false, scored)
+                                    .await
+                                    .expect("seeding inflight must succeed");
+                                keys.ext_inflight()
+                            }
+                        };
+                        let (pool, _token) = tv.client().acquire_maintenance();
+                        let never = CancellationToken::new();
+                        let started = Instant::now();
+                        let tallied = |owed: &HashMap<[u8; 32], u64>| owed.values().sum::<u64>();
+
+                        let mut all = HashMap::new();
+                        let mut control = Counting {
+                            inner: OwedSteps {
+                                client: tv.client(),
+                                walk: KeyedWalk::new(pool.next(), command, &key),
+                                kind,
+                                op,
+                                phase: "the owed walk",
+                                owed: &mut all,
+                                budget: Duration::MAX,
+                                started,
+                                cancel: &never,
+                            },
+                            pages: 0,
+                        };
+                        page_by_cursor(&mut control)
+                            .await
+                            .unwrap_or_else(|e| panic!("{command}: control completes, got {e}"));
+                        let control_pages = control.pages;
+                        assert!(control_pages > 1, "{command}: fixture: more than one step");
+                        assert_eq!(
+                            tallied(&all),
+                            RELEASES as u64,
+                            "{command}: control tallies all"
+                        );
+
+                        let forged = forge_change_after(&key, 1);
+                        let mut taken = HashMap::new();
+                        let mut crossed = Counting {
+                            inner: OwedSteps {
+                                client: tv.client(),
+                                walk: KeyedWalk::new(pool.next(), command, &key),
+                                kind,
+                                op,
+                                phase: "the owed walk",
+                                owed: &mut taken,
+                                budget: Duration::MAX,
+                                started,
+                                cancel: &never,
+                            },
+                            pages: 0,
+                        };
+                        let result = page_by_cursor(&mut crossed).await;
+                        let pages = crossed.pages;
+                        drop(forged);
+                        match result {
+                            Err(PassError::ServingChanged(change)) => {
+                                assert_process_change(&change, command, &key);
+                            }
+                            other => {
+                                panic!("{command}: the forged change ends the walk, got {other:?}")
+                            }
+                        }
+                        assert_eq!(pages, 1, "{command}: only the first step is taken");
+                        let tallied = tallied(&taken);
+                        assert!(
+                            0 < tallied && tallied < RELEASES as u64,
+                            "{command}: only the first step's releases are tallied: {tallied}"
+                        );
+                    }
+                }
+
+                // ── On a real cluster ──────────────────────────────────────
+
+                /// The fixture on `LIVE_EDIT_TEST_CLUSTER_URL`, or `None`
+                /// after a `SKIP:` line.
+                async fn cluster_fixture() -> Option<TestValkey> {
+                    let Some(url) = crate::storage::test_support::test_cluster_url() else {
+                        eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
+                        return None;
+                    };
+                    let tv = TestValkey::setup_with_url(url, 2).await;
+                    assert!(
+                        tv.client().pool.next().is_clustered(),
+                        "LIVE_EDIT_TEST_CLUSTER_URL names a cluster"
+                    );
+                    Some(tv)
+                }
+
+                /// The cluster's primaries as `CLUSTER SLOTS` names them
+                /// (`host:port`), each with its slot set, in the order a
+                /// keyspace walk visits them: by its lowest slot.
+                async fn map_primaries(tv: &TestValkey) -> Vec<(String, SlotSet)> {
+                    let reply: Value = tv
+                        .client()
+                        .pool
+                        .next()
+                        .cluster_slots()
+                        .await
+                        .expect("CLUSTER SLOTS must succeed");
+                    let mut ranges: Vec<(u16, u16, String)> = reply
+                        .into_array()
+                        .into_iter()
+                        .map(|entry| {
+                            let mut fields = entry.into_array().into_iter();
+                            let slot = |value: Option<Value>| {
+                                value
+                                    .and_then(|v| v.as_i64())
+                                    .and_then(|n| u16::try_from(n).ok())
+                                    .expect("a slot number")
+                            };
+                            let (start, end) = (slot(fields.next()), slot(fields.next()));
+                            let mut node =
+                                fields.next().expect("a primary").into_array().into_iter();
+                            let host = node.next().and_then(|h| h.as_string()).unwrap_or_default();
+                            let port = node.next().and_then(|p| p.as_i64()).expect("a port");
+                            (start, end, format!("{host}:{port}"))
+                        })
+                        .collect();
+                    ranges.sort_unstable();
+                    let mut primaries: Vec<(String, Vec<(u16, u16)>)> = Vec::new();
+                    for (start, end, primary) in ranges {
+                        match primaries.iter_mut().find(|(p, _)| *p == primary) {
+                            Some((_, owned)) => owned.push((start, end)),
+                            None => primaries.push((primary, vec![(start, end)])),
+                        }
+                    }
+                    primaries
+                        .into_iter()
+                        .map(|(primary, owned)| (primary, SlotSet::from_ranges(owned)))
+                        .collect()
+                }
+
+                /// A `CLUSTER NODES` reply whose myself line lists `owned`.
+                fn myself_reply(owned: &SlotSet) -> String {
+                    let slots: Vec<String> = owned
+                        .ranges()
+                        .iter()
+                        .map(|&(start, end)| format!("{start}-{end}"))
+                        .collect();
+                    format!(
+                        "0000000000000000000000000000000000000001 127.0.0.1:7000@17000 \
+                         myself,master - 0 0 1 connected {}\n",
+                        slots.join(" ")
+                    )
+                }
+
+                /// `owned` less its highest slot.
+                fn less_its_last_slot(owned: &SlotSet) -> SlotSet {
+                    let mut ranges = owned.ranges().to_vec();
+                    let (start, end) = ranges.pop().expect("a primary serves a slot");
+                    if start < end {
+                        ranges.push((start, end - 1));
+                    }
+                    SlotSet::from_ranges(ranges)
+                }
+
+                /// Test 18 (b.gns; cluster-gated, `test-cluster:`). A pinned
+                /// node whose myself line lists one slot fewer than the
+                /// walk's map gives its primary — forged on the object
+                /// walk's first `CLUSTER NODES` read — is `NotOwner` at the
+                /// walk's start: the periodic pass forfeits with it, naming
+                /// the primary, the node and both slot sets, after
+                /// re-syncing the client's routing table, and
+                /// `enumeration_failed` ticks once. That `NotOwner` is no
+                /// fred error, so never counted on `valkey_errors_total`, is
+                /// `scan_guard`'s unit test
+                /// `a_missing_witness_names_its_command_and_what_was_seen_and_is_not_a_fred_error`
+                /// (that metric counts only fred's `Timeout`, so an assertion
+                /// on it here could not fail).
+                ///
+                /// Fail-on-old (not run in this sandbox, which has no
+                /// cluster): with the slot-set comparison in `read_primary`
+                /// removed, the pass completes and `enumeration_failed`
+                /// stays 0.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_cluster_pass_whose_object_walk_misses_its_primarys_slots_forfeits() {
+                    const REPLICA: &str = "gns-recon-cluster-not-owner";
+                    let Some(tv) = cluster_fixture().await else {
+                        return;
+                    };
+                    let metrics = Arc::new(metrics_scrape_only(REPLICA));
+                    seed_object_referencing(&tv, OID, &hex_of(0xB3)).await;
+                    let (primary, expected) = map_primaries(&tv)
+                        .await
+                        .into_iter()
+                        .next()
+                        .expect("a primary");
+                    let served = less_its_last_slot(&expected);
+                    let pattern = tv.key_schema().obj_header_scan_pattern();
+                    let forged = || {
+                        arm_walk_fault_for_test(
+                            &pattern,
+                            WalkFault::ClusterNodesReply {
+                                read: 0,
+                                reply: myself_reply(&served),
+                            },
+                        )
+                    };
+
+                    let armed = forged();
+                    let pass = run_pass(
+                        tv.client(),
+                        tv.key_schema(),
+                        TEST_GRACE,
+                        TEST_INTERVAL,
+                        Instant::now(),
+                        &CancellationToken::new(),
+                        None,
+                    )
+                    .await;
+                    drop(armed);
+                    match pass {
+                        Err(PassError::ServingChanged(change)) => match *change {
+                            ServingChange::NotOwner {
+                                primary: ref p,
+                                ref node,
+                                expected: ref e,
+                                served: ref s,
+                                at,
+                                ref refresh,
+                                ..
+                            } => {
+                                assert_eq!(p, &primary, "the map's first primary");
+                                assert!(node.is_some(), "the pinned node is named");
+                                assert_eq!((e, s.as_ref()), (&expected, Some(&served)));
+                                assert_eq!(at, WalkEnd::Start);
+                                assert_eq!(refresh, &RoutingRefresh::Refreshed);
+                                let text = change.to_string();
+                                for part in
+                                    [primary.clone(), expected.to_string(), served.to_string()]
+                                {
+                                    assert!(
+                                        text.contains(&part),
+                                        "the line names {part:?}: {text}"
+                                    );
+                                }
+                            }
+                            other => panic!("NotOwner, got {other:?}"),
+                        },
+                        other => panic!("the pass forfeits on NotOwner, got {other:?}"),
+                    }
+
+                    let armed = forged();
+                    one_pass(&tv, &metrics, REPLICA).await;
+                    drop(armed);
+                    assert_eq!(
+                        outcome(&metrics, EXT_RECONCILE_OUTCOME_ENUMERATION_FAILED),
+                        1
+                    );
+                    assert_eq!(gauges(&metrics, REPLICA), None, "nothing is published");
+                    println!("CLUSTER-GATED RAN: a_cluster_pass_whose_object_walk_misses_its_primarys_slots_forfeits");
+                }
+
+                /// Test 19, the recount and the periodic pass (b.gns, policy
+                /// 6; cluster-gated, `test-cluster:`). A pinned node's
+                /// `CLUSTER NODES` reply with no myself line — forged on the
+                /// object walk's first read — is a missing witness: the
+                /// recount fails with `RecountError::WitnessMissing` (exit 3
+                /// in the Job) naming `CLUSTER NODES` and "no myself line",
+                /// setting no count, and the periodic pass forfeits, ticking
+                /// `enumeration_failed` once.
+                ///
+                /// Fail-on-old (not run in this sandbox): with an unusable
+                /// myself line mapped to a `WalkError::Read` again, as
+                /// before policy 6, the recount fails as a store fault
+                /// (exit 1) instead.
+                #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+                async fn a_cluster_walk_with_no_myself_line_fails_the_recount_as_a_missing_witness()
+                {
+                    const REPLICA: &str = "gns-recon-cluster-no-myself";
+                    let Some(tv) = cluster_fixture().await else {
+                        return;
+                    };
+                    let metrics = Arc::new(metrics_scrape_only(REPLICA));
+                    let fixture = seed(&tv).await;
+                    let before = metas(&tv, &fixture).await;
+                    let pattern = tv.key_schema().obj_header_scan_pattern();
+                    let forged = || {
+                        arm_walk_fault_for_test(
+                            &pattern,
+                            WalkFault::ClusterNodesReply {
+                                read: 0,
+                                reply: "0000000000000000000000000000000000000001 \
+                                        127.0.0.1:7000@17000 master - 0 0 1 connected 0-16383\n"
+                                    .to_owned(),
+                            },
+                        )
+                    };
+
+                    let armed = forged();
+                    let result = recount(&tv).await;
+                    drop(armed);
+                    match result {
+                        Err(RecountError::WitnessMissing(why)) => {
+                            for part in ["`CLUSTER NODES`", "no myself line", pattern.as_str()] {
+                                assert!(why.contains(part), "names {part:?}: {why}");
+                            }
+                        }
+                        other => panic!(
+                            "no myself line fails the recount as a missing witness, got {:?}",
+                            other.map(|receipt| receipt.report().clone())
+                        ),
+                    }
+                    assert_eq!(metas(&tv, &fixture).await, before, "no count is set");
+
+                    let armed = forged();
+                    one_pass(&tv, &metrics, REPLICA).await;
+                    drop(armed);
+                    assert_eq!(
+                        outcome(&metrics, EXT_RECONCILE_OUTCOME_ENUMERATION_FAILED),
+                        1
+                    );
+                    println!(
+                        "CLUSTER-GATED RAN: a_cluster_walk_with_no_myself_line_fails_the_recount_as_a_missing_witness"
+                    );
+                }
+            }
+        }
+
+        // ── The row reads, chunk by chunk ───────────────────────────────────
+        //
+        // `object_referenced_hashes` reads an object's row hashes
+        // `ROW_HASH_CHUNK_ROWS` rows to a pipeline, folding each chunk's
+        // replies before it sends the next, so the client holds one chunk's
+        // commands and replies however large the object is. The chunking must
+        // change nothing the walk reads, and it must bound what is in flight.
+        mod row_hash_chunks {
+            use super::*;
+
+            use std::collections::BTreeSet;
+
+            use fred::interfaces::{ClientInterface, ConfigInterface};
+
+            use crate::storage::test_support::{
+                object_encoding_for_test, release_all, CONN_STALL_WAIT,
+            };
+
+            /// The object every test here reads.
+            const OID: &str = "962001";
+
+            /// How long the bounded-read tests watch the stalled connection,
+            /// once the first chunk (or the recount's first rank page's
+            /// pipeline) has arrived, for any more of its commands. Well inside the
+            /// fixture's 5 s command timeout, which the stalled reads must
+            /// not reach.
+            const QUIET_WINDOW: Duration = Duration::from_millis(300);
+
+            /// The walk's read of [`OID`]'s references, its rows read
+            /// `chunk_rows` at a time: `(hashes, index_mismatch)`, both
+            /// sorted.
+            async fn references_in_chunks(
+                tv: &TestValkey,
+                chunk_rows: usize,
+            ) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+                let members = list_value_members(tv.client(), tv.key_schema(), OID)
+                    .await
+                    .expect("the members list");
+                let refs = object_referenced_hashes_in_chunks(
+                    tv.client(),
+                    tv.key_schema(),
+                    OID,
+                    &members,
+                    chunk_rows,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("chunks of {chunk_rows}: the walk reads, got {e:?}"));
+                let mut hashes: Vec<[u8; 32]> = refs.hashes.into_iter().collect();
+                hashes.sort_unstable();
+                let mut mismatch = refs.index_mismatch;
+                mismatch.sort_unstable();
+                (hashes, mismatch)
+            }
+
+            /// The restore Job's recount's read of [`OID`]'s references, its
+            /// row indices read by rank pages of `step` ranks and its
+            /// `obj:ext` by counted `HSCAN` steps of `step` elements
+            /// ([`object_referenced_hashes_paged`]): the hashes, sorted. It
+            /// runs no index audit, so it reports no index mismatch.
+            async fn references_paged(tv: &TestValkey, step: usize) -> Vec<[u8; 32]> {
+                let refs = object_referenced_hashes_paged(tv.client(), tv.key_schema(), OID, step)
+                    .await
+                    .unwrap_or_else(|e| panic!("steps of {step}: the read reads, got {e:?}"));
+                assert_eq!(
+                    refs.index_mismatch,
+                    Vec::<[u8; 32]>::new(),
+                    "steps of {step}: the recount audits no index"
+                );
+                let mut hashes: Vec<[u8; 32]> = refs.hashes.into_iter().collect();
+                hashes.sort_unstable();
+                hashes
+            }
+
+            /// Seed [`OID`] with every row shape on compact indices: five
+            /// field rows and three time-sample rows, A on two fields and a
+            /// time sample, B and C on one field each, D on a time sample,
+            /// and an inline field and time sample (no hash). Its index
+            /// stores A at 3 and D at 1 (agreeing), B at 2 (an over-count),
+            /// no field for C, and E, which no row holds. Returns the hashes
+            /// the object references and the index mismatches, both sorted.
+            async fn seed_every_row_shape(tv: &TestValkey) -> (Vec<[u8; 32]>, Vec<[u8; 32]>) {
+                let (a, b, c, d, e) = (
+                    hex_of(0xA1),
+                    hex_of(0xB1),
+                    hex_of(0xC1),
+                    hex_of(0xD1),
+                    hex_of(0xE1),
+                );
+                let external =
+                    |hash: &str| vec![("hash", hash.to_owned()), ("size", "1".to_owned())];
+                let inline = vec![("value", "AA==".to_owned())];
+                for (name, columns) in [
+                    ("f0", external(&a)),
+                    ("f1", external(&a)),
+                    ("f2", inline.clone()),
+                    ("f3", external(&b)),
+                    ("f4", external(&c)),
+                ] {
+                    let columns: Vec<(&str, &str)> =
+                        columns.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    seed_row(tv, OID, Family::Field, name, &columns).await;
+                }
+                for (time, columns) in [("0.5", external(&a)), ("1", external(&d)), ("2", inline)] {
+                    let columns: Vec<(&str, &str)> =
+                        columns.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                    seed_row(tv, OID, Family::TimeSample, time, &columns).await;
+                }
+                seed_index(
+                    tv,
+                    OID,
+                    &[
+                        (a.as_str(), "3"),
+                        (b.as_str(), "2"),
+                        (d.as_str(), "1"),
+                        (e.as_str(), "1"),
+                    ],
+                )
+                .await;
+                let sorted = |mut hashes: Vec<[u8; 32]>| {
+                    hashes.sort_unstable();
+                    hashes
+                };
+                (
+                    sorted(vec![
+                        hash_of(0xA1),
+                        hash_of(0xB1),
+                        hash_of(0xC1),
+                        hash_of(0xD1),
+                        hash_of(0xE1),
+                    ]),
+                    sorted(vec![hash_of(0xB1), hash_of(0xC1), hash_of(0xE1)]),
+                )
+            }
+
+            /// The periodic walk reads the same hashes and the same index
+            /// mismatches whatever its chunk size: one row a chunk (each a
+            /// pipeline of one read, an inline row's nil reply among them),
+            /// chunks that end inside the field rows, one that spans the last
+            /// field row and the first time-sample row, one that ends exactly
+            /// at the last field row, one exactly the object's rows, and
+            /// chunks larger than the object, the production size among them
+            /// (the object of [`seed_every_row_shape`]).
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn object_referenced_hashes_reads_the_same_references_at_every_chunk_size() {
+                let tv = TestValkey::setup().await;
+                let expected = seed_every_row_shape(&tv).await;
+
+                for chunk_rows in [1, 2, 3, 5, 8, 9, ROW_HASH_CHUNK_ROWS] {
+                    assert_eq!(
+                        references_in_chunks(&tv, chunk_rows).await,
+                        expected,
+                        "chunks of {chunk_rows} rows: the hashes and the index mismatches"
+                    );
+                }
+            }
+
+            /// One hash per index of `byte`, told apart by `i`: the table
+            /// fixture's many distinct hashes.
+            fn table_hash(byte: u8, i: usize) -> [u8; 32] {
+                let mut hash = [byte; 32];
+                hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                hash
+            }
+
+            /// Seed [`OID`] with indices the store keeps as tables, past the
+            /// compact encodings' 128 entries, and return the hashes it
+            /// references, sorted: 150 field rows (every tenth inline, every
+            /// tenth after it dual-shape, a `value` beside a `hash`, whose raw
+            /// column both walks count), on 16 hashes; 140 time-sample rows
+            /// (every tenth inline) on 16 more, and a legacy `-0.0` / `+0.0`
+            /// pair naming two hashes of their own; and an `obj:ext` of 12
+            /// fields more than the store keeps compact, none of which a row
+            /// names. Asserts the three encodings.
+            async fn seed_table_encoded_object(tv: &TestValkey) -> Vec<[u8; 32]> {
+                type Row = (String, String, String, Vec<(&'static str, String)>);
+                let keys = tv.key_schema();
+                let mut referenced: BTreeSet<[u8; 32]> = BTreeSet::new();
+                // Each row: its index, its member, its key and its columns.
+                let mut rows: Vec<Row> = Vec::new();
+                let external =
+                    |hash: &[u8; 32]| vec![("hash", sha256_to_hex(hash)), ("size", "1".to_owned())];
+                for i in 0..150usize {
+                    let member = KeySchema::field_member("1", &format!("k{i:03}"));
+                    let row_key = keys.obj_field_from_member(OID, &member);
+                    let hash = table_hash(0x40, i % 16);
+                    let columns = match i % 10 {
+                        0 => vec![("value", "AA==".to_owned())],
+                        1 => {
+                            referenced.insert(hash);
+                            let mut columns = external(&hash);
+                            columns.push(("value", "AA==".to_owned()));
+                            columns
+                        }
+                        _ => {
+                            referenced.insert(hash);
+                            external(&hash)
+                        }
+                    };
+                    rows.push((keys.obj_fields_index(OID), member, row_key, columns));
+                }
+                let samples = (0..140usize)
+                    .map(|i| (i as f64 + 0.25, table_hash(0x50, i % 16), i % 10 == 0))
+                    .chain([(-0.0, hash_of(0x5A), false), (0.0, hash_of(0x5B), false)]);
+                for (time, hash, inline) in samples {
+                    let member = KeySchema::time_sample_member("1", time);
+                    let row_key = keys.obj_ts_from_member(OID, &member);
+                    let columns = if inline {
+                        vec![("value", "AA==".to_owned())]
+                    } else {
+                        referenced.insert(hash);
+                        external(&hash)
+                    };
+                    rows.push((keys.obj_time_samples_index(OID), member, row_key, columns));
+                }
+                let seeding = tv.client().pool.next().pipeline();
+                for (index, member, row_key, columns) in rows {
+                    let _: () = seeding
+                        .hset(row_key, columns)
+                        .await
+                        .expect("queueing a row");
+                    let _: () = seeding
+                        .zadd(index, None, None, false, false, (1.0, member.as_str()))
+                        .await
+                        .expect("queueing its index member");
+                }
+                // Past the store's own compact limit for hashes, read, never
+                // set: a store may keep more than the default 128 fields
+                // compact.
+                let limit: HashMap<String, String> = tv
+                    .client()
+                    .pool
+                    .config_get("hash-max-listpack-entries")
+                    .await
+                    .expect("CONFIG GET hash-max-listpack-entries");
+                let ext_fields = limit
+                    .get("hash-max-listpack-entries")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .expect("the store reports its hash listpack limit")
+                    .max(128)
+                    + 12;
+                let index: Vec<(String, String)> = (0..ext_fields)
+                    .map(|i| {
+                        let hash = table_hash(0x60, i);
+                        referenced.insert(hash);
+                        (sha256_to_hex(&hash), "1".to_owned())
+                    })
+                    .collect();
+                let _: () = seeding
+                    .hset(keys.obj_ext_index(OID), index)
+                    .await
+                    .expect("queueing obj:ext");
+                let _: Vec<Value> = seeding
+                    .all()
+                    .await
+                    .expect("seeding the object must succeed");
+                for (key, encoding) in [
+                    (keys.obj_fields_index(OID), "skiplist"),
+                    (keys.obj_time_samples_index(OID), "skiplist"),
+                    (keys.obj_ext_index(OID), "hashtable"),
+                ] {
+                    assert_eq!(
+                        object_encoding_for_test(tv.client(), &key).await,
+                        encoding,
+                        "fixture: {key} is table-encoded"
+                    );
+                }
+                referenced.into_iter().collect()
+            }
+
+            /// Part A's equivalence: the recount's paged read names exactly
+            /// the hashes the periodic walk's whole-listing read names, at
+            /// pages and steps of 1, 2, 3, 5, 8 and 9 and the production
+            /// page, on compact indices (the every-shape object, whose
+            /// `obj:ext` step answers the whole hash) and on table-encoded
+            /// ones (whose `obj:ext` steps answer about the step, so that
+            /// walk takes many steps, and whose `-0.0` / `+0.0` pair the rank
+            /// pages read as two rows). A rank page spans exactly its ranks
+            /// on either encoding. On the table object both also equal the
+            /// fixture's own list of what it references.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recounts_paged_read_names_the_periodic_reads_hashes_at_every_step() {
+                let tv = TestValkey::setup().await;
+                let (shapes, _) = seed_every_row_shape(&tv).await;
+                let periodic = references_in_chunks(&tv, ROW_HASH_CHUNK_ROWS).await.0;
+                assert_eq!(periodic, shapes, "fixture: the periodic read");
+                for step in [1, 2, 3, 5, 8, 9, ROW_HASH_CHUNK_ROWS] {
+                    assert_eq!(
+                        references_paged(&tv, step).await,
+                        periodic,
+                        "compact indices, steps of {step}"
+                    );
+                }
+
+                let tv = TestValkey::setup().await;
+                let table = seed_table_encoded_object(&tv).await;
+                let periodic = references_in_chunks(&tv, ROW_HASH_CHUNK_ROWS).await.0;
+                assert_eq!(periodic, table, "fixture: the periodic read");
+                for step in [1, 2, 3, 5, 8, 9, ROW_HASH_CHUNK_ROWS] {
+                    assert_eq!(
+                        references_paged(&tv, step).await,
+                        periodic,
+                        "table-encoded indices, steps of {step}"
+                    );
+                }
+            }
+
+            /// One command as the server reads it: a RESP array of bulk
+            /// strings.
+            fn frame_len(args: &[&str]) -> u64 {
+                let header = format!("*{}\r\n", args.len()).len();
+                let body: usize = args
+                    .iter()
+                    .map(|arg| format!("${}\r\n{arg}\r\n", arg.len()).len())
+                    .sum();
+                (header + body) as u64
+            }
+
+            /// One of the recount's rank pages of `key` as the server reads
+            /// it: `ZRANGE <key> <start> <stop>` and `ZCARD <key>`, sent in
+            /// one pipeline.
+            fn rank_page_len(key: &str, start: u64, stop: u64) -> u64 {
+                frame_len(&["ZRANGE", key, &start.to_string(), &stop.to_string()])
+                    + frame_len(&["ZCARD", key])
+            }
+
+            /// `tot-net-in` of connection `conn_id`, read from another
+            /// connection: every byte the server has read from it.
+            async fn net_in_of(tv: &TestValkey, conn_id: &str) -> u64 {
+                let listing: String = tv
+                    .client()
+                    .pool
+                    .next()
+                    .client_list::<String, String>(None, Some(vec![conn_id.to_owned()]))
+                    .await
+                    .expect("CLIENT LIST ID must succeed");
+                listing
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("tot-net-in="))
+                    .unwrap_or_else(|| panic!("connection {conn_id} is listed: {listing:?}"))
+                    .parse()
+                    .expect("tot-net-in is a byte count")
+            }
+
+            /// The last command connection `conn_id` sent, as `CLIENT LIST`
+            /// names it.
+            async fn last_command_of(tv: &TestValkey, conn_id: &str) -> String {
+                let listing: String = tv
+                    .client()
+                    .pool
+                    .next()
+                    .client_list::<String, String>(None, Some(vec![conn_id.to_owned()]))
+                    .await
+                    .expect("CLIENT LIST ID must succeed");
+                listing
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("cmd="))
+                    .unwrap_or_else(|| panic!("connection {conn_id} is listed: {listing:?}"))
+                    .to_owned()
+            }
+
+            /// T3's bound (b.f3t): the recount reads a row index by rank
+            /// pages, one page in flight, with each page's `ZCARD` in its
+            /// pipeline, and never a `ZSCAN`, a whole listing or a witness.
+            /// On an object of 384 field rows (a table-encoded `obj:flds`)
+            /// read by pages of 4, with the maintenance connection — the one
+            /// connection the read's pages, its row reads and its `obj:ext`
+            /// steps share — held in a server-side `BLPOP`, the read's first
+            /// pipeline reaches the server and then nothing more does:
+            /// exactly `ZRANGE obj:flds 0 3` and `ZCARD obj:flds`, byte for
+            /// byte, for the whole [`QUIET_WINDOW`], so the count costs no
+            /// round trip of its own and no second page goes out before the
+            /// first is answered. Released, the read completes with the
+            /// object's one hash, and the connection has sent, byte for byte,
+            /// exactly: `obj:flds`'s 97 pages (the last, past its 384 ranks,
+            /// empty), each full page followed by its four rows' `HGET`s;
+            /// `obj:tss`'s one empty page; and one `HSCAN obj:ext 0 COUNT 4`
+            /// with its `HLEN`, the last command. A `ZSCAN`, a whole listing
+            /// or an `INFO server` anywhere would change the count.
+            ///
+            /// New behaviour (b.f3t), shown non-vacuous by its exact counts
+            /// rather than a run against the old code, whose `ZSCAN` steps
+            /// and witnesses this read no longer has.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recounts_paged_read_sends_one_rank_page_at_a_time_and_no_zscan_or_whole_listing(
+            ) {
+                const PAGE: usize = 4;
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema().clone();
+                let hash = hex_of(0xA4);
+                let rows = 3 * 128;
+                let members: Vec<String> = (0..rows)
+                    .map(|row| KeySchema::field_member("1", &format!("k{row:05}")))
+                    .collect();
+                let seeding = tv.client().pool.next().pipeline();
+                for member in &members {
+                    let _: () = seeding
+                        .hset(
+                            keys.obj_field_from_member(OID, member),
+                            [("hash", hash.as_str()), ("size", "1")],
+                        )
+                        .await
+                        .expect("queueing a row");
+                    let _: () = seeding
+                        .zadd(
+                            keys.obj_fields_index(OID),
+                            None,
+                            None,
+                            false,
+                            false,
+                            (1.0, member.as_str()),
+                        )
+                        .await
+                        .expect("queueing its index member");
+                }
+                let _: Vec<Value> = seeding.all().await.expect("seeding the rows must succeed");
+                seed_index(&tv, OID, &[(hash.as_str(), &rows.to_string())]).await;
+                let index = keys.obj_fields_index(OID);
+                assert_eq!(
+                    object_encoding_for_test(tv.client(), &index).await,
+                    "skiplist",
+                    "fixture: obj:flds is table-encoded"
+                );
+                let first_page = rank_page_len(&index, 0, PAGE as u64 - 1);
+                // Every byte the whole read sends, in order: `obj:flds`'s
+                // pages, each full one followed by its rows' reads, then the
+                // empty page past its last rank; `obj:tss`'s one empty page;
+                // `obj:ext`'s one counted step (one field: compact, so one
+                // step answers it whole).
+                let mut whole_read: u64 = 0;
+                for (page, chunk) in members.chunks(PAGE).enumerate() {
+                    let start = (page * PAGE) as u64;
+                    whole_read += rank_page_len(&index, start, start + PAGE as u64 - 1);
+                    for member in chunk {
+                        whole_read +=
+                            frame_len(&["HGET", &keys.obj_field_from_member(OID, member), "hash"]);
+                    }
+                }
+                whole_read += rank_page_len(&index, rows as u64, (rows + PAGE) as u64 - 1);
+                whole_read += rank_page_len(&keys.obj_time_samples_index(OID), 0, PAGE as u64 - 1);
+                let ext = keys.obj_ext_index(OID);
+                whole_read += frame_len(&["HSCAN", &ext, "0", "COUNT", &PAGE.to_string()])
+                    + frame_len(&["HLEN", &ext]);
+
+                let stalls = tv.stall_maintenance_pool().await;
+                assert_eq!(stalls.len(), 1, "fixture: one maintenance connection");
+                let conn_id = stalls[0].conn_id().to_owned();
+                let baseline = stalls[0].net_in().await.expect("the stalled connection");
+                let read = {
+                    let client = tv.client().clone();
+                    let keys = keys.clone();
+                    tokio::spawn(async move {
+                        object_referenced_hashes_paged(&client, &keys, OID, PAGE).await
+                    })
+                };
+                // Wait for the whole first pipeline; released before any
+                // assertion, so a failed one leaves no connection stalled.
+                let deadline = tokio::time::Instant::now() + CONN_STALL_WAIT;
+                let arrived = loop {
+                    let sent = stalls[0].net_in().await.expect("the stalled connection") - baseline;
+                    if sent >= first_page || tokio::time::Instant::now() >= deadline {
+                        break sent;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                };
+                if arrived >= first_page {
+                    tokio::time::sleep(QUIET_WINDOW).await;
+                }
+                let sent = stalls[0].net_in().await.expect("the stalled connection") - baseline;
+                release_all(stalls).await;
+
+                assert!(
+                    arrived >= first_page,
+                    "the first page's pipeline (its ZRANGE and its ZCARD, {first_page} B) did not \
+                     reach the server within {CONN_STALL_WAIT:?} ({arrived} B did)"
+                );
+                assert_eq!(
+                    sent, first_page,
+                    "while its first page waits for its replies, the read sends only that page's \
+                     ZRANGE 0 3 and ZCARD: no second page, no ZSCAN, no whole listing"
+                );
+                let refs = tokio::time::timeout(CONN_STALL_WAIT, read)
+                    .await
+                    .expect("the read finishes once released")
+                    .expect("the read task did not panic")
+                    .expect("released, the read succeeds");
+                assert_eq!(
+                    refs.hashes,
+                    HashSet::from([hash_of(0xA4)]),
+                    "every page read: the one hash"
+                );
+                assert_eq!(
+                    net_in_of(&tv, &conn_id).await - baseline,
+                    whole_read,
+                    "the connection sent the rank pages, their row reads and obj:ext's one \
+                     counted step, and nothing else"
+                );
+                assert_eq!(
+                    last_command_of(&tv, &conn_id).await,
+                    "hlen",
+                    "the read ends on obj:ext's count, not a whole listing"
+                );
+            }
+
+            /// A rank page spans exactly its ranks whatever the index's
+            /// encoding, so the recount holds at most one page of rows: on
+            /// ten field rows (a `listpack` `obj:flds`, whose `ZSCAN` step
+            /// would answer all ten whatever its `COUNT`) read by pages of 4,
+            /// with the row-hash reply seam armed, the first chunk is the
+            /// first page's four rows, so the arity check fails it "3 frames
+            /// for 4 rows". Disarmed, the same read is clean.
+            ///
+            /// Fails with the recount's rows read in chunks of one (in-place
+            /// perturbation of `RecountRowPages::take_page`): the first
+            /// chunk is one row, "0 frames for 1 rows".
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn the_recount_reads_a_compact_index_one_page_of_rows_at_a_time() {
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema().clone();
+                let hash = hex_of(0xA5);
+                for row in 0..10 {
+                    seed_row(
+                        &tv,
+                        OID,
+                        Family::Field,
+                        &format!("k{row}"),
+                        &[("hash", hash.as_str()), ("size", "1")],
+                    )
+                    .await;
+                }
+                seed_index(&tv, OID, &[(hash.as_str(), "10")]).await;
+                assert_eq!(
+                    object_encoding_for_test(tv.client(), &keys.obj_fields_index(OID)).await,
+                    "listpack",
+                    "fixture: obj:flds is compact"
+                );
+
+                let armed = arm_row_hash_reply_drop_for_test(&keys.obj_ext_index(OID));
+                match object_referenced_hashes_paged(tv.client(), &keys, OID, 4).await {
+                    Err(PassError::Undecodable { what, text }) => {
+                        assert_eq!(what, "a row-hash pipeline reply of the expected arity");
+                        assert_eq!(text, "3 frames for 4 rows", "the first chunk is the page");
+                    }
+                    other => panic!(
+                        "a short chunk fails the read closed, got {:?}",
+                        other.map(|refs| refs.hashes)
+                    ),
+                }
+                drop(armed);
+                let refs = object_referenced_hashes_paged(tv.client(), &keys, OID, 4)
+                    .await
+                    .expect("disarmed, the read is clean");
+                assert_eq!(refs.hashes, HashSet::from([hash_of(0xA5)]));
+            }
+
+            /// `HGET <row> hash` as the server reads it: a RESP array of
+            /// three bulk strings.
+            fn hget_hash_frame_len(row_key: &str) -> u64 {
+                format!(
+                    "*3\r\n$4\r\nHGET\r\n${}\r\n{row_key}\r\n$4\r\nhash\r\n",
+                    row_key.len()
+                )
+                .len() as u64
+            }
+
+            /// A large object's reference read never sends more than one
+            /// chunk of row reads before that chunk is answered. Its object
+            /// has two chunks and one row more of field rows; with the
+            /// maintenance connection held in a server-side `BLPOP`, the
+            /// read's first chunk reaches the server and then nothing more
+            /// does: exactly the first [`ROW_HASH_CHUNK_ROWS`] rows' `HGET`s,
+            /// byte for byte, for the whole [`QUIET_WINDOW`]. Released, the
+            /// read finishes its three chunks and reads the object's one hash.
+            ///
+            /// The window bounds what an absence can show: a correct read
+            /// sends nothing more however long it is held, so the window
+            /// cannot fail it; a read that sent every chunk at once would
+            /// have to take longer than the window to send the rest to pass.
+            ///
+            /// Fails without the chunking (in-place perturbation of
+            /// `object_referenced_hashes`, passing `usize::MAX` rows a chunk):
+            /// all 2,049 rows' reads arrive at once.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_large_objects_reference_read_sends_one_chunk_of_row_reads_at_a_time() {
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema().clone();
+                let hash = hex_of(0xA2);
+                let rows = 2 * ROW_HASH_CHUNK_ROWS + 1;
+                let seeding = tv.client().pool.next().pipeline();
+                for row in 0..rows {
+                    let member = KeySchema::field_member("1", &format!("k{row:05}"));
+                    let _: () = seeding
+                        .hset(
+                            keys.obj_field_from_member(OID, &member),
+                            [("hash", hash.as_str()), ("size", "1")],
+                        )
+                        .await
+                        .expect("queueing a row");
+                    let _: () = seeding
+                        .zadd(
+                            keys.obj_fields_index(OID),
+                            None,
+                            None,
+                            false,
+                            false,
+                            (1.0, member.as_str()),
+                        )
+                        .await
+                        .expect("queueing its index member");
+                }
+                let _: Vec<Value> = seeding.all().await.expect("seeding the rows must succeed");
+                seed_index(&tv, OID, &[(hash.as_str(), &rows.to_string())]).await;
+                let members = list_value_members(tv.client(), &keys, OID)
+                    .await
+                    .expect("the members list");
+                assert_eq!(members.fields.len(), rows, "fixture: every row listed");
+                let first_chunk: u64 = members.fields[..ROW_HASH_CHUNK_ROWS]
+                    .iter()
+                    .map(|member| hget_hash_frame_len(&keys.obj_field_from_member(OID, member)))
+                    .sum();
+
+                let stalls = tv.stall_maintenance_pool().await;
+                assert_eq!(stalls.len(), 1, "fixture: one maintenance connection");
+                let baseline = stalls[0].net_in().await.expect("the stalled connection");
+                let read = {
+                    let client = tv.client().clone();
+                    let keys = keys.clone();
+                    tokio::spawn(async move {
+                        object_referenced_hashes(&client, &keys, OID, &members).await
+                    })
+                };
+                let deadline = tokio::time::Instant::now() + CONN_STALL_WAIT;
+                loop {
+                    let sent = stalls[0].net_in().await.expect("the stalled connection") - baseline;
+                    if sent >= first_chunk {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the first chunk's {first_chunk} B did not reach the server within \
+                         {CONN_STALL_WAIT:?} ({sent} B did)"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                tokio::time::sleep(QUIET_WINDOW).await;
+                let sent = stalls[0].net_in().await.expect("the stalled connection") - baseline;
+                release_all(stalls).await;
+
+                assert_eq!(
+                    sent, first_chunk,
+                    "while the first chunk waits for its replies, only its {ROW_HASH_CHUNK_ROWS} \
+                     reads are sent (all {rows} rows' would be far more)"
+                );
+                let refs = tokio::time::timeout(CONN_STALL_WAIT, read)
+                    .await
+                    .expect("the read finishes once released")
+                    .expect("the read task did not panic")
+                    .expect("the read succeeds");
+                assert_eq!(
+                    (refs.hashes, refs.index_mismatch),
+                    (HashSet::from([hash_of(0xA2)]), Vec::new()),
+                    "every chunk read: the one hash, its index agreeing"
+                );
+            }
+
+            /// The walk's arity check fails closed: with a chunk's pipeline
+            /// answering one reply short (the test seam
+            /// `arm_row_hash_reply_drop_for_test`, armed for this object's
+            /// `obj:ext` key), the reference read answers
+            /// `PassError::Undecodable` "a row-hash pipeline reply of the
+            /// expected arity", naming both counts, rather than pairing the
+            /// replies with the wrong rows; the periodic pass forfeits
+            /// (counted `enumeration_failed`) and the authoritative recount,
+            /// whose paged read folds its chunks through the same
+            /// `fold_row_hash_chunk`, fails corrupt, naming the object,
+            /// setting no count. The guard dropped, the same read is clean.
+            ///
+            /// Fails without the check (in-place perturbation of
+            /// `fold_row_hash_chunk`, its arity condition never true): the
+            /// short chunk is folded and the read succeeds.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            async fn a_row_hash_reply_short_of_its_chunk_fails_the_walk_closed() {
+                const REPLICA: &str = "tv3-row-hash-arity";
+                let tv = TestValkey::setup().await;
+                let keys = tv.key_schema().clone();
+                let metrics = Arc::new(metrics_scrape_only(REPLICA));
+                let hash = hex_of(0xA3);
+                seed_live_header(&tv, OID).await;
+                for name in ["f0", "f1", "f2"] {
+                    seed_row(
+                        &tv,
+                        OID,
+                        Family::Field,
+                        name,
+                        &[("hash", hash.as_str()), ("size", "1")],
+                    )
+                    .await;
+                }
+                seed_index(&tv, OID, &[(hash.as_str(), "3")]).await;
+                let members = list_value_members(tv.client(), &keys, OID)
+                    .await
+                    .expect("the members list");
+
+                let armed = arm_row_hash_reply_drop_for_test(&keys.obj_ext_index(OID));
+                let read = object_referenced_hashes(tv.client(), &keys, OID, &members).await;
+                match read {
+                    Err(PassError::Undecodable { what, text }) => {
+                        assert_eq!(what, "a row-hash pipeline reply of the expected arity");
+                        assert_eq!(text, "2 frames for 3 rows");
+                    }
+                    other => panic!("a short reply fails the read closed, got {:?}", other.err()),
+                }
+                one_pass(&tv, &metrics, REPLICA).await;
+                assert_eq!(
+                    outcome(&metrics, EXT_RECONCILE_OUTCOME_ENUMERATION_FAILED),
+                    1,
+                    "the periodic pass forfeits"
+                );
+                let recount =
+                    recount_authoritative(tv.client(), &keys, || async { Ok::<(), ()>(()) }).await;
+                match recount {
+                    Err(RecountError::Corrupt { what, key }) => {
+                        assert_eq!(what, "a row-hash pipeline reply of the expected arity");
+                        assert_eq!(key, format!("object {OID}: 2 frames for 3 rows"));
+                    }
+                    other => panic!("the recount fails corrupt, got {:?}", other.err()),
+                }
+                let meta: HashMap<String, String> = tv
+                    .client()
+                    .pool
+                    .hgetall(keys.ext_meta(&hash))
+                    .await
+                    .expect("HGETALL ext:meta must succeed");
+                assert!(meta.is_empty(), "no count is set from a walk that failed");
+
+                drop(armed);
+                let refs = object_referenced_hashes(tv.client(), &keys, OID, &members)
+                    .await
+                    .expect("disarmed, the read is clean");
+                assert_eq!(
+                    (refs.hashes, refs.index_mismatch),
+                    (HashSet::from([hash_of(0xA3)]), Vec::new())
+                );
+            }
+
+            /// The restore memory envelope's record (plan b.tv3), which
+            /// records the recount's step and chunk and its flat peaks.
+            const RESTORE_ENVELOPE_DERIVATION_JSON: &str =
+                "docs-internal/validation/restore-memory-envelope-tv3-20261022/derivation.json";
+
+            /// The record's ratio of the larger shape's peak to the
+            /// smaller's that still reads flat: the plateau ceiling the
+            /// record's other paged measurements use (1.15).
+            const FLAT_CEILING: f64 = 1.15;
+
+            /// [`ROW_HASH_CHUNK_ROWS`] is the paged recount's step and
+            /// chunk the record measured, `recount_paged.step_rows`, and
+            /// still `recount_row_hash_chunk.value`. The recount's peaks
+            /// are flat across its two shapes, at least 4 × apart in rows:
+            /// each recorded ratio (heap, resident) is the larger shape's
+            /// peak over the smaller's, to four places, and within
+            /// [`FLAT_CEILING`]; the row ratio is the two shapes' rows, to
+            /// three places. No row bound is stated any more: the per-row
+            /// line and bound are retired (`line_mib` and `bound_rows` gone,
+            /// kept as history under `retired_row_bound`). An edit to the
+            /// constant or to the record without the other fails here; the
+            /// published source tree, which has no `docs-internal/`, skips.
+            #[test]
+            fn row_hash_chunk_is_the_recorded_paged_recount_step_and_its_peaks_are_flat() {
+                let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                if !root.join("docs-internal").is_dir() {
+                    eprintln!(
+                        "skipped: no docs-internal/ (published source tree), so no \
+                         {RESTORE_ENVELOPE_DERIVATION_JSON}"
+                    );
+                    return;
+                }
+                let raw = std::fs::read_to_string(root.join(RESTORE_ENVELOPE_DERIVATION_JSON))
+                    .unwrap_or_else(|e| {
+                        panic!("the committed record {RESTORE_ENVELOPE_DERIVATION_JSON}: {e}")
+                    });
+                let record: serde_json::Value =
+                    serde_json::from_str(&raw).expect("the record is valid JSON");
+                let integer = |pointer: &str| {
+                    record
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or_else(|| {
+                            panic!("the record carries {pointer} as a non-negative integer")
+                        })
+                };
+                let number = |pointer: &str| {
+                    record
+                        .pointer(pointer)
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or_else(|| panic!("the record carries {pointer} as a number"))
+                };
+                let to_places = |value: f64, places: i32| {
+                    let scale = 10f64.powi(places);
+                    (value * scale).round() / scale
+                };
+
+                assert_eq!(
+                    integer("/recount_paged/step_rows"),
+                    ROW_HASH_CHUNK_ROWS as u64,
+                    "the step is the record's recount_paged.step_rows"
+                );
+                assert_eq!(
+                    integer("/recount_row_hash_chunk/value"),
+                    ROW_HASH_CHUNK_ROWS as u64,
+                    "the chunk is still the record's recount_row_hash_chunk.value"
+                );
+
+                let rows: Vec<u64> = record
+                    .pointer("/recount_paged/value_rows")
+                    .and_then(serde_json::Value::as_array)
+                    .expect("the record carries the two shapes' rows")
+                    .iter()
+                    .map(|n| n.as_u64().expect("a row count"))
+                    .collect();
+                let [small, large] = rows[..] else {
+                    panic!("two shapes, got {rows:?}");
+                };
+                let row_ratio = large as f64 / small as f64;
+                assert!(
+                    row_ratio >= 4.0,
+                    "the shapes are at least 4 x apart in rows: {row_ratio}"
+                );
+                assert_eq!(
+                    number("/recount_paged/value_rows_ratio"),
+                    to_places(row_ratio, 3),
+                    "the recorded row ratio is the shapes' rows"
+                );
+                for (peaks, ratio) in [
+                    ("heap_peak_bytes_max", "flat_ratio_heap"),
+                    ("rss_growth_bytes_max", "flat_ratio_rss"),
+                ] {
+                    let peak = |shape_rows: u64| {
+                        integer(&format!("/recount_paged/{peaks}/{shape_rows}_rows"))
+                    };
+                    let computed = peak(large) as f64 / peak(small) as f64;
+                    let recorded = number(&format!("/recount_paged/{ratio}"));
+                    assert_eq!(
+                        recorded,
+                        to_places(computed, 4),
+                        "{ratio} is the larger shape's {peaks} over the smaller's"
+                    );
+                    assert!(
+                        recorded <= FLAT_CEILING,
+                        "{ratio}: {recorded} reads flat, at most {FLAT_CEILING}"
+                    );
+                }
+
+                for retired in ["line_mib", "bound_rows"] {
+                    assert!(
+                        record
+                            .pointer(&format!("/recount_row_hash_chunk/{retired}"))
+                            .is_none(),
+                        "recount_row_hash_chunk.{retired} is retired, no longer a stated bound"
+                    );
+                }
+                assert!(
+                    record
+                        .pointer("/recount_row_hash_chunk/retired_row_bound")
+                        .is_some(),
+                    "the retired bound is kept as history"
+                );
             }
         }
     }

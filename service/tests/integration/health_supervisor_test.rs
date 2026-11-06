@@ -54,8 +54,25 @@ use live_edit::observability::health::{
     create_health_service, spawn_health_supervisor, HealthSupervisorConfig,
 };
 use live_edit::storage::client::ValkeyClient;
+use live_edit::storage::test_support::connect_test_client_or_skip;
 
 const READINESS_SERVICE_NAME: &str = "nvidia.omniverse.live.v1alpha.LiveService";
+
+/// Hang guard on every positive wait for a readiness status: it has to
+/// contain a supervisor tick — up to one probe bound plus a probe interval —
+/// and sits far below nextest's 120 s kill. Not a timing claim: a healthy run
+/// observes the status within a tick.
+const STATUS_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// The probe bound for a `PING` against a healthy Valkey: the client's own
+/// command timeout (test-writing guide § Synchronization Patterns, "a one-shot
+/// read the test expects to answer"). A tighter bound reads a merely slow PING
+/// on a loaded shared Valkey as an outage and flips readiness. The tests that
+/// kill the probe's connection keep their tight bound: there the probe failing
+/// is the subject.
+fn healthy_probe_timeout(valkey: &ValkeyClient) -> Duration {
+    valkey.pool.next().perf_config().default_command_timeout
+}
 
 /// b.ohv item 8: delegate to `common::test_config()` and override only the
 /// fields this test cares about.
@@ -155,19 +172,6 @@ async fn wait_for_status(
     false
 }
 
-async fn maybe_connect_valkey() -> Option<ValkeyClient> {
-    let cfg = test_config();
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(c)) => Some(c),
-        _ => None,
-    }
-}
-
 /// Read the victim pool-client's Valkey-assigned connection ID so we can
 /// kill it by ID instead of by TYPE — the TYPE-based kill would also
 /// close other parallel tests' pool connections and pollute results.
@@ -197,11 +201,12 @@ async fn kill_connection_by_id(killer: &ValkeyClient, victim_id: i64) -> i64 {
 
 /// Steady state: with a reachable Valkey, the supervisor keeps readiness
 /// at SERVING. This is the base invariant — if it fails, the supervisor
-/// is flipping spuriously and every downstream test is noise.
+/// is flipping spuriously and every downstream test is noise. The probe is
+/// bounded by the client's command timeout ([`healthy_probe_timeout`]), so a
+/// PING that is merely slow on a loaded shared Valkey is not a flip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_keeps_serving_when_valkey_is_healthy() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -216,7 +221,7 @@ async fn supervisor_keeps_serving_when_valkey_is_healthy() {
         metrics,
         HealthSupervisorConfig {
             probe_interval: Duration::from_millis(200),
-            probe_timeout: Duration::from_millis(50),
+            probe_timeout: healthy_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             ..Default::default()
         },
@@ -230,12 +235,7 @@ async fn supervisor_keeps_serving_when_valkey_is_healthy() {
     // supervisor's first tick, so wait for that before sampling — a bare
     // sample would race the first probe rather than test anything.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(5)
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "precondition: a healthy Valkey must let the supervisor raise readiness to SERVING"
     );
 
@@ -275,15 +275,16 @@ async fn supervisor_keeps_serving_when_valkey_is_healthy() {
 /// the test tolerates and reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_flips_not_serving_on_valkey_drop_and_restores_on_recovery() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
     // Second independent client for issuing the kill. It uses the same
     // `test_config()` pools (one data connection), so it wastes no
-    // connection slots.
-    let Some(killer) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // connection slots. The two connect concurrently, so the connect phase
+    // costs one hang guard, not two.
+    let cfg = test_config();
+    let (valkey, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(valkey), Some(killer)) = (valkey, killer) else {
         return;
     };
 
@@ -293,9 +294,10 @@ async fn supervisor_flips_not_serving_on_valkey_drop_and_restores_on_recovery() 
 
     let cancel = CancellationToken::new();
     // Tight cadence so the transition fires within a test-reasonable
-    // window. Probe timeout is short enough that a dead-connection ping
-    // cannot succeed, but long enough that a healthy ping at localhost
-    // is never racy.
+    // window. The probe keeps a tight 200 ms bound rather than the client's
+    // command timeout because the killed connection is this test's subject.
+    // A healthy PING on a loaded shared Valkey can still overrun it and cost
+    // a tick; every wait below is hang-guarded, so a lost tick is absorbed.
     let supervisor = spawn_health_supervisor(
         reporter.clone(),
         valkey.clone(),
@@ -315,14 +317,12 @@ async fn supervisor_flips_not_serving_on_valkey_drop_and_restores_on_recovery() 
     // Baseline: readiness must come up SERVING before the drop. Since b.rgs
     // `create_health_service` registers readiness as NOT_SERVING and the
     // supervisor's first probe raises it, so this is a bounded wait rather
-    // than a single sample — a sample here would race that first tick.
+    // than a single sample — a sample here would race that first tick. The
+    // probe here keeps a tight bound (the killed connection is the subject),
+    // so a slow PING on a loaded Valkey can cost a tick; the wait is a hang
+    // guard, not a count of ticks.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(5),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "initial readiness must be SERVING before the drop"
     );
 
@@ -352,16 +352,13 @@ async fn supervisor_flips_not_serving_on_valkey_drop_and_restores_on_recovery() 
     .await;
 
     // Whichever path we went down, readiness must eventually be back to
-    // SERVING once fred reconnects.
-    let got_restored = wait_for_status(
-        &mut client,
-        PbServingStatus::Serving,
-        Duration::from_secs(5),
-    )
-    .await;
+    // SERVING once fred reconnects — an event bounded only by the hang guard.
+    let got_restored =
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await;
     assert!(
         got_restored,
-        "readiness must return to SERVING within 5s after fred reconnects"
+        "readiness must return to SERVING within the {STATUS_HANG_GUARD:?} hang guard after \
+         fred reconnects"
     );
 
     if !got_not_serving {
@@ -395,12 +392,13 @@ async fn supervisor_flips_not_serving_on_valkey_drop_and_restores_on_recovery() 
 /// trigger Kubernetes pod restarts instead of just traffic re-routing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_does_not_touch_liveness_service_status() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The probed client and the killer connect concurrently: one hang guard.
+    let cfg = test_config();
+    let (valkey, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(valkey), Some(killer)) = (valkey, killer) else {
         return;
     };
 
@@ -486,8 +484,7 @@ async fn supervisor_does_not_touch_liveness_service_status() {
 ///    readiness returning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_auth_backend_outage_does_not_flip_readiness() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -507,13 +504,14 @@ async fn supervisor_auth_backend_outage_does_not_flip_readiness() {
         metrics,
         HealthSupervisorConfig {
             probe_interval: Duration::from_millis(100),
-            probe_timeout: Duration::from_millis(50),
+            probe_timeout: healthy_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             // No auth client can be wired here post-b.9f4 — the fields are
             // gone. Startup gates satisfied: service-token inert, seed done.
             service_token_provider: None,
             counter_seed_ready: Some(seed_rx),
             api_serving: None,
+            verdict_stale: None,
         },
         cancel.clone(),
     );
@@ -524,12 +522,7 @@ async fn supervisor_auth_backend_outage_does_not_flip_readiness() {
     // Since b.rgs readiness is registered NOT_SERVING and raised by the
     // supervisor's first tick; wait for that before sampling.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(5)
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "precondition: Valkey healthy + startup gates satisfied must raise readiness SERVING"
     );
 

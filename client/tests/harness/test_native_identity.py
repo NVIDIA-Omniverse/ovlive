@@ -87,7 +87,7 @@ class NativeIdentityTests(unittest.TestCase):
                      "source/live/protos/nvidia/omniverse/live/v1alpha/live.proto",
                      "tests/native/runtime/runtime_foundation.cpp", "tests/native/runtime/request_lifecycle.cpp",
                      "tests/contracts/diagnostic-catalog.json", "tools/live/diagnostic_catalog.py",
-                     "tests/native/runtime/auth_controller.cpp", "tests/native/runtime/layer_write_lifecycle.cpp", "tests/native/runtime/layer_read_lifecycle.cpp", "tests/native/runtime/layer_progress.cpp", "tests/native/runtime/jitter.cpp", "tests/native/runtime/drain.cpp", "tests/native/runtime/status.cpp", "tests/native/runtime/diagnostics.cpp", "tests/native/runtime/diagnostics_api.cpp", "tests/native/runtime/session_peers.cpp", "tests/native/runtime/session_api.cpp", "tests/native/runtime/layer_admission.cpp", "tests/native/runtime/layer_status.cpp",
+                     "tests/native/runtime/auth_controller.cpp", "tests/native/runtime/layer_write_lifecycle.cpp", "tests/native/runtime/layer_read_lifecycle.cpp", "tests/native/runtime/layer_progress.cpp", "tests/native/runtime/jitter.cpp", "tests/native/runtime/drain.cpp", "tests/native/runtime/status.cpp", "tests/native/runtime/diagnostics.cpp", "tests/native/runtime/diagnostics_api.cpp", "tests/native/runtime/session_peers.cpp", "tests/native/runtime/session_api.cpp", "tests/native/runtime/layer_admission.cpp", "tests/native/runtime/layer_status.cpp", "tests/native/runtime/grpc_dns.cpp",
                      "cmake/LiveTestSupport.cmake", "tests/native/support/test_tls.h"):
             source = self.root / name
             source.parent.mkdir(parents=True, exist_ok=True)

@@ -17,9 +17,10 @@ PACKAGES = {"harness", "runtime", "wire", "scene", "resolver", "plugin", "python
 CASE_SELECTING = {"foundation"} | runner.REFERENCE_LANES - {"kit-reference"}
 # Angle-bracket include roots of native tests, and the pinned input that provides each (deps/README.md).
 PINNED_INCLUDES = {"pxr": "USD", "grpcpp": "grpc", "openssl": "openssl", "omni": "repository", "SHA256.h": "repository"}
-POSIX_HEADERS = {"dirent.h", "dlfcn.h", "execinfo.h", "fcntl.h", "pthread.h", "unistd.h", "sys", "mach-o"}
+# System headers of the POSIX branches; unwind.h is the toolchain's unwinder interface, which execinfo.h's backtrace uses.
+POSIX_HEADERS = {"dirent.h", "dlfcn.h", "execinfo.h", "fcntl.h", "pthread.h", "unistd.h", "unwind.h", "sys", "mach-o", "arpa", "netinet"}
 # The Windows SDK headers the Windows branches of the native tests use, as the POSIX branches use the system's.
-WINDOWS_HEADERS = {"windows.h", "tlhelp32.h", "psapi.h", "io.h"}
+WINDOWS_HEADERS = {"windows.h", "tlhelp32.h", "psapi.h", "io.h", "crtdbg.h", "dbghelp.h", "winsock2.h", "ws2tcpip.h"}
 
 
 class SuiteCatalogTests(unittest.TestCase):

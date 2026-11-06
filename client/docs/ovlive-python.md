@@ -25,7 +25,7 @@ Import with `from omni.usd import live` under the matching USD SDK's CPython 3.1
 
 ## Quick start
 
-The example needs a Live Services endpoint you can reach: `localhost:50051` stands for its authority, because the repository's reference service runs only inside the test suites. `layer_uri` names an existing live layer such as `live://localhost:50051/<session-id>/scene.live`, which [Creating layers](#creating-layers) shows how to make; `package_root` is a `pathlib.Path` to the staged package `<target-dir>/usd/omniverse/live`; and `token` is an access token the service accepts.
+The example needs a Live Services endpoint you can reach: `localhost:50051` stands for its authority. Without a deployed service, `tools/live/reference.py serve` starts the repository's reference service on loopback and prints an authority and a token it accepts ([testing guide](ovlive-testing.md#the-reference-service)). `layer_uri` names an existing live layer such as `live://localhost:50051/<session-id>/scene.live`, which [Creating layers](#creating-layers) shows how to make; `package_root` is a `pathlib.Path` to the staged package `<target-dir>/usd/omniverse/live`; and `token` is an access token the service accepts.
 
 ```python
 import logging, queue, threading, types
@@ -183,6 +183,8 @@ The export keeps every local edit, whether admitted, buffered, rejected or of un
 
 `runtime.join_session(uri, app_name, callback, max_events=256, max_bytes=1048576)`, or `join_session` on the current runtime, returns a `Session`. Only the application name is sent; user names come from the service. The callback receives `SessionEvent` records in order on the session's own thread: `CONNECTION` per connection attempt (a reconnect can bring a new `connection_id`), `JOINED` and `LEFT` for peers, and `MESSAGE` with the payload in `bytes`. A non-OK `CONNECTION` event alone is not a stop; read `session.status`. A dropped join rejoins, as a layer read reconnects, on the backoff that `initialize(reconnect_initial_ms=1000, reconnect_maximum_ms=60000, reconnect_max_attempts=10)` configures, apart from the `retry_*` options of finite requests ([runtime options](ovlive-reference.md#runtime-options)).
 
+A `join_session` call whose `merge_owner` keyword is `True` asks the service for the advisory merge-owner lease on that join ([design section 15](ovlive-design.md#15-sessions-presence-and-messages)). `Session.request_merge_owner(MergeOwnerAction.CLAIM)`, `RELEASE` or `VERIFY`, with `_async` and `_with_callback` forms, returns `(Result, MergeOwnerState)`: `UNSUPPORTED` with no state means the lease is not in force for the join, and the host keeps its static creator rule. `Session.merge_owner` is the join's current `MergeOwner` view, every `SessionEvent` carries the same view in its `merge_owner_*` fields, and a `MERGE_OWNER` event reports each owner change with the holder's connection ID and user name.
+
 `Session.send_message` succeeds when the local queue accepts the bytes, not on delivery, and a message that fails in flight is resent, so peers can receive it twice; carry your own message IDs for exactly-once handling. If the event queue (`max_events` up to 4096, `max_bytes` up to 16 MiB) overflows or an event cannot be converted, the session delivers one terminal `CONNECTION` event with `RESOURCE_EXHAUSTED` or `INTERNAL_ERROR`, latches `delivery_status`, refuses sends and stops; join again. `Session.leave(timeout_ms=30000)` stops and waits for a running callback. See [design section 15](ovlive-design.md#15-sessions-presence-and-messages).
 
 ## Dispatch, bounds and teardown
@@ -238,7 +240,7 @@ At interpreter exit the package disarms Python delivery, abandons publication co
 | --- | --- |
 | `Runtime` | `register_endpoint`, `join_session`, `close` |
 | `Endpoint` | `handle` (not an owner), `close` |
-| `Session` | `handle`, `status`, `delivery_status`, `send_message`, `send_message_async`, `send_message_with_callback`, `leave`, `close` (same as `leave`) |
+| `Session` | `handle`, `status`, `delivery_status`, `send_message`, `send_message_async`, `send_message_with_callback`, `merge_owner`, `request_merge_owner`, `request_merge_owner_async`, `request_merge_owner_with_callback`, `leave`, `close` (same as `leave`) |
 | `Subscription` | `handle`, `delivery_status`, `dropped_records` (diagnostic bridge drops), `close`, `unregister` (same as `close`) |
 | `Request` | `status` and `error` (effective result), `native_status` (native result), `outcome`, `wait`, `cancel`, `close` |
 | `PublicationContext` | `delivery_status`, `creations`, `prepare_creation`, `prepare_retained_creation` (returns a subject ID), `acquire_retained_creation`, `close` |
@@ -252,7 +254,9 @@ At interpreter exit the package disarms Python delivery, abandons publication co
 | `StatusEvent` | A `Status` with endpoint, session and URI |
 | `AuthRequired` | Rejected generation, challenge ID, reason, raw gRPC status |
 | `AuthState` | Generation, expiry, challenge, state, reason |
-| `SessionEvent` | Kind, result, connection ID, user and application names, payload |
+| `SessionEvent` | Kind, result, connection ID, user and application names, payload, and the join's merge-owner view |
+| `MergeOwnerState` | A merge-owner answer: outcome, holder's connection ID and user name, epoch, supported, held |
+| `MergeOwner` | A join's merge-owner view: supported, held, owned, epoch |
 | `CreatedSession` | Session ID and URI |
 | `SessionInfo` | Session ID, URI, name, creator, creation time |
 | `LayerInfo` | Creation and modification times |
@@ -273,7 +277,9 @@ At interpreter exit the package disarms Python delivery, abandons publication co
 | `Result` | `OK` (0) through `IO_ERROR` (21); 17 is never assigned |
 | `State` | `OPENING`, `READY`, `RECONNECTING`, `AUTH_WAIT`, `BLOCKED`, `FAILED`, `CLOSING`, `CLOSED` |
 | `CreationPhase` | `PREPARED`, `CREATING`, `CONFIRMED`, `UNISSUED_FAILURE`, `REJECTED`, `OUTCOME_UNKNOWN` |
-| `SessionEventKind` | `CONNECTION`, `JOINED`, `LEFT`, `MESSAGE` |
+| `SessionEventKind` | `CONNECTION`, `JOINED`, `LEFT`, `MESSAGE`, `MERGE_OWNER` |
+| `MergeOwnerAction` | `CLAIM`, `RELEASE`, `VERIFY` |
+| `MergeOwnerOutcome` | `NONE`, `GRANTED`, `HELD_BY_OTHER`, `RELEASED`, `NOT_HELD`, `NOT_ELIGIBLE`, `UNAUTHENTICATED`, `UNAVAILABLE` |
 | `TransportSecurity` | `DEFAULT` (plaintext to loopback, else TLS), `TLS`, `PLAINTEXT` |
 | `Severity` | `TRACE`, `DEBUG`, `INFO`, `WARN`, `ERROR` |
 | `DiagnosticFieldKind` | `UINT64`, `INT64`, `STRING`, `BOOLEAN` |

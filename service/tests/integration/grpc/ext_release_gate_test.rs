@@ -18,7 +18,7 @@
 //! `ValkeyExternalValueStore` carrying an `ExtReleaseGate`.
 //!
 //! The release total is planted directly on `le:ext:{gc}:pending:total`,
-//! except in the shutdown and call-deadline tests, whose gate reads a
+//! except in the shutdown, hold and call-deadline tests, whose gate reads a
 //! test-chosen total (`ExtReleaseGate::with_total_reader_for_test`) so they can
 //! see each read the gate makes. The handlers are called directly, so no gRPC
 //! deadline is in scope unless a test installs one with
@@ -617,6 +617,101 @@ async fn a_shutdown_while_an_upload_waits_at_the_gate_answers_the_shutdown_statu
         gate_cells(&metrics),
         (0, 0, 0),
         "a shutdown is not a budget refusal"
+    );
+}
+
+/// An upload already waiting at the gate is not ended by a disaster-recovery
+/// hold (SDD SR-6.3) — the hold ends the streams only, and leaves `begun`, the
+/// uploads' shutdown signal, alone — and a SIGTERM after the hold still ends
+/// it with the shutdown status, `UNAVAILABLE "server shutting down"` with
+/// `SERVER_SHUTTING_DOWN`, never the hold's: the upload's wait reads `begun`,
+/// which carries no hold cause. Nothing applied.
+///
+/// The upload is known to wait once the gate's poller has read the total
+/// twice, and known to keep waiting through the hold once the poller has read
+/// it twice more after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upload_waiting_at_the_gate_survives_a_hold_and_a_later_shutdown_answers_the_shutdown_status(
+) {
+    use live_edit::grpc::graceful_shutdown::HoldCause;
+    use std::sync::atomic::AtomicBool;
+
+    let tv = TestValkey::setup().await;
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (svc, metrics) = service_with_reader(
+        &tv,
+        counting_reader(Arc::clone(&reads), Arc::new(Mutex::new(None))),
+        Duration::from_secs(600),
+    );
+    let name = "gate-hold-then-shutdown";
+    let (sid, oid) = layer(&tv, &svc, name).await;
+    let before = seq_and_stream_len(&tv, oid).await;
+    let (delta, part) = external_upload(7);
+
+    let finished = AtomicBool::new(false);
+    let shutdown = svc.shutdown.clone();
+    // Wait until the gate's poller has read the total `at_least` times,
+    // failing at once if the upload has finished meanwhile.
+    let wait_for_reads = |at_least: usize, what: &'static str| {
+        let reads = Arc::clone(&reads);
+        let finished = &finished;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            while reads.load(Ordering::SeqCst) < at_least {
+                assert!(
+                    !finished.load(Ordering::SeqCst),
+                    "the upload finished while it should still be waiting at the gate ({what}); \
+                     a hold must end the streams only, never an upload"
+                );
+                assert!(tokio::time::Instant::now() < deadline, "{what}");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    };
+    let hold_then_cancel = async {
+        wait_for_reads(2, "the upload never waited at the gate").await;
+        shutdown.end_streams_for_hold(HoldCause::Held {
+            incident: Some("20261013t1708-a3f9".to_owned()),
+        });
+        assert!(
+            !shutdown.begun().is_cancelled(),
+            "the hold must leave `begun`, the uploads' shutdown signal, alone"
+        );
+        let after_hold = reads.load(Ordering::SeqCst);
+        wait_for_reads(after_hold + 2, "the upload kept waiting after the hold").await;
+        shutdown.cancel();
+    };
+    let ((result, captured), ()) = tokio::join!(
+        async {
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(60),
+                capture(update(&svc, &sid, name, oid, &delta, &[&part])),
+            )
+            .await
+            .expect("the shutdown must end the wait (the gate would otherwise wait 595 s)");
+            finished.store(true, Ordering::SeqCst);
+            outcome
+        },
+        hold_then_cancel
+    );
+    let status = result.expect_err("a shutdown must end the gate's wait");
+    assert_shutdown_status(&status);
+    let event = captured.only(RPC_FAILURE_MSG);
+    assert_common_fields(event, "INFO", "UpdateLayer", "parse", "UNAVAILABLE");
+    assert_eq!(
+        ext_keys_present(&tv, &part).await,
+        0,
+        "no value stored or incremented"
+    );
+    assert_eq!(
+        seq_and_stream_len(&tv, oid).await,
+        before,
+        "no commit, no stream entry"
+    );
+    assert_eq!(
+        gate_cells(&metrics),
+        (0, 0, 0),
+        "neither a hold nor a shutdown is a budget refusal"
     );
 }
 

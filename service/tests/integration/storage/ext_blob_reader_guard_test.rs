@@ -123,20 +123,31 @@ const KEY_LITERAL: &str = "ext:data";
 const STORE_FILE: &str = "src/storage/external_values.rs";
 const STORE_TRAIT_HEADER: &str = "pub trait ExternalValueStore";
 
-/// The catch-up build's blob read.
+/// The catch-up build's layout: its length probe (its fetch-on-miss is the
+/// caller's, through [`OMPF_PAYLOAD_FILE`], D1).
 const DIFF_READ_FILE: &str = "src/storage/diff_read.rs";
+
+/// The catch-up payload's fill: its ranged reads, closing length check and
+/// fetch-on-miss (b.ntm), and the restore of the values its layout found
+/// missing, in batches (D1).
+const OMPF_PAYLOAD_FILE: &str = "src/storage/ompf_payload.rs";
 
 /// The backup confirmations' module, home of the backup repair's reads of a
 /// stored value (b.wsx).
 const EXT_BACKUP_FILE: &str = "src/storage/ext_backup.rs";
 
+/// The disaster-recovery Jobs' store reads, home of the restore planner's
+/// coverage check.
+const DR_JOB_FILE: &str = "src/storage/dr_job.rs";
+
 /// The `ExternalValueStore` methods that hand blob bytes to their caller,
 /// sorted; checked against the trait by [`trait_blob_read_methods`].
-const BLOB_READ_METHODS: [&str; 4] = [
+const BLOB_READ_METHODS: [&str; 5] = [
     "load_values",
     "probe_values",
     "read_batch",
-    "read_batch_with_recovery_counter",
+    "read_value_range",
+    "recover_value",
 ];
 
 /// Return-type spellings that carry blob bytes, for [`trait_blob_read_methods`],
@@ -163,7 +174,7 @@ struct AllowedSite {
 /// only means the value was collected and has nothing left to serve (the
 /// backup copy's reader); or (none today) it is an unrelated method that only
 /// shares a scanned name.
-const ALLOWED_SITES: [AllowedSite; 13] = [
+const ALLOWED_SITES: [AllowedSite; 17] = [
     // ── The key builder ────────────────────────────────────────────────────
     AllowedSite {
         file: STORE_FILE,
@@ -192,11 +203,11 @@ const ALLOWED_SITES: [AllowedSite; 13] = [
     },
     AllowedSite {
         file: STORE_FILE,
-        item: "ValkeyExternalValueStore::read_batch_with_recovery_counter",
+        item: "ValkeyExternalValueStore::read_batch",
         needle: KEY_BUILDER,
         count: 1,
         why: "the store's own `GET` behind Recover (`read_batch`); its callers are the rows \
-              for those methods",
+              for that method",
     },
     AllowedSite {
         file: STORE_FILE,
@@ -220,28 +231,22 @@ const ALLOWED_SITES: [AllowedSite; 13] = [
         item: "read_ext_value_bytes",
         needle: KEY_BUILDER,
         count: 1,
-        why: "serves no snapshot: the backup repair's ranged read (`GETRANGE`s, then a closing \
-              `STRLEN`) of a value it copies to the backup store, never to a layer read or a \
-              client. A miss means the GC collected the value, \
+        why: "serves no snapshot: the backup repair's and the checkpoint clean-up heal's ranged \
+              read (`GETRANGE`s, then a closing `STRLEN`) of a value they copy to the backup \
+              store, never to a layer read or a client. A miss means the GC collected the value, \
               so no live object references it and there is nothing to back up; the caller drops \
-              the hash. The clean-up fence's heal (b.g65) is to reuse it",
+              the hash",
+    },
+    // ── The DR restore planner's coverage check ────────────────────────────
+    AllowedSite {
+        file: DR_JOB_FILE,
+        item: "ext_value_stored",
+        needle: KEY_BUILDER,
+        count: 1,
+        why: "never reads blob bytes: an existence probe, `EXISTS` only, the restore planner's \
+              coverage check of a referenced value (SR-9.3)",
     },
     // ── The store's read methods ───────────────────────────────────────────
-    AllowedSite {
-        file: STORE_FILE,
-        item: "ExternalValueStore::read_batch_with_recovery_counter",
-        needle: "read_batch",
-        count: 1,
-        why: "the trait default delegating to the same read; its callers are the rows for \
-              `read_batch_with_recovery_counter`",
-    },
-    AllowedSite {
-        file: STORE_FILE,
-        item: "ValkeyExternalValueStore::read_batch",
-        needle: "read_batch_with_recovery_counter",
-        count: 1,
-        why: "delegation with no counter; its callers are the rows for `read_batch`",
-    },
     AllowedSite {
         file: STORE_FILE,
         item: "ValkeyExternalValueStore::probe_values",
@@ -252,29 +257,80 @@ const ALLOWED_SITES: [AllowedSite; 13] = [
     },
     AllowedSite {
         file: STORE_FILE,
-        item: "MockExternalValueStore::read_batch",
-        needle: "read_batch_with_recovery_counter",
+        item: "ExternalValueStore::probe_value_lengths",
+        needle: "probe_values",
         count: 1,
-        why: "the in-memory test double's delegation; it reads no Valkey key, so the Valkey \
-              GC cannot collect under it",
+        why: "a delegation between the store's read methods: the trait's default length probe, \
+              for a store with no length read of its own (the test doubles), measures \
+              `probe_values`' answer; its callers are the rows for `probe_value_lengths` (b.ntm)",
+    },
+    AllowedSite {
+        file: STORE_FILE,
+        item: "ExternalValueStore::read_value_range",
+        needle: "probe_values",
+        count: 1,
+        why: "a delegation between the store's read methods: the trait's default ranged read, \
+              for a store with no ranged read (the test doubles), slices `probe_values`' answer; \
+              its callers are the rows for `read_value_range` (b.ntm)",
+    },
+    AllowedSite {
+        file: STORE_FILE,
+        item: "ExternalValueStore::recover_value",
+        needle: "read_batch",
+        count: 1,
+        why: "a delegation between the store's read methods: the trait's default fetch-on-miss, \
+              for a store with no restore of its own (the test doubles), is `read_batch` of the \
+              one hash; its callers are the rows for `recover_value` (b.ntm, D1)",
+    },
+    AllowedSite {
+        file: STORE_FILE,
+        item: "ValkeyExternalValueStore::probe_value_lengths",
+        needle: KEY_BUILDER,
+        count: 1,
+        why: "never reads blob bytes: the catch-up length probe's `STRLEN`, and an `EXISTS` \
+              for a key that reads 0 (b.ntm)",
+    },
+    AllowedSite {
+        file: STORE_FILE,
+        item: "ValkeyExternalValueStore::read_value_range",
+        needle: KEY_BUILDER,
+        count: 1,
+        why: "the store's own `GETRANGE` behind `read_value_range` (b.ntm); its callers are the \
+              rows for that method",
     },
     // ── The catch-up build: the one reader of blob bytes ───────────────────
     AllowedSite {
-        file: DIFF_READ_FILE,
-        item: "resolve_external_values",
-        needle: "probe_values",
+        file: OMPF_PAYLOAD_FILE,
+        item: "restore_in_batches",
+        needle: "recover_value",
         count: 1,
-        why: "follows the miss protocol: Probe, every catch-up build's first read; a miss \
-              answers `Built::Missing` and the caller re-reads under a read hold",
+        why: "follows the miss protocol: restores, in batches charged to the catch-up payload \
+              budget, the hashes a Recover layout's length probe found missing (`diff_read`'s \
+              `LaidOut::Restore`), re-probed first; Recover is built only from the \
+              `LiveHoldProof` of a genuine-miss check under a live read hold (pinned by \
+              `grpc::b_yuo_catch_up_miss_test`), and under Probe a missing hash answers \
+              `Built::Missing` and the caller re-reads under a read hold (D1)",
     },
     AllowedSite {
-        file: DIFF_READ_FILE,
-        item: "resolve_external_values",
-        needle: "read_batch_with_recovery_counter",
+        file: OMPF_PAYLOAD_FILE,
+        item: "read_ranges",
+        needle: "read_value_range",
         count: 1,
-        why: "follows the miss protocol: Recover, built only from the `LiveHoldProof` of a \
-              genuine-miss check under a live read hold (pinned by \
-              `grpc::b_yuo_catch_up_miss_test`)",
+        why: "follows the miss protocol: the catch-up payload's ranged reads, after its length \
+              probe, of every value, one restored before the layout read back from where its \
+              restore wrote it; a range read short reads as missing, which answers \
+              `Built::Missing` under Probe (the caller re-reads under a read hold), and under \
+              Recover is restored when the closing check finds it not stored (b.ntm)",
+    },
+    AllowedSite {
+        file: OMPF_PAYLOAD_FILE,
+        item: "PayloadLayout::fill",
+        needle: "recover_value",
+        count: 1,
+        why: "follows the miss protocol: a value a Recover fill's closing check finds not \
+              stored is restored, one at a time — one still stored, at its length or another, \
+              never is — and Recover is built only from the `LiveHoldProof` of a genuine-miss \
+              check under a live read hold; a Probe fill answers `Built::Missing` instead (b.ntm)",
     },
 ];
 
@@ -1051,7 +1107,7 @@ fn the_blob_reader_scanners_attribute_uses_and_skip_definitions_tests_comments_a
         "}\n",                                                              // 11
         "impl<S: Send> ExternalValueStore for Store<S> where S: Sync {\n",  // 12
         "    async fn read_batch(&self, f: impl Fn() -> u8) -> X {\n",      // 13
-        "        self.read_batch_with_recovery_counter(h, None).await\n",   // 14
+        "        self.load_values(h).await\n",                              // 14
         "    }\n",                                                          // 15
         "}\n",                                                              // 16
         "fn path_call(s: &dyn ExternalValueStore) {\n",                     // 17
@@ -1064,7 +1120,7 @@ fn the_blob_reader_scanners_attribute_uses_and_skip_definitions_tests_comments_a
         "    async fn probe_values(&self, h: &[[u8; 32]]) -> Result<ExtValueProbe, E>;\n", // 24
         "    async fn load_values(&self) -> Result<Vec<([u8; 32], Vec<u8>)>, E>;\n", // 25
         "    async fn store_values(&self, v: &[(&[u8; 32], &[u8])]) -> Result<(), E>;\n", // 26
-        "    async fn read_batch_with_recovery_counter(&self) -> Result<Vec<u8>, E> {\n", // 27
+        "    async fn read_all(&self) -> Result<Vec<u8>, E> {\n",           // 27
         "        self.read_batch(h).await\n",                               // 28
         "    }\n",                                                          // 29
         "}\n",                                                              // 30
@@ -1087,15 +1143,11 @@ fn the_blob_reader_scanners_attribute_uses_and_skip_definitions_tests_comments_a
     };
     let mut expected = vec![
         hit("ext_data", "direct", 8),
-        hit("read_batch_with_recovery_counter", "Store::read_batch", 14),
+        hit("load_values", "Store::read_batch", 14),
         hit("probe_values", "path_call", 18),
         hit("load_values", "path_call", 20),
         hit("ext_data", "path_call", 21),
-        hit(
-            "read_batch",
-            "ExternalValueStore::read_batch_with_recovery_counter",
-            28,
-        ),
+        hit("read_batch", "ExternalValueStore::read_all", 28),
     ];
     expected.sort();
     assert_eq!(
@@ -1106,11 +1158,7 @@ fn the_blob_reader_scanners_attribute_uses_and_skip_definitions_tests_comments_a
 
     assert_eq!(
         trait_blob_read_methods(&code),
-        [
-            "load_values",
-            "probe_values",
-            "read_batch_with_recovery_counter"
-        ],
+        ["load_values", "probe_values", "read_all"],
         "the trait's methods returning `Vec<u8>` or `ExtValueProbe`, declared or with a body"
     );
     for returns in [

@@ -1582,14 +1582,18 @@ async fn update_layer_watch_commit_size_of_a_section_tree_creation_matches_what_
 
 /// Deleting a section that has a child, fields and time samples: the
 /// sections' `DEL` and `SREM`, their tombstones' `HSET` and `SADD`, the
-/// deleted parent's children-list `DEL` and `SREM`, the emptied root list's
+/// deleted parent's children-list `DEL` and `SREM`, the emptied anchor list's
 /// `DEL` and `SREM`, and each purged field's and time sample's `DEL` and
 /// `ZREM`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_layer_watch_commit_size_of_a_cascading_section_delete_matches_what_it_sent() {
+    // `Parent` sits under a top-level `Anchor`, which the delete leaves, so
+    // the delete keeps a top-level section (an update leaving none is refused,
+    // SDD §9.7) and still empties a list: the anchor's.
     let setup = OwnedDelta {
         struct_commands: vec![
-            create_section(0, 1, "Parent"),
+            create_section(0, 9, "Anchor"),
+            create_section(9, 1, "Parent"),
             create_section(1, 2, "Child"),
         ],
         set_fields: vec![
@@ -1604,7 +1608,7 @@ async fn update_layer_watch_commit_size_of_a_cascading_section_delete_matches_wh
         vec![setup.into()],
         OwnedDelta {
             struct_commands: vec![StructCommand::DeleteSection(CommandDeleteSection {
-                parent_id: 0,
+                parent_id: 9,
                 section_id: 1,
             })],
             ..Default::default()

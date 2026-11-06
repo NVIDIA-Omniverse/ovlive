@@ -86,8 +86,9 @@ const THIS_FILE: &str = "tests/integration/storage/shared_valkey_config_fence_te
 ///   `LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL` is unset.
 /// - `disruptive_valkey.rs`: the `maxmemory` guard of the disruptive
 ///   real-`-OOM` tests (`store_write_refusal_test.rs`,
-///   `oom_collection_test.rs`) sets the server's `maxmemory` and restores it
-///   (`RestoreMaxmemory::set`, `restore` and its `Drop`). Every one of those
+///   `oom_collection_test.rs`, `b_2tu_tests.rs`) sets the server's
+///   `maxmemory` and restores it (`RestoreMaxmemory::set`, `restore` and its
+///   `Drop`). Every one of those
 ///   tests is `#[ignore]`d and returns before connecting when
 ///   `LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL` is unset.
 const ALLOWED_SITES: &[(&str, usize)] = &[

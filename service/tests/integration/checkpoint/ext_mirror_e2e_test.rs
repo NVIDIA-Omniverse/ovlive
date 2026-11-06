@@ -75,7 +75,7 @@ use live_edit::storage::layer::LayerStore;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
 
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external};
+use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external, with_root};
 use crate::grpc::helpers::{
     build_disabled_recovery_hook, build_disabled_session_recovery_hook, make_create_data,
     make_create_header, make_request, streaming_create, AllowAllPermissions, StubUserinfo,
@@ -212,7 +212,6 @@ async fn setup_ext_mirror_harness(
     let session_recovery = build_disabled_session_recovery_hook(&tv, Arc::clone(&metrics));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store,
@@ -390,6 +389,9 @@ async fn create_layer_with_ext_value_mirrors_to_checkpoint_store() {
         1,
         /*set_order=*/ 1,
     );
+    // The field sits on the layer's root section, which the content creates:
+    // content leaving a field with no top-level section is refused (SDD §9.7).
+    let delta = with_root(delta);
     let ompf_bytes = delta_to_ompf_bytes(&delta, &[payload]);
 
     let stream = streaming_create(vec![
@@ -453,7 +455,14 @@ async fn create_layer_with_ext_value_no_mirror_path_is_noop_when_sender_absent()
     let hash_hex = sha256_to_hex(&hash);
 
     // ext_value_index is 1-based: index 1 = the first (and only) blob.
-    let delta = delta_with_set_field_external(1, "f", hash.to_vec(), payload.len() as u64, 1, 1);
+    let delta = with_root(delta_with_set_field_external(
+        1,
+        "f",
+        hash.to_vec(),
+        payload.len() as u64,
+        1,
+        1,
+    ));
     let ompf_bytes = delta_to_ompf_bytes(&delta, &[payload]);
 
     let stream = streaming_create(vec![
@@ -580,6 +589,9 @@ async fn create_layer_with_ext_value_drop_on_full_increments_dropped_metric() {
         ],
         ..Default::default()
     };
+    // The fields sit on the layer's root section, which the content creates
+    // (SDD §9.7).
+    let delta = with_root(delta);
     let ompf_bytes = delta_to_ompf_bytes(&delta, &[payload_a, payload_b]);
 
     let stream = streaming_create(vec![
@@ -681,6 +693,9 @@ async fn create_layer_with_external_values(
             .collect(),
         ..Default::default()
     };
+    // The fields sit on the layer's root section, which the content creates
+    // (SDD §9.7).
+    let delta = with_root(delta);
     let refs: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
     let stream = streaming_create(vec![
         make_create_header(&session_id, "layer-ext-budget"),

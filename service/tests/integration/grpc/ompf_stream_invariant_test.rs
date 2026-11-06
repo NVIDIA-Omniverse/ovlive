@@ -319,6 +319,128 @@ fn structural_delta(section_id: u64, section_name: &str) -> OwnedDelta {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// 0. What a subscriber receives is the entry's `ompf`, cut into 1 MiB slices
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The next message of `stream`, which must arrive and be `Ok`.
+async fn next_message(
+    stream: &mut std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<
+                        live_edit::grpc::proto::SubscribeReadLayerResponse,
+                        tonic::Status,
+                    >,
+                > + Send,
+        >,
+    >,
+) -> live_edit::grpc::proto::subscribe_read_layer_response::ResponseType {
+    use futures::StreamExt;
+    tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+        .await
+        .expect("a message arrives")
+        .expect("the stream is open")
+        .expect("the message is not a status")
+        .response_type
+        .expect("the message carries a header or a chunk")
+}
+
+/// b.ntm (T14, T1): what a caught-up subscriber receives for a commit is that
+/// commit's stream entry's `ompf` field byte for byte — the relay the reader
+/// copied once and every subscriber's chunks slice — cut at 1 MiB: a 2.5 MiB
+/// relay arrives as chunks of 1 MiB, 1 MiB and the rest, under a header whose
+/// `total_size` is the field's length, and their concatenation is the field,
+/// itself the writer's inbound OMPF. An ompf-less (empty) commit's entry then
+/// arrives as the empty delta, which no catch-up payload memory backs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_commit_reaches_a_subscriber_as_one_mib_slices_of_its_entrys_ompf_field() {
+    use live_edit::grpc::proto::{
+        subscribe_read_layer_response::ResponseType, SubscribeReadLayerRequest,
+    };
+
+    const MIB: usize = 1 << 20;
+    let tv = TestValkey::setup().await;
+    let svc = service_with_backend(&tv, UpdateLayerBackend::Lua);
+    let layer = "sr12-relay-slices-layer";
+    let (session_id, object_id) =
+        create_session_and_layer(&tv, &svc, "sr12-relay-slices-session", layer).await;
+    let mut request = Request::new(SubscribeReadLayerRequest {
+        session_id: session_id.clone(),
+        layer_name: layer.to_owned(),
+        object_id: 0,
+        sequence_num: 0,
+        client_id: "slice-reader".to_owned(),
+    });
+    request
+        .extensions_mut()
+        .insert(BearerToken::new("test-token"));
+    let mut stream = live_edit::grpc::subscribe::handle_subscribe_read_layer(&svc, request)
+        .await
+        .expect("the subscription is admitted")
+        .into_inner();
+    loop {
+        if let ResponseType::Header(h) = next_message(&mut stream).await {
+            if h.total_size == 0 {
+                break;
+            }
+        }
+    }
+
+    let mut large = field_set_delta(3, "blob", 1);
+    large.set_fields[0].value_or_ext_hash = (0..5 * MIB / 2).map(|i| (i % 251) as u8).collect();
+    let (seq, inbound) = commit_delta(&svc, &session_id, layer, object_id, &large).await;
+    let entries = read_stream(&tv, object_id).await;
+    let field = entry_at_seq(&entries, seq)
+        .1
+        .get(RELAY_OMPF_FIELD)
+        .expect("the entry carries its ompf")
+        .clone();
+    assert_eq!(field.as_ref(), inbound.as_slice());
+
+    let ResponseType::Header(header) = next_message(&mut stream).await else {
+        panic!("the relay's header comes first");
+    };
+    assert_eq!(
+        (header.sequence_num, header.total_size),
+        (seq, field.len() as u64)
+    );
+    let mut sizes = Vec::new();
+    let mut received = Vec::new();
+    while (received.len() as u64) < header.total_size {
+        let ResponseType::Chunk(chunk) = next_message(&mut stream).await else {
+            panic!("the relay's chunks follow its header");
+        };
+        sizes.push(chunk.data.len());
+        received.extend_from_slice(&chunk.data);
+    }
+    assert_eq!(sizes, vec![MIB, MIB, field.len() - 2 * MIB]);
+    assert!(
+        received == field.as_ref(),
+        "the chunks are the entry's ompf, byte for byte"
+    );
+
+    let empty_seq = commit_empty(&svc, &session_id, layer, object_id).await;
+    assert_is_ompf_less(
+        entry_at_seq(&read_stream(&tv, object_id).await, empty_seq),
+        "empty commit",
+    );
+    let ResponseType::Header(header) = next_message(&mut stream).await else {
+        panic!("the empty delta's header");
+    };
+    assert_eq!(header.sequence_num, empty_seq);
+    assert!(header.total_size > 0, "the empty delta is a container");
+    let ResponseType::Chunk(_) = next_message(&mut stream).await else {
+        panic!("the empty delta's one chunk");
+    };
+    let budget = &svc.valkey.catchup_payload_budget;
+    assert_eq!(
+        (budget.reserved_bytes(), budget.overcommit_bytes()),
+        (0, 0),
+        "neither a relay nor the empty delta holds catch-up payload memory"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // 1. Field-set commit → `{seq}-0` carries the inbound OMPF byte-identically
 // ═════════════════════════════════════════════════════════════════════════════
 

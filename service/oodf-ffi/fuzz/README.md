@@ -73,6 +73,9 @@ treat it as a high-priority bug.
   cargo-fuzz manifest with `libfuzzer-sys = "0.4"` and `arbitrary` for the
   round-trip target. Enables the `oodf-ffi` `internal-bridge` feature so the
   fuzz crate can reach bridge types directly when needed.
+- `Cargo.lock` — the harness's own lockfile. CI audits it against the
+  RustSec advisory database and checks that it satisfies `Cargo.toml`
+  (see CI integration below for regenerating it).
 - `fuzz_targets/fuzz_parse_delta.rs` — random-byte parse fuzzer.
 - `fuzz_targets/fuzz_mutate_built.rs` — mutate-built-bytes fuzzer.
 - `fuzz_targets/fuzz_round_trip.rs` — structure-aware round-trip fuzzer.
@@ -113,3 +116,20 @@ cargo +nightly fuzz run fuzz_parse_delta -- -max_total_time=60
 The run starts from an empty corpus. A crash fails the job, which keeps
 `oodf-ffi/fuzz/artifacts/` for a week so the reproducer can be re-run
 locally. `fuzz_mutate_built` and `fuzz_round_trip` run only locally.
+
+The `supply-chain:audit` job audits `Cargo.lock` here with warnings
+denied and no advisories ignored. It first resolves `Cargo.toml` with
+`--locked`, so it fails when the lockfile no longer satisfies the manifest,
+for example after a version pin in `oodf-ffi/Cargo.toml` moves.
+To regenerate the lockfile, seed it from the workspace's lockfile and let
+cargo resolve, from the workspace root:
+
+```sh
+cp Cargo.lock oodf-ffi/fuzz/Cargo.lock
+cargo metadata --format-version 1 --manifest-path oodf-ffi/fuzz/Cargo.toml > /dev/null
+```
+
+Cargo drops the packages the harness does not use and adds only the
+harness's own, so every shared package keeps the workspace's version. Do
+not use `cargo update` or `cargo generate-lockfile`: they resolve from
+scratch and can pick versions the service is not built with.

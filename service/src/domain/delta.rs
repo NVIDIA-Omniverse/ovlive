@@ -52,9 +52,10 @@
 //
 //   * children-list writes are coalesced to ONE per dirty parent, emitted by
 //     `finalize_children_lists` at the close of the structural phase;
-//   * `(parent_id, name)` conflict lookups: the first scans `state.sections`
-//     with no allocation, the second builds an index used from then on, with
-//     a lowest-`section_id` tie-break either way (`find_child_by_name`);
+//   * sibling-collision lookups, keyed on `(parent_id, collision_slot,
+//     name)`: the first scans `state.sections` with no allocation, the
+//     second builds an index used from then on, with a lowest-`section_id`
+//     tie-break either way (`find_child_by_name`);
 //   * a bounded plan's build sites project the object-scaled structures they
 //     are about to allocate — a parent's listing, the name index, the
 //     adoption index's ids, a reset's, a cascade's or an adoption's rows —
@@ -98,8 +99,9 @@ use crate::domain::types::{
 // `From<DeltaError>` arm for the old
 // `Oodf` variant just forwarded to that same impl, so the variant existed
 // purely as dead plumbing. Removing it tightens the contract: `DeltaError`
-// now represents only the apply-time invariant violations that the domain
-// layer actually emits.
+// now represents only the invariant violations that the domain layer
+// actually emits — the engine's apply-time ones, and the two refusals of the
+// layer-root rule (`domain::layer_root`), which runs beside the engine.
 #[derive(Debug, Error)]
 pub enum DeltaError {
     #[error("inconsistent state: section {section_id} missing during {operation}")]
@@ -197,24 +199,22 @@ pub enum DeltaError {
         section_id: u64,
     },
 
-    /// b.dmu item 2: `DiffChangeSection` would rename a section onto an
-    /// existing sibling's `(parent_id, name)` slot. Mirrors `MoveSection`'s
-    /// edge 4 / 5 conflict-detection **on the cross-parent move path only**:
-    /// `MoveSection`'s same-parent rename (`old_parent_id ==
-    /// new_parent_id`) performs no conflict check at all, by design (PRD
-    /// §2.3.4, SDD §9.3.1), so it remains the one command shape that can
-    /// produce duplicate `(parent_id, name)` siblings. When it does, the
-    /// `conflicting_id` reported here is the lowest such `section_id` —
-    /// see [`find_child_by_name`]. Without this guard the diff path
-    /// silently stores two siblings with the same name, and the corruption
-    /// surfaces on the *write* path: the engine's own `(parent_id, name)`
-    /// conflict lookup — the one deciding which sibling a later
-    /// `CreateSection`, `DiffChangeSection` or `MoveSection`
-    /// cascade-deletes — then has to pick between the two (pre-b.ot3
-    /// arbitrarily, now the lowest `section_id`), and that pick destroys a
-    /// subtree in place of its namesake. Read-path diff reconstruction does
-    /// not key by name (SDD §10.1). Rejected before the rename mutates
-    /// state.
+    /// b.dmu item 2: a `DiffChangeSection` of an existing row would put it
+    /// into a slot another sibling occupies: the same parent, the same
+    /// [`collision_slot`] of its (possibly changed) `section_type`, and the
+    /// same name. A sibling of another slot sharing the name is no conflict.
+    /// Where `CreateSection`, a new row's `DiffChangeSection` and
+    /// `MoveSection` cascade-delete the occupant, this command refuses
+    /// instead: it is a client's statement of a row's state, and a silent
+    /// delete of a sibling there is worse than a clear refusal. The
+    /// `conflicting_id` reported is the occupant, the lowest such
+    /// `section_id` — see [`find_child_by_name`]. Without this guard the
+    /// diff path would store two rows in one slot, and a later
+    /// `CreateSection`, `DiffChangeSection` or `MoveSection` collision would
+    /// then have to pick between the two (the lowest `section_id`), a pick
+    /// that destroys a subtree in place of its namesake. Read-path diff
+    /// reconstruction does not key by name (SDD §10.1). Rejected before the
+    /// row is written.
     #[error(
         "DiffChangeSection rename of section {section_id} under parent {parent_id} \
          conflicts with existing sibling section {conflicting_id} named {name:?}"
@@ -237,6 +237,27 @@ pub enum DeltaError {
          delta would leave the materialized tree unrecoverable on the read path"
     )]
     SectionTreeTooDeep { depth: usize, cap: usize },
+
+    /// A `CreateLayer`'s content leaves sections, fields or time samples but
+    /// no top-level section (SDD §9.7). Raised by
+    /// [`build_creation_state`](crate::domain::layer_root::build_creation_state),
+    /// never by the engine itself.
+    #[error(
+        "layer content leaves sections or field data but no top-level section (a section \
+         whose parent_id is 0): create the layer's root section (section_id 1, parent_id 0, \
+         section_type 7) or send no content"
+    )]
+    CreateWithoutTopLevelSection,
+
+    /// An `UpdateLayer` delta would take a layer from at least one top-level
+    /// section to none (SDD §9.7). Raised by
+    /// [`check_keeps_top_level_section`](crate::domain::layer_root::check_keeps_top_level_section)
+    /// at the structural commit routes, never by the engine itself.
+    #[error(
+        "delta would remove the layer's last top-level section (parent_id 0); a layer must keep \
+         its root section"
+    )]
+    RemovesLastTopLevelSection,
 }
 
 // ── StorageMutation ───────────────────────────────────────────────────────────
@@ -426,21 +447,24 @@ pub struct ApplyDeltaStats {
     /// parent whose loaded list was sorted.
     pub children_scan_steps: u64,
 
-    /// Number of `(parent_id, name)` conflict lookups performed — one per
+    /// Number of sibling-collision lookups performed — one per
     /// [`find_child_by_name`] call, which each command reaches only past its
     /// own earlier gates:
     ///
-    /// * `DiffChangeSection`: always one (the probe precedes every branch).
+    /// * `DiffChangeSection`: one, except a new row's under
+    ///   [`ApplyMode::RestoreBase`], which probes **zero** times (the probe
+    ///   otherwise precedes every branch).
     /// * `CreateSection`: one, unless the command returned first — a
     ///   `section_id` that already has a row (`DuplicateSection`) or a
     ///   non-root `parent_id` with no row (silently skipped, SDD §9.1.4c)
     ///   both probe **zero** times.
-    /// * `MoveSection`: one, only when the command reaches the
-    ///   destination-conflict check at edges 4/5 — that is, the section
-    ///   exists, `old_parent_id != new_parent_id` (a same-parent rename
-    ///   returns first), the new parent exists (edge 2), and the move is not
-    ///   a cycle (edge 3). Each of those earlier exits probes **zero**
-    ///   times.
+    /// * `MoveSection`: one, when the section exists and either
+    ///   `old_parent_id == new_parent_id` with a new name differing from the
+    ///   stored one (the rename's occupant lookup), or the command reaches
+    ///   the destination-conflict check at edges 4/5 — that is,
+    ///   `old_parent_id != new_parent_id`, the new parent exists (edge 2),
+    ///   and the move is not a cycle (edge 3). A rename to the stored name,
+    ///   and each of those earlier exits, probes **zero** times.
     /// * `DeleteSection`, `ReorderChildren`, `DiffDeleteSection`: never.
     pub name_index_probes: u64,
 
@@ -565,6 +589,32 @@ pub struct ApplyDeltaStats {
     /// index that never dropped a pair would inflate this one while leaving
     /// that one alone.
     pub cache_index_peak_pairs: u64,
+
+    /// Number of points at which the delta's outcome under the current
+    /// collision rule — keyed on [`collision_slot`], with a same-parent
+    /// rename that cascades its occupant — can differ from its outcome under
+    /// the earlier rule, keyed on `(parent_id, name)` alone, with a
+    /// same-parent rename that checked nothing. Ticked:
+    ///
+    /// * by every [`find_child_by_name`] lookup whose occupant differs from
+    ///   the lowest same-name row of any slot (the earlier rule's answer);
+    /// * by every same-parent `MoveSection` rename that cascade-deletes an
+    ///   occupant;
+    /// * by every cross-parent `MoveSection` whose edge-5 cascade took the
+    ///   new parent, so the section is deleted rather than stored as an
+    ///   orphan.
+    ///
+    /// It may over-count (a rename's lookup that finds only a sibling of
+    /// another slot ticks, though the earlier rule's rename looked nothing up
+    /// and lands on the same state), but never misses a divergent outcome. A
+    /// rename to the stored name does not tick: its one difference from the
+    /// earlier rule is the `last_version` that rule wrote. Read only by the
+    /// structural cache's stream repair, which reloads an entry rather than
+    /// trust its replay of a record with a non-zero count, since another
+    /// build may have committed that record under the earlier rule
+    /// (`storage::structural_cache_repair`, `ReloadReason::CollisionRule`).
+    /// Every commit path and compose ignore it.
+    pub collision_rule_divergences: u64,
 }
 
 // ── MutationSink ──────────────────────────────────────────────────────────────
@@ -590,11 +640,13 @@ pub struct ApplyDeltaStats {
 ///
 /// # The only legitimate `Discard` callers
 ///
-/// 1. `handle_create_layer`'s empty-content branch (`src/grpc/layer.rs`) —
-///    CreateLayer materializes the whole object from `ObjectState` via
-///    `queue_object_state`, never from the delta's mutation list.
-/// 2. `handle_create_layer`'s parsed-delta branch (same file, same reason);
-///    this is the path the 8,000-sibling blowup in b.ot3 was measured on.
+/// 1. `build_creation_state` (`src/domain/layer_root.rs`), the state
+///    `handle_create_layer` commits (`src/grpc/layer.rs`) — CreateLayer
+///    materializes the whole object from `ObjectState` via
+///    `queue_object_state`, never from the delta's mutation list. This is the
+///    path the 8,000-sibling blowup in b.ot3 was measured on.
+/// 2. The same function's apply of the root it supplies to a create that
+///    leaves the layer empty (same file, same reason).
 /// 3. `decode_checkpoint_ompf` (`src/checkpoint/apply.rs`) — the DR decoder
 ///    rebuilds state from checkpoint bytes and writes it out itself; it runs
 ///    in [`ApplyMode::RestoreBase`].
@@ -1583,16 +1635,16 @@ struct ParentEntry {
 /// `String`, so building the index costs no per-section allocation — a
 /// one-command delta against a million-section layer would otherwise pay a
 /// million `String` clones to answer one lookup. Bucket entries are
-/// *candidates*: [`find_child_by_name`] re-verifies `parent_id` and `name`
-/// against `state.sections` before returning, so a hash collision is a
-/// correctness non-event.
+/// *candidates*: [`find_child_by_name`] re-verifies `parent_id`, `name` and
+/// the row's [`collision_slot`] against `state.sections` before returning,
+/// so a hash collision is a correctness non-event.
 ///
-/// Multimap-valued because duplicate `(parent_id, name)` siblings are
-/// producible from legal commands today: `apply_move_section`'s same-parent
-/// rename performs no conflict check (SDD §9.3.1, PRD §2.3.4) and is
-/// deliberately left that way — rejecting it would be a client-visible wire
-/// contract change. What b.ot3 fixes is that the *resolution* of such a
-/// duplicate is deterministic; see [`find_child_by_name`].
+/// Keyed by name, not by slot: siblings of different slots legally share a
+/// name (a prim and a property), and the slot is read off the live row, so a
+/// `DiffChangeSection` that changes only a row's type re-files nothing.
+/// Multimap-valued for those, and for a slot that holds two rows in stored
+/// state an earlier build wrote; the occupant of such a slot is the lowest
+/// id, see [`find_child_by_name`].
 #[derive(Default)]
 struct NameIndex {
     buckets: std::collections::HashMap<(u64, u64), Vec<u64>>,
@@ -2503,11 +2555,15 @@ pub fn apply_delta<R: ValueRows>(
 }
 
 /// Like [`apply_delta`], but reports per-delta observability stats through
-/// an out-parameter (b.39x item 7). The hot-path callers (`LayerStore::
-/// update_layer`, `handle_create_layer`) use this variant so they can bump
+/// an out-parameter (b.39x item 7), so a caller can bump
 /// `delta_create_section_skipped_missing_parent_total` from the metrics
 /// registry — domain code has no access to `Metrics` and cannot bump
-/// counters directly without violating the "zero I/O" rule.
+/// counters directly without violating the "zero I/O" rule. The service's
+/// hot paths take the same out-parameter through other entry points: the
+/// `UpdateLayer` commit routes through [`apply_delta_bounded`] (or the
+/// structural cache's indexed plan), and `CreateLayer` through
+/// `domain::layer_root::build_creation_state`, which uses
+/// [`apply_delta_into`].
 ///
 /// See [`apply_delta`] for the partial-mutation contract on `Err(_)`.
 pub fn apply_delta_with_stats<R: ValueRows>(
@@ -2678,12 +2734,14 @@ pub fn apply_delta_into<R: ValueRows>(
 /// Whether [`apply_delta_into_mode`] is planning a new commit, re-applying
 /// one that already committed, or rebuilding a layer from a checkpoint base.
 ///
-/// Each non-`Commit` mode changes exactly one thing relative to `Commit`:
+/// Each non-`Commit` mode changes a named set of steps relative to `Commit`:
 /// `Replay` whether the post-mutation `check_section_tree_depth` walk runs
-/// for a delta that cannot change the section tree, `RestoreBase` whether the
-/// per-delta entry-count cap is checked. Every other step — the per-item
-/// rules of bounds validation, sequence ceiling, command semantics, the sink,
-/// the stats — is identical in all modes.
+/// for a delta that cannot change the section tree; `RestoreBase` whether the
+/// per-delta entry-count cap is checked, and whether a `DiffChangeSection`
+/// that creates a row resolves a name conflict. Every other step — the
+/// per-item rules of bounds validation, sequence ceiling, every other
+/// command's semantics, the sink, how the stats count the work that ran — is
+/// identical in all modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyMode {
     /// Planning a commit: the depth walk always runs. Every caller except
@@ -2691,20 +2749,38 @@ pub enum ApplyMode {
     /// [`apply_delta`], [`apply_delta_with_stats`] or [`apply_delta_into`].
     Commit,
     /// Rebuilding a whole layer from a checkpoint base
-    /// (`checkpoint::apply::decode_checkpoint_ompf`, its only caller). Skips
-    /// the [`MAX_DELTA_ENTRIES`](crate::domain::limits::MAX_DELTA_ENTRIES)
-    /// check of [`validate_delta_bounds`](crate::domain::validation::validate_delta_bounds)
-    /// and nothing else: every per-item rule
-    /// ([`validate_delta_content`](crate::domain::validation::validate_delta_content))
-    /// and the depth walk still run, exactly as in [`ApplyMode::Commit`].
+    /// (`checkpoint::apply::decode_checkpoint_ompf`, its only caller). Differs
+    /// from [`ApplyMode::Commit`] in exactly two steps:
     ///
-    /// Why only here: the entry cap bounds one delta, but a base describes a
-    /// whole layer, and layers have no size cap. A base over the cap is
-    /// written as several chunks (`checkpoint::chunked_base`) and decoded
-    /// back into the one reset delta an unchunked base would have carried,
-    /// which can legitimately exceed the cap. Rebuilding N entries costs O(N)
-    /// however the base is framed, so skipping the cap here adds no work the
-    /// layer's size did not already imply.
+    /// - It skips the
+    ///   [`MAX_DELTA_ENTRIES`](crate::domain::limits::MAX_DELTA_ENTRIES)
+    ///   check of [`validate_delta_bounds`](crate::domain::validation::validate_delta_bounds).
+    /// - A `DiffChangeSection` that creates a row takes no collision action:
+    ///   it does not cascade-delete a sibling that already occupies its
+    ///   parent, [`collision_slot`] and name.
+    ///
+    /// Every per-item rule
+    /// ([`validate_delta_content`](crate::domain::validation::validate_delta_content)),
+    /// the depth walk, adoption, and a `DiffChangeSection`'s
+    /// `DuplicateSiblingName` refusal on a row that already exists (a base
+    /// that repeats an id onto an occupied slot) still run, exactly as in
+    /// [`ApplyMode::Commit`].
+    ///
+    /// Why the entry cap: it bounds one delta, but a base describes a whole
+    /// layer, and layers have no size cap. A base over the cap is written as
+    /// several chunks (`checkpoint::chunked_base`) and decoded back into the
+    /// one reset delta an unchunked base would have carried, which can
+    /// legitimately exceed the cap. Rebuilding N entries costs O(N) however
+    /// the base is framed, so skipping the cap here adds no work the layer's
+    /// size did not already imply.
+    ///
+    /// Why the collision: a base is a stored state, not an edit, and every
+    /// row in it existed live — two rows in one slot included, which an
+    /// earlier build's same-parent `MoveSection` rename stored, as it renamed
+    /// without a collision check (SDD §9.3). The cascade is the contract for
+    /// a client's new section; applied to a base, it would drop one of the
+    /// pair and its whole subtree, so the restored layer would lose rows the
+    /// live layer holds.
     RestoreBase,
     /// Re-applying a stream entry that already committed
     /// (`domain::replay::replay_stream_record`). The depth walk is skipped
@@ -2787,7 +2863,8 @@ fn apply_delta_engine<R: ValueRows, H: EngineHooks<R>>(
     // OODF FlatBuffers verifier rejects malformed wire bytes and the 100 MB
     // OMPF cap bounds total size, but nothing else constrains per-primitive
     // shape — see [`crate::domain::validation::validate_delta_bounds`].
-    // `RestoreBase` skips only the per-delta entry-count cap (see
+    // `RestoreBase` skips the per-delta entry-count cap here; its one other
+    // difference is in `apply_diff_change_section` (see
     // `ApplyMode::RestoreBase`).
     if let Some(d) = delta.as_ref() {
         if mode == ApplyMode::RestoreBase {
@@ -2877,6 +2954,7 @@ fn apply_delta_engine<R: ValueRows, H: EngineHooks<R>>(
                         new_version,
                         c,
                         commands,
+                        mode,
                         &mut plan,
                         sink,
                         stats,
@@ -3497,11 +3575,13 @@ fn emit_reset_section<H>(
 
 // ── CommandDiffChangeSection ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn apply_diff_change_section<R: ValueRows, H: EngineHooks<R>>(
     state: &mut ObjectStateOf<R>,
     new_version: u64,
     cmd: &CommandDiffChangeSection,
     commands: &[StructCommand],
+    mode: ApplyMode,
     plan: &mut ChildPlan<'_, H>,
     sink: &mut impl PlanSink,
     stats: &mut ApplyDeltaStats,
@@ -3511,22 +3591,41 @@ fn apply_diff_change_section<R: ValueRows, H: EngineHooks<R>>(
     let name = cmd.section_name.clone();
     let section_type = cmd.section_type;
     let section_order = cmd.section_order;
+    let existing = state.sections.get(&section_id).cloned();
 
-    // b.dmu item 2: detect `(parent_id, name)` conflict at the destination
-    // before mutating. Mirrors `apply_move_section` edges 4 & 5 — without
-    // this guard a rename can produce two siblings with the same
-    // `(parent_id, name)`, which the diff path then keys on at every
-    // child-by-name lookup. Cascade-delete the conflicting sibling on the
-    // *new-section* branch (matching CreateSection's PRD §2.3.4 policy);
-    // on the *existing-section* branch return the new
-    // `DuplicateSiblingName` error variant so the client gets a clear
-    // protocol-level signal rather than silent corruption. The
-    // existing-section branch is the rename path where surfacing the
-    // conflict is more useful than the silent cascade — clients can
-    // disambiguate before retrying.
-    let conflict_id = find_child_by_name(state, plan, stats, parent_id, &name, Some(section_id));
+    // b.dmu item 2: find the occupant of the destination slot — the parent,
+    // the `collision_slot` of the command's (possibly new) `section_type`,
+    // and the name — before mutating. A sibling of another slot with the
+    // same name is no conflict. On the *new-section* branch the occupant is
+    // cascade-deleted, as `CreateSection` does (PRD §2.3.4); on the
+    // *existing-section* branch, a client's statement of the row's state, the
+    // command is refused with `DuplicateSiblingName`, so the client gets a
+    // clear protocol-level signal rather than a sibling silently deleted, and
+    // can disambiguate before retrying. A type change into an occupied slot
+    // is refused the same way.
+    //
+    // A checkpoint base decode (`ApplyMode::RestoreBase`) takes no collision
+    // action on the new-section branch, so it does not probe there: a base is
+    // a stored state, and every pair of rows in one slot it holds existed
+    // live (an earlier build's same-parent `MoveSection` rename stored such
+    // pairs, SDD §9.3). Cascading would drop a row, and its subtree, that the
+    // layer holds. The existing-section branch still probes and refuses in
+    // every mode: there it can only mean a base that repeats an id.
+    let conflict_id = if existing.is_none() && mode == ApplyMode::RestoreBase {
+        None
+    } else {
+        find_child_by_name(
+            state,
+            plan,
+            stats,
+            parent_id,
+            collision_slot(section_type),
+            &name,
+            Some(section_id),
+        )
+    };
 
-    if let Some(existing) = state.sections.get(&section_id).cloned() {
+    if let Some(existing) = existing {
         if let Some(cid) = conflict_id {
             return Err(DeltaError::DuplicateSiblingName {
                 section_id,
@@ -3589,7 +3688,9 @@ fn apply_diff_change_section<R: ValueRows, H: EngineHooks<R>>(
         }
     } else {
         // New section. Mirror `apply_create_section`: cascade-delete the
-        // conflicting sibling (if any) under SDD §9.1.4c / PRD §2.3.4.
+        // slot's occupant (if any) under SDD §9.1.4c / PRD §2.3.4. Under
+        // `ApplyMode::RestoreBase` there is none to act on — the probe above
+        // did not run — so a base's same-slot siblings all keep their rows.
         if let Some(cid) = conflict_id {
             cascade_delete_section(state, new_version, cid, Some(parent_id), plan, sink, stats);
         }
@@ -3700,8 +3801,21 @@ fn apply_create_section<R: ValueRows, H: EngineHooks<R>>(
         return Ok(());
     }
 
-    // Name conflict: cascade-delete the conflicting sibling (SDD §9.1.4c / PRD §2.3.4).
-    let conflicting_id = find_child_by_name(state, plan, stats, parent_id, &name, Some(section_id));
+    // Collision: cascade-delete the occupant of the new row's slot — its
+    // parent, `collision_slot` and name (SDD §9.1.4c / PRD §2.3.4). A sibling
+    // of another slot with the same name stays. The parent is not re-checked
+    // after the cascade: one that also took it (a stale listing under the
+    // occupant names it) leaves the new row an orphan, listed nowhere
+    // (SDD §10.4).
+    let conflicting_id = find_child_by_name(
+        state,
+        plan,
+        stats,
+        parent_id,
+        collision_slot(section_type),
+        &name,
+        Some(section_id),
+    );
     if let Some(conflict_id) = conflicting_id {
         cascade_delete_section(
             state,
@@ -3714,8 +3828,8 @@ fn apply_create_section<R: ValueRows, H: EngineHooks<R>>(
         );
     }
 
-    // Computed after the conflict cascade, so a deleted same-name sibling's
-    // key no longer counts.
+    // Computed after the conflict cascade, so a deleted occupant's key no
+    // longer counts.
     let section_order = append_order(state, plan, stats, parent_id);
 
     // Same order-side guard every row-writing site runs. The id had no row
@@ -3772,8 +3886,8 @@ fn apply_create_section<R: ValueRows, H: EngineHooks<R>>(
 /// adopted subtrees also come under the end-of-delta depth check.
 ///
 /// Each adopted row is rewritten with `last_version = new_version` and gets a
-/// `SetSection`. Without it a snapshot-mode reconnector whose `have_version`
-/// lies between the orphaning and the adoption would never receive the row:
+/// `SetSection`. Without it a reconnector whose `have_version` lies between
+/// the orphaning and the adoption would never receive the row:
 /// the coalesced diff emits only rows created or modified after the
 /// reconnector's cut, plus the other children of a parent with such a row.
 /// The parent born in this delta is itself new, but that touches only its own
@@ -3934,29 +4048,67 @@ fn apply_move_section<R: ValueRows, H: EngineHooks<R>>(
     // The same stored `(parent_id, name)` pair is the `SetSection::previous`
     // pre-image on every arm that writes this row — edge 1, the rename in
     // place, and edge 6: nothing between here and any of those emissions
-    // writes this row (edge 5's cascade removes only the non-ancestor
-    // conflict's subtree, and a cascade that removed this row instead fails
-    // the arm's re-read before emitting).
-    let (stored_parent_id, stored_name) = state
+    // writes this row. A collision cascade (edge 1's, edge 5's) removes only
+    // the occupant's subtree; when that subtree took this row too, the arm
+    // returns before it writes anything.
+    //
+    // The stored type's `collision_slot` is the slot every collision lookup
+    // below probes: a move or rename never changes a row's type.
+    let (stored_parent_id, stored_name, slot) = state
         .sections
         .get(&section_id)
-        .map(|s| (s.parent_id, s.name.clone()))
+        .map(|s| (s.parent_id, s.name.clone(), collision_slot(s.section_type)))
         .ok_or(DeltaError::InconsistentState {
             section_id,
             operation: "apply_move_section (read stored parent/name)",
         })?;
 
     // Edge case 1: same parent as the command carries it → rename only, under
-    // the stored parent, with no list write (SDD §9.3.1).
+    // the stored parent, with no list write (SDD §9.3.1). The C++ client
+    // library's same-parent move, at the revision SDD §9.3 records:
     //
-    // No conflict check here, deliberately. PRD §2.3.4 and SDD §9.3.1
-    // describe rename as unconditional, and a previously-accepted delta
-    // starting to return INVALID_ARGUMENT would be a client-visible wire
-    // contract change. A rename onto an occupied `(parent_id, name)` still
-    // succeeds and still produces duplicate siblings — what b.ot3 changes is
-    // that the *resolution* of such a duplicate is deterministic, see
-    // [`find_child_by_name`].
+    // - A rename to the section's own stored name changes nothing: no row
+    //   write, no mutation, not even a `last_version` bump.
+    // - Any other name first cascade-deletes the occupant of (stored parent,
+    //   the section's slot, new name), with its listed subtree, exactly as an
+    //   explicit `DeleteSection` of it would (`cascade_delete_section`). The
+    //   occupant is a sibling, so neither holds the other by stored parent,
+    //   but the occupant's listed subtree holds this section when a stale
+    //   listing below it names the section: the section then leaves with it,
+    //   and the command stops.
+    // - Otherwise the section is renamed in place.
     if old_parent_id == new_parent_id {
+        if new_name == stored_name {
+            return Ok(());
+        }
+        if let Some(occupant) = find_child_by_name(
+            state,
+            plan,
+            stats,
+            stored_parent_id,
+            slot,
+            &new_name,
+            Some(section_id),
+        ) {
+            // The earlier rule renamed with no lookup, so any cascade here is
+            // an outcome it would not have reached.
+            stats.collision_rule_divergences = stats.collision_rule_divergences.saturating_add(1);
+            // Found by its own row's parent (`find_child_by_name` re-verifies
+            // `parent_id`), so `stored_parent_id` is the occupant's stored
+            // parent too.
+            cascade_delete_section(
+                state,
+                new_version,
+                occupant,
+                Some(stored_parent_id),
+                plan,
+                sink,
+                stats,
+            );
+            if !state.sections.contains_key(&section_id) {
+                return Ok(());
+            }
+        }
         let order_before = effective_order(&state.sections, section_id);
         let updated = write::update_section(state, &mut plan.hooks, section_id, |sec| {
             sec.name = new_name;
@@ -4028,12 +4180,15 @@ fn apply_move_section<R: ValueRows, H: EngineHooks<R>>(
         return Ok(());
     }
 
-    // Edges 4 & 5: name conflict at destination.
+    // Edges 4 & 5: the destination slot's occupant — the new parent, the
+    // section's slot and the new name. A sibling of another slot with the
+    // new name stays.
     let conflict_id = find_child_by_name(
         state,
         plan,
         stats,
         new_parent_id,
+        slot,
         &new_name,
         Some(section_id),
     );
@@ -4064,6 +4219,33 @@ fn apply_move_section<R: ValueRows, H: EngineHooks<R>>(
             sink,
             stats,
         );
+        // The occupant is not an ancestor of the section, but its listed
+        // subtree holds the section, or the new parent, when a stale listing
+        // below it names one; the C++ client library's cross-parent move
+        // checks both, at the revision SDD §9.3 records. Checked here, ahead
+        // of both branches below:
+        //
+        // - The section left with the occupant: the command stops.
+        // - The new parent left with it: the section is deleted, as a move
+        //   to a missing parent is (edge 2), rather than stored as an orphan.
+        if !state.sections.contains_key(&section_id) {
+            return Ok(());
+        }
+        if new_parent_id != 0 && !state.sections.contains_key(&new_parent_id) {
+            // The earlier rule moved the section under the missing parent.
+            stats.collision_rule_divergences = stats.collision_rule_divergences.saturating_add(1);
+            unlink_carried_parent(state, plan, stats, carried_parent, section_id);
+            cascade_delete_section(
+                state,
+                new_version,
+                section_id,
+                Some(stored_parent_id),
+                plan,
+                sink,
+                stats,
+            );
+            return Ok(());
+        }
     }
 
     // Destination is already the stored parent — reachable only with a stale
@@ -4219,10 +4401,10 @@ fn unlink_carried_parent<R: ValueRows, H: EngineHooks<R>>(
 /// child whose key changes — in the first case exactly the children that
 /// moved — has its row rewritten with `last_version` bumped and a
 /// `SetSection` emitted. That is what makes a reorder visible to every reader
-/// that does not replay this delta: a snapshot-mode reconnector, whose
-/// coalesced diff re-emits rows modified since its cut, and any reader that
-/// rebuilds a list from the stored keys (checkpoint restore, a rollback-mode
-/// cold start). The layout and keys come from [`reorder_layout`].
+/// that does not replay this delta: a reconnector, whose coalesced diff
+/// re-emits rows modified since its cut, and any reader that rebuilds a list
+/// from the stored keys (checkpoint restore). The layout and keys come from
+/// [`reorder_layout`].
 fn apply_reorder_children<R: ValueRows, H: EngineHooks<R>>(
     state: &mut ObjectStateOf<R>,
     new_version: u64,
@@ -4433,19 +4615,41 @@ fn reorder_layout(
 // `SdfSpecType` values, as clients write them into `section_type`: the Kit
 // client sends the spec type cast to a byte, and the C++ client library reads
 // the byte back as an `SdfSpecType`. OpenUSD `pxr/usd/sdf/types.h:71-89` @
-// `ee47c679`.
+// `ee47c679`. `SPEC_ATTRIBUTE` and `SPEC_PRIM` are also read by the DR restore
+// Job's coverage report (`dr::job::plan::report`), to name a value's prim path
+// and attribute.
 const SPEC_UNKNOWN: u8 = 0;
-const SPEC_ATTRIBUTE: u8 = 1;
+pub(crate) const SPEC_ATTRIBUTE: u8 = 1;
 const SPEC_CONNECTION: u8 = 2;
 const SPEC_EXPRESSION: u8 = 3;
 const SPEC_MAPPER: u8 = 4;
 const SPEC_MAPPER_ARG: u8 = 5;
-const SPEC_PRIM: u8 = 6;
+pub(crate) const SPEC_PRIM: u8 = 6;
 const SPEC_PSEUDO_ROOT: u8 = 7;
 const SPEC_RELATIONSHIP: u8 = 8;
 const SPEC_RELATIONSHIP_TARGET: u8 = 9;
 const SPEC_VARIANT: u8 = 10;
 const SPEC_VARIANT_SET: u8 = 11;
+
+/// The collision slot of a child of spec type `section_type`: two live
+/// siblings collide exactly when they share their stored parent, their slot
+/// and their name.
+///
+/// A relationship shares the attribute slot, as both are properties, and
+/// every other value — Unknown (0), PseudoRoot (7) and any value USD does not
+/// define included — is a slot of its own. So a prim and a property of one
+/// name, or a prim and a variant set of one name, do not collide, while an
+/// attribute and a relationship of one name do. This is the C++ client
+/// library's slot rule, at the revision SDD §9.3 records, and every
+/// sibling-name lookup of the engine follows it ([`find_child_by_name`]);
+/// nothing else in this crate defines it.
+pub(crate) fn collision_slot(section_type: u8) -> u8 {
+    if section_type == SPEC_RELATIONSHIP {
+        SPEC_ATTRIBUTE
+    } else {
+        section_type
+    }
+}
 
 /// Which of its parent's child lists a child belongs to, from the two
 /// sections' `SdfSpecType`s (`section_type`). `None` is the **fallback** list.
@@ -4660,9 +4864,18 @@ fn apply_time_sample<R: ValueRows, H: EngineHooks<R>>(
 /// the strict H-dom-3 `find_child_by_name`, the post-write invariant holds that
 /// `state.children[p] ⊆ state.sections`, so this branch should only fire for
 /// stored state that predates the bundled fixes. That invariant is about
-/// cross-map *membership* only — it does not make `(parent_id, name)`
-/// unique, which same-parent `MoveSection` rename can still violate; which
-/// duplicate a cascade targets is settled by [`find_child_by_name`].
+/// cross-map *membership* only — it does not make a collision slot's
+/// occupant unique, which stored state an earlier build wrote can violate;
+/// which of two occupants a cascade targets is settled by
+/// [`find_child_by_name`].
+///
+/// Every section deletion the engine makes, a reset's drain aside, goes
+/// through here: an explicit
+/// `DeleteSection`, the delete arms of `MoveSection` (edges 2–4, and edge 5's
+/// deleted destination), and every collision cascade of an occupant — a
+/// `CreateSection`'s, a new row's `DiffChangeSection`'s, a same-parent
+/// rename's and edge 5's. So a cascade emits the same rows, tombstones,
+/// external-value releases and purge ordering whatever triggered it.
 ///
 /// b.ot3 part E: the deleted sections' fields and time samples are **not**
 /// erased here. Their ids are accumulated on the plan and
@@ -5096,25 +5309,23 @@ fn append_order<R: ValueRows, H>(
 /// stays an unlisted row — an *orphan* — until its parent is born, when
 /// [`adopt_orphans`] lists it.
 ///
-/// Three routes arrive here with a missing parent, and each leaves exactly
-/// the orphan that rule describes:
+/// Two routes arrive here with a missing parent, and each leaves exactly the
+/// orphan that rule describes:
 ///
 /// * `apply_diff_change_section`, which does not check that its parent
 ///   exists (SDD §10.4) — a new row, or a reparent, under an id with no row;
-/// * `apply_create_section`, whose parent check runs *before* its
-///   name-conflict cascade. When the conflicting sibling's listed subtree
-///   loops back to the parent (a cycle in the lists), the cascade deletes the
-///   parent too, and the new row is left naming an id that no longer has a
-///   row;
-/// * `apply_move_section`'s normal (parent-changing) move, whose destination
-///   check likewise runs before the edge-5 conflict cascade that can delete
-///   the destination the same way. (Its rename-in-place arm cannot, on
-///   consistent state: there the destination is the section's own stored
-///   parent, so a destination inside the conflicting sibling's subtree makes
-///   that sibling an ancestor of the section, and edge 4 deletes the section
-///   first.)
+/// * `apply_create_section`, whose parent check runs *before* its collision
+///   cascade and is not repeated after it. When the occupant's listed
+///   subtree loops back to the parent (a cycle in the lists), the cascade
+///   deletes the parent too, and the new row is left naming an id that no
+///   longer has a row.
 ///
-/// In all three the row's `parent_id` names an id with no row, so keeping no
+/// `apply_move_section` never arrives here with a missing parent: its
+/// destination check runs before the edge-5 collision cascade, but the
+/// post-cascade check after that cascade deletes the section, and returns,
+/// when the cascade took the destination.
+///
+/// In both the row's `parent_id` names an id with no row, so keeping no
 /// list for it is the rule above, and the row is listed if and when that id
 /// is born again. [`adopt_orphans`] itself never arrives with a missing parent:
 /// it inserts under the section just born.
@@ -5389,16 +5600,61 @@ fn rebuild_children_list<R: ValueRows, H: EngineHooks<R>>(
     plan.restore_cache(parent_id, cache);
 }
 
-/// Find the section whose `(parent_id, name)` matches the arguments,
-/// excluding `except_id`.
+/// The two answers of one sibling-name lookup over the rows naming
+/// `(parent_id, name)`, other than the excepted id: what every lookup
+/// ([`scan_child_by_name`], the per-delta [`NameIndex`], the structural
+/// cache's persistent index through `EngineHooks::child_by_name`) answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SiblingLookup {
+    /// The collision occupant: the lowest id among those rows whose
+    /// [`collision_slot`] is the probed slot. The engine acts on this one.
+    pub(crate) occupant: Option<u64>,
+    /// The lowest id among those rows of any slot: the answer of the earlier
+    /// `(parent_id, name)` rule. Read only to count where the two rules
+    /// differ ([`ApplyDeltaStats::collision_rule_divergences`]).
+    pub(crate) any_slot: Option<u64>,
+}
+
+impl SiblingLookup {
+    /// Take one verified candidate, `id`, into the answers: the lowest wins
+    /// in each, so candidates can come in any order. `in_slot` is whether
+    /// its row's slot is the probed one.
+    pub(crate) fn take(&mut self, id: u64, in_slot: bool) {
+        let lower = |held: Option<u64>| Some(held.map_or(id, |held| held.min(id)));
+        self.any_slot = lower(self.any_slot);
+        if in_slot {
+            self.occupant = lower(self.occupant);
+        }
+    }
+
+    /// Whether the earlier name-only rule would have answered differently.
+    fn diverges(self) -> bool {
+        self.occupant != self.any_slot
+    }
+}
+
+/// Find the collision occupant of `(parent_id, slot, name)`: the lowest
+/// `section_id`, other than `except_id`, among the rows naming `parent_id`
+/// and `name` whose [`collision_slot`] is `slot`. `slot` is a
+/// [`collision_slot`] value; every caller derives it from a section type.
+///
+/// This is the C++ client library's occupant rule, at the revision SDD §9.3
+/// records: the lowest live identity in the parent's slot other than the
+/// section itself. Like the client's, it reads every row naming the parent,
+/// listed or not.
 ///
 /// Indexes `state.sections` (authoritative membership) rather than the
 /// `state.children[parent_id]` list (ordering-only). Stored state can hold a
 /// row its parent's list does not reach — a partial reorder stored before
 /// reorders kept the children they did not name dropped them from the list
-/// — and the snapshot load reads it back. If such a row shares a name with a new sibling, a
-/// children-list-only scan misses it and `apply_create_section` happily
-/// admits a duplicate `(parent_id, name)` pair (see b.55p H-dom-3).
+/// — and the snapshot load reads it back. If such a row shares a slot and
+/// name with a new sibling, a children-list-only scan misses it and
+/// `apply_create_section` admits a second occupant of the slot (see b.55p
+/// H-dom-3).
+///
+/// Every lookup also finds the lowest such row of any slot, the earlier
+/// `(parent_id, name)` rule's answer, and counts the lookup in
+/// [`ApplyDeltaStats::collision_rule_divergences`] when the two differ.
 ///
 /// b.ot3 part D: the pre-b.ot3 implementation scanned `sections.values()` on
 /// **every** command, which is O(S) per command and unbounded by
@@ -5416,30 +5672,39 @@ fn rebuild_children_list<R: ValueRows, H: EngineHooks<R>>(
 ///
 /// # Tie-break: the lowest `section_id` wins (b.ot3 P2)
 ///
-/// Two or more siblings can legally share `(parent_id, name)` today:
-/// `apply_move_section`'s rename arm (carried `old_parent_id ==
-/// new_parent_id`) performs no conflict check, and that stays true. When they do, **the lowest `section_id` is the conflict
-/// target.** That is not a cosmetic choice about which id an error names:
+/// The engine gives no slot a second occupant: every command that can put a
+/// row into an occupied slot first cascade-deletes the occupant or, for an
+/// existing row's `DiffChangeSection`, refuses. A slot holds two rows only
+/// in stored state an earlier build wrote, whose same-parent rename did not
+/// cascade, or in a checkpoint base that holds such a pair (a base decode,
+/// [`ApplyMode::RestoreBase`], keeps it). Then **the lowest `section_id` is
+/// the occupant**, as in the C++ client library. That is not a cosmetic
+/// choice about which
+/// id an error names:
 ///
-/// - For `apply_create_section` and `apply_diff_change_section`'s
-///   new-section branch it decides **which entire subtree is
-///   cascade-deleted** — its descendants, tombstones, fields and time
-///   samples.
-/// - For `apply_move_section` it additionally decides **which of edge 4 and
-///   edge 5 applies**, i.e. whether the moving section's subtree is
-///   destroyed or the conflicting sibling's.
+/// - For `apply_create_section`, `apply_diff_change_section`'s new-section
+///   branch and `apply_move_section`'s same-parent rename it decides
+///   **which entire subtree is cascade-deleted** — its descendants,
+///   tombstones, fields and time samples. The new-section branch probes
+///   only outside [`ApplyMode::RestoreBase`]; a checkpoint base decode
+///   cascades nothing there, so a base's same-slot siblings all survive it.
+/// - For `apply_move_section`'s cross-parent move it additionally decides
+///   **which of edge 4 and edge 5 applies**, i.e. whether the moving
+///   section's subtree is destroyed or the occupant's.
 /// - For `apply_diff_change_section`'s existing-section branch it fixes
 ///   `DuplicateSiblingName::conflicting_id`.
 ///
-/// Resolution removes one name-holder; it does not converge the parent to a
-/// single holder, so a second conflicting command picks the next-lowest id.
+/// Resolution removes one occupant; it does not converge the slot to a
+/// single occupant, so a second conflicting command picks the next-lowest
+/// id, and the other row of a stored pair stays beside a section renamed
+/// onto their name.
 ///
 /// The pre-b.ot3 `HashMap::values().find()` answered this from the hash
 /// table's layout, which depends on a process-local seed — two replicas
 /// replaying the same delta bytes, or the live path and
 /// `checkpoint::compose`'s replay of the same history, could destroy
 /// different subtrees. Any principal already authorized to write this layer
-/// could always cause a name-holder's subtree to be cascade-deleted with a
+/// could always cause an occupant's subtree to be cascade-deleted with a
 /// legal delta, subject to that same write permission; what changes here is
 /// only that the *selection* is now reproducible.
 fn find_child_by_name<R: ValueRows, H: EngineHooks<R>>(
@@ -5447,15 +5712,35 @@ fn find_child_by_name<R: ValueRows, H: EngineHooks<R>>(
     plan: &mut ChildPlan<'_, H>,
     stats: &mut ApplyDeltaStats,
     parent_id: u64,
+    slot: u8,
     name: &str,
     except_id: Option<u64>,
 ) -> Option<u64> {
     stats.name_index_probes = stats.name_index_probes.saturating_add(1);
+    let lookup = sibling_lookup(state, plan, stats, parent_id, slot, name, except_id);
+    if lookup.diverges() {
+        stats.collision_rule_divergences = stats.collision_rule_divergences.saturating_add(1);
+    }
+    lookup.occupant
+}
+
+/// [`find_child_by_name`]'s two answers ([`SiblingLookup`]), from the
+/// structural cache's persistent index when the plan's hooks keep one, else
+/// from the plan's first-probe scan or its per-delta [`NameIndex`].
+fn sibling_lookup<R: ValueRows, H: EngineHooks<R>>(
+    state: &ObjectStateOf<R>,
+    plan: &mut ChildPlan<'_, H>,
+    stats: &mut ApplyDeltaStats,
+    parent_id: u64,
+    slot: u8,
+    name: &str,
+    except_id: Option<u64>,
+) -> SiblingLookup {
     // A plan whose hooks keep a persistent index (the structural cache's)
     // answers from it, by the same rule, and builds nothing.
-    if let Some(answer) = plan
-        .hooks
-        .child_by_name(&state.sections, parent_id, name, except_id)
+    if let Some(answer) =
+        plan.hooks
+            .child_by_name(&state.sections, parent_id, slot, name, except_id)
     {
         return answer;
     }
@@ -5465,7 +5750,7 @@ fn find_child_by_name<R: ValueRows, H: EngineHooks<R>>(
             // nothing, so a one-command edit never builds the index.
             plan.name_scanned = true;
             return pass_timing::time(Pass::NameScan, || {
-                scan_child_by_name(&state.sections, parent_id, name, except_id)
+                scan_child_by_name(&state.sections, parent_id, slot, name, except_id)
             });
         }
         // The second: build the index at the object's sections plus every
@@ -5485,42 +5770,64 @@ fn find_child_by_name<R: ValueRows, H: EngineHooks<R>>(
         .as_ref()
         .expect("name index built immediately above");
 
-    let bucket = index.buckets.get(&(parent_id, name_hash(name)))?;
-    // Bucket entries are ascending candidates: re-verify each against
-    // `state.sections` (a hash collision, or an id the index has not yet
-    // been told about, must never be reported as a conflict) and return the
-    // lowest surviving id.
-    bucket.iter().copied().find(|&section_id| {
-        except_id != Some(section_id)
-            && state
-                .sections
-                .get(&section_id)
-                .is_some_and(|s| s.parent_id == parent_id && s.name == name)
-    })
+    let mut lookup = SiblingLookup::default();
+    let Some(bucket) = index.buckets.get(&(parent_id, name_hash(name))) else {
+        return lookup;
+    };
+    // Bucket entries are ascending candidates of every slot: re-verify each
+    // against `state.sections` (a hash collision, or an id the index has not
+    // yet been told about, must never be reported as a conflict) and take the
+    // lowest surviving id of the slot and of any slot. The first of the slot
+    // ends the walk: the lowest of any slot is at or below it, so already
+    // taken.
+    for &section_id in bucket {
+        if except_id == Some(section_id) {
+            continue;
+        }
+        let Some(row) = state.sections.get(&section_id) else {
+            continue;
+        };
+        if row.parent_id != parent_id || row.name != name {
+            continue;
+        }
+        let in_slot = collision_slot(row.section_type) == slot;
+        lookup.take(section_id, in_slot);
+        if in_slot {
+            break;
+        }
+    }
+    lookup
 }
 
-/// [`find_child_by_name`]'s answer without the index, by one pass over
+/// [`find_child_by_name`]'s answers without the index, by one pass over
 /// `sections` that allocates nothing: the same rule — the lowest
-/// `section_id` among the rows naming `(parent_id, name)`, re-verified by
-/// that id's own row as the index's candidates are, other than `except_id`.
-/// The plan's first probe takes it.
+/// `section_id` among the rows naming `(parent_id, name)` in `slot`, and of
+/// any slot, other than `except_id`, each re-verified by that id's own row as
+/// the index's candidates are. The plan's first probe takes it.
 fn scan_child_by_name(
     sections: &std::collections::HashMap<u64, Section>,
     parent_id: u64,
+    slot: u8,
     name: &str,
     except_id: Option<u64>,
-) -> Option<u64> {
-    sections
-        .values()
-        .filter(|s| s.parent_id == parent_id && s.name == name)
-        .map(|s| s.section_id)
-        .filter(|&section_id| {
-            except_id != Some(section_id)
-                && sections
-                    .get(&section_id)
-                    .is_some_and(|s| s.parent_id == parent_id && s.name == name)
-        })
-        .min()
+) -> SiblingLookup {
+    let mut lookup = SiblingLookup::default();
+    for candidate in sections.values() {
+        if candidate.parent_id != parent_id || candidate.name != name {
+            continue;
+        }
+        let section_id = candidate.section_id;
+        if except_id == Some(section_id) {
+            continue;
+        }
+        if let Some(row) = sections
+            .get(&section_id)
+            .filter(|row| row.parent_id == parent_id && row.name == name)
+        {
+            lookup.take(section_id, collision_slot(row.section_type) == slot);
+        }
+    }
+    lookup
 }
 
 /// Debug-only cross-map consistency check (debug builds only — release
@@ -11086,7 +11393,7 @@ mod tests {
                 create_cmd(1, 5, "A3"),
                 // Cross-parent move.
                 move_cmd(3, 1, 2, "Moved"),
-                // Same-parent rename (no conflict check, SDD §9.3.1).
+                // Same-parent rename onto a free name (SDD §9.3.1).
                 move_cmd(5, 1, 1, "A3renamed"),
                 // Cascade delete of a leaf.
                 delete_cmd(4),
@@ -11218,6 +11525,9 @@ mod tests {
                     // ends at its peak, n — one entry per live insertion, which
                     // is the linear term this shape is allowed to hold.
                     cache_index_peak_pairs: n,
+                    // Every probe finds no row of any slot under its fresh
+                    // parent, so the two collision rules agree.
+                    collision_rule_divergences: 0,
                 },
                 "n={n}: every counter grows at most one step per command"
             );
@@ -13804,39 +14114,45 @@ mod tests {
 
     // ── Duplicate-name determinism (b.ot3 P2) ────────────────────────────────
     //
-    // Two siblings can legally share `(parent_id, name)`: `apply_move_section`'s
-    // same-parent rename performs no conflict check, and that is deliberately
-    // unchanged (rejecting it would be a client-visible wire contract change,
-    // PRD §2.3.4 / SDD §9.3.1). What b.ot3 fixes is that the RESOLUTION of such
-    // a duplicate is deterministic — the lowest `section_id` is the conflict
-    // target — where the pre-fix `HashMap::values().find()` answered from a
-    // process-local hash seed. The stakes are not cosmetic: the pick decides
-    // which whole subtree is cascade-deleted, and for `MoveSection` whether
-    // edge 4 or edge 5 applies.
+    // No command of this engine puts a second row into an occupied collision
+    // slot (the same parent, `collision_slot` and name): a same-parent rename
+    // onto an occupied name cascade-deletes the occupant, as the C++ client
+    // library does (SDD §9.3.1). Stored state an earlier build wrote can still hold
+    // such a pair, since that build's rename checked nothing, and so can a
+    // checkpoint base. What b.ot3 fixes is that the RESOLUTION of such a pair
+    // is deterministic — the lowest `section_id` is the occupant — where the
+    // pre-fix `HashMap::values().find()` answered from a process-local hash
+    // seed. The stakes are not cosmetic: the pick decides which whole subtree
+    // is cascade-deleted, and for `MoveSection` whether edge 4 or edge 5
+    // applies. Every row below is an attribute (`seed_section`,
+    // `create_cmd`, `change_cmd`), so every same-name pair shares one slot.
 
-    /// The unchanged half: a same-parent rename onto an occupied sibling name
-    /// succeeds and produces the duplicate.
-    ///
-    /// Pinned explicitly so a future "tidy-up" that adds a conflict check here
-    /// fails a test that says why it must not.
+    /// A same-parent rename onto an occupied name cascade-deletes the
+    /// occupant with its subtree, then renames: no pair is left behind, and
+    /// the parent lists the renamed section alone.
     #[test]
-    fn apply_delta_same_parent_rename_onto_an_occupied_name_creates_a_duplicate() {
+    fn apply_delta_same_parent_rename_onto_an_occupied_name_cascades_the_occupant() {
         let mut state = make_state();
         seed_section(&mut state, 1, 0, "P", 0);
         seed_section(&mut state, 10, 1, "A", 0);
+        seed_section(&mut state, 11, 10, "child-of-10", 0);
         seed_section(&mut state, 20, 1, "B", 0);
         state.children.insert(0, vec![1]);
         state.children.insert(1, vec![10, 20]);
+        state.children.insert(10, vec![11]);
 
         apply_delta(&mut state, Some(batch(vec![move_cmd(20, 1, 1, "A")])))
-            .expect("a same-parent rename is unconditional (SDD §9.3.1)");
+            .expect("a same-parent rename onto an occupied name applies");
 
-        assert_eq!(state.sections[&10].name, "A");
-        assert_eq!(state.sections[&20].name, "A");
+        assert!(
+            !state.sections.contains_key(&10) && !state.sections.contains_key(&11),
+            "the occupant and its subtree are cascade-deleted"
+        );
+        assert_eq!(state.sections[&20].name, "A", "the section is renamed");
         assert_eq!(
             state.children[&1],
-            vec![10, 20],
-            "a rename touches no children list"
+            vec![20],
+            "the parent lists the renamed section alone"
         );
     }
 
@@ -14153,23 +14469,21 @@ mod tests {
         }
     }
 
-    /// `MoveSection` edge 5 against a *rename-created* duplicate targets the
-    /// lowest id.
+    /// `MoveSection` edge 5 after an in-delta rename onto an occupied name
+    /// targets the renamed row.
     ///
-    /// The duplicate is produced inside the same delta by the rename in
-    /// command 1, so the tie-break has to hold over a second holder that did
-    /// not exist when the delta started.
+    /// The rename in command 3 cascade-deletes the occupant, 10, and leaves
+    /// 20 the only `(1, "A")` row, a holder that did not exist when the delta
+    /// started. The edge-5 move after it must find 20 and cascade it.
     ///
-    /// It does **not** discriminate the index's incremental insert. The pick
-    /// is id 10, which `NameIndex::build` already supplies from the
-    /// *pre-delta* `state.sections`; delete the `plan.name_inserted(...)` in
-    /// [`apply_move_section`]'s same-parent rename arm and every assertion
-    /// below is unchanged. The hooks that only the incremental insert can
-    /// answer are pinned by the three
-    /// `apply_delta_*_same_name_*` / `..._cascades_the_new_row` tests above
-    /// and by `apply_delta_mixed_conflict_sequence_matches_one_per_delta`.
+    /// It discriminates the index's incremental insert in
+    /// [`apply_move_section`]'s same-parent rename arm: the two leading
+    /// probes build `NameIndex` from the *pre-delta* `state.sections`, where
+    /// `(1, "A")` holds only 10, so delete that arm's
+    /// `plan.name_inserted(...)` and the edge-5 probe finds no live occupant,
+    /// the mover lands beside 20, and the parent holds two `A` rows.
     #[test]
-    fn apply_delta_move_section_edge5_conflict_targets_the_lowest_id() {
+    fn apply_delta_move_section_edge5_after_an_in_delta_rename_targets_the_renamed_row() {
         let mut state = make_state();
         seed_section(&mut state, 1, 0, "P1", 0);
         seed_section(&mut state, 2, 0, "P2", 0);
@@ -14188,9 +14502,9 @@ mod tests {
                 // rather than built fresh at the conflicting command.
                 create_cmd(1, 40, "Z"),
                 create_cmd(1, 41, "Y"),
-                // Rename 20 onto 10's name: two "A" siblings under parent 1.
+                // Rename 20 onto 10's name: 10 is cascaded, 20 holds "A".
                 move_cmd(20, 1, 1, "A"),
-                // Edge 5: the mover is not a descendant of the conflict target.
+                // Edge 5: the mover is not a descendant of the occupant.
                 move_cmd(5, 2, 1, "A"),
             ])),
         )
@@ -14198,18 +14512,22 @@ mod tests {
 
         assert!(
             !state.sections.contains_key(&10),
-            "the lowest name holder is the one cascade-deleted"
+            "the rename cascaded the first occupant"
         );
         assert!(
-            state.sections.contains_key(&20),
-            "the higher-id name holder survives"
+            !state.sections.contains_key(&20),
+            "edge 5 cascaded the renamed row, the occupant when the mover arrived"
         );
-        assert_eq!(state.sections[&20].name, "A");
         assert_eq!(
             state.sections[&5].parent_id, 1,
             "the mover completed its move"
         );
         assert_eq!(state.sections[&5].name, "A");
+        assert_eq!(
+            state.children[&1],
+            vec![40, 41, 5],
+            "the parent holds one A, the mover, appended last"
+        );
     }
 
     /// The pick decides **which edge applies**, not merely which id an error
@@ -14285,50 +14603,48 @@ mod tests {
         }
     }
 
-    /// A mixed conflict sequence — two probes, rename-duplicate, create, move,
-    /// reorder, delete, create — settles to one deterministic state.
+    /// A mixed conflict sequence — two probes, rename onto an occupied name,
+    /// create, move, reorder, delete, create — settles to one deterministic
+    /// state.
     ///
-    /// Resolution removes one name holder but does not converge the parent to
-    /// a single holder, so a second conflicting command picks the next-lowest
-    /// id; this sequence exercises exactly that succession. The
+    /// Each conflicting command cascades the one occupant `(1, "A")` holds
+    /// when it runs, and each occupant is a row an earlier command of the
+    /// delta put there; this sequence exercises exactly that succession. The
     /// `structural_shape` comparison against the one-command-per-delta replay
     /// is what pins the whole sequence rather than the individual picks: this
     /// arrangement is cross-map consistent throughout, so the oracle applies.
     ///
     /// Both of [`apply_move_section`]'s `NameIndex` incremental insert hooks
-    /// are pinned here, and nowhere else:
+    /// are pinned here:
     ///
-    /// * The **same-parent rename** hook — the second conflict (command 5)
+    /// * The **same-parent rename** hook — the second conflict (command 4)
     ///   picks id 20, which is a `(1, "A")` holder only because command 3
     ///   renamed it there.
     /// * The **cross-parent move** hook — the final conflict picks id 40,
     ///   which acquired `(1, "A")` by the move in command 5. Pre-delta, 40
     ///   sits under parent 2 named "Mover".
     ///
-    /// Drop either call and a later same-name command picks the next id up
-    /// instead — 50 in both cases — leaving two live `(1, "A")` siblings and
+    /// Drop either call and the later same-name command finds no live
+    /// occupant in the bucket, leaving two live `(1, "A")` siblings and
     /// diverging from the replay.
     ///
     /// **Commands 1 and 2 are load-bearing, not decoration.** The plan's
-    /// first `(parent_id, name)` probe scans `state.sections` and builds
-    /// nothing; `NameIndex::build` runs lazily at its *second* probe, not at
-    /// delta entry, and [`apply_move_section`]'s same-parent arm returns
-    /// before it probes. With fewer than two earlier probes the build is
-    /// therefore deferred until command 4 (or the scan answers it) and reads
-    /// the already-renamed row straight off `state.sections`, so the
-    /// same-parent hook supplies nothing the build did not — measured with one
-    /// leading probe under the first-probe build: commenting out that hook
-    /// left every assertion below green. The two probes pin the build to the
-    /// pre-delta snapshot, where `(1, "A")` holds only id 10, and hand the
-    /// hook its job back. They are aimed at the root rather than at parent 1
-    /// so they perturb neither command 6's complete-list reorder nor the
-    /// children assertion.
+    /// first probe scans `state.sections` and builds nothing;
+    /// `NameIndex::build` runs lazily at its *second* probe, not at delta
+    /// entry. Without the leading probes the rename's probe would be the
+    /// plan's first, a scan, and command 4's the second, building the index
+    /// after the rename and reading the renamed row straight off
+    /// `state.sections`, so the same-parent hook would supply nothing the
+    /// build did not. The leading probes pin the build to the pre-delta
+    /// snapshot, where `(1, "A")` holds only id 10, and hand the hook its job
+    /// back. They are aimed at the root rather than at parent 1 so they
+    /// perturb neither command 6's reorder nor the children assertion.
     ///
     /// The final create is likewise appended at the end rather than spliced in
     /// right after the move so that the reorder still names a live id; "after
     /// the move" is all the cross-parent hook's coverage requires.
     ///
-    /// The persisted half of this sequence — `LRANGE` children and `SMEMBERS
+    /// The persisted half of the rule — `LRANGE` children and `SMEMBERS
     /// obj:chs` after a real commit — is asserted in
     /// `tests/integration/storage/b_ot3_tests.rs`.
     #[test]
@@ -14356,20 +14672,21 @@ mod tests {
             // same-parent hook look redundant. See the doc-comment above.
             create_cmd(0, 70, "Z"),
             create_cmd(0, 71, "Y"),
-            // Rename 20 onto "A": holders are now {10, 20}.
+            // Rename 20 onto "A" → cascade-deletes the occupant, 10; 20
+            // holds "A".
             move_cmd(20, 1, 1, "A"),
-            // Create onto "A" → cascade-deletes the lowest holder, 10.
+            // Create onto "A" → cascade-deletes 20, an occupant only the
+            // same-parent rename hook supplies.
             create_cmd(1, 50, "A"),
-            // Move onto "A" → the live holders are now {20, 50} and the
-            // lowest is 20, which only the same-parent rename hook supplies.
+            // Move onto "A" → edge 5 cascade-deletes 50.
             move_cmd(40, 2, 1, "A"),
-            // A complete-list reorder of what is left under parent 1.
+            // A reorder of what is left under parent 1, naming the cascaded
+            // 50 too.
             reorder_cmd(1, vec![50, 30, 40]),
             // Delete one of the survivors.
             delete_cmd(30),
-            // Create onto "A" once more. Live holders are {40, 50}; the
-            // lowest is 40, which is a candidate only because the
-            // cross-parent move above told the index so.
+            // Create onto "A" once more. The occupant is 40, a candidate only
+            // because the cross-parent move above told the index so.
             create_cmd(1, 60, "A"),
         ]);
 
@@ -14386,24 +14703,28 @@ mod tests {
         );
         assert!(
             !batched.sections.contains_key(&10),
-            "the first conflict took the lowest holder"
+            "the rename took the first occupant"
         );
         assert!(
             !batched.sections.contains_key(&20),
-            "the second conflict took the next-lowest holder — id 20, which is a \
-             (1, \"A\") holder only because the same-parent rename hook said so"
+            "the second conflict took id 20, which is a (1, \"A\") holder only \
+             because the same-parent rename hook said so"
+        );
+        assert!(
+            !batched.sections.contains_key(&50),
+            "the edge-5 move took the created 50"
         );
         assert!(
             !batched.sections.contains_key(&40),
-            "the third conflict took 40 — the row that acquired (1, \"A\") by a \
+            "the last conflict took 40 — the row that acquired (1, \"A\") by a \
              cross-parent move inside this delta, which only the incremental \
              insert puts in the bucket"
         );
         assert!(
-            batched.sections.contains_key(&50) && batched.sections.contains_key(&60),
-            "the two higher-id holders survive"
+            batched.sections.contains_key(&60),
+            "the last created holder survives"
         );
-        assert_eq!(batched.children[&1], vec![50, 60]);
+        assert_eq!(batched.children[&1], vec![60]);
 
         let writes = set_children_writes(&mutations);
         let mut parents: Vec<u64> = writes.iter().map(|(p, _)| *p).collect();
@@ -14413,6 +14734,913 @@ mod tests {
             writes.len(),
             parents.len(),
             "no parent is written twice: {writes:?}"
+        );
+    }
+
+    // ── Collision slots and the rename cascade (b.z16) ───────────────────────
+    //
+    // Two live siblings collide when they share their stored parent, their
+    // `collision_slot` and their name: a relationship shares the attribute
+    // slot, every other `SdfSpecType` is a slot of its own. A same-parent
+    // rename to another name cascade-deletes the occupant first, and a rename
+    // to the stored name changes nothing. Each rule is the C++ client
+    // library's slot, occupant and move rule, at the revision SDD §9.3
+    // records; the tests below pin the engine to it shape by shape, and pin the
+    // `collision_rule_divergences` count each shape leaves, which the
+    // structural cache's repair reloads on.
+    //
+    // Fixtures place every row explicitly, with its `SdfSpecType`: the
+    // `seed_section` / `create_cmd` / `change_cmd` helpers make attributes
+    // only, and `make_section` rows are Unknown (0), a slot of its own.
+
+    /// A prim, under the root, that parents the collision fixtures.
+    const SLOT_P: u64 = 1;
+    /// A second prim under the root: the source of the cross-parent moves.
+    const SLOT_Q: u64 = 2;
+
+    /// Install an unlisted row of `SdfSpecType` `ty` (as [`seed_section`]).
+    fn seed_typed(state: &mut ObjectState, id: u64, parent: u64, name: &str, ty: u8) {
+        seed_section(state, id, parent, name, 0);
+        state
+            .sections
+            .get_mut(&id)
+            .expect("just seeded")
+            .section_type = ty;
+    }
+
+    fn create_typed(parent_id: u64, section_id: u64, name: &str, ty: u8) -> StructCommand {
+        StructCommand::CreateSection(OodfCreateSection {
+            parent_id,
+            section_id,
+            section_name: name.to_string(),
+            section_type: ty,
+        })
+    }
+
+    fn change_typed(
+        parent_id: u64,
+        section_id: u64,
+        name: &str,
+        ty: u8,
+        section_order: u32,
+    ) -> StructCommand {
+        StructCommand::DiffChangeSection(OodfDiffChangeSection {
+            parent_id,
+            section_id,
+            section_name: name.to_string(),
+            section_type: ty,
+            section_order,
+        })
+    }
+
+    /// One [`slot_fixture`] row: `(id, parent, name, SdfSpecType)`.
+    type SlotRow = (u64, u64, &'static str, u8);
+
+    /// [`SLOT_P`] and [`SLOT_Q`], both prims, then each [`SlotRow`], listed
+    /// under its parent in the order given, at the key of its position. A row
+    /// whose parent is another row is listed under it.
+    fn slot_fixture(rows: &[SlotRow]) -> ObjectState {
+        let mut state = make_state();
+        seed_typed(&mut state, SLOT_P, 0, "P", SPEC_PRIM);
+        seed_typed(&mut state, SLOT_Q, 0, "Q", SPEC_PRIM);
+        state.children.insert(0, vec![SLOT_P, SLOT_Q]);
+        for &(id, parent, name, ty) in rows {
+            seed_typed(&mut state, id, parent, name, ty);
+            let list = state.children.entry(parent).or_default();
+            state
+                .sections
+                .get_mut(&id)
+                .expect("just seeded")
+                .section_order = u32::try_from(list.len()).expect("a fixture list is short");
+            list.push(id);
+        }
+        state
+    }
+
+    /// The ids every `CreateTombstone` in `mutations` names, sorted.
+    fn tombstoned_ids(mutations: &[StorageMutation]) -> Vec<u64> {
+        let mut ids: Vec<u64> = mutations
+            .iter()
+            .filter_map(|m| match m {
+                StorageMutation::CreateTombstone { section_id, .. } => Some(*section_id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The `(held, new)` type pairs of one name under one parent that hold
+    /// distinct collision slots: a prim beside each kind of property, and a
+    /// prim beside a variant set, each way round.
+    const DISTINCT_SLOT_PAIRS: [(u8, u8); 6] = [
+        (SPEC_PRIM, SPEC_ATTRIBUTE),
+        (SPEC_ATTRIBUTE, SPEC_PRIM),
+        (SPEC_PRIM, SPEC_RELATIONSHIP),
+        (SPEC_RELATIONSHIP, SPEC_PRIM),
+        (SPEC_PRIM, SPEC_VARIANT_SET),
+        (SPEC_VARIANT_SET, SPEC_PRIM),
+    ];
+
+    /// A new row — by `CreateSection`, or by a `DiffChangeSection` of an id
+    /// with no row — beside a same-named sibling of another collision slot
+    /// cascades nothing: both rows stay, listed in arrival order. The lookup
+    /// found no occupant where the earlier `(parent_id, name)` rule found
+    /// the sibling, so the delta counts one collision-rule divergence.
+    #[test]
+    fn apply_delta_new_row_beside_a_same_named_sibling_of_another_slot_keeps_both() {
+        for (held_ty, new_ty) in DISTINCT_SLOT_PAIRS {
+            for (shape, cmd) in [
+                ("CreateSection", create_typed(SLOT_P, 20, "x", new_ty)),
+                (
+                    "new-row DiffChangeSection",
+                    change_typed(SLOT_P, 20, "x", new_ty, 1),
+                ),
+            ] {
+                let label = format!("{shape}, held type {held_ty}, new type {new_ty}");
+                let mut state = slot_fixture(&[(10, SLOT_P, "x", held_ty)]);
+
+                let (mutations, stats) = apply_counted(&mut state, batch(vec![cmd]));
+
+                assert_eq!(
+                    (
+                        state.sections[&10].section_type,
+                        state.sections[&20].section_type
+                    ),
+                    (held_ty, new_ty),
+                    "{label}: both rows are live"
+                );
+                assert_eq!(state.children[&SLOT_P], vec![10, 20], "{label}");
+                assert_eq!(tombstoned_ids(&mutations), Vec::<u64>::new(), "{label}");
+                assert_eq!(stats.collision_rule_divergences, 1, "{label}");
+            }
+        }
+    }
+
+    /// An existing row's `DiffChangeSection` that renames it onto the name of
+    /// a sibling of another collision slot is accepted: no
+    /// `DuplicateSiblingName`, no cascade. One divergence: the earlier rule
+    /// refused it.
+    #[test]
+    fn apply_delta_diff_change_rename_beside_a_same_named_sibling_of_another_slot_is_accepted() {
+        for (held_ty, renamed_ty) in DISTINCT_SLOT_PAIRS {
+            let label = format!("held type {held_ty}, renamed type {renamed_ty}");
+            let mut state =
+                slot_fixture(&[(10, SLOT_P, "x", held_ty), (20, SLOT_P, "y", renamed_ty)]);
+
+            let (mutations, stats) = apply_counted(
+                &mut state,
+                batch(vec![change_typed(SLOT_P, 20, "x", renamed_ty, 1)]),
+            );
+
+            assert_eq!(
+                (
+                    state.sections[&10].name.as_str(),
+                    state.sections[&20].name.as_str()
+                ),
+                ("x", "x"),
+                "{label}: the rename lands beside the sibling"
+            );
+            assert_eq!(state.children[&SLOT_P], vec![10, 20], "{label}");
+            assert_eq!(tombstoned_ids(&mutations), Vec::<u64>::new(), "{label}");
+            assert_eq!(stats.collision_rule_divergences, 1, "{label}");
+        }
+    }
+
+    /// A same-parent `MoveSection` rename onto the name of a sibling of
+    /// another collision slot cascades nothing: both rows stay, and the
+    /// parent's list is unchanged. The rename's lookup counts one divergence.
+    #[test]
+    fn apply_delta_same_parent_rename_beside_a_same_named_sibling_of_another_slot_keeps_both() {
+        for (held_ty, renamed_ty) in DISTINCT_SLOT_PAIRS {
+            let label = format!("held type {held_ty}, renamed type {renamed_ty}");
+            let mut state =
+                slot_fixture(&[(10, SLOT_P, "x", held_ty), (20, SLOT_P, "y", renamed_ty)]);
+
+            let (mutations, stats) =
+                apply_counted(&mut state, batch(vec![move_cmd(20, SLOT_P, SLOT_P, "x")]));
+
+            assert_eq!(
+                (
+                    state.sections[&10].name.as_str(),
+                    state.sections[&20].name.as_str()
+                ),
+                ("x", "x"),
+                "{label}: both rows are live under the one name"
+            );
+            assert_eq!(state.children[&SLOT_P], vec![10, 20], "{label}");
+            assert_eq!(tombstoned_ids(&mutations), Vec::<u64>::new(), "{label}");
+            assert_eq!(stats.collision_rule_divergences, 1, "{label}");
+        }
+    }
+
+    /// A cross-parent `MoveSection` onto the name a sibling of another
+    /// collision slot holds at the destination: edge 5 does not fire, the
+    /// sibling stays, and the section is appended under the destination.
+    #[test]
+    fn apply_delta_cross_parent_move_beside_a_same_named_sibling_of_another_slot_keeps_both() {
+        for (held_ty, moved_ty) in DISTINCT_SLOT_PAIRS {
+            let label = format!("held type {held_ty}, moved type {moved_ty}");
+            let mut state =
+                slot_fixture(&[(10, SLOT_P, "x", held_ty), (20, SLOT_Q, "x", moved_ty)]);
+
+            let (mutations, stats) =
+                apply_counted(&mut state, batch(vec![move_cmd(20, SLOT_Q, SLOT_P, "x")]));
+
+            assert!(
+                state.sections.contains_key(&10),
+                "{label}: the sibling stays"
+            );
+            assert_eq!(
+                state.sections[&20].parent_id, SLOT_P,
+                "{label}: the section moved"
+            );
+            assert_eq!(state.children[&SLOT_P], vec![10, 20], "{label}");
+            assert_eq!(tombstoned_ids(&mutations), Vec::<u64>::new(), "{label}");
+            assert_eq!(stats.collision_rule_divergences, 1, "{label}");
+        }
+    }
+
+    /// An attribute and a relationship of one name share the attribute
+    /// slot, so they still collide, each way round, on a create, a
+    /// same-parent rename and a cross-parent move: the held row is
+    /// cascade-deleted and the arriving one holds the name. A create's and a
+    /// move's lookup agree with the earlier rule (no divergence); the rename's
+    /// cascade is one.
+    #[test]
+    fn apply_delta_relationship_and_attribute_of_one_name_collide() {
+        for (held_ty, arriving_ty) in [
+            (SPEC_ATTRIBUTE, SPEC_RELATIONSHIP),
+            (SPEC_RELATIONSHIP, SPEC_ATTRIBUTE),
+        ] {
+            let cases: [(&str, Vec<SlotRow>, StructCommand, u64); 3] = [
+                (
+                    "CreateSection",
+                    vec![(10, SLOT_P, "x", held_ty)],
+                    create_typed(SLOT_P, 20, "x", arriving_ty),
+                    0,
+                ),
+                (
+                    "same-parent rename",
+                    vec![(10, SLOT_P, "x", held_ty), (20, SLOT_P, "y", arriving_ty)],
+                    move_cmd(20, SLOT_P, SLOT_P, "x"),
+                    1,
+                ),
+                (
+                    "cross-parent move",
+                    vec![(10, SLOT_P, "x", held_ty), (20, SLOT_Q, "x", arriving_ty)],
+                    move_cmd(20, SLOT_Q, SLOT_P, "x"),
+                    0,
+                ),
+            ];
+            for (shape, rows, cmd, divergences) in cases {
+                let label = format!("{shape}, held type {held_ty}, arriving type {arriving_ty}");
+                let mut state = slot_fixture(&rows);
+
+                let (mutations, stats) = apply_counted(&mut state, batch(vec![cmd]));
+
+                assert!(
+                    !state.sections.contains_key(&10),
+                    "{label}: the held row is cascade-deleted"
+                );
+                assert_eq!(
+                    (
+                        state.sections[&20].parent_id,
+                        state.sections[&20].name.as_str()
+                    ),
+                    (SLOT_P, "x"),
+                    "{label}: the arriving row holds the name"
+                );
+                assert_eq!(state.children[&SLOT_P], vec![20], "{label}");
+                assert_eq!(tombstoned_ids(&mutations), vec![10], "{label}");
+                assert_eq!(stats.collision_rule_divergences, divergences, "{label}");
+            }
+        }
+    }
+
+    /// A same-parent rename onto an occupied name emits exactly the
+    /// mutations an explicit `DeleteSection` of the occupant emits — its
+    /// rows, tombstones and children lists, and every field and time sample
+    /// of its subtree, external-value rows included — plus the rename's one
+    /// `SetSection`, after the cascade's row deletes. The rename's cascade
+    /// counts one divergence; its lookup, which finds the lowest row of any
+    /// slot, counts none.
+    #[test]
+    fn apply_delta_same_parent_rename_cascade_emits_an_explicit_delete_of_the_occupant() {
+        const OCCUPANT: u64 = 10;
+        const CHILD: u64 = 11;
+        const GRANDCHILD: u64 = 12;
+        const RENAMED: u64 = 20;
+        let external = |seed: u8| FieldValue::External {
+            hash: [seed; 32],
+            size: 2_000_000,
+            ext_value_index: 0,
+        };
+        let arrange = || {
+            let mut state = slot_fixture(&[
+                (OCCUPANT, SLOT_P, "A", SPEC_PRIM),
+                (CHILD, OCCUPANT, "child", SPEC_PRIM),
+                (GRANDCHILD, CHILD, "leaf", SPEC_ATTRIBUTE),
+                (RENAMED, SLOT_P, "B", SPEC_PRIM),
+            ]);
+            seed_field(&mut state, OCCUPANT, "inline");
+            seed_field(&mut state, CHILD, "external");
+            state
+                .fields
+                .get_mut(&(CHILD, "external".to_string()))
+                .expect("just seeded")
+                .value = external(7);
+            seed_time_sample(&mut state, CHILD, 1.0);
+            seed_time_sample(&mut state, GRANDCHILD, 2.0);
+            state
+                .time_samples
+                .get_mut(&(GRANDCHILD, OrderedFloat(2.0)))
+                .expect("just seeded")
+                .value = external(9);
+            seed_field(&mut state, RENAMED, "kept");
+            state
+        };
+
+        let mut deleted = arrange();
+        let delete_mutations = apply_counted(
+            &mut deleted,
+            batch(vec![StructCommand::DeleteSection(OodfDeleteSection {
+                parent_id: SLOT_P,
+                section_id: OCCUPANT,
+            })]),
+        )
+        .0;
+        let mut renamed = arrange();
+        let (rename_mutations, stats) = apply_counted(
+            &mut renamed,
+            batch(vec![move_cmd(RENAMED, SLOT_P, SLOT_P, "A")]),
+        );
+
+        let deleted_rows: BTreeSet<(u64, String)> = delete_mutations
+            .iter()
+            .filter_map(|m| match m {
+                StorageMutation::DeleteField {
+                    section_id,
+                    key_name,
+                } => Some((*section_id, key_name.clone())),
+                StorageMutation::DeleteTimeSample { section_id, time } => {
+                    Some((*section_id, format!("t={time}")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deleted_rows,
+            BTreeSet::from([
+                (OCCUPANT, "inline".to_string()),
+                (CHILD, "external".to_string()),
+                (CHILD, "t=1".to_string()),
+                (GRANDCHILD, "t=2".to_string()),
+            ]),
+            "precondition: the explicit delete drops every subtree row, the external ones included"
+        );
+        assert_eq!(
+            tombstoned_ids(&delete_mutations),
+            vec![OCCUPANT, CHILD, GRANDCHILD],
+            "precondition: the explicit delete tombstones the subtree"
+        );
+
+        let set_section_at: Vec<usize> = rename_mutations
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(m, StorageMutation::SetSection { .. }))
+            .map(|(at, _)| at)
+            .collect();
+        let [at] = set_section_at[..] else {
+            panic!("the rename emits exactly one SetSection: {rename_mutations:?}");
+        };
+        let StorageMutation::SetSection { section, previous } = &rename_mutations[at] else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(
+            (section.section_id, section.name.as_str(), previous.clone()),
+            (
+                RENAMED,
+                "A",
+                Some(SectionKey {
+                    parent_id: SLOT_P,
+                    name: "B".to_string()
+                })
+            ),
+            "the SetSection is the rename"
+        );
+        let last_cascade_write = rename_mutations
+            .iter()
+            .rposition(|m| {
+                matches!(
+                    m,
+                    StorageMutation::DeleteSection { .. }
+                        | StorageMutation::CreateTombstone { .. }
+                        | StorageMutation::DeleteChildrenList { .. }
+                )
+            })
+            .expect("the rename cascades");
+        assert!(
+            last_cascade_write < at,
+            "the rename follows the cascade: {rename_mutations:?}"
+        );
+        let mut without_rename = rename_mutations.clone();
+        without_rename.remove(at);
+        // The purge's row deletes come in the rows' hash-table order, which
+        // two applies need not share; everything else comes in command order.
+        let is_purge = |m: &StorageMutation| {
+            matches!(
+                m,
+                StorageMutation::DeleteField { .. } | StorageMutation::DeleteTimeSample { .. }
+            )
+        };
+        let split = |mutations: &[StorageMutation]| {
+            let (purged, ordered): (Vec<_>, Vec<_>) =
+                mutations.iter().cloned().partition(|m| is_purge(m));
+            let mut purged: Vec<String> = purged.iter().map(|m| format!("{m:?}")).collect();
+            purged.sort_unstable();
+            (ordered, purged)
+        };
+        assert_eq!(
+            split(&without_rename),
+            split(&delete_mutations),
+            "the rest is exactly the explicit delete's mutations, in its order, \
+             the purge's row deletes as a set"
+        );
+
+        deleted
+            .sections
+            .get_mut(&RENAMED)
+            .expect("the explicit delete keeps the renamed row")
+            .name = "A".to_string();
+        assert_eq!(
+            structural_shape(&renamed),
+            structural_shape(&deleted),
+            "the rename leaves the explicit delete's state, with the section renamed"
+        );
+        assert_eq!(stats.collision_rule_divergences, 1);
+    }
+
+    /// A same-parent rename with a stale carried parent — the command names
+    /// Q as both its old and its new parent, but the section's stored parent
+    /// is P — looks the occupant up under the stored parent, as the C++ client
+    /// library's move reads the row's own parent (at the revision SDD §9.3
+    /// records): P's same-slot occupant is cascaded with its subtree, Q's same-named
+    /// row of the same slot survives, and the section is renamed in place
+    /// under P. The cascade counts one divergence.
+    #[test]
+    fn apply_delta_same_parent_rename_with_a_stale_carried_parent_cascades_the_stored_parents_occupant(
+    ) {
+        let mut state = slot_fixture(&[
+            (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+            (11, 10, "child-of-10", SPEC_ATTRIBUTE),
+            (20, SLOT_P, "B", SPEC_ATTRIBUTE),
+            (30, SLOT_Q, "A", SPEC_ATTRIBUTE),
+        ]);
+
+        let (mutations, stats) =
+            apply_counted(&mut state, batch(vec![move_cmd(20, SLOT_Q, SLOT_Q, "A")]));
+
+        assert_eq!(
+            tombstoned_ids(&mutations),
+            vec![10, 11],
+            "the stored parent's occupant is cascaded with its subtree"
+        );
+        assert_eq!(
+            (
+                state.sections[&30].parent_id,
+                state.sections[&30].name.as_str()
+            ),
+            (SLOT_Q, "A"),
+            "the carried parent's same-named row survives"
+        );
+        assert_eq!(
+            (
+                state.sections[&20].parent_id,
+                state.sections[&20].name.as_str()
+            ),
+            (SLOT_P, "A"),
+            "the section is renamed under its stored parent"
+        );
+        assert_eq!(state.children[&SLOT_P], vec![20]);
+        assert_eq!(state.children[&SLOT_Q], vec![30]);
+        assert_eq!(stats.collision_rule_divergences, 1);
+    }
+
+    /// A rename to the section's own stored name changes nothing — no row
+    /// write, no lookup, no cascade, not even a `last_version` bump — even
+    /// beside a twin in the same slot that stored state an earlier build
+    /// wrote holds: the twin survives. Either member of the pair renamed to
+    /// the shared name is a no-op.
+    #[test]
+    fn apply_delta_same_parent_rename_to_its_own_name_changes_nothing_beside_a_stored_twin() {
+        let arrange = || {
+            slot_fixture(&[
+                (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+                (11, 10, "child-of-10", SPEC_ATTRIBUTE),
+                (20, SLOT_P, "A", SPEC_ATTRIBUTE),
+            ])
+        };
+        for renamed in [10, 20] {
+            let mut state = arrange();
+            let before = state.clone();
+
+            let (mutations, stats) = apply_counted(
+                &mut state,
+                batch(vec![move_cmd(renamed, SLOT_P, SLOT_P, "A")]),
+            );
+
+            let beyond_header: Vec<&StorageMutation> = mutations
+                .iter()
+                .filter(|m| !matches!(m, StorageMutation::SetObjectHeader { .. }))
+                .collect();
+            assert_eq!(
+                beyond_header,
+                Vec::<&StorageMutation>::new(),
+                "renaming {renamed} to its own name emits nothing beyond the header"
+            );
+            assert_eq!(
+                state.sections, before.sections,
+                "renaming {renamed}: every row as it was, last_version included"
+            );
+            assert_eq!(state.children, before.children, "renaming {renamed}");
+            assert_eq!(
+                (stats.name_index_probes, stats.collision_rule_divergences),
+                (0, 0),
+                "renaming {renamed}: no lookup, no divergence"
+            );
+        }
+    }
+
+    /// A parent id with no row, for the stale-listing fixtures below.
+    ///
+    /// A stale listing — a list naming a row whose stored parent is another
+    /// id — exists only in legacy stored state, which the debug cross-map
+    /// check (`debug_assert_cross_map_consistent`, run at the end of every
+    /// delta) reads as inconsistent. Each fixture puts the stale-listed row
+    /// under a parent with no row, an orphan listed nowhere else, so the
+    /// state the delta leaves holds no listing of a deleted row and passes
+    /// the check, while the delta itself starts from the legacy shape.
+    const STALE_MISSING_PARENT: u64 = 77;
+
+    /// A same-parent rename whose occupant's listed subtree holds the section
+    /// — a stale listing under the occupant names it — deletes the section
+    /// with the occupant, and the command stops: the delta applies, with no
+    /// `InconsistentState`, and nothing is renamed. Occupant and section are
+    /// orphans under one missing parent; the lookup reads rows by their
+    /// stored parent, listed or not. The rename's cascade counts one
+    /// divergence (the earlier rule renamed with no lookup); its lookup,
+    /// whose occupant is also the lowest row of any slot, counts none.
+    #[test]
+    fn apply_delta_same_parent_rename_whose_occupant_lists_the_section_stops_with_the_cascade() {
+        const M: u64 = STALE_MISSING_PARENT;
+        let mut state = make_state();
+        seed_typed(&mut state, 10, M, "A", SPEC_ATTRIBUTE);
+        seed_typed(&mut state, 20, M, "B", SPEC_ATTRIBUTE);
+        // The stale listing: 20's stored parent is M, but 10's list names it.
+        state.children.insert(10, vec![20]);
+
+        let (mutations, stats) = apply_counted(&mut state, batch(vec![move_cmd(20, M, M, "A")]));
+
+        assert!(
+            !state.sections.contains_key(&10) && !state.sections.contains_key(&20),
+            "the occupant's cascade took the section"
+        );
+        assert_eq!(tombstoned_ids(&mutations), vec![10, 20]);
+        assert!(
+            !mutations
+                .iter()
+                .any(|m| matches!(m, StorageMutation::SetSection { .. })),
+            "nothing is renamed: {mutations:?}"
+        );
+        assert_eq!(stats.collision_rule_divergences, 1);
+    }
+
+    /// Edge 5's occupant, not an ancestor of the section, whose listed
+    /// subtree holds the section (a stale listing under the occupant names
+    /// it): the cascade deletes the section with the occupant, and the
+    /// command stops — the delta applies, with no `InconsistentState`. The
+    /// section is an orphan under a missing parent, its carried one. It
+    /// counts no divergence: edge 5's lookup finds the occupant the earlier
+    /// rule found, and that rule's build refused this delta
+    /// (`InconsistentState`), so no build committed another outcome of it.
+    #[test]
+    fn apply_delta_cross_parent_move_whose_occupant_lists_the_section_stops_with_the_cascade() {
+        const M: u64 = STALE_MISSING_PARENT;
+        let mut state = slot_fixture(&[(10, SLOT_P, "A", SPEC_ATTRIBUTE)]);
+        seed_typed(&mut state, 20, M, "A", SPEC_ATTRIBUTE);
+        // The stale listing: 20's stored parent is M, but 10's list names it.
+        state.children.insert(10, vec![20]);
+
+        let (mutations, stats) =
+            apply_counted(&mut state, batch(vec![move_cmd(20, M, SLOT_P, "A")]));
+
+        assert!(
+            !state.sections.contains_key(&10) && !state.sections.contains_key(&20),
+            "the occupant's cascade took the section"
+        );
+        assert_eq!(tombstoned_ids(&mutations), vec![10, 20]);
+        assert!(
+            !mutations
+                .iter()
+                .any(|m| matches!(m, StorageMutation::SetSection { .. })),
+            "nothing is moved: {mutations:?}"
+        );
+        assert_eq!(stats.collision_rule_divergences, 0);
+    }
+
+    /// Edge 5's occupant whose listed subtree holds the destination (a cycle
+    /// in the lists: the occupant lists its own parent): the cascade takes
+    /// the destination, and the section is then deleted with its subtree, as
+    /// a move to a missing parent is (edge 2), rather than stored as an
+    /// orphan under an id with no row. The earlier rule stored the orphan,
+    /// so the delta counts one divergence. The destination, D, is an orphan
+    /// under a missing parent, listed only under the occupant.
+    #[test]
+    fn apply_delta_cross_parent_move_whose_occupant_lists_the_destination_deletes_the_section() {
+        const D: u64 = 5;
+        let mut state = slot_fixture(&[
+            (20, SLOT_Q, "A", SPEC_ATTRIBUTE),
+            (21, 20, "child-of-20", SPEC_ATTRIBUTE),
+        ]);
+        seed_typed(&mut state, D, STALE_MISSING_PARENT, "D", SPEC_PRIM);
+        seed_typed(&mut state, 10, D, "A", SPEC_ATTRIBUTE);
+        state.children.insert(D, vec![10]);
+        // The cycle in the lists: 10's list names its own parent, D.
+        state.children.insert(10, vec![D]);
+
+        let (mutations, stats) =
+            apply_counted(&mut state, batch(vec![move_cmd(20, SLOT_Q, D, "A")]));
+
+        assert!(
+            !state.sections.contains_key(&10) && !state.sections.contains_key(&D),
+            "precondition: the occupant's cascade took the destination"
+        );
+        assert!(
+            !state.sections.contains_key(&20) && !state.sections.contains_key(&21),
+            "the section and its subtree are deleted, not orphaned"
+        );
+        assert_eq!(tombstoned_ids(&mutations), vec![D, 10, 20, 21]);
+        assert!(
+            state.children.get(&SLOT_Q).is_none_or(Vec::is_empty),
+            "the section's old parent lists nothing: {:?}",
+            state.children.get(&SLOT_Q)
+        );
+        assert_eq!(stats.collision_rule_divergences, 1);
+    }
+
+    /// Edge 5's destination-gone branch with a stale carried parent: the
+    /// section's stored parent is Q, but the command carries P, a live row
+    /// whose list still names the section (a stale listing). As in
+    /// `apply_delta_cross_parent_move_whose_occupant_lists_the_destination_deletes_the_section`,
+    /// the occupant's cascade takes the destination and the section is
+    /// deleted; it leaves the carried parent's list as well as its stored
+    /// parent's, as a move to a missing parent (edge 2) does, so no list
+    /// names the deleted row.
+    #[test]
+    fn apply_delta_cross_parent_move_whose_occupant_lists_the_destination_unlinks_the_carried_parent(
+    ) {
+        const D: u64 = 5;
+        let mut state = slot_fixture(&[
+            (20, SLOT_Q, "A", SPEC_ATTRIBUTE),
+            (21, 20, "child-of-20", SPEC_ATTRIBUTE),
+        ]);
+        seed_typed(&mut state, D, STALE_MISSING_PARENT, "D", SPEC_PRIM);
+        seed_typed(&mut state, 10, D, "A", SPEC_ATTRIBUTE);
+        state.children.insert(D, vec![10]);
+        // The cycle in the lists: 10's list names its own parent, D.
+        state.children.insert(10, vec![D]);
+        // The stale listing: 20's stored parent is Q, but P's list names it.
+        state.children.insert(SLOT_P, vec![20]);
+
+        let (mutations, stats) =
+            apply_counted(&mut state, batch(vec![move_cmd(20, SLOT_P, D, "A")]));
+
+        assert!(
+            !state.sections.contains_key(&D),
+            "precondition: the occupant's cascade took the destination"
+        );
+        assert!(
+            !state.sections.contains_key(&20) && !state.sections.contains_key(&21),
+            "the section and its subtree are deleted, not orphaned"
+        );
+        assert_eq!(tombstoned_ids(&mutations), vec![D, 10, 20, 21]);
+        assert!(
+            state.children.get(&SLOT_P).is_none_or(Vec::is_empty),
+            "the carried parent's list no longer names the deleted section: {:?}",
+            state.children.get(&SLOT_P)
+        );
+        assert!(
+            state.children.get(&SLOT_Q).is_none_or(Vec::is_empty),
+            "the stored parent's list no longer names it either: {:?}",
+            state.children.get(&SLOT_Q)
+        );
+        assert_eq!(stats.collision_rule_divergences, 1);
+    }
+
+    /// An existing row's `DiffChangeSection` into an occupied slot is
+    /// refused with `DuplicateSiblingName`, naming the occupant: a rename
+    /// onto an attribute's name, a relationship's rename onto an attribute's
+    /// name, and a type change that moves a row into the slot of a
+    /// same-named sibling.
+    #[test]
+    fn apply_delta_diff_change_existing_row_into_an_occupied_slot_is_refused() {
+        let cases: [(&str, [SlotRow; 2], StructCommand); 3] = [
+            (
+                "attribute renamed onto an attribute",
+                [
+                    (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+                    (20, SLOT_P, "B", SPEC_ATTRIBUTE),
+                ],
+                change_typed(SLOT_P, 20, "A", SPEC_ATTRIBUTE, 1),
+            ),
+            (
+                "relationship renamed onto an attribute",
+                [
+                    (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+                    (20, SLOT_P, "B", SPEC_RELATIONSHIP),
+                ],
+                change_typed(SLOT_P, 20, "A", SPEC_RELATIONSHIP, 1),
+            ),
+            (
+                "attribute retyped into a same-named prim's slot",
+                [
+                    (10, SLOT_P, "A", SPEC_PRIM),
+                    (20, SLOT_P, "A", SPEC_ATTRIBUTE),
+                ],
+                change_typed(SLOT_P, 20, "A", SPEC_PRIM, 1),
+            ),
+        ];
+        for (label, rows, cmd) in cases {
+            let mut state = slot_fixture(&rows);
+
+            let err = apply_delta(&mut state, Some(batch(vec![cmd])))
+                .expect_err("a change into an occupied slot is refused");
+
+            assert!(
+                matches!(
+                    &err,
+                    DeltaError::DuplicateSiblingName {
+                        section_id: 20,
+                        parent_id: SLOT_P,
+                        conflicting_id: 10,
+                        name,
+                    } if name == "A"
+                ),
+                "{label}: got {err:?}"
+            );
+        }
+    }
+
+    /// Stored state an earlier build wrote holds two attributes `A` under P,
+    /// each with a child. A third section renamed onto `A` cascades the
+    /// lowest, 10, with its subtree, and leaves the other, 20, beside the
+    /// renamed section, as the C++ client library does: the next conflict resolves the next
+    /// lowest. (A `CreateSection` onto such a pair is
+    /// `apply_delta_create_section_name_conflict_cascades_the_lowest_id_subtree`.)
+    #[test]
+    fn apply_delta_rename_onto_a_stored_same_slot_pair_cascades_the_lowest_and_keeps_the_other() {
+        let mut state = slot_fixture(&[
+            (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+            (11, 10, "child-of-10", SPEC_ATTRIBUTE),
+            (20, SLOT_P, "A", SPEC_ATTRIBUTE),
+            (21, 20, "child-of-20", SPEC_ATTRIBUTE),
+            (30, SLOT_P, "C", SPEC_ATTRIBUTE),
+        ]);
+
+        let (mutations, _) =
+            apply_counted(&mut state, batch(vec![move_cmd(30, SLOT_P, SLOT_P, "A")]));
+
+        assert_eq!(
+            tombstoned_ids(&mutations),
+            vec![10, 11],
+            "the lowest is cascaded"
+        );
+        assert!(
+            state.sections.contains_key(&20) && state.sections.contains_key(&21),
+            "the other member of the pair keeps its subtree"
+        );
+        assert_eq!(
+            (
+                state.sections[&20].name.as_str(),
+                state.sections[&30].name.as_str()
+            ),
+            ("A", "A"),
+            "the other member stays beside the renamed section"
+        );
+        assert_eq!(state.children[&SLOT_P], vec![20, 30]);
+    }
+
+    /// Renaming either member of a stored same-slot pair to a free name
+    /// keeps both: there is no occupant at the new name, and the pair's
+    /// other member is not one.
+    #[test]
+    fn apply_delta_renaming_a_member_of_a_stored_same_slot_pair_to_a_free_name_keeps_both() {
+        for (renamed, kept) in [(20, 10), (10, 20)] {
+            let mut state = slot_fixture(&[
+                (10, SLOT_P, "A", SPEC_ATTRIBUTE),
+                (20, SLOT_P, "A", SPEC_ATTRIBUTE),
+            ]);
+
+            let (mutations, stats) = apply_counted(
+                &mut state,
+                batch(vec![move_cmd(renamed, SLOT_P, SLOT_P, "Z")]),
+            );
+
+            assert_eq!(
+                tombstoned_ids(&mutations),
+                Vec::<u64>::new(),
+                "renaming {renamed}"
+            );
+            assert_eq!(
+                (
+                    state.sections[&renamed].name.as_str(),
+                    state.sections[&kept].name.as_str()
+                ),
+                ("Z", "A"),
+                "renaming {renamed}: both live, the renamed one under its new name"
+            );
+            assert_eq!(state.children[&SLOT_P], vec![10, 20], "renaming {renamed}");
+            assert_eq!(stats.collision_rule_divergences, 0, "renaming {renamed}");
+        }
+    }
+
+    /// The client models apply the collision rules as the engine does: after
+    /// each delta of a history that walks every rule — kinds that coexist,
+    /// an attribute and a relationship colliding, a rename cascading its
+    /// occupant's subtree, a rename to the held name, an edge-5 move onto a
+    /// relationship, and a move beside a sibling of another kind — a live
+    /// client of either reader holds the server's sections and lists.
+    #[test]
+    fn apply_delta_collision_rules_leave_every_reader_holding_the_servers_scene() {
+        const P: u64 = 1;
+        const Q: u64 = 2;
+        let history: [(&str, Vec<StructCommand>); 7] = [
+            (
+                "parents",
+                vec![
+                    create_typed(0, P, "P", SPEC_PRIM),
+                    create_typed(0, Q, "Q", SPEC_PRIM),
+                ],
+            ),
+            (
+                "a prim and an attribute of one name coexist",
+                vec![
+                    create_typed(P, 10, "x", SPEC_PRIM),
+                    create_typed(P, 11, "x", SPEC_ATTRIBUTE),
+                ],
+            ),
+            (
+                "a relationship takes the attribute's slot",
+                vec![create_typed(P, 12, "x", SPEC_RELATIONSHIP)],
+            ),
+            (
+                "a rename cascades its occupant's subtree",
+                vec![
+                    create_typed(P, 13, "y", SPEC_PRIM),
+                    create_typed(13, 14, "c", SPEC_ATTRIBUTE),
+                    move_cmd(10, P, P, "y"),
+                ],
+            ),
+            ("a rename to the held name", vec![move_cmd(10, P, P, "y")]),
+            (
+                "an attribute moved onto the relationship's name",
+                vec![
+                    create_typed(Q, 15, "x", SPEC_ATTRIBUTE),
+                    move_cmd(15, Q, P, "x"),
+                ],
+            ),
+            (
+                "a variant set moved beside a same-named prim",
+                vec![
+                    create_typed(Q, 16, "y", SPEC_VARIANT_SET),
+                    move_cmd(16, Q, P, "y"),
+                ],
+            ),
+        ];
+
+        let mut state = make_state();
+        let mut live: Vec<ClientModel> = READERS.iter().map(|&r| ClientModel::new(r)).collect();
+        for (label, cmds) in history {
+            let delta = batch(cmds);
+            for model in &mut live {
+                model.apply(&delta);
+            }
+            apply_delta(&mut state, Some(delta)).expect("delta must apply");
+            for model in &live {
+                let label = format!("{label} / {:?}", model.reader);
+                assert_eq!(
+                    model.rows.keys().copied().collect::<BTreeSet<u64>>(),
+                    section_ids(&state),
+                    "{label}: the client holds the server's sections"
+                );
+                assert_live_and_snapshot_parity(&label, model, &state);
+            }
+        }
+        assert_eq!(
+            section_ids(&state),
+            BTreeSet::from([P, Q, 10, 15, 16]),
+            "precondition: every rule fired"
         );
     }
 
@@ -15934,14 +17162,15 @@ mod tests {
         );
     }
 
-    // ── ApplyMode::RestoreBase: the per-delta entry cap is skipped, and
-    //    nothing else ─────────────────────────────────────────────────────────
+    // ── ApplyMode::RestoreBase: the per-delta entry cap is skipped ──────────
     //
     // A checkpoint base describes a whole layer, and a chunked base decodes
     // into one reset delta that may carry more entries than one delta may.
     // Every fixture below carries `MAX_DELTA_ENTRIES + 1` entries, so a
     // `RestoreBase` apply that ran the entry cap would refuse it with
-    // `TooManyEntries` instead of the outcome under test.
+    // `TooManyEntries` instead of the outcome under test. The mode's one other
+    // difference, the name conflict of a `DiffChangeSection` that creates a
+    // row, has its own group below.
 
     /// A whole-layer reset delta (`is_diff`, `base_version = 0`): `commands`,
     /// then inline set fields `k000000`, `k000001`, … on section 1 with
@@ -16095,7 +17324,165 @@ mod tests {
             let err = apply_in_mode(&mut state, Some(delta), ApplyMode::RestoreBase).unwrap_err();
             assert!(
                 is_expected(&err),
-                "{label}: RestoreBase skips only the entry cap; got {err:?}"
+                "{label}: RestoreBase still runs the content and depth rules over the cap; \
+                 got {err:?}"
+            );
+        }
+    }
+
+    // ── ApplyMode::RestoreBase: a base's same-slot siblings keep their rows ─
+    //
+    // An earlier build's same-parent `MoveSection` rename onto an occupied
+    // name renamed without a collision check (SDD §9.3), so a stored layer
+    // can hold two siblings in one collision slot: the same parent, slot and
+    // name. A checkpoint base carries each as a `DiffChangeSection`. In
+    // `Commit`, the one that creates the second row cascade-deletes the
+    // first; in `RestoreBase` both rows, and the subtree under the lower id,
+    // are rebuilt. A `DiffChangeSection` that renames an existing row into an
+    // occupied slot is still refused in every mode. (`change_cmd` rows are
+    // all attributes, so every pair here shares one slot.)
+
+    /// The parent of the same-name pair in [`same_name_pair_reset`].
+    const PAIR_PARENT: u64 = 1;
+    /// The pair's lower id, created first, with [`PAIR_CHILD`] under it.
+    const PAIR_LOWER: u64 = 10;
+    /// The pair's higher id, created second, at a lower key than
+    /// [`PAIR_LOWER`].
+    const PAIR_HIGHER: u64 = 11;
+    /// The child under [`PAIR_LOWER`].
+    const PAIR_CHILD: u64 = 20;
+
+    /// One whole-layer reset holding two rows named `A` under
+    /// [`PAIR_PARENT`]: [`PAIR_LOWER`] at key 1 with [`PAIR_CHILD`] under it,
+    /// then [`PAIR_HIGHER`] at key 0, and a field on the lower id and on its
+    /// child. The keys put the pair in neither id nor arrival order, so a
+    /// list rebuilt in either of those orders differs from the key order.
+    fn same_name_pair_reset() -> OwnedDelta {
+        OwnedDelta {
+            is_diff: true,
+            base_version: 0,
+            source_format: "usda".to_string(),
+            struct_commands: vec![
+                change_cmd(0, PAIR_PARENT, "P", 0),
+                change_cmd(PAIR_PARENT, PAIR_LOWER, "A", 1),
+                change_cmd(PAIR_LOWER, PAIR_CHILD, "leaf", 0),
+                change_cmd(PAIR_PARENT, PAIR_HIGHER, "A", 0),
+            ],
+            set_fields: vec![
+                inline_set_field(PAIR_LOWER, "lower", 0),
+                inline_set_field(PAIR_CHILD, "child", 1),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn section_ids(state: &ObjectState) -> BTreeSet<u64> {
+        state.sections.keys().copied().collect()
+    }
+
+    /// In `Commit` the second `A` resolves the name conflict as a new
+    /// section does: the lower id and its child are cascade-deleted, and the
+    /// parent lists the higher id alone. The contrast for the `RestoreBase`
+    /// test below. (The delta's set fields apply after its struct commands,
+    /// so in this mode they land on ids the cascade already removed; they are
+    /// not this test's subject.)
+    #[test]
+    fn apply_delta_into_mode_commit_cascades_the_lower_id_of_a_same_name_pair_in_a_reset() {
+        let mut state = make_state();
+        apply_in_mode(&mut state, Some(same_name_pair_reset()), ApplyMode::Commit)
+            .expect("Commit applies the reset");
+
+        assert_eq!(
+            section_ids(&state),
+            BTreeSet::from([PAIR_PARENT, PAIR_HIGHER]),
+            "the lower id and its child are cascaded"
+        );
+        assert_eq!(
+            state.children.get(&PAIR_PARENT).map(Vec::as_slice),
+            Some([PAIR_HIGHER].as_slice()),
+            "the parent lists the higher id alone"
+        );
+    }
+
+    /// In `RestoreBase` both rows of the same-name pair are rebuilt, the
+    /// parent lists them in key order, and the lower id keeps its child and
+    /// both fields.
+    #[test]
+    fn apply_delta_into_mode_restore_base_keeps_both_rows_of_a_same_name_pair_and_their_subtrees() {
+        let mut state = make_state();
+        apply_in_mode(
+            &mut state,
+            Some(same_name_pair_reset()),
+            ApplyMode::RestoreBase,
+        )
+        .expect("RestoreBase applies the reset");
+
+        assert_eq!(
+            section_ids(&state),
+            BTreeSet::from([PAIR_PARENT, PAIR_LOWER, PAIR_HIGHER, PAIR_CHILD]),
+            "every row of the base is rebuilt"
+        );
+        assert_eq!(
+            (
+                state.sections[&PAIR_LOWER].name.as_str(),
+                state.sections[&PAIR_HIGHER].name.as_str()
+            ),
+            ("A", "A"),
+            "both rows keep the shared name"
+        );
+        assert_eq!(
+            state.children.get(&PAIR_PARENT).map(Vec::as_slice),
+            Some([PAIR_HIGHER, PAIR_LOWER].as_slice()),
+            "the parent lists both siblings, in key order"
+        );
+        assert_eq!(
+            state.children.get(&PAIR_LOWER).map(Vec::as_slice),
+            Some([PAIR_CHILD].as_slice()),
+            "the lower id keeps its child"
+        );
+        assert_eq!(
+            state.fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                (PAIR_LOWER, "lower".to_string()),
+                (PAIR_CHILD, "child".to_string()),
+            ]),
+            "the subtree's fields are rebuilt"
+        );
+    }
+
+    /// The exemption covers only a `DiffChangeSection` that creates a row. A
+    /// base that repeats an id, renaming its existing row onto a name a
+    /// sibling holds, is refused with `DuplicateSiblingName` in
+    /// `RestoreBase` as in `Commit`.
+    #[test]
+    fn apply_delta_into_mode_restore_base_refuses_a_repeated_id_renamed_onto_a_held_name() {
+        let delta = OwnedDelta {
+            is_diff: true,
+            base_version: 0,
+            source_format: "usda".to_string(),
+            struct_commands: vec![
+                change_cmd(0, PAIR_PARENT, "P", 0),
+                change_cmd(PAIR_PARENT, PAIR_LOWER, "A", 0),
+                change_cmd(PAIR_PARENT, PAIR_HIGHER, "B", 1),
+                change_cmd(PAIR_PARENT, PAIR_HIGHER, "A", 1),
+            ],
+            ..Default::default()
+        };
+
+        for mode in [ApplyMode::Commit, ApplyMode::RestoreBase] {
+            let mut state = make_state();
+            let err = apply_in_mode(&mut state, Some(delta.clone()), mode).unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    DeltaError::DuplicateSiblingName {
+                        section_id: PAIR_HIGHER,
+                        parent_id: PAIR_PARENT,
+                        conflicting_id: PAIR_LOWER,
+                        name,
+                    } if name == "A"
+                ),
+                "{mode:?} must refuse the repeated id's rename onto a held name; got {err:?}"
             );
         }
     }
@@ -16266,19 +17653,26 @@ mod tests {
     ///   last.
     /// * `MoveSection` classifies against the parent the client holds the
     ///   section under, never the carried `old_parent_id` — except that a
-    ///   carried parent equal to the destination is a rename. A section already
-    ///   under the destination keeps its key and position.
+    ///   carried parent equal to the destination is a rename under the held
+    ///   parent. A section already under the destination keeps its key and
+    ///   position.
+    /// * Siblings collide in a slot ([`client_slot`]): the same parent, the
+    ///   same name, and an attribute or relationship both, or else the same
+    ///   `SdfSpecType`. A create, a rename to a new name, and a move each
+    ///   delete the slot's occupant first — its lowest-id holder, as on the
+    ///   server — with its subtree; a rename to the held name changes
+    ///   nothing. A move whose occupant's deletion took the destination
+    ///   deletes the section. A `DiffChangeSection` row cascades no holder:
+    ///   neither client does.
     /// * `DeleteSection` and a catch-up's `DiffDeleteSection` remove the
-    ///   subtree; a name conflict on create or move cascades the lowest-id
-    ///   holder, as on the server. A `DiffChangeSection` row cascades no
-    ///   holder: neither client does.
-    /// * A row whose parent has no row — an *orphan*, which a create or a move
-    ///   whose name-conflict cascade deletes the parent it names makes (the
-    ///   holder's subtree loops back to it) — is listed nowhere, and when its
-    ///   parent is born by a create every row naming it joins its list in
-    ///   `(key, id)` order, before the next command. No real client holds
-    ///   orphan rows: this is the server's SDD §10.4 rule, modelled so the
-    ///   parity checks extend to histories that hold them.
+    ///   subtree.
+    /// * A row whose parent has no row — an *orphan*, which a create whose
+    ///   collision cascade deletes the parent it names makes (the holder's
+    ///   subtree loops back to it) — is listed nowhere, and when its parent is
+    ///   born by a create every row naming it joins its list in `(key, id)`
+    ///   order, before the next command. No real client holds orphan rows:
+    ///   this is the server's SDD §10.4 rule, modelled so the parity checks
+    ///   extend to histories that hold them.
     ///
     /// Reader rules:
     ///
@@ -16399,12 +17793,18 @@ mod tests {
             })
         }
 
-        /// The lowest-id section named `name` under `parent`, other than
-        /// `except`.
-        fn holder(&self, parent: u64, name: &str, except: u64) -> Option<u64> {
+        /// The occupant of the slot a `ty` child named `name` takes under
+        /// `parent`: the lowest-id section there, other than `except`, whose
+        /// [`client_slot`] is `ty`'s (the C++ client library's occupant rule).
+        fn holder(&self, parent: u64, ty: u8, name: &str, except: u64) -> Option<u64> {
             self.rows
                 .iter()
-                .find(|(id, r)| **id != except && r.parent == parent && r.name == name)
+                .find(|(id, r)| {
+                    **id != except
+                        && r.parent == parent
+                        && r.name == name
+                        && client_slot(r.ty) == client_slot(ty)
+                })
                 .map(|(id, _)| *id)
         }
 
@@ -16484,7 +17884,7 @@ mod tests {
             if self.rows.contains_key(&id) || (parent != 0 && !self.rows.contains_key(&parent)) {
                 return;
             }
-            if let Some(holder) = self.holder(parent, name, id) {
+            if let Some(holder) = self.holder(parent, ty, name, id) {
                 self.delete(holder);
             }
             let key = self.append_key(parent);
@@ -16680,10 +18080,24 @@ mod tests {
         }
 
         fn move_section(&mut self, id: u64, carried: u64, dest: u64, name: &str) {
-            let Some(current) = self.rows.get(&id).map(|r| r.parent) else {
+            let Some((current, ty, held_name)) =
+                self.rows.get(&id).map(|r| (r.parent, r.ty, r.name.clone()))
+            else {
                 return;
             };
             if carried == dest {
+                // A rename under the held parent: to the held name it changes
+                // nothing; to another, the occupant of the new name goes
+                // first, with its subtree, which can take the section too.
+                if held_name == name {
+                    return;
+                }
+                if let Some(holder) = self.holder(current, ty, name, id) {
+                    self.delete(holder);
+                    if !self.rows.contains_key(&id) {
+                        return;
+                    }
+                }
                 self.rows.get_mut(&id).expect("checked above").name = name.to_string();
                 return;
             }
@@ -16695,12 +18109,22 @@ mod tests {
                 self.delete(id);
                 return;
             }
-            if let Some(holder) = self.holder(dest, name, id) {
+            if let Some(holder) = self.holder(dest, ty, name, id) {
                 if self.is_descendant(id, holder) {
                     self.delete(id);
                     return;
                 }
                 self.delete(holder);
+                // The holder's subtree can hold the section, which then left
+                // with it, or the destination, which deletes the section as
+                // a move to a missing parent does.
+                if !self.rows.contains_key(&id) {
+                    return;
+                }
+                if dest != 0 && !self.rows.contains_key(&dest) {
+                    self.delete(id);
+                    return;
+                }
             }
             if dest == current {
                 self.rows.get_mut(&id).expect("checked above").name = name.to_string();
@@ -16712,13 +18136,7 @@ mod tests {
             row.parent = dest;
             row.name = name.to_string();
             row.key = key;
-            // The holder's cascade can take the destination with it (a
-            // holder whose subtree loops back to the destination); the
-            // section then sits under a parent with no row, an orphan listed
-            // nowhere.
-            if dest == 0 || self.rows.contains_key(&dest) {
-                self.lists.entry(dest).or_default().push(id);
-            }
+            self.lists.entry(dest).or_default().push(id);
         }
 
         fn reorder(&mut self, parent: u64, named: &[u64]) {
@@ -16810,6 +18228,20 @@ mod tests {
         let mut out: Vec<u64> = scratch.into_iter().flatten().collect();
         out.extend(result);
         out
+    }
+
+    /// A child's collision slot under its parent, written from the C++ client
+    /// library's slot rule (the revision recorded in
+    /// `docs-internal/cross-repo-debugging.md` § Sibling order and move
+    /// rules): a Relationship (8) takes the Attribute (1) slot, and every
+    /// other `SdfSpecType` is a slot of its own. Two siblings collide only in
+    /// one slot under one name.
+    fn client_slot(ty: u8) -> u8 {
+        if ty == 8 {
+            1
+        } else {
+            ty
+        }
     }
 
     /// Which child list of its parent a child belongs to, written from the
@@ -16937,16 +18369,16 @@ mod tests {
 
     /// The structural core of the checkpoint round trip, without the FFI
     /// encoding: `build_reset_ompf_from_state` plans
-    /// `DiffEngine::plan(state, &[], 0, 0, None)` — full content, each row at
+    /// `DiffEngine::plan_full_content(state)` — full content, each row at
     /// its *stored* key — and `decode_checkpoint_ompf` replays that reset of
     /// `DiffChangeSection`s through `apply_delta`. The real pair is driven in
     /// `src/checkpoint/assembler.rs`'s b.xje tests.
     fn full_content_round_trip(state: &ObjectState) -> ObjectState {
-        let sections = match crate::domain::diff::DiffEngine::plan(state, &[], 0, 0, None)
+        let sections = match crate::domain::diff::DiffEngine::plan_full_content(state)
             .expect("full content must plan")
         {
             crate::domain::diff::DiffPlan::FullContent { sections, .. } => sections,
-            other => panic!("have_version 0 plans FullContent, got {other:?}"),
+            other => panic!("plan_full_content plans FullContent, got {other:?}"),
         };
         let mut rebuilt = ObjectState {
             object_id: state.object_id,
@@ -18127,8 +19559,8 @@ mod tests {
 
     // ── Readers that rebuild the list ────────────────────────────────────────
 
-    /// A snapshot-mode reconnector holding the list from before a partial
-    /// reorder receives `plan_faithful_coalesced`'s existing rows: the
+    /// A reconnector holding the list from before a partial reorder receives
+    /// its coalesced catch-up's (`plan_faithful_coalesced`) existing rows: the
     /// children the reorder re-keyed — D, B and C, the ones that moved in
     /// `[A, B, C, D]` by `[D, B]` — and, because P now has a changed child,
     /// its unchanged child A too, so P's whole children sequence is restated.
@@ -18141,7 +19573,7 @@ mod tests {
     /// restating the changed rows only, which leaves A out of the modified
     /// set.
     #[test]
-    fn apply_reorder_children_partial_reorder_reaches_a_snapshot_mode_reconnector() {
+    fn apply_reorder_children_partial_reorder_reaches_a_coalesced_reconnector() {
         const P: u64 = 1;
         const A: u64 = 10;
         const B: u64 = 11;
@@ -18250,7 +19682,7 @@ mod tests {
             .collect()
     }
 
-    /// The snapshot-mode catch-up for a reconnector at `have_version`, in
+    /// The coalesced catch-up for a reconnector at `have_version`, in
     /// `build_delta`'s wire order: new sections, then existing ones, then
     /// retractions.
     fn coalesced_catch_up(
@@ -19141,7 +20573,7 @@ mod tests {
         debug_assert_cross_map_consistent(&state);
     }
 
-    /// T8. A snapshot-mode reconnector whose cut lies between a row's
+    /// T8. A reconnector whose cut lies between a row's
     /// orphaning and its adoption receives the row under its new parent:
     /// adoption re-stamps it, so `plan_faithful_coalesced` re-emits it as
     /// modified, and the reconnector ends with the server's lists.
@@ -20166,13 +21598,15 @@ mod tests {
         }
     }
 
-    /// The name probe's conflict answer: the plan's first
-    /// `(parent_id, name)` probe is answered by a scan of `state.sections`
+    /// The name probe's conflict answer: the plan's first sibling-collision
+    /// probe is answered by a scan of `state.sections`
     /// ([`scan_child_by_name`]) and its second by the index it builds, and
-    /// both give the same conflict id over duplicate `(parent, name)` rows:
-    /// the lowest surviving id, other than `except_id`. After the index is
-    /// built, a holder deleted, reparented or renamed under it is filtered by
-    /// the index's re-verification exactly as a fresh scan leaves it out.
+    /// both give the same occupant over rows sharing one `(parent, slot,
+    /// name)` (stored state an earlier build wrote): the lowest surviving id,
+    /// other than `except_id`. After the index is built, a holder deleted,
+    /// reparented or renamed under it is filtered by the index's
+    /// re-verification exactly as a fresh scan leaves it out. Every row here
+    /// is an attribute; the mixed-slot twin is the test below.
     #[test]
     fn find_child_by_name_scan_and_index_give_the_same_conflict_id() {
         const P: u64 = 1;
@@ -20239,21 +21673,178 @@ mod tests {
             let mut state = base();
             let mut plan = ChildPlan::default();
             let mut stats = ApplyDeltaStats::default();
-            let scanned = find_child_by_name(&state, &mut plan, &mut stats, P, "A", except_id);
+            let slot = SPEC_ATTRIBUTE;
+            let scanned =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
             assert!(
                 plan.names.is_none(),
                 "{label}: the first probe builds nothing"
             );
-            let indexed = find_child_by_name(&state, &mut plan, &mut stats, P, "A", except_id);
+            let indexed =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
             assert!(plan.names.is_some(), "{label}: the second probe builds");
             assert_eq!(scanned, indexed, "{label}: before the change");
             change(&mut state);
-            let indexed = find_child_by_name(&state, &mut plan, &mut stats, P, "A", except_id);
-            let scanned = scan_child_by_name(&state.sections, P, "A", except_id);
+            let indexed =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
+            let scanned = scan_child_by_name(&state.sections, P, slot, "A", except_id).occupant;
             assert_eq!(
                 (indexed, scanned),
                 (expected, expected),
                 "{label}: the index and a scan agree after the change"
+            );
+        }
+    }
+
+    /// The mixed-slot twin of the test above: rows of four kinds named `A`
+    /// under one parent, probed by slot. The plan's scan, the index its
+    /// second probe builds, and the index and a fresh scan after a change all
+    /// give the same occupant — the lowest id, other than `except_id`, whose
+    /// `collision_slot` is the probed one (a relationship's is the
+    /// attribute's) — and each probe counts one `collision_rule_divergences`
+    /// exactly when that occupant is not the lowest `A` row of any slot, the
+    /// earlier `(parent_id, name)` rule's answer.
+    #[test]
+    fn find_child_by_name_scan_and_index_agree_on_the_slot_over_mixed_types() {
+        const P: u64 = 1;
+        const PRIM: u64 = 5;
+        const VARIANT_SET: u64 = 15;
+        const RELATIONSHIP: u64 = 20;
+        const ATTRIBUTE: u64 = 30;
+        let base = || {
+            let mut state = make_state();
+            seed_typed(&mut state, P, 0, "P", SPEC_PRIM);
+            for (id, ty) in [
+                (ATTRIBUTE, SPEC_ATTRIBUTE),
+                (RELATIONSHIP, SPEC_RELATIONSHIP),
+                (VARIANT_SET, SPEC_VARIANT_SET),
+                (PRIM, SPEC_PRIM),
+            ] {
+                seed_typed(&mut state, id, P, "A", ty);
+            }
+            seed_typed(&mut state, 40, P, "B", SPEC_ATTRIBUTE);
+            state
+        };
+        type Change = fn(&mut ObjectState);
+        // (label, change, probed slot, except_id, occupant after the change,
+        // whether that answer diverges from the earlier rule's)
+        type Case = (&'static str, Change, u8, Option<u64>, Option<u64>, bool);
+        let cases: [Case; 10] = [
+            (
+                "the prim slot: the lowest of any slot",
+                |_| {},
+                SPEC_PRIM,
+                None,
+                Some(PRIM),
+                false,
+            ),
+            (
+                "the attribute slot: the relationship",
+                |_| {},
+                SPEC_ATTRIBUTE,
+                None,
+                Some(RELATIONSHIP),
+                true,
+            ),
+            (
+                "a relationship's slot is the attribute's",
+                |_| {},
+                collision_slot(SPEC_RELATIONSHIP),
+                None,
+                Some(RELATIONSHIP),
+                true,
+            ),
+            (
+                "the attribute slot, the relationship excepted",
+                |_| {},
+                SPEC_ATTRIBUTE,
+                Some(RELATIONSHIP),
+                Some(ATTRIBUTE),
+                true,
+            ),
+            (
+                "the variant-set slot",
+                |_| {},
+                SPEC_VARIANT_SET,
+                None,
+                Some(VARIANT_SET),
+                true,
+            ),
+            ("an empty slot", |_| {}, SPEC_CONNECTION, None, None, true),
+            (
+                "the prim slot, the prim excepted",
+                |_| {},
+                SPEC_PRIM,
+                Some(PRIM),
+                None,
+                true,
+            ),
+            (
+                "the relationship retyped to a prim",
+                |s| {
+                    s.sections
+                        .get_mut(&RELATIONSHIP)
+                        .expect("seeded")
+                        .section_type = SPEC_PRIM
+                },
+                SPEC_ATTRIBUTE,
+                None,
+                Some(ATTRIBUTE),
+                true,
+            ),
+            (
+                "the prim retyped to an attribute",
+                |s| s.sections.get_mut(&PRIM).expect("seeded").section_type = SPEC_ATTRIBUTE,
+                SPEC_ATTRIBUTE,
+                None,
+                Some(PRIM),
+                false,
+            ),
+            (
+                "the prim deleted",
+                |s| {
+                    s.sections.remove(&PRIM);
+                },
+                SPEC_VARIANT_SET,
+                None,
+                Some(VARIANT_SET),
+                false,
+            ),
+        ];
+        for (label, change, slot, except_id, expected, diverges) in cases {
+            let mut state = base();
+            let mut plan = ChildPlan::default();
+            let mut stats = ApplyDeltaStats::default();
+            let scanned =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
+            let scan_ticks = stats.collision_rule_divergences;
+            assert!(
+                plan.names.is_none(),
+                "{label}: the first probe builds nothing"
+            );
+            let indexed =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
+            assert!(plan.names.is_some(), "{label}: the second probe builds");
+            assert_eq!(
+                (indexed, stats.collision_rule_divergences),
+                (scanned, 2 * scan_ticks),
+                "{label}: the index answers and counts as the scan did, before the change"
+            );
+            change(&mut state);
+            let before = stats.collision_rule_divergences;
+            let indexed =
+                find_child_by_name(&state, &mut plan, &mut stats, P, slot, "A", except_id);
+            let index_ticks = stats.collision_rule_divergences - before;
+            let scanned = scan_child_by_name(&state.sections, P, slot, "A", except_id);
+            assert_eq!(
+                (indexed, scanned.occupant),
+                (expected, expected),
+                "{label}: the index and a scan agree after the change"
+            );
+            assert_eq!(
+                (index_ticks, scanned.occupant != scanned.any_slot),
+                (u64::from(diverges), diverges),
+                "{label}: the probe counts a divergence exactly when the earlier rule differs"
             );
         }
     }

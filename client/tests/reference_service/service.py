@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+import contextlib
 from dataclasses import dataclass, field, replace
 import hashlib
+import inspect
 import re
 import time
 from typing import Callable
 
 import grpc
+from http2_proxy import INGRESS_REJECTED
 from nvidia.omniverse.live.v1alpha import live_pb2 as pb, live_pb2_grpc as rpc
 
 
@@ -180,6 +183,10 @@ class Session:
     writers: set[str]
     layers: dict[str, Layer] = field(default_factory=dict)
     peers: dict[str, "Peer"] = field(default_factory=dict)
+    # The merge-owner lease: the holder's connection ID, empty when nobody holds it, and the epoch of the latest
+    # grant, which only grows. The holder is live only while its connection is in peers.
+    owner: str = ""
+    epoch: int = 0
 
 
 @dataclass
@@ -197,6 +204,9 @@ class Peer:
     keepalive_ms: int = 0
     last_activity_ms: int = 0
     close_details: bytes | None = None
+    # The bearer the join started with, and whether its Connected negotiated the merge-owner lease.
+    token: str = ""
+    merge_owner: bool = False
 
 
 @dataclass
@@ -319,6 +329,25 @@ class DetachedContext:
         raise DetachedAbort(code)
 
 
+class StateChanged(asyncio.Condition):
+    """The state lock and its change notification. The service's calls wait on this condition and observers
+    (State.observed) on `observers`, a condition over the same lock. notify_all wakes both; notify_observers wakes only
+    the observers, for a change that no call waits for, such as a call's arrival, so that each of many calls waiting at
+    once is not woken again by every other call's arrival."""
+
+    def __init__(self):
+        lock = asyncio.Lock()
+        super().__init__(lock)
+        self.observers = asyncio.Condition(lock)
+
+    def notify_all(self):
+        super().notify_all()
+        self.observers.notify_all()
+
+    def notify_observers(self):
+        self.observers.notify_all()
+
+
 class State:
     def __init__(self, seed: int, *, clock: Callable[[], int] | None = None,
                  max_payload=8 * 1024 * 1024, max_commits=10000,
@@ -329,7 +358,7 @@ class State:
         self.max_commits = max_commits
         self.max_retained_bytes = max_retained_bytes
         self.peer_queue = peer_queue
-        self.changed = asyncio.Condition()
+        self.changed = StateChanged()
         self.tokens: dict[str, Principal] = {}
         self.sessions: dict[str, Session] = {}
         self.incarnations: dict[tuple[str, str], int] = {}
@@ -366,6 +395,9 @@ class State:
         self.chains: dict[tuple, Chain] = {}
         self.waiting: set[tuple[str, str]] = set()
         self.arrivals: Counter = Counter()
+        # UpdateLayer calls that have ended, by any outcome, in services that count them (GraphService and
+        # test_scene.CompactSceneService); attempts minus this is the number in flight.
+        self.ended: Counter = Counter()
         self.chain_log: list[dict] = []
         self.arrival_log: list[dict] = []
         # None models a service without the client keepalive: it ignores the header's client_keepalive, returns no
@@ -378,6 +410,21 @@ class State:
         self.joins: list[dict] = []
         self.keepalives: dict[str, int] = {}
         self.keepalive_timeouts: list[str] = []
+        # False models a service without the merge-owner lease: it ignores the header's merge_owner, answers
+        # merge_owner false in SessionConnected and Ping, and ends a join that sends a MergeOwnerRequest
+        # INVALID_ARGUMENT. True models the lease on every replica. merge_owner_rejections names principals whose
+        # claims the permission check answers UNAUTHENTICATED, as for an expired join credential; merge_owner_log
+        # records every merge-owner answer and announcement in order. merge_owner_requests records every valid
+        # MergeOwnerRequest received, answered or not. While merge_owner_hold is set, requests are recorded and left
+        # unanswered, so a test can end a connection or leave with a request in flight. A connection in
+        # merge_owner_linger stays in presence after its stream ends, as a join the service has not yet noticed is
+        # gone, until evict removes it.
+        self.merge_owner = False
+        self.merge_owner_rejections: set[str] = set()
+        self.merge_owner_log: list[dict] = []
+        self.merge_owner_requests: list[dict] = []
+        self.merge_owner_hold = False
+        self.merge_owner_linger: set[str] = set()
         self.tasks: set[asyncio.Task] = set()
 
     def plan(self, method, boundary, *, attempt=None, code=None, pause=False, details=None):
@@ -453,11 +500,15 @@ class State:
                 chained.header.operation_id not in self.pre_chaining_operations)
 
     def chain_event(self, event, header, **fields):
-        """Records a chain event and wakes observers; the state lock is held."""
+        """Records a chain event and wakes observers, and every waiting call unless the event is a call starting to
+        wait, which changes nothing another call waits for; the state lock is held."""
         previous = predecessor(header)
         self.chain_log.append(dict(event=event, client_id=header.client_id, operation_id=header.operation_id,
                                    previous_operation_id=previous, **fields))
-        self.changed.notify_all()
+        if event == "wait":
+            self.changed.notify_observers()
+        else:
+            self.changed.notify_all()
 
     def restore_checkpoint(self):
         """Models a backing-store loss and a restore from a saved snapshot: every UpdateLayer operation record is lost.
@@ -473,11 +524,14 @@ class State:
         self.wake()
         return len(lost)
 
-    def wake(self):
-        """Wakes every waiter on `changed` from code that may not hold it."""
+    def wake(self, *, observers_only=False):
+        """Wakes every waiter on `changed`, or only the observers, from code that may not hold it."""
         async def notify():
             async with self.changed:
-                self.changed.notify_all()
+                if observers_only:
+                    self.changed.notify_observers()
+                else:
+                    self.changed.notify_all()
         self.spawn(notify())
 
     def spawn(self, coroutine):
@@ -489,7 +543,7 @@ class State:
     async def observed(self, predicate):
         """Returns once `predicate()` holds; it is checked after every state change."""
         async with self.changed:
-            await self.changed.wait_for(predicate)
+            await self.changed.observers.wait_for(predicate)
 
     async def settle(self):
         """Waits for the service's own background work, such as stale commit steps, to finish."""
@@ -524,6 +578,29 @@ class State:
                     self.keepalive_timeouts.append(peer.id)
                     ended.append(peer.id)
         return ended
+
+    def evict(self, connection_id, *, release=True):
+        """Removes a join from presence as the service's sweep does, and ends its stream UNAVAILABLE.
+
+        Its peers receive one PeerLeft. With release, the sweep also frees a lease the join holds and announces it;
+        without, the lease still names the evicted connection, as after a sweep by a replica without the release
+        hook, and the next claim takes it. Returns whether the connection was present."""
+        for session in self.sessions.values():
+            peer = session.peers.pop(connection_id, None)
+            if peer is None:
+                continue
+            LiveService.fail_peer(peer, grpc.StatusCode.UNAVAILABLE)
+            for other in session.peers.values():
+                LiveService.emit_to(other, pb.JoinSessionResponse(peer_left=pb.PeerLeft(connection_id=peer.id)))
+            if release and session.owner == connection_id:
+                LiveService.free_lease(self, session)
+            self.changed.notify_all()  # Caller holds changed.
+            return True
+        return False
+
+    def reject_principal(self, name):
+        """Answers every later merge-owner claim by the principal UNAUTHENTICATED; a lease it holds survives."""
+        self.merge_owner_rejections.add(name)
 
     async def boundary(self, method, attempt, boundary, context, backend):
         for fault in self.faults:
@@ -574,7 +651,8 @@ class State:
                 "operations": list(self.operation_log), "chain": list(self.chain_log),
                 "keepalive_interval_ms": self.keepalive_interval_ms,
                 "joins": list(self.joins), "keepalives": dict(self.keepalives),
-                "keepalive_timeouts": list(self.keepalive_timeouts)}
+                "keepalive_timeouts": list(self.keepalive_timeouts), "merge_owner": self.merge_owner,
+                "merge_owner_log": list(self.merge_owner_log)}
 
 
 class LiveService(rpc.LiveServiceServicer):
@@ -598,6 +676,11 @@ class LiveService(rpc.LiveServiceServicer):
             await context.abort(grpc.StatusCode.UNAUTHENTICATED, "")
         await self.state.boundary(method, attempt, "before", context, self.backend)
         return principal, attempt
+
+    @staticmethod
+    def token(context):
+        values = [value for key, value in context.invocation_metadata() if key == "authorization"]
+        return values[0][7:] if len(values) == 1 and values[0].startswith("Bearer ") else ""
 
     async def end(self, method, attempt, context, *, committed=False):
         if committed:
@@ -675,7 +758,9 @@ class LiveService(rpc.LiveServiceServicer):
         _, attempt = await self.begin("ListSessions", context)
         async with self.state.changed:
             result = pb.ListSessionsResponse(sessions=[pb.Session(session_id=s.id, name=s.name,
-                created_by_user_name=s.creator, created_at=s.created_us)
+                created_by_user_name=s.creator, created_at=s.created_us,
+                merge_owner_user_name=self.owner_name(s) if self.state.merge_owner else "",
+                merge_owner_epoch=s.epoch if self.state.merge_owner and self.owner_name(s) else 0)
                 for s in self.state.sessions.values() if s.path == request.path])
         await self.end("ListSessions", attempt, context)
         return result
@@ -784,7 +869,7 @@ class LiveService(rpc.LiveServiceServicer):
             self.state.arrival_log.append(dict(
                 client_id=header.client_id, operation_id=header.operation_id, chained=self.chained(header),
                 no_wait=bool(getattr(header, "no_wait", False)), at=now, cutoff=call.cutoff))
-        self.state.wake()
+        self.state.wake(observers_only=True)  # No call waits for another's arrival.
 
     def untrack(self, call):
         """Ends a call's operation in flight."""
@@ -1081,14 +1166,83 @@ class LiveService(rpc.LiveServiceServicer):
                                 trailing_metadata=(("grpc-status-details-bin", peer.close_details),))
         await context.abort(peer.close_code, "peer event queue closed")
 
-    def emit(self, peer, event):
+    @staticmethod
+    def emit_to(peer, event):
         if peer.failed or peer.input_closed.is_set():
             return
         try:
             peer.events.put_nowait(event)
             peer.ready.set()
         except asyncio.QueueFull:
-            self.fail_peer(peer)
+            LiveService.fail_peer(peer)
+
+    def emit(self, peer, event):
+        self.emit_to(peer, event)
+
+    @staticmethod
+    def owner_name(session):
+        """The live holder's user name, empty when nobody live holds the lease."""
+        holder = session.peers.get(session.owner) if session.owner else None
+        return holder.name if holder else ""
+
+    @staticmethod
+    def owner_state(state, session, peer, outcome, request_id=0):
+        """Queues a MergeOwnerState for an opted-in join and logs it; a join that did not opt in gets nothing."""
+        if not peer.merge_owner:
+            return
+        holder = session.peers.get(session.owner) if session.owner else None
+        state.merge_owner_log.append(dict(connection=peer.id, request_id=request_id,
+                                          outcome=pb.MergeOwnerOutcome.Name(outcome),
+                                          owner=holder.id if holder else "", epoch=session.epoch))
+        LiveService.emit_to(peer, pb.JoinSessionResponse(merge_owner=pb.MergeOwnerState(
+            request_id=request_id, outcome=outcome, owner_connection_id=holder.id if holder else "",
+            owner_user_name=holder.name if holder else "", epoch=session.epoch)))
+
+    @staticmethod
+    def announce(state, session, cause=None):
+        """Sends the owner change to every opted-in join except the one whose request made it."""
+        holder = session.owner if session.owner in session.peers else ""
+        for other in session.peers.values():
+            if other is cause:
+                continue
+            outcome = (pb.MERGE_OWNER_OUTCOME_RELEASED if not holder else pb.MERGE_OWNER_OUTCOME_GRANTED
+                       if holder == other.id else pb.MERGE_OWNER_OUTCOME_HELD_BY_OTHER)
+            LiveService.owner_state(state, session, other, outcome)
+
+    @staticmethod
+    def free_lease(state, session, cause=None):
+        session.owner = ""
+        LiveService.announce(state, session, cause)
+
+    def merge_owner_answer(self, session, peer, request):
+        """Applies one MergeOwnerRequest atomically, as the service's single-slot script does, and answers it."""
+        state = self.state
+        if peer.id not in session.peers:
+            return pb.MERGE_OWNER_OUTCOME_UNAVAILABLE
+        if request.action == pb.MERGE_OWNER_ACTION_VERIFY:
+            return (pb.MERGE_OWNER_OUTCOME_GRANTED if session.owner == peer.id else
+                    pb.MERGE_OWNER_OUTCOME_NOT_HELD)
+        if request.action == pb.MERGE_OWNER_ACTION_RELEASE:
+            if session.owner != peer.id:
+                return pb.MERGE_OWNER_OUTCOME_NOT_HELD
+            self.free_lease(state, session, peer)
+            return pb.MERGE_OWNER_OUTCOME_RELEASED
+        # A claim checks the join's own credential, as the permission cache does, then eligibility: only the
+        # session's creator with write permission may hold the lease. Neither check revokes a held lease.
+        principal = state.tokens.get(peer.token)
+        if (principal is None or principal.expired or principal.name in state.merge_owner_rejections or
+                (principal.expires_us is not None and principal.expires_us <= state.clock())):
+            return pb.MERGE_OWNER_OUTCOME_UNAUTHENTICATED
+        if principal.name != session.creator or not principal.write or principal.name not in session.writers:
+            return pb.MERGE_OWNER_OUTCOME_NOT_ELIGIBLE
+        if session.owner in session.peers:
+            return (pb.MERGE_OWNER_OUTCOME_GRANTED if session.owner == peer.id else
+                    pb.MERGE_OWNER_OUTCOME_HELD_BY_OTHER)
+        # A holder that is absent from presence holds no lease, whether or not its release ran.
+        session.epoch += 1
+        session.owner = peer.id
+        self.announce(state, session, peer)
+        return pb.MERGE_OWNER_OUTCOME_GRANTED
 
     async def JoinSession(self, stream, context):
         principal, attempt = await self.begin("JoinSession", context)
@@ -1104,11 +1258,15 @@ class LiveService(rpc.LiveServiceServicer):
             identifier = f"{self.state.namespace}/connection-{self.state.connection_counter}"
             interval = self.state.keepalive_interval_ms if first.header.client_keepalive else None
             peer = Peer(identifier, principal.name, first.header.user_application, asyncio.Queue(self.state.peer_queue),
-                        keepalive_ms=interval or 0, last_activity_ms=self.state.keepalive_clock_ms)
+                        keepalive_ms=interval or 0, last_activity_ms=self.state.keepalive_clock_ms,
+                        token=self.token(context),
+                        merge_owner=self.state.merge_owner and first.header.merge_owner)
             self.state.joins.append(dict(connection=identifier, client_keepalive=first.header.client_keepalive,
-                                         keepalive_interval_ms=peer.keepalive_ms))
+                                         keepalive_interval_ms=peer.keepalive_ms,
+                                         merge_owner_requested=first.header.merge_owner,
+                                         merge_owner=peer.merge_owner))
             self.emit(peer, pb.JoinSessionResponse(connected=pb.SessionConnected(
-                connection_id=identifier, keepalive_interval_ms=peer.keepalive_ms)))
+                connection_id=identifier, keepalive_interval_ms=peer.keepalive_ms, merge_owner=peer.merge_owner)))
             for other in session.peers.values():
                 self.emit(peer, pb.JoinSessionResponse(peer_joined=pb.PeerJoined(
                     connection_id=other.id, user_name=other.name, user_application=other.application)))
@@ -1127,6 +1285,26 @@ class LiveService(rpc.LiveServiceServicer):
                     if kind == "keepalive" and self.state.keepalive_interval_ms is not None:
                         async with self.state.changed:
                             self.state.keepalives[peer.id] = self.state.keepalives.get(peer.id, 0) + 1
+                            self.state.changed.notify_all()
+                        continue
+                    # Only a join whose Connected negotiated the lease may send a merge-owner frame; any other gets
+                    # the INVALID_ARGUMENT a service without the lease gives an unknown frame.
+                    if kind == "merge_owner" and peer.merge_owner:
+                        # A request needs a nonzero request_id and a known action; anything else ends the stream.
+                        if (not request.merge_owner.request_id or request.merge_owner.action not in (
+                                pb.MERGE_OWNER_ACTION_CLAIM, pb.MERGE_OWNER_ACTION_RELEASE,
+                                pb.MERGE_OWNER_ACTION_VERIFY)):
+                            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid merge-owner request")
+                        async with self.state.changed:
+                            self.state.merge_owner_requests.append(dict(
+                                connection=peer.id, request_id=request.merge_owner.request_id,
+                                action=pb.MergeOwnerAction.Name(request.merge_owner.action)))
+                            self.state.changed.notify_all()
+                            if self.state.merge_owner_hold:
+                                continue
+                            current = await self.session(session_id, principal, context)
+                            outcome = self.merge_owner_answer(current, peer, request.merge_owner)
+                            self.owner_state(self.state, current, peer, outcome, request.merge_owner.request_id)
                             self.state.changed.notify_all()
                         continue
                     if kind != "message":
@@ -1169,9 +1347,15 @@ class LiveService(rpc.LiveServiceServicer):
             await asyncio.gather(reader, return_exceptions=True)
             async with self.state.changed:
                 current = self.state.sessions.get(session_id)
+                if peer.id in self.state.merge_owner_linger:
+                    current = None  # Presence keeps the join until evict removes it.
                 if current and current.peers.pop(peer.id, None):
                     for other in current.peers.values():
                         self.emit(other, pb.JoinSessionResponse(peer_left=pb.PeerLeft(connection_id=peer.id)))
+                    # Teardown releases the lease the join holds and announces it in the same step as its PeerLeft.
+                    if current.owner == peer.id:
+                        self.free_lease(self.state, current)
+                    self.state.changed.notify_all()
 
     async def Ping(self, request, context):
         _, attempt = await self.begin("Ping", context)
@@ -1179,25 +1363,118 @@ class LiveService(rpc.LiveServiceServicer):
                                 server_timestamp_microseconds_since_epoch=self.state.clock(),
                                 operation_ids=self.state.advertise_capabilities and self.state.operation_ids,
                                 chained_writes=(self.state.advertise_capabilities and self.state.operation_ids and
-                                                self.state.chained_writes))
+                                                self.state.chained_writes),
+                                merge_owner=self.state.advertise_capabilities and self.state.merge_owner)
         await self.end("Ping", attempt, context)
         return result
 
 
+class IngressRejected(grpc.aio.ServerInterceptor):
+    """Parks each call whose header block the HTTP/2 proxy rejected at its ingress until the reset the proxy sends
+    after the block cancels it; neither the service's handler nor a CallCounter wrapper runs for it.
+
+    The proxy forwards a rejected header block so that this server's HPACK decoder stays in step with the client's
+    encoder, and gRPC may dispatch that stream before it sees the reset. A parked call sends nothing, so the service
+    never counts, authorizes or answers a request an ingress rejected, as with an ingress that forwards nothing.
+    """
+
+    @staticmethod
+    async def parked(request, context):
+        await asyncio.get_running_loop().create_future()
+
+    async def intercept_service(self, continuation, details):
+        handler = await continuation(details)
+        if handler is None or not any(key == INGRESS_REJECTED for key, _ in details.invocation_metadata or ()):
+            return handler
+        return handler._replace(unary_unary=handler.unary_unary and self.parked,
+                                unary_stream=handler.unary_stream and self.parked,
+                                stream_unary=handler.stream_unary and self.parked,
+                                stream_stream=handler.stream_stream and self.parked)
+
+
+class CallCounter(grpc.aio.ServerInterceptor):
+    """Counts each connection's calls open in this server's handlers, at present and at most so far.
+
+    A call counts from its handler's start until the handler returns, raises or is cancelled. A handler returns before
+    gRPC sends its status, so a call the service ends never counts after the client sees it end; a call the client
+    cancels counts until the server notices the cancellation.
+    """
+
+    def __init__(self):
+        self.open: Counter = Counter()
+        self.peak: Counter = Counter()
+        self.changed = asyncio.Event()
+
+    def enter(self, context):
+        """Counts the call in and returns its peer, which `leave` takes: a call's context is read only while the call
+        is active, since gRPC may release the call's core state once it ends or is cancelled."""
+        peer = context.peer()
+        self.open[peer] += 1
+        self.peak[peer] = max(self.peak[peer], self.open[peer])
+        self.changed.set()
+        return peer
+
+    def leave(self, peer):
+        self.open[peer] -= 1
+        self.changed.set()
+
+    async def until(self, predicate):
+        while not predicate():
+            self.changed.clear()
+            await self.changed.wait()
+
+    def wrap(self, behavior, streaming):
+        if behavior is None:
+            return None
+        if streaming and inspect.isasyncgenfunction(behavior):
+            async def generator(request, context):
+                peer = self.enter(context)
+                try:
+                    async with contextlib.aclosing(behavior(request, context)) as responses:
+                        async for response in responses:
+                            yield response
+                finally:
+                    self.leave(peer)
+            return generator
+
+        async def coroutine(request, context):
+            peer = self.enter(context)
+            try:
+                return await behavior(request, context)
+            finally:
+                self.leave(peer)
+        return coroutine
+
+    async def intercept_service(self, continuation, details):
+        handler = await continuation(details)
+        if handler is None:
+            return None
+        return handler._replace(
+            unary_unary=self.wrap(handler.unary_unary, False), unary_stream=self.wrap(handler.unary_stream, True),
+            stream_unary=self.wrap(handler.stream_unary, False), stream_stream=self.wrap(handler.stream_stream, True))
+
+
 class ReferenceServer:
-    def __init__(self, state, backend="A", *, credentials=None, service_factory=LiveService):
+    def __init__(self, state, backend="A", *, credentials=None, service_factory=LiveService, reuse_port=True,
+                 calls: CallCounter | None = None):
         self.state, self.backend, self.credentials = state, backend, credentials
-        self.server = grpc.aio.server(options=[("grpc.max_receive_message_length", state.max_payload + 65536),
-                                               ("grpc.max_send_message_length", state.max_payload + 65536)],
-                                      maximum_concurrent_rpcs=256)
+        options = [("grpc.max_receive_message_length", state.max_payload + 65536),
+                   ("grpc.max_send_message_length", state.max_payload + 65536)]
+        if not reuse_port:
+            options.append(("grpc.so_reuseport", 0))  # gRPC otherwise shares a port another server holds.
+        # gRPC refuses a call past this many with RESOURCE_EXHAUSTED before any handler runs. The nightly campaign's 32
+        # coalesced writers each hold a first write with up to a window of chained calls behind it, beside their read
+        # streams and the observers' (about 300 calls together), so the limit leaves several times that room.
+        self.server = grpc.aio.server(options=options, maximum_concurrent_rpcs=1024,
+                                      interceptors=[IngressRejected()] + ([calls] if calls else []))
         rpc.add_LiveServiceServicer_to_server(service_factory(state, backend), self.server)
         self.port = 0
 
-    async def start(self):
+    async def start(self, port=0):
         if self.credentials:
-            self.port = self.server.add_secure_port("127.0.0.1:0", self.credentials)
+            self.port = self.server.add_secure_port(f"127.0.0.1:{port}", self.credentials)
         else:
-            self.port = self.server.add_insecure_port("127.0.0.1:0")
+            self.port = self.server.add_insecure_port(f"127.0.0.1:{port}")
         if not self.port:
             raise RuntimeError("reference service could not bind loopback")
         await self.server.start()

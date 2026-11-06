@@ -17,6 +17,7 @@ pub mod auth;
 pub mod checkpoint;
 pub mod config;
 pub mod domain;
+pub mod dr;
 pub mod error;
 pub mod grpc;
 pub mod observability;

@@ -1466,6 +1466,22 @@ pub(crate) mod tests {
     /// Replay `commits` as live history: one `apply_delta` per commit against a
     /// single reference state, one captured [`TailRecord`] per commit.
     pub(crate) fn run(commits: &[Commit]) -> History {
+        run_with_stored_edit(commits, 0, |_| {})
+    }
+
+    /// [`run`], with `edit` applied to the reference state right after the
+    /// commit at `after_seq` (never, for 0), and the state after that commit
+    /// recorded as edited. For stored state no commit of this build makes —
+    /// a pair of rows in one collision slot, which an earlier build's
+    /// same-parent rename stored — so the commits after it apply to it as
+    /// live history would. The record captured at `after_seq` is the commit's
+    /// own, not the edit's.
+    pub(crate) fn run_with_stored_edit(
+        commits: &[Commit],
+        after_seq: u64,
+        edit: impl FnOnce(&mut ObjectState),
+    ) -> History {
+        let mut edit = Some(edit);
         let mut state = ObjectState {
             object_id: OBJECT_ID,
             ..ObjectState::default()
@@ -1503,6 +1519,9 @@ pub(crate) mod tests {
                 state.sequence_num, sequence_num,
                 "reference history must advance exactly one sequence per commit"
             );
+            if let Some(edit) = edit.take_if(|_| sequence_num == after_seq) {
+                edit(&mut state);
+            }
             states.push(state.clone());
             records.push(record);
         }
@@ -2400,6 +2419,140 @@ pub(crate) mod tests {
             vec![(HASH_B, Bytes::from(blob_b()))],
             "a lineage that stops before HASH_C's record must not surface it"
         );
+    }
+
+    // ── #13 — a base holding a same-name pair composes like live history ────
+    //
+    // An earlier build's same-parent `MoveSection` rename onto an occupied
+    // name renamed without a collision check (SDD §9.3), so stored state can
+    // hold two siblings in one collision slot: the same parent, slot and
+    // name. This build's rename cascades the occupant instead, so the pair
+    // is edited into the reference history's stored state directly
+    // ([`run_with_stored_edit`]). The base decode must rebuild both, and the
+    // tail's records must then replay against them exactly as the live
+    // commits applied, collision cascade included.
+
+    /// The base cut of [`same_name_pair_timeline`]: once the pair is stored.
+    const PAIR_BASE_SNAP_SEQ: u64 = 2;
+    /// [`same_name_pair_timeline`]'s head sequence.
+    const PAIR_HEAD_SEQ: u64 = 4;
+    /// The parent of the pair.
+    const PAIR_P: u64 = 1;
+    /// The pair's lower id, named `A` from creation, with [`PAIR_LEAF`] under it.
+    const PAIR_LOWER: u64 = 10;
+    /// The pair's higher id, created as `B` and stored renamed onto `A`.
+    const PAIR_RENAMED: u64 = 11;
+    /// The child under [`PAIR_LOWER`].
+    const PAIR_LEAF: u64 = 20;
+    /// The section the last tail record creates under the held name `A`.
+    const PAIR_LATE: u64 = 30;
+
+    /// | seq | era | what it does |
+    /// |---|---|---|
+    /// | 1 | base | reset: `P{A(10){leaf(20)}, B(11)}`, every section of type 2 |
+    /// | 2 | base | an empty commit, after which the stored state holds 11 renamed onto `A`, as an earlier build's rename stored it ([`same_name_pair_history`]): the pair |
+    /// | 3 | tail | a field on 10 and on 20 |
+    /// | 4 | tail | a `DiffChangeSection` creating 30 named `A`, of the pair's type, under P: its new-section branch resolves the collision, cascading the lowest id of the two holders, 10, with 20 and both fields |
+    ///
+    /// Seq 4 is a `DiffChangeSection`, not a `CreateSection`, on purpose: the
+    /// `DiffChangeSection` new-section branch is the one step whose conflict
+    /// handling depends on the `ApplyMode` (`RestoreBase` skips it), while
+    /// `apply_create_section` cascades in every mode. So only this record can
+    /// show that tail replay runs it as a commit.
+    fn same_name_pair_timeline() -> Vec<Commit> {
+        vec![
+            // seq 1 — reset.
+            Commit::inline(OwnedDelta {
+                struct_commands: vec![
+                    create_section(0, PAIR_P, "P", 1),
+                    create_section(PAIR_P, PAIR_LOWER, "A", 2),
+                    create_section(PAIR_P, PAIR_RENAMED, "B", 2),
+                    create_section(PAIR_LOWER, PAIR_LEAF, "leaf", 3),
+                ],
+                ..reset_delta(SOURCE_FORMAT)
+            }),
+            // seq 2 — empty; [`same_name_pair_history`] stores the pair after it.
+            Commit::empty(),
+            // ── base cut at PAIR_BASE_SNAP_SEQ = 2 ──────────────────────────
+            // seq 3.
+            Commit::inline(OwnedDelta {
+                set_fields: vec![
+                    inline_field(PAIR_LOWER, "lower_key", 3, 0),
+                    inline_field(PAIR_LEAF, "leaf_key", 3, 1),
+                ],
+                ..delta()
+            }),
+            // seq 4 — a new `A` under P, created by a `DiffChangeSection`.
+            Commit::inline(OwnedDelta {
+                struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+                    parent_id: PAIR_P,
+                    section_id: PAIR_LATE,
+                    section_name: "A".to_string(),
+                    section_type: 2,
+                    section_order: 2,
+                })],
+                ..delta()
+            }),
+        ]
+    }
+
+    /// [`same_name_pair_timeline`] driven as live history, with the pair
+    /// stored after seq 2: 11 renamed onto `A` beside 10, as an earlier
+    /// build's same-parent rename stored it.
+    fn same_name_pair_history() -> History {
+        run_with_stored_edit(&same_name_pair_timeline(), PAIR_BASE_SNAP_SEQ, |state| {
+            state
+                .sections
+                .get_mut(&PAIR_RENAMED)
+                .expect("seq 1 creates the renamed section")
+                .name = "A".to_string();
+        })
+    }
+
+    /// Composing a base taken while a same-name pair exists, plus a tail
+    /// whose last record creates a third `A`, equals live history: `{P, 11,
+    /// 30}`, the lowest id 10 and its subtree cascaded by the live commit and
+    /// by its replay alike. A base decode that cascaded 10 itself composes
+    /// `{P, 30}` (the replayed create then takes 11); a decode exemption that
+    /// reached tail replay, so the replayed `DiffChangeSection` cascaded
+    /// nothing, keeps 10.
+    #[test]
+    fn compose_over_a_base_holding_a_same_name_pair_equals_live_history() {
+        let history = same_name_pair_history();
+        let at_base = history.state_at(PAIR_BASE_SNAP_SEQ);
+        assert_eq!(
+            (
+                at_base.sections[&PAIR_LOWER].name.as_str(),
+                at_base.sections[&PAIR_RENAMED].name.as_str(),
+                at_base.children.get(&PAIR_LOWER).map(Vec::as_slice),
+            ),
+            ("A", "A", Some([PAIR_LEAF].as_slice())),
+            "precondition: the base is taken while the pair exists and 10 has its child"
+        );
+        let live = history.state_at(PAIR_HEAD_SEQ);
+        assert_eq!(
+            live.sections.keys().copied().collect::<BTreeSet<u64>>(),
+            BTreeSet::from([PAIR_P, PAIR_RENAMED, PAIR_LATE]),
+            "precondition: live history cascades the lowest id and its subtree"
+        );
+
+        let base = base_ompf(at_base);
+        let records = history.records_in(PAIR_BASE_SNAP_SEQ, PAIR_HEAD_SEQ);
+        let envelope = tail_envelope(PAIR_BASE_SNAP_SEQ, PAIR_BASE_SNAP_SEQ, &records);
+        let composed = compose_lineage(OBJECT_ID, &base, PAIR_BASE_SNAP_SEQ, &[envelope])
+            .expect("the lineage must compose");
+
+        assert_eq!(
+            composed
+                .state
+                .sections
+                .keys()
+                .copied()
+                .collect::<BTreeSet<u64>>(),
+            BTreeSet::from([PAIR_P, PAIR_RENAMED, PAIR_LATE]),
+            "the composed section set must be live history's"
+        );
+        assert_faithful_columns(&composed.state, live);
     }
 
     // ════════════════════════════════════════════════════════════════════════

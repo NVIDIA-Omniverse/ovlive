@@ -19,7 +19,8 @@
 //! [`PRODUCT_WORKER_STACK`] and runs a current-thread tokio runtime whose
 //! blocking pool gets the same explicit size, so neither inherits
 //! `RUST_MIN_STACK`. B serves the service the way `main.rs` builds the
-//! full-API server — `production_server_builder()`, `MetricsLayer`, then
+//! full-API server — `production_server_builder` at the gate's waiter cap,
+//! `MetricsLayer`, then
 //! `live_service_server` — so every task the server spawns for an RPC (the
 //! connection, each HTTP/2 stream, a subscription's task, an overwrite's
 //! cleanup) is polled on B's stack. B's protocol, from its entry frame:
@@ -464,9 +465,12 @@ async fn setup(
                 RPC_DEADLINE_MS_DEFAULT,
                 SESSION_LIST_TIMEOUT_MS_DEFAULT,
             );
-            let router = production_server_builder()
+            let router = production_server_builder(svc.upload_admission.max_waiters())
                 .layer(metrics_layer)
-                .add_service(live_service_server(LiveEditService::clone(svc)));
+                .add_service(live_service_server(
+                    LiveEditService::clone(svc),
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ));
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
             let task = tokio::spawn(router.serve_with_incoming_shutdown(
                 tokio_stream::wrappers::TcpListenerStream::new(listener),

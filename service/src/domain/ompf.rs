@@ -250,15 +250,42 @@ impl<'a> OmpfContainer<'a> {
             return Ok(Vec::new());
         }
 
-        let num_parts = 1 + external_values.len();
+        let ext_lens: Vec<u64> = external_values.iter().map(|v| v.len() as u64).collect();
+        let total_payload: usize =
+            delta.len() + external_values.iter().map(|v| v.len()).sum::<usize>();
+        let header = Self::header_bytes(delta.len() as u64, &ext_lens, total_payload)?;
+        let mut out = header;
+
+        out.extend_from_slice(delta);
+        for ext in external_values {
+            out.extend_from_slice(ext);
+        }
+
+        Ok(out)
+    }
+
+    /// What [`Self::serialize`] writes before the first part of a container
+    /// whose delta is `delta_len` bytes and whose external values are
+    /// `ext_lens` bytes each, in order: the magic, the part count and the
+    /// offset table. The one writer of that layout, so a container laid out
+    /// from its parts' lengths before their bytes are read (the catch-up
+    /// payload's pages, `storage::ompf_payload`) is byte-identical to one
+    /// serialized from the bytes. `reserve` more bytes of capacity are
+    /// allocated after the header, for the parts the caller appends.
+    ///
+    /// Returns [`OmpfError::SerializeNumPartsOverflow`] if `1 +
+    /// ext_lens.len()` doesn't fit in a `u32`, as [`Self::serialize`] does.
+    pub fn header_bytes(
+        delta_len: u64,
+        ext_lens: &[u64],
+        reserve: usize,
+    ) -> Result<Vec<u8>, OmpfError> {
+        let num_parts = 1 + ext_lens.len();
         let num_parts_u32 = u32::try_from(num_parts)
             .map_err(|_| OmpfError::SerializeNumPartsOverflow { num_parts })?;
         let header_size = MAGIC_SIZE + NUM_PARTS_SIZE + num_parts * OFFSET_SIZE;
 
-        let total_payload: usize =
-            delta.len() + external_values.iter().map(|v| v.len()).sum::<usize>();
-        let mut out = Vec::with_capacity(header_size + total_payload);
-
+        let mut out = Vec::with_capacity(header_size.saturating_add(reserve));
         out.extend_from_slice(&MAGIC.to_le_bytes());
         out.extend_from_slice(&num_parts_u32.to_le_bytes());
 
@@ -267,17 +294,11 @@ impl<'a> OmpfContainer<'a> {
         // start of each external value.
         let mut offset = header_size as u64;
         out.extend_from_slice(&offset.to_le_bytes());
-        offset += delta.len() as u64;
-        for ext in external_values {
+        offset += delta_len;
+        for len in ext_lens {
             out.extend_from_slice(&offset.to_le_bytes());
-            offset += ext.len() as u64;
+            offset += len;
         }
-
-        out.extend_from_slice(delta);
-        for ext in external_values {
-            out.extend_from_slice(ext);
-        }
-
         Ok(out)
     }
 }

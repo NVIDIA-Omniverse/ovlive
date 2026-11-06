@@ -34,14 +34,17 @@
 //!   session-scoped second with each step independently atomic (SR-2.7), (b)
 //!   the asymmetric self-healing rationale in SR-2.7 holds at restore time
 //!   even if the assembler captures a mid-update state, and (c) the
-//!   orphan-sweep / `ListSessions` opportunistic-cleanup path tolerates
+//!   `ListSessions` ghost walk (veto, then release) tolerates
 //!   ghost-vs-session inconsistency.
 //!
 //! - **Lifecycle-event triggered, not periodic.** Unlike the Epic-1
 //!   layer-checkpoint assembler at [`crate::checkpoint::assembler`], this
 //!   function has no leader-elected loop. Sibling Task `t2.fgj.7v.p9` calls
 //!   it from lifecycle-event hooks (CreateSession / CreateLayer / DeleteLayer
-//!   / DeleteSession).
+//!   / DeleteSession); the disaster-recovery accept-loss Job calls it for
+//!   each session whose backup it rewrites
+//!   ([`rewrite_session_checkpoint`]): once, or twice for a session with an
+//!   over-limit layer (first without that layer, ahead of its unmap).
 //!
 //! - **Atomic within the session slot, and it mints a build stamp.** The
 //!   session-scoped read runs as ONE Lua script
@@ -69,8 +72,12 @@ use fred::types::Value;
 
 use crate::checkpoint::session_payload::SessionCheckpoint;
 use crate::checkpoint::store::CheckpointError;
-use crate::storage::client::{FredErrOrigin, ValkeyClient, POOL_LABEL_DATA, POOL_LABEL_TXN};
+use crate::storage::client::{
+    evalsha_with_fenced_reload, FencedEvalError, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
+    POOL_LABEL_TXN,
+};
 use crate::storage::keys::{hex_decode, KeySchema};
+use crate::storage::lua::SESSION_RECORD_RESTORE_SCRIPT;
 
 /// Compiled Lua script backing [`build_session_checkpoint`]'s atomic
 /// session-state read (b.443).
@@ -85,7 +92,7 @@ use crate::storage::keys::{hex_decode, KeySchema};
 /// directory is the home for every Lua script regardless of which module
 /// owns the call site) while the `Script` handle is declared next to its
 /// only caller — mirroring `STREAM_HIGH_WATER_PROBE_SCRIPT` in
-/// `src/checkpoint/recovery.rs`.
+/// `src/storage/stream_high_water.rs`.
 ///
 /// `Script::from_lua` is infallible — it just hashes the source. The first
 /// `evalsha_with_reload` call sends `SCRIPT LOAD` on `NOSCRIPT` before
@@ -296,13 +303,18 @@ fn mint_incarnation_token() -> String {
 /// # Layers-index members without a mapping
 ///
 /// The script filters them out, so `layers_index` and `layer_mappings` stay
-/// consistent with each other. This is no longer a read race (atomicity
-/// rules that out) but a real keyspace state: `LayerStore::delete_layer`
-/// DELs the mapping several steps before it SREMs the index member, so a
-/// build that lands in that window legitimately sees an index member with
-/// no mapping. Dropping it is correct — a checkpoint naming a layer with no
-/// `object_id` would restore an unreachable layer — and the count is logged
-/// at debug for diagnosis.
+/// consistent with each other. This is not a read race (atomicity rules
+/// that out), and no current write path leaves one in a live session's
+/// index either: `CreateLayer` writes the mapping and the member in one
+/// step, and `DeleteLayer`'s unmap removes both in one step. (The orphan
+/// sweep's clean-up of a session whose metadata is gone still sends its
+/// mapping `DEL` and its `SREM` separately, so an interruption between them
+/// leaves such a member — but only in a session this read answers absent
+/// before it reads the index.) In a live session such a member is a
+/// leftover — a delete an older build interrupted between its mapping `DEL`
+/// and its index `SREM`, or an out-of-band write. Dropping it is correct —
+/// a checkpoint naming a layer with no `object_id` would restore an
+/// unreachable layer — and the count is logged at debug for diagnosis.
 pub(crate) async fn build_session_checkpoint(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -320,8 +332,8 @@ pub(crate) async fn build_session_checkpoint(
             session_id = %session_id,
             dropped = raw.dropped,
             "session-checkpoint assembler: layers-index members had no mapping key and were \
-             excluded from the payload (expected mid-`delete_layer`; persistent counts here \
-             indicate orphaned index members)"
+             excluded from the payload (leftover index members: a delete an older build \
+             interrupted, or an out-of-band write)"
         );
     }
     let stamp = raw.stamp;
@@ -472,8 +484,27 @@ pub(crate) async fn build_session_checkpoint(
     // resulting cross-slot non-atomicity is the long-standing, tolerated
     // property documented at the top of this module — the applier's restore
     // is authoritative for `le:path:{hex(base_path)}`, so a `false` here
-    // doesn't block the checkpoint. We warn and still populate the field;
-    // the orphan-sweep self-heals any divergence.
+    // doesn't block the checkpoint. We warn and still populate the field.
+    //
+    // What a `false` means: the session's metadata exists but its id is not
+    // in `path_index`. Three causes:
+    // - a `DeleteSession` in flight (or the DR Job's completion of an
+    //   abandoned one), or one stopped after its first `SREM` — every remover
+    //   takes the `path_index` member first. The client's `DeleteSession`
+    //   retry finishes the delete;
+    // - a `ListSessions` walk that vetoed the id and released BOTH its members
+    //   between another replica's recovery Step A and Step B; Step B then
+    //   writes the metadata, since it does not read the veto (SDD §22.13);
+    // - during a rolling upgrade, an older build's walk that removed both
+    //   members of a create whose metadata write then landed (SDD §7.10,
+    //   *Mixed versions*).
+    // In the last two the session has neither index member: it is unlisted,
+    // its name is free, and no retry or live-store path re-adds the members
+    // (on-access recovery does not run for a session whose metadata exists).
+    // A restore from this checkpoint re-adds both (Step A). The orphan sweep
+    // never reads or writes the path indices, and the `ListSessions` reconcile
+    // removes only the opposite divergence (a `path_index` member with no
+    // names member).
     let path_index_key = keys.path_index(&base_path);
     let in_path_index: bool = client
         .pool
@@ -489,8 +520,12 @@ pub(crate) async fn build_session_checkpoint(
         tracing::warn!(
             session_id = %session_id,
             base_path = %base_path,
-            "session-checkpoint assembler: session_id missing from live path_index; \
-             populating payload anyway (applier restore is authoritative; orphan-sweep self-heals)"
+            "session-checkpoint assembler: session_id missing from live path_index (a \
+             DeleteSession in flight or stopped after its first SREM, which its retry finishes; \
+             or an unlisted session whose index members a ListSessions walk removed between a \
+             recovery's two steps, or an older build's walk removed during a rolling upgrade, \
+             which nothing repairs in the live store); populating payload anyway (a restore \
+             from it re-adds both index members)"
         );
     }
 
@@ -702,6 +737,44 @@ pub(crate) async fn mint_session_checkpoint_stamp(
 // Session-recovery applier (SR-2.7)
 // ───────────────────────────────────────────────────────────────────────────
 
+/// How far [`apply_session_checkpoint`] goes, and how its Step B writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionApplySteps {
+    /// Step A (the path index), then Step B (the record, the mappings and
+    /// the layers index) as an unconditional `MULTI`/`EXEC`: the whole apply,
+    /// over whatever the session holds. The restore Job's mode: the fleet is
+    /// held, so the Job is the only writer, and a replay of its transaction
+    /// overwrites only its own writes.
+    PathIndexThenRecord,
+    /// Step A, then Step B as one conditional script
+    /// (`scripts/session_record_restore.lua`): it writes only while neither
+    /// the record nor the session's deletion marker exists, and the record
+    /// last. On-access recovery's mode
+    /// (`SessionRecoveryHook::try_recover_session`): there the service is
+    /// live, and an unconditional Step B could overwrite another call's write
+    /// to a session that already exists.
+    PathIndexThenRecordIfAbsent,
+    /// Step A alone: the restore Job's restore of a session whose record
+    /// survives and that needs no mapping written.
+    PathIndexOnly,
+}
+
+/// What [`apply_session_checkpoint`]'s Step B did. Only
+/// [`SessionApplySteps::PathIndexThenRecordIfAbsent`] can answer anything but
+/// [`SessionApplied::Applied`]; Step A has run before any of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionApplied {
+    /// Every step the mode names ran and wrote.
+    Applied,
+    /// The conditional Step B found the session's record present and wrote
+    /// nothing: another replica's restore, or an earlier send of this one,
+    /// landed first.
+    RecordPresent,
+    /// The conditional Step B found the record absent and the session's
+    /// deletion marker present, and wrote nothing: the session was deleted.
+    Deleted,
+}
+
 /// Identifies which half of [`apply_session_checkpoint`]'s two-step protocol
 /// a fault-injection entry targets. Per-step keying is the contract that
 /// Task 7's integration tests (`t3.fgj.7v.o7.6f` + `t3.fgj.7v.o7.xt`) rely
@@ -810,20 +883,32 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 /// the session-scoped keys (`le:{sid}:sess`, `le:{sid}:layers`,
 /// `le:{sid}:layer:{hex(name)}`) hash under `{session_id}`. They CANNOT
 /// live in one MULTI/EXEC, so the applier splits into two independently-
-/// atomic transactions:
+/// atomic steps:
 ///
 /// 1. **Step A** — SADD the path-index set + the composite path-names set
-///    on the `{hex(base_path)}` slot. Atomic across both sets.
-/// 2. **Step B** — HSET session-meta, SET each layer-mapping, SADD the
-///    layers-index on the `{session_id}` slot. Atomic across all three
-///    key families.
+///    on the `{hex(base_path)}` slot, one MULTI/EXEC. Atomic across both
+///    sets.
+/// 2. **Step B** (the record step) — HSET session-meta, SET each
+///    layer-mapping, SADD the layers-index on the `{session_id}` slot.
+///    Atomic across all three key families. How it writes depends on
+///    `steps` (see *Steps* below): the restore Job's
+///    [`SessionApplySteps::PathIndexThenRecord`] sends it as an unconditional
+///    MULTI/EXEC; on-access recovery's
+///    [`SessionApplySteps::PathIndexThenRecordIfAbsent`] sends it as one
+///    `EVALSHA` of `scripts/session_record_restore.lua`, which writes only
+///    while neither the record nor the deletion marker
+///    (`le:{sid}:sess:deleted`) exists, mappings and index first and the
+///    record last.
 ///
 /// **Order is load-bearing per SR-2.7. Do not reorder without a spec change.**
 ///
 /// The ordering exploits an asymmetric self-healing property: if Step A
 /// commits and Step B fails (or the process crashes between), the next
-/// `ListSessions` opportunistic-cleanup walk (SDD §7.13) sees a path-index
-/// member pointing at a non-existent session and removes the ghost member.
+/// `ListSessions` ghost walk (SDD §7.13) sees a names member pointing at a
+/// non-existent session, and once the recovery probe finds no checkpoint it
+/// vetoes the id and removes both members. The veto does not stop a later
+/// recovery: Step B's `HSET` does not read it, and a re-run Step A re-adds
+/// the members.
 /// The reverse — session-scoped keys present without a path-index entry —
 /// would be a "ghost-but-functional" session with NO self-healing path:
 /// the session exists for direct lookups but is invisible to
@@ -838,29 +923,54 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 /// function (and adding one would break the idempotency contract — a
 /// destructive pre-clean would erase the Step A path-index half if a
 /// caller retried after Step A succeeded but Step B failed). The applier
-/// is purely additive.
+/// is purely additive. In the conditional mode the record is written last
+/// and is what the script's `PRESENT` branch trusts, so a Step B cut part-way
+/// (a write refused out of memory, a wrong-typed layers index) leaves no
+/// record, and a later re-apply writes the whole step again.
 ///
 /// # Cross-replica race
 ///
-/// The applier acquires NO admission lock — two replicas concurrently
-/// restoring the same session race benignly because every write is
-/// idempotent. The Task-6 consumer (`t2.fgj.7v.fp`) is the right surface
-/// for any per-`session_id` admission-control gate.
+/// Idempotent is not enough once another writer is live: an unconditional
+/// Step B that lands after a `DeleteLayer` or `CreateLayer` on the restored
+/// session puts the backup's mappings back over that change. That happens
+/// when two replicas restore one session (the hook's admission mutex is per
+/// replica), and when fred replays a `Transaction` whose `EXEC` landed but
+/// whose reply was lost (`storage::client`'s `txn_pool` notes). So on-access
+/// recovery uses the conditional Step B: the second restore, and a re-send
+/// of the first, find the record and answer
+/// [`SessionApplied::RecordPresent`] without writing. Its marker check, in
+/// the same atomic step, also stops a restore racing a `DeleteSession` from
+/// bringing the session back. The restore Job keeps the unconditional Step B:
+/// the fleet is held, so the Job is the only writer, and it must be able to
+/// write a backup's mapping into a session whose record survives. Step A
+/// stays a `Transaction` in every mode: its replay only re-adds index
+/// members, which at worst leaves a ghost of a session deleted in the window,
+/// and the next `ListSessions` walk retires it (recovery refuses the marked
+/// id, so the walk vetoes and releases it).
 ///
 /// # Session-meta field set
 ///
 /// The four HSET fields written to `le:{sid}:sess` are:
 /// `name`, `base_path`, `created_by`, `created_at`. **This set is a
-/// load-bearing co-location with `SessionStore::create_once` at
-/// `src/storage/session.rs:386-394`.** A recovered session is
+/// load-bearing co-location with the metadata-write `ARGV` that
+/// `SessionStore::finish_create` (`src/storage/session.rs`) passes to
+/// `scripts/session_meta_write.lua`.** A recovered session is
 /// byte-identical to one created by `CreateSession`. Adding a fifth
 /// field to either side without updating the other is a contract
 /// violation — the recovered session would diverge from the
-/// freshly-created shape on that field.
+/// freshly-created shape on that field. Both Step B forms write them from the
+/// one list [`record_fields`] builds.
 ///
 /// # Connection pool
 ///
-/// Each step acquires an exclusive `txn_pool` connection via
+/// The conditional Step B is one `EVALSHA` on the data pool through
+/// `storage::client::evalsha_with_fenced_reload` (`evalsha_with_reload`
+/// under the hold write fence), as `SessionStore::write_session_meta` runs
+/// its script: one atomic command, so it needs no exclusive connection, and
+/// the data pool's re-send of a command whose reply was lost finds the record
+/// and writes nothing. Every `MULTI`/`EXEC` step below — Step A always, and
+/// the unconditional Step B — instead acquires an exclusive `txn_pool`
+/// connection via
 /// [`ValkeyClient::acquire_txn_for`], pinned to the slot that step's
 /// transaction actually runs on: Step A pins on
 /// `keys.path_index(&checkpoint.base_path)` (`{hex(base_path)}`), Step B on
@@ -881,7 +991,8 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 ///
 /// Step A and Step B errors both map to [`CheckpointError::Transient`]
 /// with a message that names the step (`"Step A path-index MULTI/EXEC
-/// failed: ..."` / `"Step B session-scoped MULTI/EXEC failed: ..."`) so
+/// failed: ..."` / `"Step B session-scoped MULTI/EXEC failed: ..."` /
+/// `"Step B session-scoped EVALSHA session_record_restore failed: ..."`) so
 /// an operator log can locate the partial-failure boundary.
 ///
 /// **The blanket `Transient` wrap is deliberate — do not route these arms
@@ -890,17 +1001,21 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 /// (b.4t3). Four reasons, in order of weight:
 ///
 /// 1. **Re-drive is always safe.** Neither step holds a `WATCH` and every write
-///    is additive and idempotent (see *Idempotency* above), so the single
-///    `MULTI … EXEC` replay fred's transaction router performs under the
-///    `txn_pool`'s `max_command_attempts = 1` cannot corrupt anything, and a
+///    is additive and idempotent per key (see *Idempotency* above), and a
 ///    half-done apply (A committed, B failed) is self-describing and converges
 ///    on the next attempt — pinned by
-///    `recovery_retry_after_step_b_failure_converges`.
+///    `recovery_retry_after_step_b_failure_converges`. What a re-drive or a
+///    replay must not do is overwrite another writer's change: on-access
+///    recovery's conditional Step B answers `PRESENT` once its record is
+///    there, and the single `MULTI … EXEC` replay fred's transaction router
+///    performs under the `txn_pool`'s `max_command_attempts = 1` is confined
+///    to Step A (index members only) and the restore Job, which writes while
+///    it is the only writer (*Cross-replica race* above).
 /// 2. **A caller re-drives on `Transient`.** The re-drive is request-path, not
 ///    a maintenance tick: `SessionBasePathCache::get_base_path` maps
 ///    `Transient` → `ServiceError::Unavailable` (the client retries), and
-///    `grpc::session::reconcile_ghost_members` deliberately does not `SREM` on
-///    a recovery error, so the member survives and the next `ListSessions`
+///    `grpc::session::reconcile_ghost_members` deliberately keeps both members
+///    on a recovery error, so the member survives and the next `ListSessions`
 ///    walk retries.
 /// 3. **This site's retriability is a property of its own writes, not of the
 ///    shared classifier.** The shape that matters most here is the routine
@@ -922,8 +1037,9 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 ///    make a joiner's retry depend on the shared classifier's next edit,
 ///    when what makes a re-drive safe here is reason 1, which the classifier
 ///    cannot see. The cost of the blanket grade is the deterministic class
-///    below. Each step's `EXEC` goes through `ValkeyClient::exec_txn`, as
-///    every fred `Transaction` caller's does, so on a `"Max redirections
+///    below. Each transaction step's `EXEC` goes through
+///    `ValkeyClient::exec_txn`, as every fred `Transaction` caller's does, so
+///    on a `"Max redirections
 ///    exceeded"` the checkout's routing is re-synced before the error reaches
 ///    the arms, because fred does not re-sync it.
 /// 4. **A local retry loop would serialise joiners.** The applier runs under
@@ -932,8 +1048,11 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 ///    mutex and stalls every other joiner for the same session.
 ///
 /// The blanket grade does sweep in a **deterministic-rejection** class that a
-/// re-drive can never clear: a `WRONGTYPE` from a corrupted `le:path:{hex(bp)}`
-/// or `le:{sid}:sess` lands in the catch-all `Err(e)` arms and is graded
+/// re-drive can never clear: a `WRONGTYPE` from a corrupted `le:path:{hex(bp)}`,
+/// `le:{sid}:sess` or `le:{sid}:layers` lands in the catch-all `Err(e)` arms
+/// (except a wrong-typed record under the conditional Step B, whose `EXISTS`
+/// reads any type as present, so that step answers `RecordPresent`) and is
+/// graded
 /// `Transient`, so the client re-drives it as `UNAVAILABLE` instead of getting a
 /// non-retriable `INTERNAL`. That is accepted deliberately, not an oversight in
 /// those arms — a corrupted restore target is an operator-visible keyspace fault
@@ -942,19 +1061,69 @@ fn pop_apply_step_fault(step: ApplyStep) -> Option<CheckpointError> {
 /// Splitting the deterministic shapes out into their own non-retriable arm is a
 /// possible future refinement.
 ///
-/// # Production caller
+/// # Production callers
 ///
 /// [`SessionRecoveryHook::try_recover_session`](crate::checkpoint::session_recovery::SessionRecoveryHook::try_recover_session)
-/// step 7 (`src/checkpoint/session_recovery.rs`), reached from the
-/// request-path recovery arms described under *Error classification* above.
-/// (The earlier `#[allow(dead_code)]` placeholder for the pre-consumer window
-/// is gone — this is a live path.)
+/// step 7 (`src/checkpoint/session_recovery.rs`), in the conditional mode,
+/// reached from the request-path recovery arms described under *Error
+/// classification* above; and the restore Job's session restore
+/// (`dr::job::execute::session`), in the unconditional modes.
+///
+/// # The hold write fence
+///
+/// `hold_fence` is the session restore's hold write fence
+/// (`checkpoint::hold_fence`). Each step checks it immediately before its
+/// send, after its queueing: a transaction step's `EXEC` (fred's
+/// `Transaction` buffers `MULTI` and the queued commands locally and sends
+/// them with the `EXEC` as one unit), or the conditional Step B's
+/// `EVALSHA` (and, on `NOSCRIPT`, its `SCRIPT LOAD` and re-send), so nothing
+/// of the step has reached the store at the check. A
+/// closed fence refuses that step with [`CheckpointError::Transient`]
+/// carrying the fence's refusal message, and nothing more is sent. The fence
+/// does not stop a step already handed to fred: it runs under the Valkey
+/// command timeout, and fred writes it only while its caller still waits —
+/// once the caller gives up, fred writes no frame of it not yet written, even
+/// behind a reconnect, and closes the connection under a cut `MULTI`. So
+/// the step is written within that timeout of the fence closing, or never;
+/// a frame fred had already written is not recalled, a residual
+/// (`checkpoint::hold_fence`; SDD §15.3 *Vendored fred* change 9). A Step A
+/// that lands with Step B refused is safe by the self-healing order above.
+///
+/// # Steps
+///
+/// `steps` says how far the apply goes, and how Step B writes:
+/// [`SessionApplySteps::PathIndexThenRecordIfAbsent`] runs Step A then the
+/// conditional Step B (on-access recovery);
+/// [`SessionApplySteps::PathIndexThenRecord`] runs Step A then the
+/// unconditional Step B (the restore Job's session restore that needs its
+/// record or mappings written); [`SessionApplySteps::PathIndexOnly`] returns
+/// after Step A (the restore Job's restore of a session whose record
+/// survives and needs no mapping written). Step B never runs without Step A
+/// before it.
+///
+/// # Returns
+///
+/// [`SessionApplied`]: `Applied` unless the conditional Step B found the
+/// record (`RecordPresent`) or the deletion marker (`Deleted`) and wrote
+/// nothing.
 pub(crate) async fn apply_session_checkpoint(
     client: &ValkeyClient,
     keys: &KeySchema,
     session_id: &str,
     checkpoint: &SessionCheckpoint,
-) -> Result<(), CheckpointError> {
+    hold_fence: Option<&tokio_util::sync::CancellationToken>,
+    steps: SessionApplySteps,
+) -> Result<SessionApplied, CheckpointError> {
+    // The hold write fence's check before each step's send.
+    let refuse_if_held = || {
+        if crate::checkpoint::hold_fence::is_closed(hold_fence) {
+            Err(CheckpointError::Transient {
+                source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+            })
+        } else {
+            Ok(())
+        }
+    };
     // Defensive pre-check: the function operates on `session_id` for key
     // construction; the field on the payload is informational. They MUST
     // match for the applied state to be coherent; a debug-build mismatch
@@ -1073,6 +1242,12 @@ pub(crate) async fn apply_session_checkpoint(
         // `# Error classification` section of this function's doc comment.
         // `exec_txn` re-syncs this checkout's routing when the transaction was
         // redirected (fred re-syncs nothing on it), before any arm runs.
+        //
+        // The hold write fence first, immediately before the send: fred's
+        // `Transaction` buffers `MULTI` and the queued `SADD`s locally and
+        // sends them with the `EXEC` as one unit, so a refusal here drops a
+        // transaction nothing of which reached the store.
+        refuse_if_held()?;
         match client
             .exec_txn::<fred::types::Value>(
                 &exclusive_client,
@@ -1110,12 +1285,25 @@ pub(crate) async fn apply_session_checkpoint(
         // the gauge and the checkout permit, in that order — before Step B.
     }
 
-    // ── Step B — Session-scoped MULTI/EXEC ({session_id} slot) ──────────────
+    if steps == SessionApplySteps::PathIndexOnly {
+        return Ok(SessionApplied::Applied);
+    }
+
+    // ── Step B — Session-scoped record step ({session_id} slot) ─────────────
     #[cfg(any(test, feature = "test-checkpoint-fault-injection"))]
     if let Some(err) = pop_apply_step_fault(ApplyStep::StepB) {
         return Err(err);
     }
 
+    // On-access recovery: the conditional script, never the transaction
+    // below (see `# Cross-replica race` in this function's doc comment).
+    if steps == SessionApplySteps::PathIndexThenRecordIfAbsent {
+        return restore_session_record_if_absent(client, keys, session_id, checkpoint, hold_fence)
+            .await;
+    }
+
+    // The restore Job's unconditional Step B: one MULTI/EXEC.
+    //
     // b.4t3: every key this transaction touches — `le:{sid}:sess`,
     // `le:{sid}:layer:{hex(name)}`, `le:{sid}:layers` — carries the
     // `{session_id}` hash tag (Valkey's tag is first `{` … first `}`, so the
@@ -1129,19 +1317,13 @@ pub(crate) async fn apply_session_checkpoint(
     let exclusive_client = client.acquire_txn_for(&session_meta_key).await;
     let trx = exclusive_client.multi();
 
-    // (B.1) session-meta HSET — the four-field set MUST match
-    // `SessionStore::create_once` at `src/storage/session.rs:386-394`.
-    // See the module-level doc comment for the contract.
+    // (B.1) session-meta HSET — the four-field set MUST match the
+    // metadata-write `ARGV` of `SessionStore::finish_create`
+    // (`src/storage/session.rs`). See this function's doc comment for the
+    // contract. It does not read the metadata veto
+    // (`KeySchema::session_meta_veto`): a recovery completes a vetoed id.
     let _: () = trx
-        .hset(
-            &session_meta_key,
-            [
-                ("name", checkpoint.name.clone()),
-                ("base_path", checkpoint.base_path.clone()),
-                ("created_by", checkpoint.created_by.clone()),
-                ("created_at", checkpoint.created_at.to_string()),
-            ],
-        )
+        .hset(&session_meta_key, record_fields(checkpoint))
         .await
         .map_err(|e| CheckpointError::Transient {
             source: format!(
@@ -1196,7 +1378,9 @@ pub(crate) async fn apply_session_checkpoint(
     // because (B.1)'s session-meta HSET is UNCONDITIONAL — making it conditional
     // re-opens that path. Every arm wraps as `Transient` deliberately — see the
     // `# Error classification` section of this function's doc comment. As in
-    // Step A, `exec_txn` re-syncs a redirected checkout's routing first.
+    // Step A, `exec_txn` re-syncs a redirected checkout's routing first, and
+    // the hold write fence is checked immediately before the send.
+    refuse_if_held()?;
     match client
         .exec_txn::<fred::types::Value>(
             &exclusive_client,
@@ -1212,7 +1396,7 @@ pub(crate) async fn apply_session_checkpoint(
                      residue, or an empty command queue)"
                 .into(),
         }),
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(SessionApplied::Applied),
         Err(e) if e.is_canceled() => Err(CheckpointError::Transient {
             source: format!(
                 "Step B session-scoped MULTI/EXEC failed: transaction canceled (connection drop): {e}"
@@ -1227,6 +1411,168 @@ pub(crate) async fn apply_session_checkpoint(
             })
         }
     }
+}
+
+/// The session record's four field / value pairs, in the order both Step B
+/// forms of [`apply_session_checkpoint`] write them. The set MUST match the
+/// metadata-write `ARGV` of `SessionStore::finish_create` (see the applier's
+/// *Session-meta field set*).
+fn record_fields(checkpoint: &SessionCheckpoint) -> [(&'static str, String); 4] {
+    [
+        ("name", checkpoint.name.clone()),
+        ("base_path", checkpoint.base_path.clone()),
+        ("created_by", checkpoint.created_by.clone()),
+        ("created_at", checkpoint.created_at.to_string()),
+    ]
+}
+
+/// [`apply_session_checkpoint`]'s conditional Step B
+/// ([`SessionApplySteps::PathIndexThenRecordIfAbsent`]): one `EVALSHA` of
+/// `scripts/session_record_restore.lua` on the data pool, on the
+/// `{session_id}` slot. Unless the record or the deletion marker exists, it
+/// writes the backup's layer mappings, its layers-index members (hex-encoded,
+/// as `LayerStore::create_layer` writes them) and, last, the record.
+///
+/// Every key is declared and known before the call: the record, the marker,
+/// the layers index (declared even when the backup names no layer) and one
+/// mapping key per mapped layer. All carry the `{session_id}` hash tag
+/// (Valkey's tag is first `{` … first `}`, so a mapping key's trailing
+/// `{hex(name)}` is inert), so the script runs on one slot.
+///
+/// Sent through `storage::client::evalsha_with_fenced_reload`, which is
+/// `evalsha_with_reload` with the hold write fence checked immediately
+/// before each send: the `EVALSHA`, and on `NOSCRIPT` (a store that lost its
+/// keyspace has usually lost its script cache too) the `SCRIPT LOAD` and the
+/// re-sent `EVALSHA`. A closed fence answers `Transient` with the fence's
+/// refusal message and sends nothing more. Every other failure is
+/// `Transient` too, as the transaction steps' are (the applier's *Error
+/// classification*).
+async fn restore_session_record_if_absent(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    session_id: &str,
+    checkpoint: &SessionCheckpoint,
+    hold_fence: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<SessionApplied, CheckpointError> {
+    const STEP: &str = "Step B session-scoped EVALSHA session_record_restore failed";
+
+    // KEYS: record, marker, layers index, then one mapping key per layer, in
+    // `layer_mappings`' order, which the object ids in `ARGV` follow.
+    let mut script_keys = Vec::with_capacity(3 + checkpoint.layer_mappings.len());
+    script_keys.push(keys.session_meta(session_id));
+    script_keys.push(keys.session_deleted_marker(session_id));
+    script_keys.push(keys.layers_index(session_id));
+    script_keys.extend(
+        checkpoint
+            .layer_mappings
+            .keys()
+            .map(|layer_name| keys.layer_mapping(session_id, layer_name)),
+    );
+
+    // ARGV: the record's field / value pairs, then the mapping object ids,
+    // then the layers index's hex-encoded members.
+    let mut argv =
+        Vec::with_capacity(8 + checkpoint.layer_mappings.len() + checkpoint.layers_index.len());
+    for (field, value) in record_fields(checkpoint) {
+        argv.push(field.to_owned());
+        argv.push(value);
+    }
+    argv.extend(
+        checkpoint
+            .layer_mappings
+            .values()
+            .map(|object_id| object_id.to_string()),
+    );
+    argv.extend(
+        checkpoint
+            .layers_index
+            .iter()
+            .map(|name| crate::storage::keys::hex_encode(name)),
+    );
+
+    let reply: Vec<String> = evalsha_with_fenced_reload(
+        &SESSION_RECORD_RESTORE_SCRIPT,
+        client.pool.next(),
+        script_keys,
+        argv,
+        hold_fence,
+    )
+    .await
+    .map_err(|e| match e {
+        FencedEvalError::Held => CheckpointError::Transient {
+            source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+        },
+        FencedEvalError::Fred(e) => {
+            FredErrOrigin::client(client, POOL_LABEL_DATA).observe_error(&e);
+            CheckpointError::Transient {
+                source: format!("{STEP}: {e}").into(),
+            }
+        }
+    })?;
+    match reply.first().map(String::as_str) {
+        Some("APPLIED") => Ok(SessionApplied::Applied),
+        Some("PRESENT") => Ok(SessionApplied::RecordPresent),
+        Some("DELETED") => Ok(SessionApplied::Deleted),
+        _ => Err(CheckpointError::Transient {
+            source: format!("{STEP}: unexpected reply {reply:?}").into(),
+        }),
+    }
+}
+
+/// What [`rewrite_session_checkpoint`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRewrite {
+    /// The session's backup was rebuilt from the store and PUT.
+    Rewritten,
+    /// The session has no record in the store: nothing was PUT.
+    SessionAbsent,
+}
+
+/// Rewrite session `session_id`'s backup from the store's live state: build
+/// it ([`build_session_checkpoint`], which mints the `le:{sid}:ckpt` build
+/// stamp, a store write) and PUT it to `store`, its meta naming
+/// `replica_id` as its creator. The disaster-recovery accept-loss Job's
+/// session-backup rewrite (SDD SR-10, PD-8), after it changed the session's
+/// mappings or found its backup undecodable or absent: a later restore then
+/// reads mappings the store holds. Unlike the session-checkpoint writer it
+/// publishes nothing: the minted stamp keeps the live writer's later builds
+/// ordered after this one. One attempt; an absent record PUTs nothing.
+///
+/// `leave_out` maps layer names to objects: a layer the build finds mapped
+/// to exactly that object is left out of the backup, from its mappings and
+/// its layers index alike, while the store still maps it (the Job's
+/// rewrite of an over-limit layer's session ahead of its unmap); a layer
+/// mapped to any other object, or not at all, is written as the build
+/// found it. Empty for a rewrite of the session as it stands.
+pub(crate) async fn rewrite_session_checkpoint(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    store: &dyn crate::checkpoint::store::CheckpointStore,
+    session_id: &str,
+    replica_id: &str,
+    leave_out: &std::collections::BTreeMap<String, u64>,
+) -> Result<SessionRewrite, CheckpointError> {
+    let Some(mut build) = build_session_checkpoint(client, keys, session_id).await? else {
+        return Ok(SessionRewrite::SessionAbsent);
+    };
+    for (layer_name, object_id) in leave_out {
+        if build.checkpoint.layer_mappings.get(layer_name) == Some(object_id) {
+            build.checkpoint.layer_mappings.remove(layer_name);
+            build.checkpoint.layers_index.remove(layer_name);
+        }
+    }
+    let bytes = build.checkpoint.to_bytes()?;
+    let meta = crate::checkpoint::store::CheckpointMeta {
+        creator_replica_id: replica_id.to_owned(),
+        written_at_unix_ms: crate::checkpoint::now_unix_ms(),
+        snap_seq: None,
+        session_id: session_id.to_owned(),
+        ..crate::checkpoint::store::CheckpointMeta::default()
+    };
+    store
+        .put_session_checkpoint(session_id, bytes, meta)
+        .await?;
+    Ok(SessionRewrite::Rewritten)
 }
 
 #[cfg(test)]
@@ -1418,12 +1764,14 @@ mod tests {
     ///
     /// **This is no longer a read race** (b.443 made the read atomic, so the
     /// index membership and the mappings are observed at one instant). It is
-    /// a genuine keyspace state and still reachable: `delete_layer` DELs the
-    /// mapping several steps before it SREMs the index member, so a build
-    /// landing in that window legitimately sees an index member with no
-    /// mapping. Dropping it is correct — a checkpoint naming a layer with no
-    /// `object_id` would restore an unreachable layer, which is exactly what
-    /// `apply_checkpoint`'s SR-2.4 live-mapping guard then refuses.
+    /// a genuine keyspace state: `delete_layer`'s unmap now removes the
+    /// mapping and the member in one step, but an older build deleted the
+    /// mapping several steps before it removed the member, and a delete that
+    /// stopped in that window left the member behind for good; an
+    /// out-of-band write can leave one too. Dropping it is correct — a
+    /// checkpoint naming a layer with no `object_id` would restore an
+    /// unreachable layer, which is exactly what `apply_checkpoint`'s SR-2.4
+    /// live-mapping guard then refuses.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn build_session_checkpoint_layers_index_member_without_mapping_is_filtered() {
         let tv = TestValkey::setup().await;
@@ -1445,10 +1793,10 @@ mod tests {
         .await
         .expect("create_layer must succeed");
 
-        // Reproduce the mid-`delete_layer` state: DEL the mapping key
-        // directly (bypassing `delete_layer`'s cascade, which would also
-        // SREM the layers-index member). The layers-index keeps the orphan
-        // member.
+        // Reproduce the state an older build's `delete_layer` left between
+        // its mapping `DEL` and its layers-index `SREM` (today's unmap
+        // removes both at once): DEL the mapping key directly. The
+        // layers-index keeps the orphan member.
         let mapping_key = tv.key_schema().layer_mapping(&session_id, "raced.usda");
         let _: () = tv
             .client()
@@ -2216,9 +2564,16 @@ mod tests {
         let session_id = format!("apply-rt-{}", uuid::Uuid::new_v4());
         let sc = sample_apply_checkpoint(&session_id);
 
-        apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect("apply must succeed against fresh keyspace");
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect("apply must succeed against fresh keyspace");
 
         // (1) Path-index legacy set: session_id is a member.
         let path_index_key = tv.key_schema().path_index(&sc.base_path);
@@ -2317,9 +2672,16 @@ mod tests {
         let sc = sample_apply_checkpoint(&session_id);
 
         // First apply.
-        apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect("first apply must succeed");
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect("first apply must succeed");
 
         // Snapshot the post-apply state.
         let path_index_key = tv.key_schema().path_index(&sc.base_path);
@@ -2353,9 +2715,16 @@ mod tests {
             .expect("SMEMBERS layers_index #1");
 
         // Second apply — must succeed, must not error.
-        apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect("second apply must succeed (idempotency)");
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect("second apply must succeed (idempotency)");
 
         // Compare post-apply #2 state byte-for-byte against #1. Sets are
         // sorted to defuse non-deterministic SMEMBERS ordering across
@@ -2435,8 +2804,8 @@ mod tests {
         // Step B fails via fault-injection. Post-condition is the
         // "ghost-but-functional" path-index half is present and the
         // session-scoped half is absent — exactly the recoverable
-        // ghost-member state SR-2.7 self-heals via ListSessions' opportunistic
-        // cleanup.
+        // ghost-member state SR-2.7 self-heals via the ListSessions ghost
+        // walk (veto, then release) or a retried recovery.
         let _serial = APPLY_FAULT_SERIAL.lock().await;
         clear_apply_step_fault_injectors_for_test();
         let tv = TestValkey::setup().await;
@@ -2451,9 +2820,16 @@ mod tests {
         set_apply_step_fault_injector_for_test(ApplyStep::StepB, q);
 
         // Apply — must return Transient.
-        let err = apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect_err("Step B fault must surface as Err");
+        let err = apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect_err("Step B fault must surface as Err");
         assert!(
             matches!(err, CheckpointError::Transient { .. }),
             "Step B injection must propagate as Transient; got {err:?}"
@@ -2527,6 +2903,355 @@ mod tests {
 
         // Drain to avoid cross-test bleed.
         clear_apply_step_fault_injectors_for_test();
+    }
+
+    // ───────────────────────────────────────────────────────────────────────
+    // On-access recovery's conditional record step
+    // (`SessionApplySteps::PathIndexThenRecordIfAbsent`,
+    // `scripts/session_record_restore.lua`).
+    //
+    // A second apply of one backup — another replica's restore of the same
+    // session, or the data pool's re-send of a script whose reply was lost —
+    // finds the record and writes nothing, so a `DeleteLayer` or a
+    // `CreateLayer` overwrite that landed between the two keeps its change. A
+    // session carrying the deletion marker gets nothing written. The record is
+    // written last, so a run cut part-way leaves no record and a later apply
+    // writes the whole step. The two-replica race through the recovery hook
+    // is `session_recovery`'s
+    // `concurrent_recoveries_on_two_replicas_keep_a_layer_deleted_between_their_applies`;
+    // a marker landing during Step A, through the hook, is
+    // `tests/integration/checkpoint/e2e_session_recovery_record_step_test.rs`.
+    // ───────────────────────────────────────────────────────────────────────
+
+    /// One apply of `sc` in on-access recovery's conditional mode.
+    async fn apply_if_absent(
+        tv: &TestValkey,
+        session_id: &str,
+        sc: &SessionCheckpoint,
+    ) -> Result<SessionApplied, CheckpointError> {
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            session_id,
+            sc,
+            None,
+            SessionApplySteps::PathIndexThenRecordIfAbsent,
+        )
+        .await
+    }
+
+    async fn mapping_of(tv: &TestValkey, session_id: &str, layer: &str) -> Option<String> {
+        tv.client()
+            .pool
+            .get(tv.key_schema().layer_mapping(session_id, layer))
+            .await
+            .expect("GET layer_mapping")
+    }
+
+    async fn layers_index_of(tv: &TestValkey, session_id: &str) -> BTreeSet<String> {
+        let members: Vec<String> = tv
+            .client()
+            .pool
+            .smembers(tv.key_schema().layers_index(session_id))
+            .await
+            .expect("SMEMBERS layers_index");
+        members.into_iter().collect()
+    }
+
+    async fn record_of(tv: &TestValkey, session_id: &str) -> HashMap<String, String> {
+        tv.client()
+            .pool
+            .hgetall(tv.key_schema().session_meta(session_id))
+            .await
+            .expect("HGETALL session_meta")
+    }
+
+    /// A replay of the record step after a `DeleteLayer` (fail-on-old). The
+    /// first apply restores the session; a `DeleteLayer` then removes
+    /// `root.usda`'s mapping and its layers-index member; a second apply of
+    /// the same backup finds the record, answers `RecordPresent` and writes
+    /// nothing, so the layer stays deleted. With the unconditional Step B in
+    /// this mode, the second apply put the mapping and the member back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_session_checkpoint_if_absent_replayed_after_a_delete_layer_keeps_the_layer_deleted(
+    ) {
+        let _serial = APPLY_FAULT_SERIAL.lock().await;
+        clear_apply_step_fault_injectors_for_test();
+        let tv = TestValkey::setup().await;
+        let session_id = format!("apply-replay-del-{}", uuid::Uuid::new_v4());
+        let sc = sample_apply_checkpoint(&session_id);
+        assert_eq!(
+            apply_if_absent(&tv, &session_id, &sc)
+                .await
+                .expect("the first apply"),
+            SessionApplied::Applied,
+            "fixture: the first apply restores the session"
+        );
+        let _: i64 = tv
+            .client()
+            .pool
+            .del(tv.key_schema().layer_mapping(&session_id, "root.usda"))
+            .await
+            .expect("DEL the mapping, as DeleteLayer does");
+        let _: i64 = tv
+            .client()
+            .pool
+            .srem(
+                tv.key_schema().layers_index(&session_id),
+                ks_hex_encode("root.usda"),
+            )
+            .await
+            .expect("SREM the layers-index member, as DeleteLayer does");
+
+        let replay = apply_if_absent(&tv, &session_id, &sc).await;
+
+        assert_eq!(
+            mapping_of(&tv, &session_id, "root.usda").await,
+            None,
+            "the replay must not put a deleted layer's mapping back"
+        );
+        assert_eq!(
+            layers_index_of(&tv, &session_id).await,
+            BTreeSet::from([ks_hex_encode("sublayer.usda")]),
+            "the replay must not put a deleted layer's layers-index member back"
+        );
+        assert_eq!(
+            mapping_of(&tv, &session_id, "sublayer.usda").await,
+            Some("1002".to_owned()),
+            "the other layer is untouched"
+        );
+        assert_eq!(
+            replay.expect("the replay answers"),
+            SessionApplied::RecordPresent
+        );
+    }
+
+    /// A second replica's apply after a `CreateLayer` overwrite
+    /// (fail-on-old). The first apply restores the session; the overwrite
+    /// then maps `root.usda` to a new object; a second apply of the same
+    /// backup finds the record, answers `RecordPresent` and writes nothing,
+    /// so the new mapping stands. With the unconditional Step B in this mode,
+    /// the second apply put the backup's older mapping back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_session_checkpoint_if_absent_on_a_restored_session_keeps_a_later_mapping() {
+        const OVERWRITTEN_TO: &str = "2001";
+        let _serial = APPLY_FAULT_SERIAL.lock().await;
+        clear_apply_step_fault_injectors_for_test();
+        let tv = TestValkey::setup().await;
+        let session_id = format!("apply-replay-set-{}", uuid::Uuid::new_v4());
+        let sc = sample_apply_checkpoint(&session_id);
+        assert_eq!(
+            apply_if_absent(&tv, &session_id, &sc)
+                .await
+                .expect("the first apply"),
+            SessionApplied::Applied,
+            "fixture: the first apply restores the session"
+        );
+        let index_before = layers_index_of(&tv, &session_id).await;
+        let _: () = tv
+            .client()
+            .pool
+            .set(
+                tv.key_schema().layer_mapping(&session_id, "root.usda"),
+                OVERWRITTEN_TO,
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("SET the mapping to the new object, as a CreateLayer overwrite does");
+
+        let second = apply_if_absent(&tv, &session_id, &sc).await;
+
+        assert_eq!(
+            mapping_of(&tv, &session_id, "root.usda").await.as_deref(),
+            Some(OVERWRITTEN_TO),
+            "the second apply must not put the backup's older mapping back"
+        );
+        assert_eq!(
+            layers_index_of(&tv, &session_id).await,
+            index_before,
+            "the layers index is unchanged"
+        );
+        assert_eq!(
+            second.expect("the second apply answers"),
+            SessionApplied::RecordPresent
+        );
+    }
+
+    /// The deletion marker (fail-on-old). With the marker present and the
+    /// record absent, the conditional record step answers `Deleted` and
+    /// writes no record, no mapping and no layers-index member; Step A, which
+    /// runs before it and does not read the marker, has added the path-index
+    /// members. With the marker check dropped from the script, the record
+    /// step restored the deleted session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_session_checkpoint_if_absent_on_a_marked_session_answers_deleted_and_writes_no_record(
+    ) {
+        let _serial = APPLY_FAULT_SERIAL.lock().await;
+        clear_apply_step_fault_injectors_for_test();
+        let tv = TestValkey::setup().await;
+        let session_id = format!("apply-marked-{}", uuid::Uuid::new_v4());
+        let sc = sample_apply_checkpoint(&session_id);
+        let _: () = tv
+            .client()
+            .pool
+            .set(
+                tv.key_schema().session_deleted_marker(&session_id),
+                "1",
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("SET the deletion marker");
+
+        let applied = apply_if_absent(&tv, &session_id, &sc).await;
+
+        assert!(
+            record_of(&tv, &session_id).await.is_empty(),
+            "a deleted session's record must not be written"
+        );
+        for layer in sc.layer_mappings.keys() {
+            assert_eq!(
+                mapping_of(&tv, &session_id, layer).await,
+                None,
+                "a deleted session's mapping of {layer} must not be written"
+            );
+        }
+        assert!(
+            layers_index_of(&tv, &session_id).await.is_empty(),
+            "a deleted session's layers index must not be written"
+        );
+        assert_eq!(applied.expect("the apply answers"), SessionApplied::Deleted);
+        let path_index: Vec<String> = tv
+            .client()
+            .pool
+            .smembers(tv.key_schema().path_index(&sc.base_path))
+            .await
+            .expect("SMEMBERS path_index");
+        assert!(
+            path_index.contains(&session_id),
+            "Step A ran before the record step; got {path_index:?}"
+        );
+    }
+
+    /// The record is written last (fail-on-old). A wrong-typed layers index
+    /// makes the script's `SADD` fail after its mapping `SET`s: the apply
+    /// answers `Transient` and leaves no record, so its `RecordPresent`
+    /// branch never trusts the cut run. Once the fault is cleared, a re-run
+    /// applies the whole step. With the record's `HSET` moved before the
+    /// `SADD`, the cut run left a record and the re-run wrote nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_session_checkpoint_if_absent_cut_after_a_mapping_leaves_no_record_and_a_rerun_applies(
+    ) {
+        let _serial = APPLY_FAULT_SERIAL.lock().await;
+        clear_apply_step_fault_injectors_for_test();
+        let tv = TestValkey::setup().await;
+        let session_id = format!("apply-cut-{}", uuid::Uuid::new_v4());
+        let sc = sample_apply_checkpoint(&session_id);
+        let layers_index_key = tv.key_schema().layers_index(&session_id);
+        let _: () = tv
+            .client()
+            .pool
+            .set(&layers_index_key, "not-a-set", None, None, false)
+            .await
+            .expect("SET a string where the layers index goes");
+
+        let cut = apply_if_absent(&tv, &session_id, &sc).await;
+
+        match &cut {
+            Err(CheckpointError::Transient { source }) => assert!(
+                source.to_string().contains("session_record_restore"),
+                "the failure names the record step; got {source}"
+            ),
+            other => panic!("a record step cut by a refused SADD is Transient; got {other:?}"),
+        }
+        assert_eq!(
+            mapping_of(&tv, &session_id, "root.usda").await,
+            Some("1001".to_owned()),
+            "fixture: the run was cut after a mapping SET"
+        );
+        assert!(
+            record_of(&tv, &session_id).await.is_empty(),
+            "a cut run must leave no record"
+        );
+
+        let _: i64 = tv
+            .client()
+            .pool
+            .del(&layers_index_key)
+            .await
+            .expect("clear the fault");
+        let rerun = apply_if_absent(&tv, &session_id, &sc).await;
+
+        assert_eq!(rerun.expect("the re-run answers"), SessionApplied::Applied);
+        let record = record_of(&tv, &session_id).await;
+        let want: HashMap<String, String> = record_fields(&sc)
+            .into_iter()
+            .map(|(field, value)| (field.to_owned(), value))
+            .collect();
+        assert_eq!(record, want, "the re-run writes the record");
+        for (layer, object_id) in &sc.layer_mappings {
+            assert_eq!(
+                mapping_of(&tv, &session_id, layer).await,
+                Some(object_id.to_string()),
+                "the re-run writes {layer}'s mapping"
+            );
+        }
+        assert_eq!(
+            layers_index_of(&tv, &session_id).await,
+            sc.layers_index
+                .iter()
+                .map(|n| ks_hex_encode(n))
+                .collect::<BTreeSet<String>>(),
+            "the re-run writes the layers index"
+        );
+    }
+
+    /// `session_record_restore.lua` refuses an `ARGV` shorter than the
+    /// record's four pairs plus one object id per mapping key, before it reads
+    /// or writes anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_record_restore_script_with_a_short_argv_is_refused_writing_nothing() {
+        let tv = TestValkey::setup().await;
+        let session_id = format!("restore-bad-args-{}", uuid::Uuid::new_v4());
+        let keys = tv.key_schema();
+        let script_keys = vec![
+            keys.session_meta(&session_id),
+            keys.session_deleted_marker(&session_id),
+            keys.layers_index(&session_id),
+            keys.layer_mapping(&session_id, "root.usda"),
+        ];
+        // The record's four pairs, and no object id for the one mapping key.
+        let argv: Vec<String> = [
+            "name",
+            "n",
+            "base_path",
+            "/p",
+            "created_by",
+            "u",
+            "created_at",
+            "1",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+
+        let reply: Result<Vec<String>, fred::error::Error> = SESSION_RECORD_RESTORE_SCRIPT
+            .evalsha_with_reload(tv.client().pool.next(), script_keys, argv)
+            .await;
+
+        match reply {
+            Err(e) => assert!(
+                e.details().starts_with("BAD_ARGS: "),
+                "the refusal leads with BAD_ARGS; got {:?}",
+                e.details()
+            ),
+            Ok(reply) => panic!("a short ARGV must be refused; got {reply:?}"),
+        }
+        assert!(record_of(&tv, &session_id).await.is_empty());
+        assert_eq!(mapping_of(&tv, &session_id, "root.usda").await, None);
     }
 
     // ───────────────────────────────────────────────────────────────────────
@@ -2724,9 +3449,16 @@ mod tests {
         let session_id = format!("apply-4t3-brace-{{{}}}", uuid::Uuid::new_v4());
         let sc = brace_hostile_apply_checkpoint(&session_id);
 
-        apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect("the brace-hostile checkpoint must apply against a fresh keyspace");
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect("the brace-hostile checkpoint must apply against a fresh keyspace");
 
         // (1) Step A, path-names half: all THREE composites land. Two of them
         //     belong to sibling sessions rooted at the same base path, so this
@@ -2964,8 +3696,15 @@ mod tests {
         let capture = tracing::subscriber::set_default(subscriber);
 
         // Act — the applier's own two checkouts.
-        let applied =
-            apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc).await;
+        let applied = apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await;
 
         // Stop capturing before the assertions so a panic's own output is not
         // swallowed by the buffer.
@@ -3073,9 +3812,16 @@ mod tests {
              has work and the all-empty malformed-checkpoint guard is NOT the branch under test"
         );
 
-        apply_session_checkpoint(tv.client(), tv.key_schema(), &session_id, &sc)
-            .await
-            .expect("a path-names-only contribution is well-formed and must apply");
+        apply_session_checkpoint(
+            tv.client(),
+            tv.key_schema(),
+            &session_id,
+            &sc,
+            None,
+            SessionApplySteps::PathIndexThenRecord,
+        )
+        .await
+        .expect("a path-names-only contribution is well-formed and must apply");
 
         let path_names: Vec<String> = tv
             .client()
@@ -3204,6 +3950,115 @@ mod tests {
             command_timeout_row(&metrics),
             command_timeouts_only_on("data", 1),
             "the timed-out EVALSHA must count once, on the data pool"
+        );
+    }
+
+    /// [`rewrite_session_checkpoint`]'s `leave_out` (fail-on-old). A layer
+    /// the store maps to exactly the object named is left out of the PUT
+    /// backup, from its mappings and its layers index alike, and the store
+    /// still maps and indexes it; a layer named with another object than
+    /// the store maps, and a name the store does not map, change nothing,
+    /// so every other layer is written as found. An empty `leave_out`
+    /// writes the session as it stands. With the object-equality check
+    /// dropped, the layer named with another object is left out too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rewrite_session_checkpoint_leaves_out_only_a_layer_mapped_to_the_named_object() {
+        use crate::checkpoint::adapters::in_memory::InMemoryCheckpointStore;
+        use crate::checkpoint::store::CheckpointStore;
+
+        let tv = TestValkey::setup().await;
+        let ss = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+        let ls = LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096);
+        let ext_store: Arc<MockExternalValueStore> = Arc::new(MockExternalValueStore::new());
+        let session_id = ss
+            .create("leave-out-stage", "/stage/leave-out", "leave-out-user")
+            .await
+            .expect("session creation must succeed");
+        let mut objects = BTreeMap::new();
+        for layer in ["left.usda", "other.usda", "kept.usda"] {
+            let object_id = ls
+                .create_layer(
+                    &session_id,
+                    layer,
+                    "leave-out-user",
+                    &fresh_state(),
+                    ext_store.clone(),
+                )
+                .await
+                .expect("create_layer must succeed");
+            objects.insert(layer.to_owned(), object_id);
+        }
+        let store = InMemoryCheckpointStore::new();
+        let rewrite = |leave_out: BTreeMap<String, u64>| {
+            let (tv, store, session_id) = (&tv, &store, session_id.as_str());
+            async move {
+                let outcome = rewrite_session_checkpoint(
+                    tv.client(),
+                    tv.key_schema(),
+                    store,
+                    session_id,
+                    "replica-a",
+                    &leave_out,
+                )
+                .await
+                .expect("the rewrite succeeds");
+                assert_eq!(outcome, SessionRewrite::Rewritten);
+                let blob = store
+                    .get_session_checkpoint(session_id)
+                    .await
+                    .expect("the in-memory store answers")
+                    .expect("the backup was PUT");
+                SessionCheckpoint::from_bytes(&blob.bytes).expect("the backup decodes")
+            }
+        };
+
+        let backup = rewrite(BTreeMap::from([
+            ("left.usda".to_owned(), objects["left.usda"]),
+            ("other.usda".to_owned(), objects["other.usda"] + 1_000),
+            ("absent.usda".to_owned(), objects["kept.usda"]),
+        ]))
+        .await;
+
+        let written: BTreeMap<String, u64> = objects
+            .iter()
+            .filter(|(layer, _)| layer.as_str() != "left.usda")
+            .map(|(layer, object_id)| (layer.clone(), *object_id))
+            .collect();
+        assert_eq!(
+            backup.layer_mappings, written,
+            "only the layer mapped to the object named is left out"
+        );
+        assert_eq!(
+            backup.layers_index,
+            BTreeSet::from(["kept.usda".to_owned(), "other.usda".to_owned()]),
+            "and it is left out of the layers index too"
+        );
+        let mapped: Option<String> = tv
+            .client()
+            .pool
+            .get(tv.key_schema().layer_mapping(&session_id, "left.usda"))
+            .await
+            .expect("GET mapping");
+        assert_eq!(
+            mapped,
+            Some(objects["left.usda"].to_string()),
+            "the store still maps the layer left out"
+        );
+        let indexed: bool = tv
+            .client()
+            .pool
+            .sismember(
+                tv.key_schema().layers_index(&session_id),
+                hex_encode("left.usda"),
+            )
+            .await
+            .expect("SISMEMBER");
+        assert!(indexed, "and still indexes it");
+
+        let whole = rewrite(BTreeMap::new()).await;
+        assert_eq!(
+            whole.layer_mappings, objects,
+            "an empty leave_out writes every mapping"
         );
     }
 }

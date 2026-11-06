@@ -40,7 +40,7 @@
 //! | [`chained_call_waiting_when_the_layer_is_deleted_is_answered_not_found_without_status_details`] / [`fault_injected::chained_call_waiting_when_create_layer_supersedes_its_object_is_answered_failed_precondition`] / [`chained_call_waiting_when_its_header_is_removed_and_the_layer_is_replaced_is_answered_failed_precondition`] | 11, Q2 | a replaced or deleted object ends a waiting call `FAILED_PRECONDITION` / `NOT_FOUND`, plain, outcome `replaced`; a removed header under a live mapping keeps it waiting |
 //! | [`chained_call_to_a_stale_object_id_is_refused_failed_precondition_without_status_details`] | Q2 | the step-3 stale-object refusal of a chained call is plain |
 //! | [`chained_header_read_as_a_pre_chaining_replica_reads_it_is_refused_before_any_chunk`] | 12 | the fail-closed old replica: the frame it decodes is refused `INVALID_ARGUMENT` with no details having read no chunk |
-//! | [`every_invalid_argument_a_chained_call_meets_carries_invalid_update`] | 13 | every `INVALID_ARGUMENT` producer reachable by a chained call that has no reason of its own carries `INVALID_UPDATE`; the unchained twin stays plain with the same message |
+//! | [`every_invalid_argument_a_chained_call_meets_carries_invalid_update`] | 13 | every `INVALID_ARGUMENT` producer reachable by a chained call that has no reason of its own carries `INVALID_UPDATE` (the layer-root rule's refusal after the plan, SDD §9.7, included); the unchained twin stays plain with the same message |
 //! | [`size_refusals_a_chained_call_meets_carry_their_own_reason_in_place_of_invalid_update`] | 13 (b.tbw) | a size refusal keeps its own reason on a chained call — `DELTA_TOO_LARGE`, or `CHILDREN_LIST_TOO_LONG` from the domain bound or the parser's cap — exactly as on the unchained twin; a content error on the same service still carries `INVALID_UPDATE` |
 //! | [`fault_injected::planning_invalid_argument_after_a_counted_retry_is_plain_unavailable`] / [`fault_injected::planning_invalid_argument_on_the_reissue_after_a_two_attempt_first_call_is_plain_unavailable`] | 14 (a) | after a counted retry a chained `INVALID_ARGUMENT` becomes a plain `UNAVAILABLE`, outcome unknown |
 //! | [`chained_call_waiting_at_shutdown_is_refused_server_shutting_down_at_stage_chain`] | 19, 22 | graceful shutdown ends a waiting call `UNAVAILABLE "server shutting down"`, INFO at stage `chain`, outcome `shutdown` |
@@ -137,7 +137,7 @@ use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::layer::LayerStore;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::{connect_test_client, TestValkey};
-use oodf_ffi::{CommandCreateSection, OwnedDelta, StructCommand};
+use oodf_ffi::{CommandCreateSection, CommandDeleteSection, OwnedDelta, StructCommand};
 
 use super::helpers::*;
 use super::log_capture::{
@@ -314,6 +314,20 @@ fn sections_ompf(sections: &[(u64, u64)]) -> Vec<u8> {
 /// creates section 70 twice (`DuplicateSection`, `INVALID_ARGUMENT`).
 fn duplicate_section_ompf() -> Vec<u8> {
     sections_ompf(&[(0, 70), (0, 70)])
+}
+
+/// A delta deleting section 1, the root every [`new_target`] layer holds (the
+/// root the service supplies to its empty create): refused after the plan by
+/// the layer-root rule (`RemovesLastTopLevelSection`, `INVALID_ARGUMENT`).
+fn delete_root_ompf() -> Vec<u8> {
+    let delta = OwnedDelta {
+        struct_commands: vec![StructCommand::DeleteSection(CommandDeleteSection {
+            parent_id: 0,
+            section_id: 1,
+        })],
+        ..Default::default()
+    };
+    delta_to_ompf_bytes(&delta, &[])
 }
 
 /// A chained header from `client`.
@@ -2089,6 +2103,14 @@ async fn every_invalid_argument_a_chained_call_meets_carries_invalid_update() {
                 make_update_data(duplicate_section_ompf()),
             ]),
         },
+        Producer {
+            name: "the layer-root rule after the plan (deleting the last top-level section)",
+            chained: vec![chained_head("iu-1"), make_update_data(delete_root_ompf())],
+            unchained: Some(vec![
+                plain_head("iu-1"),
+                make_update_data(delete_root_ompf()),
+            ]),
+        },
     ];
 
     for producer in producers {
@@ -3188,9 +3210,12 @@ impl ChainServer {
         let task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = ready_tx.send(());
-            production_server_builder()
+            production_server_builder(svc.upload_admission.max_waiters())
                 .layer(metrics_layer)
-                .add_service(live_service_server(svc))
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("test server error");
@@ -3940,8 +3965,8 @@ async fn chained_call_parked_at_the_gate_whose_connection_closes_applies_nothing
 use futures::future::BoxFuture;
 use live_edit::config::UpdateLayerBackend;
 use live_edit::storage::external_values::{
-    ExtRelease, ExtValueProbe, ExtValueVerify, ExternalValueStore, GcBatchResult, GcPassState,
-    GcPolicy, MockExternalValueStore, ReleaseAttemptOutcome,
+    ExtRelease, ExtValueLengths, ExtValueProbe, ExtValueVerify, ExternalValueStore, GcBatchResult,
+    GcPassState, GcPolicy, MockExternalValueStore, ReleaseAttemptOutcome,
 };
 
 /// The external-value store of a call under test: `inner` (the mock, or a
@@ -4038,6 +4063,33 @@ impl ExternalValueStore for IntrudingExtStore {
 
     async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
         self.inner.probe_values(hashes).await
+    }
+
+    // The catch-up payload's reads are defaulted on the trait: an omitted arm
+    // would substitute the default (a whole-value read) for the inner store's
+    // own, so they are forwarded too.
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
     }
 
     async fn enqueue_retirement_attempt(

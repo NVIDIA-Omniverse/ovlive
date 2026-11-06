@@ -19,6 +19,7 @@
 
 use std::env;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -26,10 +27,13 @@ use std::time::Duration;
 use crate::checkpoint::tail_codec::{TAIL_HEADER_SIZE, TAIL_RECORD_PREFIX_SIZE};
 use crate::checkpoint::CheckpointAdapter;
 
+pub mod key_prefix;
 pub mod memory_plan;
 pub mod pod_memory;
 
-pub use memory_plan::{PlanInputs, PodMemoryPlan, SUBSCRIPTION_CEILING_AT_REFERENCE_LIMIT};
+pub use memory_plan::{
+    MemoryLimitSetting, PlanInputs, PodMemoryPlan, SUBSCRIPTION_CEILING_AT_REFERENCE_LIMIT,
+};
 pub use pod_memory::{
     PodMemoryLimit, PodMemoryLimitSource, PodMemorySource, REFERENCE_POD_MEMORY_LIMIT_BYTES,
     REFERENCE_POD_MEMORY_LIMIT_MIB,
@@ -470,10 +474,8 @@ pub struct Config {
     /// ([`Self::catchup_build_memory_budget_mib`]), or, past what the pod
     /// memory limit can carry, refuses startup (`config::memory_plan`).
     /// A catch-up (a re-bootstrap's included) holds a slot only
-    /// across its backing-store reads and its build — and, in rollback mode
-    /// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) on a same-object reconnect,
-    /// the cluster stream-reader wait — never across a send and never on the
-    /// up-to-date path. A shared fenced-read flight
+    /// across its backing-store reads and its build — never across a send and
+    /// never on the up-to-date path. A shared fenced-read flight
     /// (`storage::snapshot_flights`) is one unit of catch-up work: it holds one
     /// slot from its read, through its fence `RETRY_AFTER` sleeps and its
     /// permit and memory waits, to the last build of the catch-ups attached to
@@ -484,17 +486,18 @@ pub struct Config {
     /// ([`Self::subscriber_admission_wait_ms`]; cancelled by session deletion,
     /// shutdown or client disconnect) instead of all allocating a full layer
     /// state at once, and is refused `UNAVAILABLE` (`catchup_capacity`) when the
-    /// budget runs out: before any content during catch-up, in both catch-up
-    /// modes; after the caught-up ack only for a steady-state overwrite
-    /// re-bootstrap. A value above
+    /// budget runs out: before any content during catch-up; after the
+    /// caught-up ack only for a steady-state overwrite re-bootstrap. A value above
     /// `tokio::sync::Semaphore::MAX_PERMITS` is rejected at startup.
     pub subscriber_max_concurrent_catchups: usize,
     /// A `SubscribeReadLayer`'s single capacity-wait budget
     /// (LIVE_EDIT_SUBSCRIBER_ADMISSION_WAIT_MS). Default: 20000. One budget
     /// covers every wait for capacity the subscribe makes: for an admission
-    /// slot, in cluster mode for a free stream reader, for each catch-up slot
-    /// and for each snapshot read permit
-    /// ([`Self::catchup_snapshot_read_concurrency`]), and, for a catch-up
+    /// slot, in cluster mode for a free stream reader, for each catch-up slot,
+    /// for each snapshot read permit
+    /// ([`Self::catchup_snapshot_read_concurrency`]) and for each catch-up
+    /// payload's reservation of the catch-up payload budget
+    /// (`ValkeyClient::catchup_payload_budget`), and, for a catch-up
     /// attached to a shared fenced-read flight, the time it is attached while
     /// the flight waits for its slot, its fenced read permit
     /// ([`Self::catchup_fenced_read_concurrency`]) or its memory
@@ -503,8 +506,8 @@ pub struct Config {
     /// is not charged, nor is a flight's fence sleeps, its wait for a
     /// predecessor flight or a wait for a build turn. A re-bootstrap onto an overwritten
     /// layer's new object starts a fresh budget. Zero means never wait for
-    /// capacity: each of those waits takes a free slot, reader or permit or is
-    /// refused at once, and no queue is joined (b.f4f).
+    /// capacity: each of those waits takes free capacity or is refused at
+    /// once, and no queue is joined (b.f4f).
     ///
     /// The 20 s default is derived from the tightest client retry window
     /// (SDD §16): the longest budget, rounded down to 5 s, that still leaves a
@@ -519,12 +522,12 @@ pub struct Config {
     /// read-permission check — so pod saturation is not observable to an
     /// unauthorized caller — and *before* the response channel and the
     /// catch-up spawn, so an admission refusal is a Trailers-Only status with
-    /// no task spawned behind it. The reader, catch-up-slot and read-permit
-    /// waits (a shared fenced-read flight's slot, permit and memory waits
-    /// included, as its attached catch-ups' shares of them) come after the
-    /// stream opens and race the same three endings, and their refusals
-    /// (`reader_capacity`, `catchup_capacity` for the others) end the stream
-    /// `UNAVAILABLE`:
+    /// no task spawned behind it. The reader, catch-up-slot, read-permit and
+    /// catch-up payload waits (a shared fenced-read flight's slot, permit and
+    /// memory waits included, as its attached catch-ups' shares of them) come
+    /// after the stream opens and race the same three endings, and their
+    /// refusals (`reader_capacity`, `catchup_capacity` for the others) end the
+    /// stream `UNAVAILABLE`:
     /// before any content during catch-up; after the caught-up ack only for a
     /// steady-state overwrite re-bootstrap.
     pub subscriber_admission_wait_ms: u64,
@@ -539,7 +542,8 @@ pub struct Config {
     pub subscriber_admission_max_waiters: Option<usize>,
     /// Maintenance pool size: dedicated Valkey connections used by the
     /// background GC sweep + orphan sweep (and the reference-count reconciler's
-    /// and the external-value backup repair's keyspace walks) so they cannot
+    /// and the external-value backup repair's keyspace walks, and the
+    /// checkpoint clean-up's `{recon}` reads and scripts) so they cannot
     /// starve the data pool with long-running SCAN / HGETALL passes
     /// (LIVE_EDIT_MAINTENANCE_POOL_SIZE). Default: 1.
     ///
@@ -560,9 +564,7 @@ pub struct Config {
     /// read only; the wait is a capacity wait, charged to the subscription's
     /// budget ([`Self::subscriber_admission_wait_ms`]) and refused
     /// `UNAVAILABLE` (`catchup_capacity`) before any content when it runs out.
-    /// A legacy in-window replay takes one per replayed commit the same way,
-    /// except for an empty commit, which reads nothing. The steady state never
-    /// reads layer state and takes none. It bounds the shard-blocking atomic
+    /// The steady state never reads layer state and takes none. It bounds the shard-blocking atomic
     /// reads one replica issues at
     /// once, so raising it raises the writer delay a join wave can cause; the
     /// ceilings hold only at the value they were solved at.
@@ -633,7 +635,7 @@ pub struct Config {
     /// Default: [`snapshot_pool_size_default`] of the configured
     /// [`Self::catchup_snapshot_read_concurrency`] and
     /// [`Self::catchup_fenced_read_concurrency`], `P_a + P_f + 4` (6 at the
-    /// defaults): one connection per atomic read (catch-up or per-commit) and
+    /// defaults): one connection per catch-up atomic read and
     /// per fenced read a replica runs at once, plus four for the structural
     /// and checkpoint reads and the ext-GC reference walks.
     ///
@@ -652,7 +654,12 @@ pub struct Config {
     /// would cut every one of them before it could finish.
     pub valkey_connect_timeout_secs: u64,
     /// Per-command timeout applied to every Valkey command in ms
-    /// (LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS). Default: 5000. 0 disables the timeout.
+    /// (LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS). Default: 5000. Zero is rejected
+    /// at startup: it is fred's "no timeout", which would leave unbounded
+    /// every write the service has handed to fred, the disaster-recovery
+    /// hold's bound on a replica's last write after entry included
+    /// (`dr::hold::hold_write_bound`). Code that takes the value still treats
+    /// 0 as fred does, for configurations a test builds directly.
     ///
     /// Prevents commands from hanging indefinitely when a pooled connection is
     /// mid-reconnect (e.g. after a Valkey restart). Pair with
@@ -765,9 +772,11 @@ pub struct Config {
     /// refused for its size. Every CreateLayer / UpdateLayer reserves from it
     /// after its authorization and before reading its content, and holds the
     /// reservation to the end of the call (`grpc::upload_admission`, SDD
-    /// §5.4); one whose processing does not fit runs in the overflow slot, one
-    /// at a time beyond the budget. `LIVE_EDIT_UPLOAD_MEMORY_BUDGET_MIB`, which
-    /// set it before, is refused at startup.
+    /// §5.4); one whose processing does not fit — or, unless it is a chained
+    /// UpdateLayer, whose content does not fit while it is received and finds
+    /// the slot free — runs in the overflow slot, one at a time beyond the
+    /// budget. `LIVE_EDIT_UPLOAD_MEMORY_BUDGET_MIB`, which set it before, is
+    /// refused at startup.
     ///
     /// Copied from [`Self::pod_memory`] at load (`with_pod_memory_plan`); the
     /// plan is the authority.
@@ -785,7 +794,11 @@ pub struct Config {
     /// (LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS). Default:
     /// [`UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT`](crate::grpc::upload_admission::UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT)
     /// = 64. One more is refused UNAVAILABLE at once. Zero is rejected at
-    /// startup; fail-fast is `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS=0`.
+    /// startup; fail-fast is `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS=0`. It also
+    /// sizes each inbound connection's HTTP/2 receive window, (cap + 1) ×
+    /// 1 MiB (`grpc::transport::http2_connection_window_bytes`), so a cap above
+    /// 2,046, whose window would pass HTTP/2's largest, is rejected at startup
+    /// too.
     pub upload_admission_max_waiters: usize,
     /// The entry cap on per-layer Streams retention, applied as `MAXLEN ~ N`
     /// on every `XADD` to the layer stream (LIVE_EDIT_LAYER_STREAM_MAXLEN).
@@ -900,22 +913,30 @@ pub struct Config {
     /// Applies to (a) the HTTP/2 drain window after flipping the readiness
     /// probe to NOT_SERVING — live streams keep serving through it, and start
     /// ending `UNAVAILABLE`, paced, just after it, behind the server's GOAWAY
-    /// ([`Self::shutdown_stream_end_rate`]) — and (b) the per-task join budget
-    /// for each background task, and for the JoinSession and
-    /// SubscribeReadLayer task drains, during the shutdown sequence.
+    /// ([`Self::shutdown_stream_end_rate`]) — and (b) the per-task bound of
+    /// each wait in the post-server shutdown sequence before Valkey `quit()`:
+    /// the layer-cleanup drain, the JoinSession and SubscribeReadLayer task
+    /// drains, the session-checkpoint drain and the background-task join. A
+    /// wait gets less when the sequence's shared deadline, which keeps
+    /// `MIN_SHUTDOWN_BUDGET_HEADROOM_SECS` (15 s) of
+    /// [`Self::shutdown_overall_budget_secs`] for `quit()`, is nearer
+    /// (`grpc::transport::run_post_server_sequence`).
     pub shutdown_timeout_secs: u64,
     /// Overall upper bound on the post-gRPC-server shutdown sequence in
     /// seconds (LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS). Default: 30.
     ///
-    /// The shutdown sequence after the gRPC server stops (layer-cleanup
-    /// wait + streaming-RPC and session-checkpoint drains + background-task
-    /// joins + Valkey `quit()`) runs under one `tokio::time::timeout` sized
-    /// to this value; the metrics-server abort and the final telemetry flush
-    /// run after it, outside this budget. Must fit inside the Helm chart's
-    /// `terminationGracePeriodSeconds` (80 s by default) together with the
-    /// drain window (`shutdown_timeout_secs`), the bound on the server after
-    /// GOAWAY and the final flush; the startup log line reports the minimum
-    /// grace this configuration needs
+    /// The shutdown sequence after the gRPC server stops (the layer-cleanup
+    /// wait beside the streaming-RPC drains, then the session-checkpoint
+    /// drain, then one concurrent background-task join, then Valkey `quit()`;
+    /// `grpc::transport::run_post_server_sequence`) runs under one
+    /// `tokio::time::timeout` sized to this value, and every wait before
+    /// `quit()` ends early enough to leave `quit()`
+    /// `MIN_SHUTDOWN_BUDGET_HEADROOM_SECS` (15 s) of it; the metrics-server
+    /// abort and the final telemetry flush run after it, outside this budget.
+    /// Must fit inside the Helm chart's `terminationGracePeriodSeconds` (80 s
+    /// by default) together with the drain window (`shutdown_timeout_secs`),
+    /// the bound on the server after GOAWAY and the final flush; the startup
+    /// log line reports the minimum grace this configuration needs
     /// (`grpc::transport::minimum_termination_grace`). See b.3z7 C-2.
     pub shutdown_overall_budget_secs: u64,
     /// Graceful shutdown's stream endings per second, per replica, while the
@@ -1040,8 +1061,9 @@ pub struct Config {
     /// Its own interval rather than a step of the GC loop: the pass walks the
     /// whole object and blob keyspace, which is far too heavy for that
     /// cadence, and the residuals it drains accumulate over hours, not seconds.
-    /// It shares the `le:gc:leader` lease with the GC and orphan sweeps and the
-    /// external-value backup repair — independent cadences, one lease, the
+    /// It shares the `le:gc:leader` lease with the GC and orphan sweeps, the
+    /// external-value backup repair and the checkpoint clean-up — independent
+    /// cadences, one lease, the
     /// SDD §22.7.2 shape.
     ///
     /// The pass's **grace** — the window a surplus must survive unchanged before
@@ -1163,15 +1185,6 @@ pub struct Config {
     /// (LIVE_EDIT_EXT_VALUE_VERIFY). Default: `enforce`. See
     /// [`ExtValueVerifyMode`].
     pub ext_value_verify: ExtValueVerifyMode,
-    /// Late-join / catch-up snapshot switch (LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED).
-    /// Default: `true` (on).
-    ///
-    /// `true` (default) routes late-join / rejoin catch-up through the faithful
-    /// builders: a full-state snapshot for a brand-new subscriber (SDD §12.9)
-    /// and one coalesced diff reconciled in place for a reconnector (SDD
-    /// §12.10). `false` selects the legacy builders (SDD §12.3). The routing
-    /// that acts on this flag lives in the subscribe handler.
-    pub catchup_snapshot_enabled: bool,
     /// Item ceiling for one atomic object-snapshot read
     /// (LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS; Spec SDD SR-1.9). Default:
     /// [`SNAPSHOT_ATOMIC_READ_MAX_ITEMS_DEFAULT`] = 37,554.
@@ -1298,8 +1311,9 @@ pub struct Config {
     /// SDD §22.7 step 5.
     pub checkpoint_quiesce_secs: u64,
     /// Tick cadence in seconds for the checkpoint loop's quiesce-watch
-    /// poll (LIVE_EDIT_CHECKPOINT_TICK_SECS). Default: 10. Zero is rejected
-    /// and the value must be strictly less than `checkpoint_interval_secs`.
+    /// poll (LIVE_EDIT_CHECKPOINT_TICK_SECS). Default: 10. Zero is rejected,
+    /// and the value must be strictly less than `checkpoint_interval_secs`
+    /// and than [`CHECKPOINT_TICK_MAX_EXCLUSIVE_MS`] (20 s).
     pub checkpoint_tick_secs: u64,
     /// Number of historical checkpoint generations the GC retains per
     /// object after a successful new write
@@ -1355,8 +1369,10 @@ pub struct Config {
     /// publish arithmetic). A flat 3600 would refuse to boot once that timeout
     /// pushes the grace past an hour — on a variable the operator never set.
     ///
-    /// Runs on the same `le:checkpoint:leader` lock as the per-layer and
-    /// counters ticks, on its own timer. Hourly by default because the pass is
+    /// Runs as its own task, the checkpoint clean-up, on the maintenance
+    /// leader lock `le:gc:leader` (b.g65) — not on the `le:checkpoint:leader`
+    /// lock the per-layer and counters ticks use, so the backup loop never
+    /// pauses for it — and only while a current build leads backups. Hourly by default because the pass is
     /// pure garbage reclamation on a cold path: its input is a full enumeration
     /// of the adapter's `layers/` namespace plus one live-set read, both of
     /// which are LIST-shaped and cost real money on a blob backend, and nothing
@@ -1462,6 +1478,14 @@ pub struct Config {
     /// payload budget of zero, so no verbatim commit is representable and every
     /// capture would refuse observably as `refused_missing_bytes`. Rejecting at
     /// startup turns a permanent silent refusal loop into a loud boot failure.
+    ///
+    /// The pod memory plan charges the capture this cap allows: about twice
+    /// it, plus a per-entry overhead up to
+    /// [`Self::checkpoint_tail_max_entries`] and one page, inside the line's
+    /// checkpoint term (`config::memory_plan::tail_capture_peak_bytes`). At
+    /// the default the checkpoint reference read is the larger, so the cap
+    /// costs nothing; raised past about 84 MiB it sets the term, lowering the
+    /// catch-up budget or, on too small a pod, refusing startup.
     pub checkpoint_tail_max_bytes: usize,
     /// Filesystem path used by the `LocalDisk` checkpoint adapter
     /// (LIVE_EDIT_CHECKPOINT_LOCAL_DISK_PATH). Default: `None`.
@@ -1519,6 +1543,30 @@ pub struct Config {
     /// `t2.fgj.jd.8e` passes the value into
     /// `StorageApiCheckpointStore::new`.
     pub checkpoint_request_timeout_ms: u64,
+    /// How long, in seconds, the storage service behind the `StorageApi`
+    /// adapter may answer a by-address read from a cache: not found for an
+    /// object written after the cached read, or the earlier content of one
+    /// rewritten or deleted after it
+    /// (LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS; the name
+    /// predates the widened meaning and is kept). Default:
+    /// [`CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT`] (900, the
+    /// storage service's default cache lifetime). SDD SR-9.1, §16, §22.16.
+    ///
+    /// The storage service can cache a by-address answer per pod, and a write
+    /// clears the entry on at most the pod that served it, and only with
+    /// update invalidation on (peers asynchronously with the shared cache;
+    /// SDD §22.16), so any
+    /// by-address answer read through this adapter (a GET's body, a HEAD, a
+    /// not-found) may be this old; a listing is fresh. The restore and
+    /// accept-loss Jobs (`crate::dr::job`) never act on an absence observed
+    /// before `detected_at` + the quiet period + this lifetime (`T_safe`);
+    /// they wait and observe again. Read by the Jobs only, and only under the
+    /// `StorageApi` adapter: `LocalDisk` and `InMemory` have no such cache and
+    /// count 0. The on-access readers (session and layer recovery, the
+    /// counter seed) do not read it; their stale-answer residual is stated in
+    /// SDD §22.16. Any whole number of seconds, 0 included; set it to at least
+    /// the storage service's by-address cache lifetime.
+    pub checkpoint_storage_api_not_found_cache_secs: u64,
     /// Number of worker tasks that drain the external-value blob mirror
     /// queue (LIVE_EDIT_CHECKPOINT_EXT_MIRROR_WORKERS). Default: 2, at most
     /// [`crate::checkpoint::ext_mirror::EXT_MIRROR_MAX_WORKERS`] (16).
@@ -1606,6 +1654,29 @@ pub struct Config {
     /// because a zero-interval `tokio::time::interval` panics. b.j5t item 5 /
     /// b.f36 A6.
     pub session_tokens_sweep_interval_secs: u64,
+    /// Interval in ms between hold polls (LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS).
+    /// Default: [`DR_HOLD_POLL_INTERVAL_MS_DEFAULT`] (2000). SDD SR-2.2, SR-6.5.
+    ///
+    /// Every replica reads the fleet hold marker this often
+    /// (`crate::dr::hold`), and each read is bounded by the smaller of this and
+    /// [`Self::valkey_command_timeout_ms`]. Accepted from 1 to
+    /// [`DR_HOLD_POLL_INTERVAL_MS_MAX`] (6000): zero would panic
+    /// `tokio::time::interval`, and above the maximum fewer than five polls
+    /// fit in the 30 s after which a replica's verdict counts as stale
+    /// (`crate::dr::hold::STALE_VERDICT_THRESHOLD`), so a few failed polls in
+    /// a row would make it stale.
+    pub dr_hold_poll_interval_ms: u64,
+    /// The most layers the restore and accept-loss Jobs plan or write at once
+    /// (LIVE_EDIT_DR_RESTORE_PARALLELISM). Default:
+    /// [`DR_RESTORE_PARALLELISM_DEFAULT`] (8). A count, not a memory budget:
+    /// the Job also admits layers only within its restore memory budget, a
+    /// fixed half of its pod memory limit (`dr::job::execute::memory`), and
+    /// one at a time when it can read no limit. Read only by the Jobs; the
+    /// server ignores it. Zero is refused at startup. Accept-loss's value
+    /// removal holds one admission per layer within that budget too, its
+    /// charge set by whether the allocator is purged around its transactions
+    /// (`dr::job::execute::memory::value_removal_admission`).
+    pub dr_restore_parallelism: NonZeroUsize,
     /// The pod memory plan: the pod memory limit read at startup, every
     /// pod-memory budget derived from it and the term list they close
     /// (`config::memory_plan`). [`Self::from_env`] derives it and copies its
@@ -1670,10 +1741,12 @@ const _: () = assert!(
 /// The headroom `LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS` must leave above
 /// `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` (`Config::validate_shutdown_budgets`):
 /// room for `ValkeyClient::quit()`'s sequential internal bounds plus slack for
-/// the shutdown steps with no timeout of their own. The `const` assertion
-/// after `STREAM_MUX_SHUTDOWN_GRACE` in `storage::client` sums those bounds
-/// against this value, so a bound raised or added in `quit()` without raising
-/// this fails the build.
+/// the shutdown steps with no timeout of their own. The post-server shutdown
+/// sequence's shared deadline keeps this much of the overall budget for
+/// `quit()` (`grpc::transport::run_post_server_sequence`). The `const`
+/// assertion after `STREAM_MUX_SHUTDOWN_GRACE` in `storage::client` sums those
+/// bounds against this value, so a bound raised or added in `quit()` without
+/// raising this fails the build.
 pub(crate) const MIN_SHUTDOWN_BUDGET_HEADROOM_SECS: u64 = 15;
 
 /// Default `LIVE_EDIT_MAX_LAYER_SIZE`: 104,857,600 bytes (100 MiB), the cap on
@@ -1749,6 +1822,41 @@ pub const RPC_DEADLINE_MS_DEFAULT: u64 = 30_000;
 /// `LayerStore::with_commit_release_ring_ttl` uses
 /// (`storage::keys::commit_release_ring_ttl`).
 pub const VALKEY_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+
+/// Default `LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS`: 2 s, fifteen polls inside the
+/// 30 s stale-verdict threshold (`crate::dr::hold::STALE_VERDICT_THRESHOLD`).
+pub const DR_HOLD_POLL_INTERVAL_MS_DEFAULT: u64 = 2_000;
+
+/// Largest accepted `LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS`: 6 s, the stale-verdict
+/// threshold divided by five, so at least five polls fit before a replica
+/// counts its verdict stale (SDD SR-6.5 "Poll bounds"). `crate::dr::hold`
+/// asserts the relation at compile time.
+pub const DR_HOLD_POLL_INTERVAL_MS_MAX: u64 = 6_000;
+
+/// Default `LIVE_EDIT_DR_RESTORE_PARALLELISM`: the restore Job plans and
+/// writes up to 8 layers at once, within its restore memory budget.
+pub const DR_RESTORE_PARALLELISM_DEFAULT: NonZeroUsize = match NonZeroUsize::new(8) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
+/// Default `LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS`: 900 s,
+/// the storage service's default by-address cache lifetime (15 minutes per
+/// pod, measured on RC), for a cached not-found and a cached earlier body
+/// alike. [`Config::checkpoint_storage_api_not_found_cache_secs`].
+pub const CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT: u64 = 900;
+
+/// Exclusive maximum of `LIVE_EDIT_CHECKPOINT_TICK_SECS`, in ms: two thirds of
+/// the checkpoint leader lock's TTL
+/// ([`crate::storage::external_values::LEADER_LOCK_TTL_MS`], 30 s), so 20 s
+/// (b.g65). The checkpoint loop takes and refreshes `le:checkpoint:leader`
+/// only on its ticks; a tick this long or longer lets the key lapse between
+/// ticks, and the checkpoint clean-up reads an absent key as an older build
+/// leading backups and skips its pass. Enforced by
+/// `Config::validate_checkpoint_budgets`; the chart's `checkpoint.tick` check
+/// spells the same figure.
+pub const CHECKPOINT_TICK_MAX_EXCLUSIVE_MS: u64 =
+    crate::storage::external_values::LEADER_LOCK_TTL_MS * 2 / 3;
 
 /// The structural-planning cache's budget in bytes for a budget of `max_mib`
 /// MiB ([`Config::structural_cache_max_mib`]): the per-entry cap and the
@@ -2030,11 +2138,11 @@ pub const CATCHUP_FENCED_READ_CONCURRENCY_DEFAULT: u32 = 1;
 /// upload memory budget, 384 MiB, its 64 queued waiters at the 1 MiB HTTP/2
 /// stream window each, and one `LIVE_EDIT_MAX_LAYER_SIZE` single-value
 /// upload in the overflow slot, 409.1 MiB) + the Valkey connections' at-rest
-/// buffers on a 10-primary cluster at the chart's pools (127.7 MiB,
+/// buffers on a 10-primary cluster at the chart's pools (123.7 MiB,
 /// `storage::connection_buffers::at_rest_bound_bytes`) + its 20 % margin
-/// (1,024 MiB) = 5,102.7 ≤ 5,120 MiB; at f = 0.16 (`T` = 794) the same list
-/// is 5,202.7 MiB. At exact shares, the shares unrounded, the list is
-/// 5,104.1 MiB at f = 0.15, 15.9 MiB under the limit, and 5,203.4 MiB at
+/// (1,024 MiB) = 5,098.7 ≤ 5,120 MiB; at f = 0.16 (`T` = 794) the same list
+/// is 5,198.7 MiB. At exact shares, the shares unrounded, the list is
+/// 5,100.1 MiB at f = 0.15, 19.9 MiB under the limit, and 5,199.4 MiB at
 /// f = 0.16. With the uploads and the connections' buffers in the list, a
 /// `T` the rule accepts closes SDD §21.2's combined line by construction.
 /// At other limits the same rule gives 433 at 4,096 MiB and 1,607 at
@@ -2329,9 +2437,19 @@ impl Config {
     /// Returns `Err` immediately if any required variable is absent, with a message
     /// that names the missing variable; when the pod memory plan cannot close
     /// at the limit, naming the smallest limit the configuration needs; and
-    /// when a removed memory-budget variable is set, naming it.
+    /// when a removed variable is set, whatever its value, naming it: a
+    /// removed memory budget, or `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED`, the
+    /// switch that selected the removed legacy catch-up.
     pub fn from_env() -> Result<Self, String> {
         Self::from_env_with(PodMemorySource::Cgroup)
+    }
+
+    /// [`Self::from_env`], with every memory-limit refusal and no-limit WARN
+    /// naming `setting` as the memory limit to set or raise. `main.rs` passes
+    /// [`MemoryLimitSetting::DrJob`] in a disaster-recovery Job, whose limit
+    /// the chart takes from `dr.resources`, not the service's `resources`.
+    pub fn from_env_naming(setting: MemoryLimitSetting) -> Result<Self, String> {
+        Self::from_env_with_naming(PodMemorySource::Cgroup, setting)
     }
 
     /// [`Self::from_env`] with the pod memory limit taken from `pod_memory`
@@ -2341,6 +2459,15 @@ impl Config {
     /// [`PodMemorySource::Fixed`], so the limit of the machine running them
     /// never changes their outcome.
     pub fn from_env_with(pod_memory: PodMemorySource) -> Result<Self, String> {
+        Self::from_env_with_naming(pod_memory, MemoryLimitSetting::Server)
+    }
+
+    /// [`Self::from_env_with`], naming `setting` as
+    /// [`Self::from_env_naming`] does.
+    pub fn from_env_with_naming(
+        pod_memory: PodMemorySource,
+        setting: MemoryLimitSetting,
+    ) -> Result<Self, String> {
         let authn_enabled = optional_parsed("LIVE_EDIT_AUTHN_ENABLED", true)?;
         if !authn_enabled {
             return Err(
@@ -2697,10 +2824,23 @@ impl Config {
                 }
                 secs
             },
-            valkey_command_timeout_ms: optional_parsed(
-                "LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS",
-                VALKEY_COMMAND_TIMEOUT_MS_DEFAULT,
-            )?,
+            valkey_command_timeout_ms: {
+                let ms = optional_parsed(
+                    "LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS",
+                    VALKEY_COMMAND_TIMEOUT_MS_DEFAULT,
+                )?;
+                if ms == 0 {
+                    return Err(format!(
+                        "invalid value for LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS: 0 (no timeout) is \
+                         no longer accepted; set a timeout in milliseconds, such as the default \
+                         {VALKEY_COMMAND_TIMEOUT_MS_DEFAULT}, or leave it unset for the default. \
+                         With no timeout a Valkey command can wait forever, and the \
+                         disaster-recovery hold relies on every write finishing within the \
+                         timeout"
+                    ));
+                }
+                ms
+            },
             valkey_reconnect_max_delay_ms: optional_parsed(
                 "LIVE_EDIT_VALKEY_RECONNECT_MAX_DELAY_MS",
                 30_000u32,
@@ -3103,7 +3243,6 @@ impl Config {
                 "LIVE_EDIT_EXT_VALUE_VERIFY",
                 ExtValueVerifyMode::Enforce,
             )?,
-            catchup_snapshot_enabled: optional_parsed("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", true)?,
             snapshot_atomic_read_max_items: {
                 let n = optional_parsed(
                     "LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS",
@@ -3173,6 +3312,27 @@ impl Config {
                     );
                 }
                 n
+            },
+            dr_hold_poll_interval_ms: {
+                let n = optional_parsed(
+                    "LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS",
+                    DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+                )?;
+                if n == 0 || n > DR_HOLD_POLL_INTERVAL_MS_MAX {
+                    return Err(format!(
+                        "invalid value for LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS: {n} is outside 1 to {DR_HOLD_POLL_INTERVAL_MS_MAX}; zero would panic tokio::time::interval, and above {DR_HOLD_POLL_INTERVAL_MS_MAX} ms fewer than five hold polls fit in the 30 s after which a replica's hold verdict counts as stale"
+                    ));
+                }
+                n
+            },
+            dr_restore_parallelism: {
+                let n = optional_parsed(
+                    "LIVE_EDIT_DR_RESTORE_PARALLELISM",
+                    DR_RESTORE_PARALLELISM_DEFAULT.get(),
+                )?;
+                NonZeroUsize::new(n).ok_or_else(|| {
+                    "invalid value for LIVE_EDIT_DR_RESTORE_PARALLELISM: must be greater than 0 (the restore Job could restore no layer at all)".to_string()
+                })?
             },
             checkpoint_enabled: optional_parsed("LIVE_EDIT_CHECKPOINT_ENABLED", false)?,
             checkpoint_adapter,
@@ -3288,8 +3448,8 @@ impl Config {
             // opt-in; default promoted to `true` on 2026-09-11 (b.3n1) after the
             // dev soak, with `false` retained as the opt-out. The plain stdlib
             // `bool` parse matches every other bool knob here
-            // (LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED, LIVE_EDIT_CHECKPOINT_ENABLED),
-            // so only the exact strings `true` / `false` are accepted.
+            // (LIVE_EDIT_CHECKPOINT_ENABLED, for one), so only the exact
+            // strings `true` / `false` are accepted.
             checkpoint_tail_enabled: optional_parsed("LIVE_EDIT_CHECKPOINT_TAIL_ENABLED", true)?,
             checkpoint_tail_max_chain: {
                 let n = optional_parsed("LIVE_EDIT_CHECKPOINT_TAIL_MAX_CHAIN", 8u32)?;
@@ -3370,6 +3530,13 @@ impl Config {
             checkpoint_base_path,
             checkpoint_connect_timeout_ms,
             checkpoint_request_timeout_ms,
+            // Any whole number of seconds, 0 included: a negative or
+            // fractional value fails the unsigned parse, which names the
+            // variable.
+            checkpoint_storage_api_not_found_cache_secs: optional_parsed(
+                "LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS",
+                CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
+            )?,
             checkpoint_ext_mirror_workers,
             checkpoint_ext_mirror_queue_capacity,
             service_token_file,
@@ -3392,8 +3559,13 @@ impl Config {
         // The pod memory plan: every pod-memory budget from the pod memory
         // limit, after the settings it charges are parsed and before the
         // validation chain, so the chain's errors keep their order.
-        let plan = PodMemoryPlan::derive(pod_memory.resolve(), &PlanInputs::from_config(&config))?;
+        let plan = PodMemoryPlan::derive_naming(
+            pod_memory.resolve(),
+            &PlanInputs::from_config(&config),
+            setting,
+        )?;
         refuse_removed_memory_settings(&plan)?;
+        refuse_removed_catchup_setting()?;
         let config = config.with_pod_memory_plan(plan);
         config
             .validate_shutdown_budgets()?
@@ -3498,8 +3670,14 @@ impl Config {
     /// says why, and the line's level follows it (b.1jt): INFO for a store
     /// that reports no `maxmemory` field (expected on a managed store such as
     /// Azure Managed Redis), WARN for a fault (`maxmemory:0`, a malformed
-    /// value, no routing table or primary, an `INFO` that failed or was
-    /// denied) and for an unknown reason. For any other source
+    /// value, no routing table or primary, an `INFO` that failed, was denied
+    /// or was cut off at the startup read's deadline, primaries the read could
+    /// not confirm against the cluster map)
+    /// and for an unknown reason. The WARN names the remedy for its reason
+    /// only, from the one text the store-memory WARNs use too
+    /// (`storage::store_memory::problem_remedy`) — none for an unknown
+    /// reason — and that a fixed `LIVE_EDIT_EXT_RELEASE_MAX_BYTES` is the
+    /// alternative. For any other source
     /// `fallback_problem` is not read here: a problem the startup store read
     /// had is logged by `storage::store_memory::log_store_memory_startup`.
     ///
@@ -3522,6 +3700,12 @@ impl Config {
                     .map_or_else(|| "no reason recorded".to_owned(), ToString::to_string);
                 let fault = fallback_problem.is_none_or(|p| p.kind().is_fault());
                 if fault {
+                    let remedy = fallback_problem.map_or("", |problem| {
+                        crate::storage::store_memory::problem_remedy(
+                            problem,
+                            self.valkey_memory_bytes.is_some(),
+                        )
+                    });
                     tracing::warn!(
                         ext_release_max_bytes = budget.bytes,
                         pressure_threshold_bytes = budget.bytes / 2,
@@ -3534,14 +3718,8 @@ impl Config {
                          set, and the store's memory could not be used because of a fault (see \
                          reason). The GC collects released blobs at any age once they total half \
                          the budget, and uploads carrying external values wait while they total \
-                         all of it. By reason: for maxmemory 0 or a malformed maxmemory, set \
-                         maxmemory on every primary; for a failed or refused INFO, let this \
-                         service's user run INFO, or, on a store that does not report maxmemory \
-                         (Azure Managed Redis), set LIVE_EDIT_VALKEY_MEMORY_BYTES to the store's \
-                         total memory, which needs only the cluster map; for an unknown routing \
-                         table or one with no primary, check the store's cluster state (it \
-                         usually clears at a later read). Or set LIVE_EDIT_EXT_RELEASE_MAX_BYTES \
-                         for a fixed budget. The store is asked again every 60 s"
+                         all of it{remedy}. Or set LIVE_EDIT_EXT_RELEASE_MAX_BYTES for a fixed \
+                         budget. The store is asked again every 60 s"
                     );
                 } else {
                     tracing::info!(
@@ -3592,7 +3770,14 @@ impl Config {
 
     /// Reject an upload admission configuration that cannot work: a waiter
     /// cap of 0, which would make any non-zero wait dead code (fail-fast is
-    /// `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS=0`).
+    /// `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS=0`), and a waiter cap above
+    /// [`UPLOAD_ADMISSION_MAX_WAITERS_CEILING`](crate::grpc::transport::UPLOAD_ADMISSION_MAX_WAITERS_CEILING)
+    /// (2,046). The cap sizes every inbound connection's HTTP/2 receive window
+    /// (`grpc::transport::http2_connection_window_bytes`, (cap + 1) × 1 MiB),
+    /// and above 2,046 that window passes h2's largest, 2³¹ − 1, which h2
+    /// asserts in every connection's handshake: every connection would panic.
+    /// Reject rather than clamp, as for the reconciler interval below: a
+    /// clamped cap would silently queue fewer uploads than the operator set.
     ///
     /// The budget needs no check: the pod memory plan derives it at or above
     /// the floor `F + A + 2 × LIVE_EDIT_MAX_LAYER_SIZE`, so no upload under the
@@ -3608,6 +3793,16 @@ impl Config {
                  code). Express fail-fast with LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS=0 instead."
                     .to_string(),
             );
+        }
+        let ceiling = crate::grpc::transport::UPLOAD_ADMISSION_MAX_WAITERS_CEILING;
+        if self.upload_admission_max_waiters > ceiling {
+            return Err(format!(
+                "invalid value for LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS: {} is above the maximum \
+                 of {ceiling}. The waiter cap sizes each inbound HTTP/2 connection's receive \
+                 window at (LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS + 1) x 1 MiB, and above \
+                 {ceiling} that window exceeds HTTP/2's largest, 2^31 - 1 bytes.",
+                self.upload_admission_max_waiters
+            ));
         }
         Ok(self)
     }
@@ -3901,27 +4096,35 @@ impl Config {
     /// nit from PM review).
     ///
     /// `shutdown_overall_budget_secs` wraps the whole post-server sequence
-    /// in a single `tokio::time::timeout`; the metrics-server abort and the
-    /// provider flush run after it, outside the budget. In order, the
-    /// sequence is: the layer-cleanup wait; the JoinSession and
-    /// SubscribeReadLayer task drains (concurrently); the session-checkpoint
-    /// drain; firing every background task's cancellation token; the
-    /// background-task joins (one concurrent group, then the ref-count
-    /// reconciler, the checkpoint loop and each ext-mirror worker in turn);
-    /// and `ValkeyClient::quit()`. Every wait before `quit()` has its own
-    /// `shutdown_timeout_secs` budget. The steps with no timeout of their
-    /// own are the cancellation fires, the tracker close and the
-    /// result reporting between the waits; `quit()` is bounded by its
-    /// internal bounds below. A budget below the floor fails at boot rather
-    /// than at shutdown, where the outer wrapper could fire before the
-    /// per-task waits and `quit()` complete. A raise of `timeout_secs`
-    /// that stays above the floor still boots, and makes a "shutdown overall
-    /// budget exceeded" warning more likely on a shutdown whose waits run long
-    /// (a healthy shutdown finishes well inside the budget).
+    /// (`grpc::transport::run_post_server_sequence`) in a single
+    /// `tokio::time::timeout`; the metrics-server abort and the provider
+    /// flush run after it, outside the budget. In order, the sequence is: the
+    /// layer-cleanup wait beside the JoinSession and SubscribeReadLayer task
+    /// drains; the session-checkpoint drain; firing every background task's
+    /// cancellation token; one concurrent join of every background task; and
+    /// `ValkeyClient::quit()`. Each of the three waits before `quit()` is
+    /// bounded by the earlier of `shutdown_timeout_secs` and a deadline that
+    /// leaves [`MIN_SHUTDOWN_BUDGET_HEADROOM_SECS`] of the overall budget, so
+    /// `quit()` always starts with at least that much left. At an overall
+    /// budget of `3 × timeout_secs + 15` or more every wait gets its full
+    /// per-task budget (the defaults, 5 s and 30 s, sit exactly there), short
+    /// only of the few milliseconds an earlier timed-out wait overran its
+    /// bound by, which the cut WARN tolerates
+    /// (`grpc::transport::SHUTDOWN_CUT_WARN_TOLERANCE`);
+    /// below it they share `overall − 15` in that order, so the join is cut
+    /// first and the session-checkpoint drain only after it. The steps with
+    /// no timeout of their own are the cancellation fires, the tracker close
+    /// and the result reporting between the waits, for which the outer
+    /// timeout stays as a backstop; `quit()` is bounded by its internal
+    /// bounds below. A budget below the floor fails at boot rather than at
+    /// shutdown. A raise of `timeout_secs` that stays above the floor still
+    /// boots; it only lets the waits before `quit()` run longer, up to the
+    /// shared deadline (a healthy shutdown finishes well inside the budget).
     ///
     /// The floor is `timeout_secs +` [`MIN_SHUTDOWN_BUDGET_HEADROOM_SECS`]
-    /// (15 s): room for one full per-task wait plus 15 s. The waits run one
-    /// after another, so the floor is not their worst-case sum. 15 s covers
+    /// (15 s): room for one full per-task wait plus 15 s. It is not the sum of
+    /// the waits and does not need to be: the shared deadline, not the floor,
+    /// keeps `quit()`'s headroom. 15 s covers
     /// `ValkeyClient::quit()`'s sequential internal bounds — 2 s
     /// member-replacer drain, 2 s router-supervisor drain, 2 s slot-recycle
     /// drain (the snapshot-fence guard cleanup drain runs beside it and is no
@@ -4048,6 +4251,13 @@ impl Config {
     /// on how the scheduler aligns. Fail fast at boot rather than letting
     /// the misconfiguration alter steady-state cadence in production.
     ///
+    /// The tick is also kept under [`CHECKPOINT_TICK_MAX_EXCLUSIVE_MS`], two
+    /// thirds of the checkpoint lock's TTL (b.g65): the loop takes and
+    /// refreshes `le:checkpoint:leader` only on its ticks, and the checkpoint
+    /// clean-up reads an absent key as "an older build leads backups" and
+    /// skips the rest of its pass, so a tick that lets the key lapse between
+    /// ticks would stall clean-up with no upgrade in progress.
+    ///
     /// The reconciliation bound is the same class of failure with a quieter
     /// symptom. That pass acts on a candidate only on the **second**
     /// observation at least one grace window after the first — that is the
@@ -4069,6 +4279,19 @@ impl Config {
                  is not what the operator asked for.",
                 tick = self.checkpoint_tick_secs,
                 interval = self.checkpoint_interval_secs,
+            ));
+        }
+        if self.checkpoint_tick_secs.saturating_mul(1000) >= CHECKPOINT_TICK_MAX_EXCLUSIVE_MS {
+            return Err(format!(
+                "invalid configuration: LIVE_EDIT_CHECKPOINT_TICK_SECS ({tick}) must be less \
+                 than {max_secs} s, two thirds of the {ttl_secs} s checkpoint leader-lock TTL. \
+                 The checkpoint loop takes and refreshes that lock only on its ticks, so a \
+                 longer tick lets the lock lapse between ticks, and the checkpoint clean-up \
+                 reads a lapsed lock as an older version leading backups and skips its work \
+                 (deferred_older_build).",
+                tick = self.checkpoint_tick_secs,
+                max_secs = CHECKPOINT_TICK_MAX_EXCLUSIVE_MS / 1000,
+                ttl_secs = crate::storage::external_values::LEADER_LOCK_TTL_MS / 1000,
             ));
         }
         let grace = self.checkpoint_reconcile_grace();
@@ -4131,6 +4354,33 @@ impl Config {
     /// [`derived_adapter_call_ceiling`].
     pub fn checkpoint_adapter_call_ceiling(&self) -> Duration {
         derived_adapter_call_ceiling(self.checkpoint_adapter, self.checkpoint_request_timeout_ms)
+    }
+
+    /// Graceful shutdown's stream-ending pace
+    /// (`LIVE_EDIT_SHUTDOWN_STREAM_END_RATE`,
+    /// `LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS`).
+    pub fn shutdown_stream_pacing(&self) -> crate::grpc::graceful_shutdown::StreamPacing {
+        crate::grpc::graceful_shutdown::StreamPacing {
+            rate_per_sec: self.shutdown_stream_end_rate,
+            max_window: Duration::from_secs(u64::from(self.shutdown_stream_end_max_window_secs)),
+        }
+    }
+
+    /// The longest a graceful shutdown under this configuration takes, from
+    /// SIGTERM to its final flush: `grpc::transport::minimum_termination_grace`
+    /// of the drain, the RPC deadline, the stream-ending pace and the overall
+    /// budget. 76.25 s at the defaults.
+    ///
+    /// Reachable from a `Config` alone, so the disaster-recovery Jobs
+    /// (`dr::job::quiet`, which may not depend on `grpc`) read the same bound
+    /// the server logs at startup: one expression, evaluated in one place.
+    pub fn minimum_termination_grace(&self) -> Duration {
+        crate::grpc::transport::minimum_termination_grace(
+            Duration::from_secs(self.shutdown_timeout_secs),
+            Duration::from_millis(self.rpc_deadline_ms),
+            self.shutdown_stream_pacing(),
+            Duration::from_secs(self.shutdown_overall_budget_secs),
+        )
     }
 
     /// Wall-clock budget a **lazy-recovery** caller gives a checkpoint-store
@@ -4957,6 +5207,24 @@ fn refuse_removed_memory_settings(plan: &PodMemoryPlan) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse startup when `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` is set, whatever
+/// its value, `true` included, naming it: catch-up always behaves as the
+/// variable's default (`true`) has since 0.1.0, and the legacy catch-up that
+/// `false` selected has been removed, so the service no longer reads it, and
+/// a set variable left in place would read as if it still applied. The same
+/// rule as [`refuse_removed_memory_settings`].
+fn refuse_removed_catchup_setting() -> Result<(), String> {
+    const VAR: &str = "LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED";
+    if env::var_os(VAR).is_some() {
+        return Err(format!(
+            "{VAR} is no longer read: catch-up always behaves as the default (true) has \
+             since 0.1.0, and the legacy catch-up that false selected has been removed. \
+             Unset it."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5079,15 +5347,6 @@ mod tests {
             assert!(
                 !cfg.service_token_client_credentials_enabled,
                 "service_token_client_credentials_enabled default is false (V1: sidecar-only)"
-            );
-            // b.msb Epic — late-join/catch-up snapshot switch
-            // (LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED). Default `true` = the
-            // corrected full-state snapshot path (the shipped fix); `false`
-            // selects legacy per-commit reconstruction. Pinned here so a future
-            // default flip surfaces in this table-shaped defaults test.
-            assert!(
-                cfg.catchup_snapshot_enabled,
-                "catchup_snapshot_enabled default is true (corrected snapshot on)"
             );
             // b.dfh Epic 3 / SDD SR-8.1 — stream-replay tail capture. The
             // spec fixes only two of these four defaults (`TAIL_ENABLED`, now
@@ -5234,6 +5493,50 @@ mod tests {
                 let cfg = Config::from_env_with(PodMemorySource::Reference)
                     .expect("a one-second connect bound is accepted");
                 assert_eq!(cfg.valkey_connect_timeout_secs, 1);
+            },
+        );
+    }
+
+    /// `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS=0` (fred's "no timeout") is
+    /// refused at startup, written `0` or `00`: the disaster-recovery hold's
+    /// bound on a replica's last write needs a timeout. A rolling upgrade
+    /// from a deployment that set 0 stops at the new pods, so the error must
+    /// name the setting and the fix (the default, 5000). Unset is that
+    /// default, and one millisecond, the smallest timeout, is accepted.
+    #[test]
+    fn config_from_env_valkey_command_timeout_zero_rejected_naming_the_default() {
+        for zero in ["0", "00"] {
+            let err = assert_snapshot_knob_rejected(
+                "LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS",
+                zero,
+                "a zero command timeout leaves every Valkey write unbounded",
+            );
+            assert!(
+                err.contains("5000"),
+                "the reject names the default to set instead; got: {err}"
+            );
+            assert!(
+                err.contains("no longer accepted"),
+                "the reject says 0 is refused now, for the deployer it breaks; got: {err}"
+            );
+        }
+        let mut unset = REQUIRED_VARS.to_vec();
+        unset.push(("LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS", None));
+        temp_env::with_vars(unset, || {
+            let cfg = Config::from_env_with(PodMemorySource::Reference)
+                .expect("an unset command timeout takes the default");
+            assert_eq!(
+                cfg.valkey_command_timeout_ms,
+                VALKEY_COMMAND_TIMEOUT_MS_DEFAULT
+            );
+            assert_eq!(VALKEY_COMMAND_TIMEOUT_MS_DEFAULT, 5_000);
+        });
+        temp_env::with_vars(
+            snapshot_knob_env("LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS", "1"),
+            || {
+                let cfg = Config::from_env_with(PodMemorySource::Reference)
+                    .expect("a one-millisecond command timeout is accepted");
+                assert_eq!(cfg.valkey_command_timeout_ms, 1);
             },
         );
     }
@@ -6811,198 +7114,54 @@ mod tests {
         );
     }
 
-    // ---- t3.pev: LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED boolean parsing ----
+    // ---- LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED: removed, refused by name ----
     //
-    // The catch-up switch is now a plain stdlib `bool` (b.pev), replacing the
-    // former `CatchupExperiment { Off, Snapshot }` enum. Default is `true`
-    // (corrected full-state snapshot — the shipped fix); `false` selects the
-    // legacy per-commit reconstruction path. Mirrors the
-    // `LIVE_EDIT_CHECKPOINT_ENABLED` boolean coverage above: stdlib
-    // `FromStr for bool` accepts EXACTLY `"true"` / `"false"` and rejects all
-    // aliases and casings, so a silent swap to a permissive parser — or an
-    // accidental default flip — fails CI fast.
+    // The variable once selected the legacy catch-up (`false`); that path is
+    // gone. Startup refuses the variable whatever its value, `true` included,
+    // so a deployment that still sets it learns it no longer applies — the
+    // same rule as the removed memory budgets above.
 
+    /// Each value the variable could once take, its old default `true`
+    /// included, and values it never accepted, refuses startup with an error
+    /// that names the variable, says it is no longer read, says catch-up
+    /// behaves as the old default and the legacy catch-up is gone, and says
+    /// what to do. A refusal that let `true` (the old default) through would
+    /// fail on the first value.
     #[test]
-    fn config_from_env_catchup_snapshot_enabled_accepts_lowercase_true() {
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("true")),
-            ],
-            || {
-                let cfg = Config::from_env_with(PodMemorySource::Reference)
-                    .expect("should succeed with explicit `true`");
-                assert!(cfg.catchup_snapshot_enabled);
-            },
-        );
+    fn config_from_env_refuses_the_removed_catchup_switch_whatever_its_value() {
+        for value in ["true", "false", "", "yes", "True", "1"] {
+            temp_env::with_vars(
+                [
+                    (
+                        "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
+                        Some("http://auth.example.com"),
+                    ),
+                    (
+                        "LIVE_EDIT_USERINFO_ENDPOINT",
+                        Some("http://userinfo.example.com"),
+                    ),
+                    ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some(value)),
+                ],
+                || {
+                    let err = Config::from_env_with(PodMemorySource::Reference)
+                        .expect_err("a set LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED refuses startup");
+                    for part in [
+                        "LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED is no longer read",
+                        "catch-up always behaves as the default (true) has since 0.1.0",
+                        "the legacy catch-up that false selected has been removed",
+                        "Unset it",
+                    ] {
+                        assert!(err.contains(part), "value {value:?}: {part:?} in {err}");
+                    }
+                },
+            );
+        }
     }
 
+    /// With the variable unset, startup proceeds: the refusal fires on the
+    /// variable's presence only.
     #[test]
-    fn config_from_env_catchup_snapshot_enabled_accepts_lowercase_false() {
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("false")),
-            ],
-            || {
-                let cfg = Config::from_env_with(PodMemorySource::Reference)
-                    .expect("should succeed with explicit `false`");
-                assert!(!cfg.catchup_snapshot_enabled);
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_catchup_snapshot_enabled_rejects_capitalized_true() {
-        // Stdlib `FromStr for bool` is case-sensitive: only the exact
-        // lowercase strings `"true"` and `"false"` parse. Pin this so a
-        // regression that silently swaps in a case-insensitive parser
-        // doesn't drift the contract out from under operators.
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("True")),
-            ],
-            || {
-                let err = Config::from_env_with(PodMemorySource::Reference)
-                    .expect_err("`True` must be rejected");
-                assert!(
-                    err.contains("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED"),
-                    "error should name the env var, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_catchup_snapshot_enabled_rejects_uppercase_false() {
-        // Same rationale as the capitalized-`True` test — stdlib
-        // `FromStr for bool` rejects `"FALSE"`.
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("FALSE")),
-            ],
-            || {
-                let err = Config::from_env_with(PodMemorySource::Reference)
-                    .expect_err("`FALSE` must be rejected");
-                assert!(
-                    err.contains("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED"),
-                    "error should name the env var, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_catchup_snapshot_enabled_rejects_yes_returns_err_naming_var() {
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("yes")),
-            ],
-            || {
-                let err = Config::from_env_with(PodMemorySource::Reference)
-                    .expect_err("`yes` must be rejected");
-                assert!(
-                    err.contains("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED"),
-                    "error should name LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_catchup_snapshot_enabled_rejects_numeric_one_returns_err_naming_var() {
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("1")),
-            ],
-            || {
-                let err = Config::from_env_with(PodMemorySource::Reference)
-                    .expect_err("`1` must be rejected");
-                assert!(
-                    err.contains("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED"),
-                    "error should name LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_catchup_snapshot_enabled_rejects_empty_returns_err_naming_var() {
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("")),
-            ],
-            || {
-                let err = Config::from_env_with(PodMemorySource::Reference)
-                    .expect_err("empty string must be rejected");
-                assert!(
-                    err.contains("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED"),
-                    "error should name LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED, got: {err}"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_default_catchup_snapshot_enabled_is_true() {
-        // Regression guard for the b.pev default flip: with the env var UNSET
-        // the config default is `true` (corrected snapshot ON) — the behavior
-        // change this ticket ships. This is the test that would have failed
-        // before the fix (former default was legacy/off) and passes after.
+    fn config_from_env_starts_with_the_removed_catchup_switch_unset() {
         temp_env::with_vars(
             [
                 (
@@ -7016,35 +7175,8 @@ mod tests {
                 ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", None),
             ],
             || {
-                let cfg = Config::from_env_with(PodMemorySource::Reference)
-                    .expect("should succeed with required vars set");
-                assert!(
-                    cfg.catchup_snapshot_enabled,
-                    "default (env unset) must be true — corrected snapshot on"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn config_from_env_explicit_catchup_snapshot_enabled_false() {
-        // `false` opts back into the legacy per-commit reconstruction path.
-        temp_env::with_vars(
-            [
-                (
-                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
-                    Some("http://auth.example.com"),
-                ),
-                (
-                    "LIVE_EDIT_USERINFO_ENDPOINT",
-                    Some("http://userinfo.example.com"),
-                ),
-                ("LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED", Some("false")),
-            ],
-            || {
-                let cfg = Config::from_env_with(PodMemorySource::Reference)
-                    .expect("should succeed with explicit `false`");
-                assert!(!cfg.catchup_snapshot_enabled);
+                Config::from_env_with(PodMemorySource::Reference)
+                    .expect("startup proceeds with LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED unset");
             },
         );
     }
@@ -10079,8 +10211,8 @@ mod tests {
     const TASK10_RULE_CHECK_LIMIT_MIB: u64 = 4_096;
 
     /// The HTTP/2 stream window each queued upload waiter's unread content is
-    /// bounded by: hyper's server default, 1 MiB per stream, which
-    /// `production_server_builder` leaves as it is (SDD §5.4).
+    /// bounded by: 1 MiB per stream, `grpc::transport::HTTP2_STREAM_WINDOW_BYTES`,
+    /// which `production_server_builder` sets (SDD §5.4).
     const UPLOAD_WAITER_WINDOW_MIB: f64 = 1.0;
 
     /// The uploads' terms of the chart limit's list, derived from the binary's
@@ -10204,7 +10336,7 @@ mod tests {
     ///    single-value upload's charge in the overflow slot, each derived from
     ///    configuration and code — the Valkey connections' at-rest buffers on
     ///    a 10-primary cluster at the chart's pools, and the 20 % margin. It
-    ///    gives 744 (f = 0.15, 5,102.7 MiB; f = 0.20 would need 5,600.7). The
+    ///    gives 744 (f = 0.15, 5,098.7 MiB; f = 0.20 would need 5,596.7). The
     ///    record's connection-buffer figures and total are the shipped
     ///    build's, with the `valkey-tls` feature on, and are compared only in
     ///    that shape; without it `C_conn` is smaller, and the list is derived
@@ -10666,22 +10798,36 @@ mod tests {
     /// limit for the chart's configuration reproduces the chart limit's
     /// record ([`CHART_LIMIT_DERIVATION_JSON`]) term by term — the plan
     /// replaces that hand-derived list at run time, so every figure of the
-    /// record, at the precision it records, must be the plan's:
+    /// record, at the precision it records, must be the plan's — with one
+    /// swap the record predates (b.ntm): the plan's live-delivery budget
+    /// `D_live` replaced two of the record's five subscription load terms,
+    /// one lagging layer and the catch-ups before their first poll. So:
     ///
     /// - the budgets: `T` 744 at f = 0.15, `B` 384, `C` 256 (its resident
     ///   budget × (1 + φ) to the byte), `S` 4,096;
-    /// - each line term: the floor, the five subscription load terms and their
-    ///   sum, the cache, its cold-start reads and audit, `T × (1 + P_f)`, the
-    ///   window term (to the byte: the watch-read pool build's `X`), the
-    ///   reference read, the uploads (the overflow slot to the byte) and
-    ///   `C_conn` on 10 primaries;
-    /// - the line: its 80 % limit, its total before `C_conn`, its fenced-read
-    ///   terms, and its headroom on a standalone store and on 1, 3 and 10
-    ///   primaries, which must not be negative;
-    /// - the subscription ceiling's allowance per subscription on each
-    ///   topology, floored to 0.1 KiB as recorded and at least the measured
-    ///   49.8 KiB, so the ceiling holds; and the catch-up slots the line
-    ///   funds, at least the CPU-derived default of 8, which so binds.
+    /// - the swap: the plan carries neither replaced term and carries `D_live`
+    ///   as its "live delivery" term, at its 49 MiB budget; the replaced
+    ///   terms, computed from their constants (the code's, and the plan
+    ///   record's `reproduction_constants` for the pre-poll pair no code
+    ///   constant holds any more and for the `e` the record was computed
+    ///   with, 167.1 B, which the code's re-measured `e` superseded), are
+    ///   the record's two parts and, to the byte, the plan record's
+    ///   `reproduction.replaced_load_terms_bytes`;
+    /// - each line term: the floor, the three remaining subscription load
+    ///   terms and, with the two replaced terms put back, their sum, the
+    ///   cache, its cold-start reads and audit, `T × (1 + P_f)`, the window
+    ///   term (to the byte: the watch-read pool build's `X`), the reference
+    ///   read, the uploads (the overflow slot to the byte) and `C_conn` on 10
+    ///   primaries;
+    /// - the line, with `D_live` taken out and the replaced terms put back:
+    ///   its 80 % limit, its total before `C_conn`, its fenced-read terms,
+    ///   its headroom on a standalone store and on 1, 3 and 10 primaries, the
+    ///   subscription ceiling's allowance per subscription on each topology
+    ///   (floored to 0.1 KiB as recorded) and the catch-up slots it funds;
+    /// - the plan's own line, `D_live` in it: it closes on every topology,
+    ///   leaves each established subscription at least the measured 49.8 KiB,
+    ///   so the ceiling holds, and funds at least the CPU-derived default of 8
+    ///   catch-up slots, which so binds.
     ///
     /// The plan is derived at the limit `Config::from_env` resolves with no
     /// readable limit (the reference, the chart's), for the chart's
@@ -10749,6 +10895,78 @@ mod tests {
         // Each line term, at the record's precision.
         let term = |name: &str| line_term(&plan, name);
         assert_eq!(mib_1dp(mib(term("steady-state floor"))), at("/floor"));
+
+        // The swap (b.ntm): `D_live` replaced the record's one-lagging-layer
+        // and pre-poll load terms. Each replaced term, from its constants.
+        let names: Vec<&str> = plan.line_terms().iter().map(|t| t.name).collect();
+        for gone in ["one lagging layer", "catch-ups before their first poll"] {
+            assert!(
+                !names.contains(&gone),
+                "the plan's line no longer carries {gone:?}: {names:?}"
+            );
+        }
+        let live_delivery = term("live delivery");
+        assert_eq!(
+            live_delivery,
+            plan.live_delivery_budget_bytes(),
+            "the plan's line carries D_live as its live-delivery term"
+        );
+        assert_eq!(live_delivery, 49 * MIB, "D_live at the chart's limit");
+        let Some(plan_record) = sr_11_8_record(POD_MEMORY_PLAN_INPUTS_JSON) else {
+            return;
+        };
+        let reproduction =
+            |key: &str| recorded_u64(&plan_record, &format!("/reproduction_constants/{key}"));
+        let replaced_parts = {
+            use crate::storage::notifications::{
+                CONSUMER_BACKLOG_BYTES, CONSUMER_CHANNEL_CAPACITY,
+            };
+            use crate::storage::stream_mux::BACKLOG_HARD_CAP_FACTOR;
+            // The `e` the record's line was computed with, not the code's
+            // re-measured one (`memory_plan::QUEUED_ENTRY_BYTES_DECI`).
+            let queued_entry_bytes_deci = reproduction("queued_entry_bytes_deci");
+            let hard_cap_entries = (CONSUMER_CHANNEL_CAPACITY * BACKLOG_HARD_CAP_FACTOR) as u64;
+            let slots = PlanInputs::reference().catchup_slots;
+            [
+                (
+                    "lagging_layer_hard_cap",
+                    CONSUMER_BACKLOG_BYTES * BACKLOG_HARD_CAP_FACTOR as u64
+                        + (hard_cap_entries * queued_entry_bytes_deci).div_ceil(10),
+                ),
+                (
+                    "registration_to_first_poll",
+                    reproduction("pre_poll_shared_payload_bytes")
+                        + (slots
+                            * reproduction("pre_poll_entries_per_slot_centi")
+                            * queued_entry_bytes_deci)
+                            .div_ceil(1_000),
+                ),
+            ]
+        };
+        for (part, bytes) in replaced_parts {
+            assert_eq!(
+                mib_1dp(mib(bytes)),
+                at(&format!("/load_terms/parts/{part}")),
+                "the replaced {part} term, from its constants"
+            );
+        }
+        let replaced: u64 = replaced_parts.iter().map(|(_, bytes)| bytes).sum();
+        if let Some(plan_derivation) = sr_11_8_record(POD_MEMORY_PLAN_DERIVATION_JSON) {
+            assert_eq!(
+                (
+                    replaced,
+                    live_delivery,
+                    recorded(&plan_derivation, "/reproduction/matches")
+                ),
+                (
+                    recorded_u64(&plan_derivation, "/reproduction/replaced_load_terms_bytes"),
+                    recorded_u64(&plan_derivation, "/reproduction/live_delivery_bytes"),
+                    serde_json::json!(true),
+                ),
+                "the plan record's reproduction swapped the same bytes"
+            );
+        }
+
         let load_parts = [
             (
                 "established subscriptions",
@@ -10756,11 +10974,6 @@ mod tests {
             ),
             ("catch-up slots", "catchup_slots_8"),
             ("stream readers", "readers_replies"),
-            ("one lagging layer", "lagging_layer_hard_cap"),
-            (
-                "catch-ups before their first poll",
-                "registration_to_first_poll",
-            ),
         ];
         for (name, part) in load_parts {
             assert_eq!(
@@ -10769,8 +10982,12 @@ mod tests {
                 "{name}"
             );
         }
-        let load_terms: u64 = load_parts.iter().map(|(name, _)| term(name)).sum();
-        assert_eq!(mib_1dp(mib(load_terms)), at("/load_terms/value"));
+        let load_terms: u64 = load_parts.iter().map(|(name, _)| term(name)).sum::<u64>() + replaced;
+        assert_eq!(
+            mib_1dp(mib(load_terms)),
+            at("/load_terms/value"),
+            "the record's five load terms: the plan's three and the two D_live replaced"
+        );
         assert_eq!(mib_2dp(term("structural cache")), at("/structural_cache"));
         assert_eq!(
             mib_1dp(mib(term("structural cache cold-start reads"))),
@@ -10810,10 +11027,12 @@ mod tests {
         );
 
         // The line: limit, total before C_conn, fenced-read terms, headroom
-        // per topology.
+        // per topology — the record's with `D_live` taken out of the plan's
+        // line and the two terms it replaced put back.
         let c_conn_10 = term("connection pools");
         let line_limit = plan.line_limit_bytes();
-        let before_c_conn = plan.line_total_bytes() - c_conn_10;
+        let plan_before_c_conn = plan.line_total_bytes() - c_conn_10;
+        let before_c_conn = plan_before_c_conn - live_delivery + replaced;
         assert_eq!(mib(line_limit), at("/line/limit_80pct"));
         assert_eq!(mib_1dp(mib(before_c_conn)), at("/line/total_before_c_conn"));
         assert_eq!(
@@ -10852,10 +11071,20 @@ mod tests {
             mib_2dp(slot),
             at("/subscription/catchup_slot_at_ceiling_mib")
         );
+        // The ceiling's allowance (the line's room for the established
+        // subscriptions, over the ceiling, in KiB) and the catch-up slots a
+        // line funds, from its headroom.
+        let allowance_kib_of = |headroom: u64| {
+            mib(headroom + subscriptions) * 1024.0 / plan.max_subscriptions() as f64
+        };
+        let funded_slots_of = |headroom: u64| (headroom + term("catch-up slots")) / slot;
         let mut funded_slots = u64::MAX;
+        let mut recorded_funded_slots = u64::MAX;
         for (name, topology) in topologies {
             let c_conn = at_rest_bound_bytes(pools, topology);
-            let line = before_c_conn + c_conn;
+            // The plan's own line, `D_live` in it: it closes, the ceiling
+            // holds and the CPU default binds.
+            let line = plan_before_c_conn + c_conn;
             assert!(
                 line <= line_limit,
                 "the line must close at the chart's limit on {name}: {} MiB over {} MiB",
@@ -10863,16 +11092,16 @@ mod tests {
                 mib(line_limit)
             );
             let headroom = line_limit - line;
-            // The ceiling's allowance: the line's room for the established
-            // subscriptions, over the ceiling, in KiB.
-            let allowance_kib =
-                mib(headroom + subscriptions) * 1024.0 / plan.max_subscriptions() as f64;
+            let allowance_kib = allowance_kib_of(headroom);
             assert!(
                 allowance_kib >= at("/subscription/measured_kib"),
                 "{name}: an established subscription may cost {allowance_kib:.2} KiB, under the \
                  one measured: the ceiling does not hold"
             );
-            funded_slots = funded_slots.min((headroom + term("catch-up slots")) / slot);
+            funded_slots = funded_slots.min(funded_slots_of(headroom));
+            // The record's line, the swap undone.
+            let recorded_headroom = line_limit - (before_c_conn + c_conn);
+            recorded_funded_slots = recorded_funded_slots.min(funded_slots_of(recorded_headroom));
             if shipped_shape {
                 assert_eq!(
                     mib_2dp(c_conn),
@@ -10880,12 +11109,12 @@ mod tests {
                     "{name}"
                 );
                 assert_eq!(
-                    mib_1dp(mib(headroom)),
+                    mib_1dp(mib(recorded_headroom)),
                     at(&format!("/line/headroom_after_c_conn/{name}")),
                     "{name}"
                 );
                 assert_eq!(
-                    (allowance_kib * 10.0).floor() / 10.0,
+                    (allowance_kib_of(recorded_headroom) * 10.0).floor() / 10.0,
                     at(&format!("/subscription/allowance_kib/{name}")),
                     "{name}: floored to 0.1 KiB"
                 );
@@ -10897,7 +11126,10 @@ mod tests {
             "the plan's headroom is its 10-primary line's"
         );
         if shipped_shape {
-            assert_eq!(funded_slots as f64, at("/subscription/memory_slot_bound"));
+            assert_eq!(
+                recorded_funded_slots as f64,
+                at("/subscription/memory_slot_bound")
+            );
         }
         assert!(
             funded_slots >= cpu_slots,
@@ -10909,8 +11141,8 @@ mod tests {
     // ── The pod memory plan against its own record and the chart (b.fj4) ────
     //
     // The plan's record (`POD_MEMORY_PLAN_DERIVATION_JSON`) is the plan at
-    // 2,048 / 2,706 / 4,096 / 5,120 / 8,192 MiB and at its minimum for the
-    // chart's configuration, and at 2,709 / 2,808 / 4,096 / 5,120 / 8,192 MiB
+    // 2,048 / 2,686 / 4,096 / 5,120 / 8,192 MiB and at its minimum for the
+    // chart's configuration, and at 2,709 / 3,281 / 4,096 / 5,120 / 8,192 MiB
     // and at its minimum for that configuration with a backup store on (its
     // `backup_store` block), built and at exact shares, written by a script
     // that re-implements the plan's rules in Python (`scripts/derive_plan.py`
@@ -11002,7 +11234,8 @@ mod tests {
     /// `backup_store` block), at each limit the record lists for it is the
     /// record's, term by term and to the byte: a limit below the minimum is
     /// refused, and at every other the budgets — the mirror's `M_ext` among
-    /// them, absent without a backup store — `T` and its step, every line and
+    /// them, absent without a backup store, and b.ntm's `D_live` and `D_c` —
+    /// `T` and its step, every line and
     /// margin term in order, the line's total, limit and headroom on each
     /// topology, the margin left and the minimum are the record's, and so,
     /// exactly, are the line at exact shares at `T`'s step and at the next
@@ -11029,20 +11262,48 @@ mod tests {
             &record,
             "/plan",
             &PlanInputs::reference(),
-            &[2_048, 4_096, 5_120, 8_192],
+            &[2_048, 2_686, 4_096, 5_120, 8_192],
         );
         let backup = record_backup_store_inputs();
         assert_plan_matches_its_record(
             &record,
             "/plan/backup_store",
             &backup,
-            &[2_709, 2_808, 4_096, 5_120, 8_192],
+            &[2_709, 3_281, 4_096, 5_120, 8_192],
+        );
+        assert_eq!(
+            recorded_u64(&record, "/plan/minimum_limit_mib"),
+            2_687,
+            "the chart's configuration starts from 2,687 MiB"
         );
         assert_eq!(
             recorded_u64(&record, "/plan/backup_store/minimum_limit_mib"),
-            2_809,
-            "the chart's configuration with a backup store starts from 2,809 MiB"
+            3_282,
+            "the chart's configuration with a backup store starts from 3,282 MiB"
         );
+        // b.ntm's terms: `D_live` in the line, `D_c` in the margin, and the
+        // checkpoint term's tail capture piece at the backup store's caps.
+        for (pointer, value) in [
+            (
+                "/plan/live_delivery_term/name",
+                serde_json::json!("live delivery"),
+            ),
+            ("/plan/live_delivery_term/side", serde_json::json!("line")),
+            (
+                "/plan/catchup_payload_term/name",
+                serde_json::json!("catch-up payloads"),
+            ),
+            (
+                "/plan/catchup_payload_term/side",
+                serde_json::json!("margin"),
+            ),
+            (
+                "/plan/checkpoint_term/tail_capture_peak_bytes",
+                serde_json::json!(memory_plan::tail_capture_peak_bytes(&backup)),
+            ),
+        ] {
+            assert_eq!(recorded(&record, pointer), value, "{pointer}");
+        }
         assert_eq!(
             recorded_u64(&record, "/plan/ext_mirror_term/floor_mib"),
             memory_plan::ext_mirror_floor_mib(&backup),
@@ -11151,6 +11412,8 @@ mod tests {
                     plan.structural_cache_budget_mib(),
                     plan.upload_budget_mib(),
                     plan.retirement_budget_bytes() >> 20,
+                    plan.live_delivery_budget_bytes() >> 20,
+                    plan.catchup_payload_budget_bytes() >> 20,
                     plan.catchup_budget_mib(),
                     plan.catchup_step_centi(),
                 ),
@@ -11159,10 +11422,12 @@ mod tests {
                     budget("structural_cache_mib"),
                     budget("upload_mib"),
                     budget("retirement_mib"),
+                    budget("live_delivery_mib"),
+                    budget("catchup_payload_mib"),
                     budget("catchup_mib"),
                     budget("catchup_step_centi"),
                 ),
-                "{prefix}: {mib} MiB: S, C, B, R_ref, T and T's step"
+                "{prefix}: {mib} MiB: S, C, B, R_ref, D_live, D_c, T and T's step"
             );
             assert_eq!(
                 plan_terms(plan.line_terms()),
@@ -11286,22 +11551,15 @@ mod tests {
             ("/configuration/byte_ceiling", reference.byte_ceiling),
             ("/configuration/upload_waiters", reference.upload_waiters),
             ("/configuration/max_layer_size", reference.max_layer_size),
+            ("/configuration/tail_max_bytes", reference.tail_max_bytes),
+            (
+                "/configuration/tail_max_entries",
+                reference.tail_max_entries,
+            ),
             ("/constants/floor_bytes", POD_MEMORY_FLOOR_BYTES),
             (
                 "/constants/subscription_bytes_deci",
                 SUBSCRIPTION_BYTES_DECI,
-            ),
-            (
-                "/constants/queued_entry_bytes_deci",
-                QUEUED_ENTRY_BYTES_DECI,
-            ),
-            (
-                "/constants/pre_poll_entries_per_slot_centi",
-                PRE_POLL_ENTRIES_PER_SLOT_CENTI,
-            ),
-            (
-                "/constants/pre_poll_shared_payload_bytes",
-                PRE_POLL_SHARED_PAYLOAD_BYTES,
             ),
             (
                 "/constants/catchup_slot_bytes_per_ceiling_byte",
@@ -11361,6 +11619,10 @@ mod tests {
             (
                 "/constants/ext_mirror_item_overhead_kib",
                 crate::checkpoint::ext_mirror::ITEM_OVERHEAD_KIB,
+            ),
+            (
+                "/constants/tail_entry_overhead_bytes",
+                TAIL_ENTRY_OVERHEAD_BYTES,
             ),
             (
                 "/code_terms/upload_budget_floor_bytes",
@@ -11476,6 +11738,16 @@ mod tests {
             (
                 "LIVE_EDIT_CHECKPOINT_TAIL_ENABLED",
                 &["checkpoint", "tail", "enabled"],
+            ),
+            // The tail's caps size the line's checkpoint term while the tail
+            // capture runs (b.ntm).
+            (
+                "LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES",
+                &["checkpoint", "tail", "maxBytes"],
+            ),
+            (
+                "LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES",
+                &["checkpoint", "tail", "maxEntries"],
             ),
         ]
         .into_iter()
@@ -11797,13 +12069,14 @@ mod tests {
         }
     }
 
-    /// T12 (d), through `Config::from_env` (b.mhq): with a backup store on
-    /// (checkpointing enabled, an adapter, the tail on) the smallest limit
-    /// that starts is 2,809 MiB, the margin's. At 2,808 MiB startup is refused
+    /// T12 (d), through `Config::from_env` (b.mhq, b.ntm): with a backup store
+    /// on (checkpointing enabled, an adapter, the tail on) the smallest limit
+    /// that starts is 3,282 MiB, the margin's. At 3,281 MiB startup is refused
     /// naming the mirror's term with the settings that switch it on and size
     /// it, and the remedy, raising the limit first, never turning off
-    /// checkpointing or the adapter; the same
-    /// limit starts with the backup store off, funding no mirror.
+    /// checkpointing or the adapter, and not naming the catch-up payload
+    /// budget, which no setting sizes; the same limit starts with the backup
+    /// store off, funding no mirror.
     #[test]
     fn config_from_env_with_a_backup_store_refuses_one_mib_below_its_minimum_naming_the_mirror_term(
     ) {
@@ -11812,12 +12085,12 @@ mod tests {
                 Config::from_env_with(PodMemorySource::Fixed(mib << 20))
             })
         };
-        let err = parse("true", 2_808).expect_err("one MiB below the minimum");
+        let err = parse("true", 3_281).expect_err("one MiB below the minimum");
         for part in [
-            "is below the 2,809 MiB this configuration needs, 1 MiB short",
+            "is below the 3,282 MiB this configuration needs, 1 MiB short",
             "backup copies of external values 101 MiB (LIVE_EDIT_CHECKPOINT_ENABLED, \
              LIVE_EDIT_CHECKPOINT_ADAPTER, LIVE_EDIT_MAX_LAYER_SIZE)",
-            "raise resources.limits.memory to at least 2,809 MiB, which costs nothing else; \
+            "raise resources.limits.memory to at least 3,282 MiB, which costs nothing else; \
              failing that, lower LIVE_EDIT_MAX_LAYER_SIZE, or turn off incremental backups \
              (LIVE_EDIT_CHECKPOINT_TAIL_ENABLED=false), though recovery points then come only \
              from full backup passes, so a newly created or just-restored layer has no backup of \
@@ -11825,10 +12098,48 @@ mod tests {
         ] {
             assert!(err.contains(part), "{part:?} in {err}");
         }
-        let at_minimum = parse("true", 2_809).expect("the minimum starts");
+        assert!(
+            !err.contains("catch-up payloads"),
+            "the catch-up payload budget has no setting, so it is never named: {err}"
+        );
+        let at_minimum = parse("true", 3_282).expect("the minimum starts");
         assert_eq!(at_minimum.pod_memory.ext_mirror_bytes(), Some(101 << 20));
-        let off = parse("false", 2_808).expect("the same limit starts with the backup store off");
+        let off = parse("false", 3_281).expect("the same limit starts with the backup store off");
         assert_eq!(off.pod_memory.ext_mirror_bytes(), None);
+    }
+
+    /// `Config::from_env_with_naming` reaches the plan with its setting: in a
+    /// disaster-recovery Job (`MemoryLimitSetting::DrJob`, what `main.rs`
+    /// passes for `live-edit dr …`) the refusal one MiB below the minimum
+    /// names `dr.resources.limits.memory`, and is otherwise the service's
+    /// refusal, which `from_env_with` still words with
+    /// `resources.limits.memory`.
+    #[test]
+    fn config_from_env_with_naming_a_dr_job_refuses_naming_dr_resources() {
+        let parse = |setting| {
+            temp_env::with_vars(checkpoint_env("true", "InMemory", "true"), || {
+                Config::from_env_with_naming(PodMemorySource::Fixed(3_281 << 20), setting)
+            })
+        };
+        let server = temp_env::with_vars(checkpoint_env("true", "InMemory", "true"), || {
+            Config::from_env_with(PodMemorySource::Fixed(3_281 << 20))
+        })
+        .expect_err("one MiB below the minimum");
+        assert_eq!(
+            parse(MemoryLimitSetting::Server).expect_err("one MiB below the minimum"),
+            server,
+            "`from_env_with` names the service's setting"
+        );
+        assert!(
+            server.contains("raise resources.limits.memory to at least 3,282 MiB"),
+            "{server}"
+        );
+        let dr_job = parse(MemoryLimitSetting::DrJob).expect_err("one MiB below the minimum");
+        assert_eq!(
+            dr_job,
+            server.replace("resources.limits.memory", "dr.resources.limits.memory"),
+            "the DR Job's refusal is the service's with the setting renamed"
+        );
     }
 
     /// W6, through `Config::from_env`: a pool, slot, waiter or upload-size
@@ -12592,6 +12903,81 @@ mod tests {
         });
     }
 
+    // ── Fleet hold poll interval (SDD SR-2.2, SR-6.5 "Poll bounds") ─────────
+
+    const DR_HOLD_POLL_INTERVAL_MS: &str = "LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS";
+
+    #[test]
+    fn config_from_env_dr_hold_poll_interval_defaults_to_two_seconds() {
+        assert_eq!(
+            DR_HOLD_POLL_INTERVAL_MS_DEFAULT, 2_000,
+            "the spec's default: fifteen polls inside the 30 s stale threshold"
+        );
+        temp_env::with_vars(REQUIRED_VARS, || {
+            let cfg = Config::from_env_with(PodMemorySource::Reference)
+                .expect("should succeed with required vars set");
+            assert_eq!(
+                cfg.dr_hold_poll_interval_ms,
+                DR_HOLD_POLL_INTERVAL_MS_DEFAULT
+            );
+        });
+    }
+
+    /// Both ends of 1–6000 are accepted as given, and so is a value between.
+    #[test]
+    fn config_from_env_dr_hold_poll_interval_accepts_one_to_six_thousand() {
+        assert_eq!(
+            DR_HOLD_POLL_INTERVAL_MS_MAX, 6_000,
+            "the spec's bound: the 30 s stale threshold divided by five"
+        );
+        for (raw, ms) in [
+            ("1", 1),
+            ("2500", 2_500),
+            ("6000", 6_000),
+            (" 6000 ", 6_000),
+        ] {
+            temp_env::with_vars(snapshot_knob_env(DR_HOLD_POLL_INTERVAL_MS, raw), || {
+                let cfg = Config::from_env_with(PodMemorySource::Reference).unwrap_or_else(|e| {
+                    panic!("{DR_HOLD_POLL_INTERVAL_MS}={raw:?} must parse: {e}")
+                });
+                assert_eq!(cfg.dr_hold_poll_interval_ms, ms, "{raw:?}");
+            });
+        }
+    }
+
+    /// 0 would panic `tokio::time::interval`, and above 6000 fewer than five
+    /// polls fit before a verdict is stale: both fail startup naming the
+    /// variable, as does anything that is not a non-negative whole number.
+    #[test]
+    fn config_from_env_dr_hold_poll_interval_rejects_zero_above_six_thousand_and_non_numbers() {
+        for raw in ["0", "6001", "60000", "18446744073709551615"] {
+            let err = assert_snapshot_knob_rejected(
+                DR_HOLD_POLL_INTERVAL_MS,
+                raw,
+                "it is outside 1 to 6000",
+            );
+            assert!(
+                err.contains("outside 1 to 6000"),
+                "{raw}: the reject must give the accepted range, got: {err}"
+            );
+        }
+        for garbage in [
+            "-1",
+            "-2000",
+            "abc",
+            "",
+            "2s",
+            "1.5",
+            "18446744073709551616",
+        ] {
+            let _ = assert_snapshot_knob_rejected(
+                DR_HOLD_POLL_INTERVAL_MS,
+                garbage,
+                "it is not a whole number of milliseconds",
+            );
+        }
+    }
+
     // ---- b.9qd: checkpoint-store reconciliation cadence -------------------
     //
     // `LIVE_EDIT_CHECKPOINT_RECONCILE_INTERVAL_SECS` has three guards, and the
@@ -13332,6 +13718,34 @@ mod tests {
         });
     }
 
+    /// The waiter cap sizes every inbound connection's HTTP/2 receive window
+    /// at (cap + 1) × 1 MiB, so its largest valid value is the one whose
+    /// window still fits h2's largest, 2³¹ − 1: 2,046 is accepted, and 2,047
+    /// is refused at startup naming the variable and the maximum. The pod is
+    /// sized at 16 GiB so the memory plan, which counts 1 MiB per waiter,
+    /// closes at 2,046 and the waiter cap's own check is what answers.
+    #[test]
+    fn config_upload_admission_max_waiters_above_the_h2_window_ceiling_is_refused_naming_it() {
+        use crate::grpc::transport::UPLOAD_ADMISSION_MAX_WAITERS_CEILING;
+        const POD: PodMemorySource = PodMemorySource::Fixed(16 << 30);
+        assert_eq!(UPLOAD_ADMISSION_MAX_WAITERS_CEILING, 2_046);
+
+        temp_env::with_vars(upload_admission_env(None, None, Some("2046")), || {
+            let cfg = Config::from_env_with(POD).expect("the ceiling itself is a valid cap");
+            assert_eq!(cfg.upload_admission_max_waiters, 2_046);
+        });
+        temp_env::with_vars(upload_admission_env(None, None, Some("2047")), || {
+            let err = Config::from_env_with(POD)
+                .expect_err("a waiter cap whose window passes h2's largest must be refused");
+            assert!(
+                err.contains("LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS")
+                    && err.contains("2047")
+                    && err.contains("2046"),
+                "the refusal names the variable, the value and the maximum; got: {err}"
+            );
+        });
+    }
+
     /// A non-numeric value is refused, naming the variable.
     #[test]
     fn config_upload_admission_non_numeric_values_are_refused() {
@@ -13734,7 +14148,9 @@ mod tests {
 
     #[test]
     fn config_from_env_checkpoint_tick_ge_interval_rejected() {
-        // Cross-validation: tick must be strictly less than interval.
+        // Cross-validation: tick must be strictly less than interval. The tick
+        // (19 s) is under the 20 s tick maximum, so only the interval rule
+        // can refuse it, whichever order the two checks run in.
         temp_env::with_vars(
             [
                 (
@@ -13745,16 +14161,17 @@ mod tests {
                     "LIVE_EDIT_USERINFO_ENDPOINT",
                     Some("http://userinfo.example.com"),
                 ),
-                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("60")),
-                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("60")),
+                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("19")),
+                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("19")),
             ],
             || {
                 let err = Config::from_env_with(PodMemorySource::Reference)
                     .expect_err("tick == interval must be rejected by cross-validation");
                 assert!(
                     err.contains("LIVE_EDIT_CHECKPOINT_TICK_SECS")
-                        && err.contains("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS"),
-                    "error must name both vars, got: {err}"
+                        && err.contains("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS")
+                        && err.contains("must be strictly less than"),
+                    "the interval rule's error, naming both vars, got: {err}"
                 );
             },
         );
@@ -13788,7 +14205,8 @@ mod tests {
         // also be rejected. Complements the `tick == interval` test
         // above by pinning the other side of the boundary so a future
         // refactor that flips the inequality to `>` (instead of `>=`)
-        // is caught here.
+        // is caught here. The tick (19 s) is under the 20 s tick maximum,
+        // so only the interval rule can refuse it.
         temp_env::with_vars(
             [
                 (
@@ -13799,19 +14217,74 @@ mod tests {
                     "LIVE_EDIT_USERINFO_ENDPOINT",
                     Some("http://userinfo.example.com"),
                 ),
-                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("90")),
-                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("60")),
+                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("19")),
+                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("15")),
             ],
             || {
                 let err = Config::from_env_with(PodMemorySource::Reference)
                     .expect_err("tick > interval must be rejected by cross-validation");
                 assert!(
                     err.contains("LIVE_EDIT_CHECKPOINT_TICK_SECS")
-                        && err.contains("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS"),
-                    "error must name both env vars so the operator sees \
-                     which knob to adjust, got: {err}"
+                        && err.contains("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS")
+                        && err.contains("must be strictly less than"),
+                    "the interval rule's error must name both env vars so the \
+                     operator sees which knob to adjust, got: {err}"
                 );
             },
+        );
+    }
+
+    /// b.g65 (F4): a tick of 20 s — two thirds of the checkpoint leader
+    /// lock's 30 s TTL — is refused at startup, naming the variable, even
+    /// though it is below the interval: the loop refreshes the lock only on
+    /// its ticks, so the lock could lapse between ticks and the checkpoint
+    /// clean-up would read the lapse as an older build leading backups.
+    #[test]
+    fn config_from_env_checkpoint_tick_of_twenty_seconds_is_rejected_naming_the_variable() {
+        temp_env::with_vars(
+            [
+                (
+                    "LIVE_EDIT_STORAGE_SERVICE_ENDPOINT",
+                    Some("http://auth.example.com"),
+                ),
+                (
+                    "LIVE_EDIT_USERINFO_ENDPOINT",
+                    Some("http://userinfo.example.com"),
+                ),
+                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("20")),
+                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("60")),
+            ],
+            || {
+                let err = Config::from_env_with(PodMemorySource::Reference)
+                    .expect_err("a 20 s tick must be rejected: the lock could lapse between ticks");
+                assert!(
+                    err.contains("LIVE_EDIT_CHECKPOINT_TICK_SECS") && err.contains("20 s"),
+                    "the error names the variable and its 20 s maximum, got: {err}"
+                );
+                assert!(
+                    !err.contains("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS"),
+                    "the tick is below the interval, so the refusal is the lock-TTL bound, not \
+                     the tick-versus-interval rule, got: {err}"
+                );
+            },
+        );
+    }
+
+    /// b.g65 (F4): the tick maximum is derived from the checkpoint leader
+    /// lock's TTL (two thirds of it), and is the 20 s the chart's
+    /// `checkpoint.tick` check spells as a literal — so a change to the TTL
+    /// fails here, where the chart's figure has to follow it.
+    #[test]
+    fn checkpoint_tick_maximum_is_two_thirds_of_the_leader_lock_ttl_and_the_charts_twenty() {
+        assert_eq!(
+            CHECKPOINT_TICK_MAX_EXCLUSIVE_MS,
+            crate::storage::external_values::LEADER_LOCK_TTL_MS * 2 / 3,
+            "the bound is two thirds of the lock TTL"
+        );
+        assert_eq!(
+            CHECKPOINT_TICK_MAX_EXCLUSIVE_MS, 20_000,
+            "helm/live-edit-service/templates/configmap.yaml refuses checkpoint.tick >= 20; \
+             change it with this bound"
         );
     }
 
@@ -13819,7 +14292,8 @@ mod tests {
     fn config_from_env_checkpoint_tick_just_inside_interval_accepted() {
         // Boundary just inside the accept band: tick = interval - 1.
         // The rule is strict `<`, so this value must pass and the
-        // explicit values must round-trip without silent clamping.
+        // explicit values must round-trip without silent clamping. The
+        // interval is 20 so the tick also stays under its own 20 s maximum.
         temp_env::with_vars(
             [
                 (
@@ -13830,18 +14304,18 @@ mod tests {
                     "LIVE_EDIT_USERINFO_ENDPOINT",
                     Some("http://userinfo.example.com"),
                 ),
-                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("59")),
-                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("60")),
+                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("19")),
+                ("LIVE_EDIT_CHECKPOINT_INTERVAL_SECS", Some("20")),
             ],
             || {
                 let cfg = Config::from_env_with(PodMemorySource::Reference)
                     .expect("tick = interval - 1 must be accepted (strict `<`)");
                 assert_eq!(
-                    cfg.checkpoint_tick_secs, 59,
+                    cfg.checkpoint_tick_secs, 19,
                     "tick must round-trip the explicit boundary value"
                 );
                 assert_eq!(
-                    cfg.checkpoint_interval_secs, 60,
+                    cfg.checkpoint_interval_secs, 20,
                     "interval must round-trip the explicit boundary value"
                 );
             },
@@ -15555,6 +16029,22 @@ mod tests {
                     cfg.valkey_token_refresh_lead_secs, 180,
                     "access-token-file refresh-lead must default to 180 under static"
                 );
+                // The relation, not just the two values: the Valkey headroom
+                // WARN tells operators to keep this lead at or above the
+                // prolongation floor ", as it is by default," and SDD §15.4
+                // makes the same promise. Pinning 180 here and 180 in
+                // `storage::client` separately would let both move apart with
+                // every test green and the WARN wrong.
+                let floor_secs =
+                    crate::storage::client::VALKEY_TOKEN_ROTATION_FANOUT_CEILING.as_secs();
+                assert!(
+                    cfg.valkey_token_refresh_lead_secs >= floor_secs,
+                    "the default LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS ({}) must be at or above \
+                     the Valkey prolongation floor ({floor_secs} s, \
+                     VALKEY_TOKEN_ROTATION_FANOUT_CEILING): the headroom WARN's default note \
+                     (`auth::service_token`) and SDD §15.4 both say it is",
+                    cfg.valkey_token_refresh_lead_secs
+                );
                 assert_eq!(
                     cfg.valkey_iam_username, None,
                     "iam username must default to None under static"
@@ -16700,8 +17190,8 @@ mod tests {
 
     #[test]
     fn config_from_env_checkpoint_tick_explicit_override_round_trips() {
-        // Use 20 (< default interval of 60) so cross-validation passes
-        // without setting the interval as well.
+        // Use 15 (< default interval of 60, and below the 20 s tick maximum)
+        // so cross-validation passes without setting the interval as well.
         temp_env::with_vars(
             [
                 (
@@ -16712,12 +17202,12 @@ mod tests {
                     "LIVE_EDIT_USERINFO_ENDPOINT",
                     Some("http://userinfo.example.com"),
                 ),
-                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("20")),
+                ("LIVE_EDIT_CHECKPOINT_TICK_SECS", Some("15")),
             ],
             || {
                 let cfg = Config::from_env_with(PodMemorySource::Reference)
-                    .expect("explicit tick=20 should parse");
-                assert_eq!(cfg.checkpoint_tick_secs, 20);
+                    .expect("explicit tick=15 should parse");
+                assert_eq!(cfg.checkpoint_tick_secs, 15);
             },
         );
     }
@@ -17773,7 +18263,7 @@ mod tests {
     //
     // Four knobs gate stream-replay tail capture. Coverage below mirrors the
     // two established shapes in this file case-for-case:
-    //   * boolean  → the LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED cluster (stdlib
+    //   * boolean  → the LIVE_EDIT_CHECKPOINT_ENABLED cluster (stdlib
     //     `FromStr for bool`: exactly `true` / `false`, every alias rejected)
     //   * sizing   → the LIVE_EDIT_LAYER_STREAM_MAXLEN cluster (default /
     //     explicit round-trip / non-numeric / negative / boundary trio)
@@ -19457,6 +19947,38 @@ mod tests {
     /// Distinctive phrase of the WARN it logs when the budget is disabled.
     const RELEASE_BUDGET_DISABLED_WARN_MARKER: &str = "disables the external-value release budget";
 
+    /// The distinctive phrase of each remedy clause the fallback WARN can
+    /// carry (`storage::store_memory::problem_remedy`, whose own tests pin the
+    /// same phrases), by name.
+    const RELEASE_BUDGET_FALLBACK_REMEDIES: [(&str, &str); 7] = [
+        (
+            "deadline",
+            "a later read that still fails logs its own cause",
+        ),
+        ("acl", "If INFO was denied"),
+        ("store total", "set LIVE_EDIT_VALKEY_MEMORY_BYTES"),
+        ("maxmemory", "Set maxmemory on every primary"),
+        ("cluster state", "Check the store's cluster state"),
+        ("no map", "the store answers CLUSTER SLOTS"),
+        ("table differs", "the pods can reach every primary"),
+    ];
+
+    /// The names of the [`RELEASE_BUDGET_FALLBACK_REMEDIES`] whose phrase
+    /// `output` carries, in that list's order.
+    fn release_budget_fallback_remedies(output: &str) -> Vec<&'static str> {
+        RELEASE_BUDGET_FALLBACK_REMEDIES
+            .iter()
+            .filter(|(_, phrase)| output.contains(phrase))
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
+    /// How a step startup's store-memory read cut off at its deadline reads
+    /// as an error (`store_memory::ReadDeadline::cut_off`, private there).
+    const STORE_MEMORY_DEADLINE_CUT_OFF: &str = "the startup store-memory read reached its \
+                                                 deadline after 10000 ms (2 x the command \
+                                                 timeout)";
+
     /// T12 (b.1jt): unset, the budget is the fallback
     /// `min(8 × LIVE_EDIT_MAX_LAYER_SIZE, 100 MB)`, labelled `fallback`: the
     /// default 100 MiB layer size gives the 100 MB cap (one eighth of a 1 GB
@@ -19504,7 +20026,8 @@ mod tests {
     /// the expected case on Azure Managed Redis — logs exactly one INFO and no
     /// WARN; `maxmemory:0`, a failed or denied `INFO`, and a fallback with no
     /// reason recorded log one WARN. Each line names the reason and `source`
-    /// `fallback`.
+    /// `fallback`; each WARN names its own reason's remedy and no other's —
+    /// none with no reason recorded — and the INFO none.
     ///
     /// **Fails on the build before b.1jt**: every fallback WARNed, whatever
     /// the reason.
@@ -19537,17 +20060,29 @@ mod tests {
             infos.contains("reports no maxmemory field") && infos.contains("source=\"fallback\""),
             "the INFO names why and the source; got {infos}"
         );
+        assert_eq!(
+            release_budget_fallback_remedies(&infos),
+            Vec::<&str>::new(),
+            "the INFO carries no fault's remedy; got {infos}"
+        );
 
-        let faults = [
-            Some(StoreMemoryProblem::Unusable(UnusableReason::ZeroLimit {
-                primary: "the store".to_owned(),
-            })),
-            Some(StoreMemoryProblem::ReadFailed(
-                "NOPERM this user has no permissions to run the 'info' command".to_owned(),
-            )),
-            None,
+        // (the reason, the remedies its WARN names), the store total unset.
+        let faults: [(Option<StoreMemoryProblem>, &[&str]); 3] = [
+            (
+                Some(StoreMemoryProblem::Unusable(UnusableReason::ZeroLimit {
+                    primary: "the store".to_owned(),
+                })),
+                &["maxmemory"],
+            ),
+            (
+                Some(StoreMemoryProblem::ReadFailed(
+                    "NOPERM this user has no permissions to run the 'info' command".to_owned(),
+                )),
+                &["acl", "store total"],
+            ),
+            (None, &[]),
         ];
-        for problem in &faults {
+        for (problem, remedies) in &faults {
             let ((), output) = capture_info_output(|| {
                 cfg.log_ext_release_budget_startup(&budget, problem.as_ref())
             });
@@ -19569,6 +20104,11 @@ mod tests {
                 output.contains(RELEASE_BUDGET_FALLBACK_MARKER),
                 "{problem:?}: {output}"
             );
+            assert_eq!(
+                release_budget_fallback_remedies(&output),
+                *remedies,
+                "{problem:?}: its own reason's remedy only; got {output}"
+            );
         }
         let ((), output) =
             capture_info_output(|| cfg.log_ext_release_budget_startup(&budget, None));
@@ -19580,8 +20120,9 @@ mod tests {
 
     /// With `LIVE_EDIT_VALKEY_MEMORY_BYTES` set, the fallback is still
     /// possible — no cluster map to divide the setting by (the routing table
-    /// not known yet, or no primary) — and its WARN names the reason and the
-    /// setting it could not use.
+    /// not known yet, or no primary) — and its WARN names the reason, the
+    /// setting it could not use and the remedy for checking the cluster state,
+    /// no other.
     #[test]
     fn the_release_budget_fallback_warns_with_the_store_total_set_and_no_map() {
         use crate::storage::store_memory::{StoreMemoryProblem, UnusableReason};
@@ -19610,6 +20151,120 @@ mod tests {
                     && output.contains("valkey_memory_bytes=12000000000"),
                 "{problem}: got {output}"
             );
+            assert_eq!(
+                release_budget_fallback_remedies(&output),
+                ["cluster state"],
+                "{problem}: its own reason's remedy only; got {output}"
+            );
+        }
+    }
+
+    /// b.xb7: the fallback WARN names the remedy for its own reason only, with
+    /// `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset and set, for every fault the
+    /// startup read can leave behind besides those above — primaries the read
+    /// could not confirm, with no cluster map or with a routing table that
+    /// differs from it, a malformed `maxmemory`, an `INFO` that failed or was
+    /// denied (naming the setting only while it is unset), and a failed
+    /// `INFO memory` or `CLUSTER SLOTS` startup's deadline cut off (the
+    /// deadline's remedy, not the step's).
+    ///
+    /// Fail-on-old, by in-place perturbation: with the WARN's `{remedy}`
+    /// dropped, or the static list of every reason's remedy it carried
+    /// before, this goes red.
+    #[test]
+    fn the_release_budget_fallback_warn_names_only_its_own_reasons_remedy() {
+        use crate::storage::scan_guard::RoutingRefresh;
+        use crate::storage::store_memory::{
+            ClusterMapProblem, PrimariesUnconfirmed, StoreMemoryProblem, UnusableReason,
+        };
+        let unset = from_env_with_release_budget(&[]).expect("the defaults must load");
+        let set =
+            from_env_with_release_budget(&[("LIVE_EDIT_VALKEY_MEMORY_BYTES", Some("12000000000"))])
+                .expect("a store total must load");
+        let unconfirmed =
+            |cause| StoreMemoryProblem::Unusable(UnusableReason::PrimariesUnconfirmed(cause));
+        let no_map = |problem| unconfirmed(PrimariesUnconfirmed::NoMap(problem));
+        // (the reason, its WARN's remedies with the store total unset, with
+        // it set)
+        let cases: Vec<(StoreMemoryProblem, &[&str], &[&str])> = vec![
+            (
+                no_map(ClusterMapProblem::ReadFailed(
+                    "Timeout Error: Request timed out.".to_owned(),
+                )),
+                &["no map"],
+                &["no map"],
+            ),
+            (
+                no_map(ClusterMapProblem::Malformed),
+                &["no map"],
+                &["no map"],
+            ),
+            (
+                unconfirmed(PrimariesUnconfirmed::TableDiffers {
+                    map: "0-8191@10.0.0.1:6379,8192-16383@10.0.0.2:6379".to_owned(),
+                    table: "0-16383@10.0.0.1:6379".to_owned(),
+                    refresh: Some(RoutingRefresh::Refreshed),
+                }),
+                &["table differs"],
+                &["table differs"],
+            ),
+            (
+                StoreMemoryProblem::Unusable(UnusableReason::Malformed {
+                    primary: "primary 10.0.0.1:6379".to_owned(),
+                }),
+                &["maxmemory"],
+                &["maxmemory"],
+            ),
+            (
+                StoreMemoryProblem::ReadFailed(
+                    "NOPERM this user has no permissions to run the 'info' command".to_owned(),
+                ),
+                &["acl", "store total"],
+                &["acl"],
+            ),
+            (
+                StoreMemoryProblem::ReadFailed(STORE_MEMORY_DEADLINE_CUT_OFF.to_owned()),
+                &["deadline"],
+                &["deadline"],
+            ),
+            (
+                no_map(ClusterMapProblem::ReadFailed(
+                    STORE_MEMORY_DEADLINE_CUT_OFF.to_owned(),
+                )),
+                &["deadline"],
+                &["deadline"],
+            ),
+        ];
+        for (problem, remedies_unset, remedies_set) in &cases {
+            for (cfg, remedies) in [(&unset, remedies_unset), (&set, remedies_set)] {
+                let budget = cfg.ext_release_budget();
+                assert_eq!(
+                    budget.source,
+                    ExtReleaseBudgetSource::Fallback,
+                    "precondition"
+                );
+                let ((), output) = capture_info_output(|| {
+                    cfg.log_ext_release_budget_startup(&budget, Some(problem))
+                });
+                let setting = cfg.valkey_memory_bytes;
+                assert_eq!(
+                    output.lines().count(),
+                    1,
+                    "{problem} (store total {setting:?}): one line; got {output}"
+                );
+                assert!(
+                    output.contains(" WARN ")
+                        && output.contains(RELEASE_BUDGET_FALLBACK_WARN_MARKER)
+                        && output.contains(&problem.to_string()),
+                    "{problem} (store total {setting:?}): a WARN naming the reason; got {output}"
+                );
+                assert_eq!(
+                    release_budget_fallback_remedies(&output),
+                    *remedies,
+                    "{problem} (store total {setting:?}): its own reason's remedy only; got \
+                     {output}"
+                );
+            }
         }
     }
 

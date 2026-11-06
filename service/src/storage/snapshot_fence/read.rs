@@ -31,7 +31,15 @@
 //! 3. **release** — [`FenceLease::release`], which proves the read in the same
 //!    script that gives the lease up: `VERIFIED` returns the state at the
 //!    cut (the `seq` acquire read), `BROKEN` retries the whole read, up to
-//!    [`FENCE_READ_ATTEMPTS`], and `NOT_FOUND` is `NotFound`.
+//!    [`FENCE_READ_ATTEMPTS`], and `NOT_FOUND` is `NotFound`. The release
+//!    proves no writer changed the object, not that the pass read all of it:
+//!    a pass whose round 1 collected an index short of its count (an `SSCAN`
+//!    cursor continued on another serving process can skip members) ended
+//!    after round 1 and is never served, whatever the release answers: its
+//!    attempt is broken and retried unless the release finds the object gone
+//!    (`NotFound`) or fails (that error). With a `VERIFIED` release and its
+//!    header at the cut, it is a proven skip, logged at WARN and counted on
+//!    `live_edit_snapshot_read_index_incomplete_total`.
 //!
 //! It never returns an unverified state: three broken attempts are a
 //! transient error (`ServiceError::Unavailable`).
@@ -87,7 +95,8 @@ use crate::error::ServiceError;
 use crate::observability::metrics::{self, SharedMetrics};
 use crate::storage::client::ValkeyClient;
 use crate::storage::diff_read::{
-    read_object_snapshot_fenced_pass, AtomicSnapshotOf, SnapshotConsumer, SnapshotReadPath,
+    read_object_snapshot_fenced_pass, report_index_shortfall, AtomicSnapshotOf, FencedPass,
+    SnapshotConsumer, SnapshotReadPath,
 };
 use crate::storage::fanout_thread::{PassAnswer, PassLane, PassRequest};
 use crate::storage::keys::KeySchema;
@@ -153,7 +162,9 @@ pub enum FenceAttemptOutcome {
     /// `BROKEN`, and the fan-out completed but the release answered `BROKEN`
     /// or the fan-out read a header other than the cut's, or a lost lease
     /// stopped the fan-out, or the fan-out found no header (which the release
-    /// then found). A fan-out that failed otherwise, or a release that
+    /// then found), or the fan-out's round 1 collected an index short of its
+    /// count and the pass ended there (`measured` is then `None`). A fan-out
+    /// that failed otherwise, or a release that
     /// answered `NOT_FOUND` or failed, ends the read instead ([`Self::Ended`]).
     /// The read retries with a new attempt, or after [`FENCE_READ_ATTEMPTS`]
     /// broken attempts ends `ServiceError::Unavailable`.
@@ -181,8 +192,9 @@ pub struct FenceReleased {
     pub outcome: FenceAttemptOutcome,
     /// The layer's size as the read measured it
     /// ([`AtomicSnapshotOf::measured_size`]), when the fan-out completed —
-    /// on broken attempts too; the weight a memory reservation is adjusted
-    /// to.
+    /// on broken attempts too, but not on one whose pass ended on a round-1
+    /// index short of its count, which read no more than round 1; the weight
+    /// a memory reservation is adjusted to.
     pub measured: Option<LayerSize>,
 }
 
@@ -198,7 +210,8 @@ pub struct FenceReleased {
 ///      first round and after each later window, with the reply bytes read
 ///      so far (none when a lost lease stopped the read before it began);
 /// 4. [`Self::before_release`] — once the fan-out ended (completed, failed,
-///    or stopped by a lost lease), before the release script is sent;
+///    stopped by a lost lease, or ended after round 1 on an index short of
+///    its count), before the release script is sent;
 /// 5. [`Self::after_release`] — once the release replied or failed, and the
 ///    read decided how the attempt ended ([`FenceAttemptOutcome`]).
 ///
@@ -243,7 +256,9 @@ pub trait FencedReadHook: Send {
     /// this attempt: called after its first round (the index members) and
     /// after each later window, the last call carrying the attempt's
     /// `reply_bytes` ([`AtomicSnapshotOf::measured_size`]'s bytes) when the
-    /// fan-out completes. Each attempt counts from zero again.
+    /// fan-out completes. A pass whose round 1 collected an index short of
+    /// its count ends after round 1, so its attempt reports once, after round
+    /// 1. Each attempt counts from zero again.
     ///
     /// Synchronous, and must not wait: it runs between the fan-out's windows,
     /// beside the lease's renewal timer. A hook that reserved memory for the
@@ -291,7 +306,8 @@ pub trait FencedReadHook: Send {
 ///   (Spec SDD SR-5.3). A fan-out that found no header but a release that
 ///   did is a restore under the read: a broken attempt, retried;
 /// - `ServiceError::Unavailable` after [`FENCE_READ_ATTEMPTS`] broken attempts
-///   (the lease lost to a stall, or a restore or cleanup during the read);
+///   (the lease lost to a stall, a restore or cleanup during the read, or a
+///   pass whose round 1 collected an index short of its count);
 /// - the hook's error, when it refused;
 /// - a classified error otherwise (transient → `Aborted`, permanent →
 ///   `Internal`): a fence script's failure as `storage::snapshot_fence`
@@ -321,7 +337,7 @@ pub async fn read_object_snapshot_fenced<C: SnapshotConsumer, H: FencedReadHook>
     for attempt in 1..=FENCE_READ_ATTEMPTS {
         hook.before_attempt(FenceAttempt { attempt, size }).await?;
         let lease = read.wait_for_lease(&mut size, hook).await?;
-        match read.hold(lease, hook).await {
+        match read.hold(lease, hook, attempt).await {
             AttemptEnd::Verified(snapshot) => return Ok(*snapshot),
             AttemptEnd::Broken { measured } => {
                 if let Some(measured) = measured {
@@ -332,8 +348,9 @@ pub async fn read_object_snapshot_fenced<C: SnapshotConsumer, H: FencedReadHook>
                     consumer = consumer.label(),
                     attempt,
                     max_attempts = FENCE_READ_ATTEMPTS,
-                    "fenced snapshot read broken (its lease was lost, or the object was \
-                     restored or removed during the read); not serving it"
+                    "fenced snapshot read broken (its lease was lost, the object was restored \
+                     or removed during the read, or its pass read an index short of its \
+                     count); not serving it"
                 );
             }
             AttemptEnd::Ended(error) => return Err(error),
@@ -341,8 +358,8 @@ pub async fn read_object_snapshot_fenced<C: SnapshotConsumer, H: FencedReadHook>
     }
     Err(ServiceError::Unavailable(format!(
         "fenced snapshot read of object {object_id} was broken {FENCE_READ_ATTEMPTS} times in a \
-         row (its lease lost, or the object restored or removed, during each read); an \
-         unverified snapshot is never served"
+         row (its lease lost, the object restored or removed, or an index read short of its \
+         count, during each read); an unverified snapshot is never served"
     )))
 }
 
@@ -352,8 +369,10 @@ enum AttemptEnd<S> {
     /// the snapshot's size.
     Verified(Box<AtomicSnapshotOf<S>>),
     /// The release answered `BROKEN`, a lost lease stopped the read, the
-    /// read's header was not at the cut, or the read found no header that the
-    /// release then found: retry. `measured` when the fan-out completed.
+    /// read's header was not at the cut, the read found no header that the
+    /// release then found, or the read's round 1 collected an index short of
+    /// its count (its pass ended there): retry. `measured` when the fan-out
+    /// completed.
     Broken { measured: Option<LayerSize> },
     /// The read ends with this error (`NotFound` included).
     Ended(ServiceError),
@@ -431,14 +450,16 @@ impl<C: SnapshotConsumer> FencedRead<'_, C> {
         }
     }
 
-    /// Hold `lease` for one attempt: tell `hook` of the grant, run the fan-out
-    /// beside the renewal timer, routing its progress reports to `hook`, tell
-    /// `hook` the release is next, release, decide how the attempt ended, and
-    /// tell `hook` both.
+    /// Hold `lease` for one attempt (the `attempt`th, which only the WARN of a
+    /// proven skip names): tell `hook` of the grant, run the fan-out beside
+    /// the renewal timer, routing its progress reports to `hook`, tell `hook`
+    /// the release is next, release, decide how the attempt ended, and tell
+    /// `hook` both.
     async fn hold<H: FencedReadHook>(
         &self,
         lease: Box<FenceLease>,
         hook: &mut H,
+        attempt: u32,
     ) -> AttemptEnd<C::State> {
         let mut hold = Span::start(self.metrics.clone(), self.consumer.label(), SpanKind::Hold);
         let cut = lease.cut();
@@ -495,7 +516,7 @@ impl<C: SnapshotConsumer> FencedRead<'_, C> {
             read
         };
         let measured = match &read {
-            Some(Ok(snapshot)) => Some(snapshot.measured_size()),
+            Some(Ok(FencedPass::Read(snapshot))) => Some(snapshot.measured_size()),
             _ => None,
         };
         let release = lease.release(measured).await;
@@ -526,10 +547,32 @@ impl<C: SnapshotConsumer> FencedRead<'_, C> {
             (_, Ok(ReleaseVerdict::NotFound)) => AttemptEnd::Ended(self.not_found()),
             // A pass whose header was not at the cut read something other
             // than the cut's state, whatever the release says.
-            (Some(Ok(snapshot)), Ok(ReleaseVerdict::Verified)) if snapshot.cut == cut => {
-                AttemptEnd::Verified(Box::new(snapshot))
+            (Some(Ok(FencedPass::Read(snapshot))), Ok(ReleaseVerdict::Verified))
+                if snapshot.cut == cut =>
+            {
+                AttemptEnd::Verified(snapshot)
             }
-            (Some(Ok(_)), Ok(_)) => AttemptEnd::Broken { measured },
+            (Some(Ok(FencedPass::Read(_))), Ok(_)) => AttemptEnd::Broken { measured },
+            // A pass whose round 1 came back short of a count did not read
+            // the cut's whole state, whatever the release says. With a
+            // `VERIFIED` release and the pass at the cut, no writer changed
+            // the object and the lease held: the store's cursor skipped
+            // members (a proven skip, reported once). Otherwise the release's
+            // or the header's own cause stands, and the DEBUG line in the
+            // attempt loop covers it.
+            (Some(Ok(FencedPass::Incomplete { seq, shortfall })), Ok(verdict)) => {
+                if verdict == ReleaseVerdict::Verified && seq == cut {
+                    report_index_shortfall(
+                        self.metrics.as_ref(),
+                        &self.object_id_str,
+                        self.consumer,
+                        SnapshotReadPath::Fenced,
+                        &shortfall,
+                        Some((attempt, FENCE_READ_ATTEMPTS)),
+                    );
+                }
+                AttemptEnd::Broken { measured: None }
+            }
             // A lost lease stopped the fan-out: nothing to prove.
             (None, Ok(_)) => AttemptEnd::Broken { measured: None },
         };

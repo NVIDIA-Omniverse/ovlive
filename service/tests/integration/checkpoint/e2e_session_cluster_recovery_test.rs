@@ -56,12 +56,12 @@
 //! Two cases:
 //!
 //! 1. `cluster_session_recovery_round_trip_against_three_shard_cluster`
-//!    — single-session round-trip exercising the two-MULTI/EXEC apply
-//!    crossing both shards. Asserts post-recovery `restored{session}`
-//!    AND `restored{layer}` both ticked by 1, `handle_list_sessions`
-//!    surfaces the recovered session (proves Step A path-index landed
-//!    on the `{hex(base_path)}` shard), and `read_object_state_for_test`
-//!    returns restored state.
+//!    — single-session round-trip exercising the two-step apply (Step A
+//!    a MULTI/EXEC, Step B one script) crossing both shards. Asserts
+//!    post-recovery `restored{session}` AND `restored{layer}` both ticked
+//!    by 1, `handle_list_sessions` surfaces the recovered session (proves
+//!    Step A path-index landed on the `{hex(base_path)}` shard), and
+//!    `read_object_state_for_test` returns restored state.
 //!
 //! 2. `cluster_session_recovery_multi_session_distinct_base_paths_all_recover`
 //!    — three sessions on three DISTINCT `base_path`s, each on its own
@@ -274,7 +274,6 @@ async fn setup_cluster_session_harness(cluster_url: String) -> ClusterSessionChe
         .with_recovery_hook(Arc::clone(&session_recovery));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store,
@@ -550,8 +549,9 @@ async fn full_wipe(harness: &ClusterSessionCheckpointHarness) {
 ///   by session_id). On a 3-shard cluster the two key families hash to
 ///   potentially different shards. The session-checkpoint writer
 ///   captures BOTH families into one blob, which the per-session
-///   recovery applier later re-applies via two separate MULTI/EXEC
-///   transactions (one per slot).
+///   recovery applier later re-applies in two separate atomic steps, one
+///   per slot (Step A a MULTI/EXEC, Step B one `session_record_restore.lua`
+///   script).
 /// - `wait_for_session_checkpoint` blocks on the fire-and-forget writer's
 ///   `put_session_checkpoint` landing on disk. Without it, the post-wipe
 ///   `try_recover_session` would race the writer's put-task and surface
@@ -580,8 +580,9 @@ async fn full_wipe(harness: &ClusterSessionCheckpointHarness) {
 ///   a. Cache funnel: `get_base_path` sees NotFound on `le:{sid}:sess`,
 ///      fires session-recovery. The applier runs Step A on the
 ///      `{hex(base_path)}` shard and Step B on the `{session_id}` shard
-///      — two separate MULTI/EXEC transactions. A regression that
-///      lumped them into one would surface as `CROSSSLOT`.
+///      — two separate atomic steps, Step A a MULTI/EXEC and Step B one
+///      `session_record_restore.lua` script. A regression that lumped
+///      them into one would surface as `CROSSSLOT`.
 ///   b. Layer-recovery: `update_layer_once` HGETALLs the empty
 ///      `obj:hdr`, surfaces NotFound, the layer-recovery branch fires,
 ///      `apply_checkpoint` rebuilds object state on the `{object_id}`
@@ -599,7 +600,7 @@ async fn full_wipe(harness: &ClusterSessionCheckpointHarness) {
 /// env var and runs the real assertions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_session_recovery_round_trip_against_three_shard_cluster() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -714,8 +715,9 @@ async fn cluster_session_recovery_round_trip_against_three_shard_cluster() {
     //
     // Two recovery hops in series across shards:
     //   1. Session-recovery: Step A on `{hex(base_path)}` shard, Step B
-    //      on `{session_id}` shard. A regression that crossed slots in
-    //      a single MULTI/EXEC would surface as CROSSSLOT.
+    //      on `{session_id}` shard, two separate atomic steps (Step A a
+    //      MULTI/EXEC, Step B one script). A regression that lumped them
+    //      into one would surface as CROSSSLOT.
     //   2. Layer-recovery: apply on `{object_id}` shard, re-issued
     //      commit lands.
     let post_recovery_seq = issue_update(
@@ -730,7 +732,7 @@ async fn cluster_session_recovery_round_trip_against_three_shard_cluster() {
     .expect(
         "post-wipe UpdateLayer MUST succeed on cluster — a CROSSSLOT error here \
          indicates the session-recovery applier issued a multi-key write across \
-         shards (regression that lost the cluster-aware two-MULTI/EXEC routing). \
+         shards (regression that lost the cluster-aware two-step routing). \
          A NotFound here indicates one of the two recovery hops did not fire.",
     );
     assert!(
@@ -896,7 +898,7 @@ async fn cluster_session_recovery_round_trip_against_three_shard_cluster() {
 ///   matches the per-session count (3 sessions → 3 increments).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_session_recovery_multi_session_distinct_base_paths_all_recover() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -1016,8 +1018,8 @@ async fn cluster_session_recovery_multi_session_distinct_base_paths_all_recover(
             panic!(
                 "post-wipe UpdateLayer #{i} MUST succeed on cluster — a CROSSSLOT \
                  error indicates the session-recovery applier crossed slots in a \
-                 single MULTI/EXEC (Step A and Step B must run as separate \
-                 transactions on distinct slot owners). Got status: {status:?}"
+                 single atomic step (Step A, a MULTI/EXEC, and Step B, one script, \
+                 must run separately on distinct slot owners). Got status: {status:?}"
             )
         });
         let seq = response.into_inner().sequence_num;

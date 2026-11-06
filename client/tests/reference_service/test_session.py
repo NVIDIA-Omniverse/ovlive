@@ -103,6 +103,23 @@ class SessionService(LiveService):
                     await anext(recorded_stream)
                 yield pb.JoinSessionResponse(peer_message=pb.PeerMessage(connection_id="peer-keep", data=b"resumed"))
                 await asyncio.Event().wait()
+        elif mode in ("join-reconnect-stall", "join-reconnect-stall-resume"):
+            if attempt == 1:
+                yield pb.JoinSessionResponse(connected=pb.SessionConnected(connection_id="connection-old"))
+                await context.abort(grpc.StatusCode.UNAVAILABLE, "synthetic rotation before a stalled rejoin")
+            elif attempt == 2 or mode == "join-reconnect-stall":
+                # Accepts the rejoin and never answers it; only the client's first-response deadline ends it.
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.state.stalled_cancelled += 1
+                    raise
+            else:
+                yield pb.JoinSessionResponse(connected=pb.SessionConnected(connection_id="connection-new"))
+                async for request in recorded_stream:
+                    if request.WhichOneof("request_type") == "message":
+                        yield pb.JoinSessionResponse(peer_message=pb.PeerMessage(connection_id="fixture-peer", data=b"echo"))
+                await asyncio.Event().wait()
         else:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "unknown fixture mode")
 
@@ -116,6 +133,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.state.rotate_ready, self.state.queue_ready = asyncio.Event(), asyncio.Event()
         self.state.expiry_ready, self.state.message_recorded = asyncio.Event(), asyncio.Event()
         self.state.keepalive_ready = asyncio.Event()
+        self.state.stalled_cancelled = 0
         self.children, self.drainers = [], []
         self.proxies = []
         self.artifact = Path(os.environ["LIVE_TEST_ARTIFACT_DIR"])
@@ -421,9 +439,14 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.attempts["JoinSession"], 2)
         # A message over the service's 4 MiB stream limit is rejected locally and recorded, never sent.
         records = self.check_message_records(data, [(24, 3, 14), (25, 3, 14), (26, 3, 14), (28, 1, 4128769)])
+        # The receiving session records each of the three peer messages once, in FIFO order.
         incoming = [r for r in records if r['event_name'] == 'message_received']
-        self.assertTrue(all(r['fields']['request_id'] == 0 for r in incoming))
-        self.assertTrue(all(r['subject_id'] != data['subject'] for r in incoming))
+        self.assertEqual([(r['event_code'], r['severity'], r['subject_id'], r['fields']['session_handle'])
+                          for r in incoming], [(26, 1, data['receiver_subject'], data['receiver_handle'])] * 3)
+        self.assertEqual([(r['fields']['result'], r['fields']['request_id'], r['fields']['bytes'])
+                          for r in incoming], [(0, 0, 3), (0, 0, 6), (0, 0, 5)])
+        self.assertTrue(all(r['fields']['stream_generation'] > 0 for r in incoming))
+        self.assertNotEqual(data['receiver_subject'], data['subject'])
 
     def check_reconnect(self, data, result=8, grpc_status=14, departed=True):
         events = data["a"]
@@ -506,6 +529,52 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data['diagnostics']['metrics']['rpc_attempts_by_operation'], [dict(operation=6, count=4)])
         self.assertEqual(data['diagnostics']['metrics']['rpc_by_operation_result'], [dict(operation=6, result=10, count=4)])
 
+    async def stalled_cancellations(self, count):
+        # The client's cancellation reaches the fixture's handler asynchronously; a failure-only watchdog bounds it.
+        async def reached():
+            while self.state.stalled_cancelled < count:
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(reached(), 5)
+        self.assertEqual(self.state.stalled_cancelled, count)
+
+    def first_response_records(self, data):
+        records = [r for r in data['diagnostics']['recent_records'] if r['subject_id'] == data['subject']]
+        def fields(name, key):
+            return [(r['fields']['stream_generation'], r['fields'][key]) for r in records if r['event_name'] == name]
+        return fields
+
+    async def test_session_stalled_rejoins_time_out_and_exhaust_the_reconnect_attempts(self):
+        # Every rejoin is accepted and never answered. Each ends TIMEOUT at its first-response deadline and counts,
+        # so the third (reconnect_max_attempts) fails the session UNAVAILABLE.
+        data = await self.driver('join-reconnect-stall', expected=8)
+        self.assertEqual(self.state.attempts['JoinSession'], 4)
+        await self.stalled_cancellations(3)
+        connections = [(e['id'], e['result']) for e in data['a'] if e['kind'] == 1]
+        self.assertEqual(connections[:4], [('connection-old', 0), ('connection-old', 8), ('connection-old', 9),
+                                           ('connection-old', 9)])
+        # The driver checks the FAILED status and its UNAVAILABLE result; the first disconnect's UNAVAILABLE event
+        # already satisfies its event wait, so its Leave may come before the failure notification.
+        self.assertIn(connections[4:], ([], [('connection-old', 8)]))
+        fields = self.first_response_records(data)
+        self.assertEqual(fields('stream_disconnected', 'result'), [(1, 8), (2, 9), (3, 9), (4, 9)])
+        self.assertEqual(fields('retry_scheduled', 'result'), [(1, 8), (2, 9), (3, 9)])
+        self.assertEqual(fields('rpc_failed', 'result'), [(1, 8), (2, 9), (3, 9), (4, 9)])
+        self.assertEqual(fields('stream_resumed', 'result'), [(1, 0)])
+
+    async def test_session_stalled_rejoin_times_out_and_the_next_one_resumes_without_a_deadline(self):
+        # The second join stalls and times out; the third connects, and an expired deadline on that connected
+        # attempt changes nothing: its message is echoed without a fourth join.
+        data = await self.driver('join-reconnect-stall-resume')
+        self.assertEqual(self.state.attempts['JoinSession'], 3)
+        await self.stalled_cancellations(1)
+        self.assertEqual([(e['id'], e['result']) for e in data['a'] if e['kind'] == 1],
+                         [('connection-old', 0), ('connection-old', 8), ('connection-old', 9), ('connection-new', 0)])
+        self.assertEqual([e['hex'] for e in data['a'] if e['kind'] == 4], [b'echo'.hex()])
+        self.assertEqual([e['hex'] for e in self.state.session_wire if e['kind'] == 'message'], [b'after-expiry'.hex()])
+        fields = self.first_response_records(data)
+        self.assertEqual(fields('stream_disconnected', 'result'), [(1, 8), (2, 9)])
+        self.assertEqual(fields('stream_resumed', 'result'), [(1, 0), (3, 0)])
+
     async def test_session_pending_queue_limit_preserves_accepted_fifo(self):
         data = await self.driver("join-capacity")
         self.assertEqual([e["hex"] for e in self.state.session_wire if e["kind"] == "message"],
@@ -549,6 +618,10 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         for table in ('rpc_attempts_by_operation', 'rpc_by_operation_result'):
             self.assertFalse(any(row['operation'] == 7 for row in snapshot['metrics'][table]))
         records = [r for r in snapshot['recent_records'] if r['event_name'].startswith('message_')]
+        if not snapshot['effective_configuration']['flags'] & 1:
+            # With history enabled, every counted message event is a record.
+            self.assertEqual([(code, sum(r['event_code'] == code for r in records)) for code, _, _ in counts],
+                             [(code, count) for code, count, _ in counts])
         accepted = [r for r in records if r['event_name'] == 'message_accepted']
         self.assertEqual([r['fields']['request_id'] for r in accepted], data['send_requests'])
         for record in records:

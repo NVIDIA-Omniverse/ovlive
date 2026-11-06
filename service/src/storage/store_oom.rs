@@ -41,6 +41,16 @@
 //!   fire-and-forget: a note never waits and never fails its caller. The GC
 //!   leader, on whatever replica, takes the request with a `GETDEL` at the
 //!   start of its next pass.
+//! - **Behind the hold write fence.** Startup hands the signal the on-access
+//!   hold write fence ([`StoreOomSignal::set_hold_fence`]; SDD SR-6.2), which
+//!   a disaster-recovery hold's entry and a stale hold verdict's close. Once
+//!   it is closed, a note sends no request and only wakes the GC loop, and a
+//!   request already in flight checks the fence before a `NOSCRIPT` reload's
+//!   `SCRIPT LOAD` and re-send, so it gives up within its command timeout.
+//!   The request is not one of the writes the hold aborts by task: it is
+//!   spawned by whichever write is refused, at any time, so without the
+//!   fence each refused write after entry could start one more
+//!   (`crate::dr::hold`'s writer audit). Normal operation is unchanged.
 //!
 //! A signal belongs to one [`ValkeyClient`](crate::storage::client::ValkeyClient)
 //! and every clone of it ([`ValkeyClient::store_oom_signal`](crate::storage::client::ValkeyClient::store_oom_signal));
@@ -53,7 +63,9 @@ use std::time::Duration;
 
 use fred::clients::Pool;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
+use crate::storage::client::{evalsha_with_fenced_reload, hold_fence_closed, FencedEvalError};
 use crate::storage::keys::KeySchema;
 
 /// The least time between two collection requests one replica writes
@@ -87,6 +99,9 @@ struct Inner {
     last_request: Mutex<Option<tokio::time::Instant>>,
     /// Where requests go, once startup armed the signal.
     target: OnceLock<RequestTarget>,
+    /// The disaster-recovery hold write fence, once startup handed it over
+    /// ([`StoreOomSignal::set_hold_fence`]): closed, no request is sent.
+    hold_fence: OnceLock<CancellationToken>,
 }
 
 /// The request key and the value a request carries.
@@ -122,6 +137,7 @@ impl StoreOomSignal {
                 wake: Notify::new(),
                 last_request: Mutex::new(None),
                 target: OnceLock::new(),
+                hold_fence: OnceLock::new(),
             })),
         }
     }
@@ -155,6 +171,23 @@ impl StoreOomSignal {
         }
     }
 
+    /// Put the signal behind the on-access hold write fence (SDD SR-6.2):
+    /// once `hold_fence` is cancelled — at a disaster-recovery hold's entry or
+    /// a stale hold verdict's — a note sends no collection request, and a
+    /// request in flight sends no `NOSCRIPT` reload (module docs). Called
+    /// once at startup, with the token the hold's `OnAccessRepairs` entry
+    /// cancels; a second call changes nothing.
+    pub fn set_hold_fence(&self, hold_fence: CancellationToken) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if inner.hold_fence.set(hold_fence).is_err() {
+            tracing::debug!(
+                "the store out-of-memory signal already had a hold write fence; kept it"
+            );
+        }
+    }
+
     /// Note that the store refused a write `-OOM`. At most once per
     /// [`STORE_OOM_REQUEST_MIN_INTERVAL`] — the note that takes the turn —
     /// send a collection request (when armed) and wake this replica's GC loop;
@@ -165,6 +198,8 @@ impl StoreOomSignal {
     /// fails: the request is sent from a spawned task (none without a tokio
     /// runtime), its failure only logged at DEBUG, and the GC loop is woken
     /// after it, so a leader on this replica finds the request it wakes for.
+    /// Once the hold write fence is closed ([`Self::set_hold_fence`]), the
+    /// note that takes the turn only wakes the GC loop.
     pub fn note(&self) {
         let Some(inner) = &self.inner else {
             return;
@@ -172,7 +207,16 @@ impl StoreOomSignal {
         if !inner.take_request_turn() {
             return;
         }
-        let send = inner.target.get().is_some();
+        let armed = inner.target.get().is_some();
+        let fenced = hold_fence_closed(inner.hold_fence.get());
+        if armed && fenced {
+            tracing::debug!(
+                "a store write was refused -OOM after this replica's hold write fence closed (a \
+                 disaster-recovery hold or a stale hold verdict): no out-of-memory collection \
+                 request is sent; the GC loop is woken"
+            );
+        }
+        let send = armed && !fenced;
         let runtime = tokio::runtime::Handle::try_current().ok();
         match (send, runtime) {
             (true, Some(runtime)) => {
@@ -219,31 +263,41 @@ impl Inner {
     }
 
     /// Write the request: one `EVALSHA` of `gc_oom_signal.lua` on the request
-    /// key. A failure is logged at DEBUG and not observed on a
-    /// `FredErrOrigin`: a refused request must not note itself again.
+    /// key, under the hold write fence once startup handed it over
+    /// ([`evalsha_with_fenced_reload`]): the fence is checked before the
+    /// `EVALSHA` and, on `NOSCRIPT`, before the `SCRIPT LOAD` and the re-send,
+    /// so a request in flight when the fence closes gives up within its
+    /// command timeout and sends no reload. A failure is logged at DEBUG and
+    /// not observed on a `FredErrOrigin`: a refused request must not note
+    /// itself again.
     async fn send_request(&self) {
         let Some(target) = self.target.get() else {
             return;
         };
-        let sent: Result<i64, fred::error::Error> =
-            crate::storage::external_values::GC_OOM_SIGNAL_SCRIPT
-                .evalsha_with_reload(
-                    self.pool.next(),
-                    vec![target.key.clone()],
-                    vec![
-                        target.requester.clone(),
-                        u64::try_from(OOM_COLLECTION_REQUEST_TTL.as_millis())
-                            .unwrap_or(u64::MAX)
-                            .to_string(),
-                    ],
-                )
-                .await;
-        if let Err(error) = sent {
-            tracing::debug!(
+        let sent: Result<i64, FencedEvalError> = evalsha_with_fenced_reload(
+            &crate::storage::external_values::GC_OOM_SIGNAL_SCRIPT,
+            self.pool.next(),
+            vec![target.key.clone()],
+            vec![
+                target.requester.clone(),
+                u64::try_from(OOM_COLLECTION_REQUEST_TTL.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .to_string(),
+            ],
+            self.hold_fence.get(),
+        )
+        .await;
+        match sent {
+            Ok(_) => {}
+            Err(FencedEvalError::Fred(error)) => tracing::debug!(
                 error = %error,
                 "could not request an out-of-memory GC collection; a later refused write requests \
                  it again"
-            );
+            ),
+            Err(FencedEvalError::Held) => tracing::debug!(
+                "out-of-memory GC collection request not sent: this replica's hold write fence \
+                 closed (a disaster-recovery hold or a stale hold verdict)"
+            ),
         }
     }
 }
@@ -252,17 +306,24 @@ impl Inner {
 mod tests {
     //! The signal's turn (b.pa1): a note acts only when it takes the
     //! once-per-[`STORE_OOM_REQUEST_MIN_INTERVAL`] turn, then sends the
-    //! request when armed and wakes the GC loop after the send.
+    //! request when armed and wakes the GC loop after the send. Behind the
+    //! hold write fence (kl-retire F3), a note sends nothing once the fence
+    //! is closed, and a request answered `NOSCRIPT` after it closed sends no
+    //! `SCRIPT LOAD`.
     //!
     //! The turn tests run an unarmed signal under paused tokio time, so a
     //! note lands at an exact instant of the interval. The armed signal's
     //! pool connects to [`HoldingServer`], a stand-in for the store that
     //! answers fred's connection setup and holds the request's `EVALSHA`
     //! until the test releases it, so the test sees the request's arguments
-    //! and the state of the wake while the send is still in flight. Where
-    //! the request lands in a real store and how the GC leader takes it are
-    //! covered against Valkey in `tests/integration/storage/oom_collection_test.rs`
-    //! and `store_write_refusal_test.rs`.
+    //! and the state of the wake while the send is still in flight. The
+    //! fence tests have it answer the request `-NOSCRIPT` and count every
+    //! `SCRIPT` command: a stand-in is the only way to force `NOSCRIPT`,
+    //! since the shared test store's script cache is server-wide and is
+    //! never flushed. Where the request lands in a real store and how the GC
+    //! leader takes it are covered against Valkey in
+    //! `tests/integration/storage/oom_collection_test.rs` and
+    //! `store_write_refusal_test.rs`.
 
     use super::*;
 
@@ -406,14 +467,97 @@ mod tests {
         );
     }
 
+    /// What [`HoldingServer::start_answering`] answers a request with
+    /// `-NOSCRIPT`: a store whose script cache was lost, as after a restart.
+    const NOSCRIPT: &[u8] = b"-NOSCRIPT No matching script. Please use EVAL.\r\n";
+
+    /// A note that takes its turn once the hold write fence is closed sends
+    /// no request and still wakes the GC loop (kl-retire F3): after the
+    /// wake-up, and a barrier `PING` the stand-in answers only after every
+    /// command sent before it, the stand-in has read no `EVALSHA`. The
+    /// stand-in answers an `EVALSHA` at once (released before the note), so
+    /// a request sent anyway is counted rather than left holding the wake.
+    ///
+    /// Fail-on-old: with `note()` sending whenever the signal is armed
+    /// (`let send = armed;`), the stand-in counts one `EVALSHA`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_note_after_the_hold_write_fence_closed_sends_no_request_and_still_wakes_the_gc_loop()
+    {
+        let server = HoldingServer::start().await;
+        server.release();
+        let pool = server.connected_pool().await;
+        let signal = StoreOomSignal::new(pool.clone());
+        signal.arm(&KeySchema::default(), "replica-held");
+        let fence = CancellationToken::new();
+        signal.set_hold_fence(fence.clone());
+        fence.cancel();
+
+        signal.note();
+        tokio::time::timeout(WAIT, signal.woken())
+            .await
+            .expect("a note behind a closed fence must still wake the GC loop");
+        let _: () = tokio::time::timeout(WAIT, pool.next().ping(None))
+            .await
+            .expect("the barrier PING must return")
+            .expect("the stand-in store answers PING");
+        assert_eq!(
+            server.evalshas(),
+            0,
+            "no out-of-memory collection request is sent once the hold write fence is closed"
+        );
+    }
+
+    /// A request in flight when the hold write fence closes, answered
+    /// `-NOSCRIPT` after it closed, sends no `SCRIPT LOAD` and no second
+    /// `EVALSHA` (kl-retire F3), and the GC loop still wakes. The stand-in
+    /// holds the request's reply until the test has closed the fence, so the
+    /// close falls between the `EVALSHA` and its `NOSCRIPT`.
+    ///
+    /// Fail-on-old: with `send_request` passing no fence (`None` in place of
+    /// `self.hold_fence.get()`), the `NOSCRIPT` reload sends one `SCRIPT
+    /// LOAD`, which the stand-in counts and refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_answered_noscript_after_the_fence_closed_sends_no_script_load() {
+        let server = HoldingServer::start_answering(NOSCRIPT).await;
+        let pool = server.connected_pool().await;
+        let signal = StoreOomSignal::new(pool.clone());
+        signal.arm(&KeySchema::default(), "replica-in-flight");
+        let fence = CancellationToken::new();
+        signal.set_hold_fence(fence.clone());
+
+        signal.note();
+        tokio::time::timeout(WAIT, server.held_evalsha())
+            .await
+            .expect("an armed note behind an open fence must send its request");
+        fence.cancel();
+        server.release();
+
+        tokio::time::timeout(WAIT, signal.woken())
+            .await
+            .expect("the GC loop must wake once the request gave up");
+        let _: () = tokio::time::timeout(WAIT, pool.next().ping(None))
+            .await
+            .expect("the barrier PING must return")
+            .expect("the stand-in store answers PING");
+        assert_eq!(
+            (server.scripts(), server.evalshas()),
+            (0, 1),
+            "a NOSCRIPT answered after the fence closed sends no SCRIPT LOAD and no second \
+             EVALSHA"
+        );
+    }
+
     /// A stand-in for the store on one connection: it answers fred's
     /// connection setup (`PING`, `CLIENT ID`, `INFO`), reports the first
     /// `EVALSHA` it receives and holds its reply until released, then answers
-    /// it `:1`, and counts every `EVALSHA` it reads. Every other command is
-    /// answered `+OK`.
+    /// it `:1` (or what [`Self::start_answering`] names), and counts every
+    /// `EVALSHA` it reads. It counts every `SCRIPT` command too and refuses
+    /// it with an error, so a `NOSCRIPT` reload stops there. Every other
+    /// command is answered `+OK`.
     struct HoldingServer {
         port: u16,
         evalshas: Arc<std::sync::atomic::AtomicUsize>,
+        scripts: Arc<std::sync::atomic::AtomicUsize>,
         held: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<Vec<String>>>,
         release: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         task: tokio::task::JoinHandle<()>,
@@ -427,6 +571,12 @@ mod tests {
 
     impl HoldingServer {
         async fn start() -> Self {
+            Self::start_answering(b":1\r\n").await
+        }
+
+        /// A stand-in that answers every `EVALSHA` with `evalsha_reply`, the
+        /// first one once released.
+        async fn start_answering(evalsha_reply: &'static [u8]) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("the stand-in store must bind");
@@ -435,6 +585,8 @@ mod tests {
             let (release_tx, release_rx) = tokio::sync::oneshot::channel();
             let evalshas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counted = Arc::clone(&evalshas);
+            let scripts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let scripts_counted = Arc::clone(&scripts);
             let task = tokio::spawn(async move {
                 let Ok((mut conn, _)) = listener.accept().await else {
                     return;
@@ -460,7 +612,11 @@ mod tests {
                                 if let Some(rx) = release_rx.take() {
                                     let _ = rx.await;
                                 }
-                                b":1\r\n".to_vec()
+                                evalsha_reply.to_vec()
+                            }
+                            "SCRIPT" => {
+                                scripts_counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                b"-ERR the stand-in store loads no script\r\n".to_vec()
                             }
                             _ => b"+OK\r\n".to_vec(),
                         };
@@ -477,6 +633,7 @@ mod tests {
             Self {
                 port,
                 evalshas,
+                scripts,
                 held: tokio::sync::Mutex::new(held_rx),
                 release: std::sync::Mutex::new(Some(release_tx)),
                 task,
@@ -514,6 +671,12 @@ mod tests {
         /// The `EVALSHA`s the stand-in has read so far.
         fn evalshas(&self) -> usize {
             self.evalshas.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// The `SCRIPT` commands (a `SCRIPT LOAD`) the stand-in has read so
+        /// far.
+        fn scripts(&self) -> usize {
+            self.scripts.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 

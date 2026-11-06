@@ -42,19 +42,11 @@
       "license_evidence": "LICENSE",
       "reason": "Preserved notice or metadata format without an inline SPDX header."
     },
-    "client/tests/contracts/source-manifest.json": {
-      "license_evidence": "LICENSE",
-      "reason": "Preserved notice or metadata format without an inline SPDX header."
-    },
     "client/tests/contracts/suites.json": {
       "license_evidence": "LICENSE",
       "reason": "Preserved notice or metadata format without an inline SPDX header."
     },
     "client/tests/native/resolver/plugInfo.json.in": {
-      "license_evidence": "LICENSE",
-      "reason": "Preserved notice or metadata format without an inline SPDX header."
-    },
-    "client/tools/release/hygiene-allowlist.json": {
       "license_evidence": "LICENSE",
       "reason": "Preserved notice or metadata format without an inline SPDX header."
     },
@@ -68,10 +60,6 @@
     },
     "client/THIRD_PARTY_LICENSES.txt": {
       "license_evidence": "client/THIRD_PARTY_NOTICES.md",
-      "reason": "Preserved notice or metadata format without an inline SPDX header."
-    },
-    "client/PROVENANCE.json": {
-      "license_evidence": "LICENSE",
       "reason": "Preserved notice or metadata format without an inline SPDX header."
     },
     "client/LICENSES/SHA256-BSD-2-Clause.txt": {

@@ -61,16 +61,20 @@ pub fn sample(text: &str, metric: &str, labels: &[(&str, &str)]) -> Option<f64> 
         })
 }
 
-/// Every value `label` takes on `metric`'s samples.
+/// Every value `label` takes on `metric`'s samples. The label is matched by
+/// its whole name, so `pod` does not match `server_pod`.
 pub fn label_values(text: &str, metric: &str, label: &str) -> std::collections::BTreeSet<String> {
     let prefix = format!("{metric}{{");
     let key = format!("{label}=\"");
     text.lines()
         .filter_map(|line| line.strip_prefix(&prefix))
         .filter_map(|rest| {
-            let start = rest.find(&key)? + key.len();
-            let end = rest[start..].find('"')? + start;
-            Some(rest[start..end].to_owned())
+            let (series, _value) = rest.rsplit_once(' ')?;
+            series
+                .trim_end_matches('}')
+                .split(',')
+                .find_map(|pair| pair.strip_prefix(&key)?.strip_suffix('"'))
+                .map(str::to_owned)
         })
         .collect()
 }

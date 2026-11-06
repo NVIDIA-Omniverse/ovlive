@@ -28,13 +28,14 @@
 //!
 //! | Area | Tests |
 //! |---|---|
-//! | Test 6, the stale-miss regression, per regime the helper serves | [`a_brand_new_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`a_brand_new_legacy_mode_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`an_in_window_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`an_out_of_window_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`an_out_of_window_legacy_mode_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`a_rollback_replay_stale_miss_rebuilds_its_commit_from_a_fresh_read`] |
-//! | Test 7, the genuine miss | [`a_genuine_miss_under_a_live_hold_recovers_through_the_adapter`], [`a_genuine_miss_the_adapter_cannot_restore_ends_internal`], [`a_hold_lost_before_the_genuine_check_ends_unavailable_never_internal`], [`a_stale_miss_whose_layer_was_overwritten_rebootstraps_on_the_new_object`], [`a_stale_miss_whose_layer_was_deleted_ends_not_found`] |
-//! | The protocol's other endings, each releasing the hold or never holding one | [`a_hold_that_cannot_be_taken_ends_unavailable_never_internal`], [`a_genuine_check_whose_renewal_fails_ends_unavailable_never_internal`], [`a_re_read_whose_cut_regressed_ends_unavailable_before_content`], [`a_per_commit_re_read_handed_to_a_flight_releases_its_hold_first`], [`a_per_commit_re_read_too_large_hands_back_to_a_flight_with_its_hold_released`], [`a_per_commit_re_read_whose_cut_regressed_ends_unavailable_before_content`], [`a_re_read_out_of_capacity_budget_ends_with_its_capacity_ending_and_releases_the_hold`], [`a_re_read_waiting_for_its_permit_at_shutdown_ends_as_is_and_releases_the_hold`] (the unreleased guard's drop is pinned at the store, `b_yuo_gc_tests::a_hold_dropped_unreleased_deletes_its_field`); the cut-based re-read's three endings here also leave `live_edit_stream_mux_subscriptions` at its pre-subscribe level |
-//! | The re-read finding the layer overwritten, per regime, the stream registrations back at their pre-subscribe level | [`a_stale_miss_whose_layer_was_overwritten_rebootstraps_on_the_new_object`], [`an_in_window_stale_miss_whose_layer_was_overwritten_rebootstraps`], [`an_out_of_window_stale_miss_whose_layer_was_overwritten_rebootstraps`], [`an_out_of_window_legacy_mode_stale_miss_whose_layer_was_overwritten_rebootstraps`], [`a_rollback_replay_stale_miss_whose_layer_was_overwritten_rebootstraps`] |
-//! | The re-read finding the layer's state gone (lost, or overwritten for the rollback replay), with checkpointing on: at a cut-based site the recovery runs once the hold is released, and the restored layer is caught up again (or the recovery's failure ends UNAVAILABLE); the rollback replay never asks the recovery | [`a_brand_new_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`an_in_window_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`an_out_of_window_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`a_re_read_whose_recovery_fails_transiently_ends_unavailable`], [`re_read_through_a_flight::a_fenced_re_attach_that_finds_the_state_lost_restores_it_and_delivers_it`]; a restored re-run charged to the budget the first read left, ending with the capacity refusal when it runs out, [`a_restored_re_run_out_of_its_capacity_budget_ends_with_the_capacity_refusal`]; the rollback replay's per-commit re-read re-bootstrapping without asking the recovery, [`a_rollback_replay_re_read_that_finds_the_state_gone_rebootstraps_without_recovery`] |
+//! | Test 6, the stale-miss regression, per regime the helper serves | [`a_brand_new_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`an_in_window_stale_miss_rebuilds_fresh_state_at_the_new_cut`], [`an_out_of_window_stale_miss_rebuilds_fresh_state_at_the_new_cut`] |
+//! | Test 7, the genuine miss | [`a_genuine_miss_under_a_live_hold_recovers_through_the_adapter`], [`a_genuine_miss_restoring_more_than_half_the_payload_budget_is_served_at_once`], [`a_genuine_miss_restoring_the_whole_payload_budget_is_served_at_once`] (b.ntm: the restored blob written back and read back by range, nothing of the payload budget held for it while the payload reserves; D1: the restore itself waits for the payload budget holding nothing and restoring nothing: [`a_genuine_miss_waiting_for_the_payload_budget_holds_nothing_of_it_while_it_waits`], [`a_genuine_miss_whose_restored_blob_is_gone_at_its_read_back_ends_unavailable_restored_once`], [`two_catch_ups_restoring_at_once_are_both_served_without_a_capacity_refusal`]), [`a_genuine_miss_the_adapter_cannot_restore_ends_internal`], [`a_hold_lost_before_the_genuine_check_ends_unavailable_never_internal`], [`a_stale_miss_whose_layer_was_overwritten_rebootstraps_on_the_new_object`], [`a_stale_miss_whose_layer_was_deleted_ends_not_found`] |
+//! | The protocol's other endings, each releasing the hold or never holding one | [`a_hold_that_cannot_be_taken_ends_unavailable_never_internal`], [`a_genuine_check_whose_renewal_fails_ends_unavailable_never_internal`], [`a_re_read_whose_cut_regressed_ends_unavailable_before_content`], [`a_re_read_out_of_capacity_budget_ends_with_its_capacity_ending_and_releases_the_hold`], [`a_re_read_waiting_for_its_permit_at_shutdown_ends_as_is_and_releases_the_hold`] (the unreleased guard's drop is pinned at the store, `b_yuo_gc_tests::a_hold_dropped_unreleased_deletes_its_field`); the re-read's three endings here also leave `live_edit_stream_mux_subscriptions` at its pre-subscribe level |
+//! | The re-read finding the layer overwritten, per regime, the stream registrations back at their pre-subscribe level | [`a_stale_miss_whose_layer_was_overwritten_rebootstraps_on_the_new_object`], [`an_in_window_stale_miss_whose_layer_was_overwritten_rebootstraps`], [`an_out_of_window_stale_miss_whose_layer_was_overwritten_rebootstraps`] |
+//! | The re-read finding the layer's state lost, with checkpointing on: the recovery runs once the hold is released, and the restored layer is caught up again (or the recovery's failure ends UNAVAILABLE) | [`a_brand_new_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`an_in_window_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`an_out_of_window_re_read_that_finds_the_state_lost_restores_it_and_delivers_it`], [`a_re_read_whose_recovery_fails_transiently_ends_unavailable`], [`re_read_through_a_flight::a_fenced_re_attach_that_finds_the_state_lost_restores_it_and_delivers_it`]; a restored re-run charged to the budget the first read left, ending with the capacity refusal when it runs out, [`a_restored_re_run_out_of_its_capacity_budget_ends_with_the_capacity_refusal`] |
 //! | H-b, renewal through the rebuild | [`a_rebuild_parked_across_hold_renewals_stays_protected`] |
 //! | H-c, a lapse the store reports | [`a_renewal_that_finds_the_hold_lapsed_ends_the_catch_up_unavailable`] |
+//! | T13 (kl-retire F6), the build dropped at its stream's ending (the hold's): before its probe, no read hold taken; under its hold, the hold removed; one test per build site (brand new both ways, in-window and out-of-window under the hold) | [`a_catch_up_ended_while_parked_in_its_build_never_takes_a_read_hold`], [`a_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold`], [`an_in_window_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold`], [`an_out_of_window_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold`] |
 //! | 6f-a, a stale fenced miss re-attaching to one successor flight, with the order pin (the old flight's turn and place given back before the hold is taken) | [`re_read_through_a_flight::a_stale_fenced_miss_re_attaches_to_one_successor_flight_and_serves_its_cut`] |
 //! | 6f-b, two late waiters sharing one successor read | [`re_read_through_a_flight::two_late_waiters_that_miss_share_one_successor_read`] |
 //! | 6f-c, a cut-based atomic re-read routed to a flight under its hold | [`re_read_through_a_flight::a_cut_based_re_read_answering_too_large_hands_over_to_a_flight_under_its_hold`], [`re_read_through_a_flight::a_cut_based_re_read_finding_the_objects_flight_registered_reads_through_it_under_its_hold`] |
@@ -45,6 +46,7 @@
 //! | 6-swap, the registration swapped before the re-read waits | [`re_read_through_a_flight::a_re_read_waiting_for_its_permit_keeps_no_registration_at_the_first_cut`] |
 //! | The D-helper pin (a source scan) | [`the_read_mode_and_every_builder_call_stay_inside_the_miss_protocol`], [`build_catch_up_once_is_reached_only_through_the_miss_protocol`], [`every_catch_up_regime_builds_through_build_catch_up`] |
 //! | The miss counter's cells | [`the_miss_counter_is_zero_seeded_over_outcome_and_read`] |
+//! | D1, a genuine miss's restore in batches charged to the catch-up payload budget | [`restore_in_batches`] (its own table) |
 //!
 //! The hold's own lifecycle (no chaining, re-send, crash lapse, the `renew`
 //! script's answers) and `gc_select.lua`'s reading of it are pinned at the
@@ -58,7 +60,7 @@
 //! `GcPolicy::IMMEDIATE` collects it; the catch-up is released. Test 6 parks
 //! on the service's own seam (`CatchUpStateReadSeam::new_before_ext_probe`,
 //! `test-fault-injection`). The other tests park, or act, inside the external
-//! value store's `probe_values` ([`ScriptedProbeStore`]), which the build
+//! value store's length probe ([`ScriptedProbeStore`]), which the build
 //! calls at the same point and again after the re-read — the only place a
 //! test can stand between the re-read and the rebuild's blob read. A genuine
 //! miss is staged by deleting the blob's keys out of band, so the re-read
@@ -101,10 +103,12 @@ use live_edit::observability::metrics::Metrics;
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::ext_release_gate::ExtReleaseGate;
 use live_edit::storage::external_values::{
-    ext_content_hash, ExtRelease, ExtValueProbe, ExtValueVerify, ExternalValueStore, GcBatchResult,
-    GcPassState, GcPolicy, ReadHoldTiming, ValkeyExternalValueStore,
+    ext_content_hash, ExtRelease, ExtValueLengths, ExtValueProbe, ExtValueVerify,
+    ExternalValueStore, GcBatchResult, GcPassState, GcPolicy, ReadHoldTiming,
+    ValkeyExternalValueStore,
 };
 use live_edit::storage::keys::sha256_to_hex;
+#[cfg(feature = "test-fault-injection")]
 use live_edit::storage::snapshot_fence::LayerSize;
 use live_edit::storage::test_support::TestValkey;
 use oodf_ffi::{
@@ -122,10 +126,6 @@ use crate::common::owned_delta::delta_to_ompf_bytes;
 /// a deadline costs nothing on the healthy path.
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// How long a stream must stay silent for "nothing else arrives".
-#[cfg(feature = "test-fault-injection")]
-const QUIET: Duration = Duration::from_secs(2);
-
 /// The section every field here lives in.
 const SECTION: u64 = 7;
 
@@ -142,10 +142,9 @@ fn blob(seed: u8) -> Vec<u8> {
 /// A service on `tv` whose external values live in a real
 /// `ValkeyExternalValueStore` — with the service's metrics, and an empty
 /// `InMemoryCheckpointStore` as its adapter (returned, so a test can seed
-/// it) — wrapped by `wrap`, in catch-up snapshot mode `snapshot_mode`.
+/// it) — wrapped by `wrap`.
 fn service_with(
     tv: &TestValkey,
-    snapshot_mode: bool,
     wrap: impl FnOnce(ValkeyExternalValueStore) -> Arc<dyn ExternalValueStore>,
 ) -> (LiveEditService, Arc<InMemoryCheckpointStore>) {
     let base = build_service(tv, Arc::new(AllowAllPermissions));
@@ -155,7 +154,6 @@ fn service_with(
         .with_checkpoint_store(Arc::clone(&adapter) as Arc<dyn CheckpointStore>);
     let svc = LiveEditService {
         ext_value_store: wrap(store),
-        catchup_snapshot_enabled: snapshot_mode,
         ..base
     };
     (svc, adapter)
@@ -364,15 +362,6 @@ async fn expect_ended_before_content(stream: &mut SubscribeStream, what: &str) -
     }
 }
 
-/// Nothing more arrives for [`QUIET`].
-#[cfg(feature = "test-fault-injection")]
-async fn assert_quiet(stream: &mut SubscribeStream) {
-    match tokio::time::timeout(QUIET, stream.next()).await {
-        Err(_) | Ok(None) => {}
-        Ok(Some(item)) => panic!("expected nothing more, got {item:?}"),
-    }
-}
-
 /// The external-value parts a payload carries.
 fn carried(body: &[u8]) -> Vec<Vec<u8>> {
     OmpfContainer::parse(body)
@@ -543,9 +532,10 @@ fn atomic_misses(metrics: &Metrics) -> (u64, u64) {
     )
 }
 
-/// `live_edit_checkpoint_ext_recovery_total{result}`, zero-seeded.
+/// `live_edit_checkpoint_ext_recovery_total{result}`, summed over its `meta`
+/// label, zero-seeded.
 fn adapter_result(metrics: &Metrics, result: &str) -> u64 {
-    sample_value(
+    live_edit::observability::metrics::test_util::sample_sum(
         &render(metrics),
         "live_edit_checkpoint_ext_recovery_total",
         &[("result", result)],
@@ -568,10 +558,9 @@ fn adapter_consults(metrics: &Metrics) -> u64 {
     .sum()
 }
 
-// ── An external-value store that acts inside `probe_values` ──────────────────
+// ── An external-value store that acts inside its probes ──────────────────────
 
-/// What [`ScriptedProbeStore`] does on one `probe_values` call before it
-/// delegates.
+/// What [`ScriptedProbeStore`] does on one probe call before it delegates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OnProbe {
     /// Nothing.
@@ -586,14 +575,18 @@ enum OnProbe {
     PoisonReadHolds,
 }
 
-/// A real store whose `probe_values` calls run `script` by call index (then
-/// [`OnProbe::Pass`]). A catch-up build probes after its snapshot, before any
-/// blob read, and again after the miss protocol's re-read; so call 0 stands
-/// where the service's pre-ext-probe seam does, and call 1 between the re-read
-/// and the rebuild's blob read, under the hold.
+/// A real store whose probe calls — `probe_value_lengths`, the catch-up
+/// build's length probe, and `probe_values` — run `script` by call index
+/// (then [`OnProbe::Pass`]). A catch-up build probes its values' lengths
+/// after its snapshot, before any blob read, and again after the miss
+/// protocol's re-read; so call 0 stands where the service's pre-ext-probe
+/// seam does, and call 1 between the re-read and the rebuild's blob read,
+/// under the hold. A build that finds nothing missing probes once more, at
+/// its closing length check, after its ranged reads.
 ///
-/// Every trait method is forwarded, the defaulted ones included: an omitted
-/// arm would substitute the default body, not pass through.
+/// Every trait method is forwarded; should the trait gain a defaulted one,
+/// forward it too: an omitted arm would substitute the default body, not
+/// pass through.
 struct ScriptedProbeStore {
     inner: ValkeyExternalValueStore,
     client: ValkeyClient,
@@ -628,6 +621,27 @@ impl ScriptedProbeStore {
     fn release(&self) {
         self.released.notify_one();
     }
+
+    /// Run this probe call's step of the script.
+    async fn act(&self) {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.script.get(call).copied().unwrap_or(OnProbe::Pass) {
+            OnProbe::Pass => {}
+            OnProbe::Park => {
+                self.parked.notify_one();
+                self.released.notified().await;
+            }
+            OnProbe::DropReadHolds => {
+                let _: i64 = self
+                    .client
+                    .pool
+                    .del(&self.hold_key)
+                    .await
+                    .expect("DEL read_hold");
+            }
+            OnProbe::PoisonReadHolds => poison_read_holds(&self.client, &self.hold_key).await,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -661,35 +675,34 @@ impl ExternalValueStore for ScriptedProbeStore {
         self.inner.read_batch(hashes).await
     }
 
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&AtomicUsize>,
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
-        self.inner
-            .read_batch_with_recovery_counter(hashes, recovery_counter)
-            .await
+    async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
+        self.act().await;
+        self.inner.probe_values(hashes).await
     }
 
-    async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        match self.script.get(call).copied().unwrap_or(OnProbe::Pass) {
-            OnProbe::Pass => {}
-            OnProbe::Park => {
-                self.parked.notify_one();
-                self.released.notified().await;
-            }
-            OnProbe::DropReadHolds => {
-                let _: i64 = self
-                    .client
-                    .pool
-                    .del(&self.hold_key)
-                    .await
-                    .expect("DEL read_hold");
-            }
-            OnProbe::PoisonReadHolds => poison_read_holds(&self.client, &self.hold_key).await,
-        }
-        self.inner.probe_values(hashes).await
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<ExtValueLengths, ServiceError> {
+        self.act().await;
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
     }
 
     async fn enqueue_retirement_attempt(
@@ -729,23 +742,14 @@ async fn poison_read_holds(client: &ValkeyClient, hold_key: &str) {
         .expect("SET read_hold");
 }
 
-/// A service whose store runs `script` in `probe_values`, in snapshot mode,
-/// with the store kept for the test to drive.
+/// A service whose store runs `script` in its probes, with the store kept
+/// for the test to drive.
 fn scripted_service(
     tv: &TestValkey,
     script: Vec<OnProbe>,
 ) -> (Arc<LiveEditService>, Arc<ScriptedProbeStore>) {
-    scripted_service_in(tv, true, script)
-}
-
-/// [`scripted_service`] in catch-up snapshot mode `snapshot_mode`.
-fn scripted_service_in(
-    tv: &TestValkey,
-    snapshot_mode: bool,
-    script: Vec<OnProbe>,
-) -> (Arc<LiveEditService>, Arc<ScriptedProbeStore>) {
     let mut scripted = None;
-    let (svc, _adapter) = service_with(tv, snapshot_mode, |store| {
+    let (svc, _adapter) = service_with(tv, |store| {
         let store = Arc::new(ScriptedProbeStore::new(store, tv, script));
         scripted = Some(Arc::clone(&store));
         store
@@ -753,7 +757,7 @@ fn scripted_service_in(
     (Arc::new(svc), scripted.expect("the wrap closure ran"))
 }
 
-/// [`scripted_service_in`] whose catch-ups run on `valkey` — a client
+/// [`scripted_service`] whose catch-ups run on `valkey` — a client
 /// connected with a test's own `configure`d settings (atomic-read limits,
 /// capacity budget) on `TEST_VALKEY_URL` — instead of the fixture's. The
 /// catch-up's reads, read permits, capacity budget, stream registration and
@@ -762,7 +766,6 @@ fn scripted_service_in(
 /// same database, so writes and GC are unchanged.
 async fn scripted_service_on(
     tv: &TestValkey,
-    snapshot_mode: bool,
     script: Vec<OnProbe>,
     configure: impl FnOnce(&mut live_edit::config::Config),
 ) -> (Arc<LiveEditService>, Arc<ScriptedProbeStore>) {
@@ -772,7 +775,7 @@ async fn scripted_service_on(
         .await
         .expect("a catch-up client with test settings connects");
     let mut scripted = None;
-    let (svc, _adapter) = service_with(tv, snapshot_mode, |store| {
+    let (svc, _adapter) = service_with(tv, |store| {
         let store = Arc::new(ScriptedProbeStore::new(store, tv, script));
         scripted = Some(Arc::clone(&store));
         store
@@ -809,11 +812,9 @@ async fn scripted_service_on(
 enum Regime {
     /// Regime 1, `have = (0, 0)`: the full state.
     BrandNew,
-    /// Regime 2, `have = (object, 1)` with `2-0` retained: in snapshot mode
-    /// the coalesced diff; in rollback mode the per-commit replay.
+    /// Regime 2, `have = (object, 1)` with `2-0` retained: the coalesced diff.
     InWindow,
-    /// Regime 3, `have = (object, 1)` with `2-0` trimmed: the coalesced diff
-    /// (snapshot mode) or the legacy version diff (rollback mode).
+    /// Regime 3, `have = (object, 1)` with `2-0` trimmed: the coalesced diff.
     OutOfWindow,
 }
 
@@ -852,19 +853,37 @@ async fn seed_regime(
     (have, first_cut)
 }
 
+/// b.ntm (T4, T14): once a catch-up's content has been taken and dropped,
+/// nothing of the replica's catch-up payload budget is held — no page's
+/// share, no forced top-up for a restored value — whatever the miss protocol
+/// did on the way: a stale miss rebuilt, a genuine miss restored through the
+/// adapter, a lost layer restored.
+fn assert_payload_budget_returned(svc: &LiveEditService, what: &str) {
+    let budget = &svc.valkey.catchup_payload_budget;
+    assert_eq!(
+        (
+            budget.reserved_bytes(),
+            budget.overcommit_bytes(),
+            budget.waiters()
+        ),
+        (0, 0, 0),
+        "{what}: the catch-up payload budget is all returned"
+    );
+}
+
 /// Drive one cut-based test-6 case: see the section header. Asserts the
 /// payload is fresh and carries C2, the ack is C2, the next message is the
 /// next commit, the miss counted one `stale_retried` on the atomic read and
 /// nothing genuine, the adapter was never consulted, and no hold field is
 /// left once the content arrives.
 #[cfg(feature = "test-fault-injection")]
-async fn assert_cut_based_stale_miss_rebuilds_fresh(regime: Regime, snapshot_mode: bool) {
+async fn assert_cut_based_stale_miss_rebuilds_fresh(regime: Regime) {
     let tv = TestValkey::setup().await;
-    let (mut svc, _adapter) = service_with(&tv, snapshot_mode, |store| Arc::new(store));
+    let (mut svc, _adapter) = service_with(&tv, |store| Arc::new(store));
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_ext_probe());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let svc = Arc::new(svc);
-    let layer = format!("stale-{regime:?}-{snapshot_mode}");
+    let layer = format!("stale-{regime:?}");
     let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-stale", &layer).await;
     let (old, fresh) = (blob(0xA1), blob(0xB2));
     let (have, first_cut) =
@@ -893,7 +912,7 @@ async fn assert_cut_based_stale_miss_rebuilds_fresh(regime: Regime, snapshot_mod
 
     let (content, body) = next_message(&mut stream).await.unwrap_or_else(|status| {
         panic!(
-            "[{regime:?} / snapshot_mode={snapshot_mode}] a blob collected after the snapshot \
+            "[{regime:?}] a blob collected after the snapshot \
              must be re-read, not end the catch-up: got {status:?}"
         )
     });
@@ -904,24 +923,24 @@ async fn assert_cut_based_stale_miss_rebuilds_fresh(regime: Regime, snapshot_mod
     assert_eq!(
         hold_fields(&tv).await,
         0,
-        "[{regime:?} / snapshot_mode={snapshot_mode}] no hold field is left once the content \
+        "[{regime:?}] no hold field is left once the content \
          arrives"
     );
     assert_eq!(
         (content.object_id, content.sequence_num),
         (object_id, new_cut),
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the payload carries the re-read's cut"
+        "[{regime:?}] the payload carries the re-read's cut"
     );
     let parts = carried(&body);
     assert!(
         parts.contains(&fresh) && !parts.contains(&old),
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the payload carries the fresh value, not \
+        "[{regime:?}] the payload carries the fresh value, not \
          the collected one"
     );
     assert_eq!(
         field_hash(&body),
         Some(ext_content_hash(&fresh).to_vec()),
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the field references the fresh value"
+        "[{regime:?}] the field references the fresh value"
     );
     expect_caught_up_ack(&mut stream, object_id, new_cut).await;
     // The rewrite is at the ack, so the next message must be the next commit:
@@ -931,128 +950,42 @@ async fn assert_cut_based_stale_miss_rebuilds_fresh(regime: Regime, snapshot_mod
     assert_eq!(
         live.sequence_num,
         new_cut + 1,
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the next commit arrives next: none lost, \
+        "[{regime:?}] the next commit arrives next: none lost, \
          none repeated"
     );
 
     assert_eq!(
         atomic_misses(&svc.metrics),
         (1, 0),
-        "[{regime:?} / snapshot_mode={snapshot_mode}] one stale_retried miss, nothing genuine"
+        "[{regime:?}] one stale_retried miss, nothing genuine"
     );
     assert_eq!(
         adapter_consults(&svc.metrics),
         0,
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the checkpoint adapter is never consulted"
+        "[{regime:?}] the checkpoint adapter is never consulted"
     );
+    assert_payload_budget_returned(&svc, &format!("[{regime:?}] a stale miss rebuilt"));
 }
 
-/// Regime 1 in snapshot mode (`compute_faithful_full_content_at_cut`).
+/// Regime 1 (`compute_faithful_full_content_at_cut`).
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_brand_new_stale_miss_rebuilds_fresh_state_at_the_new_cut() {
-    assert_cut_based_stale_miss_rebuilds_fresh(Regime::BrandNew, true).await;
+    assert_cut_based_stale_miss_rebuilds_fresh(Regime::BrandNew).await;
 }
 
-/// Regime 1 in rollback mode (the legacy full-content `compute_diff_at_cut`).
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_brand_new_legacy_mode_stale_miss_rebuilds_fresh_state_at_the_new_cut() {
-    assert_cut_based_stale_miss_rebuilds_fresh(Regime::BrandNew, false).await;
-}
-
-/// Regime 2's in-window snapshot (`compute_faithful_coalesced_at_cut`).
+/// Regime 2 (`compute_faithful_coalesced_at_cut`).
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_window_stale_miss_rebuilds_fresh_state_at_the_new_cut() {
-    assert_cut_based_stale_miss_rebuilds_fresh(Regime::InWindow, true).await;
+    assert_cut_based_stale_miss_rebuilds_fresh(Regime::InWindow).await;
 }
 
-/// Regime 3 in snapshot mode (`compute_faithful_coalesced_at_cut`).
+/// Regime 3 (`compute_faithful_coalesced_at_cut`).
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_out_of_window_stale_miss_rebuilds_fresh_state_at_the_new_cut() {
-    assert_cut_based_stale_miss_rebuilds_fresh(Regime::OutOfWindow, true).await;
-}
-
-/// Regime 3 in rollback mode (the legacy version diff, `compute_diff_at_cut`).
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_legacy_mode_stale_miss_rebuilds_fresh_state_at_the_new_cut() {
-    assert_cut_based_stale_miss_rebuilds_fresh(Regime::OutOfWindow, false).await;
-}
-
-/// Regime 2 in rollback mode: the per-commit replay's first commit (seq 2,
-/// which wrote `old`) is built from its own atomic read and parks; the
-/// rewrite (seq 3) lands and `old` is collected. The commit's re-read is
-/// taken at cut 3 and its diff stays bounded by its own sequence, so the
-/// rewrite is not folded into it: the replay delivers seq 2 (without `old`),
-/// then seq 3 live (with `fresh`), each once, and nothing ends INTERNAL.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_stale_miss_rebuilds_its_commit_from_a_fresh_read() {
-    let tv = TestValkey::setup().await;
-    let (mut svc, _adapter) = service_with(&tv, false, |store| Arc::new(store));
-    let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_ext_probe());
-    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    let svc = Arc::new(svc);
-    let layer = "stale-rollback-replay";
-    let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-stale", layer).await;
-    let (old, fresh) = (blob(0xA3), blob(0xB4));
-    commit_ext(&svc, &session_id, layer, object_id, true, &old).await; // seq 2
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1).await;
-    seam.wait_until_parked_pre_ext_probe().await;
-    commit_ext(&svc, &session_id, layer, object_id, false, &fresh).await; // seq 3
-    collect(&tv, &old).await;
-    seam.release_pre_ext_probe().await;
-
-    let (replayed, replayed_body) = next_message(&mut stream).await.unwrap_or_else(|status| {
-        panic!("a replayed commit whose blob was collected must be re-read: got {status:?}")
-    });
-    assert_eq!(
-        hold_fields(&tv).await,
-        0,
-        "no hold field is left once the replay's content arrives"
-    );
-    assert_eq!(
-        (replayed.object_id, replayed.sequence_num),
-        (object_id, 2),
-        "the replay delivers the commit it was rebuilding, under its own sequence"
-    );
-    let replayed_parts = carried(&replayed_body);
-    assert!(
-        !replayed_parts.contains(&old),
-        "the collected value is never delivered"
-    );
-    assert!(
-        !replayed_parts.contains(&fresh),
-        "the rewrite (seq 3) is not folded into seq 2's diff: it is delivered once, as itself"
-    );
-    // Then the rewrite, once. An empty header between them (an ack) is
-    // allowed; a second copy of seq 2 or a skip to seq 4 is not.
-    let mut sequences = vec![replayed.sequence_num];
-    let live_body = loop {
-        let (header, body) = next_message(&mut stream)
-            .await
-            .unwrap_or_else(|status| panic!("the replay's tail ended {status:?}"));
-        if header.total_size == 0 {
-            continue;
-        }
-        sequences.push(header.sequence_num);
-        if header.sequence_num >= 3 {
-            break body;
-        }
-    };
-    assert_eq!(sequences, [2, 3], "each commit is delivered once, in order");
-    assert!(
-        carried(&live_body).contains(&fresh),
-        "the rewrite delivers the fresh value"
-    );
-    assert_quiet(&mut stream).await;
-
-    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
-    assert_eq!(adapter_consults(&svc.metrics), 0);
+    assert_cut_based_stale_miss_rebuilds_fresh(Regime::OutOfWindow).await;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1068,7 +1001,18 @@ async fn genuinely_missing(
     value: &[u8],
     adapter_holds_it: bool,
 ) -> (Arc<LiveEditService>, String, String, u64) {
-    let (svc, adapter) = service_with(tv, true, |store| Arc::new(store));
+    genuinely_missing_with(tv, value, adapter_holds_it, |_| {}).await
+}
+
+/// [`genuinely_missing`] on a service `configure` adjusts first.
+async fn genuinely_missing_with(
+    tv: &TestValkey,
+    value: &[u8],
+    adapter_holds_it: bool,
+    configure: impl FnOnce(&mut LiveEditService),
+) -> (Arc<LiveEditService>, String, String, u64) {
+    let (mut svc, adapter) = service_with(tv, |store| Arc::new(store));
+    configure(&mut svc);
     let svc = Arc::new(svc);
     let layer = format!("genuine-{adapter_holds_it}");
     let (session_id, object_id) = create_session_and_layer(tv, &svc, "b-yuo-genuine", &layer).await;
@@ -1115,10 +1059,479 @@ async fn a_genuine_miss_under_a_live_hold_recovers_through_the_adapter() {
         "the recovery stored it again"
     );
     assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
+    assert_payload_budget_returned(&svc, "a genuine miss restored through the adapter");
 }
 
+/// b.ntm, D1: a genuine miss's restore writes the blob back to the store, and
+/// the build drops the restored bytes once their length is known, so nothing
+/// of the catch-up payload budget is held for them when the payload reserves.
+/// The restore's own charge (`EXT_RESTORE_CHARGE_CENTI` hundredths per byte,
+/// 4.24, about 8.5 KiB here) is clamped to
+/// the budget's total, granted at once on a budget nothing else holds, and
+/// given back at the blob's write-back; then the payload's reservation — the
+/// whole payload, the restored blob included, and its replies in flight — is
+/// clamped to the total and granted at once too; the blob is read back by
+/// range. With the replica's budget sized to `total_kib`, against the 2 KiB
+/// restored blob and a payload of about 2.4 KiB, the catch-up is served on
+/// its first try, its capacity budget never run out, and the budget is all
+/// returned once the content is taken. A regression guard: the reservation
+/// beside a top-up b.ntm replaced served both cases too, by its own clamp.
+async fn assert_a_genuine_miss_restoring_most_of_the_payload_budget_is_served(total_kib: u64) {
+    let tv = TestValkey::setup().await;
+    let value = blob(0xC5);
+    let (svc, session_id, layer, object_id) = genuinely_missing_with(&tv, &value, true, |svc| {
+        svc.valkey.catchup_payload_budget = payload_budget(total_kib);
+    })
+    .await;
+    assert!(
+        (value.len() as u64) * 2 > total_kib * 1024,
+        "fixture self-check: the restored blob is more than half the budget"
+    );
+
+    let mut stream = subscribe(&svc, &session_id, &layer, 0, 0).await;
+    let (content, body) = next_content(&mut stream, "a genuine miss restoring most of D_c").await;
+    assert_eq!((content.object_id, content.sequence_num), (object_id, 2));
+    assert!(
+        carried(&body).contains(&value),
+        "the adapter's copy is delivered"
+    );
+    expect_caught_up_ack(&mut stream, object_id, 2).await;
+    assert_eq!(adapter_result(&svc.metrics, "recovered"), 1);
+    assert_payload_budget_returned(&svc, "a genuine miss restoring most of the budget");
+}
+
+/// The restored blob (2 KiB) is more than half of a 3 KiB budget; its
+/// restore's charge and the payload's whole reservation (about 2.4 KiB and its
+/// replies in flight) are each clamped to the 3 KiB total, and the payload's
+/// would not fit beside a top-up held for the blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_miss_restoring_more_than_half_the_payload_budget_is_served_at_once() {
+    assert_a_genuine_miss_restoring_most_of_the_payload_budget_is_served(3).await;
+}
+
+/// The restored blob (2 KiB) is the whole 2 KiB budget: its restore's charge
+/// and then the payload's reservation are each clamped to the total and run
+/// alone, as any reservation larger than the budget does — here at once, the
+/// catch-up being the budget's only holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_miss_restoring_the_whole_payload_budget_is_served_at_once() {
+    assert_a_genuine_miss_restoring_most_of_the_payload_budget_is_served(2).await;
+}
+
+// ── A genuine miss's restore and its read-back (b.ntm) ──────────────────────
+
+/// What [`RestoreWatchingStore`] does once a restore through the checkpoint
+/// adapter (`recover_value`) has returned, before the build goes on.
+enum AfterRestore {
+    /// Nothing.
+    Nothing,
+    /// Delete the restored values' keys, as a write-back that did not land,
+    /// or a value gone again before the fill reads it back, leaves the store.
+    Wipe,
+}
+
+/// A real store that counts its restores through the checkpoint adapter and
+/// the bytes read back by range of each value, and acts once each restore
+/// returns ([`AfterRestore`]).
+///
+/// Every trait method is forwarded; should the trait gain a defaulted one,
+/// forward it too: an omitted arm would substitute the default body, not
+/// pass through.
+struct RestoreWatchingStore {
+    inner: ValkeyExternalValueStore,
+    client: ValkeyClient,
+    keys: live_edit::storage::keys::KeySchema,
+    after: AfterRestore,
+    restores: AtomicUsize,
+    /// Bytes each `read_value_range` answered, by hash.
+    read_back: std::sync::Mutex<std::collections::HashMap<[u8; 32], u64>>,
+}
+
+impl RestoreWatchingStore {
+    fn new(inner: ValkeyExternalValueStore, tv: &TestValkey, after: AfterRestore) -> Self {
+        Self {
+            inner,
+            client: tv.client().clone(),
+            keys: tv.key_schema().clone(),
+            after,
+            restores: AtomicUsize::new(0),
+            read_back: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn restores(&self) -> usize {
+        self.restores.load(Ordering::SeqCst)
+    }
+
+    /// The bytes of `value` read by range so far.
+    fn read_back(&self, value: &[u8]) -> u64 {
+        self.read_back
+            .lock()
+            .expect("read_back")
+            .get(&ext_content_hash(value))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl ExternalValueStore for RestoreWatchingStore {
+    async fn store_values(&self, values: &[(&[u8; 32], &[u8])]) -> Result<(), ServiceError> {
+        self.inner.store_values(values).await
+    }
+
+    async fn store_verified_values(
+        &self,
+        values: &[(&[u8; 32], &[u8])],
+    ) -> Result<(), ServiceError> {
+        self.inner.store_verified_values(values).await
+    }
+
+    fn ext_value_verify(&self) -> ExtValueVerify<'_> {
+        self.inner.ext_value_verify()
+    }
+
+    async fn load_values(
+        &self,
+        hashes: &[&[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>, ServiceError> {
+        self.inner.load_values(hashes).await
+    }
+
+    async fn read_batch(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
+        self.inner.read_batch(hashes).await
+    }
+
+    async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
+        self.inner.probe_values(hashes).await
+    }
+
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<Bytes, ServiceError> {
+        let read = self.inner.read_value_range(hash, start, len).await?;
+        *self
+            .read_back
+            .lock()
+            .expect("read_back")
+            .entry(*hash)
+            .or_insert(0) += read.len() as u64;
+        Ok(read)
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<Bytes, ServiceError> {
+        self.restores.fetch_add(1, Ordering::SeqCst);
+        let restored = self.inner.recover_value(hash, on_fetched).await;
+        match &self.after {
+            AfterRestore::Nothing => {}
+            AfterRestore::Wipe => {
+                let hex = sha256_to_hex(hash);
+                let _: i64 = self
+                    .client
+                    .pool
+                    .unlink(vec![self.keys.ext_meta(&hex), self.keys.ext_data(&hex)])
+                    .await
+                    .expect("UNLINK the restored value's keys");
+            }
+        }
+        restored
+    }
+
+    async fn enqueue_retirement_attempt(
+        &self,
+        object_id: &str,
+        attempt: &str,
+        releases: &[ExtRelease],
+        send_by: std::time::Instant,
+    ) -> Result<live_edit::storage::external_values::ReleaseAttemptOutcome, ServiceError> {
+        self.inner
+            .enqueue_retirement_attempt(object_id, attempt, releases, send_by)
+            .await
+    }
+
+    async fn process_pending(
+        &self,
+        policy: &GcPolicy,
+        state: &mut GcPassState,
+    ) -> Result<GcBatchResult, ServiceError> {
+        self.inner.process_pending(policy, state).await
+    }
+
+    fn ext_release_gate(&self) -> Option<&Arc<ExtReleaseGate>> {
+        self.inner.ext_release_gate()
+    }
+}
+
+/// A service whose store is a [`RestoreWatchingStore`] acting `after` each
+/// restore, adjusted by `configure`, with one layer per value in one session:
+/// each layer's field references its value, which the adapter holds and
+/// which is then deleted out of band, so each layer's catch-up misses it
+/// genuinely and restores it. Returns the service, the store, the session
+/// and each layer with its object.
+async fn genuinely_missing_watched(
+    tv: &TestValkey,
+    values: &[&[u8]],
+    after: AfterRestore,
+    configure: impl FnOnce(&mut LiveEditService),
+) -> (
+    Arc<LiveEditService>,
+    Arc<RestoreWatchingStore>,
+    String,
+    Vec<(String, u64)>,
+) {
+    let mut watched = None;
+    let (mut svc, adapter) = service_with(tv, |store| {
+        let store = Arc::new(RestoreWatchingStore::new(store, tv, after));
+        watched = Some(Arc::clone(&store));
+        store
+    });
+    configure(&mut svc);
+    let svc = Arc::new(svc);
+    let watched = watched.expect("the wrap closure ran");
+    let (session_id, first) =
+        create_session_and_layer(tv, &svc, "b-ntm-restored", "restored-0").await;
+    let mut layers = vec![("restored-0".to_owned(), first)];
+    for i in 1..values.len() {
+        let layer = format!("restored-{i}");
+        let object_id = create_layer(&svc, &session_id, &layer).await;
+        layers.push((layer, object_id));
+    }
+    for ((layer, object_id), value) in layers.iter().zip(values) {
+        commit_ext(&svc, &session_id, layer, *object_id, true, value).await; // seq 2
+        adapter
+            .put_ext_blob(
+                &sha256_to_hex(&ext_content_hash(value)),
+                Bytes::from(value.to_vec()),
+            )
+            .await
+            .expect("seed the adapter");
+        wipe(tv, value).await;
+    }
+    (svc, watched, session_id, layers)
+}
+
+/// A catch-up payload budget of `total_kib`, as the replica builds it.
+fn payload_budget(total_kib: u64) -> Arc<live_edit::storage::memory_budget::MemoryBudget> {
+    use live_edit::storage::memory_budget::{MemoryBudget, CATCHUP_PAYLOAD_SERIES};
+    Arc::new(MemoryBudget::with_series(
+        total_kib,
+        Arc::new(std::sync::Mutex::new(None)),
+        &CATCHUP_PAYLOAD_SERIES,
+    ))
+}
+
+/// D1 (T5, b.ntm's pin rewritten): a genuine miss's restore is charged to
+/// the catch-up payload budget, reserved before the blob is fetched, and
+/// nothing is held across that wait. With another holder filling the budget,
+/// the catch-up waits for it having restored nothing — no adapter fetch, no
+/// grant and no forced top-up of its own — so it holds back no other
+/// catch-up. Once the other holder lets go it restores the blob, gives the
+/// restore's charge back, reserves its payload and is served: the restored
+/// blob read back by range from the store its restore wrote it to, restored
+/// once, and the budget all returned.
+///
+/// Fails without the change (in-place perturbation): with the restore's
+/// reservation skipped, the blob is restored before the catch-up waits, as
+/// b.ntm restored it, and the waiting catch-up has restored once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_miss_waiting_for_the_payload_budget_holds_nothing_of_it_while_it_waits() {
+    const TOTAL_KIB: u64 = 3;
+    let tv = TestValkey::setup().await;
+    let value = blob(0xC7);
+    let (svc, store, session_id, layers) =
+        genuinely_missing_watched(&tv, &[value.as_slice()], AfterRestore::Nothing, |svc| {
+            svc.valkey.catchup_payload_budget = payload_budget(TOTAL_KIB);
+        })
+        .await;
+    let (layer, object_id) = layers[0].clone();
+    let budget = Arc::clone(&svc.valkey.catchup_payload_budget);
+    let held = budget
+        .reserve(TOTAL_KIB * 1024, None)
+        .await
+        .expect("an idle budget grants its whole total");
+
+    let mut stream = subscribe(&svc, &session_id, &layer, 0, 0).await;
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while budget.waiters() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the catch-up never waited for the payload budget"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        (store.restores(), adapter_consults(&svc.metrics)),
+        (0, 0),
+        "the catch-up waits for the budget before it restores the blob: nothing fetched"
+    );
+    assert_eq!(
+        (
+            budget.overcommit_bytes(),
+            budget.reserved_bytes(),
+            budget.waiters()
+        ),
+        (0, TOTAL_KIB * 1024, 1),
+        "while it waits the catch-up holds nothing of the budget: no grant, no top-up; only the \
+         other holder's grant is charged"
+    );
+    assert!(
+        !blob_stored(&tv, &value).await,
+        "nothing restored the blob while the catch-up waits"
+    );
+
+    drop(held);
+    let (content, body) = next_content(&mut stream, "a genuine miss granted after its wait").await;
+    assert_eq!((content.object_id, content.sequence_num), (object_id, 2));
+    assert!(
+        carried(&body).contains(&value),
+        "the restored blob is delivered"
+    );
+    expect_caught_up_ack(&mut stream, object_id, 2).await;
+    assert_eq!(
+        (store.restores(), store.read_back(&value)),
+        (1, value.len() as u64),
+        "restored once, and read back by range, whole"
+    );
+    assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
+    assert_payload_budget_returned(&svc, "a genuine miss granted after its wait");
+}
+
+/// b.ntm: a genuine miss's blob restored before the payload's layout that is
+/// gone again when the fill reads it back — the restore's write-back did not
+/// land, or the value went before the read-back — ends the catch-up
+/// `UNAVAILABLE` before content: never a payload with the blob's bytes zero,
+/// and never a second restore of it in the same build. Nothing of the payload
+/// budget is left held, no forced top-up included, and the hold is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_genuine_miss_whose_restored_blob_is_gone_at_its_read_back_ends_unavailable_restored_once(
+) {
+    let tv = TestValkey::setup().await;
+    let value = blob(0xC8);
+    let (svc, store, session_id, layers) =
+        genuinely_missing_watched(&tv, &[value.as_slice()], AfterRestore::Wipe, |_| {}).await;
+    let (layer, _object_id) = layers[0].clone();
+
+    let mut stream = subscribe(&svc, &session_id, &layer, 0, 0).await;
+    let status = expect_ended_before_content(&mut stream, "a restored blob gone again").await;
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert_eq!(
+        (store.restores(), adapter_result(&svc.metrics, "recovered")),
+        (1, 1),
+        "restored once through the adapter, never a second time"
+    );
+    assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
+    assert_payload_budget_returned(&svc, "a restored blob gone again");
+}
+
+/// D1 (T5, b.ntm's pin rewritten; the closed b.5fz's scenario): two
+/// catch-ups that must each restore a genuinely missing blob wait for the
+/// catch-up payload budget at once — another holder fills it while both
+/// reach their restores and queue, as a join wave on a freshly restored
+/// layer finds it — on a budget too small for either blob's restore charge
+/// (each is clamped to the total, so it runs alone) or for the two payloads
+/// together. Both wait having restored nothing and holding nothing, and each
+/// gives its restore's charge back before its payload reserves, so neither
+/// waits on the other: once the other holder lets go, the restores and then
+/// the payloads are granted in turn, and both are served, neither refused
+/// `catchup_capacity`.
+///
+/// Fails without the change (in-place perturbation): a restore whose charge is
+/// never repaid, so held across the payload's reservation, leaves the first
+/// catch-up's payload waiting on its own restore's charge until its capacity
+/// budget runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_catch_ups_restoring_at_once_are_both_served_without_a_capacity_refusal() {
+    const TOTAL_KIB: u64 = 3;
+    let tv = TestValkey::setup().await;
+    let values = [blob(0xD1), blob(0xD2)];
+    let (svc, store, session_id, layers) = genuinely_missing_watched(
+        &tv,
+        &[values[0].as_slice(), values[1].as_slice()],
+        AfterRestore::Nothing,
+        |svc| svc.valkey.catchup_payload_budget = payload_budget(TOTAL_KIB),
+    )
+    .await;
+    let budget = Arc::clone(&svc.valkey.catchup_payload_budget);
+    let held = budget
+        .reserve(TOTAL_KIB * 1024, None)
+        .await
+        .expect("an idle budget grants its whole total");
+
+    let mut streams = Vec::new();
+    for (layer, _) in &layers {
+        streams.push(subscribe(&svc, &session_id, layer, 0, 0).await);
+    }
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while budget.waiters() < layers.len() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both catch-ups never waited for the payload budget"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(
+        (store.restores(), adapter_consults(&svc.metrics)),
+        (0, 0),
+        "both catch-ups wait for the budget before they restore their blobs"
+    );
+    assert_eq!(
+        (budget.overcommit_bytes(), budget.reserved_bytes()),
+        (0, TOTAL_KIB * 1024),
+        "while they wait neither holds anything of the budget; only the other holder's grant is \
+         charged"
+    );
+    drop(held);
+
+    // Both streams are read at once: a payload's grant is held until its
+    // stream takes it, so the second catch-up's reservations wait on the
+    // first stream's reader, whichever catch-up is granted first.
+    futures::future::join_all(streams.iter_mut().zip(&layers).zip(&values).map(
+        |((stream, (_, object_id)), value)| async move {
+            let (content, body) =
+                next_content(stream, "a catch-up restoring beside another's restore").await;
+            assert_eq!((content.object_id, content.sequence_num), (*object_id, 2));
+            assert!(
+                carried(&body).contains(value),
+                "each restored blob is delivered"
+            );
+            expect_caught_up_ack(stream, *object_id, 2).await;
+        },
+    ))
+    .await;
+    assert_eq!(store.restores(), 2, "each blob restored once");
+    assert_eq!(hold_fields(&tv).await, 0, "the holds are released");
+    assert_payload_budget_returned(&svc, "two catch-ups restoring at once");
+}
+
+/// D1: a genuine miss's restore of backup-only values in batches charged to
+/// the catch-up payload budget — the charge held while the values are
+/// fetched, the refusal when it cannot be reserved and the retry after one,
+/// no deadlock among catch-ups restoring at once, the join wave's re-probes
+/// (uncontended and contended), a batch's grant through its re-probe, a
+/// failure and a disconnect, the bounded parallelism (b.cyy) and the
+/// recovery counter's `meta` label.
+mod restore_in_batches;
+
 /// A genuine miss the adapter cannot restore ends the catch-up INTERNAL,
-/// before content — the one ending that says the layer is damaged.
+/// before content — the one ending that says the layer is damaged — with
+/// nothing of the catch-up payload budget its restore reserved left held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_genuine_miss_the_adapter_cannot_restore_ends_internal() {
     let tv = TestValkey::setup().await;
@@ -1132,6 +1545,7 @@ async fn a_genuine_miss_the_adapter_cannot_restore_ends_internal() {
     assert_eq!(atomic_misses(&svc.metrics), (1, 1));
     assert_eq!(adapter_result(&svc.metrics, "adapter_miss"), 1);
     assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
+    assert_payload_budget_returned(&svc, "a genuine miss the adapter cannot restore");
 }
 
 /// The in-stream message of `read_hold_refused` names this phrase.
@@ -1177,25 +1591,20 @@ async fn a_hold_lost_before_the_genuine_check_ends_unavailable_never_internal() 
 /// The layer overwritten between the stale snapshot and the re-read: the
 /// re-read answers NotFound for the old object, and the catch-up re-bootstraps
 /// onto the new one before any content, with the hold released. One case per
-/// regime, because each maps the re-read's NotFound itself: the cut-based
-/// regimes through `CatchUpBuilt::RereadNotFound` and the recovery that
-/// follows the hold's release (`recover_after_reread_not_found`; with
-/// checkpointing off here it answers not recoverable, and the re-bootstrap
-/// follows), the rollback replay's per-commit build through its own
-/// `NotFound` arm. One stream registration is left, the re-bootstrap's, and
+/// regime, each mapping the re-read's NotFound through
+/// `CatchUpBuilt::RereadNotFound` and the recovery that follows the hold's
+/// release (`recover_after_reread_not_found`; with checkpointing off here it
+/// answers not recoverable, and the re-bootstrap follows). One stream
+/// registration is left, the re-bootstrap's, and
 /// `live_edit_stream_mux_subscriptions` is back at its pre-subscribe level
-/// once the subscription goes: a cut-based re-read's swap reservation goes
-/// with its `RereadNotFound` answer.
-async fn assert_overwrite_between_reads_rebootstraps(
-    regime: Regime,
-    snapshot_mode: bool,
-    seed: u8,
-) {
+/// once the subscription goes: a re-read's swap reservation goes with its
+/// `RereadNotFound` answer.
+async fn assert_overwrite_between_reads_rebootstraps(regime: Regime, seed: u8) {
     let tv = TestValkey::setup().await;
     let value = blob(seed);
-    let (svc, store) = scripted_service_in(&tv, snapshot_mode, vec![OnProbe::Park]);
+    let (svc, store) = scripted_service(&tv, vec![OnProbe::Park]);
     let before = count_subscriptions(&svc).await;
-    let layer = format!("overwritten-{regime:?}-{snapshot_mode}");
+    let layer = format!("overwritten-{regime:?}");
     let layer = layer.as_str();
     let (session_id, old_object) = create_session_and_layer(&tv, &svc, "b-yuo-gone", layer).await;
     let (have, _) = seed_regime(&tv, &svc, &session_id, layer, old_object, regime, &value).await;
@@ -1213,17 +1622,16 @@ async fn assert_overwrite_between_reads_rebootstraps(
     assert_eq!(
         (content.object_id, content.sequence_num),
         (new_object, 1),
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the catch-up re-bootstraps onto the new \
-         object"
+        "[{regime:?}] the catch-up re-bootstraps onto the new object"
     );
     expect_caught_up_ack(&mut stream, new_object, 1).await;
     assert_eq!(atomic_misses(&svc.metrics), (1, 0));
     assert_eq!(
         hold_fields(&tv).await,
         0,
-        "[{regime:?} / snapshot_mode={snapshot_mode}] the hold is released"
+        "[{regime:?}] the hold is released"
     );
-    let what = format!("[{regime:?} / snapshot_mode={snapshot_mode}] the re-bootstrap");
+    let what = format!("[{regime:?}] the re-bootstrap");
     assert_eq!(
         subscriptions(&svc.metrics),
         before + 1,
@@ -1236,32 +1644,19 @@ async fn assert_overwrite_between_reads_rebootstraps(
 /// Regime 1 (`catch_up_brand_new`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stale_miss_whose_layer_was_overwritten_rebootstraps_on_the_new_object() {
-    assert_overwrite_between_reads_rebootstraps(Regime::BrandNew, true, 0xC4).await;
+    assert_overwrite_between_reads_rebootstraps(Regime::BrandNew, 0xC4).await;
 }
 
-/// Regime 2's snapshot arm (`catch_up_in_window_snapshot`).
+/// Regime 2 (`catch_up_in_window`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_window_stale_miss_whose_layer_was_overwritten_rebootstraps() {
-    assert_overwrite_between_reads_rebootstraps(Regime::InWindow, true, 0xCB).await;
+    assert_overwrite_between_reads_rebootstraps(Regime::InWindow, 0xCB).await;
 }
 
-/// Regime 3 (`catch_up_out_of_window`), in snapshot mode.
+/// Regime 3 (`catch_up_out_of_window`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_out_of_window_stale_miss_whose_layer_was_overwritten_rebootstraps() {
-    assert_overwrite_between_reads_rebootstraps(Regime::OutOfWindow, true, 0xCC).await;
-}
-
-/// Regime 3 in rollback mode.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_legacy_mode_stale_miss_whose_layer_was_overwritten_rebootstraps() {
-    assert_overwrite_between_reads_rebootstraps(Regime::OutOfWindow, false, 0xCD).await;
-}
-
-/// The rollback replay's per-commit build (`replay_commit_diff`'s own
-/// `NotFound` arm).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_stale_miss_whose_layer_was_overwritten_rebootstraps() {
-    assert_overwrite_between_reads_rebootstraps(Regime::InWindow, false, 0xCE).await;
+    assert_overwrite_between_reads_rebootstraps(Regime::OutOfWindow, 0xCC).await;
 }
 
 /// The layer deleted between the stale snapshot and the re-read: the
@@ -1301,12 +1696,11 @@ async fn a_stale_miss_whose_layer_was_deleted_ends_not_found() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// A cut-based site's re-read NotFound runs the layer recovery, once the hold
-// is released
+// A re-read's NotFound runs the layer recovery, once the hold is released
 // ═════════════════════════════════════════════════════════════════════════════
 //
-// At a cut-based site (Regime 1, Regime 2's snapshot arm, Regime 3, and the
-// re-attach to a flight), a stale miss whose re-read finds the layer's state
+// At every re-read site (Regime 1, Regime 2, Regime 3, and the re-attach to
+// a flight), a stale miss whose re-read finds the layer's state
 // gone — every `le:{oid}:obj:*` key lost, the session's mapping kept, as a
 // keyspace loss leaves it — is the first read's `NotFound` met later: with
 // checkpointing on and a restorable checkpoint, the catch-up restores the
@@ -1316,16 +1710,8 @@ async fn a_stale_miss_whose_layer_was_deleted_ends_not_found() {
 //
 // In-place proof (fail-on-old): with `recover_after_reread_not_found`'s body
 // replaced by the pre-fix `handle_deleted_and_rebootstrap(…, StateGone)`,
-// every cut-based case here ends `NOT_FOUND` (the Transient case too,
-// instead of `UNAVAILABLE`).
-//
-// The rollback replay's per-commit re-read is not a cut-based site: its
-// `NotFound` goes to the replay's own `NotFound` arm, which re-bootstraps
-// without asking the recovery and never enters
-// `recover_after_reread_not_found`. Its case here
-// (`a_rollback_replay_re_read_that_finds_the_state_gone_rebootstraps_without_recovery`)
-// is a guard on that behaviour, which the old code had too, so it passes
-// on the old code as well.
+// every case here ends `NOT_FOUND` (the Transient case too, instead of
+// `UNAVAILABLE`).
 
 /// The inline field a restorable checkpoint holds in [`SECTION`]: only the
 /// restore can have written it.
@@ -1538,6 +1924,10 @@ impl CheckpointStore for RestoreObservingStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.inner.delete_ext_blob(hash_hex).await
     }
@@ -1630,9 +2020,9 @@ async fn lose_the_layers_state(tv: &TestValkey, object_id: u64, value: &[u8]) {
     }
 }
 
-/// A service in snapshot mode whose store runs `script` in `probe_values`,
-/// with an enabled layer recovery hook over a [`RestoreObservingStore`]
-/// (listing fails `Transient` when `fail_listing`).
+/// A service whose store runs `script` in its probes, with an enabled
+/// layer recovery hook over a [`RestoreObservingStore`] (listing fails
+/// `Transient` when `fail_listing`).
 fn restoring_service(
     tv: &TestValkey,
     script: Vec<OnProbe>,
@@ -1642,22 +2032,8 @@ fn restoring_service(
     Arc<ScriptedProbeStore>,
     Arc<RestoreObservingStore>,
 ) {
-    restoring_service_in(tv, true, script, fail_listing)
-}
-
-/// [`restoring_service`] in catch-up snapshot mode `snapshot_mode`.
-fn restoring_service_in(
-    tv: &TestValkey,
-    snapshot_mode: bool,
-    script: Vec<OnProbe>,
-    fail_listing: bool,
-) -> (
-    Arc<LiveEditService>,
-    Arc<ScriptedProbeStore>,
-    Arc<RestoreObservingStore>,
-) {
     let mut scripted = None;
-    let (mut svc, _adapter) = service_with(tv, snapshot_mode, |store| {
+    let (mut svc, _adapter) = service_with(tv, |store| {
         let store = Arc::new(ScriptedProbeStore::new(store, tv, script));
         scripted = Some(Arc::clone(&store));
         store
@@ -1671,7 +2047,7 @@ fn restoring_service_in(
     )
 }
 
-/// One cut-based regime's site: the first build parks at its probe with its
+/// One regime's site: the first build parks at its probe with its
 /// snapshot referencing `value`; the layer's state is lost; the build misses
 /// `value`, takes its hold and re-reads, which answers `NotFound`. Then, the
 /// hold released (zero fields when the restore lists the checkpoints), the
@@ -1763,6 +2139,7 @@ async fn assert_reread_not_found_restores(regime: Regime, seed: u8) {
         before + 1,
         "{what}: one stream registration, the re-run's"
     );
+    assert_payload_budget_returned(&svc, &what);
     drop(stream);
     until_subscriptions(&svc.metrics, before, &what).await;
 }
@@ -1773,8 +2150,8 @@ async fn a_brand_new_re_read_that_finds_the_state_lost_restores_it_and_delivers_
     assert_reread_not_found_restores(Regime::BrandNew, 0xB5).await;
 }
 
-/// Regime 2's snapshot arm (`catch_up_in_window_snapshot`): re-run through
-/// Regime 3, whose coalesced diff is the one this arm builds.
+/// Regime 2 (`catch_up_in_window`): re-run through Regime 3, whose
+/// coalesced diff is the one Regime 2 builds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_window_re_read_that_finds_the_state_lost_restores_it_and_delivers_it() {
     assert_reread_not_found_restores(Regime::InWindow, 0xB6).await;
@@ -1817,67 +2194,6 @@ async fn a_re_read_whose_recovery_fails_transiently_ends_unavailable() {
     assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
 }
 
-/// The rollback replay's per-commit re-read is not a cut-based site: its
-/// `NotFound` goes to the replay's own `NotFound` arm, which re-bootstraps at
-/// once and never asks the layer recovery — even with checkpointing on and a
-/// checkpoint of the old object stored. Here the layer is overwritten at the
-/// park, so the re-bootstrap lands on the new object; no restore attempt
-/// lists the checkpoints and the recovery counts nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_re_read_that_finds_the_state_gone_rebootstraps_without_recovery() {
-    let tv = TestValkey::setup().await;
-    let value = blob(0xB9);
-    let (svc, store, checkpoints) = restoring_service_in(&tv, false, vec![OnProbe::Park], false);
-    let layer = "replay-no-recovery";
-    let (session_id, old_object) =
-        create_session_and_layer(&tv, &svc, "b-yuo-restore", layer).await;
-    let (have, first_cut) = seed_regime(
-        &tv,
-        &svc,
-        &session_id,
-        layer,
-        old_object,
-        Regime::InWindow,
-        &value,
-    )
-    .await;
-    checkpoints
-        .seed(old_object, &session_id, layer, first_cut)
-        .await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, have.0, have.1).await;
-    store.wait_parked().await;
-    let new_object = create_layer(&svc, &session_id, layer).await;
-    assert_ne!(new_object, old_object, "precondition: an overwrite");
-    svc.layer_store.wait_for_cleanup(DEADLINE).await;
-    if blob_stored(&tv, &value).await {
-        wipe(&tv, &value).await;
-    }
-    store.release();
-
-    let (content, _) = next_content(&mut stream, "the re-bootstrap").await;
-    assert_eq!(
-        (content.object_id, content.sequence_num),
-        (new_object, 1),
-        "the replay re-bootstraps onto the new object"
-    );
-    expect_caught_up_ack(&mut stream, new_object, 1).await;
-    assert_eq!(
-        checkpoints.holds_at_listing(),
-        Vec::<u64>::new(),
-        "no restore attempt listed the checkpoints"
-    );
-    for result in ["restored", "not_recoverable", "error"] {
-        assert_eq!(
-            crate::common::recovery_metric(&svc.metrics, result),
-            0,
-            "the layer recovery was not asked: `{result}`"
-        );
-    }
-    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
-    assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
-}
-
 /// A restored re-run is charged to the capacity budget the first read left —
 /// a restore is not an overwrite, so the budget is not refilled — and a
 /// re-run that cannot get capacity within it ends with the retryable
@@ -1906,7 +2222,7 @@ async fn a_restored_re_run_out_of_its_capacity_budget_ends_with_the_capacity_ref
         .await
         .expect("a catch-up client with one slot connects");
     let mut scripted = None;
-    let (svc, _adapter) = service_with(&tv, true, |store| {
+    let (svc, _adapter) = service_with(&tv, |store| {
         let store = Arc::new(ScriptedProbeStore::new(store, &tv, vec![OnProbe::Park]));
         scripted = Some(Arc::clone(&store));
         store
@@ -2154,64 +2470,6 @@ async fn a_re_read_whose_cut_regressed_ends_unavailable_before_content() {
     super::log_capture::purge_keys(&tv).await;
 }
 
-/// A rollback replay's per-commit re-read that finds the object's shared
-/// fenced-read flight registered hands the commit back as above the
-/// atomic-read limits, and the replay re-routes through the flight. The hold
-/// is released before that: while the replay builds from the flight's
-/// snapshot no field is left — the flight's read and build take no hold.
-///
-/// The flight is registered by the test (`SnapshotFlights::attach_or_create`)
-/// after the first read, so only the re-read sees it. The replay's waiter
-/// drives the flight's read; the test's own waiter, which never reads, holds
-/// the flight registered until then. The replay is parked at its flight build's
-/// probe (`probe_values` call 1), inside its build turn and still attached,
-/// so the test sees it in the flight however fast the read ran — a poll for
-/// the join could miss a replay that joined, built and left between polls.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_per_commit_re_read_handed_to_a_flight_releases_its_hold_first() {
-    let tv = TestValkey::setup().await;
-    let (old, fresh) = (blob(0xC9), blob(0xCA));
-    let (svc, store) = scripted_service_in(&tv, false, vec![OnProbe::Park, OnProbe::Park]);
-    let layer = "handed-to-a-flight";
-    let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-flight", layer).await;
-    commit_ext(&svc, &session_id, layer, object_id, true, &old).await; // seq 2
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1).await;
-    store.wait_parked().await;
-    commit_ext(&svc, &session_id, layer, object_id, false, &fresh).await; // seq 3
-    collect(&tv, &old).await;
-    let ours = svc.snapshot_flights.attach_or_create(
-        object_id,
-        LayerSize {
-            items: 1_000,
-            bytes: 1_000_000,
-        },
-    );
-    store.release();
-
-    // Parked again: the replay has joined the flight, read through it, and
-    // is building from its snapshot.
-    store.wait_parked().await;
-    assert!(
-        ours.flight().waiters() >= 2,
-        "precondition: the replay is attached to the test's flight"
-    );
-    assert_eq!(
-        hold_fields(&tv).await,
-        0,
-        "the hold is released before the replay re-routes through the flight"
-    );
-    drop(ours);
-    store.release();
-
-    let (content, body) = next_content(&mut stream, "the flight's catch-up").await;
-    assert_eq!((content.object_id, content.sequence_num), (object_id, 3));
-    assert!(carried(&body).contains(&fresh));
-    expect_caught_up_ack(&mut stream, object_id, 3).await;
-    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
-    assert_eq!(adapter_consults(&svc.metrics), 0);
-}
-
 /// `live_subscribe_stable_cut_total{outcome, regime}`, 0 while absent.
 fn stable_cuts(metrics: &Metrics, outcome: &str, regime: &str) -> u64 {
     sample_value(
@@ -2222,151 +2480,20 @@ fn stable_cuts(metrics: &Metrics, outcome: &str, regime: &str) -> u64 {
     .unwrap_or(0.0) as u64
 }
 
-/// A rollback replay's per-commit re-read whose cut is below the commit it
-/// rebuilds — the header's sequence rewound at the park — ends the catch-up
-/// through the per-commit regression ending (`per_commit_regressed`:
-/// UNAVAILABLE before content, one `unverified` stable cut under
-/// `regime="in_window"`), never the cut-based regression check, which a
-/// per-commit build skips; the hold is released.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_per_commit_re_read_whose_cut_regressed_ends_unavailable_before_content() {
-    let tv = TestValkey::setup().await;
-    let value = blob(0xD6);
-    let (svc, store) = scripted_service_in(&tv, false, vec![OnProbe::Park]);
-    let layer = "per-commit-regressed";
-    let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-regress", layer).await;
-    commit_ext(&svc, &session_id, layer, object_id, true, &value).await; // seq 2
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1).await;
-    store.wait_parked().await;
-    // Commit 2's first read had cut 2; its re-read will see 1.
-    let _: () = tv
-        .client()
-        .pool
-        .hset(
-            tv.key_schema().obj_header(&object_id.to_string()),
-            ("seq", "1"),
-        )
-        .await
-        .expect("rewind the header sequence");
-    wipe(&tv, &value).await;
-    store.release();
-
-    let status = expect_ended_before_content(&mut stream, "a regressed per-commit re-read").await;
-    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
-    assert!(
-        status.message().contains("sequence moved backwards"),
-        "the sequence-regression ending: {status:?}"
-    );
-    assert_eq!(
-        stable_cuts(&svc.metrics, "unverified", "in_window"),
-        1,
-        "the per-commit regression ending records its unverified cut"
-    );
-    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
-    assert_eq!(adapter_consults(&svc.metrics), 0);
-    assert_eq!(hold_fields(&tv).await, 0, "the hold is released");
-}
-
-/// Atomic-read item limit of the catch-up client in
-/// [`a_per_commit_re_read_too_large_hands_back_to_a_flight_with_its_hold_released`]
-/// and in 6f-c's `TOO_LARGE` case
+/// Atomic-read item limit of the catch-up client in 6f-c's `TOO_LARGE` case
 /// (`re_read_through_a_flight::a_cut_based_re_read_answering_too_large_hands_over_to_a_flight_under_its_hold`):
 /// above the layer as its first read sees it (one section, one field, and the
 /// header's own items), below it once [`GROWTH_SECTIONS`] more sections land.
+#[cfg(feature = "test-fault-injection")]
 const SMALL_ATOMIC_ITEMS: u64 = 100;
 
-/// Sections the growth commit adds at the park, in both cases
+/// Sections the growth commit adds at the park, in the case
 /// [`SMALL_ATOMIC_ITEMS`] names.
+#[cfg(feature = "test-fault-injection")]
 const GROWTH_SECTIONS: u64 = 300;
 
-/// A rollback replay's per-commit re-read that finds the layer above the
-/// atomic-read limits (`TOO_LARGE`; the layer grew past them at the park)
-/// hands the commit back as above the ceiling, and the replay re-routes
-/// through the object's shared fenced-read flight. The hold is released
-/// before that: while the replay builds from the flight's snapshot
-/// (`probe_values` call 1, parked), a flight is registered and no field is
-/// left. The catch-up client carries a small item limit
-/// ([`SMALL_ATOMIC_ITEMS`]); the flight reads fenced, whatever the limit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_per_commit_re_read_too_large_hands_back_to_a_flight_with_its_hold_released() {
-    let tv = TestValkey::setup().await;
-    let (old, fresh) = (blob(0xD7), blob(0xD8));
-    let (svc, store) =
-        scripted_service_on(&tv, false, vec![OnProbe::Park, OnProbe::Park], |config| {
-            config.snapshot_atomic_read_max_items = SMALL_ATOMIC_ITEMS
-        })
-        .await;
-    let layer = "too-large-at-the-re-read";
-    let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-flight", layer).await;
-    commit_ext(&svc, &session_id, layer, object_id, true, &old).await; // seq 2
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1).await;
-    store.wait_parked().await;
-    assert!(
-        svc.snapshot_flights.lookup(object_id).is_none(),
-        "precondition: the first read was the replay's own atomic read, not a flight's"
-    );
-    commit_ext(&svc, &session_id, layer, object_id, false, &fresh).await; // seq 3
-    let growth = OwnedDelta {
-        struct_commands: (0..GROWTH_SECTIONS)
-            .map(|i| {
-                StructCommand::CreateSection(CommandCreateSection {
-                    parent_id: 0,
-                    section_id: 1_000 + i,
-                    section_name: format!("Growth{i}"),
-                    section_type: 1,
-                })
-            })
-            .collect(),
-        ..Default::default()
-    };
-    upload(
-        &svc,
-        &session_id,
-        layer,
-        object_id,
-        delta_to_ompf_bytes(&growth, &[]),
-    )
-    .await; // seq 4
-    collect(&tv, &old).await;
-    // A write path may have run a flight of its own for the grown layer; the
-    // re-read must find none, so that it takes its atomic read (and answers
-    // TOO_LARGE) instead of the registered-flight hand-back.
-    let deadline = tokio::time::Instant::now() + DEADLINE;
-    while svc.snapshot_flights.lookup(object_id).is_some() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "precondition: no flight is registered before the re-read"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    store.release();
-
-    // Parked again: the re-read answered TOO_LARGE, the replay handed over,
-    // and it is building from the flight's snapshot.
-    store.wait_parked().await;
-    assert!(
-        svc.snapshot_flights.lookup(object_id).is_some(),
-        "the replay re-routed through a flight"
-    );
-    assert_eq!(
-        hold_fields(&tv).await,
-        0,
-        "the hold is released before the replay re-routes through the flight"
-    );
-    store.release();
-
-    let (content, body) = next_content(&mut stream, "the flight's catch-up").await;
-    assert_eq!((content.object_id, content.sequence_num), (object_id, 4));
-    assert!(carried(&body).contains(&fresh));
-    expect_caught_up_ack(&mut stream, object_id, 4).await;
-    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
-    assert_eq!(adapter_consults(&svc.metrics), 0);
-}
-
 /// Stage an atomic stale miss on `svc` (brand-new subscribe, parked at
-/// `probe_values` call 0), take the replica's only atomic read permit, and
+/// probe call 0), take the replica's only atomic read permit, and
 /// release the park: the re-read under the hold queues for that permit.
 /// Returns the stream and the held permit.
 async fn re_read_waiting_for_the_permit(
@@ -2409,7 +2536,7 @@ async fn re_read_waiting_for_the_permit(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_re_read_out_of_capacity_budget_ends_with_its_capacity_ending_and_releases_the_hold() {
     let tv = TestValkey::setup().await;
-    let (svc, store) = scripted_service_on(&tv, true, vec![OnProbe::Park], |config| {
+    let (svc, store) = scripted_service_on(&tv, vec![OnProbe::Park], |config| {
         config.subscriber_admission_wait_ms = 300;
     })
     .await;
@@ -2441,7 +2568,7 @@ async fn a_re_read_out_of_capacity_budget_ends_with_its_capacity_ending_and_rele
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_re_read_waiting_for_its_permit_at_shutdown_ends_as_is_and_releases_the_hold() {
     let tv = TestValkey::setup().await;
-    let (svc, store) = scripted_service_on(&tv, true, vec![OnProbe::Park], |config| {
+    let (svc, store) = scripted_service_on(&tv, vec![OnProbe::Park], |config| {
         config.subscriber_admission_wait_ms = 30_000;
     })
     .await;
@@ -2710,6 +2837,191 @@ async fn a_renewal_that_finds_the_hold_lapsed_ends_the_catch_up_unavailable() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// The build ends at its stream's ending (kl-retire F6, T13)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Every catch-up build races `subscription_ending`, ending first, so a stream
+// the disaster-recovery hold ends stops its build at once: the build's own
+// store work — the miss protocol's `{gc}` read hold above all — does not run
+// on past the hold's entry. Each test ends the stream with the hold ending
+// (`GracefulShutdown::end_streams_for_hold`) while the build is parked:
+// either before its first blob read with a stale miss staged, or inside the
+// miss protocol, its hold taken. Every build site — the brand-new,
+// in-window and out-of-window catch-ups — has one test, red without its
+// race.
+
+/// The incident T13's hold ending names.
+const T13_INCIDENT: &str = "20261016t0912-c4d1";
+
+/// The hold ending T13 drives: a fleet hold naming [`T13_INCIDENT`].
+fn t13_hold() -> live_edit::grpc::graceful_shutdown::HoldCause {
+    live_edit::grpc::graceful_shutdown::HoldCause::Held {
+        incident: Some(T13_INCIDENT.to_owned()),
+    }
+}
+
+/// T13 (kl-retire F6): a catch-up of `regime` parked inside its build —
+/// after its snapshot, before its first blob read (`CatchUpStateReadSeam`'s pre-ext-probe point) — with a
+/// stale miss staged (the blob its snapshot references released and
+/// collected), when the hold ends its stream. The build is dropped where it
+/// is parked: the stream ends `SERVICE_HELD` naming the incident, before any
+/// content; the probe never runs, so no miss is counted; and no command
+/// naming the `{gc}` read hold reaches the store from the ending on (a
+/// `MONITOR` of the store, drained to a fence command sent after the stream
+/// ended) — no take, no field.
+///
+/// Fail-on-old: without the race at the regime's build site, the build
+/// released from the seam probes, counts its stale miss, and takes the read
+/// hold (an `EVALSHA` naming the hold key) before the stream ends.
+#[cfg(feature = "test-fault-injection")]
+async fn assert_a_build_ended_before_its_probe_never_takes_a_read_hold(regime: Regime) {
+    use crate::storage::snapshot_read_support::{test_valkey_addr, MonitorTap};
+
+    let tv = TestValkey::setup().await;
+    let (mut svc, _adapter) = service_with(&tv, |store| Arc::new(store));
+    let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_ext_probe());
+    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
+    let svc = Arc::new(svc);
+    let layer = format!("t13-parked-{regime:?}");
+    let layer = layer.as_str();
+    let (session_id, object_id) = create_session_and_layer(&tv, &svc, "b-yuo-t13", layer).await;
+    let (old, fresh) = (blob(0xE1), blob(0xE2));
+    let (have, _) = seed_regime(&tv, &svc, &session_id, layer, object_id, regime, &old).await;
+
+    let mut stream = subscribe(&svc, &session_id, layer, have.0, have.1).await;
+    tokio::time::timeout(DEADLINE, seam.wait_until_parked_pre_ext_probe())
+        .await
+        .expect("the catch-up's build parks before its first blob read");
+    commit_ext(&svc, &session_id, layer, object_id, false, &fresh).await; // releases `old`
+    collect(&tv, &old).await;
+    let hold_key = tv.key_schema().ext_read_hold();
+    let mut monitor = MonitorTap::start(&test_valkey_addr()).await;
+
+    svc.shutdown.end_streams_for_hold(t13_hold());
+    // A build that is still parked goes on now; one the ending dropped left
+    // its arrival counted, so this completes either way.
+    tokio::time::timeout(DEADLINE, seam.release_pre_ext_probe())
+        .await
+        .expect("the seam's release completes");
+
+    let status = expect_ended_before_content(&mut stream, "a hold ending mid-build").await;
+    crate::common::refusal_detail::assert_service_held(&status, Some(T13_INCIDENT));
+    let fence = format!("{}t13-monitor-fence", tv.prefix());
+    let _: Option<String> = tv.client().pool.get(&fence).await.expect("the fence GET");
+    let sent = monitor.drain_until(&fence).await;
+    let naming_the_hold: Vec<_> = sent
+        .iter()
+        .filter(|cmd| cmd.args.iter().any(|a| a.contains(&hold_key)))
+        .collect();
+    assert!(
+        naming_the_hold.is_empty(),
+        "no read-hold take (or any command naming the `{{gc}}` read hold) is sent after the \
+         ending: {naming_the_hold:?}"
+    );
+    assert_eq!(
+        atomic_misses(&svc.metrics),
+        (0, 0),
+        "the build was dropped before its probe: no miss counted"
+    );
+    assert_eq!(hold_fields(&tv).await, 0, "no hold field");
+}
+
+/// T13, the brand-new build: see
+/// [`assert_a_build_ended_before_its_probe_never_takes_a_read_hold`].
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_ended_while_parked_in_its_build_never_takes_a_read_hold() {
+    assert_a_build_ended_before_its_probe_never_takes_a_read_hold(Regime::BrandNew).await;
+}
+
+/// [`park_under_the_hold`] for any regime's build: seed `layer` for `regime`
+/// ([`seed_regime`], `old` at seq 2), subscribe as the regime's subscriber,
+/// and at the first park rewrite the field to `fresh` and collect `old`; then
+/// release it and wait at the second park, under the hold.
+async fn park_under_the_hold_in(
+    tv: &TestValkey,
+    layer: &str,
+    regime: Regime,
+    old: &[u8],
+    fresh: &[u8],
+) -> (
+    Arc<LiveEditService>,
+    Arc<ScriptedProbeStore>,
+    SubscribeStream,
+) {
+    let (svc, store) = scripted_service(tv, vec![OnProbe::Park, OnProbe::Park]);
+    let (session_id, object_id) = create_session_and_layer(tv, &svc, "b-yuo-t13", layer).await;
+    let (have, _) = seed_regime(tv, &svc, &session_id, layer, object_id, regime, old).await;
+    let stream = subscribe(&svc, &session_id, layer, have.0, have.1).await;
+    store.wait_parked().await;
+    commit_ext(&svc, &session_id, layer, object_id, false, fresh).await;
+    collect(tv, old).await;
+    store.release();
+    store.wait_parked().await;
+    (svc, store, stream)
+}
+
+/// T13 (kl-retire F6): a catch-up of `regime` inside the miss protocol — its
+/// `{gc}` read hold taken, its re-read done, parked in the rebuild's probe —
+/// when the hold ends its stream. The build is dropped with its hold, whose drop spawns the
+/// release: the hold field is gone while the rebuild's probe is still parked
+/// (within one command timeout, the spawned `HDEL`'s), and the stream ends
+/// `SERVICE_HELD` naming the incident, before any content.
+///
+/// Fail-on-old: without the race at the regime's build site, the build
+/// stays parked under its hold — the hold renewed, its field live — until
+/// the probe is released, and the wait for the field to go fails.
+async fn assert_a_build_ended_under_its_hold_removes_the_hold(regime: Regime) {
+    let tv = TestValkey::setup().await;
+    let (old, fresh) = (blob(0xE3), blob(0xE4));
+    let layer = format!("t13-held-{regime:?}");
+    let (svc, store, mut stream) = park_under_the_hold_in(&tv, &layer, regime, &old, &fresh).await;
+    assert_eq!(
+        hold_fields(&tv).await,
+        1,
+        "[{regime:?}] precondition: the parked rebuild holds its read hold"
+    );
+
+    svc.shutdown.end_streams_for_hold(t13_hold());
+
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    while hold_fields(&tv).await != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "[{regime:?}] the hold ending must drop the build and its read hold while the \
+             rebuild's probe is still parked; the hold field is still live after {DEADLINE:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = expect_ended_before_content(&mut stream, "a hold ending under the hold").await;
+    crate::common::refusal_detail::assert_service_held(&status, Some(T13_INCIDENT));
+    assert_eq!(atomic_misses(&svc.metrics), (1, 0));
+    assert_eq!(adapter_consults(&svc.metrics), 0);
+    store.release();
+}
+
+/// T13, Regime 2: the coalesced in-window build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_in_window_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold() {
+    assert_a_build_ended_under_its_hold_removes_the_hold(Regime::InWindow).await;
+}
+
+/// T13, Regime 3: the out-of-window build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_out_of_window_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold() {
+    assert_a_build_ended_under_its_hold_removes_the_hold(Regime::OutOfWindow).await;
+}
+
+/// T13, the brand-new build: see
+/// [`assert_a_build_ended_under_its_hold_removes_the_hold`].
+/// [`seed_regime`]'s brand-new staging is [`park_under_the_hold`]'s: `old`
+/// committed at seq 2, then a subscribe from `(0, 0)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_catch_up_ended_while_it_holds_a_read_hold_removes_the_hold() {
+    assert_a_build_ended_under_its_hold_removes_the_hold(Regime::BrandNew).await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // The re-read through a flight: the fenced re-attach, the cut-based routing,
 // and the registration swap
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2881,7 +3193,7 @@ mod re_read_through_a_flight {
         }
     }
 
-    /// A service in snapshot mode whose external values live in a
+    /// A service whose external values live in a
     /// [`ScriptedProbeStore`] running `script`, with an empty checkpoint
     /// adapter. Its catch-ups, its flights and its read holds run on one
     /// client of `shape` with the service's metrics installed (flight roles,
@@ -2909,7 +3221,7 @@ mod re_read_through_a_flight {
             .await
             .expect("the catch-up client connects");
         let mut scripted = None;
-        let (svc, adapter) = service_with(tv, true, |store| {
+        let (svc, adapter) = service_with(tv, |store| {
             let store = Arc::new(ScriptedProbeStore::new(store, tv, script));
             scripted = Some(Arc::clone(&store));
             store
@@ -3593,7 +3905,7 @@ mod re_read_through_a_flight {
     /// park — hands over to the object's flight, under its hold: no
     /// UNAVAILABLE, the payload and ack at the grown layer's cut with the
     /// fresh value, and the hold live while the build reads from the flight's
-    /// snapshot (`probe_values` call 1, parked), released once the content
+    /// snapshot (probe call 1, parked), released once the content
     /// arrives. The catch-up client carries a small item limit
     /// ([`SMALL_ATOMIC_ITEMS`]); the flight reads fenced, whatever the limit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3685,7 +3997,7 @@ mod re_read_through_a_flight {
     /// registered — here by the test, after the first read — gives its slot
     /// back and reads through that flight, under its hold, sized as the
     /// flight knows the layer: the build from the flight's snapshot
-    /// (`probe_values` call 1, parked) runs attached to the test's flight with
+    /// (probe call 1, parked) runs attached to the test's flight with
     /// the hold live, and the payload and ack carry the flight's cut.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cut_based_re_read_finding_the_objects_flight_registered_reads_through_it_under_its_hold(
@@ -3749,7 +4061,7 @@ mod re_read_through_a_flight {
 
     /// 6f-d. The hold covers the re-attach, from the successor's cut to the
     /// last blob read. The late waiter is parked inside its successor build
-    /// turn (its build's `probe_values` call 1), its hold live; a commit then
+    /// turn (its build's probe call 1), its hold live; a commit then
     /// releases `fresh`, which the successor's cut references. The hold's TTL
     /// is sized per the test-writing guide's rule (c)
     /// ([`renewing_hold_timing`], on the catch-up client its renewals run
@@ -3884,7 +4196,12 @@ mod re_read_through_a_flight {
         let stream =
             subscribe_and_stale_its_first_build(&tv, &svc, &parks, &seeded, &old, &fresh).await;
 
-        let successor_read = ReleaseRead(injector(&svc.valkey).push_hold_at(next_fenced_read()));
+        // The successor's read is held across several of the test's steps:
+        // its lease is lengthened, so no renewal landing late can end the
+        // held attempt and let its retry run unheld.
+        let reads = injector(&svc.valkey);
+        reads.lengthen_fence_leases(true);
+        let successor_read = ReleaseRead(reads.push_hold_at(next_fenced_read()));
         let ours = svc
             .snapshot_flights
             .attach_or_create(object_id, TEST_FLIGHT_SIZE);
@@ -3897,6 +4214,13 @@ mod re_read_through_a_flight {
         tokio::time::timeout(DEADLINE, successor_read.0.parked())
             .await
             .expect("the successor's fence is granted and its read reaches its held command");
+        live_edit::storage::test_support::assert_fence_lease_lengthened(
+            tv.client(),
+            tv.key_schema(),
+            object_id,
+            &svc.valkey,
+        )
+        .await;
         until(
             "the late waiter's hold take is held back (or it joined a flight first)",
             || take.0.is_parked() || roles(&svc.metrics, "joined_read") > 0,
@@ -3949,7 +4273,7 @@ mod re_read_through_a_flight {
     /// take — neither ahead of the take nor by reaching the take only after
     /// its flight read. Released, it takes its hold and joins the successor;
     /// the successor's read is let go, the waiter parks in its build from that
-    /// snapshot (`probe_values` call 1), a commit releases `fresh` (which the
+    /// snapshot (probe call 1), a commit releases `fresh` (which the
     /// joined cut references) and GC passes run: nothing is collected, and
     /// the payload at C2 carries `fresh`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4640,7 +4964,7 @@ mod re_read_through_a_flight {
     /// successor (as in 6f-b), each registered at its cut C2 under a
     /// [`TINY_HARD_CAP`]-entry hard cap. The replica's one catch-up slot is
     /// the successor's, so no extra build can start: whichever waiter gets
-    /// the successor's turn parks in its build (`probe_values` call 2), and
+    /// the successor's turn parks in its build (probe call 2), and
     /// the other waits for the turn. [`OVERFLOW_COMMITS`] commits overflow
     /// both registrations. The waiter queued for the turn — the only one that
     /// can end while the build is parked — ends before content by the hard
@@ -4888,11 +5212,9 @@ mod re_read_through_a_flight {
 
 /// The `storage::diff_read` builders that read a snapshot's external values;
 /// checked against the module's own signatures.
-const BUILDERS: [&str; 4] = [
-    "compute_diff_at_cut",
+const BUILDERS: [&str; 2] = [
     "compute_faithful_coalesced_at_cut",
     "compute_faithful_full_content_at_cut",
-    "compute_per_commit_diff_at_cut",
 ];
 
 /// The catch-up module, relative to the crate root.
@@ -5388,8 +5710,7 @@ fn build_catch_up_once_is_reached_only_through_the_miss_protocol() {
 }
 
 /// Every catch-up regime builds through `build_catch_up`: Regime 1 (and
-/// every re-bootstrap, which enters it), Regime 2's snapshot arm, Regime 3,
-/// and the rollback replay's per-commit build.
+/// every re-bootstrap, which enters it), Regime 2 and Regime 3.
 #[test]
 fn every_catch_up_regime_builds_through_build_catch_up() {
     let subscribe = read_source(SUBSCRIBE_RS);
@@ -5399,9 +5720,8 @@ fn every_catch_up_regime_builds_through_build_catch_up() {
         .collect();
     let expected: std::collections::BTreeSet<String> = [
         "catch_up_brand_new",
-        "catch_up_in_window_snapshot",
+        "catch_up_in_window",
         "catch_up_out_of_window",
-        "replay_commit_diff",
     ]
     .into_iter()
     .map(str::to_owned)

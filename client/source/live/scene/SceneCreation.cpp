@@ -9,6 +9,14 @@
 
 namespace omni::usd::live {
 namespace {
+// A slot on the layer's stream unit for its CreateLayer; empty, so that the
+// call takes a free call unit, once the unit has been returned.
+CallSlot streamSlot(const LayerAdmission& admission) noexcept {
+    const auto stream = admission.stream();
+    return stream ? stream->open() : CallSlot{};
+}
+} // namespace
+namespace {
 using Clock = std::chrono::steady_clock;
 OmniUsdLiveRequestError errorRecord(OmniUsdLiveResult result) noexcept {
     OmniUsdLiveRequestError error{};
@@ -292,7 +300,8 @@ struct SceneCreation::State final : ScheduledOperation, DispatchJob {
         // neither, as start() admits no attempt after close.
         if (!stopped && !failed) try {
                 next = submitLayerCreate(*runtime, reservation->endpoint(), reservation->session(),
-                    reservation->layer(), wire, {}, 0, nullptr, receipt, {status->id(), 0, 0}, operationId);
+                    reservation->layer(), wire, {}, 0, nullptr, receipt, {status->id(), 0, 0}, operationId,
+                    streamSlot(*reservation));
             } catch (...) {}
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -415,9 +424,11 @@ OmniUsdLiveResult SceneCreation::start() noexcept {
     // the timer thread and outside the mutex read by advance/close/snapshot.
     std::shared_ptr<Request> request;
     try {
+        // A creation's CreateLayer rides on its layer's stream reservation:
+        // the layer's read starts only after the creation is confirmed.
         request = submitLayerCreate(*state_->runtime, state_->reservation->endpoint(), state_->reservation->session(),
             state_->reservation->layer(), state_->wire, {}, 0, nullptr, state_->receipt, {state_->status->id(), 0, 0},
-            state_->operationId);
+            state_->operationId, streamSlot(*state_->reservation));
     } catch (OmniUsdLiveResult failure) { result = failure; } catch (const std::bad_alloc&) {
         result = OMNI_USD_LIVE_RESOURCE_EXHAUSTED;
     } catch (const std::length_error&) {

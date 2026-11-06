@@ -92,12 +92,13 @@
 //!       for its next `SCAN` page — fails at once instead of waiting forever
 //!       (with an `Unknown` error from fred's closed-channel path, which the
 //!       service treats as permanent; those walks retry on their next tick);
-//!       the credential-refresh task is stopped; and the backchannel
-//!       connection is closed — on a detached task bounded at about 6 s
-//!       (`RETIRE_ROUTER_WAIT` plus `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`), with
-//!       one rare residual: a close that times out before it gets the
-//!       backchannel's lock leaves that socket open until the client is
-//!       dropped (see `fred::live_edit::pool::retire` and
+//!       the credential-refresh task is stopped; and the backchannel's
+//!       router-dependent state is cleared — on a detached task bounded at
+//!       about 6 s (`RETIRE_ROUTER_WAIT` plus
+//!       `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`). The client holds no backchannel
+//!       connection to close: the vendored fred drops the connection a cluster
+//!       sync opens for `CLUSTER SLOTS` when the sync ends, and the service
+//!       sends no backchannel command (see `fred::live_edit::pool::retire` and
 //!       [`MemberReplacer::quit_and_release`]). Nothing in flight on it moves
 //!       to the fresh client, so a replacement never re-sends a command. The
 //!       retirement is bounded by the grace plus [`MEMBER_RETIRE_QUIT_BOUND`]:
@@ -142,7 +143,7 @@
 //!    in progress aborts its old client's router at once. Either way, once
 //!    that router has finished, the discarded client is released as in step 6
 //!    (command channel closed, credential-refresh task stopped, backchannel
-//!    closed within its bound, with the same rare residual). A drop guard does
+//!    state cleared within its bound). A drop guard does
 //!    the same when a replacement task is aborted or panics, and for the
 //!    retirement the per-replica cap evicts. When the client's last owner
 //!    drops without `quit`, the same cancellation runs without the wait
@@ -446,6 +447,12 @@ pub(crate) struct MemberReplacer {
     /// for a replacer built without a client (unit tests), whose routers
     /// start on the calling runtime.
     snapshot_io: Option<tokio::runtime::Handle>,
+    /// Test-only hold of the next `txn` slot replacement between its read of
+    /// the pool's routing epoch and the fresh client's build and connect
+    /// ([`Self::hold_txn_after_epoch_read_for_test`]). Taken by the first
+    /// `txn` replacement that reaches that point. Absent from release builds.
+    #[cfg(any(test, feature = "test-support"))]
+    txn_epoch_read_hold_for_test: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 /// The retirements in progress across a replacer's pools, oldest first.
@@ -581,6 +588,8 @@ impl MemberReplacer {
             tracker: TaskTracker::new(),
             retiring: Mutex::new(Retiring::default()),
             snapshot_io,
+            #[cfg(any(test, feature = "test-support"))]
+            txn_epoch_read_hold_for_test: Mutex::new(None),
         })
     }
 
@@ -593,6 +602,26 @@ impl MemberReplacer {
             .knobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold the next `txn` slot replacement right after it reads the pool's
+    /// routing epoch and before it builds and connects the fresh client.
+    /// **Test-only.**
+    ///
+    /// `gate` is a two-party [`tokio::sync::Barrier`] the replacement waits on
+    /// twice: the first `wait` is the arrival rendezvous (when the test's own
+    /// first `wait` returns, the replacement has read the epoch and connected
+    /// nothing), the second releases it. So a test marks the pool's routing
+    /// stale between its two waits, with no sleep. One-shot: the first `txn`
+    /// replacement to reach that point takes the gate, and later ones run
+    /// unheld. A held replacement that the replacer's shutdown cancels returns
+    /// without waiting further.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold_txn_after_epoch_read_for_test(&self, gate: Arc<tokio::sync::Barrier>) {
+        *self
+            .txn_epoch_read_hold_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(gate);
     }
 
     /// Replace the trigger, cooldown and grace. **Test-only.**
@@ -962,6 +991,35 @@ impl MemberReplacer {
         };
         let knobs = self.knobs();
         let old_id = ClientLike::id(&old).to_owned();
+        // A `txn` slot's routing epoch, read before the fresh client connects:
+        // its connect syncs the cluster routing as of then, so it covers the
+        // routing-stale marks up to this epoch and no later one (a mark made
+        // while it connects, or while the swap waits for the slot, is still
+        // owed a re-sync; `ExclusiveCheckout::swap_slot_client`).
+        let txn_routing_epoch = match &pool.kind {
+            PoolKind::Txn(txn) => txn.routing_epoch(),
+            PoolKind::Multiplexed(_) => 0,
+        };
+        // Test-only: hold a `txn` replacement here, between the epoch read and
+        // the fresh client's build and connect
+        // (`hold_txn_after_epoch_read_for_test`).
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(pool.kind, PoolKind::Txn(_)) {
+            let hold = self
+                .txn_epoch_read_hold_for_test
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(hold) = hold {
+                for _ in 0..2 {
+                    tokio::select! {
+                        biased;
+                        () = self.cancel.cancelled() => return,
+                        _ = hold.wait() => {}
+                    }
+                }
+            }
+        }
 
         // 1–2. Build and connect the fresh client, its router's handle kept
         // from the spawn so a connect that is cut off can still be aborted.
@@ -1026,8 +1084,18 @@ impl MemberReplacer {
         let members = match &pool.kind {
             PoolKind::Multiplexed(members) => members,
             PoolKind::Txn(txn) => {
-                self.swap_txn_slot(guard, pool, txn, member, old_id, fresh, router, verdicts)
-                    .await;
+                self.swap_txn_slot(
+                    guard,
+                    pool,
+                    txn,
+                    member,
+                    old_id,
+                    fresh,
+                    router,
+                    verdicts,
+                    txn_routing_epoch,
+                )
+                .await;
                 return;
             }
         };
@@ -1136,6 +1204,8 @@ impl MemberReplacer {
     /// its guard once no caller holds it, swap `fresh` (connected, hooks armed,
     /// its router `router`) in, re-key the slot's watch, release the slot, then
     /// retire the old client. Every early return leaves the cleanup to `guard`.
+    /// `routing_epoch` is the pool's routing epoch read before `fresh`
+    /// connected, recorded as the slot's synced epoch by the swap.
     #[allow(clippy::too_many_arguments)]
     async fn swap_txn_slot(
         &self,
@@ -1147,6 +1217,7 @@ impl MemberReplacer {
         fresh: Client,
         router: fred::types::ConnectHandle,
         verdicts: usize,
+        routing_epoch: u64,
     ) {
         let label = pool.label;
         let fresh_id = ClientLike::id(&fresh).to_owned();
@@ -1190,7 +1261,8 @@ impl MemberReplacer {
             if self.cancel.is_cancelled() {
                 return;
             }
-            let Some(retired) = txn.swap_slot_client(&mut checkout, fresh.clone()) else {
+            let Some(retired) = txn.swap_slot_client(&mut checkout, fresh.clone(), routing_epoch)
+            else {
                 return;
             };
             let old_router = self.supervisor.retire_slot(&old_id);
@@ -1261,14 +1333,14 @@ impl MemberReplacer {
     /// on a task spawned on the runtime, not on this replacer's tracker, so
     /// neither this retirement nor shutdown waits for it. That is safe because
     /// it is bounded and holds nothing of ours: it waits at most
-    /// `RETIRE_ROUTER_WAIT` (5 s) for the router to finish, its only I/O is one
-    /// socket's close — the client's backchannel connection — bounded by
-    /// `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT` (1 s), so about 6 s in all, it holds
-    /// no pool or slot, and process exit ends it. One residual: a close that
-    /// times out while still waiting for the backchannel's lock takes nothing,
-    /// so that socket stays open until the client is dropped — for a
-    /// multiplexed member's old client, with its pool (fred logs a WARN when it
-    /// happens; `pool::retire`'s doc says when it can).
+    /// `RETIRE_ROUTER_WAIT` (5 s) for the router to finish, then clears the
+    /// client's backchannel state under `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`
+    /// (1 s), so about 6 s in all; it holds no pool or slot, and process exit
+    /// ends it. The client holds no backchannel connection for that step to
+    /// close (the vendored fred drops a cluster sync's `CLUSTER SLOTS`
+    /// connection when the sync ends, and the service sends no backchannel
+    /// command), so a step cut short leaves no socket behind; fred still logs
+    /// a WARN when it is (`pool::retire`'s doc says when it can).
     async fn quit_and_release(
         &self,
         retired: &Client,
@@ -1405,8 +1477,8 @@ async fn router_ended(router: &AbortHandle, deadline: Instant) {
 /// per-replica cap ([`MEMBER_RETIRING_CAP`]) evicts it. Either client is then
 /// released (`fred::live_edit::pool::retire`, once the aborted router has
 /// finished: command channel closed, credential-refresh task stopped,
-/// backchannel closed within a bound — see
-/// [`MemberReplacer::quit_and_release`] for its rare residual). A completed
+/// backchannel state cleared within a bound — see
+/// [`MemberReplacer::quit_and_release`]). A completed
 /// replacement has cleared every client field.
 ///
 /// **The pool's slot.** The replacement holds it from the trigger

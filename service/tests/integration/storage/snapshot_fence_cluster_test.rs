@@ -61,7 +61,7 @@ const SIZE: LayerSize = LayerSize {
 };
 
 async fn cluster() -> Option<TestValkey> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run this"

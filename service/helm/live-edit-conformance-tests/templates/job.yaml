@@ -64,7 +64,7 @@ spec:
         - name: conformance
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          command: [python, -m, live_edit_conformance.deployment]
+          command: ["/app/live-edit-conformance"]
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

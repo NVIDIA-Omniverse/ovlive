@@ -579,7 +579,7 @@ async fn open_tap(tv: &TestValkey, sid: &str) -> Tap {
 /// `TestValkey` on the 3-shard cluster at `LIVE_EDIT_TEST_CLUSTER_URL`, with
 /// its URL, or `None` (after printing the `SKIP:` line) when it is unset.
 async fn cluster() -> Option<(TestValkey, String)> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return None;
     };

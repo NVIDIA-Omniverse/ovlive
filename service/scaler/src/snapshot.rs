@@ -83,4 +83,12 @@ pub struct ScalingSnapshot {
     /// (`LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS`). `0` means unlimited:
     /// only a replica of an older version, which accepted it, reports it.
     pub max_concurrent_catchups: u32,
+    /// The pod is held for disaster recovery: it refuses every request and
+    /// carries no subscriptions until the hold clears, when it restarts.
+    /// While any polled pod reports it, the scaler keeps the replica count
+    /// where it is (`decide::BlockReason::Held`), because every client
+    /// reconnects when the hold clears. Absent (`false`) from a pod of an
+    /// older version, which has no hold.
+    #[serde(default)]
+    pub held: bool,
 }

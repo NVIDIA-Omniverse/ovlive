@@ -3,47 +3,212 @@
 """Fresh public-header-only consumers of the packaged production shared plugin."""
 import asyncio
 import copy
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from urllib.parse import quote
 
 import grpc
-from service import State, Principal, ReferenceServer, pb, rpc
+from service import Chained, Commit, State, Principal, ReferenceServer, pb, rpc
 from scene_wire import Model, decode_update, empty_snapshot, update
-from graph_service import GraphState, GraphServer
+from graph_service import GraphService, GraphState, GraphServer
 from scene_graph_wire import decode as graph_decode
 import scene_graph_model as graph_model
 import test_scene as scene_support
 import tls_fixture
 from writer_history import (generate as writer_plan, account as account_writers,
                             load as load_writer_plan, validate as validate_writer_plan, WriterMismatch)
-from writer_reduction import reduce_history as reduce_writers, publish as publish_writer
+from writer_reduction import reduce_history as reduce_writers, publish as publish_writer, period_domain, round_domain
+import period_plans
+from period_plans import generate as rotation_writer_plan
+import plan_replay
+import round_plans
+import rotation_history
 from tools.live import writer_campaign as campaign
 
 WRITER = (("authorization", "Bearer synthetic-writer"),)
 
 
 class CorruptWriterService(scene_support.CompactSceneService):
-    """Named test-only service defect: corrupt one edit before committing it.
+    """Named test-only service defect: corrupt one edit before committing it, committing -1 for `field`, which only
+    that edit authors, in whichever update carries it.
 
     Real plugin processes still admit, issue and acknowledge the original edit.
     This exercises semantic failure reduction; no production fault switch exists.
     """
+    field = 'owned_0_2'
+
     async def chunks(self, stream, context):
         header, payload = await super().chunks(stream, context)
-        if not isinstance(header, pb.UpdateLayerHeader):
+        # An update's header is plain, or Chained when the endpoint chains its writes.
+        if not isinstance(header, (pb.UpdateLayerHeader, Chained)):
             return header, payload
         fields = decode_update(payload)
-        if 'owned_0_2' in fields:
-            fields['owned_0_2'] = -1
+        if self.corrupts(fields):
+            fields[self.field] = -1
             payload = update(fields)
         return header, payload
+
+    def corrupts(self, fields):
+        return self.field in fields
+
+
+class CorruptRotationWriterService(CorruptWriterService):
+    """The queued-rotation defect `corrupt-owned-w0:6`: writer 0's round-6 edit, an owned field, commits -1. Its
+    field is written once, so no later write of a coalesced run folds it away, whatever the run's shape."""
+    field = 'owned_0_6'
+
+
+class CorruptPeriodWriterService(CorruptWriterService):
+    """The period-plan defect `corrupt-w0:4` of the stream-age and long-rotations cases: writer 0's ordinal-4 edit
+    commits -1, on whichever backend its period selects. A period plan writes each owned field every eighth period, so
+    only the update carrying `state.corrupt_item`, that edit's planned field and value, is corrupted; a plan without
+    the edit sets it to None."""
+    @property
+    def field(self):
+        return self.state.corrupt_item[0]
+
+    def corrupts(self, fields):
+        item = getattr(self.state, 'corrupt_item', None)
+        return item is not None and fields.get(item[0]) == item[1]
+
+
+# Named test-only defects of uncertain-write plans (rotation_history.FAULTS), as CutWriterService modes.
+CUT_DEFECTS = {'apply-cut-w0:0': 'apply', 'lose-cut-w0:0': 'lose', 'leak-cut-w0:0': 'leak'}
+
+
+class CutWriterService(scene_support.CompactSceneService):
+    """Named test-only service defects at an uncertain-write cut, on the update whose fields are
+    `state.cut_defect[1]`.
+
+    `apply` buffers each upload before its handler begins and commits that update when the cut cancels its handler
+    held before execution; `lose` passes that update through its commit step without committing it; `leak` commits
+    it and records its attempt as `state.cut_attempt`, whose fault the harness releases before the cut. Real plugin
+    processes still issue the original edit. This exercises cut-oracle failure reduction; no production fault switch
+    exists.
+    """
+    def defective(self, payload, mode):
+        defect = getattr(self.state, 'cut_defect', None)
+        return defect is not None and defect[0] == mode and decode_update(payload) == defect[1]
+
+    async def UpdateLayer(self, stream, context):
+        if getattr(self.state, 'cut_defect', (None,))[0] != 'apply':
+            return await super().UpdateLayer(stream, context)
+        messages = [message async for message in stream]
+
+        async def replay():
+            for message in messages:
+                yield message
+        try:
+            return await super().UpdateLayer(replay(), context)
+        except asyncio.CancelledError:
+            header = next(m.header for m in messages if m.WhichOneof('message_type') == 'header')
+            payload = b''.join(m.chunk.data for m in messages if m.WhichOneof('message_type') == 'chunk')
+            if self.defective(payload, 'apply'):
+                # State.commit, without the lock a cancelled handler cannot take; wake() notifies the waiters.
+                state, layer = self.state, self.state.sessions[header.session_id].layers[header.layer_name]
+                entry = Commit(len(state.ledger) + 1, 'UpdateLayer', header.session_id, timestamp_us=state.clock(),
+                               layer=header.layer_name, object_id=layer.object_id,
+                               sequence=layer.commits[-1].sequence + 1, payload=payload, writer=header.client_id,
+                               client_timestamp_us=header.timestamp_microseconds_since_epoch)
+                state.ledger.append(entry)
+                state.retained_bytes += len(payload)
+                layer.commits.append(entry)
+                state.wake()
+            raise
+
+    async def apply_update(self, method, attempt, session, layer, header, payload, context):
+        if self.defective(payload, 'lose'):
+            return pb.UpdateLayerResponse(sequence_num=layer.commits[-1].sequence + 1,
+                                          server_timestamp_microseconds_since_epoch=self.state.clock())
+        if self.defective(payload, 'leak'):
+            self.state.cut_attempt = attempt
+        return await super().apply_update(method, attempt, session, layer, header, payload, context)
+
+
+async def fresh_trial(fixture, run):
+    """One reduction trial: set up the fresh `fixture`, await `run`, a coroutine of its, and run every cleanup the
+    fixture registered, even after a partial setup; returns the reducer's result.
+
+    A mismatch counts only once every native writer has closed through the checked path (PluginTests.retire_writers);
+    a writer that cannot close or exited abnormally leaves the trial unresolved, with the mismatch's signature as
+    `mismatch`.
+    """
+    result = dict(outcome='unresolved', cleanup_complete=False)
+    try:
+        await fixture.asyncSetUp()
+        await run
+        result.update(outcome='passed')
+    except WriterMismatch as error:
+        try:
+            await fixture.retire_writers()
+            # The reducer compares only the signature; the evidence stays in the trial's result.json.
+            result.update(outcome='mismatch', signature=error.signature, **({'evidence': error.evidence}
+                                                                            if error.evidence else {}))
+        except Exception as failure:
+            result.update(error=repr(failure), mismatch=error.signature)
+    except Exception as error:
+        result.update(error=repr(error))
+    finally:
+        run.close()  # A setup failure leaves the coroutine unawaited.
+        try:
+            # Run all registered cleanups, even on partial setup failure.
+            while fixture._cleanups:
+                callback, args, kwargs = fixture._cleanups.pop()
+                await callback(*args, **kwargs)
+            result['cleanup_complete'] = True
+        except Exception as error:
+            result.update(outcome='unresolved', cleanup_complete=False, cleanup_error=repr(error))
+    return result
+
+
+async def export_layer(driver, path):
+    """`driver`'s reply to an export of its layer to `path`. SdfLayer::Export resolves the path through TfRealPath,
+    which on Windows fails for a path of MAX_PATH (260) characters or more, and a reducer's standalone replay nests its
+    artifacts deeper than that; so on Windows the writer exports into a short temporary directory, which the suite's
+    scratch directory holds until the suite ends, and the file is copied to `path`. The writer re-reads its export when
+    it closes, so the exported file stays where it wrote it."""
+    if os.name != 'nt':
+        return await driver.command(f'export {path}')
+    short = Path(tempfile.mkdtemp()) / 'export.usda'
+    exported = await driver.command(f'export {short}')
+    if exported['result'] == 0:
+        shutil.copyfile(short, path)
+    return exported
+
+
+async def crash_beside_mismatch(fixture, run):
+    """A test-only evaluator run: await `run()`, a coroutine of the fixture's, and on its WriterMismatch kill the
+    fixture's first running native writer before the mismatch propagates, as a writer that crashed after its last
+    reply beside a genuine mismatch."""
+    try:
+        await run()
+    except WriterMismatch:
+        driver = next(driver for driver in fixture.drivers if driver.process.returncode is None)
+        await scene_support.kill_writer(driver.process)
+        raise
+
+
+# The plugin test of each root-field rotation case that reduces its failures.
+ROTATION_TESTS = {
+    'queued-rotations': 'test_seeded_writers_resume_queued_edits_through_two_backend_rotations',
+    'queued-rotations-coalesced': 'test_seeded_coalesced_writers_resume_queued_edits_through_two_backend_rotations',
+    'uncertain-before': 'test_rotation_before_execution_retains_uncertain_and_queued_writer_intents',
+    'uncertain-after': 'test_rotation_after_commit_retains_uncertain_and_queued_writer_intents',
+}
+# The plugin test of each period-plan case that reduces its failures.
+PERIOD_TESTS = {
+    'long-rotations': 'test_seeded_writers_converge_through_many_backend_rotations',
+    'stream-age': 'test_seeded_writers_and_joins_survive_stream_age_expiries_after_server_token_expiry',
+}
 
 
 async def writer_tasks(*operations):
@@ -57,6 +222,28 @@ async def client_update_attempts(driver):
     """UpdateLayer attempts one client process issued, from its public diagnostics."""
     metrics = (await driver.command('diagnostics'))['snapshot']['metrics']
     return sum(item['count'] for item in metrics['rpc_attempts_by_operation'] if item['operation'] == 4)
+
+
+async def issued_at_least(driver, least):
+    """UpdateLayer attempts once a client has issued at least `least`: its worker issues each admitted write after
+    the write's local publication, so the count is polled under a failure-only watchdog."""
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        attempts = await client_update_attempts(driver)
+        if attempts >= least or asyncio.get_running_loop().time() > deadline:
+            return attempts
+
+
+# The chain window a layer's first write issues under (design section 13). Admitted writes never exceed it while no
+# acknowledgment widens it, and at most one waits to be issued, so a writer whose first write is held and that
+# authors more than one block per window slot must coalesce.
+FIRST_CHAIN_WINDOW = 8
+
+
+def chained_commits(state, client_id):
+    """The service's commits of `client_id`'s writes that named a predecessor, from its chain log."""
+    return [event for event in state.chain_log
+            if event['event'] == 'commit' and event['client_id'] == client_id and event['previous_operation_id']]
 
 
 def account_direct_prims(authored, commits):
@@ -132,29 +319,6 @@ def account_direct_prims(authored, commits):
     for entry in lineage.values():
         entry['outcome'] = 'superseded' if 'superseded_by' in entry else 'reflected'
     return dict(paths=sorted(alive), values={prim: values[prim] for prim in sorted(alive)}), lineage
-
-
-def rotation_writer_plan(master_seed, clients, rotations):
-    """One root-field edit per writer per rotation, over a bounded field set.
-
-    Even steps cycle through four owned fields and odd steps pick one of three
-    shared fields, so the scene stays small however many rotations run. Every
-    value is unique, so a committed value names its planned edit.
-    """
-    if not 2 <= clients <= 8 or not 1 <= rotations <= 4096:
-        raise ValueError('long rotation profile requires 2..8 clients and 1..4096 rotations')
-    seeds = [int.from_bytes(hashlib.sha256(f'long-rotation-v1:{master_seed}:{i}'.encode()).digest()[:8], 'big')
-             for i in range(clients)]
-    writers = []
-    for writer, seed in enumerate(seeds):
-        rng = random.Random(seed)
-        writers.append([{'writer': writer, 'ordinal': step, 'edit': f'w{writer}:{step}',
-                         'field': f'owned_{writer}_{step // 2 % 4}' if step % 2 == 0 else f'shared_{rng.randrange(3)}',
-                         'value': (writer + 1) * 10000000 + step * 1024 + rng.randrange(1024)}
-                        for step in range(rotations)])
-    return {'schema_version': 1, 'scenario': 'public-plugin.long-rotations.v1', 'master_seed': master_seed,
-            'writer_seeds': seeds, 'client_count': clients, 'writers': writers,
-            'replay_scope': 'exact generated inputs; observed OS/gRPC commit order may differ'}
 
 
 def ping_results(snapshot):
@@ -241,20 +405,29 @@ def windows_process_figures(pid):
                 threads=threads, files=handles.value)
 
 
-async def idle_executor_snapshot(driver):
-    """A diagnostics snapshot taken once both executors have no queued or running job.
+async def settled_snapshot(driver):
+    """A diagnostics snapshot taken once the runtime is settled: both executors have no queued or running job and
+    no application is admitted, in this snapshot and in the one before it.
 
-    A job can still be accounted as running just after its callback answered
-    the driver; a job that never finishes fails the watchdog.
+    A job can still be accounted as running just after its callback answered the driver. A host publication retires
+    its application on the host thread, and the scheduler thread queues the actor that settles the retirement, so a
+    snapshot can find both executors idle while an application whose fields the driver already read is still
+    admitted with its pending bytes reserved. A snapshot copies the metrics before the executor counters, so a
+    settled snapshot's metrics can predate the end of the job that settled the last application; the next snapshot
+    follows that job. A job or application that never finishes fails the watchdog.
     """
     deadline = time.monotonic() + 10  # Failure-only watchdog.
+    previous = False
     while True:
         snapshot = (await driver.command('diagnostics'))['snapshot']
-        executors = snapshot['metrics']['executors']
-        if all(executor['queued'] == 0 and executor['running'] == 0 for executor in executors.values()):
+        executors, applications = snapshot['metrics']['executors'], snapshot['metrics']['applications']
+        settled = (all(executor['queued'] == 0 and executor['running'] == 0 for executor in executors.values()) and
+                   all(application['current'] == 0 for application in applications))
+        if settled and previous:
             return snapshot
+        previous = settled
         if time.monotonic() >= deadline:
-            raise AssertionError(f'executors stayed busy: {executors}')
+            raise AssertionError(f'runtime stayed busy: executors {executors}, applications {applications}')
 
 
 # Per-gauge change one unary Ping makes while it is in flight: one RPC attempt,
@@ -288,19 +461,10 @@ def soak_drift(baseline, sample):
     return drift
 
 
-def rss_slope(points):
-    """Least-squares slope of (rotation, bytes) points, in bytes per rotation."""
-    count = len(points)
-    mean_x = sum(x for x, _ in points) / count
-    mean_y = sum(y for _, y in points) / count
-    spread = sum((x - mean_x) ** 2 for x, _ in points)
-    return sum((x - mean_x) * (y - mean_y) for x, y in points) / spread if spread else 0.0
-
-
 class RotationRun:
     """Writers rotating between two backends behind one RotatingProxy.
 
-    Each rotation parks new connections, so every writer reconnects once,
+    Each rotation parks new connections, so every writer's read resumes once,
     queues one planned edit without issuing it, recovers on the other backend
     and converges before the rotation ends.
     """
@@ -308,7 +472,7 @@ class RotationRun:
         self.test, self.plan, self.proxy, self.backends, self.history = test, plan, proxy, backends, history
         self.clients = plan['client_count']
         self.drivers, self.status, self.generations = [], [], []
-        self.seen, self.initial_ms = [0] * self.clients, [0] * self.clients
+        self.seen, self.initial_ms, self.maximum_ms = [0] * self.clients, [0] * self.clients, [0] * self.clients
         self.model, self.expected, self.identities = Model(), {}, {}
 
     def record(self, kind, **fields):
@@ -333,6 +497,7 @@ class RotationRun:
         test.assertGreaterEqual(configuration['reconnect_maximum_ms'], 2 * configuration['reconnect_initial_ms'],
                                 configuration)
         self.initial_ms[index] = configuration['reconnect_initial_ms']
+        self.maximum_ms[index] = configuration['reconnect_maximum_ms']
         return [r for r in records if r['subject_id'] == int(self.status[index]['subject']) and
                 r['fields'].get('operation') == 3], attempts  # Public OPERATION_READ.
 
@@ -347,17 +512,24 @@ class RotationRun:
             self.generations.append(resumed[0])
             self.record('writer-ready', writer=index, pid=driver.process.pid, generation=resumed[0])
 
-    async def rotate(self, rotation, *, gated, relaxed=False, client_updates=None):
+    async def rotate(self, rotation, *, period=None, gated, relaxed=False, client_updates=None, destination=None):
         """One outage and recovery with exact accounting of the writers' planned edits.
 
+        rotation counts the rotations run, this one included, and runs each
+        writer's plan edit at that position; period is the seeded period it
+        runs, rotation by default, whose parity names the destination backend
+        (period_plans) and which the accounting and resume signatures name.
         gated holds every caught-up read reply until all writers reconnected,
         with no write issued. relaxed admits the extra retries of a reconnect
         whose credentials the service rejected: at least one retry_scheduled
         and a changed incident. client_updates are the UPDATE attempts each
         writer has issued after this rotation, the rotation number by default.
+        destination, a test-only defect's, names the backend the proxy forwards
+        to in place of the period's.
         """
         test, state, clients, drivers = self.test, self.test.state, self.clients, self.drivers
-        name = 'B' if rotation % 2 else 'A'
+        period = rotation if period is None else period
+        name = 'B' if period % 2 else 'A'
         before = len(test.commits())
         read_begin = len(state.scene_reads)
         read_attempt = state.attempts.get('SubscribeReadLayer', 0)
@@ -365,7 +537,8 @@ class RotationRun:
         read_faults = [state.plan('SubscribeReadLayer', 'before_reply', attempt=read_attempt + i + 1,
                                   pause=True) for i in range(clients)] if gated else []
         try:
-            retired = await asyncio.wait_for(self.proxy.rotate_and_wait(self.backends[name], pause=True), 5)
+            retired = await asyncio.wait_for(self.proxy.rotate_and_wait(self.backends[destination or name],
+                                                                        pause=True), 5)
             test.assertGreaterEqual(retired, clients)
             for index, driver in enumerate(drivers):
                 current = await driver.command('await-status 3')
@@ -397,20 +570,25 @@ class RotationRun:
             self.proxy.gate.set()
             for fault in read_faults:
                 fault.release.set()
+        # The rotation's own check, once every writer is ready on the destination, before the plain read checks:
+        # each writer resumed reading there at the frontier before the rotation.
         reads = state.scene_reads[read_begin:]
+        period_plans.check_rotation_resume(period, reads, clients, name, before)
         test.assertEqual(len(reads), clients)
         test.assertEqual(len({read['writer'] for read in reads}), clients)
-        test.assertTrue(all(read['backend'] == name and read['cursor'] == before and read['object'] == 1
-                            for read in reads), reads)
+        test.assertTrue(all(read['object'] == 1 for read in reads), reads)
         saves = await writer_tasks(*(driver.command('save 5000') for driver in drivers))
         test.assertTrue(all(result['result'] == 0 for result in saves), saves)
         commits = test.commits()[before:]
-        test.assertEqual(len(commits), clients)
         decoded = [{'sequence': commit.sequence, 'writer': commit.writer, 'fields': decode_update(commit.payload)}
                    for commit in commits]
         partial = dict(self.plan, writers=[[op] for op in ops])
-        changed, _ = account_writers(partial, [{'edit': op['edit'], 'ordinal': 1} for op in ops], decoded,
-                                    base_sequence=before)
+        # The accounting comes before the plain commit count, so a lost or repeated commit raises its
+        # WriterMismatch, which names the period.
+        with period_plans.in_period(period):
+            changed, _ = account_writers(partial, [{'edit': op['edit'], 'ordinal': 1} for op in ops], decoded,
+                                        base_sequence=before)
+        test.assertEqual(len(commits), clients)
         owners = {(op['field'], op['value']): op['writer'] for op in ops}
         for commit in decoded:
             writer = owners[next(iter(commit['fields'].items()))]
@@ -428,20 +606,17 @@ class RotationRun:
             reads, attempts = await self.read_records(index, driver)
             test.assertEqual(attempts, rotation if client_updates is None else client_updates[index],
                              'client UPDATE attempts differ from admissions')
-            retry = [r['fields'] for r in reads if r['event_name'] == 'retry_scheduled']
-            resumed = [r['fields'] for r in reads if r['event_name'] == 'stream_resumed']
             if relaxed:
+                retry = [r['fields'] for r in reads if r['event_name'] == 'retry_scheduled']
+                resumed = [r['fields'] for r in reads if r['event_name'] == 'stream_resumed']
                 test.assertEqual(len(resumed), 1, reads)
                 test.assertGreaterEqual(len(retry), 1, reads)
             else:
-                test.assertEqual((len(retry), len(resumed)), (1, 1), reads)
-                # One reconnect per rotation, drawn from the first backoff
-                # window, below twice reconnect_initial_ms; an unreset count
-                # would widen the window each rotation and fail the layer
-                # after reconnect_max_attempts.
-                test.assertEqual((retry[0]['attempt_id'], retry[0]['stream_generation']),
-                                 (1, self.generations[index]), retry)
-                test.assertLess(retry[0]['delay_ms'], 2 * self.initial_ms[index], retry)
+                # The first retry is drawn from the first backoff window, so
+                # the attempt count reset at the last recovery; a retry that
+                # fails before reaching a backend is the next attempt.
+                retry, resumed = period_plans.check_rotation_reconnects(
+                    reads, self.generations[index], self.initial_ms[index], self.maximum_ms[index])
             test.assertGreater(resumed[0]['stream_generation'], self.generations[index], resumed)
             test.assertEqual(resumed[0]['resume_sequence'], before, resumed)
             self.generations[index] = resumed[0]['stream_generation']
@@ -467,7 +642,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.drivers = []
         self.proxies, self.extra_servers = [], []
         self.trace = {"seed": self.seed, "states": []}
-        self.server = (GraphServer(self.state, "A") if getattr(self, 'graph_creation', False) else
+        self.server = (GraphServer(self.state, "A",
+                                   service_factory=getattr(self, 'graph_service_factory', GraphService))
+                       if getattr(self, 'graph_creation', False) else
                        ReferenceServer(self.state, "A", service_factory=getattr(
                            self, 'writer_service_factory', scene_support.CompactSceneService)))
         self.addAsyncCleanup(self.cleanup)
@@ -550,12 +727,46 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.trace["states"].append(ready)
         return driver
 
+    async def start_answered(self):
+        """Starts a driver and returns once the service has counted the Ping in which its endpoint learns the service's
+        capabilities and reached that Ping's before_reply boundary. The driver reports ready before its layer actor
+        sends that Ping, so otherwise the Ping may reach the service during whatever the test does next."""
+        capabilities = self.state.plan("Ping", "before_reply")
+        driver = await PluginTests.start(self)
+        await asyncio.wait_for(capabilities.reached.wait(), 5)
+        return driver
+
     async def wait_fields(self, driver, expected):
         command = "wait " + str(len(expected)) + "".join(f" {key} {value}" for key, value in sorted(expected.items()))
         result = await driver.command(command)
         self.assertEqual(result["fields"], expected)
         self.trace["states"].append(result)
         return result
+
+    def release_holds(self):
+        """Release every planned service fault and open every rotating proxy's gate, so no writer's close waits on a
+        hold the fixture still keeps."""
+        for fault in self.state.faults:
+            fault.release.set()
+        for proxy in self.proxies:
+            if hasattr(proxy, 'gate'):
+                proxy.gate.set()
+
+    async def retire_writers(self):
+        """Release the fixture's holds, then close every native writer still running through the checked path (close)
+        and check that every writer that already exited did so cleanly; raises when any writer failed, so no
+        reduction accepts a mismatch beside a crashed writer.
+
+        The mismatch is final before this runs, so releasing the holds changes no signature; a released write
+        commits or is cancelled by its writer's close, which cancels every call still in flight."""
+        self.release_holds()
+        for driver in self.drivers:
+            if driver.process.returncode is None:
+                await self.close(driver)
+            else:
+                await driver.drainer
+                self.assertIsNone(driver.failure)
+                self.assertEqual(driver.process.returncode, 0, driver.log.read_text()[-8192:])
 
     async def close(self, driver):
         result = await driver.command("close")
@@ -586,7 +797,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         # Review focus 2: two change blocks before any wait -> two ordered updates.
         self.assertEqual((await second.command("usd-set 1 c 3"))["result"], 0)
         self.assertEqual((await second.command("usd-set 1 d 4"))["result"], 0)
-        self.assertEqual((await second.command("save 5000"))["result"], 0)
+        # The driver saves off the host, which returns BUSY while a host edit is unflushed; the second block's flush
+        # coalesces while the first block's write fills the issuance window, so the save waits for its admission.
+        self.assertEqual((await second.command("save-admitted 5000"))["result"], 0)
         expected.update({"c": 3, "d": 4})
         self.assertEqual(self.state.attempts["UpdateLayer"], updates_before + 3)
         self.assertEqual([decode_update(c.payload) for c in self.commits()[-2:]], [{"c": 3}, {"d": 4}])
@@ -753,7 +966,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_packaged_plugin_public_facade_alias_and_fresh_observer(self):
         await self.peer({"initial": 7})
-        first, second = await self.start(), await self.start()
+        first, second = await self.start_answered(), await self.start_answered()
         initial = {"initial": 7}
         attempts = dict(self.state.attempts)
         checked = await first.command("facade-checks")
@@ -793,16 +1006,25 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.close(driver))["fields"], expected)
 
     async def test_seeded_public_writers_account_every_edit_and_conflict(self):
+        await self.public_writers(coalesced=False)
+
+    async def test_seeded_coalesced_public_writers_account_every_edit_and_conflict(self):
+        """The campaign with chained writes advertised and plain USD authoring, so each writer chains and coalesces."""
+        await self.public_writers(coalesced=True)
+
+    async def public_writers(self, coalesced):
         replay = os.environ.get('LIVE_TEST_WRITER_PLAN')
-        plan = load_writer_plan(Path(replay)) if replay else self.writer_inputs(writer_plan(
-            self.seed, clients=getattr(self, 'writer_clients', 8), steps=getattr(self, 'writer_steps', 16)))
+        generated = writer_plan(self.seed, clients=getattr(self, 'writer_clients', 8), steps=getattr(self, 'writer_steps', 16))
+        if coalesced:
+            generated['coalesced_writes'] = True
+        plan = load_writer_plan(Path(replay)) if replay else self.writer_inputs(generated)
         # Explicit replay uses a fresh fixture too, so a named test-only service
         # defect can be reproduced without changing the shared default service.
         if replay:
             result = await self.writer_trial(plan, self.artifact / 'writer-replay')
             publish_writer(self.artifact / 'writer-replay-result.json', result)
             if result['outcome'] == 'mismatch':
-                raise WriterMismatch(**result['signature'])
+                raise WriterMismatch(evidence=result.get('evidence'), **result['signature'])
             self.assertEqual(result['outcome'], 'passed', result)
             return
         await self.run_writers_with_reduction(plan)
@@ -811,6 +1033,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         try:
             await self.exercise_writers(plan)
         except WriterMismatch as error:
+            publish_writer(self.artifact / 'writer-mismatch.json', dict(signature=error.signature,
+                                                                       evidence=error.evidence))
+            # The mismatch counts only once every writer closed cleanly; a crashed writer raises a plain error here,
+            # which is not reduced. The mismatch is published first, so it stays on record either way.
+            await self.retire_writers()
             # Retire the original fixture before launching any reduction trial.
             await self.cleanup()
             self._cleanups.clear()
@@ -830,7 +1057,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         plan['sanitizer_runtime'] = recorded(os.environ)
         return validate_writer_plan(plan)
 
-    async def writer_trial(self, plan, directory, *, automatic_reduction=False):
+    async def writer_trial(self, plan, directory, *, automatic_reduction=False, crash=False):
+        """One fresh fixture, service and set of native writers executing `plan`; the reducer's evaluator. `crash`, a
+        test's, kills a writer beside a mismatch (crash_beside_mismatch)."""
         validate_writer_plan(plan)
         directory.mkdir(parents=True, exist_ok=True)
         fixture = PluginTests('test_seeded_public_writers_account_every_edit_and_conflict')
@@ -838,32 +1067,19 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         fixture.seed_override = plan['master_seed']
         if plan.get('test_service_fault') == 'corrupt-owned-0-2':
             fixture.writer_service_factory = CorruptWriterService
-        result = dict(outcome='unresolved', cleanup_complete=False)
-        try:
-            await fixture.asyncSetUp()
-            if automatic_reduction:
-                await fixture.run_writers_with_reduction(plan)
-            else:
-                await fixture.exercise_writers(plan)
-            result.update(outcome='passed')
-        except WriterMismatch as error:
-            result.update(outcome='mismatch', signature=error.signature)
-        except Exception as error:
-            result.update(error=repr(error))
-        finally:
-            try:
-                # Run all registered cleanups, even on partial setup failure.
-                while fixture._cleanups:
-                    callback, args, kwargs = fixture._cleanups.pop()
-                    await callback(*args, **kwargs)
-                result['cleanup_complete'] = True
-            except Exception as error:
-                result.update(outcome='unresolved', cleanup_complete=False, cleanup_error=repr(error))
-        return result
+        if crash:
+            return await fresh_trial(fixture, crash_beside_mismatch(fixture, functools.partial(
+                fixture.exercise_writers, plan)))
+        return await fresh_trial(fixture, fixture.run_writers_with_reduction(plan) if automatic_reduction else
+                                 fixture.exercise_writers(plan))
 
     async def exercise_writers(self, plan):
-        # The campaign binds one intent per command and holds each writer's first RPC: one unchained write at a time.
-        self.state.advertise_capabilities = False
+        # Without coalesced_writes the campaign binds one intent per command and holds each writer's first RPC: one
+        # unchained write at a time. With it the endpoint advertises chained writes and each command is a plain USD
+        # change block, so a writer chains its writes behind the held first one and coalesces blocks while its window
+        # is full; each commit is then a contiguous run of the writer's edits.
+        coalesced = plan.get('coalesced_writes', False)
+        self.state.advertise_capabilities = coalesced
         validate_writer_plan(plan)
         from tools.live.writer_campaign import observe_workload
         observe_workload(self, plan)
@@ -880,24 +1096,38 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 history.flush()  # Partial failure retains the prefix that actually ran.
 
             record('plan', master_seed=self.seed, scenario=plan['scenario'], writer_seeds=plan['writer_seeds'])
-            drivers = [await self.start() for _ in plan['writers']]
+            drivers, wire = [], []
+            for _ in plan['writers']:
+                reads = len(self.state.scene_reads)
+                drivers.append(await self.start())
+                # A writer reads and writes under one client ID; its first read names it.
+                ids = {read['writer'] for read in self.state.scene_reads[reads:]}
+                self.assertEqual(len(ids), 1, self.state.scene_reads[reads:])
+                wire.append(ids.pop())
             for index, driver in enumerate(drivers):
-                record('writer-ready', writer=index, pid=driver.process.pid)
-            faults = [self.state.plan('UpdateLayer', 'before', attempt=i + 1, pause=True)
-                      for i in range(len(drivers))]
+                record('writer-ready', writer=index, pid=driver.process.pid, client_id=wire[index])
+            if coalesced:
+                # Each writer's first write is held at its commit step; its chained successors wait behind it.
+                faults = [self.state.plan_write('hold', position=1, writer=client_id) for client_id in wire]
+            else:
+                faults = [self.state.plan('UpdateLayer', 'before', attempt=i + 1, pause=True)
+                          for i in range(len(drivers))]
 
             admitted = [0] * len(drivers)
 
             async def author(index, driver):
                 for op in plan['writers'][index]:
                     record('submit', **op)
-                    # One plain USD change block. Its flush job has run when the
-                    # command returns, so the block is one admitted intent; with
-                    # every first RPC held, no admitted intent retires.
-                    result = await driver.command(f"usd-set-admit 1 {op['field']} {op['value']}")
+                    # One plain USD change block; its flush job has run when the
+                    # command returns. Bound to its own intent, the block is one
+                    # admitted intent, and with every first RPC held no admitted
+                    # intent retires; coalesced, it may join a later intent.
+                    command = 'usd-set' if coalesced else 'usd-set-admit'
+                    result = await driver.command(f"{command} 1 {op['field']} {op['value']}")
                     self.assertEqual((result['result'], result['status_result']), (0, 0), result)
                     admitted[index] += 1
-                    self.assertEqual(result['pending'], admitted[index], result)
+                    if not coalesced:
+                        self.assertEqual(result['pending'], admitted[index], result)
                     admission = {'edit': op['edit'], 'ordinal': admitted[index]}
                     admissions.append(admission)
                     record('admitted', writer=index, **admission)
@@ -908,19 +1138,33 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                         authors.create_task(author(i, driver))
                 await asyncio.wait_for(asyncio.gather(*(fault.reached.wait() for fault in faults)), 5)
                 record('all-first-rpcs-held', attempts=self.state.attempts['UpdateLayer'])
-                self.assertEqual(self.state.attempts['UpdateLayer'], len(drivers))
+                if not coalesced:
+                    self.assertEqual(self.state.attempts['UpdateLayer'], len(drivers))
                 self.assertEqual(len(self.commits()), 1, 'held requests committed before release')
                 # All independent processes have admitted a complete queue while
                 # every writer's first issued RPC is simultaneously held.
                 for i, driver in enumerate(drivers):
                     state = await driver.command('state')
-                    self.assertEqual(state['pending'], len(plan['writers'][i]), state)
+                    if coalesced:
+                        # Once the window is full, later blocks coalesce instead of admitting.
+                        self.assertTrue(1 <= state['pending'] <= len(plan['writers'][i]), state)
+                        if len(plan['writers'][i]) > FIRST_CHAIN_WINDOW + 1:
+                            self.assertLess(state['pending'], len(plan['writers'][i]), state)
+                    else:
+                        self.assertEqual(state['pending'], len(plan['writers'][i]), state)
                     own = {op['field']: op['value'] for op in plan['writers'][i]}
                     # The host content holds every edit this writer authored.
                     self.assertEqual(state['fields'], own)
-                    # Each writer's first update is issued and held; the rest wait.
-                    self.assertEqual(await client_update_attempts(driver), 1)
-                    record('held-state', writer=i, state=state)
+                    # Each writer's first update is issued and held; unchained, the rest wait.
+                    if coalesced:
+                        # A writer of two or more blocks issues a second write, chained behind the held one.
+                        attempts = await issued_at_least(driver, min(2, len(plan['writers'][i])))
+                        self.assertTrue(min(2, len(plan['writers'][i])) <= attempts <= len(plan['writers'][i]),
+                                        attempts)
+                    else:
+                        attempts = await client_update_attempts(driver)
+                        self.assertEqual(attempts, 1)
+                    record('held-state', writer=i, state=state, attempts=attempts)
                 late = await self.start()
                 record('late-observer-ready', pid=late.process.pid)
             finally:
@@ -928,15 +1172,31 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     record('release-first-rpc', attempt=index + 1)
                     faults[index].release.set()
 
-            boundary = 1 + sum(map(len, plan['writers']))
             # Observe service progress explicitly before checking local save
             # retirement. A correctness campaign must not require hundreds of
             # instrumented, contending writes to finish in a save's five-second
             # deadline. The condition is notified by actual commits; timeout is
             # only a failure watchdog, never evidence of successful progress.
-            async with asyncio.timeout(30):
+            # Unchained, every edit is one commit, so the boundary is known in
+            # advance; coalesced, it is the commit that carries every writer's
+            # last edit, after which no writer has anything left to write.
+            lasts = [(writer[-1]['field'], writer[-1]['value']) for writer in plan['writers']]
+            boundary = 1 + sum(map(len, plan['writers']))
+
+            def committed():
+                if not coalesced:
+                    return len(self.commits()) >= boundary
+                carried = set()
+                for commit in self.commits()[1:]:
+                    carried.update(decode_update(commit.payload).items())
+                return all(last in carried for last in lasts)
+            # Workload-sized: 32 writers' 512 commits took 28 to 30 seconds on Windows under asyncio debug mode
+            # (4.5 on Linux), so the watchdog allows a quarter second per edit and never less than 30 seconds.
+            async with asyncio.timeout(max(30, sum(map(len, plan['writers'])) / 4)):
                 async with self.state.changed:
-                    await self.state.changed.wait_for(lambda: len(self.commits()) >= boundary)
+                    await self.state.changed.wait_for(committed)
+            if coalesced:
+                boundary = len(self.commits())
             record('service-commit-boundary', sequence=boundary, observed=len(self.commits()))
             # The larger nightly population includes >16,000 remote USD
             # applications under sanitizers. Preserve one event-driven save per
@@ -956,13 +1216,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             commits = [{'sequence': commit.sequence, 'writer': commit.writer, 'fields': decode_update(commit.payload)}
                        for commit in self.commits()[1:]]
             record('commit-boundary', sequence=boundary, commits=commits)
-            try:
-                expected, lineage = account_writers(plan, admissions, commits)
-            except WriterMismatch:
-                # A semantic failure is only reproducible if every native
-                # process can close cleanly; a crash cannot masquerade as loss.
-                await writer_tasks(*(self.close(driver) for driver in drivers + [late]))
-                raise
+            # A mismatch counts only once every native writer closes cleanly (retire_writers), so a crash cannot
+            # masquerade as loss.
+            expected, lineage = account_writers(plan, admissions, commits, coalesced=coalesced)
             self.assertEqual(len(self.commits()), boundary)
             self.assertEqual(self.state.attempts['UpdateLayer'], boundary - 1)
             self.assertEqual(expected, self.oracle())
@@ -971,9 +1227,32 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 state = await self.wait_fields(driver, expected)
                 self.assertEqual((state['result'], state['pending']), (0, 0), state)
                 record('converged', writer=i, state=state)
-            # Each change block issued exactly one UpdateLayer; the late observer none.
+            # Unchained, each change block issued exactly one UpdateLayer;
+            # coalesced, each commit of a writer is one of its UpdateLayer
+            # calls. The late observer issued none.
             for i, driver in enumerate(drivers):
-                self.assertEqual(await client_update_attempts(driver), len(plan['writers'][i]))
+                own = sum(commit['writer'] == wire[i] for commit in commits)
+                attempts = await client_update_attempts(driver)
+                if attempts != (own if coalesced else len(plan['writers'][i])):
+                    # Each UpdateLayer outcome by result, so a mismatch names the attempt that did not commit.
+                    metrics = (await driver.command('diagnostics'))['snapshot']['metrics']
+                    record('attempt-mismatch', writer=i, attempts=attempts, commits=own,
+                           outcomes=[item for item in metrics['rpc_by_operation_result'] if item['operation'] == 4])
+                self.assertEqual(attempts, own if coalesced else len(plan['writers'][i]), (i, own))
+                self.assertTrue(1 <= own <= len(plan['writers'][i]), (i, own))
+                if not coalesced:
+                    continue
+                # The mode took effect: writes behind the held first one were chained, and a writer of more blocks
+                # than the first window holds coalesced some of them.
+                edits = len(plan['writers'][i])
+                writes = (await driver.command('diagnostics'))['snapshot']['metrics']['layer_writes']
+                record('layer-writes', writer=i, metrics=writes, chained=len(chained_commits(self.state, wire[i])))
+                if edits >= 2:
+                    self.assertTrue(chained_commits(self.state, wire[i]), (i, self.state.chain_log))
+                    self.assertGreater(writes['window_high_water'], 1, writes)
+                if edits > FIRST_CHAIN_WINDOW + 1:
+                    self.assertLess(own, edits, (i, own))
+                    self.assertGreater(writes['coalesced_turns'], 0, writes)
             self.assertEqual(await client_update_attempts(late), 0)
             fresh = await self.start()
             state = await self.wait_fields(fresh, expected)
@@ -989,18 +1268,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         plan = self.writer_inputs(writer_plan(self.seed, clients=2, steps=4))
         plan['test_service_fault'] = 'corrupt-owned-0-2'
         directory = self.artifact / 'writer-reducer-selftest'
+        def compared(result):
+            # A trial's evidence depends on the plan and the commit order, so a replay matches the rest.
+            return {key: value for key, value in result.items() if key != 'evidence'}
         first = await self.writer_trial(plan, directory, automatic_reduction=True)
-        self.assertEqual(first['outcome'], 'mismatch', first)
-        self.assertTrue(first['cleanup_complete'])
+        self.assertEqual(compared(first), dict(outcome='mismatch', cleanup_complete=True,
+                                               signature=dict(reason='unexplained committed field', field='owned_0_2')))
         summary = json.loads((directory / 'writer-reduction/reduction.json').read_text())
         self.assertEqual(summary['status'], 'complete', summary)
-        self.assertTrue(summary['verified'] and summary['operation_deletion_minimal'])
+        self.assertTrue(summary['verified'] and summary['deletion_minimal'])
         best = load_writer_plan(directory / 'writer-reduction/best.plan.json')
         self.assertEqual(sum(map(len, best['writers'])), 2, best)
         self.assertEqual(best['writers'][0][0]['edit'], 'w0:2')
         self.assertEqual(plan['writers'], load_writer_plan(directory / 'writer-reduction/original.plan.json')['writers'])
         replay = await self.writer_trial(best, directory / 'replay')
-        self.assertEqual(replay, first)
+        self.assertEqual(compared(replay), compared(first))
         repaired = copy.deepcopy(best)
         del repaired['test_service_fault']
         passed = await self.writer_trial(repaired, directory / 'correct-service')
@@ -1008,22 +1290,276 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_seeded_writers_resume_queued_edits_through_two_tls_backend_rotations(self):
         self.transport_tls = True
-        await self.test_seeded_writers_resume_queued_edits_through_two_backend_rotations()
+        await self.queued_rotations(rotation_history.generate_queued(self.seed), coalesced=False)
 
     async def test_seeded_writers_resume_queued_edits_through_two_backend_rotations(self):
-        plan = writer_plan(self.seed, clients=4, steps=12)
-        from tools.live.writer_campaign import observe_workload
-        observe_workload(self, plan)
-        plan.update(scenario='public-plugin.queued-rotations.v1',
-                    phases=[{'backend': name, 'first_ordinal': phase * 4, 'end_ordinal': (phase + 1) * 4}
-                            for phase, name in enumerate(('A', 'B', 'A'))],
-                    initial_fixture_sha256=hashlib.sha256(empty_snapshot()).hexdigest(),
-                    candidate=json.loads(Path(os.environ['LIVE_TEST_PLUGIN_DRIVER'] + '.manifest.json').read_text()))
-        prefix = self.artifact / self.id().split('.')[-1]
-        Path(str(prefix) + '.plan.json').write_text(json.dumps(plan, indent=2, sort_keys=True) + '\n')
-        print(f"rotation-writers master_seed={self.seed} clients=4 plan={prefix}.plan.json", flush=True)
-        self.trace['writer_plan'] = plan
-        backend = ReferenceServer(self.state, 'B', service_factory=scene_support.CompactSceneService)
+        await self.rotation_writers_with_reduction('queued-rotations', rotation_history.generate_queued(self.seed))
+
+    async def test_seeded_coalesced_writers_resume_queued_edits_through_two_backend_rotations(self):
+        """The rotation campaign with plain USD authoring, so each writer's queued edits coalesce and chain."""
+        await self.rotation_writers_with_reduction('queued-rotations-coalesced',
+                                                   rotation_history.generate_queued(self.seed))
+
+    async def rotation_writers_with_reduction(self, kind, plan):
+        """Run a root-field rotation plan; a WriterMismatch is reduced through fresh trials and still fails."""
+        try:
+            await self.exercise_rotation(kind, plan)
+        except WriterMismatch as error:
+            publish_writer(self.artifact / f'{kind}-mismatch.json', dict(signature=error.signature,
+                                                                        evidence=error.evidence))
+            # The mismatch counts only once every writer closed cleanly; a crashed writer raises a plain error here,
+            # which is not reduced. The mismatch is published first, so it stays on record either way.
+            await self.retire_writers()
+            # Retire the original fixture before launching any reduction trial.
+            await self.cleanup()
+            self._cleanups.clear()
+            summary = await reduce_writers(plan, error.signature, self.artifact / f'{kind}-reduction',
+                                           functools.partial(self.rotation_trial, kind),
+                                           domain=round_domain(rotation_history.validate, rotation_history.origin),
+                                           context=plan_replay.context(kind))
+            print(f'{kind} writer reduction: ' + json.dumps(summary, sort_keys=True), flush=True)
+            raise  # Reduction never turns the original failure into a pass.
+
+    async def exercise_rotation(self, kind, plan):
+        if kind in ('queued-rotations', 'queued-rotations-coalesced'):
+            await self.queued_rotations(plan, coalesced=kind == 'queued-rotations-coalesced')
+        else:
+            await self.uncertain_writer_rotation(plan, 'before' if kind == 'uncertain-before' else 'after_commit')
+
+    async def rotation_trial(self, kind, plan, directory, *, automatic_reduction=False, crash=False):
+        """One fresh fixture, service and set of native writers executing `plan`; the reducer's evaluator. `crash`, a
+        test's, kills a writer beside a mismatch (crash_beside_mismatch)."""
+        rotation_history.validate(plan)
+        directory.mkdir(parents=True, exist_ok=True)
+        fixture = PluginTests(ROTATION_TESTS[kind])
+        fixture.artifact_override = directory
+        fixture.seed_override = plan['master_seed']
+        if plan.get('test_service_fault') in CUT_DEFECTS:
+            fixture.writer_service_factory = CutWriterService
+        elif plan.get('test_service_fault') == 'corrupt-owned-w0:6':
+            fixture.writer_service_factory = CorruptRotationWriterService
+        if crash:
+            return await fresh_trial(fixture, crash_beside_mismatch(fixture, functools.partial(
+                fixture.exercise_rotation, kind, plan)))
+        return await fresh_trial(fixture, fixture.rotation_writers_with_reduction(kind, plan)
+                                 if automatic_reduction else fixture.exercise_rotation(kind, plan))
+
+    async def reduce_rotation_defect(self, kind, plan, signature, units, edits, label=None):
+        """Reduce a named test-only defect of a root-field rotation case (reduce_defect); returns the reduction's
+        directory."""
+        return await self.reduce_defect(functools.partial(self.rotation_trial, kind), rotation_history.validate, kind,
+                                        plan, signature, units, edits, label)
+
+    async def reduce_defect(self, trial, validate, kind, plan, signature, units, edits, label=None):
+        """Reduce a named test-only defect to its minimal plan through `trial`, the case's evaluator, then replay that
+        plan with and without the defect; returns the reduction's directory.
+
+        A trial's evidence depends on the plan, so the replay must match only its outcome and signature."""
+        def compared(result):
+            return {key: value for key, value in result.items() if key != 'evidence'}
+        directory = self.artifact / f'{label or kind}-reducer-selftest'
+        first = await trial(plan, directory, automatic_reduction=True)
+        self.assertEqual(compared(first), dict(outcome='mismatch', signature=signature, cleanup_complete=True))
+        root = directory / f'{kind}-reduction'
+        summary = json.loads((root / 'reduction.json').read_text())
+        self.assertEqual(summary['status'], 'complete', summary)
+        self.assertTrue(summary['verified'] and summary['deletion_minimal'], summary)
+        self.assertEqual((summary['retained_units'], summary['retained_edits']), (units, edits))
+        self.assertEqual(validate(json.loads((root / 'original.plan.json').read_text())), plan)
+        best = validate(json.loads((root / 'best.plan.json').read_text()))
+        replay = await trial(best, directory / 'replay')
+        self.assertEqual(compared(replay), compared(first))
+        repaired = dict(best)
+        del repaired['test_service_fault']
+        passed = await trial(repaired, directory / 'correct-service')
+        self.assertEqual(passed, dict(outcome='passed', cleanup_complete=True))
+        return root
+
+    async def test_queued_rotation_fault_reduction_reexecutes_real_clients_and_service(self):
+        """The fault-schedule defect forwards the rotation after round 7 to the backend it leaves; the failure keeps
+        that rotation, its round and one writer, whose phase after the rotation is empty."""
+        plan = dict(rotation_history.generate_queued(self.seed), test_service_fault='misroute-rotation-7')
+        await self.reduce_rotation_defect(
+            'queued-rotations', plan,
+            dict(reason='writers did not resume reading on the rotation destination at its frontier', rotation=7),
+            ['rotation:7', 'writer:0', 'round:7'], ['w0:7'])
+
+    async def test_coalesced_queued_rotation_corrupt_reduction_reexecutes_real_clients_and_service(self):
+        """Coalesced, the defect commits -1 for writer 0's round-6 edit, an owned field queued during the rotation
+        after round 3, in whichever run the writer's window drains; the failure keeps that edit alone."""
+        plan = dict(rotation_history.generate_queued(self.seed), test_service_fault='corrupt-owned-w0:6')
+        await self.reduce_rotation_defect('queued-rotations-coalesced', plan,
+                                          dict(reason='unexplained committed field', field='owned_0_6'),
+                                          ['writer:0', 'round:6'], ['w0:6'], label='coalesced-corrupt')
+
+    async def test_coalesced_queued_rotation_fault_reduction_reexecutes_real_clients_and_service(self):
+        """Coalesced, the fault-schedule defect forwards the rotation after round 7 to the backend it leaves; the
+        failure keeps that rotation, its round and one writer, whose phase after the rotation is empty."""
+        plan = dict(rotation_history.generate_queued(self.seed), test_service_fault='misroute-rotation-7')
+        await self.reduce_rotation_defect(
+            'queued-rotations-coalesced', plan,
+            dict(reason='writers did not resume reading on the rotation destination at its frontier', rotation=7),
+            ['rotation:7', 'writer:0', 'round:7'], ['w0:7'], label='coalesced-misroute')
+
+    async def test_uncertain_before_cut_reduction_reexecutes_real_clients_and_service(self):
+        """The defect commits writer 0's round-0 write when the cut cancels its handler held before execution; the
+        failure keeps that write alone. The rotation class's recorded plans replay through the standalone command."""
+        plan = dict(rotation_history.generate_uncertain(self.seed), test_service_fault='apply-cut-w0:0')
+        root = await self.reduce_rotation_defect('uncertain-before', plan,
+                                                 dict(reason='write cut before execution committed', edit='w0:0'),
+                                                 ['writer:0', 'round:0'], ['w0:0'])
+        await plan_replay.check_standalone(self, root)
+
+    async def test_uncertain_after_cut_reduction_reexecutes_real_clients_and_service(self):
+        """The defect passes writer 0's round-0 write through its commit step without committing it; the failure keeps
+        that write alone."""
+        plan = dict(rotation_history.generate_uncertain(self.seed), test_service_fault='lose-cut-w0:0')
+        await self.reduce_rotation_defect('uncertain-after', plan,
+                                          dict(reason='write cut after its commit missing from the ledger',
+                                               edit='w0:0'),
+                                          ['writer:0', 'round:0'], ['w0:0'])
+
+    async def test_uncertain_leaked_cut_reduction_reexecutes_real_clients_and_service(self):
+        """The fault-schedule defect releases writer 0's round-0 write, held after its commit, before the cut, so
+        writer 0's queued writes reach the service; the failure keeps that write and the first queued behind it."""
+        plan = dict(rotation_history.generate_uncertain(self.seed), test_service_fault='leak-cut-w0:0')
+        await self.reduce_rotation_defect('uncertain-after', plan,
+                                          dict(reason='queued write behind a cut write reached the service',
+                                               edit='w0:1'),
+                                          ['writer:0', 'round:0', 'round:1'], ['w0:0', 'w0:1'],
+                                          label='leaked')
+
+    async def reduce_period_defect(self, kind, plan, signature, units, edits, label):
+        """Reduce a named test-only defect of a long-rotations or stream-age plan (reduce_defect), whose first trial
+        replays the plan cut after the failing period, never the whole plan."""
+        root = await self.reduce_defect(functools.partial(self.period_trial, kind), period_plans.validate, kind, plan,
+                                        signature, units, edits, label)
+        self.assertTrue(json.loads((root / 'reduction.json').read_text())['truncated'])
+        first = json.loads((root / 'trial-0001/input.plan.json').read_text())
+        self.assertEqual(period_plans.periods(first), list(range(1, signature['period'] + 1)))
+        return root
+
+    async def test_stream_age_corrupt_reduction_truncates_and_reexecutes_real_clients_and_service(self):
+        """The defect commits -1 for writer 0's edit of period 5, the period after the first expiry, of 8; the first
+        trial runs periods 1 to 5, and the failure keeps that edit alone. The period class's recorded plans replay
+        through the standalone command."""
+        plan = dict(period_plans.generate(self.seed, 4, 8, period_plans.STREAM_AGE), test_service_fault='corrupt-w0:4')
+        root = await self.reduce_period_defect(
+            'stream-age', plan, dict(reason='unexplained committed field', field='owned_0_2', period=5),
+            ['cycle:2', 'writer:0'], ['w0:4'], 'stream-age-corrupt')
+        await plan_replay.check_standalone(self, root)
+
+    async def test_stream_age_resume_reduction_truncates_and_reexecutes_real_clients_and_service(self):
+        """The fault-schedule defect commits an unannounced peer edit before the expiry of period 6, of 8, so every
+        read resumes past the period's frontier; the first trial runs periods 1 to 6, and the failure keeps that
+        expiry's cycle and one writer."""
+        plan = dict(period_plans.generate(self.seed, 4, 8, period_plans.STREAM_AGE),
+                    test_service_fault='unannounced-peer-6')
+        await self.reduce_period_defect(
+            'stream-age', plan,
+            dict(reason='read did not resume at its coverage frontier after a stream-age expiry', period=6),
+            ['cycle:2', 'writer:3'], ['w3:4', 'w3:5'], 'stream-age-resume')
+
+    async def test_period_trial_mismatch_beside_a_crashed_writer_is_unresolved(self):
+        """A period evaluator accepts a mismatch only once every writer closed cleanly: beside a writer that exited
+        with a failure after its last reply, the same mismatch leaves the trial unresolved."""
+        signature = dict(reason='writers did not resume reading on the rotation destination at its frontier', period=6)
+
+        async def trial(crash, directory):
+            directory.mkdir(parents=True)
+            fixture = PluginTests(PERIOD_TESTS['long-rotations'])
+            fixture.artifact_override = directory
+            fixture.seed_override = self.seed
+
+            async def run():
+                await fixture.start()
+                crashed = await fixture.start()
+                if crash:
+                    # The writer's input ends without close, so it exits 1 after its last reply.
+                    crashed.process.stdin.close()
+                    await asyncio.wait_for(crashed.process.wait(), 10)
+                    self.assertEqual(crashed.process.returncode, 1)
+                raise WriterMismatch(signature['reason'], period=signature['period'])
+            return await fresh_trial(fixture, run())
+        root = self.artifact / 'period-trial-crashed-writer'
+        healthy = await trial(False, root / 'healthy')
+        self.assertEqual(healthy, dict(outcome='mismatch', signature=signature, cleanup_complete=True))
+        crashed = await trial(True, root / 'crashed')
+        self.assertEqual((crashed['outcome'], crashed['cleanup_complete'], crashed.get('mismatch')),
+                         ('unresolved', True, signature), crashed)
+        self.assertNotIn('signature', crashed)
+
+    async def assert_crash_unresolves(self, trial, plan, signature, label):
+        """`trial`, a reducer's evaluator, accepts `plan`'s genuine mismatch, and the same mismatch beside a writer
+        killed once it is raised (crash_beside_mismatch) leaves the trial unresolved."""
+        root = self.artifact / label
+        healthy = await trial(plan, root / 'healthy')
+        self.assertEqual({key: value for key, value in healthy.items() if key != 'evidence'},
+                         dict(outcome='mismatch', signature=signature, cleanup_complete=True))
+        crashed = await trial(plan, root / 'crashed', crash=True)
+        self.assertEqual((crashed['outcome'], crashed['cleanup_complete'], crashed.get('mismatch')),
+                         ('unresolved', True, signature), crashed)
+        self.assertNotIn('signature', crashed)
+        # The killed writer's exit, not some other retire failure, leaves the trial unresolved.
+        self.assertIn(f'{scene_support.KILLED_RETURNCODE} != 0', crashed.get('error', ''), crashed)
+
+    async def test_writer_trial_mismatch_beside_a_crashed_writer_is_unresolved(self):
+        """The root-field evaluator accepts a mismatch only once every writer closed cleanly."""
+        plan = self.writer_inputs(writer_plan(self.seed, clients=2, steps=4))
+        plan['test_service_fault'] = 'corrupt-owned-0-2'
+        await self.assert_crash_unresolves(self.writer_trial, plan,
+                                           dict(reason='unexplained committed field', field='owned_0_2'),
+                                           'writer-trial-crashed-writer')
+
+    async def test_rotation_trial_mismatch_beside_a_crashed_writer_is_unresolved(self):
+        """The round-based rotation evaluator accepts a mismatch only once every writer closed cleanly: a queued
+        rotation's resume mismatch, raised once its writers converged, and an uncertain cut's, raised while its held
+        writes are cut, each over its defect's minimal plan."""
+        cases = [
+            ('queued-rotations', round_plans.select(dict(rotation_history.generate_queued(self.seed),
+                                                         test_service_fault='misroute-rotation-7'), [0], [7], [7]),
+             dict(reason='writers did not resume reading on the rotation destination at its frontier', rotation=7)),
+            ('uncertain-before', round_plans.select(dict(rotation_history.generate_uncertain(self.seed),
+                                                         test_service_fault='apply-cut-w0:0'), [0], [0], []),
+             dict(reason='write cut before execution committed', edit='w0:0')),
+        ]
+        for kind, plan, signature in cases:
+            with self.subTest(kind=kind):
+                await self.assert_crash_unresolves(functools.partial(self.rotation_trial, kind), plan, signature,
+                                                   f'{kind}-trial-crashed-writer')
+
+    async def test_long_rotation_corrupt_reduction_truncates_and_reexecutes_real_clients_and_service(self):
+        """The defect commits -1 for writer 0's edit of rotation 5, of 8, on backend B; the first trial runs rotations
+        1 to 5, and the failure keeps that edit alone."""
+        plan = dict(period_plans.generate(self.seed, 4, 8), test_service_fault='corrupt-w0:4')
+        await self.reduce_period_defect(
+            'long-rotations', plan, dict(reason='unexplained committed field', field='owned_0_2', period=5),
+            ['cycle:2', 'writer:0'], ['w0:4'], 'long-rotations-corrupt')
+
+    async def test_long_rotation_resume_reduction_truncates_and_reexecutes_real_clients_and_service(self):
+        """The fault-schedule defect forwards rotation 6, of 8, to backend B, which it leaves, so no writer resumes
+        reading on A; the first trial runs rotations 1 to 6, and the failure keeps that rotation's cycle and one
+        writer."""
+        plan = dict(period_plans.generate(self.seed, 4, 8), test_service_fault='misroute-rotation-6')
+        await self.reduce_period_defect(
+            'long-rotations', plan,
+            dict(reason='writers did not resume reading on the rotation destination at its frontier', period=6),
+            ['cycle:2', 'writer:3'], ['w3:4', 'w3:5'], 'long-rotations-resume')
+
+    async def queued_rotations(self, plan, coalesced):
+        """Run a queued-rotation plan (rotation_history): its first phase connected, each later one queued during the
+        backend rotation before it. Without `coalesced`, `usd-set-admit` binds one intent, and so one chained write,
+        to each command; with it, each command is a plain USD change block, so blocks queued during an outage
+        coalesce, and each commit is a contiguous run of one writer's edits."""
+        rotation_history.validate(plan)
+        writers = plan['client_count']
+        phases = rotation_history.phases(plan)
+        defect = plan.get('test_service_fault')
+        prefix = self.write_plan(plan, 'rotation-writers', coalesced_writes=coalesced)
+        # Both backends run the fixture's service, so a named service defect fires on whichever backend a selection
+        # puts its round on.
+        backend = ReferenceServer(self.state, 'B', service_factory=getattr(
+            self, 'writer_service_factory', scene_support.CompactSceneService))
         self.extra_servers.append(backend)
         other = await backend.start()
         proxy = scene_support.RotatingProxy(self.address, ssl_context=(await self.tls_pki()).server_context()
@@ -1037,10 +1573,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 history.write(json.dumps(dict(event=kind, **fields), sort_keys=True) + '\n')
                 history.flush()
 
-            async def check_attempts(driver, index, phase, boundary, expected, issuing=False):
+            async def check_attempts(driver, index, phase, boundary, expected, issuing=False, most=None):
                 # While a writer is `issuing` its window, its worker issues each
                 # queued write after its local publication, so the count is
                 # polled until it reaches the window under a failure-only watchdog.
+                # With `most`, `expected` is the least count and `most` the greatest.
                 deadline = asyncio.get_running_loop().time() + 5
                 while True:
                     snapshot = (await driver.command('diagnostics'))['snapshot']
@@ -1049,35 +1586,61 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     if not issuing or attempts >= expected or asyncio.get_running_loop().time() > deadline:
                         break
                 record('client-update-attempts', writer=index, phase=phase, boundary=boundary, count=attempts)
-                self.assertEqual(attempts, expected, (index, phase, boundary, snapshot))
+                if most is None:
+                    self.assertEqual(attempts, expected, (index, phase, boundary, snapshot))
+                else:
+                    self.assertTrue(expected <= attempts <= most, (index, phase, boundary, attempts, snapshot))
 
             record('plan', master_seed=self.seed, scenario=plan['scenario'], writer_seeds=plan['writer_seeds'])
-            drivers = [await self.start(address) for _ in plan['writers']]
+            drivers, wire = [], []
+            for _ in plan['writers']:
+                reads = len(self.state.scene_reads)
+                drivers.append(await self.start(address))
+                # A writer reads and writes under one client ID; its first read names it.
+                ids = {read['writer'] for read in self.state.scene_reads[reads:]}
+                self.assertEqual(len(ids), 1, self.state.scene_reads[reads:])
+                wire.append(ids.pop())
             identities = []
             for index, driver in enumerate(drivers):
                 identities.append(await driver.command('observe-status'))
-                record('writer-ready', writer=index, pid=driver.process.pid, status=identities[-1])
+                record('writer-ready', writer=index, pid=driver.process.pid, status=identities[-1],
+                       client_id=wire[index])
+            # Each writer's UpdateLayer calls so far: one per edit bound to its own intent, one per commit coalesced.
+            issued = [0] * len(drivers)
+            routed = self.address  # The backend the proxy forwards to.
 
-            for phase, definition in enumerate(plan['phases']):
-                first, end = definition['first_ordinal'], definition['end_ordinal']
+            for phase, (first, end) in enumerate(phases):
                 before = len(self.commits())
                 read_begin = len(self.state.scene_reads)
-                read_faults, write_faults = [], []
+                read_faults, write_faults, resumed = [], [], []
+                # Rotations alternate A to B and back; the phase after a rotation is queued during it.
+                backend = 'A' if phase % 2 == 0 else 'B'
                 try:
+                    if coalesced and end > first:
+                        # Each writer's first write of every phase, the one after
+                        # its earlier phases' commits, is held at its commit step;
+                        # its chained successors wait.
+                        write_faults = [self.state.plan_write('hold', position=issued[index] + 1, writer=client_id)
+                                        for index, client_id in enumerate(wire)]
                     if phase:
                         read_attempt = self.state.attempts['SubscribeReadLayer']
                         write_attempt = self.state.attempts['UpdateLayer']
                         read_faults = [self.state.plan('SubscribeReadLayer', 'before_reply',
-                                                      attempt=read_attempt + i + 1, pause=True) for i in range(4)]
-                        # Every queued write of the phase issues within its
-                        # writer's window, so each attempt is held before the
-                        # service evaluates it.
-                        write_faults = [self.state.plan('UpdateLayer', 'before', attempt=write_attempt + i + 1,
-                                                        pause=True) for i in range(4 * (end - first))]
-                        retired = await asyncio.wait_for(proxy.rotate_and_wait(
-                            other if phase == 1 else self.address, pause=True), 5)
-                        self.assertGreaterEqual(retired, 4)
-                        record('rotate', phase=phase, backend=definition['backend'], boundary=before,
+                                                      attempt=read_attempt + i + 1, pause=True) for i in range(writers)]
+                        if not coalesced:
+                            # Every queued write of the phase issues within its
+                            # writer's window, so each attempt is held before the
+                            # service evaluates it.
+                            write_faults = [self.state.plan('UpdateLayer', 'before', attempt=write_attempt + i + 1,
+                                                            pause=True) for i in range(writers * (end - first))]
+                        ordinal = rotation_history.rotation_ordinal(plan, phase - 1)
+                        # The test-only fault-schedule defect forwards the rotation after round 7 to the backend it
+                        # leaves.
+                        destination = other if backend == 'B' else self.address
+                        routed = routed if defect == 'misroute-rotation-7' and ordinal == 7 else destination
+                        retired = await asyncio.wait_for(proxy.rotate_and_wait(routed, pause=True), 5)
+                        self.assertGreaterEqual(retired, writers)
+                        record('rotate', phase=phase, rotation=ordinal, backend=backend, boundary=before,
                                retired_forwards=retired)
                         for index, driver in enumerate(drivers):
                             state = await driver.command('await-status 3')
@@ -1091,14 +1654,19 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                             record('submit', phase=phase, **op)
                             # One plain USD change block; its flush job has run
                             # when the command returns.
-                            result = await driver.command(f"usd-set-admit 1 {op['field']} {op['value']}")
+                            command = 'usd-set' if coalesced else 'usd-set-admit'
+                            result = await driver.command(f"{command} 1 {op['field']} {op['value']}")
                             admitted[index] += 1
                             # Every earlier phase's intents retired at its save.
                             # During an outage the status reports UNAVAILABLE and
-                            # nothing retires, so each block adds exactly one
-                            # pending intent; the first phase's connected updates
-                            # may retire at any point.
-                            if phase:
+                            # nothing retires, so each block bound to its own
+                            # intent adds exactly one pending intent, and a
+                            # coalesced block at most one; the first phase's
+                            # connected updates may retire at any point.
+                            if phase and coalesced:
+                                self.assertEqual((result['result'], result['status_result']), (0, 8), result)
+                                self.assertTrue(1 <= result['pending'] <= admitted[index] - first, result)
+                            elif phase:
                                 self.assertEqual((result['result'], result['status_result'], result['pending']),
                                                  (0, 8, admitted[index] - first), result)
                             else:
@@ -1111,6 +1679,20 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     async with asyncio.TaskGroup() as authors:
                         for index, driver in enumerate(drivers):
                             authors.create_task(author(index, driver))
+                    if coalesced and not phase:
+                        # Connected, each writer's first write reaches the
+                        # service while it authors and is held there; nothing
+                        # commits until the holds are released.
+                        await asyncio.wait_for(asyncio.gather(*(fault.reached.wait() for fault in write_faults)), 5)
+                        self.assertEqual(len(self.commits()), before)
+                        expected = self.oracle()
+                        for index, driver in enumerate(drivers):
+                            state = await driver.command('state')
+                            own = dict(expected)
+                            own.update({op['field']: op['value'] for op in plan['writers'][index][first:end]})
+                            self.assertEqual(state['fields'], own)
+                            self.assertTrue(1 <= state['pending'] <= end - first, state)
+                            record('first-write-held', phase=phase, writer=index, state=state)
                     if phase:
                         expected = self.oracle()
                         for index, driver in enumerate(drivers):
@@ -1118,23 +1700,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                             own = dict(expected)
                             own.update({op['field']: op['value'] for op in plan['writers'][index][first:end]})
                             self.assertEqual(state['fields'], own)
-                            self.assertEqual(state['pending'], end - first)
+                            if coalesced and end > first:
+                                # Nothing issues during the outage, so the first
+                                # admitted write waits and later blocks coalesce.
+                                self.assertTrue(1 <= state['pending'] <= end - first, state)
+                                if end - first >= 2:
+                                    self.assertLess(state['pending'], end - first, state)
+                            else:
+                                # One pending intent per queued edit; an empty phase queues none.
+                                self.assertEqual(state['pending'], end - first)
                             self.assertEqual(state['subject'], identities[index]['subject'])
                             record('queued-during-outage', phase=phase, writer=index, state=state)
-                            await check_attempts(driver, index, phase, 'proxy-paused', first)
+                            await check_attempts(driver, index, phase, 'proxy-paused', issued[index])
                         self.assertEqual(len(self.commits()), before)
                         self.assertEqual(self.state.attempts['UpdateLayer'], write_attempt)
                         proxy.gate.set()
                         await asyncio.wait_for(asyncio.gather(*(fault.reached.wait() for fault in read_faults)), 5)
-                        reads = self.state.scene_reads[read_begin:]
-                        self.assertEqual(len(reads), 4)
-                        self.assertEqual(len({read['writer'] for read in reads}), 4)
-                        self.assertTrue(all(read['backend'] == definition['backend'] and
-                                            read['cursor'] == before and read['object'] == 1 for read in reads), reads)
-                        record('all-caught-up-replies-held', phase=phase, reads=reads, boundary=before)
+                        resumed = self.state.scene_reads[read_begin:]
+                        self.assertEqual(len(resumed), writers)
+                        self.assertEqual(len({read['writer'] for read in resumed}), writers)
+                        self.assertTrue(all(read['object'] == 1 for read in resumed), resumed)
+                        record('all-caught-up-replies-held', phase=phase, reads=resumed, boundary=before)
                         self.assertEqual(self.state.attempts['UpdateLayer'], write_attempt)
                         for index, driver in enumerate(drivers):
-                            await check_attempts(driver, index, phase, 'replies-held', first)
+                            await check_attempts(driver, index, phase, 'replies-held', issued[index])
                         # Each first response was selected at the unchanged commit
                         # boundary. First-write gates keep it unchanged until all
                         # clients have consumed their zero-byte recovery reply.
@@ -1151,23 +1740,43 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                             # The endpoint chains writes, so the queued writes
                             # issue together within the window; the service
                             # holds each writer's first and its successors wait.
-                            await check_attempts(driver, index, phase, 'window-issued', end, issuing=True)
+                            # Coalesced, the queued blocks make one to all of them.
+                            if coalesced and end > first:
+                                await check_attempts(driver, index, phase, 'window-issued', issued[index] + 1,
+                                                     issuing=True, most=issued[index] + end - first)
+                            elif coalesced:
+                                # An empty phase, after the last retained round, issues nothing.
+                                await check_attempts(driver, index, phase, 'window-issued', issued[index])
+                            else:
+                                await check_attempts(driver, index, phase, 'window-issued', end, issuing=True)
                 finally:
                     proxy.gate.set()
                     for fault in read_faults:
                         fault.release.set()
-                    for index in plan['release_order']:
-                        for fault in write_faults[index::4]:
-                            record('release-write', phase=phase, attempt=fault.attempt)
+                    for index in plan['release_orders'][first] if end > first else ():
+                        for fault in (write_faults[index:index + 1] if coalesced else write_faults[index::writers]):
+                            record('release-write', phase=phase, writer=index, attempt=fault.attempt)
                             fault.release.set()
 
-                saves = await asyncio.gather(*(driver.command('save 5000') for driver in drivers))
+                # Coalesced, a phase with more blocks than the writer's issuance window leaves the later ones
+                # buffered on the host, where a plain save returns BUSY; save-admitted saves again once a flush
+                # admits them.
+                command = 'save-admitted 5000' if coalesced else 'save 5000'
+                saves = await asyncio.gather(*(driver.command(command) for driver in drivers))
                 self.assertTrue(all(result['result'] == 0 for result in saves), saves)
-                self.assertEqual(len(self.commits()), 1 + end * 4)
                 commits = [{'sequence': commit.sequence, 'writer': commit.writer, 'fields': decode_update(commit.payload)}
                            for commit in self.commits()[1:]]
                 partial = dict(plan, writers=[writer[:end] for writer in plan['writers']])
-                expected, lineage = account_writers(partial, admissions, commits)
+                # The accounting comes first, so a lost or repeated commit raises its WriterMismatch.
+                expected, lineage = account_writers(partial, admissions, commits, coalesced=coalesced)
+                if not coalesced:
+                    self.assertEqual(len(self.commits()), 1 + end * writers)
+                previous = issued
+                issued = [sum(commit['writer'] == client_id for commit in commits) for client_id in wire]
+                if coalesced and phase and end - first >= 2:
+                    # The outage's coalesced blocks commit in fewer writes than edits.
+                    self.assertTrue(all(now - before < end - first for now, before in zip(issued, previous)),
+                                    (previous, issued))
                 self.assertEqual(expected, self.oracle())
                 record('commit-boundary', phase=phase, commits=commits, lineage=lineage, expected=expected)
                 for index, driver in enumerate(drivers):
@@ -1175,28 +1784,62 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual((state['result'], state['pending'], state['subject']),
                                      (0, 0, identities[index]['subject']))
                     record('converged', phase=phase, writer=index, state=state)
-                    await check_attempts(driver, index, phase, 'converged', end)
-                self.assertEqual(self.state.attempts['UpdateLayer'], end * 4)
+                    # Coalesced, each of the writer's commits is one of its calls; otherwise each edit is one.
+                    await check_attempts(driver, index, phase, 'converged', issued[index] if coalesced else end)
+                    self.assertTrue(1 <= issued[index] <= end, (index, issued[index]))
+                # No write was re-sent: every UpdateLayer call is one commit.
+                self.assertEqual(self.state.attempts['UpdateLayer'], len(commits) if coalesced else end * writers)
+                if phase:
+                    # The rotation's own check, once its writers converged: each resumed reading on its
+                    # destination at the frontier before it.
+                    round_plans.check_resume(ordinal, resumed, writers, backend, before)
 
+            if coalesced and 'origin' not in plan:
+                # The mode took effect: each writer's writes after an outage
+                # were chained behind its held first one, and blocks coalesced.
+                # A reduced selection can retain too few queued blocks for
+                # either, so this coverage applies to generated plans.
+                for index, driver in enumerate(drivers):
+                    writes = (await driver.command('diagnostics'))['snapshot']['metrics']['layer_writes']
+                    chained = chained_commits(self.state, wire[index])
+                    record('layer-writes', writer=index, metrics=writes, chained=len(chained))
+                    self.assertTrue(chained, (index, self.state.chain_log))
+                    self.assertGreater(writes['window_high_water'], 1, writes)
+                    self.assertGreater(writes['coalesced_turns'], 0, writes)
             fresh = await self.start(address)
             await self.wait_fields(fresh, expected)
             self.assertEqual(self.state.attempts['CreateLayer'], 1)
-            self.assertEqual(self.state.attempts['SubscribeReadLayer'], 13)
+            self.assertEqual(self.state.attempts['SubscribeReadLayer'], writers * len(phases) + 1)
+            boundary = len(self.commits())
             closed = await asyncio.gather(*(self.close(driver) for driver in drivers + [fresh]))
             self.assertTrue(all(result['fields'] == expected for result in closed))
-            self.assertEqual(len(self.commits()), 49)
-            record('complete', admitted=len(admissions), boundary=49, rotations=2)
+            self.assertEqual(len(self.commits()), boundary, 'teardown issued another mutation')
+            if not coalesced:
+                self.assertEqual(boundary, 1 + writers * plan['rounds'])
+            record('complete', admitted=len(admissions), boundary=boundary, rotations=len(phases) - 1)
 
-    async def rotation_setup(self, plan, label):
-        """Write the plan artifact, then start backend B and the RotatingProxy in front of A."""
+    def write_plan(self, plan, label, **fields):
+        """Record the observed workload and write the plan artifact before any writer starts; returns its prefix.
+
+        The artifact, also the trace's `writer_plan`, is `plan` with the fixture and candidate identities and
+        `fields`; `plan` itself is unchanged, so a reduction trial replays exactly its inputs.
+        """
         campaign.observe_workload(self, plan)
-        plan.update(initial_fixture_sha256=hashlib.sha256(empty_snapshot()).hexdigest(),
-                    candidate=json.loads(Path(os.environ['LIVE_TEST_PLUGIN_DRIVER'] + '.manifest.json').read_text()))
+        candidate = json.loads(Path(os.environ['LIVE_TEST_PLUGIN_DRIVER'] + '.manifest.json').read_text())
+        artifact = dict(plan, initial_fixture_sha256=hashlib.sha256(empty_snapshot()).hexdigest(),
+                        candidate=candidate, **fields)
         prefix = self.artifact / self.id().split('.')[-1]
-        Path(str(prefix) + '.plan.json').write_text(json.dumps(plan, sort_keys=True) + '\n')
-        print(f"{label} master_seed={self.seed} clients={plan['client_count']} rotations={len(plan['writers'][0])} "
+        Path(str(prefix) + '.plan.json').write_text(json.dumps(artifact, sort_keys=True) + '\n')
+        print(f"{label} master_seed={self.seed} clients={plan['client_count']} rounds={len(plan['writers'][0])} "
               f"plan={prefix}.plan.json", flush=True)
-        backend = ReferenceServer(self.state, 'B', service_factory=scene_support.CompactSceneService)
+        self.trace['writer_plan'] = artifact
+        return prefix
+
+    async def rotation_setup(self, plan, label, backend_factory=scene_support.CompactSceneService):
+        """Write the plan artifact, then start backend B, running `backend_factory`'s service, and the RotatingProxy in
+        front of A."""
+        prefix = self.write_plan(plan, label)
+        backend = ReferenceServer(self.state, 'B', service_factory=backend_factory)
         self.extra_servers.append(backend)
         backends = {'A': self.address, 'B': await backend.start()}
         proxy = scene_support.RotatingProxy(self.address)
@@ -1206,29 +1849,59 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_seeded_writers_converge_through_many_backend_rotations(self):
         """Separated rotations never accumulate toward the reconnect attempt limit.
 
-        Each rotation parks new connections, so every writer reconnects once,
-        queues one edit without issuing it, recovers on the other backend and
-        converges before the next rotation. Each rotation's read retry is
-        scheduled at the first backoff step, which shows the reconnect attempt
-        count resets at every recovery readiness. The caught-up reply gate is
-        armed only every 50th rotation and on the last, because the service
-        scans every planned fault on each RPC.
+        Each rotation parks new connections, so every writer's read resumes
+        once, queues one edit without issuing it, recovers on the other backend
+        and converges before the next rotation. Each rotation's first read
+        retry is scheduled at the first backoff step, which shows the reconnect
+        attempt count resets at every recovery readiness; a retry that fails
+        before reaching a backend is the next attempt, in its own window
+        (period_plans.check_rotation_reconnects). The caught-up reply gate is
+        armed only in every 50th seeded period and in the generated plan's
+        last (long_rotations), because the service scans every planned fault
+        on each RPC.
+
+        Each rotation's ledger accounting and resume check raise a
+        WriterMismatch naming the seeded period, which is reduced
+        (period_with_reduction); every other check raises a plain
+        error.
         """
-        clients = getattr(self, 'writer_clients', 4)
-        rotations = getattr(self, 'writer_steps', 8)
-        plan = rotation_writer_plan(self.seed, clients, rotations)
-        prefix, proxy, backends, address = await self.rotation_setup(plan, 'long-rotation-writers')
+        await self.period_with_reduction('long-rotations', rotation_writer_plan(
+            self.seed, getattr(self, 'writer_clients', 4), getattr(self, 'writer_steps', 8)))
+
+    async def long_rotations(self, plan):
+        """Run a long-rotations period plan (period_plans), a generated one or a selection of one.
+
+        Rotation r of the run is the plan's position r - 1 and runs its seeded period: the period's parity names the
+        destination backend, and the caught-up reply gate is armed in every 50th seeded period and in the generated
+        plan's last, so a plan cut after a period runs exactly the inputs the generated plan ran through it. Every
+        count is of the rotations run.
+        """
+        period_plans.validate(plan)
+        clients = plan['client_count']
+        planned = period_plans.periods(plan)
+        rotations, last = len(planned), period_plans.last_period(plan)
+        defect = plan.get('test_service_fault')
+        # The test-only defect corrupt-w0:4 corrupts writer 0's ordinal-4 edit, when the plan holds it; backend B
+        # runs the fixture's service too, so the defect fires on whichever backend a selection puts it.
+        self.state.corrupt_item = next(((op['field'], op['value']) for writer in plan['writers'] for op in writer
+                                        if op['edit'] == 'w0:4'), None) if defect == 'corrupt-w0:4' else None
+        prefix, proxy, backends, address = await self.rotation_setup(
+            plan, 'long-rotation-writers', getattr(self, 'writer_service_factory', scene_support.CompactSceneService))
         with Path(str(prefix) + '.history.jsonl').open('w') as history:
             run = RotationRun(self, plan, proxy, backends, history)
             run.record('plan', master_seed=self.seed, scenario=plan['scenario'], writer_seeds=plan['writer_seeds'],
-                       clients=clients, rotations=rotations)
+                       clients=clients, rotations=rotations, periods=planned)
             await run.join([await self.start(address) for _ in plan['writers']])
-            for rotation in range(1, rotations + 1):
-                fields = await run.rotate(rotation, gated=rotation % 50 == 0 or rotation == rotations)
+            for rotation, period in enumerate(planned, 1):
+                # The test-only fault-schedule defect forwards rotation 6 to the backend it leaves.
+                misrouted = defect == 'misroute-rotation-6' and period == 6
+                fields = await run.rotate(rotation, period=period, gated=period % 50 == 0 or period == last,
+                                          destination=('A' if period % 2 else 'B') if misrouted else None)
                 self.assertEqual(self.state.attempts['CreateLayer'], 1)
                 self.assertEqual(self.state.attempts.get('UpdateLayer', 0), clients * rotation)
                 self.assertEqual(self.state.attempts['SubscribeReadLayer'], clients * (1 + rotation))
-                run.record('rotation', rotation=rotation, commits=len(self.commits()), fields=run.fields_digest(),
+                run.record('rotation', rotation=rotation, period=period, commits=len(self.commits()),
+                           fields=run.fields_digest(),
                            **{key: fields[key] for key in ('backend', 'gated', 'retired', 'boundary', 'delay_ms')},
                            generations=fields['generations'])
 
@@ -1415,7 +2088,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                         (index, generation, named, auth_log[index]))
                 # 8. No auth failure, every credential wait resolved usable, Ping
                 # attempts end OK, UNAVAILABLE or CANCELLED only.
-                snapshots = [await idle_executor_snapshot(driver) for driver in run.drivers]
+                snapshots = [await settled_snapshot(driver) for driver in run.drivers]
                 for snapshot in snapshots:
                     auth = snapshot['metrics']['auth']
                     self.assertEqual(auth['failures_by_cause'], [], auth)
@@ -1425,7 +2098,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 # 9. Process figures and retained-work gauges.
                 samples = [soak_sample(driver.process.pid, snapshot) for driver, snapshot in zip(run.drivers, snapshots)]
                 for index, sample in enumerate(samples):
-                    series[index].append((rotation, sample['anon']))
+                    series[index].append((rotation, sample['anon'], sample['threads']))
                 # 10. After warm-up every gauge returns to its baseline value. The
                 # baseline is the first rotation at or after warm-up without an
                 # expiry event, so no event's transient state is in it.
@@ -1447,7 +2120,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                         self.assertLessEqual(sample['files'], base['files'] + campaign.SOAK_EXTRA_FILES,
                                              (rotation, index, base['files'], sample['files']))
 
-            slopes = [rss_slope([point for point in points if point[0] >= rotations // 2]) for points in series]
+            # The second half of each writer's series: its whole least-squares slope, as a figure, and its growth
+            # checked per run of unchanged thread count (campaign.rss_growth).
+            halves = [[point for point in points if point[0] >= rotations // 2] for points in series]
+            slopes = [campaign.rss_slope([(step, value) for step, value, _ in half]) for half in halves]
+            growth = [campaign.rss_growth(half, base['threads']) for half, base in zip(halves, baseline or [])]
             challenges = [{reason: sum(entry[1] == reason for entry in log) for reason in (1, 2, 3)} for log in auth_log]
             summary = dict(
                 schema_version=1, master_seed=self.seed, clients=clients, rotations=rotations,
@@ -1457,9 +2134,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 commits=len(self.commits()), attempts=dict(self.state.attempts),
                 challenges=[{'missing': c[1], 'expiring': c[2], 'rejected': c[3]} for c in challenges],
                 generations=current, pings_ok=pings, read_generations=run.generations,
-                baseline=baseline, final=samples, anon_slope_bytes_per_rotation=slopes,
+                baseline=baseline, final=samples, anon_slope_bytes_per_rotation=slopes, anon_growth=growth,
                 thresholds=dict(rss_ratio=campaign.SOAK_RSS_RATIO, rss_slack_bytes=campaign.SOAK_RSS_SLACK_BYTES,
                                 rss_slope_bytes=campaign.SOAK_RSS_SLOPE_BYTES, extra_threads=campaign.SOAK_EXTRA_THREADS,
+                                rss_min_segment=campaign.SOAK_RSS_MIN_SEGMENT,
+                                rss_thread_bytes=campaign.SOAK_RSS_THREAD_BYTES,
                                 max_grpc_timer_threads=campaign.SOAK_MAX_GRPC_TIMER_THREADS,
                                 extra_files=campaign.SOAK_EXTRA_FILES, max_generations=campaign.SOAK_MAX_GENERATIONS))
             Path(str(prefix) + '.soak-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
@@ -1478,7 +2157,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     self.assertLessEqual(sample['anon'], bound(base['anon']), (index, base['anon'], sample['anon']))
                     # VmHWM never falls, so reclaim cannot hide a transient peak.
                     self.assertLessEqual(sample['hwm'], bound(base['hwm']), (index, base['hwm'], sample['hwm']))
-                    self.assertLess(slopes[index], campaign.SOAK_RSS_SLOPE_BYTES, (index, slopes[index]))
+                    self.assertEqual(growth[index]['failures'], [], (index, growth[index]))
 
             fresh = await self.start(address)
             state = await self.wait_fields(fresh, run.expected)
@@ -1494,24 +2173,404 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(run.expected, self.oracle())
             run.record('complete', rotations=rotations, boundary=boundary, wall_time_s=summary['wall_time_s'])
 
+    async def test_seeded_writers_and_joins_survive_stream_age_expiries_after_server_token_expiry(self):
+        """Long sessions behind an ingress that limits stream age, compressed in time.
+
+        Every writer reads the layer and joins its session through an HTTP/2
+        proxy that resets each stream once it reaches campaign.STREAM_AGE_MAX_MS
+        on the proxy's stream clock, the 240-minute ingress stream timeout the
+        deployment research records. Each period advances that clock by half the
+        limit, so every second period ends every writer's read and join on its
+        open connection, and the periods between show that the proxy ends no
+        younger stream. Before each such expiry the service stops accepting
+        every token the writer has held, as a token lifetime far shorter than the
+        stream age does, so every ended stream outlived its token; proactive
+        refresh over wall time is the soak case's. Each period every writer authors one planned edit and
+        sends one presence message, and an independent peer commits; the period
+        ends with exact accounting of commits, attempts and rejections, every
+        message delivered once to every other writer, every writer converged,
+        and every retained-work gauge, thread and open file at its warm-up
+        value. The scale comes from writer_stream_age: the campaign cases set
+        campaign.stream_age_scale(); plain discovery uses
+        campaign.STREAM_AGE_HARNESS, which runs every path and asserts the
+        memory bounds only at campaign scale.
+
+        The ledger accounting of each period's writer commits and each expiry's
+        resume check raise a WriterMismatch naming the seeded period, which is
+        reduced (period_with_reduction); every other check raises a plain
+        error.
+        """
+        await self.period_with_reduction('stream-age', period_plans.generate(
+            self.seed, getattr(self, 'writer_clients', 4),
+            getattr(self, 'writer_steps', campaign.STREAM_AGE_HARNESS_PERIODS), period_plans.STREAM_AGE))
+
+    async def exercise_period(self, kind, plan):
+        await (self.long_rotations(plan) if kind == 'long-rotations' else self.stream_age(plan))
+
+    async def period_with_reduction(self, kind, plan):
+        """Run a long-rotations or stream-age period plan; a WriterMismatch is reduced through fresh trials, the first
+        replaying the plan cut after the failing period, and still fails."""
+        try:
+            await self.exercise_period(kind, plan)
+        except WriterMismatch as error:
+            publish_writer(self.artifact / f'{kind}-mismatch.json', dict(signature=error.signature,
+                                                                        evidence=error.evidence))
+            # The mismatch counts only once every writer closed cleanly; a crashed writer raises a plain error here,
+            # which is not reduced. The mismatch is published first, so it stays on record either way.
+            await self.retire_writers()
+            # Retire the original fixture before launching any reduction trial.
+            await self.cleanup()
+            self._cleanups.clear()
+            # A stream-age trial runs at this case's scale, so a replay of its plans does too.
+            scale = getattr(self, 'writer_stream_age', campaign.STREAM_AGE_HARNESS) if kind == 'stream-age' else None
+            summary = await reduce_writers(plan, error.signature, self.artifact / f'{kind}-reduction',
+                                           functools.partial(self.period_trial, kind), domain=period_domain(),
+                                           context=plan_replay.context(kind, scale))
+            print(f'{kind} writer reduction: ' + json.dumps(summary, sort_keys=True), flush=True)
+            raise  # Reduction never turns the original failure into a pass.
+
+    async def period_trial(self, kind, plan, directory, *, automatic_reduction=False):
+        """One fresh fixture, service, proxy and set of native writers executing `plan` at this case's scale; the
+        reducer's evaluator."""
+        period_plans.validate(plan)
+        directory.mkdir(parents=True, exist_ok=True)
+        fixture = PluginTests(PERIOD_TESTS[kind])
+        fixture.artifact_override = directory
+        fixture.seed_override = plan['master_seed']
+        fixture.writer_stream_age = getattr(self, 'writer_stream_age', campaign.STREAM_AGE_HARNESS)
+        if plan.get('test_service_fault') == 'corrupt-w0:4':
+            fixture.writer_service_factory = CorruptPeriodWriterService
+        return await fresh_trial(fixture, fixture.period_with_reduction(kind, plan) if automatic_reduction else
+                                 fixture.exercise_period(kind, plan))
+
+    async def stream_age(self, plan):
+        """Run a stream-age period plan (period_plans), a generated one or a selection of one.
+
+        Period p runs the plan's ordinal p - 1; whether it ends every stream follows its seeded parity, and every
+        count of periods, expiries and commits is of the periods run.
+        """
+        from http2_proxy import Http2Proxy
+        period_plans.validate(plan)
+        clients = plan['client_count']
+        planned = period_plans.periods(plan)
+        periods = len(planned)
+        scale = getattr(self, 'writer_stream_age', campaign.STREAM_AGE_HARNESS)
+        defect = plan.get('test_service_fault')
+        # The test-only defect corrupt-w0:4 corrupts writer 0's ordinal-4 edit, when the plan holds it.
+        self.state.corrupt_item = next(((op['field'], op['value']) for writer in plan['writers'] for op in writer
+                                        if op['edit'] == 'w0:4'), None) if defect == 'corrupt-w0:4' else None
+        tokens = {}
+        for index in range(clients):
+            for generation in range(1, campaign.STREAM_AGE_MAX_GENERATIONS + 1):
+                name = f'age-w{index}-{generation}'
+                self.state.issue(name, 'writer')
+                tokens[hashlib.sha256(name.encode()).hexdigest()] = (index, generation)
+        prefix = self.write_plan(plan, 'stream-age-writers')
+        proxy = Http2Proxy(self.address, max_stream_age_ms=campaign.STREAM_AGE_MAX_MS, record_frames=False)
+        self.proxies.append(proxy)
+        address = await proxy.start()
+        started = time.monotonic()
+        peers, expiries, done = campaign.STREAM_AGE_PEER_EDITS, 0, 0
+        auth_log, current, expired = [[] for _ in range(clients)], [1] * clients, [0] * clients
+        remembered, baseline, samples, series = [], None, [], [[] for _ in range(clients)]
+        connections, received = [None] * clients, [0] * clients
+
+        def rejections(method):
+            """Rejected attempts per writer for one method, each naming a writer token."""
+            counts = [0] * clients
+            for rejection in self.state.auth_rejections:
+                if rejection['method'] == method:
+                    counts[tokens[rejection['token_sha256']][0]] += 1
+            return counts
+
+        with Path(str(prefix) + '.history.jsonl').open('w') as history:
+            run = RotationRun(self, plan, proxy, None, history)
+
+            async def auth_events(index):
+                reply = await run.drivers[index].command('auth-events')
+                auth_log[index].extend(reply['events'])
+                current[index] = reply['generation']
+                return reply
+
+            async def expire_held():
+                """The service stops accepting every token each writer has held."""
+                for index in range(clients):
+                    await auth_events(index)
+                    for generation in range(expired[index] + 1, current[index] + 1):
+                        self.state.expire(f'age-w{index}-{generation}')
+                    expired[index] = current[index]
+                    remembered.append((index, current[index]))
+
+            async def presence(index, connected):
+                """The writer's presence events once its join connected `connected` times and received every message."""
+                reply = await run.drivers[index].command(f'session-events {connected} {received[index]}')
+                self.assertEqual((reply['state'], reply['result']), (2, 0), reply)
+                return reply['events']
+
+            async def resumed(index, driver):
+                """The writer's read records up to its next stream_resumed, under a failure-only watchdog."""
+                records, deadline = [], time.monotonic() + 15
+                while not any(record['event_name'] == 'stream_resumed' for record in records):
+                    self.assertLess(time.monotonic(), deadline, records)
+                    records += (await run.read_records(index, driver))[0]
+                return records
+
+            run.record('plan', master_seed=self.seed, scenario=plan['scenario'],
+                       writer_seeds=plan['writer_seeds'], clients=clients, periods=periods, scale=scale,
+                       max_stream_age_ms=campaign.STREAM_AGE_MAX_MS, step_ms=campaign.STREAM_AGE_STEP_MS,
+                       peer_edits=peers)
+            await run.join([await self.start(address, environment=dict(
+                LIVE_TEST_TOKEN_PREFIX=f'age-w{index}')) for index in range(clients)])
+            for index, driver in enumerate(run.drivers):
+                self.assertEqual((await driver.command(f'session-join w{index}'))['result'], 0)
+            for index in range(clients):
+                connected = [event for event in await presence(index, 1) if event[0] == 1]
+                self.assertEqual([event[1] for event in connected], [0], connected)
+                connections[index] = connected[0][2]
+            self.assertEqual(len(set(connections)), clients)
+            for position, period in enumerate(planned):
+                done += 1
+                expiry = period % 2 == 0
+                pings = [ping_results((await driver.command('diagnostics'))['snapshot']).get(0, 0)
+                         for driver in run.drivers]
+                boundary, joins_rejected = len(self.commits()), rejections('JoinSession')
+                # 1. Every token each writer has held expires before its streams reach the age limit.
+                if expiry:
+                    await expire_held()
+                if defect == 'unannounced-peer-6' and period == 6:
+                    # The test-only fault-schedule defect commits a peer edit that the period's frontier does not
+                    # count, and every writer applies it before its streams end.
+                    await self.peer({'unannounced': -1})
+                    for driver in run.drivers:
+                        await self.wait_fields(driver, dict(run.expected, unannounced=-1))
+                # 2. The stream clock advances; at the limit the ingress ends each writer's read and join.
+                ended = await proxy.advance_stream_clock(campaign.STREAM_AGE_STEP_MS)
+                if not expiry:
+                    self.assertEqual(ended, [])
+                else:
+                    expiries += 1
+                    streams = {}
+                    for record in ended:
+                        streams.setdefault(record['connection'], []).append(record['age_ms'])
+                    self.assertEqual(sorted(streams.values()), [[campaign.STREAM_AGE_MAX_MS] * 2] * clients, ended)
+                    # 3. Every read resumes once, from its coverage frontier, on the same connection: the expiry's
+                    # own check of each writer's first resume, decided over every writer once each has resumed; a
+                    # second resume fails a plain check here or at step 10, whichever read it lands in.
+                    records = [[r['fields'] for r in await resumed(index, driver) if r['event_name'] == 'stream_resumed']
+                               for index, driver in enumerate(run.drivers)]
+                    period_plans.check_expiry_resume(period, [writer[0]['writer'] for writer in plan['writers']],
+                                                     records, run.generations, boundary)
+                    run.generations = [resumed_reads[0]['stream_generation'] for resumed_reads in records]
+                    # 4. Every join rejoins as a new connection: the ended stream reports CANCELLED and each
+                    # attempt the service rejected UNAUTHENTICATED.
+                    for index in range(clients):
+                        connected = [event for event in await presence(index, expiries + 1) if event[0] == 1]
+                        rejected = rejections('JoinSession')[index] - joins_rejected[index]
+                        results = [event[1] for event in connected]
+                        self.assertEqual((results[0], results[-1]), (10, 0), connected)
+                        self.assertEqual(sorted(results[1:-1]), [6] * rejected, connected)
+                        self.assertNotIn(connected[-1][2], connections, connected)
+                        connections[index] = connected[-1][2]
+                    # 5. Every read generation pings: each writer finishes a Ping OK after its reconnect, under a
+                    # failure-only watchdog.
+                    for index, driver in enumerate(run.drivers):
+                        async def pinged():
+                            while True:
+                                count = ping_results((await driver.command('diagnostics'))['snapshot']).get(0, 0)
+                                if count > pings[index]:
+                                    return count
+                        pings[index] = await asyncio.wait_for(pinged(), 15)
+                # 6. One planned edit per writer, each its own commit.
+                ops = [writer[position] for writer in plan['writers']]
+                for index, driver in enumerate(run.drivers):
+                    result = await driver.command(f"usd-set 1 {ops[index]['field']} {ops[index]['value']}")
+                    self.assertEqual(result['result'], 0, result)
+                saves = await writer_tasks(*(driver.command('save 5000') for driver in run.drivers))
+                self.assertTrue(all(result['result'] == 0 for result in saves), saves)
+                commits = self.commits()[boundary:]
+                decoded = [{'sequence': commit.sequence, 'writer': commit.writer, 'fields': decode_update(commit.payload)}
+                           for commit in commits]
+                # The period's ledger accounting names the period, which the reducer's truncation cuts after.
+                with period_plans.in_period(period):
+                    changed, _ = account_writers(dict(plan, writers=[[op] for op in ops]),
+                                                 [{'edit': op['edit']} for op in ops], decoded, base_sequence=boundary)
+                owners = {(op['field'], op['value']): op['writer'] for op in ops}
+                for commit, entry in zip(commits, decoded):
+                    writer = owners[next(iter(entry['fields'].items()))]
+                    self.assertEqual(run.identities.setdefault(writer, commit.writer), commit.writer,
+                                     'writer identity changed across stream-age expiries')
+                    run.model.apply(commit.payload, commit.sequence)
+                run.expected.update(changed)
+                # 7. Independent peer commits.
+                for ordinal in range(peers):
+                    edit = {f'peer_{(2 * period + ordinal) % 3}': -(10000 * period + ordinal)}
+                    before = len(self.commits())
+                    await self.peer(edit)
+                    commit = self.commits()[before]
+                    self.assertEqual((len(self.commits()), commit.writer, decode_update(commit.payload)),
+                                     (before + 1, 'independent-peer', edit))
+                    run.model.apply(commit.payload, commit.sequence)
+                    run.expected.update(edit)
+                # 8. One message per writer, delivered once to every other writer from its current connection.
+                for index, driver in enumerate(run.drivers):
+                    self.assertEqual((await driver.command(f'session-send p{period}w{index}'))['result'], 0)
+                for index in range(clients):
+                    received[index] += clients - 1
+                    events = await presence(index, expiries + 1)
+                    self.assertEqual([event for event in events if event[0] == 1], [], events)
+                    self.assertEqual(sorted((event[3], event[2]) for event in events if event[0] == 4),
+                                     sorted((f'p{period}w{other}', connections[other])
+                                            for other in range(clients) if other != index), events)
+                # 9. Convergence: nothing pending and every writer holds the authoritative fields.
+                self.assertEqual(run.expected, run.model.state)
+                for driver in run.drivers:
+                    self.assertEqual((await self.wait_fields(driver, run.expected))['pending'], 0)
+                # 10. Exact accounting, adjusted by the rejected attempts; no read reconnected outside an expiry.
+                rejected = {method: rejections(method) for method in ('SubscribeReadLayer', 'JoinSession', 'UpdateLayer')}
+                self.assertEqual(self.state.attempts['CreateLayer'], 1)
+                self.assertEqual(self.state.attempts['UpdateLayer'],
+                                 (clients + peers) * done + sum(rejected['UpdateLayer']))
+                self.assertEqual(self.state.attempts['SubscribeReadLayer'],
+                                 clients * (1 + expiries) + sum(rejected['SubscribeReadLayer']))
+                self.assertEqual(self.state.attempts['JoinSession'], clients * (1 + expiries) + sum(rejected['JoinSession']))
+                self.assertEqual(len(self.commits()), 1 + (clients + peers) * done)
+                for index, driver in enumerate(run.drivers):
+                    reads, attempts = await run.read_records(index, driver)
+                    self.assertEqual(attempts, done + rejected['UpdateLayer'][index])
+                    self.assertFalse([r for r in reads if r['event_name'] == 'stream_resumed'], reads)
+                # The service rejected only expired tokens, and every generation a writer held when it expired
+                # was rejected.
+                named = [tokens[rejection['token_sha256']] for rejection in self.state.auth_rejections]
+                self.assertTrue(all(rejection['reason'] == 'expired' for rejection in self.state.auth_rejections),
+                                self.state.auth_rejections)
+                self.assertTrue(all(generation <= expired[index] for index, generation in named), (named, expired))
+                for index in range(clients):
+                    await auth_events(index)
+                    challenges = [entry[0] for entry in auth_log[index]]
+                    self.assertEqual(len(challenges), len(set(challenges)), auth_log[index])
+                    self.assertTrue(all(entry[5] in (0, 15) for entry in auth_log[index]), auth_log[index])
+                for index, generation in remembered:
+                    self.assertIn((index, generation), named, (named, auth_log[index]))
+                # 11. No auth failure, every credential wait resolved usable, and Ping attempts end OK,
+                # UNAVAILABLE, CANCELLED or, once per rejection, UNAUTHENTICATED.
+                snapshots = [await settled_snapshot(driver) for driver in run.drivers]
+                ping_rejected = rejections('Ping')
+                for index, snapshot in enumerate(snapshots):
+                    auth = snapshot['metrics']['auth']
+                    self.assertEqual(auth['failures_by_cause'], [], auth)
+                    self.assertTrue(all(entry['resolution'] == 0
+                                        for entry in auth['credential_wait_ms_by_resolution']['entries']), auth)
+                    results = ping_results(snapshot)
+                    self.assertLessEqual(set(results), {0, 6, 8, 10}, results)
+                    self.assertEqual(results.get(6, 0), ping_rejected[index], results)
+                # 12. Process figures and retained-work gauges; after warm-up every gauge is at its baseline value.
+                samples = [soak_sample(driver.process.pid, snapshot) for driver, snapshot in zip(run.drivers, snapshots)]
+                for index, sample in enumerate(samples):
+                    series[index].append((done, sample['anon'], sample['threads']))
+                if baseline is None and done >= scale['warmup']:
+                    baseline = samples
+                drift = [soak_drift(base, sample) for base, sample in zip(baseline, samples)] if baseline else []
+                run.record('period', period=period, expiry=expiry, ended=len(ended), commits=len(self.commits()),
+                           fields=run.fields_digest(), generations=list(run.generations), connections=list(connections),
+                           auth_generations=list(current), pings=pings,
+                           rejected={method: sum(counts) for method, counts in rejected.items()},
+                           samples=samples, drift=drift)
+                if baseline:
+                    for index, (base, sample) in enumerate(zip(baseline, samples)):
+                        self.assertEqual(drift[index], {}, (period, index))
+                        self.assertLessEqual(sample['threads'], base['threads'] + campaign.SOAK_EXTRA_THREADS,
+                                             (period, index, base['threads'], sample['threads']))
+                        self.assertLessEqual(sample.get('timer_threads', 0), campaign.SOAK_MAX_GRPC_TIMER_THREADS,
+                                             (period, index, sample.get('timer_threads')))
+                        self.assertLessEqual(sample['files'], base['files'] + campaign.SOAK_EXTRA_FILES,
+                                             (period, index, base['files'], sample['files']))
+
+            # The second half of each writer's series: its whole least-squares slope, as a figure, and its growth
+            # checked per run of unchanged thread count (campaign.rss_growth).
+            halves = [[point for point in points if point[0] >= periods // 2] for points in series]
+            slopes = [campaign.rss_slope([(step, value) for step, value, _ in half]) if half else 0.0
+                      for half in halves]
+            growth = [campaign.rss_growth(half, base['threads']) for half, base in zip(halves, baseline or [])]
+            challenges = [{reason: sum(entry[1] == reason for entry in log) for reason in (1, 2, 3)} for log in auth_log]
+            summary = dict(
+                schema_version=1, master_seed=self.seed, clients=clients, periods=periods, expiries=expiries,
+                wall_time_s=round(time.monotonic() - started, 3), scale=scale,
+                stream_clock_ms=proxy.stream_clock_ms, max_stream_age_ms=campaign.STREAM_AGE_MAX_MS,
+                rejections={method: sum(rejections(method)) for method in
+                            ('SubscribeReadLayer', 'JoinSession', 'UpdateLayer', 'Ping')},
+                commits=len(self.commits()), attempts=dict(self.state.attempts),
+                challenges=[{'missing': c[1], 'expiring': c[2], 'rejected': c[3]} for c in challenges],
+                generations=current, read_generations=run.generations, baseline=baseline, final=samples,
+                anon_slope_bytes_per_period=slopes, anon_growth=growth)
+            Path(str(prefix) + '.stream-age-summary.json').write_text(json.dumps(summary, indent=2, sort_keys=True) + '\n')
+            print('stream-age-summary ' + json.dumps(dict(periods=periods, expiries=expiries,
+                                                          wall_time_s=summary['wall_time_s'], generations=current,
+                                                          anon=[sample['anon'] for sample in samples], slopes=slopes)),
+                  flush=True)
+            self.assertEqual(expiries, sum(period % 2 == 0 for period in planned))
+            self.assertTrue(all(generation < campaign.STREAM_AGE_MAX_GENERATIONS for generation in current), current)
+            # The warm-up baseline and the memory bounds apply to generated plans: a reduced selection can end
+            # before the case's warm-up.
+            if 'origin' not in plan:
+                self.assertIsNotNone(baseline)
+            if scale['thresholds'] and 'origin' not in plan:
+                bound = lambda value: campaign.SOAK_RSS_RATIO * value + campaign.SOAK_RSS_SLACK_BYTES
+                for index, (base, sample) in enumerate(zip(baseline, samples)):
+                    self.assertLessEqual(sample['anon'], bound(base['anon']), (index, base['anon'], sample['anon']))
+                    self.assertLessEqual(sample['hwm'], bound(base['hwm']), (index, base['hwm'], sample['hwm']))
+                    if scale['slope']:
+                        self.assertEqual(growth[index]['failures'], [], (index, growth[index]))
+
+            fresh = await self.start(address)
+            state = await self.wait_fields(fresh, run.expected)
+            self.assertEqual(state['pending'], 0, state)
+            self.assertEqual(await client_update_attempts(fresh), 0)
+            run.record('fresh-observer-converged', fields=len(run.expected))
+            closed = await writer_tasks(*(self.close(driver) for driver in run.drivers + [fresh]))
+            self.assertTrue(all(result['fields'] == run.expected for result in closed))
+            boundary = 1 + (clients + peers) * periods
+            self.assertEqual(len(self.commits()), boundary, 'teardown issued another mutation')
+            self.assertEqual(run.expected, self.oracle())
+            # Every join left: the session holds no participant.
+            self.assertEqual(self.state.sessions[self.session].peers, {})
+            run.record('complete', periods=periods, expiries=expiries, boundary=boundary,
+                       wall_time_s=summary['wall_time_s'])
+
     async def test_rotation_before_execution_retains_uncertain_and_queued_writer_intents(self):
-        await self.uncertain_writer_rotation('before')
+        await self.rotation_writers_with_reduction('uncertain-before', rotation_history.generate_uncertain(self.seed))
 
     async def test_rotation_after_commit_retains_uncertain_and_queued_writer_intents(self):
-        await self.uncertain_writer_rotation('after_commit')
+        await self.rotation_writers_with_reduction('uncertain-after', rotation_history.generate_uncertain(self.seed))
 
-    async def uncertain_writer_rotation(self, boundary):
+    async def settled_cut(self, drivers, faults, base, ended):
+        """Wait until the uncertain cut's ledger is final: every UpdateLayer call the writers report issuing has
+        reached the service and every one not held at an unreleased fault has ended.
+
+        `base` and `ended` are the service's UpdateLayer attempts and ended calls before the writers wrote. The
+        service's call ends drive the wait; the timeout is only a failure watchdog, which leaves a plain error.
+        """
+        issued = sum([await client_update_attempts(driver) for driver in drivers])
+
+        def final():
+            arrived = self.state.attempts.get('UpdateLayer', 0) - base
+            in_flight = arrived - (self.state.ended['UpdateLayer'] - ended)
+            return arrived >= issued and in_flight == sum(not fault.release.is_set() for fault in faults)
+        async with asyncio.timeout(5):
+            await self.state.observed(final)
+
+    async def uncertain_writer_rotation(self, plan, boundary):
+        """Run an uncertain-write plan (rotation_history): every writer's first write is held at `boundary`, its
+        other edits are queued behind it, and a backend rotation cuts the held writes."""
         self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
-        plan = writer_plan(self.seed, clients=4, steps=4)
-        from tools.live.writer_campaign import observe_workload
-        observe_workload(self, plan)
-        plan.update(scenario='public-plugin.uncertain-rotation.v1', fault_boundary=boundary,
-                    initial_fixture_sha256=hashlib.sha256(empty_snapshot()).hexdigest(),
-                    candidate=json.loads(Path(os.environ['LIVE_TEST_PLUGIN_DRIVER'] + '.manifest.json').read_text()))
-        prefix = self.artifact / self.id().split('.')[-1]
-        Path(str(prefix) + '.plan.json').write_text(json.dumps(plan, indent=2, sort_keys=True) + '\n')
-        print(f"uncertain-writers master_seed={self.seed} boundary={boundary} plan={prefix}.plan.json", flush=True)
-        self.trace['writer_plan'] = plan
+        rotation_history.validate(plan)
+        writers = plan['client_count']
+        edits = sum(map(len, plan['writers']))
+        prefix = self.write_plan(plan, f'uncertain-writers boundary={boundary}', fault_boundary=boundary)
+        defect = plan.get('test_service_fault')
+        target = next((op for ops in plan['writers'] for op in ops if op['edit'] == 'w0:0'), None)
+        if defect in CUT_DEFECTS and target:
+            # The test-only defect acts on writer 0's round-0 write while the plan retains it.
+            self.state.cut_defect = (CUT_DEFECTS[defect], {target['field']: target['value']})
         backend = ReferenceServer(self.state, 'B', service_factory=scene_support.CompactSceneService)
         self.extra_servers.append(backend)
         other = await backend.start()
@@ -1543,8 +2602,14 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             for driver in drivers:
                 await self.wait_fields(driver, peer_write)
             record('peer-installed', fields=peer_write)
-            base = self.state.attempts['UpdateLayer']
-            faults = [self.state.plan('UpdateLayer', boundary, attempt=base + i + 1, pause=True) for i in range(4)]
+
+            def cut_commits():
+                # The writer commits after the fixture's CreateLayer and the peer write.
+                return [dict(sequence=entry.sequence, fields=decode_update(entry.payload))
+                        for entry in self.commits()[2:]]
+            base, ended = self.state.attempts['UpdateLayer'], self.state.ended['UpdateLayer']
+            faults = [self.state.plan('UpdateLayer', boundary, attempt=base + i + 1, pause=True)
+                      for i in range(writers)]
             try:
                 async def author(index, driver):
                     for op in plan['writers'][index]:
@@ -1563,18 +2628,30 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                     for index, driver in enumerate(drivers):
                         authors.create_task(author(index, driver))
                 await asyncio.wait_for(asyncio.gather(*(fault.reached.wait() for fault in faults)), 5)
+                if getattr(self.state, 'cut_defect', (None,))[0] == 'leak' and len(plan['writers'][0]) > 1:
+                    # The test-only fault-schedule defect releases writer 0's round-0 write, held after its commit,
+                    # while writer 0 has queued writes, and waits until they have followed it into the ledger.
+                    next(f for f in faults if f.attempt == self.state.cut_attempt).release.set()
+                    leaked = {(op['field'], op['value']) for op in plan['writers'][0]}
+                    async with asyncio.timeout(5):
+                        await self.state.observed(lambda: leaked <= {item for entry in cut_commits()
+                                                                     for item in entry['fields'].items()})
+                await self.settled_cut(drivers, faults, base, ended)
+                # The ledger is final until the cut, so the cut oracle classifies it before the attempt and pending
+                # checks, which an issued queued write would also fail.
+                rotation_history.check_cut(plan, boundary, cut_commits())
                 for index, driver in enumerate(drivers):
                     await attempts(driver, index, 'first-rpc-held')
                     state = await driver.command('state')
-                    self.assertEqual(state['pending'], 4)
+                    self.assertEqual(state['pending'], len(plan['writers'][index]))
                     self.assertEqual(state['fields']['shared_peer'], peer_write['shared_peer'])
                     record('before-cut', writer=index, state=state)
                     before_cut.append(state['fields'])
-                self.assertEqual(self.state.attempts['UpdateLayer'], base + 4)
-                committed = 4 if boundary == 'after_commit' else 0
+                self.assertEqual(self.state.attempts['UpdateLayer'], base + writers)
+                committed = writers if boundary == 'after_commit' else 0
                 self.assertEqual(len(self.commits()), committed + 2)
                 retired = await asyncio.wait_for(proxy.rotate_and_wait(other, pause=True), 5)
-                self.assertGreaterEqual(retired, 4)
+                self.assertGreaterEqual(retired, writers)
                 # Transport retirement alone cannot prove the old service handler
                 # stopped before execution. Each paused handler must see actual
                 # cancellation while its release event remains unset.
@@ -1582,13 +2659,16 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(not fault.release.is_set() for fault in faults))
                 record('cut-and-service-cancelled', backend='B', retired_forwards=retired,
                        cancelled_attempts=[fault.attempt for fault in faults], committed=committed)
+                # Every cut handler has ended, so the ledger is final.
+                rotation_history.check_cut(plan, boundary, cut_commits())
                 self.assertEqual(len(self.commits()), committed + 2)
                 for index, driver in enumerate(drivers):
                     status = await driver.command('await-status 7')
                     self.assertEqual(status['subject'], identities[index]['subject'])
                     self.assertGreater(status['incident'], 0)
                     state = await driver.command('state')
-                    self.assertEqual((state['state'], state['result'], state['pending']), (7, 19, 4))
+                    self.assertEqual((state['state'], state['result'], state['pending']),
+                                     (7, 19, len(plan['writers'][index])))
                     record('uncertain', writer=index, status=status, state=state)
                     frozen.append(state['fields'])
                     await attempts(driver, index, 'terminal')
@@ -1600,20 +2680,21 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
             commit_records = [dict(sequence=entry.sequence, writer=entry.writer, wire=entry.payload.hex())
                               for entry in self.commits()[1:]]
-            planned_first = {op[0]['field']: op[0]['value'] for op in plan['writers']}
-            self.assertEqual(self.oracle(), dict(peer_write, **planned_first) if committed else peer_write)
             # Actual commit bytes account for precisely the first operation from
             # every writer; queued suffixes must never appear on the service.
+            # Two first operations may write one shared field, which the later
+            # commit wins.
+            planned_first = {}
             if committed:
                 partial = dict(plan, writers=[ops[:1] for ops in plan['writers']])
-                fields, _ = account_writers(partial, [items[0] for items in admissions], [
+                planned_first, _ = account_writers(partial, [items[0] for items in admissions], [
                     dict(sequence=entry.sequence, writer=entry.writer, fields=decode_update(entry.payload))
                     for entry in self.commits()[2:]], base_sequence=self.commits()[1].sequence)
-                self.assertEqual(fields, planned_first)
+            self.assertEqual(self.oracle(), dict(peer_write, **planned_first))
             for index, (driver, expected) in enumerate(zip(drivers, clients)):
                 self.assertEqual((await driver.command('save 5000'))['result'], 19)
                 path = Path(str(prefix) + f'.writer-{index}.usda')
-                exported = await driver.command(f'export {path}')
+                exported = await export_layer(driver, path)
                 self.assertEqual(exported['result'], 0, exported)
                 state = await driver.command('state')
                 # FAILED latched at await-status 7, so the host content is
@@ -1623,7 +2704,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                 expected.update(export=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest(), state=state)
                 await attempts(driver, index, 'exported')
                 record('exported', writer=index, **expected)
-            self.assertEqual(self.state.attempts['UpdateLayer'], base + 4)
+            self.assertEqual(self.state.attempts['UpdateLayer'], base + writers)
             evidence = dict(plan=plan, clients=clients, commits=commit_records, peers=[peer_write])
             evidence_path = Path(str(prefix) + '.offline-input.json')
             evidence_path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + '\n')
@@ -1644,17 +2725,17 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             Path(str(prefix) + '.offline-report.log').write_bytes(output)
             self.assertEqual(process.returncode, 0, output.decode(errors='replace'))
             report = json.loads(output)
-            self.assertEqual(report['verified_operations'], 16)
+            self.assertEqual(report['verified_operations'], edits)
             record('offline-verified', report=report)
             fresh = await self.start(address)
-            expected = dict(peer_write, **planned_first) if committed else peer_write
+            expected = dict(peer_write, **planned_first)
             await self.wait_fields(fresh, expected)
             self.assertEqual(self.state.scene_reads[-1]['backend'], 'B')
             self.assertEqual((await self.close(fresh))['fields'], expected)
-            self.assertEqual(self.state.attempts['UpdateLayer'], base + 4)
+            self.assertEqual(self.state.attempts['UpdateLayer'], base + writers)
             self.assertEqual(self.state.attempts['CreateLayer'], 1)
             self.assertEqual(len(self.commits()), committed + 2)
-            record('complete', admitted=16, uncertain=4, queued=12, committed=committed)
+            record('complete', admitted=edits, uncertain=writers, queued=edits - writers, committed=committed)
 
     async def test_packaged_plugin_unknown_write_exports_the_failed_layer(self):
         self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
@@ -1685,7 +2766,7 @@ class PluginGraphReadTests(unittest.IsolatedAsyncioTestCase):
     """Root-field reads of the packaged plugin against the independent graph service.
 
     Companion to PluginTests.test_reopen_of_a_released_layer_stats_again; the root-field compact service has no
-    unverified catch-up.
+    Live Edit 0.1.x unverified catch-up.
     """
     graph_creation = True
     asyncSetUp = PluginTests.asyncSetUp
@@ -1701,10 +2782,10 @@ class PluginGraphReadTests(unittest.IsolatedAsyncioTestCase):
                     if node["id"] == 1)
         return {key: value for key, value in root["fields"].items() if type(value) is int}
 
-    async def test_reopen_with_an_unverified_catch_up_applies_own_and_peer_commits(self):
-        # The reopened layer reads with the endpoint's writer ID. Without a proven stable cut its snapshot is acked
-        # below the peer and own commits it holds, which are delivered again, the own one included, so the layer
-        # converges on the service's state.
+    async def test_reopen_with_a_live_edit_0_1_unverified_catch_up_applies_own_and_peer_commits(self):
+        # Live Edit 0.1.x coverage (`unverified_cut`). The reopened layer reads with the endpoint's writer ID. Without
+        # a proven stable cut its snapshot is acked below the peer and own commits it holds, which are delivered
+        # again, the own one included, so the layer converges on the service's state.
         await self.peer({"start": 1})
         driver = await self.start()
         self.assertEqual((await driver.command("usd-set 1 start 2"))["result"], 0)
@@ -1988,7 +3069,8 @@ class PluginCreationTests(unittest.IsolatedAsyncioTestCase):
     cleanup = PluginTests.cleanup
     commits = PluginTests.commits
     oracle = PluginTests.oracle
-    start = PluginTests.start
+    # Each test compares the service's attempt counts across calls that must issue no RPC.
+    start = PluginTests.start_answered
     close = PluginTests.close
 
     async def prepared(self, command='creation-prepare'):

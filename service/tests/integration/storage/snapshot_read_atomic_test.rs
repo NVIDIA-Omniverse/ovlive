@@ -89,7 +89,7 @@ use oodf_ffi::{
 
 use crate::common::owned_delta::{
     delta_with_set_field_external, delta_with_set_field_inline, delta_with_time_sample_external,
-    delta_with_time_sample_inline,
+    delta_with_time_sample_inline, with_root,
 };
 use crate::storage::b_atj_tests::{
     assert_keyspace_type_errors_flat, assert_no_family_ticked, assert_only_family_ticked,
@@ -1112,7 +1112,6 @@ async fn read_object_snapshot_of_a_header_without_a_numeric_seq_is_not_found_for
         }
         for consumer in [
             SnapshotReadConsumer::Catchup,
-            SnapshotReadConsumer::CatchupLegacyPerCommit,
             SnapshotReadConsumer::Checkpoint,
         ] {
             let result =
@@ -1608,7 +1607,9 @@ async fn atomic_read_of_a_wrongtype_section_hash_ticks_section() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn atomic_read_of_a_wrongtype_tombstone_hash_ticks_deleted_section() {
     let fx = Fixture::empty("sr-ref-del").await;
-    fx.update(create_section_delta(DOOMED_SECTION_ID, "Doomed"))
+    // With the layer's root section beside it, so the delete below keeps a
+    // top-level section: an update leaving none is refused (SDD §9.7).
+    fx.update(with_root(create_section_delta(DOOMED_SECTION_ID, "Doomed")))
         .await
         .expect("the setup CreateSection must land");
     fx.update(delete_section_delta(DOOMED_SECTION_ID))
@@ -1751,7 +1752,7 @@ async fn read_object_snapshot_records_one_outcome_per_read_under_its_consumer() 
         tv.client(),
         tv.key_schema(),
         "987654321",
-        SnapshotReadConsumer::CatchupLegacyPerCommit,
+        SnapshotReadConsumer::Checkpoint,
     )
     .await;
     assert!(matches!(missing, Err(ServiceError::NotFound(_))));
@@ -1759,10 +1760,10 @@ async fn read_object_snapshot_records_one_outcome_per_read_under_its_consumer() 
 
     let expected: BTreeMap<(&str, &str), u64> = BTreeMap::from([
         (("checkpoint", "ok"), 1),
-        (("catchup_legacy_per_commit", "not_found"), 1),
+        (("checkpoint", "not_found"), 1),
         (("catchup", "too_large"), 1),
     ]);
-    for consumer in ["catchup", "catchup_legacy_per_commit", "checkpoint"] {
+    for consumer in ["catchup", "checkpoint"] {
         for outcome in [
             "ok",
             "not_found",
@@ -1786,8 +1787,8 @@ async fn read_object_snapshot_records_one_outcome_per_read_under_its_consumer() 
             "live_edit_snapshot_read_duration_seconds_count",
             &[("consumer", "checkpoint"), ("path", "atomic")]
         ),
-        Some(1.0),
-        "every read records its wall time"
+        Some(2.0),
+        "every read records its wall time, a NOT_FOUND answer included"
     );
     assert_eq!(
         count(
@@ -1819,11 +1820,12 @@ async fn read_object_snapshot_records_one_outcome_per_read_under_its_consumer() 
             ),
             count(
                 "live_edit_snapshot_read_reply_bytes_count",
-                &[("consumer", "catchup_legacy_per_commit")]
+                &[("consumer", "checkpoint")]
             ),
         ),
-        (None, None),
-        "a read that returned no state records no size"
+        (None, Some(1.0)),
+        "a read that returned no state records no size: the TOO_LARGE catch-up read none, \
+         and of the two checkpoint reads only the successful one"
     );
 }
 

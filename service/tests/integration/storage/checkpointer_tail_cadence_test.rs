@@ -106,7 +106,7 @@
 // | `a_failing_tail_put_moves_error_layer_tail_and_leaves_the_outcome_family_unchanged` | one `PUT_FAILURE_BUDGET` over warm-up + error observation | **25 s** |
 // | `after_a_capture_the_header_carries_both_cursor_columns_and_no_restore_seq_bump` | `drive_captured_tail`'s own 30 s | **30 s** |
 // | `flag_off_drives_the_same_fixture_with_zero_tail_movement` | one `FLAG_OFF_BUDGET` over warm-up + unverified observation | **25 s** |
-// | `a_driven_run_keeps_ten_tail_outcome_cells_and_rebased_at_zero` | `drive_captured_tail`'s own 30 s | **30 s** |
+// | `a_driven_run_keeps_eleven_tail_outcome_cells_and_rebased_at_zero` | `drive_captured_tail`'s own 30 s | **30 s** |
 // | `tails_survive_the_retention_prune_at_retain_generations_one` | one `PRUNE_BUDGET` over warm-up + plant + capture + prune observation | **30 s** |
 //
 // None approaches 120 s, and the two 30 s entries are the shared fixture's own
@@ -156,7 +156,7 @@ use crate::checkpoint::helpers::{
 // Module constants.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// The ten `live_edit_checkpoint_tail_total{outcome}` cells, restated as a
+/// The eleven `live_edit_checkpoint_tail_total{outcome}` cells, restated as a
 /// LITERAL array.
 ///
 /// Deliberately not an import of `CHECKPOINT_TAIL_OUTCOMES`: importing the
@@ -175,7 +175,12 @@ use crate::checkpoint::helpers::{
 /// `refused_no_base`, which is left meaning exactly "this object has no durable
 /// generation at all". This restatement IS the deliberate human edit the
 /// paragraph above describes.
-const TAIL_OUTCOMES: [&str; 10] = [
+///
+/// `refused_cleanup_in_flight` is the eleventh, added by b.g65: the pre-PUT
+/// backup clean-up fence refused the tail because a clean-up pass is deleting
+/// or has just collected something it names, so the capture waits for a later
+/// tick instead of writing.
+const TAIL_OUTCOMES: [&str; 11] = [
     "captured",
     "captured_capped",
     "rebased",
@@ -186,6 +191,7 @@ const TAIL_OUTCOMES: [&str; 10] = [
     "refused_no_base",
     "refused_chain_full",
     "refused_lineage_unrootable",
+    "refused_cleanup_in_flight",
 ];
 
 /// The three `result` values on `live_edit_checkpoint_writes_total`, restated
@@ -812,6 +818,10 @@ impl CheckpointStore for TailAwareCheckpointStore {
 
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         self.delegate.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
     }
 
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -1731,10 +1741,10 @@ async fn flag_off_drives_the_same_fixture_with_zero_tail_movement() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Vocabulary guard — exactly ten outcome cells after a DRIVEN run, and
+// Vocabulary guard — exactly eleven outcome cells after a DRIVEN run, and
 // `rebased` still zero.
 //
-// Case C guards the same family from the flag-off side (all ten present, all
+// Case C guards the same family from the flag-off side (all eleven present, all
 // zero). This is the other side: a run where the family actually MOVED, so a
 // regression that materialises an out-of-band `outcome` on first occurrence —
 // invisible to any per-name probe — surfaces as an extra key.
@@ -1755,7 +1765,7 @@ async fn flag_off_drives_the_same_fixture_with_zero_tail_movement() {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_driven_run_keeps_ten_tail_outcome_cells_and_rebased_at_zero() {
+async fn a_driven_run_keeps_eleven_tail_outcome_cells_and_rebased_at_zero() {
     let tv = TestValkey::setup_with_pool_size(8).await;
     let metrics = make_metrics();
     let store: Arc<dyn CheckpointStore> = Arc::new(InMemoryCheckpointStore::new());
@@ -1780,7 +1790,7 @@ async fn a_driven_run_keeps_ten_tail_outcome_cells_and_rebased_at_zero() {
     assert_eq!(
         observed, expected,
         "after a driven run the live_edit_checkpoint_tail_total outcome set must STILL be exactly \
-         the ten pinned values. An extra key is an out-of-band outcome materialised on its first \
+         the eleven pinned values. An extra key is an out-of-band outcome materialised on its first \
          occurrence — the regression a per-name probe cannot see. Cells: {cells:?}"
     );
     assert_eq!(

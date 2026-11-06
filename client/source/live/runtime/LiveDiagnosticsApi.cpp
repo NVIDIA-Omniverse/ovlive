@@ -330,6 +330,23 @@ void metricsJson(Json& out, const DiagnosticMetrics& metrics, const DispatchMetr
             out.raw("}");
         }
     }
+    out.raw("]},\"cleanup_duration_ms_by_call_result\":");
+    durationBounds(out);
+    out.raw(",\"entries\":[");
+    comma = false;
+    for (size_t call = 1; call < metrics.cleanupDurationByCallResult.size(); ++call) {
+        for (size_t result = 0; result < metrics.cleanupDurationByCallResult[call].size(); ++result) {
+            const auto& metric = metrics.cleanupDurationByCallResult[call][result];
+            if (!metric.count) continue;
+            if (comma) out.raw(",");
+            comma = true;
+            out.raw("{\"call\":");
+            out.number(call);
+            out.field("result", result);
+            durationCounts(out, metric);
+            out.raw("}");
+        }
+    }
     out.raw("]}");
     out.raw(",\"auth\":{\"blocked_endpoints\":");
     out.number(metrics.authBlockedEndpoints);

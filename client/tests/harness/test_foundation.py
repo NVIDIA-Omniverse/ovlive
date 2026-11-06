@@ -148,12 +148,28 @@ class SupervisorTests(unittest.TestCase):
 
     def test_outer_timeout_reaps_nested_supervised_process(self):
         root = str(Path(__file__).resolve().parents[2])
-        inner = "import os,time; from pathlib import Path; Path('inner.pid').write_text(str(os.getpid())); time.sleep(300)"
+        # The inner workload publishes its PID atomically, so the barrier below never reads a partial file.
+        inner = ("import os,time; from pathlib import Path; Path('inner.pid.tmp').write_text(str(os.getpid())); "
+                 "os.replace('inner.pid.tmp', 'inner.pid'); time.sleep(300)")
         outer = (f"import sys; sys.path.insert(0, {root!r}); "
                  "from tools.live.test_support import run_process; from pathlib import Path; "
                  f"run_process([sys.executable, '-c', {inner!r}], cwd=Path.cwd(), "
                  "output=Path('inner.log'), timeout_ms=300000)")
-        result = self.run_child(outer, timeout_ms=1000)
+        # The outer watchdog expires only once the inner workload is running, so its reap always has a PID to check.
+        expire, results = threading.Event(), []
+        worker = threading.Thread(target=lambda: results.append(self.run_child(outer, timeout_ms=300000, expire=expire)))
+        worker.start()
+        pid, deadline = self.directory / "inner.pid", time.monotonic() + 30  # Failure-only watchdog.
+        try:
+            while not pid.is_file():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+        finally:
+            # A failed barrier still expires the outer guard, so its process tree ends before the test does.
+            expire.set()
+            worker.join(60)  # Failure-only watchdog.
+        self.assertFalse(worker.is_alive(), "run_process did not return after its watchdog expired")
+        result, = results
         self.assertEqual(result.outcome, "timeout")
         self.assertTrue(result.cleanup_complete)
         self.assertEqual(result.stack_dumps, ())
@@ -247,6 +263,48 @@ class SupervisorTests(unittest.TestCase):
         self.assertTrue(result.stack_dumps[0].startswith(f"{prefix}."))
         self.assertEqual(Path(result.stack_dumps[0]).read_text(), "dump\n")
         self.assertFalse(any(path.exists() for path in stale))
+
+    def test_a_fatal_signal_writes_the_installed_dump(self):
+        root = str(Path(__file__).resolve().parents[2])
+        code = (f"import sys; sys.path.insert(0, {root!r}); from tools.live import stack_dump; stack_dump.install()\n"
+                "import faulthandler\n"
+                "def crash_on_purpose():\n    faulthandler._read_null()\n"
+                "crash_on_purpose()\n")
+        result = run_process([sys.executable, "-c", code], cwd=self.directory, output=self.directory / "fatal.log",
+                             timeout_ms=30000)
+        self.assertEqual(result.outcome, "crash")
+        if WINDOWS:
+            # install() needs SIGQUIT, so a Windows process registers no dump.
+            self.assertEqual(result.stack_dumps, ())
+            return
+        self.assertEqual(len(result.stack_dumps), 1)
+        dump = Path(result.stack_dumps[0]).read_text()
+        self.assertIn("Fatal Python error", dump)
+        self.assertIn("crash_on_purpose", dump)
+
+    def test_the_reference_service_dumps_a_fault_while_loading_openssl(self):
+        # The fault strikes on the reference entry point's first import of ssl, before any of its own code runs.
+        script = str(Path(__file__).resolve().parents[2] / "tools/live/reference.py")
+        code = ("import faulthandler, runpy, sys\n"
+                "class Fault:\n"
+                "    def find_spec(self, name, path=None, target=None):\n"
+                "        if name == 'ssl':\n"
+                "            faulthandler._read_null()\n"
+                "        return None\n"
+                "assert 'ssl' not in sys.modules\n"
+                "sys.meta_path.insert(0, Fault())\n"
+                f"sys.argv = [{script!r}, '--help']\n"
+                f"runpy.run_path({script!r}, run_name='__main__')\n")
+        result = run_process([sys.executable, "-c", code], cwd=self.directory, output=self.directory / "ssl.log",
+                             timeout_ms=30000)
+        self.assertEqual(result.outcome, "crash", (self.directory / "ssl.log").read_text())
+        if WINDOWS:
+            self.assertEqual(result.stack_dumps, ())
+            return
+        self.assertEqual(len(result.stack_dumps), 1)
+        dump = Path(result.stack_dumps[0]).read_text()
+        self.assertIn("Fatal Python error", dump)
+        self.assertIn("reference.py", dump)
 
     def test_a_relative_dump_prefix_is_absolute_in_the_workload(self):
         result = run_process(environment_dump(), cwd=self.directory, output=self.directory / "env.log",

@@ -105,10 +105,11 @@
 //!
 //! It carries no `#[ignore]`, deliberately. Its primitives are key-scoped —
 //! `DISCARD` / `UNWATCH` probes pinned to two slots, plus canned frames answered
-//! inside this process's own client — so nothing it does disturbs the ~600
+//! inside this process's own client — so nothing it does disturbs the ~140
 //! sibling tests sharing the cluster, and the default self-gating shape (per
-//! `docs-internal/test-writing-guide.md`) lets the unfiltered `test-cluster:`
-//! run pick it up with no CI-side filterset to keep in sync. The `#[ignore]` +
+//! `docs-internal/test-writing-guide.md`), with `cluster` in its name, lets the
+//! `test-cluster:` run's name filterset pick it up with no CI-side list to keep
+//! in sync. The `#[ignore]` +
 //! `test-cluster-disruptive:` shape is for tests whose primitive disturbs the
 //! *node* (`CLIENT PAUSE`, `CLUSTER SETSLOT`); this is not one.
 //!
@@ -126,6 +127,10 @@
 //! mark, let alone the 120 s hard kill.
 
 use std::path::{Path, PathBuf};
+
+use live_edit::storage::test_support::CLUSTER_GATED_FILTERSET;
+
+use super::test_cluster_url_read_guard_test::CLUSTER_JOB_TARGETS;
 
 #[cfg(feature = "test-fault-injection")]
 mod seam_driven {
@@ -510,7 +515,7 @@ mod seam_driven {
         // the gate is armed cannot drift apart.
         let var = super::CLUSTER_URL_VAR;
         let scheme = super::CLUSTER_URL_SCHEME;
-        let Ok(cluster_url) = std::env::var(var) else {
+        let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
             eprintln!(
                 "SKIP: {var} not set (no multi-shard cluster configured); run \
                  `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run this. \
@@ -1221,11 +1226,28 @@ const EVALSHA_CHECKPOINT_ANCHOR_FILE: &str = "src/checkpoint/session.rs";
 /// deletion marker and commit claim) and the one retirement wake-up every
 /// route shares (`retired_object_wake.lua` in `layer::wake_retired_object_stream`,
 /// passing the object's `{oid}`-tagged stream).
-const EVALSHA_STORAGE_SITES_WHEN_WRITTEN: usize = 38;
+///
+/// Raised 38 → 39 by the fleet hold's poll read (`dr_hold_poll.lua` in
+/// `storage::dr_hold::read_hold_marker`, passing the hold marker, which is
+/// tagged with the object-id counter key so it runs on the counter's slot).
+///
+/// Raised 39 → 40 by the stream high-water probe's move out of
+/// `checkpoint::recovery` into `storage::stream_high_water` (`probe_once`,
+/// passing the object's `{oid}`-tagged stream key), shared with the restore
+/// Job; the checkpoint lane lost the same site, so the total is unchanged.
+///
+/// Raised 40 → 42 by the restore Job's finish: the authoritative recount's
+/// per-hash count set (`ext_ref_count_set.lua` in
+/// `storage::ext_reconcile::set_ref_count`, passing the value's
+/// `{hash_hex}`-tagged meta) and the un-hold (`dr_unhold.lua` in
+/// `storage::dr_hold::unhold`, passing the hold marker, the Job lease and the
+/// object-id counter, all on the counter's slot).
+const EVALSHA_STORAGE_SITES_WHEN_WRITTEN: usize = 42;
 
-/// The same, under `src/checkpoint/`: `session_writer.rs`, `recovery.rs`, and
-/// `session.rs` ×2 (one production, one in its own `#[cfg(test)]` module).
-const EVALSHA_CHECKPOINT_SITES_WHEN_WRITTEN: usize = 4;
+/// The same, under `src/checkpoint/`: `session_writer.rs` and `session.rs` ×2
+/// (one production, one in its own `#[cfg(test)]` module). `recovery.rs`'s
+/// site moved to the storage lane (above).
+const EVALSHA_CHECKPOINT_SITES_WHEN_WRITTEN: usize = 3;
 
 /// Both lanes together.
 const EVALSHA_SITES_WHEN_WRITTEN: usize =
@@ -1258,8 +1280,10 @@ const EVALSHA_SITES_WHEN_WRITTEN: usize =
 /// Raised 21 → 28 when the recount above brought the total to 34, restoring
 /// the six-site headroom; raised 28 → 34 with `storage::snapshot_fence`'s six
 /// sites, restoring it below the total of 40; raised 34 → 36 with b.ua9's two
-/// sites, restoring it below the total of 42.
-const EVALSHA_SITE_FLOOR: usize = 36;
+/// sites, restoring it below the total of 42; raised 36 → 37 with the hold
+/// poll's site, restoring it below the total of 43; raised 37 → 39 with the
+/// recount's and the un-hold's sites, restoring it below the total of 45.
+const EVALSHA_SITE_FLOOR: usize = 39;
 
 /// Argument expressions that are an empty key list on their face.
 ///
@@ -1283,8 +1307,8 @@ fn is_empty_keys_expression(expr: &str) -> bool {
 /// # Why both lanes
 ///
 /// The routing defect is fred's, not any one module's: it applies to every
-/// `EVALSHA` this process sends, and `src/checkpoint/` sends four of them
-/// (`session_writer.rs`, `recovery.rs`, `session.rs` ×2) through the same
+/// `EVALSHA` this process sends, and `src/checkpoint/` sends three of them
+/// (`session_writer.rs`, `session.rs` ×2) through the same
 /// `evalsha_with_reload` helper. A fence that stopped at `src/storage/` would
 /// have policed the lane that happened to be under audit rather than the lane
 /// the hazard lives in, and a new zero-key script added on the checkpoint side
@@ -1528,10 +1552,11 @@ fn the_evalsha_argument_parser_reads_the_keys_expression() {
 ///
 /// `.scan(` is fred's *unbuffered* `Client::scan` — the same one-node walk as
 /// `.scan_buffered(`, differing only in back-pressure, and just as wrong on a
-/// cluster. Its one hit in either walked tree today is the non-cluster arm of
-/// `orphan_sweep::scan_keyspace`'s dispatch, which uses the page form so it can
-/// tell a complete walk from one cut short (and there is no `Iterator::scan` to
-/// false-positive on), so it costs nothing to carry and catches the one
+/// cluster. It has no hit in either walked tree today: its last, the
+/// non-cluster arm of `orphan_sweep::scan_keyspace`'s old dispatch, went when
+/// that walk moved onto the explicit-cursor `SCAN` step of
+/// `storage::scan_guard` (b.hyw). There is no `Iterator::scan` to
+/// false-positive on, so it costs nothing to carry and catches the one
 /// spelling the audit's needle list missed.
 ///
 /// # The keyed-cursor exemption (b.yda), and why the needles are dotted
@@ -1694,20 +1719,89 @@ fn the_bare_scan_needles_exempt_keyed_cursors() {
 /// twin — a false positive on the exact code the fence is asking for.
 const CLUSTER_SCAN_FANOUT_FORMS: [&str; 2] = ["scan_cluster_buffered(", "scan_cluster("];
 
-/// How many legitimate `is_clustered` SCAN dispatches the two walked lanes hold:
-/// `storage::orphan_sweep::scan_keyspace` (the service's one keyspace walk,
-/// shared by the orphan sweep, the reference reconciler and the checkpoint
-/// tick's pass 1) and `storage::test_support::scan_matching` (shared by the
-/// fixture's prefix cleanup and the object-keyspace dump). The checkpoint lane
-/// holds none of its own: it walks through `scan_keyspace`.
+/// How many legitimate SCAN dispatch sites the two walked lanes hold: one
+/// `is_clustered` dispatch, `storage::test_support::scan_matching` (shared by
+/// the fixture's prefix cleanup and the object-keyspace dump); and the
+/// keyspace walk's explicit `SCAN` step
+/// (`storage::scan_guard::KeyspaceWalk::next_page`, b.gns), which walks every
+/// primary of a fresh slot map, one after another, each step pinned to its
+/// primary's node with one attempt ([`GUARDED_SCAN_STEP_NEEDLE`]). That step
+/// serves all three of the walk's guard levels: the periodic reference
+/// reconcile pass's serving-process guarded walks, the DR Jobs' agreeing
+/// walks (b.f3t) and the coverage walk `storage::orphan_sweep::scan_keyspace`
+/// (b.hyw; shared by the orphan sweep, the reference reconciler's meta walk,
+/// the external-value backup repair and the checkpoint tick's pass 1), which
+/// holds no dispatch of its own any more. The checkpoint lane holds none
+/// either: it walks through `scan_keyspace`.
 const SCAN_DISPATCH_SITES: usize = 2;
+
+/// The keyspace walk's explicit-cursor `SCAN` step (b.gns; since b.hyw also
+/// the coverage walk's, `orphan_sweep::scan_keyspace`): a
+/// `CustomCommand` rather than fred's `scan`, so no needle of
+/// [`BARE_SCAN_NEEDLES`] sees it. It is credited as a dispatch only in
+/// `storage::scan_guard`'s `KeyspaceWalk::next_page`, sent with its route's
+/// one-attempt options (`route.options(true)`, a node pin per primary on a
+/// cluster): [`guarded_scan_step_is_pinned`]. Anywhere else it is a bare
+/// keyless `SCAN`.
+const GUARDED_SCAN_STEP_NEEDLE: &str = "CustomCommand::new_static(\"SCAN\"";
+
+/// The guarded keyed walk's explicit-cursor `ZSCAN` / `HSCAN` / `SSCAN` step
+/// (`storage::scan_guard::KeyedWalk::step`, b.gns): keyed, so exempt from
+/// the dispatch rule as every keyed cursor is, but fenced on its own: it is
+/// sent with its route's one-attempt options, routed by its key's slot
+/// ([`the_guarded_walks_explicit_scan_steps_are_pinned_one_attempt_steps`]).
+const GUARDED_KEYED_STEP_NEEDLE: &str = "CustomCommand::new_static(walk, ClusterHash::FirstValue";
+
+/// The file both guarded steps live in.
+const SCAN_GUARD_FILE: &str = "src/storage/scan_guard.rs";
+
+/// The name of the function whose body holds line `idx` of `lines`: the
+/// nearest `fn` declaration at or above it. Closures are not functions.
+fn enclosing_fn_name(lines: &[String], idx: usize) -> Option<String> {
+    const DECLARATIONS: [&str; 6] = [
+        "pub async fn ",
+        "pub(crate) async fn ",
+        "async fn ",
+        "pub fn ",
+        "pub(crate) fn ",
+        "fn ",
+    ];
+    lines[..=idx].iter().rev().find_map(|line| {
+        let trimmed = line.trim_start();
+        let rest = DECLARATIONS
+            .iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+        rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .map(str::to_owned)
+    })
+}
+
+/// Whether the step at line `idx` of `file` is sent as `fn_name`'s
+/// one-attempt step on its route: in [`SCAN_GUARD_FILE`], inside `fn_name`,
+/// with `route.options(true)` in the [`SCAN_DISPATCH_LOOKBACK_LINES`] code
+/// lines above it.
+fn guarded_step_is_pinned(file: &Path, lines: &[String], idx: usize, fn_name: &str) -> bool {
+    let start = idx.saturating_sub(SCAN_DISPATCH_LOOKBACK_LINES);
+    file == Path::new(SCAN_GUARD_FILE)
+        && enclosing_fn_name(lines, idx).as_deref() == Some(fn_name)
+        && lines[start..=idx]
+            .join("\n")
+            .contains("route.options(true)")
+}
+
+/// [`guarded_step_is_pinned`] for the keyspace walk's `SCAN` step.
+fn guarded_scan_step_is_pinned(file: &Path, lines: &[String], idx: usize) -> bool {
+    guarded_step_is_pinned(file, lines, idx, "next_page")
+}
 
 /// How many lines of *code* above a bare-scan call site the `is_clustered`
 /// dispatch may sit.
 ///
-/// Ten. The two legitimate sites today put the guard three lines above the
-/// call (`orphan_sweep::scan_keyspace`'s and `test_support::scan_matching`'s
-/// `if client.is_clustered()`); ten leaves headroom for rustfmt without letting
+/// Ten. The one legitimate dispatch today puts the guard three lines above
+/// the call (`test_support::scan_matching`'s `if client.is_clustered()`), as
+/// `orphan_sweep::scan_keyspace`'s did before b.hyw; ten leaves headroom for
+/// rustfmt without letting
 /// an unrelated earlier statement satisfy the match. Measured over comment-stripped lines, so a
 /// paragraph of prose between the guard and the call cannot push the guard out
 /// of the window.
@@ -1765,11 +1859,13 @@ fn no_bare_scan_call_site_survives_outside_an_is_clustered_dispatch() {
     rust_sources_under(&root, &root.join("src").join("checkpoint"), &mut files);
     files.sort();
 
-    // Non-vacuity, part 1: the walk must reach the two known dispatch sites and
-    // the checkpoint lane's keyspace walk.
+    // Non-vacuity, part 1: the walk must reach the two known dispatch sites,
+    // the keyspace walk shared by the service's walks, and the checkpoint
+    // lane's keyspace walk.
     for expected in [
-        "src/storage/orphan_sweep.rs",
+        "src/storage/scan_guard.rs",
         "src/storage/test_support.rs",
+        "src/storage/orphan_sweep.rs",
         "src/checkpoint/checkpointer.rs",
     ] {
         assert!(
@@ -1788,6 +1884,19 @@ fn no_bare_scan_call_site_survives_outside_an_is_clustered_dispatch() {
             .unwrap_or_else(|e| panic!("reading {} must succeed: {e}", file.display()));
         let lines = code_lines(&source);
         for (idx, line) in lines.iter().enumerate() {
+            // The keyspace walk's explicit `SCAN` step (b.gns; the coverage
+            // walk's too, b.hyw): a
+            // dispatch only as the per-primary, node-pinned, one-attempt step
+            // of `KeyspaceWalk::next_page`; anywhere else a bare `SCAN`.
+            if line.contains(GUARDED_SCAN_STEP_NEEDLE) {
+                let site = format!("  {}:{}\n    {}", file.display(), idx + 1, line.trim());
+                if guarded_scan_step_is_pinned(file, &lines, idx) {
+                    dispatched.push(site);
+                } else {
+                    violations.push(format!("{site}\n    (needle: {GUARDED_SCAN_STEP_NEEDLE})"));
+                }
+                continue;
+            }
             // Neither fan-out spelling contains a needle: `scan_cluster_buffered(`
             // and `scan_cluster(` both put `_cluster` immediately after `scan`,
             // where every needle wants either `_buffered(` or `(`. So the
@@ -1823,8 +1932,8 @@ fn no_bare_scan_call_site_survives_outside_an_is_clustered_dispatch() {
         "bare SCAN-family call site(s) under src/storage/ or src/checkpoint/ with no \
          `is_clustered` dispatch above them:\n\n{}\n\nDispatch on `client.is_clustered()` and use \
          `scan_cluster(...)` (or `scan_cluster_buffered(...)`) on the clustered arm — or, for a \
-         keyspace walk, call `orphan_sweep::scan_keyspace`, which also ends a walk cut short \
-         with an error. A bare `scan` / `scan_buffered` walks ONE node's slot range, so on a cluster it reports a keyspace that \
+         keyspace walk, call `orphan_sweep::scan_keyspace`, which walks every primary of a fresh \
+         slot map and ends a walk it cannot show complete with an error. A bare `scan` / `scan_buffered` walks ONE node's slot range, so on a cluster it reports a keyspace that \
          silently omits every sibling shard — and every consumer in these two lanes is an \
          enumeration (orphan reaping, prefix cleanup, the checkpoint tick's session sweep), so \
          the result is not an error but a quietly incomplete answer that returns `Ok`. Invisible \
@@ -1843,7 +1952,9 @@ fn no_bare_scan_call_site_survives_outside_an_is_clustered_dispatch() {
         dispatched.len(),
         SCAN_DISPATCH_SITES,
         "expected exactly the {SCAN_DISPATCH_SITES} legitimate dispatch sites \
-         (`orphan_sweep::scan_keyspace` and `test_support::scan_matching`) but found {}:\n\n{}\n\nA new dispatch site is \
+         (`test_support::scan_matching` and the keyspace walk's \
+         `scan_guard::KeyspaceWalk::next_page` step, which `orphan_sweep::scan_keyspace` walks \
+         through) but found {}:\n\n{}\n\nA new dispatch site is \
          fine — update SCAN_DISPATCH_SITES. A count of 0 means the needles have stopped matching \
          and this fence is asserting nothing; update BARE_SCAN_NEEDLES / CLUSTER_SCAN_FANOUT_FORMS \
          rather than deleting it. A new site in `src/checkpoint/` is caught because that lane is \
@@ -1851,6 +1962,256 @@ fn no_bare_scan_call_site_survives_outside_an_is_clustered_dispatch() {
          should go through `orphan_sweep::scan_keyspace` rather than add a dispatch.",
         dispatched.len(),
         dispatched.join("\n")
+    );
+}
+
+// Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+/// The guarded walks' explicit-cursor steps (`storage::scan_guard`, b.gns)
+/// are each sent once, as the one-attempt step of their walk on its route:
+/// the keyspace walk's `SCAN` inside `KeyspaceWalk::next_page` (a node pin per
+/// primary on a cluster) and the keyed walk's `ZSCAN` / `HSCAN` / `SSCAN`
+/// inside `KeyedWalk::step` (its key's slot), each with
+/// `route.options(true)` just above it. A second site of either, or one
+/// sent with other options, would be a walk step outside the guard: its
+/// cursor could be replayed by fred on another process, or follow a
+/// redirect to a node the witness does not read.
+///
+/// Non-vacuity: each needle must match exactly one site, so a rename of the
+/// step's spelling reddens this rather than leaving it asserting nothing.
+#[test]
+fn the_guarded_walks_explicit_scan_steps_are_pinned_one_attempt_steps() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    for lane in ["storage", "checkpoint", "dr"] {
+        rust_sources_under(&root, &root.join("src").join(lane), &mut files);
+    }
+    files.sort();
+    assert!(
+        files.iter().any(|f| f == Path::new(SCAN_GUARD_FILE)),
+        "the source scan did not visit `{SCAN_GUARD_FILE}`"
+    );
+
+    for (needle, fn_name) in [
+        (GUARDED_SCAN_STEP_NEEDLE, "next_page"),
+        (GUARDED_KEYED_STEP_NEEDLE, "step"),
+    ] {
+        let mut pinned = Vec::new();
+        let mut unpinned = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(root.join(file))
+                .unwrap_or_else(|e| panic!("reading {} must succeed: {e}", file.display()));
+            let lines = code_lines(&source);
+            for (idx, line) in lines.iter().enumerate() {
+                if !line.contains(needle) {
+                    continue;
+                }
+                let site = format!("  {}:{}\n    {}", file.display(), idx + 1, line.trim());
+                if guarded_step_is_pinned(file, &lines, idx, fn_name) {
+                    pinned.push(site);
+                } else {
+                    unpinned.push(site);
+                }
+            }
+        }
+        assert!(
+            unpinned.is_empty(),
+            "a guarded walk's step `{needle}` sent outside `{fn_name}` in {SCAN_GUARD_FILE}, or \
+             without its route's one-attempt options (`route.options(true)`) just above it:\n\n{}\n\n\
+             A walk step outside the guard can be replayed by fred on another server process or \
+             follow a redirect to a node its witness does not read (SDD §11.3.2).",
+            unpinned.join("\n")
+        );
+        assert_eq!(
+            pinned.len(),
+            1,
+            "expected exactly one `{needle}` step, in `{fn_name}`; found {}:\n{}",
+            pinned.len(),
+            pinned.join("\n")
+        );
+    }
+}
+
+// Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+/// The DR Jobs' keyspace walks are agreeing Job walks (b.f3t), never
+/// `orphan_sweep::scan_keyspace` or the periodic pass's guarded walk: the
+/// restore planner's walks of the object headers and the layer mappings
+/// (`storage::dr_job`) go through `scan_guard::collect_keyspace_agreed`, never
+/// `collect_keyspace`; the recount's object walk (`ext_reconcile`'s
+/// `walk_objects`, which the periodic pass shares) starts its authoritative
+/// walks with `KeyspaceWalk::start_job` and its periodic one with
+/// `KeyspaceWalk::start`; the recount's carrier walk
+/// (`walk_retire_carriers_agreed`) goes through `collect_keyspace_agreed`,
+/// the periodic pass's (`walk_retire_carriers`) through `KeyspaceWalk::start`;
+/// and `recount_authoritative` calls the agreeing carrier walk and the
+/// counted owed walk, never the periodic ones. `scan_keyspace` is a coverage
+/// walk (`KeyspaceWalk::start_coverage`): one walk, so a failover or restart
+/// inside it can skip keys without an error item, and a Job would then act
+/// on the walk as complete; a single guarded walk reads a serving-process
+/// witness that is blind to a shard moved behind an unchanged endpoint.
+///
+/// Non-vacuity: the needle still finds `scan_keyspace(` in
+/// `ext_reconcile.rs` (the reconciler's meta walk, outside the Jobs, keeps
+/// it), and each body names the walk it must use.
+#[test]
+fn the_dr_jobs_keyspace_walks_never_call_scan_keyspace() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let code = |path: &str| {
+        code_lines(
+            &std::fs::read_to_string(root.join(path))
+                .unwrap_or_else(|e| panic!("reading {path} must succeed: {e}")),
+        )
+    };
+
+    let dr_job = code("src/storage/dr_job.rs");
+    for needle in ["scan_keyspace(", "collect_keyspace("] {
+        let single: Vec<String> = dr_job
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .map(|(idx, line)| format!("  src/storage/dr_job.rs:{}\n    {}", idx + 1, line.trim()))
+            .collect();
+        assert!(
+            single.is_empty(),
+            "the restore planner's keyspace walks must use the agreeing Job walk \
+             (`scan_guard::collect_keyspace_agreed`), never `{needle}`:\n{}",
+            single.join("\n")
+        );
+    }
+    assert!(
+        dr_job
+            .iter()
+            .any(|line| line.contains("collect_keyspace_agreed(")),
+        "src/storage/dr_job.rs walks the keyspace through `collect_keyspace_agreed`"
+    );
+
+    let ext_reconcile = code("src/storage/ext_reconcile.rs");
+    // (the function, what its body must name, what it must not)
+    let walks: [(&str, &[&str], &[&str]); 4] = [
+        (
+            "walk_objects",
+            &["KeyspaceWalk::start_job(", "KeyspaceWalk::start("],
+            &["scan_keyspace(", "collect_keyspace("],
+        ),
+        (
+            "walk_retire_carriers",
+            &["KeyspaceWalk::start("],
+            &["scan_keyspace(", "collect_keyspace("],
+        ),
+        (
+            "walk_retire_carriers_agreed",
+            &["collect_keyspace_agreed("],
+            &[
+                "scan_keyspace(",
+                "collect_keyspace(",
+                "KeyspaceWalk::start(",
+            ],
+        ),
+        (
+            "recount_authoritative",
+            &["walk_retire_carriers_agreed(", "walk_owed_counted("],
+            &["walk_retire_carriers(", "walk_owed("],
+        ),
+    ];
+    for (walk, must, never) in walks {
+        let body = top_level_fn_body(&ext_reconcile, walk);
+        for needle in must {
+            assert!(
+                body.contains(needle),
+                "`ext_reconcile::{walk}` must call `{needle}`"
+            );
+        }
+        for needle in never {
+            assert!(
+                !body.contains(needle),
+                "`ext_reconcile::{walk}` must never call `{needle}`"
+            );
+        }
+    }
+    assert!(
+        ext_reconcile
+            .iter()
+            .any(|line| line.contains("scan_keyspace(")),
+        "non-vacuity: the needle finds the reconciler's meta walk, which keeps `scan_keyspace`"
+    );
+}
+
+/// The body of the top-level function `name` in `lines`, generic or not:
+/// from its declaration (`fn name(` or `fn name<`) to the first line that is
+/// a lone closing brace at column 0.
+fn top_level_fn_body(lines: &[String], name: &str) -> String {
+    let (plain, generic) = (format!("fn {name}("), format!("fn {name}<"));
+    let start = lines
+        .iter()
+        .position(|line| {
+            !line.starts_with(' ') && (line.contains(&plain) || line.contains(&generic))
+        })
+        .unwrap_or_else(|| panic!("no top-level `fn {name}`"));
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.trim_end() == "}")
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("`fn {name}` has no closing brace at column 0"));
+    lines[start..=end].join("\n")
+}
+
+// Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
+/// The DR Jobs' keyed walks never step through `retirement::scan_step`
+/// (b.gns; b.f3t): the recount's value-index and owed walks
+/// (`storage::ext_reconcile`) and accept-loss's value removal
+/// (`dr::job::execute::discard`) read their keys through `scan_guard`'s Job
+/// walks of one key — `RankWalk` (rank pages with `ZCARD`) and `CountedScan`
+/// (`HSCAN` / `SSCAN` steps with `HLEN` / `SCARD`) — and the periodic pass's
+/// owed walks through the guarded `KeyedWalk`. `scan_step` sends a step on a
+/// fresh pool client with fred's retries and checks nothing, so a walk
+/// stepped through it could skip members unseen. Comments are stripped, so
+/// prose naming it is not a hit.
+///
+/// Non-vacuity: the needle still finds `scan_step(` in
+/// `src/storage/retirement.rs`, which defines it and keeps it for the
+/// retirement routes' own walks; each Job file names the Job walk it reads
+/// through.
+#[test]
+fn the_dr_jobs_keyed_walks_never_call_scan_step() {
+    const NEEDLE: &str = "scan_step(";
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let code = |path: &str| {
+        code_lines(
+            &std::fs::read_to_string(root.join(path))
+                .unwrap_or_else(|e| panic!("reading {path} must succeed: {e}")),
+        )
+    };
+    for (path, job_walks) in [
+        (
+            "src/storage/ext_reconcile.rs",
+            &["RankWalk::new(", "CountedScan::"][..],
+        ),
+        ("src/dr/job/execute/discard.rs", &["RankWalk::new("][..]),
+    ] {
+        let lines = code(path);
+        let unchecked: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(NEEDLE))
+            .map(|(idx, line)| format!("  {path}:{}\n    {}", idx + 1, line.trim()))
+            .collect();
+        assert!(
+            unchecked.is_empty(),
+            "the DR Jobs' keyed walks must read through `scan_guard`'s `RankWalk` or \
+             `CountedScan`, never `retirement::scan_step`:\n{}",
+            unchecked.join("\n")
+        );
+        for walk in job_walks {
+            assert!(
+                lines.iter().any(|line| line.contains(walk)),
+                "{path} reads its keys through `{walk}`"
+            );
+        }
+    }
+    assert!(
+        code("src/storage/retirement.rs")
+            .iter()
+            .any(|line| line.contains(NEEDLE)),
+        "non-vacuity: the needle finds `scan_step(` where it is defined"
     );
 }
 
@@ -2005,7 +2366,7 @@ fn the_multi_call_site_inventory_matches_the_watch_guard_header() {
 /// twice: the fixture's gate and the guard that checks the gate is armed have to
 /// be looking at the same variable, and two string literals is exactly how that
 /// stops being true.
-const CLUSTER_URL_VAR: &str = "LIVE_EDIT_TEST_CLUSTER_URL";
+const CLUSTER_URL_VAR: &str = live_edit::storage::test_support::TEST_CLUSTER_URL_VAR;
 
 /// The URL scheme that makes fred do `CLUSTER SLOTS` discovery and route by
 /// slot. A `redis://` URL against a cluster node is not a cluster client — it
@@ -2132,24 +2493,6 @@ fn arms_feature(nextest: &str, feature: &str) -> bool {
     nextest.contains(feature)
 }
 
-/// Whether a `cargo nextest run` command line narrows its selection with a
-/// filterset expression.
-///
-/// Detects `-E` as a whole token — `-E expr`, `-E'expr'`, `-E"expr"`, `-E=expr`
-/// — plus the `--filterset` long form in both its spaced and `=` spellings. A
-/// substring scan for `" -E "` (what this used to do) sees only the spaced
-/// form and misses every quoted-adjacent one, while a bare `contains("-E")`
-/// would fire on any argument that merely contains those two characters.
-fn has_filterset(nextest: &str) -> bool {
-    nextest.split_whitespace().any(|token| {
-        token == "-E"
-            || token.starts_with("-E'")
-            || token.starts_with("-E\"")
-            || token.starts_with("-E=")
-            || token.starts_with("--filterset")
-    })
-}
-
 // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
 /// CI's `test-cluster:` job must still arm **both** activation conditions the
 /// cluster-gated tests in this file depend on.
@@ -2254,20 +2597,62 @@ fn the_test_cluster_ci_job_still_arms_both_gates() {
          {nextest:?}"
     );
 
-    // Gate 2b — nothing may narrow the selection past these tests. The job runs
-    // the suite unfiltered today; an `-E` filterset added later would deselect
-    // them exactly as silently as dropping the feature.
-    assert!(
-        !has_filterset(&nextest),
-        "the `{CI_CLUSTER_JOB}:` job's `cargo nextest run` has grown a filterset — a `-E` token in \
-         any spelling (`-E expr`, `-E'expr'`, `-E\"expr\"`, `-E=expr`) or the `--filterset` long \
-         form. The job runs the \
-         suite unfiltered today, which is how the self-gating cluster tests in this file get \
-         picked up with no CI-side list to keep in sync. A filterset is not wrong in itself — but \
-         it must be shown to still select `cluster_a_clean_on_one_primary_does_not_rearm_the_breaker_on_another` \
-         and `cluster_a_clean_on_a_named_primary_collects_the_shared_fallback_bucket`, and this \
-         fence updated to assert whatever the new selection guarantees. Command read: {nextest:?}"
+    // Gate 2b — the selection is exactly the cluster-gated name rule. The job
+    // runs only the tests `test_support::test_cluster_url`'s name check admits
+    // (every test that reads the cluster URL fails in the `test:` job unless
+    // its name is in the rule), so these tests, whose names carry `cluster`,
+    // are selected with no CI-side list to keep in sync. Any other filterset
+    // could deselect them as silently as dropping the feature.
+    assert_eq!(
+        filterset_in(&nextest).as_deref(),
+        Some(CLUSTER_GATED_FILTERSET),
+        "the `{CI_CLUSTER_JOB}:` job's `cargo nextest run` must select with exactly \
+         `test_support::CLUSTER_GATED_FILTERSET` (`-E '{CLUSTER_GATED_FILTERSET}'`): that is the \
+         name rule every reader of `{CLUSTER_URL_VAR}` is held to, so it is what guarantees \
+         `cluster_a_clean_on_one_primary_does_not_rearm_the_breaker_on_another`, \
+         `cluster_a_clean_on_a_named_primary_collects_the_shared_fallback_bucket` and every \
+         other cluster-gated test still run on a cluster. Change the rule there, not the job \
+         alone. Command read: {nextest:?}"
     );
+
+    // Gate 2c — the job builds every target a cluster-gated test can live in.
+    // A filterset only chooses among the tests built, so a target dropped from
+    // the command line drops its cluster-gated tests with no skip line at all.
+    let words: Vec<&str> = nextest.split_whitespace().collect();
+    for (flag, tree) in CLUSTER_JOB_TARGETS {
+        let flag_words: Vec<&str> = flag.split_whitespace().collect();
+        assert!(
+            words
+                .windows(flag_words.len())
+                .any(|window| window == flag_words.as_slice()),
+            "the `{CI_CLUSTER_JOB}:` job's `cargo nextest run` no longer passes `{flag}`, the \
+             target that compiles the cluster-gated tests under `{tree}`, so none of them is \
+             built there. Restore it (the list is `CLUSTER_JOB_TARGETS` in \
+             `test_cluster_url_read_guard_test.rs`). Command read: {nextest:?}"
+        );
+    }
+}
+
+/// The filterset expression a `cargo nextest run` command line passes, quotes
+/// stripped: `-E 'expr'`, `-E'expr'`, `-E=expr`, `--filterset 'expr'` or
+/// `--filterset=expr`, in single or double quotes or none. `None` when the
+/// line has no filterset. The flag must start an argument: a bare
+/// `contains("-E")` would fire on any argument that merely holds those two
+/// characters.
+fn filterset_in(nextest: &str) -> Option<String> {
+    let rest = ["--filterset", "-E"].iter().find_map(|flag| {
+        nextest
+            .match_indices(flag)
+            .find(|(at, _)| *at == 0 || nextest[..*at].ends_with(char::is_whitespace))
+            .map(|(at, _)| &nextest[at + flag.len()..])
+    })?;
+    let rest = rest.strip_prefix('=').unwrap_or(rest).trim_start();
+    match rest.chars().next()? {
+        quote @ ('\'' | '"') => rest[1..]
+            .split_once(quote)
+            .map(|(expr, _)| expr.to_string()),
+        _ => rest.split_whitespace().next().map(str::to_string),
+    }
 }
 
 /// Inside CI's cluster job, a *skipped* cluster-gated test is a failure.
@@ -2311,7 +2696,7 @@ fn the_cluster_gate_is_armed_when_ci_runs_the_test_cluster_job() {
         return;
     }
 
-    let url = std::env::var(CLUSTER_URL_VAR).unwrap_or_else(|_| {
+    let url = live_edit::storage::test_support::test_cluster_url().unwrap_or_else(|| {
         panic!(
             "{CI_JOB_NAME_VAR}={job:?} but {CLUSTER_URL_VAR} is unset. This job exists to run the \
              cluster-gated tests against a real multi-shard cluster; with the variable unset every \
@@ -2372,7 +2757,7 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
         "    TEST_VALKEY_URL: \"redis://valkey:6379\"\n",
         "  script:\n",
         "    - cargo build -p oodf-ffi --lib --features internal-bridge\n",
-        "    - cargo nextest run --profile ci --workspace --features test-fault-injection\n",
+        "    - cargo nextest run --profile ci --workspace -E 'test(/cluster/) | test(/disruptive/)' --features test-fault-injection\n",
         "\n",
         "# Prose about the next job that mentions LIVE_EDIT_TEST_CLUSTER_URL and\n",
         "# --features test-fault-injection, neither of which is wiring.\n",
@@ -2401,13 +2786,15 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
 
     let cluster = ci_job_block(fixture, "test-cluster");
     assert!(
-        cluster
-            .iter()
-            .any(|l| l.contains("LIVE_EDIT_TEST_CLUSTER_URL")),
+        cluster.iter().any(|l| l.contains(CLUSTER_URL_VAR)),
         "the `test-cluster` block must contain its own variables: {cluster:?}"
     );
+    // The sibling job's own filterset, which this job's (a union naming
+    // `disruptive` too) does not contain.
     assert!(
-        !cluster.iter().any(|l| l.contains("disruptive")),
+        !cluster
+            .iter()
+            .any(|l| l.contains("-E 'test(/disruptive/)'")),
         "the block must STOP at the next top-level key. Bleeding into \
          `test-cluster-disruptive:` would let that job's variables satisfy a fence about \
          `test-cluster:` — the two are wired separately and either can be edited alone. Read: \
@@ -2436,23 +2823,25 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
         "the nextest line selected must be the one that carries the features, not the \
          `cargo build` line above it: {nextest:?}"
     );
-    assert!(
-        !has_filterset(&nextest),
-        "the unfiltered invocation must be the one read for `test-cluster:` — picking up a \
-         sibling job's filtered command would make the filterset assertion in the fence \
-         meaningless: {nextest:?}"
+    assert_eq!(
+        filterset_in(&nextest).as_deref(),
+        Some(CLUSTER_GATED_FILTERSET),
+        "the `test-cluster:` job's own filterset must be the one read, whole (it holds a space \
+         and a `|`) — picking up a sibling job's command would make the filterset assertion in \
+         the fence meaningless: {nextest:?}"
     );
 
-    // The sibling job, read on its own terms, DOES carry a filterset. This is
-    // what proves the filterset assertion in the fence can actually fire — it is
-    // not an assertion nothing in this repo could ever violate.
+    // The sibling job, read on its own terms, carries a DIFFERENT filterset.
+    // This is what proves the filterset assertion in the fence can actually
+    // fire — it is not an assertion nothing in this repo could ever violate.
     let disruptive = ci_job_block(fixture, "test-cluster-disruptive");
     let disruptive_nextest =
         nextest_invocation_in(&disruptive).expect("the sibling job runs cargo nextest too");
-    assert!(
-        has_filterset(&disruptive_nextest),
-        "sanity: the fixture's sibling job is filtered, which is what makes the fence's \
-         `no filterset` assertion a real discriminator rather than a tautology: \
+    assert_eq!(
+        filterset_in(&disruptive_nextest).as_deref(),
+        Some("test(/disruptive/)"),
+        "sanity: the fixture's sibling job reads as its own, narrower filterset, which is what \
+         makes the fence's equality a real discriminator rather than a tautology: \
          {disruptive_nextest:?}"
     );
 
@@ -2470,8 +2859,9 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
          dedicated flag does; reading it as absent would redden the fence with a message asserting \
          the feature was DROPPED, which is a false red carrying a wrong diagnosis: {tight_nextest:?}"
     );
-    assert!(
-        has_filterset(&tight_nextest),
+    assert_eq!(
+        filterset_in(&tight_nextest).as_deref(),
+        Some("test(/tight/)"),
         "`-E'expr'` written without a space is still a filterset. Missing it would let a narrowed \
          selection past the fence, which is the exact silent deselection the fence exists to \
          catch: {tight_nextest:?}"
@@ -2498,9 +2888,10 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
         "a job arming only `test-checkpoint-fault-injection` must not read as arming \
          `{FAULT_INJECTION_FEATURE}`: {ckpt_nextest:?}"
     );
-    assert!(
-        has_filterset(&ckpt_nextest),
-        "the `--filterset` long form must be detected as well as `-E`: {ckpt_nextest:?}"
+    assert_eq!(
+        filterset_in(&ckpt_nextest).as_deref(),
+        Some("test(/ckpt/)"),
+        "the `--filterset` long form must be read as well as `-E`: {ckpt_nextest:?}"
     );
 
     // And the negative cases: a job with neither needle must read as absent, not
@@ -2517,4 +2908,20 @@ fn the_ci_job_wiring_parser_reads_a_job_block() {
         !arms_feature(&bare_nextest, FAULT_INJECTION_FEATURE),
         "a job that does not pass the feature must not appear to: {bare_nextest:?}"
     );
+    assert_eq!(
+        filterset_in(&bare_nextest),
+        None,
+        "an unfiltered job must read as having no filterset: {bare_nextest:?}"
+    );
+    // `=` spellings, and a flag-like run of characters inside another argument
+    // that is not a filterset.
+    assert_eq!(
+        filterset_in("cargo nextest run -E=test(/x/) --features a").as_deref(),
+        Some("test(/x/)")
+    );
+    assert_eq!(
+        filterset_in("cargo nextest run --filterset=\"test(/y/)\"").as_deref(),
+        Some("test(/y/)")
+    );
+    assert_eq!(filterset_in("cargo nextest run --features a-E"), None);
 }

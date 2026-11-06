@@ -23,8 +23,8 @@
 //! | `live_edit_scaler_decisions_total` | `direction` (`up`, `down`, `none`), `reason` | decisions by direction and cause |
 //! | `live_edit_scaler_poll_errors_total` | `stage` | failed API requests and unreachable pods, by poll stage |
 //! | `live_edit_scaler_pods` | `state` (`reporting`, `not_reporting`, `unready`, `terminating`) | server pods by state at the last poll that read the cluster state; a poll whose API read failed leaves them as they were |
-//! | `live_edit_scaler_scale_down_blocked_total` | `reason` | polls on which a wanted scale-down was held back, by reason |
-//! | `live_edit_scaler_catchup_rate` | `scope` (`fleet`; or `pod` with `pod`) | λ̂ at the last poll that read the cluster state: the fleet value the decision used (absent while no pod reports), and each reporting pod's own learned value; a pod's series goes when the pod leaves; a poll whose API read failed leaves both scopes as they were |
+//! | `live_edit_scaler_scale_down_blocked_total` | `reason` | polls on which a wanted scale-down was held back, by reason, and every poll a disaster-recovery hold froze (`held`) |
+//! | `live_edit_scaler_catchup_rate` | `scope` (`fleet`; or `pod` with `server_pod`) | λ̂ at the last poll that read the cluster state: the fleet value the decision used (absent while no pod reports), and each reporting pod's own learned value; a pod's series goes when the pod leaves; a poll whose API read failed leaves both scopes as they were |
 //!
 //! `/healthz` reports the poll loop's heartbeat, not the API server's health:
 //! the loop beats after every poll whatever its outcome, so an unreachable API
@@ -57,6 +57,9 @@ pub const REASON_AT_TARGET: &str = "at_target";
 pub const REASON_SCALE_DOWN_BLOCKED: &str = "scale_down_blocked";
 /// `reason` on a `none` decision: no pod reported, so nothing was decided.
 pub const REASON_NO_DATA: &str = "no_data";
+/// `reason` on a `none` decision: a pod reported a disaster-recovery hold,
+/// so the count was frozen ([`BlockReason::Held`]).
+pub const REASON_HELD: &str = "held";
 
 /// `stage` on `live_edit_scaler_poll_errors_total`.
 pub const STAGE_ENDPOINTS: &str = "endpoints";
@@ -189,10 +192,10 @@ impl ScalerMetrics {
                  catch-ups pending as its concurrent-catch-up limit. scope=\"fleet\" is the value \
                  the decision used (the mean over reporting pods that have a learned value, the \
                  prior while none has one, never below the floor), absent while no pod reports; \
-                 scope=\"pod\" is each reporting pod's own learned value, by pod. It drives the \
-                 catch-up term (replicas to drain the pending catch-ups within the target time) \
-                 and the scale-down feasibility threshold (pending catch-ups one replica drains \
-                 within the target time).",
+                 scope=\"pod\" is each reporting pod's own learned value, labelled server_pod \
+                 with that pod's name. It drives the catch-up term (replicas to drain the pending \
+                 catch-ups within the target time) and the scale-down feasibility threshold \
+                 (pending catch-ups one replica drains within the target time).",
             )
             .with_callback(move |observer| {
                 if let Ok(s) = state.lock() {
@@ -204,7 +207,7 @@ impl ScalerMetrics {
                             *rate,
                             &[
                                 KeyValue::new("scope", "pod"),
-                                KeyValue::new("pod", pod.clone()),
+                                KeyValue::new("server_pod", pod.clone()),
                             ],
                         );
                     }
@@ -217,7 +220,8 @@ impl ScalerMetrics {
             .with_description(
                 "Scaler decisions by direction (up|down|none) and reason: up by the term that set \
                  the target (min|cpu|catchup|occupancy); down below_target; none at_target, \
-                 scale_down_blocked or no_data (no pod reported, nothing decided).",
+                 scale_down_blocked, no_data (no pod reported, nothing decided) or held (a pod \
+                 reported a disaster-recovery hold, so the count was frozen).",
             )
             .build();
         let poll_errors = meter
@@ -233,7 +237,9 @@ impl ScalerMetrics {
             .u64_counter("live_edit_scaler_scale_down_blocked_total")
             .with_description(
                 "Polls on which the desired count was below the current count but the scaler did \
-                 not remove a pod, by reason: startup (less than one window since the scaler \
+                 not remove a pod, by reason, and every poll frozen by a disaster-recovery hold: \
+                 held (a server pod reported it is held, so the count was neither raised nor \
+                 lowered, whatever the desired count), startup (less than one window since the scaler \
                  started), window (a desired count in the window was not lower, or the scaler has \
                  not observed a full window since a poll that observed nothing), unsettled (a \
                  server pod was unready, terminating or not reporting, or the Deployment's pod \
@@ -252,7 +258,12 @@ impl ScalerMetrics {
             decisions.add(0, &decision_labels(DIRECTION_UP, reason.label()));
         }
         decisions.add(0, &decision_labels(DIRECTION_DOWN, REASON_BELOW_TARGET));
-        for reason in [REASON_AT_TARGET, REASON_SCALE_DOWN_BLOCKED, REASON_NO_DATA] {
+        for reason in [
+            REASON_AT_TARGET,
+            REASON_SCALE_DOWN_BLOCKED,
+            REASON_NO_DATA,
+            REASON_HELD,
+        ] {
             decisions.add(0, &decision_labels(DIRECTION_NONE, reason));
         }
         for stage in POLL_ERROR_STAGES {

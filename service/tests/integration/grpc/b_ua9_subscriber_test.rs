@@ -221,8 +221,9 @@ mod seams {
         streaming_create,
     };
 
-    /// One `CreateLayer` of `layer` through the handler (an empty layer, no
-    /// operation id), answering its object id.
+    /// One `CreateLayer` of `layer` through the handler (empty content, so the
+    /// layer holds only its root section; no operation id), answering its
+    /// object id.
     async fn create(svc: &LiveEditService, session_id: &str, layer: &str) -> Result<u64, Status> {
         handle_create_layer(
             svc,

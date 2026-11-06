@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveDiagnostics.h"
 #include "LiveAuth.h"
+#include "LiveDrain.h"
 #include "LiveRuntime.h"
 #include "LiveRequest.h"
 #include "LiveStatus.h"
@@ -10,12 +11,14 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <string>
 #include <stdexcept>
 #include <thread>
@@ -135,6 +138,9 @@ std::string section(const std::string& json, const char* first, const char* next
 }
 std::string subject(uint64_t id) { return "\"subject_id\":" + std::to_string(id) + ","; }
 void OMNI_USD_LIVE_CALL count(void* user, const OmniUsdLiveDiagnosticRecord*)
+{ ++*static_cast<std::atomic<unsigned>*>(user); }
+void OMNI_USD_LIVE_CALL ignoreStatus(void*, const OmniUsdLiveStatusEvent*) {}
+void OMNI_USD_LIVE_CALL countSessionEvent(void* user, const OmniUsdLiveSessionEvent*)
 { ++*static_cast<std::atomic<unsigned>*>(user); }
 
 void executorMetricsExportWithoutHistory()
@@ -309,6 +315,129 @@ void callbackFailuresPreserveOutcomes()
     }
 }
 
+// The records the public endpoint and credential calls emit: registration
+// admits the endpoint subject, SetAccessToken accepts a replacement
+// generation, and only the final UnregisterEndpoint, neither a nonfinal owner
+// release nor a BUSY refusal, closes the subject. History is synchronous with
+// each call, so the snapshot after it is the observation.
+void endpointAndCredentialRecords()
+{
+    Fixture fixture;
+    const auto records = [&](uint32_t code) {
+        std::vector<DiagnosticEntry> selected;
+        for (const auto& entry : fixture.runtime->diagnostics->snapshot(0, 32).records)
+            if (entry.eventCode == code) selected.push_back(entry);
+        return selected;
+    };
+    const auto fields = [](const DiagnosticEntry& entry) {
+        std::map<DiagnosticKey, uint64_t> values;
+        for (uint32_t i = 0; i < entry.fieldCount; ++i) values.emplace(entry.fields[i].key, entry.fields[i].value);
+        return values;
+    };
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = "127.0.0.1:34343"; endpointOptions.access_token = tokenCanary;
+    OmniUsdLiveEndpoint endpoint = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    auto status = record<OmniUsdLiveStatus>();
+    assert(omniUsdLiveGetEndpointStatus(endpoint, &status) == OMNI_USD_LIVE_OK && status.subject_id);
+    const auto subjectId = status.subject_id;
+    const auto registered = records(OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED);
+    assert(registered.size() == 3 && registered[0].endpoint == fixture.a && registered[1].endpoint == fixture.b);
+    {
+        const auto& entry = registered[2];
+        assert(entry.endpoint == endpoint && entry.subjectId == subjectId && entry.severity == OMNI_USD_LIVE_SEVERITY_INFO);
+        const auto values = fields(entry);
+        assert(values.at(DiagnosticKey::State) != OMNI_USD_LIVE_STATE_CLOSED &&
+               values.at(DiagnosticKey::Result) == OMNI_USD_LIVE_OK && values.at(DiagnosticKey::Revision) >= 1);
+    }
+
+    uint64_t generation = 0;
+    assert(omniUsdLiveSetAccessToken(endpoint, 1, "synthetic-replacement", 0, &generation) == OMNI_USD_LIVE_OK);
+    assert(generation == 2);
+    assert(omniUsdLiveSetAccessToken(endpoint, 1, "synthetic-stale", 0, &generation) ==
+           OMNI_USD_LIVE_STALE_TOKEN_GENERATION);
+    const auto replaced = records(OMNI_USD_LIVE_RECORD_AUTH_REPLACED);
+    assert(replaced.size() == 1); // A stale generation is refused without a record.
+    {
+        const auto& entry = replaced[0];
+        assert(entry.endpoint == endpoint && entry.subjectId == subjectId && entry.severity == OMNI_USD_LIVE_SEVERITY_INFO);
+        const auto values = fields(entry);
+        assert(values.at(DiagnosticKey::Operation) == OMNI_USD_LIVE_OPERATION_AUTH &&
+               values.at(DiagnosticKey::Result) == OMNI_USD_LIVE_OK &&
+               values.at(DiagnosticKey::AuthGeneration) == 2 && values.at(DiagnosticKey::Challenge) == 0);
+    }
+
+    // A second owner's release and a release refused BUSY by a dependent
+    // lease leave the endpoint open and record nothing.
+    OmniUsdLiveEndpoint duplicate = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &duplicate) == OMNI_USD_LIVE_OK && duplicate == endpoint);
+    assert(records(OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED).size() == 3);
+    assert(omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_OK);
+    {
+        auto lease = fixture.runtime->acquireEndpoint(endpoint);
+        assert(omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_BUSY);
+    }
+    assert(records(OMNI_USD_LIVE_RECORD_ENDPOINT_CLOSED).empty());
+    assert(omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_OK);
+    const auto closed = records(OMNI_USD_LIVE_RECORD_ENDPOINT_CLOSED);
+    assert(closed.size() == 1);
+    {
+        const auto& entry = closed[0];
+        assert(entry.endpoint == endpoint && entry.subjectId == subjectId && entry.severity == OMNI_USD_LIVE_SEVERITY_INFO);
+        const auto values = fields(entry);
+        assert(values.at(DiagnosticKey::State) == OMNI_USD_LIVE_STATE_CLOSED &&
+               values.at(DiagnosticKey::Revision) > fields(registered[2]).at(DiagnosticKey::Revision));
+    }
+    assert(omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_INVALID_HANDLE);
+    const auto json = copy();
+    contains(json, "\"event_name\":\"endpoint_registered\""); contains(json, "\"event_name\":\"auth_replaced\"");
+    contains(json, "\"event_name\":\"endpoint_closed\""); excludes(json, tokenCanary);
+    excludes(json, "synthetic-replacement"); excludes(json, "synthetic-stale");
+}
+
+// The records the public drain emits: a wait that reaches its deadline
+// records drain_timeout, and one that returns any other result records
+// drain_completed, at INFO for OK and WARN otherwise. The drain state stands
+// in for a layer's pending application work.
+void drainRecordsFromThePublicWait()
+{
+    Fixture fixture;
+    const auto drains = [&] {
+        std::vector<DiagnosticEntry> selected;
+        for (const auto& entry : fixture.runtime->diagnostics->snapshot(0, 32).records)
+            if (entry.eventCode == OMNI_USD_LIVE_RECORD_DRAIN_COMPLETED || entry.eventCode == OMNI_USD_LIVE_RECORD_DRAIN_TIMEOUT)
+                selected.push_back(entry);
+        return selected;
+    };
+    const auto check = [](const DiagnosticEntry& entry, uint32_t code, uint32_t severity, OmniUsdLiveResult result) {
+        assert(entry.eventCode == code && entry.severity == severity);
+        assert(!entry.endpoint && !entry.subjectId && !entry.incidentId && entry.fieldCount == 2);
+        assert(entry.fields[0].key == DiagnosticKey::Result && entry.fields[0].value == result);
+        assert(entry.fields[1].key == DiagnosticKey::DurationMs);
+    };
+    auto state = fixture.runtime->drains->makeState();
+    auto ticket = state->prepare();
+    assert(ticket->admit() == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveWaitForPendingUpdates(0) == OMNI_USD_LIVE_TIMEOUT);
+    auto records = drains();
+    assert(records.size() == 1);
+    check(records[0], OMNI_USD_LIVE_RECORD_DRAIN_TIMEOUT, OMNI_USD_LIVE_SEVERITY_WARN, OMNI_USD_LIVE_TIMEOUT);
+    ticket->complete();
+    assert(omniUsdLiveWaitForPendingUpdates(3000) == OMNI_USD_LIVE_OK);
+    records = drains();
+    assert(records.size() == 2);
+    check(records[1], OMNI_USD_LIVE_RECORD_DRAIN_COMPLETED, OMNI_USD_LIVE_SEVERITY_INFO, OMNI_USD_LIVE_OK);
+    assert(state->fail(OMNI_USD_LIVE_UNAVAILABLE));
+    assert(omniUsdLiveWaitForPendingUpdates(0) == OMNI_USD_LIVE_UNAVAILABLE);
+    records = drains();
+    assert(records.size() == 3);
+    check(records[2], OMNI_USD_LIVE_RECORD_DRAIN_COMPLETED, OMNI_USD_LIVE_SEVERITY_WARN, OMNI_USD_LIVE_UNAVAILABLE);
+    state->close();
+    ticket.reset(); state.reset();
+    const auto json = copy();
+    contains(json, "\"event_name\":\"drain_timeout\""); contains(json, "\"event_name\":\"drain_completed\"");
+}
+
 void subjectMetricsTrackAttachedLatchedStates()
 {
     Fixture fixture(false, true, 0, 4); // Two endpoints and two child slots.
@@ -433,7 +562,15 @@ void backpressureExitRecordsAndExport()
                 unsigned entered = 0, exited = 0;
                 for (const auto& event : snapshot.records) {
                     if (event.subjectId != id) continue;
-                    if (event.eventCode == OMNI_USD_LIVE_RECORD_BACKPRESSURE_ENTERED) ++entered;
+                    if (event.eventCode == OMNI_USD_LIVE_RECORD_BACKPRESSURE_ENTERED) {
+                        ++entered;
+                        assert(event.endpoint == fixture.a && event.severity == OMNI_USD_LIVE_SEVERITY_WARN);
+                        bool blocked = false;
+                        for (uint32_t f = 0; f < event.fieldCount; ++f)
+                            blocked |= event.fields[f].key == DiagnosticKey::State &&
+                                event.fields[f].value == OMNI_USD_LIVE_STATE_BLOCKED;
+                        assert(blocked);
+                    }
                     if (event.eventCode != OMNI_USD_LIVE_RECORD_BACKPRESSURE_EXITED) continue;
                     ++exited;
                     bool duration = false, reason = false;
@@ -784,6 +921,192 @@ void filteredStatusesResourcesAndClosedIncidents()
 }
 } // namespace
 
+// The cleanup calls' results: a TIMEOUT of Cancel, LeaveSession or
+// UnregisterCallback after a nonzero wait records cleanup_timeout, and every
+// result, a zero-timeout poll and each BUSY refusal included, is counted by
+// call and result. The single callback worker is held, so no request,
+// session or status-observer cleanup can reach quiescence while it is: the
+// held job's own calls are BUSY and the caller's bounded calls time out. A
+// diagnostic sink held in its callback times out its own unregistration,
+// which records to history only; a later record that reaches the observing
+// sink proves the sink record was never queued behind it.
+void cleanupTimeoutAndBusyResults()
+{
+    auto options = record<OmniUsdLiveRuntimeOptions>();
+    options.callback_worker_count = 1;
+    options.max_diagnostic_records = 64;
+    assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK);
+    auto runtime = getRuntime();
+    struct Observed {
+        std::mutex mutex;
+        std::condition_variable changed;
+        std::vector<std::map<std::string, uint64_t>> cleanups;
+        unsigned registered = 0;
+        static void OMNI_USD_LIVE_CALL callback(void* data, const OmniUsdLiveDiagnosticRecord* entry) {
+            auto& self = *static_cast<Observed*>(data);
+            std::lock_guard<std::mutex> lock(self.mutex);
+            if (entry->event_code == OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED) ++self.registered;
+            else {
+                std::map<std::string, uint64_t> fields;
+                for (uint32_t i = 0; i < entry->field_count; ++i)
+                    fields.emplace(entry->fields[i]->name, entry->fields[i]->unsigned_value);
+                self.cleanups.push_back(fields);
+            }
+            self.changed.notify_all();
+        }
+        void waitRegistered(unsigned count) {
+            std::unique_lock<std::mutex> lock(mutex);
+            assert(changed.wait_for(lock, std::chrono::seconds(3), [&] { return registered == count; }));
+        }
+    } observed;
+    struct HeldSink {
+        std::promise<void> entered, release;
+        std::shared_future<void> gate = release.get_future().share();
+        std::atomic<bool> first{true};
+        static void OMNI_USD_LIVE_CALL callback(void* data, const OmniUsdLiveDiagnosticRecord*) {
+            auto& self = *static_cast<HeldSink*>(data);
+            if (!self.first.exchange(false)) return;
+            self.entered.set_value();
+            assert(self.gate.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        }
+    } heldSink;
+    const std::array<uint32_t, 2> observedCodes{OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT,
+                                                OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED};
+    auto observedOptions = record<OmniUsdLiveDiagnosticOptions>();
+    observedOptions.event_codes = observedCodes.data();
+    observedOptions.event_code_count = static_cast<uint32_t>(observedCodes.size());
+    OmniUsdLiveCallbackHandle observer = 0, held = 0;
+    assert(omniUsdLiveRegisterDiagnosticCallback(&observedOptions, &observed, Observed::callback, &observer) ==
+           OMNI_USD_LIVE_OK);
+    const uint32_t registeredCode = OMNI_USD_LIVE_RECORD_ENDPOINT_REGISTERED;
+    auto heldOptions = record<OmniUsdLiveDiagnosticOptions>();
+    heldOptions.event_codes = &registeredCode; heldOptions.event_code_count = 1;
+    assert(omniUsdLiveRegisterDiagnosticCallback(&heldOptions, &heldSink, HeldSink::callback, &held) ==
+           OMNI_USD_LIVE_OK);
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = "127.0.0.1:34344"; endpointOptions.access_token = tokenCanary;
+    OmniUsdLiveEndpoint endpoint = 0, marker = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    assert(heldSink.entered.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    observed.waitRegistered(1);
+
+    auto request = runtime->requests->create(endpoint, OMNI_USD_LIVE_OPERATION_LIST, {});
+    OmniUsdLiveCallbackHandle status = 0;
+    assert(omniUsdLiveRegisterStatusCallback(endpoint, nullptr, ignoreStatus, &status) == OMNI_USD_LIVE_OK);
+    auto join = record<OmniUsdLiveJoinOptions>(); join.app_name = "cleanup-records";
+    std::atomic<unsigned> sessionEvents{0};
+    OmniUsdLiveSession session = 0;
+    assert(omniUsdLiveJoinSession("live://127.0.0.1:34344/cleanup-records", &join, &sessionEvents,
+               countSessionEvent, &session) == OMNI_USD_LIVE_OK);
+    struct HeldWorker final : DispatchJob {
+        OmniUsdLiveRequest request = 0;
+        OmniUsdLiveSession session = 0;
+        OmniUsdLiveCallbackHandle status = 0;
+        std::array<OmniUsdLiveResult, 4> results{};
+        std::promise<void> entered, release;
+        std::shared_future<void> gate = release.get_future().share();
+        void dispatch() noexcept override {
+            // A callback worker cannot block on cleanup it would have to run.
+            results = {omniUsdLiveCancel(request, 0), omniUsdLiveReleaseRequest(request),
+                       omniUsdLiveLeaveSession(session, 0), omniUsdLiveUnregisterCallback(status, 0)};
+            entered.set_value();
+            assert(gate.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+        }
+    };
+    auto worker = std::make_shared<HeldWorker>(); // The executor retains a job through shared ownership.
+    worker->request = request->handle; worker->session = session; worker->status = status;
+    runtime->requests->executor().enqueue(*worker);
+    assert(worker->entered.get_future().wait_for(std::chrono::seconds(3)) == std::future_status::ready);
+    for (const auto result : worker->results) assert(result == OMNI_USD_LIVE_BUSY);
+
+    assert(omniUsdLiveCancel(request->handle, 1) == OMNI_USD_LIVE_TIMEOUT);
+    assert(omniUsdLiveCancel(request->handle, 0) == OMNI_USD_LIVE_TIMEOUT); // A poll: counted, not recorded.
+    assert(omniUsdLiveReleaseRequest(request->handle) == OMNI_USD_LIVE_BUSY);
+    assert(omniUsdLiveLeaveSession(session, 1) == OMNI_USD_LIVE_TIMEOUT);
+    assert(omniUsdLiveUnregisterCallback(status, 1) == OMNI_USD_LIVE_TIMEOUT);
+    assert(omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_BUSY);
+    assert(omniUsdLiveUnregisterCallback(held, 1) == OMNI_USD_LIVE_TIMEOUT);
+    endpointOptions.authority = "127.0.0.1:34345";
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &marker) == OMNI_USD_LIVE_OK);
+    observed.waitRegistered(2);
+    {
+        // Each sink's records are FIFO, so the marker follows every cleanup
+        // record queued for the observing sink.
+        std::lock_guard<std::mutex> lock(observed.mutex);
+        assert(observed.cleanups.size() == 3);
+        const std::array<std::pair<const char*, uint64_t>, 3> expected{{{"request_id", request->handle},
+            {"session_handle", session}, {"callback_id", status}}};
+        for (size_t i = 0; i < expected.size(); ++i) {
+            const auto& fields = observed.cleanups[i];
+            assert(fields.size() == 4 && fields.at("result") == OMNI_USD_LIVE_TIMEOUT);
+            assert(fields.at(expected[i].first) == expected[i].second && fields.at("duration_ms") >= 1);
+        }
+        assert(observed.cleanups[0].at("reason") == static_cast<uint32_t>(CleanupCall::Cancel));
+        assert(observed.cleanups[1].at("reason") == static_cast<uint32_t>(CleanupCall::LeaveSession));
+        assert(observed.cleanups[2].at("reason") == static_cast<uint32_t>(CleanupCall::UnregisterCallback));
+    }
+    const auto snapshot = runtime->diagnostics->snapshot(0, 64);
+    std::vector<DiagnosticEntry> records;
+    for (const auto& entry : snapshot.records)
+        if (entry.eventCode == OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT) records.push_back(entry);
+    assert(records.size() == 4 && snapshot.metrics.events[OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT] == 4);
+    const std::array<std::pair<CleanupCall, DiagnosticValue>, 4> expected{{
+        {CleanupCall::Cancel, {DiagnosticKey::Request, request->handle}},
+        {CleanupCall::LeaveSession, {DiagnosticKey::Session, session}},
+        {CleanupCall::UnregisterCallback, {DiagnosticKey::Callback, status}},
+        {CleanupCall::UnregisterCallback, {DiagnosticKey::Callback, held}}}};
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto& entry = records[i];
+        assert(entry.severity == OMNI_USD_LIVE_SEVERITY_WARN && !entry.endpoint && !entry.subjectId &&
+               !entry.incidentId && entry.fieldCount == 4);
+        assert(entry.fields[0].key == DiagnosticKey::Result && entry.fields[0].value == OMNI_USD_LIVE_TIMEOUT);
+        assert(entry.fields[1].key == DiagnosticKey::DurationMs && entry.fields[1].value >= 1);
+        assert(entry.fields[2].key == DiagnosticKey::Reason &&
+               entry.fields[2].value == static_cast<uint32_t>(expected[i].first));
+        assert(entry.fields[3].key == expected[i].second.key && entry.fields[3].value == expected[i].second.value);
+    }
+    const auto count = [&](const DiagnosticMetrics& metrics, CleanupCall call, OmniUsdLiveResult result) {
+        return metrics.cleanupDurationByCallResult[static_cast<size_t>(call)][result].count;
+    };
+    const auto& metrics = snapshot.metrics;
+    assert(count(metrics, CleanupCall::Cancel, OMNI_USD_LIVE_BUSY) == 1);
+    assert(count(metrics, CleanupCall::Cancel, OMNI_USD_LIVE_TIMEOUT) == 2);
+    assert(count(metrics, CleanupCall::ReleaseRequest, OMNI_USD_LIVE_BUSY) == 2);
+    assert(count(metrics, CleanupCall::LeaveSession, OMNI_USD_LIVE_BUSY) == 1);
+    assert(count(metrics, CleanupCall::LeaveSession, OMNI_USD_LIVE_TIMEOUT) == 1);
+    assert(count(metrics, CleanupCall::UnregisterCallback, OMNI_USD_LIVE_BUSY) == 1);
+    assert(count(metrics, CleanupCall::UnregisterCallback, OMNI_USD_LIVE_TIMEOUT) == 2);
+    assert(count(metrics, CleanupCall::UnregisterEndpoint, OMNI_USD_LIVE_BUSY) == 1);
+    for (size_t call = 0; call < kCleanupCallCount; ++call)
+        assert(!metrics.cleanupDurationByCallResult[call][OMNI_USD_LIVE_OK].count);
+    const auto json = copy();
+    contains(json, "\"event_name\":\"cleanup_timeout\"");
+    contains(json, "\"cleanup_duration_ms_by_call_result\":{\"bounds\":[1,5,10,50,100,500,1000,5000],"
+                   "\"entries\":[{\"call\":1,\"result\":9,\"count\":2,");
+    contains(json, "{\"call\":5,\"result\":14,\"count\":1,");
+
+    heldSink.release.set_value();
+    assert(omniUsdLiveUnregisterCallback(held, 3000) == OMNI_USD_LIVE_OK);
+    worker->release.set_value();
+    assert(omniUsdLiveUnregisterCallback(status, 3000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveLeaveSession(session, 3000) == OMNI_USD_LIVE_OK);
+    request->finish(record<OmniUsdLiveRequestError>(), {});
+    assert(omniUsdLiveCancel(request->handle, 3000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveReleaseRequest(request->handle) == OMNI_USD_LIVE_OK);
+    request.reset();
+    assert(omniUsdLiveUnregisterCallback(observer, 3000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveUnregisterEndpoint(endpoint, 3000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveUnregisterEndpoint(marker, 3000) == OMNI_USD_LIVE_OK);
+    const auto settled = runtime->diagnostics->snapshot(0, 64).metrics;
+    assert(count(settled, CleanupCall::UnregisterCallback, OMNI_USD_LIVE_OK) == 3);
+    for (const auto call : {CleanupCall::Cancel, CleanupCall::ReleaseRequest, CleanupCall::LeaveSession})
+        assert(count(settled, call, OMNI_USD_LIVE_OK) == 1);
+    assert(count(settled, CleanupCall::UnregisterEndpoint, OMNI_USD_LIVE_OK) == 2);
+    assert(settled.events[OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT] == 4);
+    runtime.reset();
+    assert(omniUsdLiveShutdown(3000) == OMNI_USD_LIVE_OK);
+}
+
 void diagnosticsApiTests()
 {
     const auto run = [](const char* scenario, auto action) {
@@ -793,6 +1116,9 @@ void diagnosticsApiTests()
     run("options", optionValidationAndDefaultBufferContract);
     run("executors", executorMetricsExportWithoutHistory);
     run("callback-failures", callbackFailuresPreserveOutcomes);
+    run("endpoint-records", endpointAndCredentialRecords);
+    run("drain-records", drainRecordsFromThePublicWait);
+    run("cleanup-records", cleanupTimeoutAndBusyResults);
     run("subjects", subjectMetricsTrackAttachedLatchedStates);
     run("backpressure", backpressureExitRecordsAndExport);
     run("applications", applicationMetricsExportWithoutHistory);

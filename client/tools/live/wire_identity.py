@@ -53,14 +53,14 @@ def tree_hash(root):
 
 
 def sdk_identity(root, include):
-    provenance = json.loads((root / "source/live/wire/schema/provenance.json").read_text())["flatbuffers"]
-    headers = provenance["headers"]
+    record = json.loads((root / "source/live/wire/third_party/flatbuffers/provenance.json").read_text())
+    headers = {Path(name).name: digest for name, digest in record["files"].items() if name.startswith("include/flatbuffers/")}
     if set(headers) != {"flatbuffers.h", "base.h", "stl_emulation.h"}:
         raise ValueError("incomplete FlatBuffers header provenance")
     for name, expected in headers.items():
         if hashlib.sha256((include / "flatbuffers" / name).read_bytes()).hexdigest() != expected:
             raise ValueError(f"FlatBuffers {name} differs from provenance pin")
-    return {"package": provenance["package"], "version": provenance["version"]}
+    return {"package": record["package"], "version": record["version"]}
 
 
 def main():

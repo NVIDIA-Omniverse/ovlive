@@ -188,10 +188,15 @@ fn structural(cmds: Vec<StructCommand>) -> OwnedDelta {
     }
 }
 
+/// A whole-layer reset restating only the root's child `P`: everything else,
+/// an orphan included, is erased. It restates `P` because a reset leaving no
+/// top-level section would remove the layer's last one, which `update_layer`
+/// refuses (SDD §9.7).
 fn reset() -> OwnedDelta {
     OwnedDelta {
         is_diff: true,
         base_version: 0,
+        struct_commands: vec![change(0, P, "P", 0)],
         source_format: "usda".to_string(),
         ..Default::default()
     }

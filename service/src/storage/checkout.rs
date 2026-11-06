@@ -111,8 +111,32 @@
 // escalating to `report_escaped_slot`. The bounded re-scan below is defence in
 // depth against a future edit that breaks one of the two properties, not a
 // mechanism any path relies on.
+//
+// ── Keeping every slot's cluster routing current ──────────────────────────
+//
+// Each slot is its own fred client with its own cluster routing table, and on
+// this pool (`max_redirections = 0`) a member that meets a redirect fails the
+// command rather than following it. A redirect seen by one member says the
+// store's slot layout changed, but the other members' tables still describe
+// the old layout. So the checkout keeps a pool-wide routing epoch
+// ([`RoutingEpochs`]) and one synced epoch per slot: a redirect on any member
+// marks the pool's routing stale (`ValkeyClient::mark_txn_routing_stale`, at
+// most once per [`TXN_ROUTING_STALE_MARK_MIN_INTERVAL`]), and each slot whose
+// synced epoch is behind re-syncs its routing at its next checkout, before its
+// hygiene probe (`ValkeyClient::acquire_txn_inner`). The slot index a
+// [`CheckedOutClient`] carries is what names the slot. Only members about to be
+// used re-sync, and never one mid-`WATCH`: the slot is held by the checkout
+// that syncs it. The `CreateLayer` commit's repeated run takes its checkout
+// without that re-sync and runs its own sync instead, so it syncs once. A
+// [`ExclusiveCheckout::swap_slot_client`] sets the swapped slot's synced epoch
+// to the epoch read before the fresh client connected, overwriting a later
+// one an old-client checkout recorded meanwhile, because a fresh client
+// connects with a full sync as of that read. A router restart or a recycle
+// reconnects a slot's client in place without recording it, which costs at
+// most one redundant sync. Nothing here touches the permit or scan arithmetic
+// above.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -122,6 +146,147 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use crate::observability::metrics::SharedMetrics;
 use crate::storage::client::PoolUseToken;
+use crate::storage::log_gate::LogGate;
+
+/// The minimum gap between two accepted marks of the `txn_pool`'s routing as
+/// stale ([`RoutingEpochs::mark_stale`]). The first mark always passes; later
+/// ones pass at most once per interval. A `const`, not a setting.
+///
+/// It bounds what a redirect storm costs: each accepted mark makes every slot
+/// re-sync at its next checkout, so a replica runs at most one sync per slot
+/// per accepted mark. On this pool a `MOVED` and an `-ASK` fail with the same
+/// error text, so a mark cannot tell a finished slot move from a migration
+/// still in progress, whose `-ASK`s keep coming until it ends; the interval is
+/// what keeps that window from turning into back-to-back pool-wide re-syncs. A
+/// mark the gate suppresses is covered by the next one, and the `CreateLayer`
+/// commit still syncs its checkout before a repeated run
+/// (`LayerStore::dispatch_create_layer_commit`).
+pub const TXN_ROUTING_STALE_MARK_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The minimum gap between two INFO lines reporting accepted routing-stale
+/// marks ([`RoutingEpochs::mark_stale`]). Each line carries the number of
+/// marks accepted since the previous one.
+pub const TXN_ROUTING_STALE_LOG_MIN_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A mark [`RoutingEpochs::mark_stale`] accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcceptedMark {
+    /// The pool's routing epoch this mark advanced it to.
+    pub(crate) epoch: u64,
+    /// `Some(n)` when this mark's INFO line is due: `n` marks were accepted
+    /// since the previous line, this one included. `None` while the line's
+    /// gate ([`TXN_ROUTING_STALE_LOG_MIN_INTERVAL`]) is closed.
+    pub(crate) log_marks: Option<u64>,
+}
+
+/// The `txn_pool`'s routing epochs: one pool-wide epoch, advanced each time
+/// the pool's cluster routing is marked stale, and one synced epoch per slot,
+/// the pool epoch that slot last re-synced its routing at (see the module
+/// docs, *Keeping every slot's cluster routing current*).
+///
+/// A slot whose synced epoch is below the pool epoch re-syncs at its next
+/// checkout ([`Self::claim_sync`]). All counters start at zero, so a pool that
+/// was never marked never re-syncs. In memory only, torn down with the client.
+///
+/// Every operation is synchronous: atomics plus the two gates' short mutex
+/// sections, never held across an `.await`.
+pub(crate) struct RoutingEpochs {
+    epoch: AtomicU64,
+    /// One entry per slot, in slot order.
+    synced: Vec<AtomicU64>,
+    /// [`TXN_ROUTING_STALE_MARK_MIN_INTERVAL`]: the first mark passes, later
+    /// ones at most once per interval, on [`tokio::time::Instant`] so a
+    /// paused-clock test can open it.
+    mark_gate: LogGate,
+    /// [`TXN_ROUTING_STALE_LOG_MIN_INTERVAL`], the accepted marks' INFO line.
+    log_gate: LogGate,
+    /// Marks accepted since the last INFO line.
+    marks_since_log: AtomicU64,
+}
+
+impl RoutingEpochs {
+    /// Epochs for `slots` slots, all at zero, with both gates open.
+    pub(crate) fn new(slots: usize) -> Self {
+        Self {
+            epoch: AtomicU64::new(0),
+            synced: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            mark_gate: LogGate::new(TXN_ROUTING_STALE_MARK_MIN_INTERVAL),
+            log_gate: LogGate::new(TXN_ROUTING_STALE_LOG_MIN_INTERVAL),
+            marks_since_log: AtomicU64::new(0),
+        }
+    }
+
+    /// Mark the pool's routing stale: advance the epoch by one when the mark
+    /// gate allows it, and answer the accepted mark; `None` when the gate
+    /// suppressed it, leaving the epoch unchanged. A poisoned gate suppresses
+    /// the mark (`LogGate::allow`).
+    pub(crate) fn mark_stale(&self) -> Option<AcceptedMark> {
+        if !self.mark_gate.allow() {
+            return None;
+        }
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.marks_since_log.fetch_add(1, Ordering::AcqRel);
+        let log_marks = self
+            .log_gate
+            .allow()
+            .then(|| self.marks_since_log.swap(0, Ordering::AcqRel));
+        Some(AcceptedMark { epoch, log_marks })
+    }
+
+    /// The pool's current routing epoch.
+    pub(crate) fn current(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Whether `slot` must re-sync its routing now: `true` when its synced
+    /// epoch is below the pool's, in which case the pool epoch read here is
+    /// recorded as the slot's synced epoch **before** the caller syncs, so a
+    /// failing or cancelled sync costs at most one attempt per slot per mark.
+    /// `false` for a slot that is current, and for an index past the last
+    /// slot.
+    pub(crate) fn claim_sync(&self, slot: usize) -> bool {
+        let Some(synced) = self.synced.get(slot) else {
+            return false;
+        };
+        let current = self.current();
+        // The common case — the slot is current — is a plain load, no
+        // read-modify-write. Only a slot that is behind records the epoch, still
+        // before the caller syncs.
+        if synced.load(Ordering::Acquire) >= current {
+            return false;
+        }
+        synced.fetch_max(current, Ordering::AcqRel) < current
+    }
+
+    /// Record `slot` as synced at `epoch`, unless it is already recorded at a
+    /// later one. Nothing for an index past the last slot.
+    pub(crate) fn record_synced(&self, slot: usize, epoch: u64) {
+        if let Some(synced) = self.synced.get(slot) {
+            synced.fetch_max(epoch, Ordering::AcqRel);
+        }
+    }
+
+    /// Set `slot`'s synced epoch to `epoch`, overwriting whatever it held,
+    /// even a later epoch. For a slot whose client was just replaced: the
+    /// record describes the client that left the slot, and the fresh client
+    /// has synced only as of `epoch`. The caller must hold the slot, so
+    /// nothing else writes its record meanwhile. Nothing for an index past the
+    /// last slot.
+    pub(crate) fn set_synced(&self, slot: usize, epoch: u64) {
+        if let Some(synced) = self.synced.get(slot) {
+            synced.store(epoch, Ordering::Release);
+        }
+    }
+
+    /// Each slot's synced epoch, in slot order. **Test-only.**
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn synced_for_test(&self) -> Vec<u64> {
+        self.synced
+            .iter()
+            .map(|synced| synced.load(Ordering::Acquire))
+            .collect()
+    }
+}
 
 /// Budget for the bounded re-scan that follows a full pass finding no free slot.
 ///
@@ -151,6 +316,10 @@ const CHECKOUT_RESCAN_INTERVAL: Duration = Duration::from_millis(1);
 ///
 /// `Deref<Target = Client>` is preserved so no command site changes.
 pub struct CheckedOutClient {
+    /// The index of the slot `guard` locks, which names the slot's routing
+    /// epoch ([`RoutingEpochs`]). Plain data with no `Drop`, so it takes no
+    /// part in the drop order below.
+    slot: usize,
     guard: OwnedMutexGuard<Client>,
     token: PoolUseToken,
     /// What entitled this checkout to its slot, dropped last: the permit this
@@ -179,8 +348,14 @@ impl std::ops::Deref for CheckedOutClient {
 }
 
 impl CheckedOutClient {
+    /// The index of the slot this checkout holds.
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+
     /// Split the checkout into its slot guard, its gauge token and its
-    /// entitlement.
+    /// entitlement. The slot index is not among them: read it with
+    /// [`Self::slot`] first, and hand it back to [`Self::reassemble`].
     ///
     /// Only for the one caller that must hand all three to a spawned task and
     /// get them back again ([`ValkeyClient::recycle_txn_slot`], whose repair
@@ -200,13 +375,15 @@ impl CheckedOutClient {
         (self.guard, self.token, self.entitlement)
     }
 
-    /// Inverse of [`Self::into_parts`].
+    /// Inverse of [`Self::into_parts`], with the [`Self::slot`] read before it.
     pub(crate) fn reassemble(
+        slot: usize,
         guard: OwnedMutexGuard<Client>,
         token: PoolUseToken,
         entitlement: Option<SlotEntitlement>,
     ) -> Self {
         Self {
+            slot,
             guard,
             token,
             entitlement,
@@ -254,6 +431,18 @@ pub struct ExclusiveCheckout {
     /// Shared with `ValkeyClient`; `None` until `install_observability_hooks`
     /// runs, which is the state startup PINGs and metric-free tests operate in.
     metrics: Arc<std::sync::Mutex<Option<SharedMetrics>>>,
+    /// The pool's routing epoch and each slot's synced epoch (see the module
+    /// docs, *Keeping every slot's cluster routing current*).
+    routing: RoutingEpochs,
+    /// Whether the slots' clients are configured for a clustered store, read
+    /// at construction. Off a cluster there is no routing table to go stale,
+    /// so [`Self::mark_routing_stale`] does nothing.
+    clustered: bool,
+    /// Test-only count of the routing-stale triggers that reached
+    /// [`Self::mark_routing_stale`], counted before the clustered check and
+    /// the mark gate. Absent from release builds.
+    #[cfg(any(test, feature = "test-support"))]
+    routing_stale_triggers_for_test: AtomicU64,
     /// Test-only: suppress the post-yield re-scan, making an empty **first**
     /// scan terminal (b.f4f).
     ///
@@ -295,18 +484,26 @@ impl ExclusiveCheckout {
     /// [`Self::slot_of`] names no slot for it, so its hooks are armed with no
     /// verdict sink (`MemberReplacer::arm_txn`). Checkouts by callers, which
     /// scan, are unaffected.
+    ///
+    /// The same pass reads whether the slots are configured for a clustered
+    /// store: every slot is built from one config, so any slot it can read
+    /// answers for the pool.
     pub fn new(
         pool: ExclusivePool,
         label: &'static str,
         metrics: Arc<std::sync::Mutex<Option<SharedMetrics>>>,
     ) -> Self {
         let slots = pool.size();
+        let mut clustered = false;
         let slot_ids = pool
             .clients()
             .iter()
             .map(|slot| {
                 slot.try_lock()
-                    .map(|client| client.id().to_string())
+                    .map(|client| {
+                        clustered |= client.is_clustered();
+                        client.id().to_string()
+                    })
                     .unwrap_or_default()
             })
             .collect();
@@ -317,6 +514,10 @@ impl ExclusiveCheckout {
             label,
             waiters: AtomicUsize::new(0),
             metrics,
+            routing: RoutingEpochs::new(slots),
+            clustered,
+            #[cfg(any(test, feature = "test-support"))]
+            routing_stale_triggers_for_test: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-fault-injection"))]
             rescan_disabled: std::sync::atomic::AtomicBool::new(false),
         }
@@ -478,9 +679,10 @@ impl ExclusiveCheckout {
             let deadline = Instant::now() + CHECKOUT_RESCAN_DEADLINE;
             let mut first_rescan = true;
             loop {
-                if let Some(guard) = self.try_take_slot() {
+                if let Some((slot, guard)) = self.try_take_slot() {
                     self.observe_checkout(started.elapsed());
                     return CheckedOutClient {
+                        slot,
                         guard,
                         token: self.make_pool_use_token(),
                         entitlement: permit
@@ -630,6 +832,7 @@ impl ExclusiveCheckout {
             return None;
         }
         Some(CheckedOutClient {
+            slot: index,
             guard,
             token: self.make_pool_use_token(),
             entitlement: Some(SlotEntitlement::Permit { _permit: permit }),
@@ -644,10 +847,22 @@ impl ExclusiveCheckout {
     /// the permits and the scan are unchanged (see the module docs). `None`
     /// when `checkout`'s client is not one of this pool's slots, in which case
     /// nothing changes.
+    ///
+    /// The slot's synced epoch is set to `routing_epoch`, overwriting the
+    /// record, even a later one: the pool's routing epoch the caller read
+    /// **before** `fresh` connected. A fresh client connects with a full
+    /// cluster sync, so it needs no re-sync for a mark made before that read;
+    /// a mark made while it connected, or while this swap waited for the slot,
+    /// is still owed one at the slot's next checkout. The record is
+    /// overwritten because a later epoch in it describes a sync of the client
+    /// that left the slot (an old-client checkout during that wait), not of
+    /// `fresh`. This checkout holds the slot, so nothing else writes its
+    /// record meanwhile; overwriting costs at most one redundant sync.
     pub(crate) fn swap_slot_client(
         &self,
         checkout: &mut CheckedOutClient,
         fresh: Client,
+        routing_epoch: u64,
     ) -> Option<Client> {
         let mut slot_ids = self
             .slot_ids
@@ -657,7 +872,64 @@ impl ExclusiveCheckout {
             .iter()
             .position(|id| !id.is_empty() && id.as_str() == checkout.guard.id())?;
         slot_ids[index] = fresh.id().to_string();
+        self.routing.set_synced(index, routing_epoch);
         Some(std::mem::replace(&mut *checkout.guard, fresh))
+    }
+
+    /// Mark this pool's cluster routing stale, so every slot re-syncs its
+    /// routing at its next checkout ([`Self::claim_routing_sync`]). Does
+    /// nothing, and answers `None`, on a pool not configured for a clustered
+    /// store, and when the mark gate
+    /// ([`TXN_ROUTING_STALE_MARK_MIN_INTERVAL`]) suppresses the mark. Called
+    /// only by `ValkeyClient::mark_txn_routing_stale`, which logs the accepted
+    /// marks.
+    pub(crate) fn mark_routing_stale(&self) -> Option<AcceptedMark> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.routing_stale_triggers_for_test
+            .fetch_add(1, Ordering::SeqCst);
+        if !self.clustered {
+            return None;
+        }
+        self.routing.mark_stale()
+    }
+
+    /// Whether `slot` must re-sync its cluster routing now: its synced epoch
+    /// is behind the pool's. When it is, the epoch is recorded for the slot
+    /// before the caller syncs (see [`RoutingEpochs::claim_sync`]).
+    pub(crate) fn claim_routing_sync(&self, slot: usize) -> bool {
+        self.routing.claim_sync(slot)
+    }
+
+    /// Record `slot` as synced at `epoch` (never moving it back).
+    pub(crate) fn record_routing_synced(&self, slot: usize, epoch: u64) {
+        self.routing.record_synced(slot, epoch);
+    }
+
+    /// The pool's current routing epoch.
+    pub(crate) fn routing_epoch(&self) -> u64 {
+        self.routing.current()
+    }
+
+    /// The pool's routing epoch: how many routing-stale marks were accepted.
+    /// Stays at zero on a standalone store. **Test-only.**
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn routing_epoch_for_test(&self) -> u64 {
+        self.routing.current()
+    }
+
+    /// Each slot's synced routing epoch, in slot order. **Test-only.**
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn slot_routing_epochs_for_test(&self) -> Vec<u64> {
+        self.routing.synced_for_test()
+    }
+
+    /// How many routing-stale triggers reached [`Self::mark_routing_stale`],
+    /// counted before the clustered check and the mark gate, so a test on a
+    /// standalone store still sees which errors trigger a mark.
+    /// **Test-only.**
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn routing_stale_triggers_for_test(&self) -> u64 {
+        self.routing_stale_triggers_for_test.load(Ordering::SeqCst)
     }
 
     /// The slot index whose client id is `client_id`, if any.
@@ -698,12 +970,14 @@ impl ExclusiveCheckout {
     }
 
     /// One non-blocking pass over every slot. Never awaits, so the locked set it
-    /// observes cannot grow underneath it.
-    fn try_take_slot(&self) -> Option<OwnedMutexGuard<Client>> {
+    /// observes cannot grow underneath it. Answers the slot's index with its
+    /// guard.
+    fn try_take_slot(&self) -> Option<(usize, OwnedMutexGuard<Client>)> {
         self.pool
             .clients()
             .iter()
-            .find_map(|slot| slot.clone().try_lock_owned().ok())
+            .enumerate()
+            .find_map(|(index, slot)| slot.clone().try_lock_owned().ok().map(|g| (index, g)))
     }
 
     /// A full pass found nothing free. Not expected outside [`Self::quit`] (see
@@ -1697,6 +1971,323 @@ mod tests {
             "a dropped waiter must leave the gauge"
         );
         drop(held);
+    }
+
+    // ── Routing epochs (b.4q2) ────────────────────────────────────────────────
+    //
+    // The pool-wide routing epoch, each slot's synced epoch, and the mark gate
+    // (see the module docs, *Keeping every slot's cluster routing current*).
+    // Pure in-process state: nothing here connects. The gate runs on the tokio
+    // clock, so the tests that step past its interval pause it and advance
+    // virtual time instead of sleeping. `ValkeyClient`'s side of the mechanism
+    // — the re-sync at checkout, the triggers, and the record rule after a
+    // redirected transaction's own re-sync — is pinned against the clustered
+    // facade in the integration suite (`storage::b_v6d_router_test`'s
+    // `txn_routing_stale`).
+
+    /// An unconnected `ExclusiveCheckout` over `slots` slots whose clients are
+    /// configured for a clustered store (nothing connects: the host is never
+    /// dialled), so [`ExclusiveCheckout::mark_routing_stale`] is live.
+    fn clustered_checkout(slots: usize) -> ExclusiveCheckout {
+        let config = fred::types::config::Config {
+            server: fred::types::config::ServerConfig::new_clustered(vec![("127.0.0.1", 7000)]),
+            ..Default::default()
+        };
+        let pool = Builder::from_config(config)
+            .build_exclusive_pool(slots)
+            .expect("building an exclusive pool must succeed without connecting");
+        ExclusiveCheckout::new(pool, POOL_LABEL_TXN, Arc::new(std::sync::Mutex::new(None)))
+    }
+
+    /// An unconnected client to swap into a slot, as `MemberReplacer` swaps a
+    /// freshly connected one.
+    fn fresh_client() -> Client {
+        Builder::from_config(Default::default())
+            .build()
+            .expect("building a client must succeed without connecting")
+    }
+
+    /// The mark gate: the first mark always passes, a mark within
+    /// [`TXN_ROUTING_STALE_MARK_MIN_INTERVAL`] of the last accepted one is
+    /// dropped and leaves the epoch where it was, and the first mark once the
+    /// interval has passed is accepted again. Without the gate the second mark
+    /// would advance the epoch, and every slot would owe one more re-sync.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_routing_mark_passes_one_within_the_interval_is_dropped_and_one_after_it_passes(
+    ) {
+        let epochs = RoutingEpochs::new(2);
+
+        let first = epochs.mark_stale().expect("the first mark always passes");
+        assert_eq!(first.epoch, 1, "an accepted mark advances the epoch by one");
+
+        tokio::time::advance(TXN_ROUTING_STALE_MARK_MIN_INTERVAL - Duration::from_millis(1)).await;
+        assert_eq!(
+            epochs.mark_stale(),
+            None,
+            "a mark inside the interval since the last accepted one is dropped"
+        );
+        assert_eq!(
+            epochs.current(),
+            1,
+            "a dropped mark leaves the epoch as it was"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let third = epochs
+            .mark_stale()
+            .expect("the first mark once the interval has passed is accepted");
+        assert_eq!(third.epoch, 2);
+        assert_eq!(epochs.current(), 2);
+    }
+
+    /// Each accepted mark reports whether its INFO line is due: the first
+    /// one's is, carrying one mark; marks accepted while the line's own gate
+    /// ([`TXN_ROUTING_STALE_LOG_MIN_INTERVAL`]) is closed report none, and the
+    /// first one after it reopens carries every mark accepted since the last
+    /// line, itself included.
+    #[tokio::test(start_paused = true)]
+    async fn accepted_routing_marks_report_one_log_line_per_log_interval_carrying_the_marks_since_the_last(
+    ) {
+        let epochs = RoutingEpochs::new(1);
+
+        assert_eq!(
+            epochs.mark_stale().map(|m| m.log_marks),
+            Some(Some(1)),
+            "the first accepted mark's line is due, carrying itself"
+        );
+        tokio::time::advance(TXN_ROUTING_STALE_MARK_MIN_INTERVAL).await;
+        assert_eq!(
+            epochs.mark_stale().map(|m| m.log_marks),
+            Some(None),
+            "accepted inside the line's interval: no line"
+        );
+        tokio::time::advance(TXN_ROUTING_STALE_LOG_MIN_INTERVAL).await;
+        assert_eq!(
+            epochs.mark_stale().map(|m| m.log_marks),
+            Some(Some(2)),
+            "the next line carries both marks accepted since the last one"
+        );
+    }
+
+    /// A slot must re-sync exactly when its synced epoch is below the pool's:
+    /// never on a pool that was never marked, once per accepted mark for each
+    /// slot (slots are independent), never for a slot already recorded at the
+    /// pool's epoch, and never for an index past the last slot.
+    #[tokio::test]
+    async fn a_slot_needs_a_routing_sync_exactly_when_its_synced_epoch_is_below_the_pools() {
+        let epochs = RoutingEpochs::new(3);
+        assert!(
+            !epochs.claim_sync(0),
+            "a pool that was never marked never re-syncs"
+        );
+
+        epochs.mark_stale().expect("the first mark always passes");
+        assert!(epochs.claim_sync(0), "slot 0 is behind the pool: it syncs");
+        assert!(
+            !epochs.claim_sync(0),
+            "slot 0 is current now: its next checkout does not sync again"
+        );
+        assert!(
+            epochs.claim_sync(1),
+            "slot 1 is still behind: one slot's sync does not cover another's"
+        );
+        epochs.record_synced(2, 1);
+        assert!(
+            !epochs.claim_sync(2),
+            "a slot recorded at the pool's epoch is current"
+        );
+        assert!(
+            !epochs.claim_sync(3),
+            "an index past the last slot never syncs"
+        );
+        assert_eq!(epochs.synced_for_test(), vec![1, 1, 1]);
+    }
+
+    /// The pool's epoch is recorded for the slot by the claim itself, before
+    /// the caller runs its sync — so a sync that then fails, times out or is
+    /// cancelled (the caller never records anything) still counts, and the
+    /// slot's next checkout does not try again for the same mark. A store that
+    /// keeps failing costs at most one sync attempt per slot per mark. If the
+    /// epoch were recorded only after a successful sync, the second claim
+    /// below would answer `true`.
+    #[tokio::test]
+    async fn a_claimed_routing_sync_counts_for_the_slot_even_when_the_sync_then_fails() {
+        let epochs = RoutingEpochs::new(1);
+        epochs.mark_stale().expect("the first mark always passes");
+
+        assert!(epochs.claim_sync(0), "precondition: the slot is behind");
+        assert_eq!(
+            epochs.synced_for_test(),
+            vec![1],
+            "the claim recorded the pool's epoch before any sync ran"
+        );
+        // The sync fails here: nothing records anything.
+        assert!(
+            !epochs.claim_sync(0),
+            "a failed sync is not retried at the slot's next checkout for the same mark"
+        );
+    }
+
+    /// `record_synced` never moves a slot back: a record at an older epoch than
+    /// the slot already holds is ignored (two syncs finishing out of order).
+    #[tokio::test]
+    async fn recording_a_routing_sync_at_an_older_epoch_never_moves_the_slot_back() {
+        let epochs = RoutingEpochs::new(1);
+        epochs.record_synced(0, 3);
+        epochs.record_synced(0, 1);
+        assert_eq!(epochs.synced_for_test(), vec![3]);
+        epochs.record_synced(1, 5);
+        assert_eq!(
+            epochs.synced_for_test(),
+            vec![3],
+            "an index past the last slot records nothing"
+        );
+    }
+
+    /// A checkout carries the index of the slot it holds — the index that names
+    /// the slot's synced epoch — on both checkout paths: the scan
+    /// ([`ExclusiveCheckout::acquire`]) and the targeted checkout of one slot
+    /// ([`ExclusiveCheckout::checkout_slot_for_replacement`]). A wrong index
+    /// would make one slot's sync count for another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkout_carries_the_index_of_the_slot_it_holds() {
+        let pool = checkout(3, POOL_LABEL_TXN);
+        let held: Vec<CheckedOutClient> = vec![
+            pool.acquire().await,
+            pool.acquire().await,
+            pool.acquire().await,
+        ];
+        for checked_out in &held {
+            assert_eq!(
+                pool.slot_of(&slot_id(checked_out)),
+                Some(checked_out.slot()),
+                "a scanned checkout's index names the slot whose client it holds"
+            );
+        }
+        let (target, target_slot) = (slot_id(&held[1]), held[1].slot());
+        let mut indices: Vec<usize> = held.iter().map(CheckedOutClient::slot).collect();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "three held checkouts hold the three slots"
+        );
+        drop(held);
+
+        let targeted =
+            tokio::time::timeout(SETTLE_DEADLINE, pool.checkout_slot_for_replacement(&target))
+                .await
+                .expect("the targeted checkout of a free slot must complete")
+                .expect("the slot holds the client it was looked up by");
+        assert_eq!(
+            targeted.slot(),
+            target_slot,
+            "the targeted checkout carries its slot's index"
+        );
+        assert_eq!(slot_id(&targeted), target);
+    }
+
+    /// A swapped slot starts current: `swap_slot_client` records the epoch
+    /// read before the fresh client connected, so the slot's next checkout
+    /// does not re-sync a client that connected after the mark. Without the
+    /// record the slot would still read 0 and sync again.
+    #[tokio::test(start_paused = true)]
+    async fn a_swapped_slot_starts_current_at_the_epoch_read_before_its_client_connected() {
+        let pool = checkout(2, POOL_LABEL_TXN);
+        pool.routing
+            .mark_stale()
+            .expect("the first mark always passes");
+        let read_before_connect = pool.routing_epoch();
+        assert_eq!(read_before_connect, 1);
+
+        let mut held = pool.acquire().await;
+        let slot = held.slot();
+        pool.swap_slot_client(&mut held, fresh_client(), read_before_connect)
+            .expect("the held client is one of the pool's slots");
+
+        assert_eq!(pool.slot_routing_epochs_for_test()[slot], 1);
+        assert!(
+            !pool.claim_routing_sync(slot),
+            "the fresh client connected with a full sync after the mark: no re-sync owed"
+        );
+        assert!(
+            pool.claim_routing_sync(1 - slot),
+            "the other slot, not swapped, still owes its re-sync"
+        );
+    }
+
+    /// The swap OVERWRITES the slot's record, even one ahead of the epoch it
+    /// is given: a later epoch in the record describes a sync of the client
+    /// that left the slot (an old-client checkout while the swap waited), not
+    /// of the fresh one, which connected as of the earlier read. The slot then
+    /// owes a re-sync for the mark made after that read. Recording with
+    /// `fetch_max` (`record_synced`) instead would keep the later epoch and
+    /// skip it.
+    #[tokio::test(start_paused = true)]
+    async fn a_swap_overwrites_a_slot_recorded_ahead_of_the_epoch_read_before_the_fresh_client_connected(
+    ) {
+        let pool = checkout(1, POOL_LABEL_TXN);
+        pool.routing
+            .mark_stale()
+            .expect("the first mark always passes");
+        let read_before_connect = pool.routing_epoch();
+        // A second mark while the fresh client connects, which an old-client
+        // checkout of the slot then syncs for and records.
+        tokio::time::advance(TXN_ROUTING_STALE_MARK_MIN_INTERVAL).await;
+        pool.routing
+            .mark_stale()
+            .expect("a mark after the interval passes");
+        let mut held = pool.acquire().await;
+        let slot = held.slot();
+        assert!(
+            pool.claim_routing_sync(slot),
+            "precondition: the old client's checkout syncs at the latest epoch"
+        );
+        assert_eq!(
+            pool.slot_routing_epochs_for_test()[slot],
+            2,
+            "precondition: the record is ahead of the epoch the swap is given"
+        );
+
+        pool.swap_slot_client(&mut held, fresh_client(), read_before_connect)
+            .expect("the held client is one of the pool's slots");
+
+        assert_eq!(
+            pool.slot_routing_epochs_for_test()[slot],
+            read_before_connect,
+            "the swap overwrites the record down to the epoch read before the fresh client \
+             connected"
+        );
+        assert!(
+            pool.claim_routing_sync(slot),
+            "the fresh client owes a re-sync for the mark made after that read"
+        );
+    }
+
+    /// A mark advances the epoch only on a pool configured for a clustered
+    /// store: off a cluster there is no routing table to go stale, so it
+    /// answers `None` and leaves the epoch at zero (no checkout ever
+    /// re-syncs). The test-only trigger count is taken before that check, so
+    /// both pools count the trigger.
+    #[tokio::test]
+    async fn marking_routing_stale_advances_the_epoch_only_on_a_clustered_pool() {
+        let standalone = checkout(2, POOL_LABEL_TXN);
+        assert_eq!(standalone.mark_routing_stale(), None);
+        assert_eq!(standalone.routing_epoch_for_test(), 0);
+        assert_eq!(standalone.routing_stale_triggers_for_test(), 1);
+        assert!(
+            !standalone.claim_routing_sync(0),
+            "a standalone pool never re-syncs at checkout"
+        );
+
+        let clustered = clustered_checkout(2);
+        let accepted = clustered
+            .mark_routing_stale()
+            .expect("the first mark on a clustered pool is accepted");
+        assert_eq!(accepted.epoch, 1);
+        assert_eq!(clustered.routing_epoch_for_test(), 1);
+        assert_eq!(clustered.routing_stale_triggers_for_test(), 1);
+        assert_eq!(clustered.slot_routing_epochs_for_test(), vec![0, 0]);
     }
 
     // ── Constant and policy pins ──────────────────────────────────────────────

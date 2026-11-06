@@ -20,6 +20,8 @@
     omniUsdLiveJoinSession;
     omniUsdLiveLeaveSession;
     omniUsdLiveSendMessage;
+    omniUsdLiveRequestMergeOwner;
+    omniUsdLiveGetMergeOwner;
     omniUsdLiveStatLayer;
     omniUsdLiveDeleteLayer;
     omniUsdLiveGetEndpointStatus;

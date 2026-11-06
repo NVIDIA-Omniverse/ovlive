@@ -156,14 +156,16 @@ RUN set -u; \
     done; \
     echo "allocator gate OK"
 
-# Measurement-feature gate: the shipped artifact carries no measurement-only
-# code. The test-only `test-support` cargo feature (Cargo.toml) makes the
+# Measurement-feature gate: the shipped artifact carries no measurement- or
+# test-only code. The test-only `test-support` cargo feature (Cargo.toml) makes the
 # binary read the snapshot fan-out arena's decay from
-# MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS at startup (`src/allocator.rs`) and
-# the pod memory limit's cgroup root from MEASUREMENT_POD_MEMORY_CGROUP_ROOT
-# (`src/config/pod_memory.rs`); a build without it carries no reference to
-# either name, so the names' absence from the binary shows the feature is
-# off. The control: each source file declares its name exactly once, as a
+# MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS at startup (`src/allocator.rs`), the
+# pod memory limit's cgroup root from MEASUREMENT_POD_MEMORY_CGROUP_ROOT
+# (`src/config/pod_memory.rs`), and a Valkey key prefix in place of `le:` from
+# LIVE_EDIT_TEST_ONLY_KEY_PREFIX (`src/config/key_prefix.rs`); a build without
+# it carries no reference to any of the three names, so the names' absence
+# from the binary shows the feature is off. The control: each source file
+# declares its name exactly once, as a
 # string literal, so a renamed variable fails here rather than leaving the
 # search looking for a name nothing carries.
 # `scripts/check-measurement-features.sh` runs the same search (`--binary`),
@@ -175,7 +177,7 @@ RUN set -u; \
 # found, and anything else (an unreadable binary) fails rather than passing as
 # not found.
 RUN set -u; \
-    for PAIR in MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS:src/allocator.rs MEASUREMENT_POD_MEMORY_CGROUP_ROOT:src/config/pod_memory.rs; do \
+    for PAIR in MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS:src/allocator.rs MEASUREMENT_POD_MEMORY_CGROUP_ROOT:src/config/pod_memory.rs LIVE_EDIT_TEST_ONLY_KEY_PREFIX:src/config/key_prefix.rs; do \
         ENV_NAME=${PAIR%%:*}; \
         ENV_SOURCE=${PAIR#*:}; \
         HITS=$(grep -c -F "\"$ENV_NAME\"" "$ENV_SOURCE"); \
@@ -192,7 +194,7 @@ RUN set -u; \
     done
 
 # Stage 2: Runtime
-FROM nvcr.io/nvidia/distroless/cc:v4.1.4
+FROM nvcr.io/nvidia/distroless/cc:v4.1.7@sha256:c00b17d366579fa94e43398e9cbdc017647188491709e661104cfe69a6f283e7
 
 COPY --from=builder /build/target/release/live-edit /app/live-edit
 COPY --from=builder --chmod=0644 /oss-output/vendor.tar.gz /vendor.tar.gz

@@ -83,6 +83,7 @@ use live_edit::observability::health::{
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::counters::CounterStore;
 use live_edit::storage::keys::KeySchema;
+use live_edit::storage::test_support::connect_test_client_or_skip;
 
 const READINESS_SERVICE_NAME: &str = "nvidia.omniverse.live.v1alpha.LiveService";
 
@@ -96,16 +97,28 @@ const SIDECAR_MAX_OBJECT_ID_OBSERVED: u64 = 5_000;
 /// asserted in step 9 of the test outline.
 const SAFETY_MARGIN: u64 = 1_000;
 
-/// Supervisor probe cadence — short enough that the post-flip wait stays
-/// well inside the 2 s `wait_for_status` deadline used by every sibling
-/// supervisor integration test. Mirrors the cadence in
-/// `health_supervisor_service_token_test.rs`.
-const SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+/// Supervisor probe cadence: past the test's lifetime. The interval's first
+/// tick fires immediately, so that tick is the only periodic one — the
+/// pre-flip verdict comes from it alone — and the post-flip tick is the one
+/// the test wakes by republishing `api_serving = true` (each send wakes the
+/// supervisor; the value contributes `true`, so it changes no verdict). Which
+/// tick produced which verdict is then decided by events, never by a clock.
+const SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_secs(600);
 
-/// Per-probe deadline. Short enough that a healthy localhost Valkey ping
-/// is never racy and a dead-connection ping cannot succeed. Same posture
-/// as the sibling supervisor integration test files.
-const SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Hang guard on every positive wait for a readiness status: it has to
+/// contain a supervisor tick, up to one probe bound, and sits far below
+/// nextest's 120 s kill. Not a timing claim.
+const STATUS_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// Per-probe bound for the supervisor's `PING`: the client's own command
+/// timeout (test-writing guide § Synchronization Patterns, "a one-shot read
+/// the test expects to answer"). Valkey is healthy throughout this test, and a
+/// tighter bound would read a merely slow PING on a loaded shared Valkey as an
+/// outage.
+fn supervisor_probe_timeout(valkey: &ValkeyClient) -> Duration {
+    use fred::interfaces::ClientLike;
+    valkey.pool.next().perf_config().default_command_timeout
+}
 
 /// Construct a `Config` clone matching the canonical integration-test
 /// shape, narrowed to a one-connection pool. Mirrors the sibling
@@ -117,23 +130,6 @@ fn test_config() -> Config {
     cfg.subscriber_pool_size = 1;
     cfg.valkey_reconnect_max_delay_ms = 500;
     cfg
-}
-
-/// Attempt to connect to Valkey using the test config. Returns `None`
-/// when Valkey is unreachable — the test short-circuits via `return` in
-/// that case, matching the project-wide silent-skip idiom called out in
-/// the Section 3 directive.
-async fn maybe_connect_valkey() -> Option<ValkeyClient> {
-    let cfg = test_config();
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(c)) => Some(c),
-        _ => None,
-    }
 }
 
 /// Spawn a minimal tonic server that exposes only the supplied
@@ -228,8 +224,9 @@ async fn wait_for_status(
 ///
 /// Sequence (mirrors the parent-Task directive):
 ///
-/// 1. Spin up a `TestValkey`-equivalent connection (silent return if
-///    Valkey is unreachable, per the project-wide pattern).
+/// 1. Spin up a `TestValkey`-equivalent connection through
+///    `connect_test_client_or_skip` (with `TEST_VALKEY_URL` set, an
+///    unreachable store fails the test).
 /// 2. Seed an `InMemoryCheckpointStore` with a `CountersSidecar` body
 ///    encoded the same way the Epic 6 producer encodes it (`serde_json`
 ///    round-trip through the shared `CountersSidecar` type).
@@ -249,11 +246,10 @@ async fn wait_for_status(
 /// 10. Cancel the supervisor and `valkey.quit()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn counter_seed_routine_drives_supervisor_readiness_flip_end_to_end() {
-    // Step 1: silent-return if Valkey isn't reachable — matches the
-    // project-wide integration-test idiom called out by the Section 3
-    // analyst. No `eprintln!("SKIP")` here: the directive explicitly
-    // calls that out as non-idiomatic for this codebase.
-    let Some(valkey) = maybe_connect_valkey().await else {
+    // Step 1: connect. With `TEST_VALKEY_URL` set an unreachable store
+    // fails the test; only an unset variable outside CI skips it, and the
+    // helper prints the `SKIP:` line itself.
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -289,11 +285,15 @@ async fn counter_seed_routine_drives_supervisor_readiness_flip_end_to_end() {
     // Step 4: real watch channel, initial value `false`. Mirrors the
     // exact handle shape from `src/main.rs:662`.
     let (tx, rx) = tokio::sync::watch::channel(false);
+    // The tick trigger (see `SUPERVISOR_PROBE_INTERVAL`): the full-API gate,
+    // already open, republished to wake the supervisor once per send.
+    let (tick_tx, tick_rx) = tokio::sync::watch::channel(true);
 
     // Step 5: real metrics registry + real `create_health_service` pair
     // + real supervisor wiring. We deliberately leave every other
     // contributor to the aggregate verdict OFF (`service_token_provider =
-    // None`) so the only signal that can flip readiness is the
+    // None`) or held healthy (`api_serving`, wired only as the tick trigger
+    // and always `true`) so the only signal that can flip readiness is the
     // `counter_seed_ready` gate — keeps the test's intent surface minimal.
     // (Auth-backend readiness probing was removed in b.9f4, so there is no
     // longer any permissions/userinfo contributor to disable.)
@@ -314,11 +314,12 @@ async fn counter_seed_routine_drives_supervisor_readiness_flip_end_to_end() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: None,
             counter_seed_ready: Some(rx),
-            api_serving: None,
+            api_serving: Some(tick_rx),
+            verdict_stale: None,
         },
         cancel.clone(),
     );
@@ -332,14 +333,10 @@ async fn counter_seed_routine_drives_supervisor_readiness_flip_end_to_end() {
     // `src/observability/health.rs` treats `counter_seed_ready =
     // Some(rx)` + `*rx.borrow() == false` as a hard NOT_SERVING signal
     // (same posture as the service-token gate), so the verdict resolves
-    // `serving = false` and the reporter flips on the very first probe.
+    // `serving = false` and the reporter flips on the very first probe —
+    // the only periodic tick this test has.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::NotServing,
-            Duration::from_secs(2),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::NotServing, STATUS_HANG_GUARD).await,
         "pre-flip baseline: supervisor must drive readiness from the seeded SERVING down \
          to NOT_SERVING while the counter-seed gate is still false (mirrors the \
          pre-routine state in main.rs before `seed_object_id_counter().await` returns)"
@@ -377,22 +374,19 @@ async fn counter_seed_routine_drives_supervisor_readiness_flip_end_to_end() {
     // observes whatever value the sender most recently wrote.
     tx.send(true)
         .expect("watch send must succeed (receiver is held by the live supervisor task)");
+    // Wake the supervisor for its next tick (see `SUPERVISOR_PROBE_INTERVAL`).
+    tick_tx
+        .send(true)
+        .expect("watch send must succeed (receiver is held by the live supervisor task)");
 
-    // Step 11: post-flip assertion. Within ~one supervisor probe
-    // interval the supervisor's tick re-reads `*rx.borrow() == true`,
-    // the aggregate verdict flips `serving = true`, the reporter writes
-    // `SERVING`, and the real `HealthClient` observes the new state.
-    // 2 s budget gives 10x slack over the 200 ms probe interval — same
-    // slack as every other supervisor integration test in this crate.
+    // Step 11: post-flip assertion. On the tick the test just woke the
+    // supervisor re-reads `*rx.borrow() == true`, the aggregate verdict
+    // flips `serving = true`, the reporter writes `SERVING`, and the real
+    // `HealthClient` observes the new state. The wait is a hang guard.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(2),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "post-flip assertion: supervisor must observe the watch flip and restore \
-         SERVING within one probe interval + slack; pinning the end-to-end \
+         SERVING on its next tick; pinning the end-to-end \
          seed_object_id_counter → tx.send(true) → supervisor-tick → reporter flip chain"
     );
 

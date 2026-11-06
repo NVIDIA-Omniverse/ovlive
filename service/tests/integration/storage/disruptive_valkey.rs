@@ -15,8 +15,8 @@
 
 //! The store a disruptive `-OOM` test runs against, and the `maxmemory` it
 //! sets there: shared by the `store_write_refusal_disruptive_*` tests of
-//! `store_write_refusal_test.rs` (b.yvh) and `oom_collection_test.rs`
-//! (b.pa1).
+//! `store_write_refusal_test.rs` (b.yvh), `oom_collection_test.rs` (b.pa1)
+//! and `b_2tu_tests.rs` (b.2tu).
 //!
 //! Such a test changes the server's `maxmemory`, a server-wide setting, so it
 //! never runs against the shared `TEST_VALKEY_URL` server: only against the

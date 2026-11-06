@@ -55,6 +55,18 @@ service LiveService {
   // sends none; such a server ends the stream with INVALID_ARGUMENT on a
   // keepalive.
   //
+  // Merge owner: a header that sets merge_owner asks for an advisory
+  // merge-owner lease on this join. Only a join whose SessionConnected carries
+  // merge_owner true may send a MergeOwnerRequest, and only such a join
+  // receives MergeOwnerState frames; the client decides it again on every
+  // join. The lease is bound to the join's connection ID and ends with the
+  // join. At most one join of a session holds it, only the session's creator
+  // may claim it, and every grant takes a new epoch. When the owner changes,
+  // every opted-in join other than the one whose request changed it receives
+  // an unsolicited MergeOwnerState (request_id 0); the requester receives the
+  // answer to its request. The lease is advisory: it binds only joins that
+  // opt in.
+  //
   // A stream the server ends UNAVAILABLE carries a google.rpc.ErrorInfo in
   // domain nvidia.omniverse.live.v1alpha with one of these reasons:
   //   CLIENT_KEEPALIVE_TIMEOUT: the join sent nothing for three keepalive
@@ -184,6 +196,13 @@ message Session {
   string created_by_user_name = 3;
   // Session creation time in microseconds since epoch.
   uint64 created_at = 4;
+  // Placeholder pending the live edit service schema: field numbers and
+  // names follow the service commit that adds the merge-owner lease.
+  // User name of the join holding the session's merge-owner lease; empty when
+  // nobody holds it or the server does not implement the lease.
+  string merge_owner_user_name = 5;
+  // Epoch of the current merge-owner grant; zero when nobody holds the lease.
+  uint64 merge_owner_epoch = 6;
 }
 
 // JoinSession request message for presence and session messages.
@@ -199,6 +218,12 @@ message JoinSessionRequest {
     // Liveness signal, sent only on a join whose SessionConnected carried a
     // non-zero keepalive_interval_ms; the service relays nothing to peers.
     JoinSessionKeepalive keepalive = 3;
+    // Placeholder pending the live edit service schema: field number and
+    // name follow the service commit that adds the merge-owner lease.
+    // Merge-owner control frame, sent only on a join whose SessionConnected
+    // carried merge_owner true; the service relays nothing to peers and the
+    // client never replays one on a later join.
+    MergeOwnerRequest merge_owner = 4;
   }
 }
 
@@ -215,12 +240,86 @@ message JoinSessionHeader {
   // sends nothing for three intervals UNAVAILABLE with ErrorInfo reason
   // CLIENT_KEEPALIVE_TIMEOUT.
   bool client_keepalive = 3;
+  // Placeholder pending the live edit service schema: field number and
+  // name follow the service commit that adds the merge-owner lease.
+  // Asks for merge-owner frames on this join (see JoinSession, Merge owner).
+  // A server that implements the lease answers merge_owner true in
+  // SessionConnected; a server that predates it ignores the field.
+  bool merge_owner = 4;
 }
 
 // Placeholder pending the live edit service schema: the message follows the
 // service commit that adds the client keepalive.
 // Client keepalive on a JoinSession stream; it carries nothing.
 message JoinSessionKeepalive {}
+
+// Placeholder pending the live edit service schema: the enum follows the
+// service commit that adds the merge-owner lease.
+// What a MergeOwnerRequest asks for.
+enum MergeOwnerAction {
+  MERGE_OWNER_ACTION_UNSPECIFIED = 0;
+  // Grants the lease when nobody live holds it; otherwise reports the holder.
+  // A claim by the holder answers GRANTED with the same epoch.
+  MERGE_OWNER_ACTION_CLAIM = 1;
+  // Drops the lease only when this join holds it.
+  MERGE_OWNER_ACTION_RELEASE = 2;
+  // Re-reads the lease and answers GRANTED when this join holds it, NOT_HELD
+  // otherwise. A client sends it immediately before a merge.
+  MERGE_OWNER_ACTION_VERIFY = 3;
+}
+
+// Placeholder pending the live edit service schema: the enum follows the
+// service commit that adds the merge-owner lease.
+// The answer to a MergeOwnerRequest, or the reason for an unsolicited
+// MergeOwnerState.
+enum MergeOwnerOutcome {
+  MERGE_OWNER_OUTCOME_UNSPECIFIED = 0;
+  // This join holds the lease.
+  MERGE_OWNER_OUTCOME_GRANTED = 1;
+  // Another live join holds the lease; owner_connection_id names it.
+  MERGE_OWNER_OUTCOME_HELD_BY_OTHER = 2;
+  // The lease is free: its holder released it or its join ended.
+  MERGE_OWNER_OUTCOME_RELEASED = 3;
+  // This join does not hold the lease.
+  MERGE_OWNER_OUTCOME_NOT_HELD = 4;
+  // This join's principal is not the session's creator and may not claim.
+  MERGE_OWNER_OUTCOME_NOT_ELIGIBLE = 5;
+  // This join's credential no longer authorizes a claim; the client refreshes
+  // it and rejoins. A lease already held is never revoked for this reason.
+  MERGE_OWNER_OUTCOME_UNAUTHENTICATED = 6;
+  // The server could not decide, as when this join is being removed from
+  // presence.
+  MERGE_OWNER_OUTCOME_UNAVAILABLE = 7;
+}
+
+// Placeholder pending the live edit service schema: the message follows the
+// service commit that adds the merge-owner lease.
+// A merge-owner control frame on a JoinSession stream.
+message MergeOwnerRequest {
+  // Client-chosen, nonzero and unique on the join; echoed in the answering
+  // MergeOwnerState.
+  uint64 request_id = 1;
+  // CLAIM, RELEASE or VERIFY.
+  MergeOwnerAction action = 2;
+}
+
+// Placeholder pending the live edit service schema: the message follows the
+// service commit that adds the merge-owner lease.
+// The session's merge-owner lease as this join sees it.
+message MergeOwnerState {
+  // The request this answers; zero for an unsolicited owner change.
+  uint64 request_id = 1;
+  // The answer to the request, or RELEASED or HELD_BY_OTHER for an owner
+  // change.
+  MergeOwnerOutcome outcome = 2;
+  // Connection ID of the join holding the lease; empty when nobody holds it.
+  string owner_connection_id = 3;
+  // User name of the join holding the lease; empty when nobody holds it.
+  string owner_user_name = 4;
+  // Increments on every grant and is never reused within a session; zero
+  // when no grant has been made.
+  uint64 epoch = 5;
+}
 
 // Client-to-server message sent over JoinSession stream.
 message SessionMessageRequest {
@@ -237,6 +336,10 @@ message JoinSessionResponse {
     PeerJoined peer_joined = 2;
     PeerLeft peer_left = 3;
     PeerMessage peer_message = 4;
+    // Placeholder pending the live edit service schema: field number and
+    // name follow the service commit that adds the merge-owner lease.
+    // Sent only to a join whose SessionConnected carried merge_owner true.
+    MergeOwnerState merge_owner = 5;
   }
 }
 
@@ -252,6 +355,12 @@ message SessionConnected {
   // disabled or predates it, means the client sends no keepalive on this
   // join.
   uint64 keepalive_interval_ms = 2;
+  // Placeholder pending the live edit service schema: field number and
+  // name follow the service commit that adds the merge-owner lease.
+  // True only when the header set merge_owner and this server implements the
+  // merge-owner lease; false means this join sends no MergeOwnerRequest and
+  // receives no MergeOwnerState.
+  bool merge_owner = 3;
 }
 
 // A peer joined the session.
@@ -621,4 +730,9 @@ message PingResponse {
   bool operation_ids = 3;
   // The service accepts UpdateLayerRequest.chained_header.
   bool chained_writes = 4;
+  // Placeholder pending the live edit service schema: field number and
+  // name follow the service commit that adds the merge-owner lease.
+  // The replica that answered implements the merge-owner lease. Informational
+  // only: a client decides per join from SessionConnected.merge_owner.
+  bool merge_owner = 5;
 }

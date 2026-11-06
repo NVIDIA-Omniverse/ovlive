@@ -117,7 +117,6 @@ async fn connect_peer_client() -> ValkeyClient {
         std::env::var("TEST_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -205,6 +204,10 @@ async fn connect_peer_client() -> ValkeyClient {
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -278,7 +281,6 @@ fn build_service_with_client(
     );
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),

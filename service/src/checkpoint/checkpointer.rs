@@ -15,8 +15,8 @@
 
 //! Leader-elected periodic checkpoint loop (SDD §22.7).
 //!
-//! `spawn_checkpoint_loop` runs one task with **three independent timers** in
-//! one `tokio::select!`, all `MissedTickBehavior::Skip` so a paused task never
+//! `spawn_checkpoint_loop` runs one task with **two independent timers** in
+//! one `tokio::select!`, both `MissedTickBehavior::Skip` so a paused task never
 //! replays a burst of missed passes:
 //!
 //! - **Per-layer tick** (`tick`) — `leader_tick` → `run_one_tick`: pass 1
@@ -30,19 +30,27 @@
 //! - **Counters-sidecar tick** (`counters_sync`) — `run_counters_sync_tick`
 //!   persists `le:counter:object_id` so startup can re-seed it (SDD §22.18),
 //!   never writing below the stored sidecar.
-//! - **Reconciliation tick** (`reconcile_interval`) — `run_reconcile_tick`
-//!   reaps orphaned artifacts, dead objects' generations and tombstoned ext
-//!   blobs (SDD §22.17.5).
 //!
-//! All three probe the **same** `le:checkpoint:leader` lock
-//! (`try_acquire_leader_lock`, 30 s TTL). A failed probe logs and waits for the
-//! next tick; it never ends the task — only the cancellation token does. The
-//! lock is deliberately distinct from `le:gc:leader` and
-//! `le:presence:sweeper:leader` so the maintenance loops spread across
-//! replicas, but unlike those two it is a **load-bearing lease**, renewed
-//! mid-walk and re-proven before every destructive step — see
+//! Both probe the **same** `le:checkpoint:leader` lock
+//! (`try_acquire_leader_lock`, 30 s TTL), written as this build's marked
+//! value (`LeaderIdentity::checkpoint_lock_value`, b.g65). A failed probe logs
+//! and waits for the next tick; it never ends the task — only the
+//! cancellation token does. The lock is deliberately distinct from
+//! `le:gc:leader` and `le:presence:sweeper:leader` so the maintenance loops
+//! spread across replicas, but unlike those two it is a **load-bearing
+//! lease**, renewed mid-walk and re-proven before every destructive step — see
 //! `CheckpointLease` for why, and why it still cannot rule out duplicate
 //! leadership (the tick body is written to be correct under it).
+//!
+//! The backup store's clean-up — orphaned artifacts, dead objects'
+//! generations and the backup copies of large values no retained backup
+//! names (SDD §22.17.5) — is **not** a timer of this loop and holds no part of
+//! this lock (b.g65): it is its own task on `le:gc:leader`
+//! (`checkpoint::cleanup`), so this loop never pauses for it; one layer's
+//! backup can still defer to a later tick when the clean-up fence refuses its
+//! publish (`publish_deferred`). Its pass body,
+//! [`run_cleanup_pass`], lives in this module beside the retention prune it
+//! shares the `{recon}` work lists with.
 //!
 //! The module is `checkpointer.rs` rather than `loop.rs` because `loop` is a
 //! Rust keyword.
@@ -70,6 +78,8 @@ use crate::checkpoint::store::{
 };
 // Only the test modules below, through `use super::*`, derive a lineage shape
 // in this file; the capture unit derives its own.
+use crate::checkpoint::cleanup::{CleanupGate, CollectHeal};
+use crate::checkpoint::ext_backup_repair::EXT_BACKUP_MIN_AGE;
 #[cfg(test)]
 use crate::checkpoint::tail_capture::lineage_shape;
 use crate::checkpoint::tail_capture::{
@@ -83,6 +93,9 @@ use crate::pacing::stuck_threshold_secs;
 use crate::storage::client::{FredErrOrigin, ValkeyClient, POOL_LABEL_MAINTENANCE};
 use crate::storage::counters::CounterStore;
 use crate::storage::ext_backup::clear_ext_backup;
+use crate::storage::ext_backup::{
+    read_backup_marks, read_ext_value_bytes, stored_ext_value_len, valkey_time_ms, ExtValueRead,
+};
 use crate::storage::external_values::{
     recon_backlog, recon_claim_expired, recon_retire, try_acquire_leader_lock, LEADER_LOCK_TTL_MS,
 };
@@ -91,16 +104,21 @@ use crate::storage::leader_lease::{
     LeaderIdentity, LeaderLease, LeaseOutcome, LeaseState, LostCause,
 };
 use crate::storage::orphan_sweep::{extract_hash_tag_id, scan_keyspace};
+use crate::storage::recon_fence::{
+    announced_stems, ext_values_live, recon_clock_ms, recon_ext_commit, recon_ext_settle,
+    recon_orphan_commit, recon_redate, recon_tomb_record, withdraw_object_announcements,
+    CommitVerdict, SettleGroups,
+};
 
 /// Pass 1's lease-keepalive pace: one [`CheckpointLease::ensure_held`] per this
-/// many enumerated keys. Equal to the page size of the per-tick
-/// `le:{*}:obj:hdr` enumeration, which pass 1 walks through
-/// `orphan_sweep::scan_keyspace` and which owns that page size (its own
-/// `SCAN_PAGE`, the orphan sweep's): large enough that the SCAN cost per tick
-/// stays modest on a multi-thousand-object fleet, small enough that a single
-/// SCAN call doesn't pin the maintenance pool's only connection for the whole
-/// keyspace.
+/// many enumerated keys. Equal to the `COUNT` of each `SCAN` step of the
+/// per-tick `le:{*}:obj:hdr` enumeration, which pass 1 walks through
+/// `orphan_sweep::scan_keyspace` and whose walker owns that count
+/// (`storage::scan_guard::KEYSPACE_SCAN_COUNT`): large enough that the SCAN
+/// cost per tick stays modest on a multi-thousand-object fleet, small enough
+/// that a single step doesn't hold the server's event loop.
 const SCAN_PAGE: u32 = 100;
+const _: () = assert!(SCAN_PAGE as u64 == crate::storage::scan_guard::KEYSPACE_SCAN_COUNT);
 
 /// The checkpoint lease's TTL: [`LEADER_LOCK_TTL_MS`], the TTL every
 /// production leader lock uses. The [`LeaderLease`] built from it renews on
@@ -159,18 +177,19 @@ const TEST_LEADER_INSTANCE: &str = "checkpoint-test-instance";
 /// duplicate leader does is already benign: adapter PUTs are keyed by
 /// `(object_id, snap_seq)` and idempotent in content, the cursor HSET is
 /// last-writer-wins between two truthful values, and a redundant assembly
-/// costs reads. The one genuinely corrupting step is the `pruned − live`
-/// classification — which since b.9qd lives in [`run_reconcile_collect`], not
-/// in the prune: [`prune_old_generations`] only *records* tombstones now, and
-/// the deletion decision is taken a grace window later against a freshly-read
-/// live set. Publishing the ext-refs sidecar ahead of the OMPF plus enumerating
-/// the live set off the sidecars *shrinks* that window sharply — see
-/// `prune_old_generations` for exactly how far, and for the residual that
-/// survives.
+/// costs reads. The ext-blob `pruned − live` classification is not under this
+/// lease at all: since b.9qd it lives in [`run_reconcile_collect`], and since
+/// b.g65 that collect runs in the checkpoint clean-up task on `le:gc:leader`,
+/// with every delete licensed in Valkey (the snapshot clock, the writers'
+/// re-arm, the delete-time fence and the liveness gate) rather than by
+/// excluding writers. [`prune_old_generations`] only *records* tombstones and
+/// announces the stems it deletes.
 ///
-/// Because the residual is real, **this lease is load-bearing** — unlike the
-/// GC lock of SDD §11.3, which guards genuinely idempotent sweeps and really
-/// is pure load-shed. Do not reason about this one by analogy to it.
+/// What this lease still guards is the tick body and the retention prune: the
+/// generation writes, the cursor stamps and the prune's deletes. It is
+/// re-proven before each destructive step there, and the clean-up reads its
+/// marked value to know a current build leads backups. Do not reason about it
+/// by analogy to the GC lock of SDD §11.3, which only sheds load.
 ///
 /// # Fail-closed rules
 ///
@@ -196,8 +215,10 @@ impl CheckpointLease {
     /// round-trip was issued, so the local deadline under-estimates rather
     /// than over-estimates the server-side expiry.
     fn new(lock_key: String, identity: LeaderIdentity, acquired_at: Instant) -> Self {
+        let lock_value = identity.checkpoint_lock_value();
         Self {
-            inner: LeaderLease::new(lock_key, identity, acquired_at, CHECKPOINT_LEASE_TTL),
+            inner: LeaderLease::new(lock_key, identity, acquired_at, CHECKPOINT_LEASE_TTL)
+                .with_lock_value(lock_value),
         }
     }
 
@@ -213,6 +234,7 @@ impl CheckpointLease {
         held_until: Instant,
         last_refresh: Instant,
     ) -> Self {
+        let lock_value = identity.checkpoint_lock_value();
         Self {
             inner: LeaderLease::with_deadlines(
                 lock_key,
@@ -220,7 +242,8 @@ impl CheckpointLease {
                 CHECKPOINT_LEASE_TTL,
                 held_until,
                 last_refresh,
-            ),
+            )
+            .with_lock_value(lock_value),
         }
     }
 
@@ -240,6 +263,13 @@ impl CheckpointLease {
     /// of the loop's lease-lost lines.
     fn identity(&self) -> &LeaderIdentity {
         self.inner.identity()
+    }
+
+    /// The marked value this lease holds `le:checkpoint:leader` as
+    /// ([`LeaderIdentity::checkpoint_lock_value`]) — the `lock_value` field of
+    /// the loop's lease-lost lines.
+    fn lock_value(&self) -> &str {
+        self.inner.lock_value()
     }
 
     /// Count `outcome` on `live_edit_checkpoint_lease_total`, labelled with
@@ -285,12 +315,13 @@ impl CheckpointLease {
         self.count(check.outcome, metrics);
         let lock_key = self.inner.lock_key();
         let leader = self.inner.identity();
+        let lock_value = self.inner.lock_value();
         match check.cause {
             None => {}
             Some(LostCause::DeadlineOverrun) => tracing::warn!(
                 lock_key = %lock_key,
                 replica_id = %leader.service_label,
-                lock_value = %leader,
+                lock_value = %lock_value,
                 "checkpoint tick overran its leader lease before a refresh could land; \
                  aborting the remainder of this tick's walk without a refresh probe \
                  (a lapsed lease cannot be re-proven, only re-acquired next tick)"
@@ -298,93 +329,18 @@ impl CheckpointLease {
             Some(LostCause::NotHeld) => tracing::warn!(
                 lock_key = %lock_key,
                 replica_id = %leader.service_label,
-                lock_value = %leader,
+                lock_value = %lock_value,
                 "checkpoint leader lease is no longer held by this replica (key lapsed or \
                  claimed by a peer); aborting the remainder of this tick's walk"
             ),
             Some(LostCause::StoreError(e)) => tracing::warn!(
                 lock_key = %lock_key,
                 replica_id = %leader.service_label,
-                lock_value = %leader,
+                lock_value = %lock_value,
                 error = %e,
                 "checkpoint leader lease refresh failed; treating the lease as lost and \
                  aborting the remainder of this tick's walk (unknown is not held)"
             ),
-        }
-        check.state
-    }
-
-    /// Re-prove the lease from scratch after a long **read-only** enumeration,
-    /// replacing it with a freshly-acquired one (b.9qd review round 2).
-    ///
-    /// # Why `ensure_held` is not enough here
-    ///
-    /// This is the same failure `run_one_tick`'s pass-1 keepalive exists to
-    /// prevent — see the long comment at that call site — arriving through a
-    /// different door. The reconciliation pass builds its lease at the leader
-    /// probe and then, before touching anything, runs an enumeration that on
-    /// the StorageApi adapter is a paginated LIST of the whole `layers/`
-    /// subtree plus (for the collect phase) one GET per ext-refs sidecar. On a
-    /// fleet of any size that walk alone can exceed the 30 s
-    /// [`LEADER_LOCK_TTL_MS`]. `ensure_held` would then take its
-    /// **overshoot** arm — `Lost` with no round-trip, by design, because an
-    /// already-lapsed lease cannot be re-proven — and the pass would reclaim
-    /// exactly zero, every pass, forever, on precisely the deployments that
-    /// have something to reclaim. Silently: the only symptom is a backlog gauge
-    /// that climbs.
-    ///
-    /// Pass 1's keepalive answers this with a paced refresh *during* the walk;
-    /// here the enumeration is a single opaque adapter call with no iteration
-    /// to hang a pacing check off, so the equivalent is to re-acquire once it
-    /// returns.
-    ///
-    /// # Why re-acquiring (not refreshing) is safe here specifically
-    ///
-    /// [`Self::ensure_held`] deliberately uses `refresh_leader_lock_if_held`
-    /// and never the acquire variant, so a lapsed key can never be silently
-    /// re-claimed and reported as continuity. This method breaks that rule on
-    /// purpose ([`LeaderLease::reacquire`]), and it may, because it is **not**
-    /// claiming continuity: it discards the old lease and starts a new one
-    /// whose deadline is measured from now. The gap it steps over is a read
-    /// that mutated nothing — no `put`, no HSET, no delete — so nothing this
-    /// replica did during the gap can have corrupted anything, and everything
-    /// it does *after* is gated by the new lease. That is the same argument
-    /// the pass-1 keepalive comment makes for refreshing mid-enumeration,
-    /// applied to a coarser step.
-    ///
-    /// `Ok(false)` (a peer holds the lock) and `Err(_)` (unknown) both return
-    /// [`LeaseState::Lost`]; the caller skips its destructive phase.
-    ///
-    /// # Its second caller: attributing a listed-sidecar 404 (b.oya)
-    ///
-    /// `run_reconcile_collect` also calls this on the failure arm of its
-    /// live-set read, when the error is the typed listed-sidecar-absent
-    /// marker ([`CheckpointError::is_listed_sidecar_absent`]). There it
-    /// decides attribution, not entitlement to delete — that pass deletes
-    /// nothing either way. `Lost` means a peer claimed the lock while the walk
-    /// outlasted the lease (its lease-gated prune explains the absence, so the
-    /// collect ends as a lease loss with no `live_set_failed`), or the probe
-    /// failed. `Held` means no lease-gated deleter explains it, so the pass
-    /// counts it as a live-set failure. The same rationale makes re-acquiring
-    /// safe there: the step it follows is the same read-only walk.
-    async fn reacquire_after_enumeration(
-        &mut self,
-        client: &ValkeyClient,
-        metrics: Option<&SharedMetrics>,
-    ) -> LeaseState {
-        let check = self.inner.reacquire(client).await;
-        self.count(check.outcome, metrics);
-        // `Ok(false)` is counted but not logged: a peer holding the lock is an
-        // ordinary failover, and the caller logs its skipped phase.
-        if let Some(LostCause::StoreError(e)) = &check.cause {
-            tracing::warn!(
-                lock_key = %self.inner.lock_key(),
-                replica_id = %self.inner.identity().service_label,
-                lock_value = %self.inner.identity(),
-                error = %e,
-                "checkpoint leader lease re-acquire after enumeration failed; treating the \
-                 lease as lost (unknown is not held)"
-            );
         }
         check.state
     }
@@ -439,7 +395,7 @@ impl LeaderLeaseKeeper for TickLeaseKeeper<'_> {
 /// loop is cancelled for graceful shutdown (SDD §5.6).
 ///
 /// A fenced read can run for up to `reader_wait_max(L)` plus its hold, longer
-/// than `main.rs`'s per-task budget for joining this loop. Left to run on at
+/// than the shutdown sequence's per-task budget for joining this loop. Left to run on at
 /// shutdown — waiting for the fence, holding it, or in its fan-out — it could
 /// still hold its fence when the pools close; its release would then fail,
 /// and the other replicas' writers of that layer would stay paused until the
@@ -663,24 +619,25 @@ pub struct CheckpointLoopConfig {
     /// `LIVE_EDIT_CHECKPOINT_COUNTERS_SYNC_SECS`. Zero is rejected at
     /// config-parse time (tight-loop guard).
     pub counters_sync: Duration,
-    /// Cadence of the checkpoint-store reconciliation pass (b.9qd) — the
-    /// sweep that reclaims orphaned partial-publish artifacts and collects
-    /// tombstoned ext blobs. From
+    /// Cadence of the checkpoint-store clean-up pass (b.9qd) — the sweep that
+    /// reclaims orphaned partial-publish artifacts and deleted layers'
+    /// generations and collects tombstoned ext blobs. From
     /// `LIVE_EDIT_CHECKPOINT_RECONCILE_INTERVAL_SECS` (default 3600). Zero is
     /// rejected at config-parse time, and the value is cross-validated to be at
     /// least the derived reconciliation grace — below that, every pass would
     /// find its candidates still inside their grace window and reclaim nothing
-    /// forever. Its own timer, independent of `tick` and `counters_sync`: the
-    /// pass is a full namespace enumeration on a cold path and nothing
-    /// downstream depends on its latency.
+    /// forever. Not read by this loop (b.g65): the clean-up is its own task
+    /// (`checkpoint::cleanup::spawn_checkpoint_cleanup`), which takes this
+    /// config for this cadence and for [`Self::leader`].
     pub reconcile_interval: Duration,
     /// Stream-replay tail-capture knobs (SDD SR-8.1). Nested as one field
     /// rather than four flat ones so the knob set travels together and
     /// construction sites name it once.
     pub tail: TailCaptureConfig,
     /// This process's leader identity (one per process, shared with every
-    /// other leader-gated task). Its [`LeaderIdentity::lock_value`] is what
-    /// the loop writes into, and compares in, `le:checkpoint:leader`. Its
+    /// other leader-gated task). Its marked
+    /// [`LeaderIdentity::checkpoint_lock_value`] is what the loop writes
+    /// into, and compares in, `le:checkpoint:leader`. Its
     /// `service_label` alone is this replica's id everywhere else: the
     /// `service` label on every checkpoint metric, the checkpoint's
     /// `creator_replica_id`, and the `replica_id` field of every log line.
@@ -692,20 +649,39 @@ pub struct CheckpointLoopConfig {
 /// Spawn the leader-elected periodic checkpoint loop.
 ///
 /// Returns immediately with the `JoinHandle` for the spawned task. The
-/// task runs until `cancel` fires, then drains and returns. Per SDD
-/// §5.6 the shutdown sequence joins this handle inside the
-/// `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` budget; the loop body never
-/// blocks across more than one tick boundary without checking the
-/// cancellation token. Within a checkpoint tick the walk checks it before
-/// every layer, and the one wait inside a layer that can hold a snapshot
-/// fence — a fenced snapshot read, its fence wait and hold — polls the token
-/// itself ([`ShutdownAwareKeeper`]) and is dropped the moment it fires, so
-/// its fence lease is released while the pools are still open. The rest of a
-/// layer in progress does not watch the token: its reset-delta build and its
-/// adapter PUTs (each ceiling-bounded at 180 s, three per
-/// `put_layer_checkpoint`) run to completion, so a shutdown that lands in that
-/// phase can outlast the join budget. The join then times
-/// out and `main.rs` moves on; such a layer holds no fence.
+/// task runs until `cancel` fires, then returns. Per SDD §5.6 the shutdown
+/// sequence (`grpc::transport::run_post_server_sequence`) joins this handle,
+/// beside every other background task, within the
+/// `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` budget (less when the sequence's shared
+/// deadline is nearer).
+///
+/// What a cancel stops, and where:
+///
+/// - **Between ticks:** the loop's `select!` is biased toward the cancel, so
+///   once it fires no timer that is also ready starts another tick. The two
+///   timers themselves are raced unbiased, in an inner `select!`, so a
+///   per-layer timer that is always ready (ticks outrunning the tick
+///   interval) cannot starve the counters timer.
+/// - **A checkpoint tick:** the walk checks the token before every layer, and
+///   again after pass 2's lease gate, immediately before the assembler. The
+///   one wait inside a layer that can hold a snapshot fence — a fenced
+///   snapshot read, its fence wait and hold — polls the token itself
+///   ([`ShutdownAwareKeeper`]) and is dropped the moment it fires, so its
+///   fence lease is released while the pools are still open. The token is
+///   checked again before the retention prune and between its lineage units,
+///   and the prune's two reads, its post-write listing and each unit's
+///   base-sidecar read, are raced against it ([`prune_after_write`],
+///   [`prune_old_generations`]); a cancel there deletes nothing.
+/// - **A counters tick:** its two reads are raced against the token and the
+///   token is checked before its PUT ([`run_counters_sync_tick`]).
+///
+/// What runs on by design: a layer whose unit has started — its reset-delta
+/// build, its adapter PUTs (each ceiling-bounded at 180 s, three per
+/// `put_layer_checkpoint`) and its cursor stamp, since a check inside the
+/// unit would strand a durable generation without its cursor — a started
+/// lineage unit of the prune, and a counters PUT once sent. A shutdown that
+/// lands in one of them can outlast the join budget. The join then times out
+/// and the shutdown sequence moves on; such a layer holds no fence.
 ///
 /// `metrics` is `Option<SharedMetrics>` because the loop is constructed in
 /// contexts that have no registry (unit fixtures); every recording site
@@ -730,14 +706,12 @@ pub fn spawn_checkpoint_loop(
             quiesce_secs = config.quiesce.as_secs(),
             retain_generations = config.retain_generations,
             counters_sync_secs = config.counters_sync.as_secs(),
-            reconcile_interval_secs = config.reconcile_interval.as_secs(),
-            reconcile_grace_secs = reconcile_grace(store.publish_worst_case()).as_secs(),
             tail_enabled = config.tail.enabled,
             tail_max_chain = config.tail.max_chain,
             tail_max_entries = config.tail.max_entries,
             tail_max_bytes = config.tail.max_bytes,
             replica_id = %config.leader.service_label,
-            lock_value = %config.leader,
+            lock_value = %config.leader.checkpoint_lock_value(),
             "checkpoint loop background task started"
         );
 
@@ -754,15 +728,6 @@ pub fn spawn_checkpoint_loop(
         // paused/blocked tick must not stack a catch-up burst.
         let mut counters_timer = tokio::time::interval(config.counters_sync);
         counters_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        // Checkpoint-store reconciliation timer (b.9qd). Third independent
-        // cadence on the same leader lock — hourly by default, because the
-        // pass is a full enumeration of the adapter's `layers/` namespace plus
-        // one live-set read (both LIST-shaped and, on a blob backend, billable)
-        // and nothing downstream waits on it. Same MissedTickBehavior::Skip
-        // rationale as its two siblings.
-        let mut reconcile_timer = tokio::time::interval(config.reconcile_interval);
-        reconcile_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         // Constructed in-place so `spawn_checkpoint_loop`'s signature is
         // unchanged. `client` and `keys` are already captured by the closure;
@@ -790,46 +755,50 @@ pub fn spawn_checkpoint_loop(
         let mut sidecar_seen = false;
 
         loop {
-            tokio::select! {
+            // Biased toward the cancel, so once it fires no timer that is also
+            // ready starts another tick. The two timers are raced in an inner,
+            // unbiased `select!`: biasing them as well would rank the per-layer
+            // timer above the counters timer, and with ticks that outrun
+            // `tick` (both timers skip missed ticks) every pass would take the
+            // per-layer arm and the counters sidecar would never sync again.
+            // `true` when the per-layer timer fired, `false` for the counters
+            // timer.
+            let checkpoint_tick = tokio::select! {
+                biased;
                 () = cancel.cancelled() => {
                     tracing::info!("checkpoint loop shutting down");
                     return;
                 }
-                _ = timer.tick() => {
-                    leader_tick(
-                        &client,
-                        &keys,
-                        &store,
-                        &config,
-                        metrics.as_ref(),
-                        &cancel,
-                        &mut lease_loss_demotion,
-                    )
-                    .await;
-                }
-                _ = counters_timer.tick() => {
-                    counters_leader_tick(
-                        &client,
-                        &keys,
-                        &store,
-                        &counter_store,
-                        &config,
-                        metrics.as_ref(),
-                        &mut sidecar_seen,
-                    )
-                    .await;
-                }
-                _ = reconcile_timer.tick() => {
-                    reconcile_leader_tick(
-                        &client,
-                        &keys,
-                        &store,
-                        &config,
-                        metrics.as_ref(),
-                        &cancel,
-                    )
-                    .await;
-                }
+                checkpoint_tick = async {
+                    tokio::select! {
+                        _ = timer.tick() => true,
+                        _ = counters_timer.tick() => false,
+                    }
+                } => checkpoint_tick,
+            };
+            if checkpoint_tick {
+                leader_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    metrics.as_ref(),
+                    &cancel,
+                    &mut lease_loss_demotion,
+                )
+                .await;
+            } else {
+                counters_leader_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &counter_store,
+                    &config,
+                    metrics.as_ref(),
+                    &cancel,
+                    &mut sidecar_seen,
+                )
+                .await;
             }
         }
     })
@@ -846,7 +815,9 @@ pub fn spawn_checkpoint_loop(
 ///
 /// `sidecar_seen` is the loop's per-process "this process has seen the
 /// counters sidecar exist" flag, passed through to
-/// [`run_counters_sync_tick`]; a non-leader tick leaves it untouched.
+/// [`run_counters_sync_tick`]; a non-leader tick leaves it untouched. So is
+/// `cancel`, the loop's shutdown token.
+#[allow(clippy::too_many_arguments)]
 async fn counters_leader_tick(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -854,24 +825,32 @@ async fn counters_leader_tick(
     counter_store: &CounterStore,
     config: &CheckpointLoopConfig,
     metrics: Option<&SharedMetrics>,
+    cancel: &CancellationToken,
     sidecar_seen: &mut bool,
 ) {
     let lock_key = keys.checkpoint_leader_lock();
-    match try_acquire_leader_lock(client, &lock_key, &config.leader, LEADER_LOCK_TTL_MS).await {
+    match try_acquire_leader_lock(
+        client,
+        &lock_key,
+        &config.leader.checkpoint_lock_value(),
+        LEADER_LOCK_TTL_MS,
+    )
+    .await
+    {
         Ok(true) => {
-            run_counters_sync_tick(store, counter_store, metrics, sidecar_seen).await;
+            run_counters_sync_tick(store, counter_store, metrics, cancel, sidecar_seen).await;
         }
         Ok(false) => {
             tracing::debug!(
                 replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
+                lock_value = %config.leader.checkpoint_lock_value(),
                 "checkpoint counters-sync tick skipped: another replica holds the leader lock"
             );
         }
         Err(e) => {
             tracing::warn!(
                 replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
+                lock_value = %config.leader.checkpoint_lock_value(),
                 error = %e,
                 "checkpoint counters-sync leader lock acquisition failed; skipping tick"
             );
@@ -919,6 +898,14 @@ async fn counters_leader_tick(
 /// first writes the sidecar, a read served by a storage-api pod that cached
 /// the earlier not-found still answers absent, and each such tick counts an
 /// `error` until the entry expires.
+///
+/// A present answer can be stale too: the backend can serve the sidecar's
+/// earlier body, for up to the same lifetime after a later write
+/// (`Config::checkpoint_storage_api_not_found_cache_secs`). That read is a
+/// floor below the true stored value, so a counter rewound inside that window
+/// to between the two is written, lowering the sidecar. Not guarded here: it
+/// needs a backing-store loss within one cache lifetime of a sidecar write,
+/// the residual SDD §22.16 states for the on-access readers.
 ///
 /// A deleted sidecar is written again only by a replica whose process has
 /// not read or written the sidecar since it started. The bit survives
@@ -997,25 +984,39 @@ async fn counters_leader_tick(
 ///   re-reads the sidecar and the counter and retries.
 /// - Success → bump `inc_checkpoint_write("success", "counters_sidecar")`.
 ///
-/// Cancellation is handled by the outer `tokio::select!` between
-/// ticks; this body does not check `cancel.is_cancelled()` mid-tick.
+/// # Cancellation
+///
 /// The work per tick is one adapter GET, one O(1) Valkey GET and at most
-/// one adapter PUT, each bounded by its own call ceiling.
+/// one adapter PUT, each bounded by its own call ceiling. The two reads are
+/// raced against `cancel`, the loop's shutdown token, and abandoned the
+/// moment it fires, and the token is checked once more before the PUT: a
+/// tick cancelled during its reads returns at once, with no counter tick and
+/// no log line, and one cancelled after them writes nothing. A PUT already
+/// sent runs to its ceiling; abandoning a write in flight could let it land
+/// late (the residual above).
 async fn run_counters_sync_tick(
     store: &Arc<dyn CheckpointStore>,
     counter_store: &CounterStore,
     metrics: Option<&SharedMetrics>,
+    cancel: &CancellationToken,
     sidecar_seen: &mut bool,
 ) {
     // 1. Read the stored sidecar: the floor this tick must not write below.
     //    Read before the counter — see "Monotonic rule" above for why the
     //    order matters. `Ok(None)` means no floor only while this process has
     //    never seen the sidecar exist; after that it is an error.
-    let stored_max = match store.get_counters_sidecar().await {
+    let stored = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        stored = store.get_counters_sidecar() => stored,
+    };
+    let stored_max = match stored {
         Ok(None) if *sidecar_seen => {
             // The sidecar existed, so this "absent" is most likely the
-            // backup store's cached not-found answer. Taking it as no floor
-            // would let a rewound counter write below the true stored value.
+            // backup store's cached not-found answer (it may serve a cached
+            // by-address answer either way, "Monotonic rule" above). Taking it
+            // as no floor would let a rewound counter write below the true
+            // stored value.
             tracing::warn!(
                 "checkpoint counters-sync get_counters_sidecar answered absent, but this process \
                  has already seen the counters sidecar. Most likely a cached \"absent\" answer \
@@ -1066,7 +1067,12 @@ async fn run_counters_sync_tick(
     };
 
     // 2. GET le:counter:object_id.
-    let n = match counter_store.current_object_id().await {
+    let current = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        current = counter_store.current_object_id() => current,
+    };
+    let n = match current {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -1133,7 +1139,10 @@ async fn run_counters_sync_tick(
         }
     };
 
-    // 6. Persist.
+    // 6. Persist, unless the loop was cancelled during the reads.
+    if cancel.is_cancelled() {
+        return;
+    }
     match store.put_counters_sidecar(Bytes::from(bytes)).await {
         Ok(()) => {
             // A sidecar this process wrote exists: from here on an "absent"
@@ -1177,11 +1186,22 @@ async fn run_counters_sync_tick(
 ///
 /// [reap]: super::base_bootstrap
 ///
-/// `record` is a **register-only** claim (`max_return = 0`): neither writer
-/// collects. The collect — re-read the live set once the grace has elapsed,
-/// delete what is still absent — belongs solely to
-/// [`run_reconcile_collect`], which is what makes the whole thing a
-/// claim-then-collect protocol rather than the inline cascade it replaced.
+/// `record` registers and never claims: no writer collects. The collect —
+/// re-read the live set once the grace has elapsed, delete what is still
+/// absent and licensed — belongs solely to [`run_reconcile_collect`], which is
+/// what makes the whole thing a claim-then-collect protocol rather than the
+/// inline cascade it replaced.
+///
+/// Since b.g65 the same run also **announces** the stems of the base
+/// generations about to be deleted on `le:ckpt:{recon}:deleting`
+/// (`scripts/recon_tomb_record.lua`): a collect whose live-set walk listed such
+/// a sidecar and then read it absent skips it on that evidence instead of
+/// aborting, because a deleter that announced a stem has read and tombstoned
+/// its hashes and deletes only a generation it decided is not retained. Every
+/// production deleter of a base generation's sidecar records through here
+/// before its first delete: the retention prune, the orphan reap (which also
+/// announces through its commit), the dead-object reap and the base
+/// bootstrap's dead-base reap.
 ///
 /// `pub(super)` since b.vn6: the creation-time base bootstrap's fast-path reap
 /// is a THIRD writer of the same act — it deletes a base it has just written
@@ -1190,10 +1210,11 @@ async fn run_counters_sync_tick(
 /// from open-coding the ZSET key and the counter.
 pub(super) struct ExtTombstoneSink<'a> {
     client: &'a ValkeyClient,
-    /// Fully-qualified `le:ckpt:{recon}:tomb` key.
-    key: String,
+    keys: KeySchema,
     metrics: Option<&'a SharedMetrics>,
     replica_id: &'a str,
+    /// The reconciliation grace; `le:ckpt:{recon}:deleting` keeps two of them.
+    grace: Duration,
 }
 
 impl<'a> ExtTombstoneSink<'a> {
@@ -1202,30 +1223,59 @@ impl<'a> ExtTombstoneSink<'a> {
         keys: &KeySchema,
         metrics: Option<&'a SharedMetrics>,
         replica_id: &'a str,
+        grace: Duration,
     ) -> Self {
         Self {
             client,
-            key: keys.checkpoint_reconcile_tombstones(),
+            keys: keys.clone(),
             metrics,
             replica_id,
+            grace,
         }
     }
 
     /// Record `hashes` as tombstoned, stamping each with the Valkey-side clock
-    /// on **first** sighting only (`ZADD NX`).
+    /// on **first** sighting only (`ZADD NX`), and announce `stems` — the
+    /// `le:ckpt:{recon}:orphans` spelling of the base generations about to be
+    /// deleted ([`reconcile_stem_member`]) — on `le:ckpt:{recon}:deleting`,
+    /// in one run per chunk, the stems on the last
+    /// (`storage::recon_fence::recon_tomb_record`).
     ///
-    /// A no-op on an empty slice. Recording a hash that is in fact still live is
-    /// harmless — the collect phase re-reads the live set and spares it — which
-    /// is precisely the asymmetry that lets callers record first and ask
-    /// questions later.
-    pub(super) async fn record(&self, hashes: Vec<String>) -> Result<(), fred::error::Error> {
-        if hashes.is_empty() {
+    /// A no-op when both are empty. Recording a hash that is in fact still live
+    /// is harmless — the collect phase re-reads the live set and spares it —
+    /// which is precisely the asymmetry that lets callers record first and ask
+    /// questions later. A stem is different: an announcement lets the collect
+    /// skip a not-found read of that stem's sidecar (N2), so a caller announces
+    /// only a generation it has decided not to retain, before deleting it: the
+    /// retention prune its pruned generations, in one record before its
+    /// deletes; the base bootstrap's dead-base reap the base it just wrote;
+    /// the dead reap each generation after its liveness re-probe, never before.
+    ///
+    /// If a delete then fails, the generation stays announced until its
+    /// caller's retry. The retention prune's next tick re-announces and
+    /// retries it. For the dead reap and the bootstrap reap, whose object
+    /// normally has a member on the dead-object set (the bootstrap's caller
+    /// re-arms it, best effort), that is the dead reap's next re-probe of the
+    /// object, at most one pass later: a `Dead` verdict re-announces it and
+    /// retries the delete, a deferring verdict keeps it owed, and a `Live`
+    /// verdict (a restore kept it) withdraws every announcement of the object
+    /// before retiring the member, retiring nothing if that withdrawal fails.
+    /// If neither of the bootstrap reap's registrations landed (the delete
+    /// path's and its caller's re-arm, both best effort), the base stays
+    /// announced until a later announcement's trim or the key's 24 h expiry.
+    /// The other exception is two clean-up runners racing a restore (see
+    /// [`run_reconcile_dead_objects`]). A re-publish of the stem also removes
+    /// it.
+    pub(super) async fn record(
+        &self,
+        stems: &[String],
+        hashes: Vec<String>,
+    ) -> Result<(), fred::error::Error> {
+        if hashes.is_empty() && stems.is_empty() {
             return Ok(());
         }
         let n = hashes.len();
-        // `Duration::ZERO` grace + `max_return = 0`: register-only, claim
-        // nothing. The grace argument is inert on a register-only call.
-        recon_claim_expired(self.client, &self.key, Duration::ZERO, 0, &hashes).await?;
+        recon_tomb_record(self.client, &self.keys, self.grace, stems, &hashes).await?;
         if let Some(m) = self.metrics {
             m.add_checkpoint_reconcile("ext_tombstoned", n as u64, self.replica_id);
         }
@@ -1257,42 +1307,76 @@ impl<'a> ExtTombstoneSink<'a> {
 /// is the storage-cost bug this whole pass exists to fix.
 const RECONCILE_BATCH: usize = 100;
 
+/// `d` in whole milliseconds, saturating.
+fn millis_u64(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Re-date `members` of the `{recon}` work list `zset_key` to now and clear
+/// the list (b.g65, D4): members a phase deferred for a reason of their own,
+/// moved behind the members the oldest-first claim would otherwise never
+/// reach. `ZADD XX GT` (`storage::recon_fence::recon_redate`): a member
+/// retired meanwhile stays retired, and a score only ever moves later. Not
+/// fatal: a member left at its old score costs only head-of-line order, so a
+/// failure is a WARN.
+async fn redate_members(
+    client: &ValkeyClient,
+    zset_key: &str,
+    members: &mut Vec<String>,
+    replica_id: &str,
+) {
+    if members.is_empty() {
+        return;
+    }
+    if let Err(e) = recon_redate(client, zset_key, members).await {
+        tracing::warn!(
+            replica_id = %replica_id,
+            zset_key = %zset_key,
+            redate_count = members.len(),
+            error = %e,
+            "checkpoint clean-up could not move deferred members behind the rest of their work \
+             list; they stay at the head of the next claim (no member is lost)"
+        );
+    }
+    members.clear();
+}
+
 /// Divisor applied to the reconcile interval for the wall-clock half of the
 /// drain budget.
 ///
-/// A quarter, so four consecutive fully-budgeted passes still fit inside one
-/// interval — the pass must never be able to run into its own next tick (the
-/// timer is `MissedTickBehavior::Skip`, so it would not stack, but a pass that
-/// routinely consumed its whole interval would starve the per-layer and
-/// counters ticks of the leader lock they share).
+/// A quarter, so a pass never runs into its own next interval (the timer is
+/// `MissedTickBehavior::Skip`, so it would not stack) and clean-up's load on
+/// the storage service stays a bounded fraction of each interval.
 const RECONCILE_DRAIN_INTERVAL_DIVISOR: u32 = 4;
 
-/// Wall-clock ceiling on one reconciliation pass's drain loops.
+/// Wall-clock ceiling on one clean-up pass's drain loops.
 ///
 /// `min(interval / 4, grace)` — two independent bounds, and the tighter one
-/// wins because they guard different failures.
+/// wins.
 ///
-/// **The interval fraction** is the scheduling bound: see
-/// [`RECONCILE_DRAIN_INTERVAL_DIVISOR`].
+/// **The interval fraction** bounds clean-up's hourly load: see
+/// [`RECONCILE_DRAIN_INTERVAL_DIVISOR`]. There is no shared lock to protect
+/// (b.g65): the pass runs on its own task under `le:gc:leader`, and the backup
+/// loop never pauses for it.
 ///
-/// **The grace** is the *staleness* bound, and it is the one that is actually
-/// load-bearing. Both drain loops act on a snapshot read once at the top of
-/// their phase — `list_layer_artifacts` for the orphan phase,
-/// `list_live_ext_set` for the collect — and both snapshots decay in
-/// the same direction: toward classifying something as garbage that has since
-/// been made live. An orphan stem can acquire an OMPF via the SDD §22.7 step-8
-/// re-put at the same `snap_seq`; a tombstoned hash can be re-referenced by a
-/// generation whose sidecar publishes after our read. Deleting on a snapshot
-/// older than one grace window re-opens exactly the window the grace exists to
-/// close, so the drain stops there and the next pass re-reads. Re-reading the
-/// snapshot per drain iteration would be the alternative, and it is the wrong
-/// trade: on a blob backend `list_live_ext_set` is a LIST plus one GET
-/// per sidecar, which is the single most expensive thing this pass does and the
-/// reason it is structured as one read per pass.
+/// **The grace** keeps the dead-object phase's span from step (a)'s listing
+/// to its claims inside `grace − publish_worst_case`, the bound
+/// [`run_reconcile_dead_objects`]' "listings disagree" verdict rests on.
 ///
-/// Never bounds the *first* batch: both loops test the deadline only after
-/// acting, so a pass always makes at least one batch of progress however small
-/// the budget computes.
+/// It is **not** the collect's staleness bound any more (b.g65). The collect
+/// reads its live set once and acts on it for the rest of the budget, but its
+/// license is anchored to the `{recon}` clock it reads just before the walk
+/// (R1, [`run_reconcile_collect`]): only hashes whose tombstone and latest
+/// writer re-arm predate `t0 − grace` may be deleted, so a longer walk or a
+/// later batch only shrinks what is due; it never widens what may be deleted.
+/// Re-reading the live set per batch would be the alternative, and it is the
+/// wrong trade: on a blob backend `list_live_ext_set` is a LIST plus one GET
+/// per sidecar, the single most expensive thing this pass does.
+///
+/// Never bounds the *first* unit of work: the collect tests its deadline after
+/// each batch, and the orphan and dead-object drains before each member after
+/// the first, so a pass always makes some progress however small the budget
+/// computes.
 ///
 /// **One budget per pass, fair-split across the phases (b.gg7).** This function
 /// returns the budget for the *whole pass*; [`ReconcilePassBudget`] is what
@@ -1304,7 +1388,7 @@ fn reconcile_drain_budget(interval: Duration, grace: Duration) -> Duration {
 }
 
 /// The phase deadlines one reconciliation pass runs against (b.gg7 review
-/// round 2, extended by b.vn6), minted once in [`reconcile_leader_tick`] and
+/// round 2, extended by b.vn6), minted once in [`run_cleanup_pass`] and
 /// threaded down.
 ///
 /// # Why not one deadline for the pass
@@ -1323,7 +1407,7 @@ fn reconcile_drain_budget(interval: Duration, grace: Duration) -> Duration {
 /// So the orphan DRAIN gets `start + budget/4`, the dead-object phase gets
 /// `start + budget/2`, and the collect phase gets `start + budget`. The collect
 /// is thereby guaranteed **at least half** the pass (neither reclamation phase
-/// can run past its own deadline by more than one in-flight act), and the pass
+/// can run past its own deadline by more than one member's work), and the pass
 /// total is unchanged.
 ///
 /// # Why the orphan enumeration has its own deadline (b.vn6 review round 1)
@@ -1353,7 +1437,7 @@ fn reconcile_drain_budget(interval: Duration, grace: Duration) -> Duration {
 ///
 /// The two are still both bounded by the same half, so the pass total is
 /// unchanged: an enumeration that consumes all of `budget/2` leaves the orphan
-/// drain already past `orphan_deadline` (it stops after one in-flight batch, as
+/// drain already past `orphan_deadline` (it stops after one member, as
 /// designed) and the dead-object phase already past `dead_deadline`, with the
 /// collect phase holding its guaranteed half.
 ///
@@ -1380,21 +1464,24 @@ fn reconcile_drain_budget(interval: Duration, grace: Duration) -> Duration {
 /// CreateLayer-overwrite cleanup, so it races a continuous fleet-wide deletion
 /// rate exactly as the collect races a tombstone rate. What earns it a place in
 /// the bounded half is that it is far **cheaper per unit of work**: one
-/// targeted `list_layer_checkpoints(object_id)` plus a handful of
-/// per-generation deletes, against the collect's store-wide
-/// `list_live_ext_set` live-set re-read — the single most expensive
-/// call in the pass, and the one whose snapshot has to stay fresher than a
-/// grace window. A quarter of the budget buys the dead phase many more objects
-/// than it would buy the collect hashes, so the split is where the marginal
-/// second does the most work, not where the work is finite.
+/// `list_layer_checkpoints(object_id)` — on StorageApi a listing of that
+/// object's own prefix, one small page (b.g65; the whole-folder listing only
+/// as a fallback if the storage service refuses a per-layer prefix), and on
+/// LocalDisk a read of the local directory — plus a handful of per-generation
+/// deletes, against the collect's store-wide `list_live_ext_set` live-set walk
+/// — the single most expensive call in the pass. A quarter of the budget buys
+/// the dead phase many more objects than it would buy the collect hashes, so
+/// the split is where the marginal second does the most work, not where the
+/// work is finite.
 ///
 /// The honest consequence is that this phase CAN fall behind on a
 /// delete-heavy fleet. That is why it is instrumented rather than merely
 /// argued: `live_edit_checkpoint_dead_object_backlog` is sampled once per pass
 /// beside the ext-tombstone backlog, and a level that only rises is the signal
 /// that a quarter is no longer enough. Falling behind costs storage, never
-/// correctness — the ZSET is durable and every member keeps its original
-/// `ZADD NX` first-observation score.
+/// correctness — the ZSET is durable and every member keeps its `ZADD NX`
+/// first-observation score, or a later one where the phase re-dated a member
+/// it deferred (D4).
 ///
 /// "Once per pass" is unconditional, and b.vn6 review round 2 (C2) is what makes
 /// it so. The orphan enumeration used to `return` from [`run_reconcile_tick`] on
@@ -1405,10 +1492,12 @@ fn reconcile_drain_budget(interval: Duration, grace: Duration) -> Duration {
 ///
 /// # The honest pass bound
 ///
-/// `budget + one in-flight batch of acts`. All three drain loops test their
-/// deadline only *after* acting, so each phase can overshoot by one batch; every
-/// call inside a batch is individually bounded by the adapter's enforced
-/// per-call ceiling. Both phase-opening enumerations (`list_layer_artifacts`,
+/// `budget + one in-flight unit of work per phase`: the orphan and dead-object
+/// drains test their deadline before each member after the first (b.g65, D2),
+/// so each overshoots by at most one member's work, and the collect tests its
+/// deadline after each batch, so it overshoots by at most one batch; every
+/// call inside is individually bounded by the adapter's enforced per-call
+/// ceiling. Both phase-opening enumerations (`list_layer_artifacts`,
 /// `list_live_ext_set`) are wrapped in a `tokio::time::timeout` of
 /// their phase's *remaining* budget, so they are inside the number rather than
 /// added to it — which is the difference between this bound and the pre-review
@@ -1430,8 +1519,9 @@ struct ReconcilePassBudget {
     /// Deadline for the orphan phase's **drain loop**.
     orphan_deadline: Instant,
     /// Deadline for the dead-object phase's drain loop (b.vn6). That phase
-    /// opens no enumeration of its own: it claims from a ZSET and then makes
-    /// one targeted `list_layer_checkpoints` per claimed object.
+    /// opens no store-wide enumeration of its own: it claims from a ZSET and
+    /// then lists each claimed object's own generations
+    /// (`list_layer_checkpoints`).
     dead_deadline: Instant,
     /// Deadline for the collect phase, and therefore for the pass.
     collect_deadline: Instant,
@@ -1539,107 +1629,140 @@ const RECONCILE_TEMP_MEMBER_SUFFIX: &str = ".tmp";
 /// [temp-kind]: crate::checkpoint::store::LayerArtifactKind::Temp
 const RECONCILE_TAIL_MEMBER_SUFFIX: &str = ".tail";
 
-/// One iteration of the reconciliation timer (b.9qd): probe the **same**
-/// `le:checkpoint:leader` lock the per-layer and counters ticks use, and
-/// dispatch [`run_reconcile_tick`] on success. Structurally identical to
-/// [`counters_leader_tick`], including the leader-lock contract: `Ok(false)`
-/// debug-logs and skips with no metric; `Err(_)` warn-logs and skips.
+/// The `le:ckpt:{recon}:orphans` spelling of the generation stem
+/// `(object_id, snap_seq, kind)`: `<object_id>.<snap_seq>` for a base,
+/// `<object_id>.<to_seq>.tail` for a tail (see
+/// [`RECONCILE_TAIL_MEMBER_SUFFIX`]). The same spelling names the stem on
+/// `le:ckpt:{recon}:deleting` and in a publish's re-arm
+/// (`checkpoint::put_guard`), so one function owns it.
+pub(super) fn reconcile_stem_member(object_id: u64, snap_seq: u64, kind: CheckpointKind) -> String {
+    match kind {
+        // Unqualified, unchanged across the tail upgrade — see
+        // `RECONCILE_TAIL_MEMBER_SUFFIX` for why the base spelling must not
+        // gain a symmetric `.base`.
+        CheckpointKind::Base => format!("{object_id}.{snap_seq}"),
+        CheckpointKind::Tail => format!("{object_id}.{snap_seq}{RECONCILE_TAIL_MEMBER_SUFFIX}"),
+    }
+}
+
+/// What one clean-up pass did, for its one summary line (b.g65, D6): each
+/// phase's duration and listing size, the dead-object phase's tally, the
+/// collect's bound, walk time and outcome, the absent sidecars it skipped by
+/// reason, and whether it stopped because an older build, or no replica, leads
+/// backups (`deferred_older_build`). In-memory and per pass.
+#[derive(Debug, Default)]
+pub(super) struct CleanupPassSummary {
+    pub(super) orphan_listing_ms: u64,
+    pub(super) orphan_listed: usize,
+    pub(super) orphan_phase_ms: u64,
+    pub(super) orphan_deleted: u64,
+    pub(super) temp_deleted: u64,
+    pub(super) dead_phase_ms: u64,
+    pub(super) dead_claimed: u64,
+    pub(super) dead_retired: u64,
+    pub(super) dead_deferred: u64,
+    pub(super) dead_reaped: u64,
+    pub(super) dead_listed: u64,
+    pub(super) collect_phase_ms: u64,
+    pub(super) collect_bound_secs: u64,
+    pub(super) walk_ms: u64,
+    pub(super) walk_listed: usize,
+    pub(super) collected: u64,
+    pub(super) spared: u64,
+    pub(super) deferred_live: u64,
+    pub(super) deferred_rearmed: u64,
+    pub(super) healed: u64,
+    pub(super) skipped_unfinished: u64,
+    pub(super) skipped_announced: u64,
+    pub(super) deferred_older_build: bool,
+}
+
+/// One checkpoint clean-up pass, run by the clean-up task
+/// (`checkpoint::cleanup`) while this replica holds `le:gc:leader`: derive the
+/// grace and the pass budget, run [`run_reconcile_tick`] behind the pass's
+/// [`CleanupGate`], and log the pass's one summary line.
 ///
-/// # Why not a fourth leader lock
+/// The grace is derived HERE, once, from the adapter's own publish bound, and
+/// passed down explicitly rather than re-derived inside the pass: the
+/// derivation belongs on the dispatch boundary, and an in-crate test can
+/// drive [`run_reconcile_tick`] at a grace of its choosing — with no env var,
+/// trait knob or test-only seam that could weaken the real bound. A sub-floor
+/// grace suits a test of the claim deferral only: the collect's commit
+/// (`recon_ext_commit.lua`) licenses no delete once its clock is more than one
+/// grace past the `t0` it read before its live-set walk, so a pass that must
+/// collect runs at the 60 s production floor with its tombstones pre-aged
+/// rather than waiting a grace out.
 ///
-/// The GC and presence sweeps get their own locks (SDD §13.3) so the
-/// maintenance loops can spread across replicas. This pass must NOT follow that
-/// precedent. It deletes generations and ext blobs, which is the same
-/// destructive surface the retention prune has, and a second lock would let two
-/// replicas run those deletes concurrently by design rather than by accident —
-/// re-opening exactly the duplicate-leadership hazard §22.9 explains this lock
-/// is a renewed lease (not a load-shed probe) in order to narrow.
-///
-/// The non-leader arm publishes a **zero** tombstone backlog for the same
-/// reason [`leader_tick`] zeroes its pending-age gauges: an OTel `Gauge` never
-/// decays, so a demoted leader would otherwise pin the fleet-wide `max()` at a
-/// backlog that no longer exists. The `Err(_)` arm publishes nothing — a failed
-/// probe means we do not know whether this replica is the leader, and unknown
-/// is not zero.
-async fn reconcile_leader_tick(
+/// ONE budget for the whole pass, fair-split across its phases
+/// ([`ReconcilePassBudget`]), minted here for the same reason.
+pub(crate) async fn run_cleanup_pass(
     client: &ValkeyClient,
     keys: &KeySchema,
     store: &Arc<dyn CheckpointStore>,
     config: &CheckpointLoopConfig,
     metrics: Option<&SharedMetrics>,
     cancel: &CancellationToken,
+    heal: Option<&CollectHeal>,
 ) {
-    let lock_key = keys.checkpoint_leader_lock();
-    // Sampled BEFORE the acquire round-trip so the lease's local deadline
-    // under-estimates rather than over-estimates the server-side expiry —
-    // same discipline as `leader_tick`.
-    let acquire_started = Instant::now();
-    match try_acquire_leader_lock(client, &lock_key, &config.leader, LEADER_LOCK_TTL_MS).await {
-        Ok(true) => {
-            let mut lease = CheckpointLease::new(lock_key, config.leader.clone(), acquire_started);
-            // The grace is derived HERE, once, from the adapter's own publish
-            // bound, and passed down explicitly rather than re-derived inside
-            // the pass. Two reasons: the derivation belongs on the dispatch
-            // boundary next to the leader probe, and an in-crate test can drive
-            // `run_reconcile_tick` with a zero grace instead of waiting out the
-            // 60 s production floor — without any env var, trait knob, or
-            // test-only seam that could weaken the real bound.
-            let grace = reconcile_grace(store.publish_worst_case());
-            // ONE budget for the whole pass, fair-split across its phases —
-            // two at b.gg7, three since b.vn6 — minted here for the same reason
-            // `grace` is: the dispatch boundary is where the pass's budget
-            // belongs.
-            //
-            // Both phases used to compute their own `Instant::now() +
-            // reconcile_drain_budget(..)`, which was defensible only while the
-            // two long reads were unbounded — the reads dominated, so the budget
-            // was a formality. Now that `list_layer_artifacts` and
-            // `list_live_ext_set` are bounded (by their share of this
-            // budget, preemptively), per-phase budgets would let one pass claim
-            // orphan-budget + orphan-read + collect-budget + collect-read, i.e.
-            // up to 4× the number `RECONCILE_DRAIN_INTERVAL_DIVISOR` exists to
-            // guarantee.
-            //
-            // The honest pass bound this produces is `budget + one in-flight
-            // batch of acts` — each act's calls individually bounded by the
-            // adapter's enforced per-call ceiling. See `ReconcilePassBudget` for
-            // the split, and for why the collect phase's guaranteed half is not
-            // negotiable.
-            let budget = ReconcilePassBudget::starting_now(config.reconcile_interval, grace);
-            run_reconcile_tick(
-                client, keys, store, config, metrics, cancel, &mut lease, grace, budget,
-            )
-            .await;
-        }
-        Ok(false) => {
-            if let Some(m) = metrics {
-                // Both backlog gauges zero-publish on the non-leader arm, for
-                // the same reason: an OTel `Gauge` never decays, so a replica
-                // that held the lock, saw a backlog, and then lost the lock
-                // would export that stale number forever and pin the
-                // fleet-wide `max()`.
-                m.record_checkpoint_ext_tombstone_backlog(0, &config.leader.service_label);
-                m.record_checkpoint_dead_object_backlog(0, &config.leader.service_label);
-            }
-            tracing::debug!(
-                replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
-                "checkpoint reconciliation tick skipped: another replica holds the leader lock"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
-                error = %e,
-                "checkpoint reconciliation leader lock acquisition failed; skipping tick"
-            );
-        }
-    }
+    let grace = reconcile_grace(store.publish_worst_case());
+    let budget = ReconcilePassBudget::starting_now(config.reconcile_interval, grace);
+    let mut gate = CleanupGate::new(client, keys, &config.leader, metrics);
+    let mut summary = CleanupPassSummary::default();
+    let started = Instant::now();
+    run_reconcile_tick(
+        client,
+        keys,
+        store,
+        config,
+        metrics,
+        cancel,
+        &mut gate,
+        grace,
+        budget,
+        heal,
+        &mut summary,
+    )
+    .await;
+    summary.deferred_older_build = gate.older_build_leads();
+    log_cleanup_pass_summary(&config.leader.service_label, started.elapsed(), &summary);
 }
 
-/// The checkpoint-store reconciliation pass (b.9qd) — closes the two residuals
-/// SDD §22.17.3 left open after b.s5y.
+/// The pass's one summary line (D6), at INFO.
+fn log_cleanup_pass_summary(replica_id: &str, elapsed: Duration, s: &CleanupPassSummary) {
+    tracing::info!(
+        replica_id = %replica_id,
+        elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        orphan_listing_ms = s.orphan_listing_ms,
+        orphan_listed = s.orphan_listed,
+        orphan_phase_ms = s.orphan_phase_ms,
+        orphan_deleted = s.orphan_deleted,
+        temp_deleted = s.temp_deleted,
+        dead_phase_ms = s.dead_phase_ms,
+        dead_claimed = s.dead_claimed,
+        dead_listed_generations = s.dead_listed,
+        dead_retired = s.dead_retired,
+        dead_deferred = s.dead_deferred,
+        dead_reaped = s.dead_reaped,
+        collect_phase_ms = s.collect_phase_ms,
+        collect_bound_secs = s.collect_bound_secs,
+        walk_ms = s.walk_ms,
+        walk_listed = s.walk_listed,
+        collected = s.collected,
+        spared = s.spared,
+        deferred_live = s.deferred_live,
+        deferred_rearmed = s.deferred_rearmed,
+        healed = s.healed,
+        skipped_unfinished_sidecars = s.skipped_unfinished,
+        skipped_announced_sidecars = s.skipped_announced,
+        deferred_older_build = s.deferred_older_build,
+        "checkpoint clean-up pass complete"
+    );
+}
+
+/// The checkpoint-store clean-up pass body (b.9qd) — closes the two residuals
+/// SDD §22.17.3 left open after b.s5y. Run by [`run_cleanup_pass`] on the
+/// clean-up task (`checkpoint::cleanup`), never under `le:checkpoint:leader`
+/// (b.g65).
 ///
 /// # What it reclaims, and why nothing else can
 ///
@@ -1735,12 +1858,18 @@ async fn reconcile_leader_tick(
 ///    receive back the ones registered at least a grace ago. Expired members
 ///    that are no longer candidates have healed (their OMPF landed) and are
 ///    retired without action.
-/// c. **Act** on each expired candidate. For a **base** stem: read its ext-refs
-///    sidecar FIRST, tombstone those hashes, and only then delete the stem —
-///    same ZADD-before-delete ordering, and same reasoning, as the retention
-///    prune. For a **tail** stem: just delete; a tail carries no ext-refs
-///    sidecar by design (SR-2.4), so it names no hashes. For a temp: just
-///    delete, for the same reason — it was never a published sidecar.
+/// c. **Act** on each expired candidate. For a **stem** of either family, the
+///    orphan commit first (`storage::recon_fence::recon_orphan_commit`, b.g65
+///    N3): the reap is licensed only while the member is still on
+///    `:orphans` — a publish of the same stem removes it before its PUT — and
+///    the license announces the stem on `le:ckpt:{recon}:deleting`, which
+///    refuses a publish of that stem for a grace. An unlicensed stem was healed
+///    by a publish: nothing is deleted. Then, for a **base** stem: read its
+///    ext-refs sidecar FIRST, tombstone those hashes, and only then delete the
+///    stem — same ZADD-before-delete ordering, and same reasoning, as the
+///    retention prune. For a **tail** stem: just delete; a tail carries no
+///    ext-refs sidecar by design (SR-2.4), so it names no hashes. For a temp:
+///    just delete, for the same reason — it was never a published sidecar.
 /// c2. **Reap dead objects** on `le:ckpt:{recon}:dead` (b.vn6): claim the
 ///    `object_id`s a delete path registered as dead, re-check each is really
 ///    dead, and reap every generation it still has — sidecar-first for a base,
@@ -1751,10 +1880,12 @@ async fn reconcile_leader_tick(
 ///    [`run_reconcile_dead_objects`], and read
 ///    [`KeySchema::checkpoint_reconcile_dead`] before adding a producer.
 /// d. **Collect** on `le:ckpt:{recon}:tomb`: ONE `list_live_ext_set` for the
-///    whole pass (not per layer — that would be K×N remote GETs), then for each
-///    expired tombstone, delete the blob if it is absent from the live set and
-///    retire the tombstone either way. An EMPTY live set licenses deletes only
-///    when that same walk's own listing named a layer artifact.
+///    whole pass (not per layer — that would be K×N remote GETs), anchored to
+///    the `{recon}` clock read just before it; then each expired tombstone's
+///    blob is deleted only when it is absent from the live set, not live in
+///    Valkey, and licensed by the delete-time fence. An EMPTY live set
+///    licenses deletes only when that same walk's own listing named a layer
+///    artifact. See [`run_reconcile_collect`].
 ///
 /// A second, independent gap in the collect phase's *candidate set* — an ext
 /// blob that no surviving sidecar names is never recorded, so it is never a
@@ -1778,15 +1909,14 @@ async fn reconcile_leader_tick(
 ///   missing from a truncated listing is indistinguishable from a stem that
 ///   healed, so the pass would retire real candidates.
 /// - A live-set read failure aborts **only** the collect phase — the tombstones
-///   survive for the next pass, so the deferred blobs are not lost. That
-///   includes an ext-refs sidecar the live-set walk listed and then read as
-///   absent: the adapter answers it with a typed `Transient` rather than
-///   skipping it. That one failure is lease-qualified: if a peer now holds the
-///   checkpoint lease, its lease-gated prune explains the absence and the
-///   phase ends as a lease loss rather than a `live_set_failed` (see
-///   [`run_reconcile_collect`]).
+///   survive for the next pass, so the deferred blobs are not lost. So does an
+///   ext-refs sidecar the live-set walk listed and then read absent unless the
+///   evidence explains it (b.g65; see [`run_reconcile_collect`]).
 /// - A sidecar read failure leaves its stem registered and undeleted. A delete
-///   failure leaves its member claimable.
+///   failure leaves its member claimable. Both re-date the member (b.g65,
+///   D4): its score moves to now (`ZADD XX GT`) so the oldest-first claim
+///   reaches the members behind it instead of re-serving it at the head of
+///   every claim.
 ///
 /// ## No action on absence without a populated listing (b.oya)
 ///
@@ -1800,7 +1930,7 @@ async fn reconcile_leader_tick(
 /// listings in one pass can answer differently.
 ///
 /// Step (a)'s evidence is two stack-local values, set once after (a), never
-/// mutated, and dropped at pass end, so a cancel, a lost lease or an elapsed
+/// mutated, and dropped at pass end, so a cancel, a closed gate or an elapsed
 /// budget leave nothing behind: `layers_populated` — `true` only on an `Ok`
 /// listing with at least one artifact; an empty `Ok`, an `Err` or an elapse
 /// leave it `false` — and `listed_generation_oids`, the object ids of every
@@ -1827,40 +1957,68 @@ async fn reconcile_leader_tick(
 ///
 /// None of this costs a request: it is evidence the pass already pays for.
 ///
-/// A lost lease is the one exception that ends the pass, at whatever point it is
-/// detected: it is not evidence about any ZSET, it is the loss of the
-/// entitlement to delete against all of them.
+/// The pass's gate ([`CleanupGate`]) is the one thing that ends the pass early
+/// at whatever point it says so: re-checked at the pass start, at each phase
+/// start and at each drain iteration, it closes when this replica no longer holds `le:gc:leader` (a
+/// read that never refreshes the lock; load-shed only — no delete's safety
+/// rests on it) or when
+/// `le:checkpoint:leader` does not carry a current build's marked value (an
+/// older build's backup writers do not re-arm, so the collect's delete rule
+/// does not cover them). The backlog gauges are still published.
 ///
 /// Nothing here is a leak, because every arm leaves behind the durable state a
 /// later pass needs to finish the job.
 ///
-/// The lease is re-proven immediately before every destructive step, exactly as
-/// at the retention prune's call site — a replica that cannot prove it still
-/// holds the lease does not get to delete. It is additionally **re-acquired**
-/// immediately after each of the two long read-only enumerations, via
-/// [`CheckpointLease::reacquire_after_enumeration`]; without that the
-/// enumeration alone can outlive the lease on a large fleet and every pass
-/// reclaims zero, silently. See that method for the full argument.
+/// No lease is held or re-proven anywhere in the pass (b.g65): every delete is
+/// licensed by its own Valkey script, so duplicate runners cost load only, and
+/// the pass's long reads cannot lose anything they do not hold.
 ///
 /// # Draining, not batching
 ///
-/// Both the act phase and the collect phase repeat claim→act until the claim
-/// stops yielding new members, the lease cannot be re-proven, or
-/// [`reconcile_drain_budget`] is spent — rather than acting on one
+/// Every phase repeats claim→act until the claim stops yielding new members,
+/// the gate closes, or [`reconcile_drain_budget`] is spent — rather than acting on one
 /// [`RECONCILE_BATCH`] and waiting an hour. A fixed batch per pass cannot keep
 /// up with the rate the retention prune produces tombstones; see
 /// `RECONCILE_BATCH`'s own doc for that arithmetic.
 ///
-/// Cancellation is checked at the top of every candidate and every drain
-/// iteration, so a graceful shutdown that fires mid-pass returns inside
-/// `spawn_checkpoint_loop`'s drain budget rather than running the walk to
-/// completion.
+/// # Cancellation
 ///
-/// `grace` is derived by the caller ([`reconcile_leader_tick`]) from
+/// A graceful shutdown that fires mid-pass returns promptly rather than
+/// running the walk to completion. The token is checked at the top of every
+/// candidate and every drain iteration, and between a dead object's
+/// generations. Every read the pass makes before a member's (or a collect
+/// batch's) first write is raced against it, biased toward the cancel, and
+/// abandoned the moment it fires: the gate's reads, step (a), the dead-object
+/// liveness probes and per-object listing, the sidecar reads, the collect's
+/// live-set walk, its announcement check and its per-batch Valkey liveness
+/// check, and every `{recon}` claim that registers nothing. Writes are never
+/// raced: a delete and its post-delete step, a tombstone record, a retire or
+/// a re-date, once sent, runs to its own bound, and no cancel is taken
+/// between a delete and its post-delete step. Two Valkey commands are not
+/// raced for that reason: the orphan phase's first claim, which registers
+/// this pass's candidates, and the collect's clock read, whose re-arm script
+/// writes its opener. Each is under the command timeout and preceded by a
+/// token check or a raced read. Outside a dead object's generations, a cancel
+/// during a raced read leaves the member or batch it was read for, if any,
+/// registered at its score with nothing deleted for it, and ends that phase
+/// (or the pass). For an orphan base stem whose sidecar read is cancelled,
+/// that state already includes the license and the announcement on
+/// `le:ckpt:{recon}:deleting`, which the orphan commit wrote before the read.
+/// A cancel between a dead object's generations, or during one generation's
+/// sidecar read or re-probe, leaves the generations already deleted deleted
+/// and the member registered for the rest (re-dated if an earlier
+/// generation's sidecar read or delete failed). Either way the next pass
+/// resumes from the durable `{recon}` work lists.
+///
+/// `grace` is derived by the caller ([`run_cleanup_pass`]) from
 /// `store.publish_worst_case()`. Passing it in rather than re-deriving it here
 /// keeps the derivation on the dispatch boundary and lets an in-crate test
-/// drive one pass with a zero grace instead of waiting out the production
-/// floor — with no env var or trait knob that could weaken the real bound.
+/// drive one pass at a grace of its choosing — with no env var or trait knob
+/// that could weaken the real bound. A sub-floor grace suits a test of the
+/// claim deferral only: the collect's commit licenses no delete once its clock
+/// is more than one grace past `t0`, so a pass that must collect needs a grace
+/// covering the time from `t0` to the commit — in practice the production
+/// floor, with its tombstones pre-aged rather than a grace waited out.
 ///
 /// `budget` is minted by the same caller ([`ReconcilePassBudget::starting_now`])
 /// and carries **all three** phase deadlines (b.gg7, extended by b.vn6): this
@@ -1876,14 +2034,16 @@ async fn run_reconcile_tick(
     config: &CheckpointLoopConfig,
     metrics: Option<&SharedMetrics>,
     cancel: &CancellationToken,
-    lease: &mut CheckpointLease,
+    gate: &mut CleanupGate<'_>,
     grace: Duration,
     budget: ReconcilePassBudget,
+    heal: Option<&CollectHeal>,
+    summary: &mut CleanupPassSummary,
 ) {
     let replica_id = config.leader.service_label.as_str();
     let orphans_key = keys.checkpoint_reconcile_orphans();
     let tomb_key = keys.checkpoint_reconcile_tombstones();
-    let tombstones = ExtTombstoneSink::new(client, keys, metrics, replica_id);
+    let tombstones = ExtTombstoneSink::new(client, keys, metrics, replica_id, grace);
 
     // ── (a) Enumerate and group ──────────────────────────────────────────
     //
@@ -1956,10 +2116,32 @@ async fn run_reconcile_tick(
     // described above. It is logged at INFO rather than WARN: on a fresh store
     // it is routine, not a fault.
     let mut skip_orphan_phase = false;
+    let orphan_started = Instant::now();
+    // The pass's gate, at the pass start (b.g65): a closed gate skips every
+    // phase — the enumeration included — and the pass still publishes the
+    // backlog gauges below. Its reads, like every read this pass makes before
+    // a member's first write, are raced against `cancel`, biased toward it,
+    // so a shutdown abandons them at once; nothing is written yet.
+    let pass_open = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        open = gate.may_continue() => open,
+    };
     let enumerate_bound = ReconcilePassBudget::enumeration_bound(budget.enumerate_deadline, grace);
-    let artifacts = match tokio::time::timeout(enumerate_bound, store.list_layer_artifacts()).await
-    {
-        Ok(Ok(v)) => {
+    let enumeration = if pass_open {
+        // A pure read, raced against `cancel` as well as bounded (below).
+        Some(tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            listed = tokio::time::timeout(enumerate_bound, store.list_layer_artifacts()) => listed,
+        })
+    } else {
+        skip_orphan_phase = true;
+        None
+    };
+    let artifacts = match enumeration {
+        None => Vec::new(),
+        Some(Ok(Ok(v))) => {
             if v.is_empty() {
                 tracing::info!(
                     replica_id = %replica_id,
@@ -1973,7 +2155,7 @@ async fn run_reconcile_tick(
             }
             v
         }
-        Err(_elapsed) => {
+        Some(Err(_elapsed)) => {
             if let Some(m) = metrics {
                 m.inc_checkpoint_adapter_ceiling_elapsed(
                     CEILING_PHASE_ENUMERATION,
@@ -1997,7 +2179,7 @@ async fn run_reconcile_tick(
             skip_orphan_phase = true;
             Vec::new()
         }
-        Ok(Err(e)) => {
+        Some(Ok(Err(e))) => {
             tracing::warn!(
                 replica_id = %replica_id,
                 error_kind = checkpoint_error_kind(&e),
@@ -2043,28 +2225,8 @@ async fn run_reconcile_tick(
         .map(|artifact| artifact.object_id)
         .collect();
 
-    // Re-acquire the lease the moment the enumeration returns, BEFORE the
-    // claim that registers candidates and long before the destructive loop.
-    //
-    // This is the reconciliation pass's analogue of `run_one_tick`'s pass-1
-    // keepalive (see the long comment at that call site): the enumeration above
-    // is a single opaque adapter call that on StorageApi walks the whole
-    // `layers/` subtree, and it can outlive `LEADER_LOCK_TTL_MS` on its own. If
-    // it does, the first `ensure_held` in the act loop below takes the
-    // overshoot arm and this pass reclaims nothing — every pass, forever, on
-    // exactly the fleets with something to reclaim. Re-proving after a read
-    // that mutated nothing is safe by the same argument the pass-1 comment
-    // makes; `reacquire_after_enumeration` spells it out.
-    if lease.reacquire_after_enumeration(client, metrics).await == LeaseState::Lost {
-        tracing::debug!(
-            replica_id = %replica_id,
-            lock_value = %lease.identity(),
-            "checkpoint reconciliation could not re-prove its leader lease after enumerating \
-             the layers namespace; skipping the rest of this pass (a peer holds the lock, or \
-             the probe failed — either way this replica does not get to register or delete)"
-        );
-        return;
-    }
+    summary.orphan_listing_ms = millis_u64(orphan_started.elapsed());
+    summary.orphan_listed = artifacts.len();
 
     // `(object_id, snap_seq, generation kind)` → does this stem have its
     // family's generation artifact? The satisfying artifact differs per family
@@ -2116,15 +2278,7 @@ async fn run_reconcile_tick(
     let mut candidates: Vec<String> = Vec::new();
     for ((object_id, snap_seq, kind), satisfied) in stem_satisfied.iter() {
         if !satisfied {
-            match kind {
-                // Unqualified, unchanged across this upgrade — see
-                // `RECONCILE_TAIL_MEMBER_SUFFIX` for why the base spelling must
-                // not gain a symmetric `.base`.
-                CheckpointKind::Base => candidates.push(format!("{object_id}.{snap_seq}")),
-                CheckpointKind::Tail => candidates.push(format!(
-                    "{object_id}.{snap_seq}{RECONCILE_TAIL_MEMBER_SUFFIX}"
-                )),
-            }
+            candidates.push(reconcile_stem_member(*object_id, *snap_seq, *kind));
         }
     }
     for (object_id, snap_seq) in temp_stems.iter() {
@@ -2155,16 +2309,18 @@ async fn run_reconcile_tick(
     // `seen` ends a spinning pass, but it does not make progress past a
     // permanently-failing member. The claim is `ZRANGEBYSCORE 0 cutoff LIMIT 0
     // RECONCILE_BATCH` — oldest-first over a score that `ZADD NX` pins to the
-    // FIRST observation and never refreshes — so a member that can never be
-    // acted on keeps its low score forever and reappears at the head of every
-    // claim, on every pass, indefinitely. Hence: once `RECONCILE_BATCH` or more
-    // members are permanently failing, they fill the entire claim window and
-    // head-of-line block every newer candidate behind them — the drain retires
-    // nothing and the backlog grows without bound, while the pass itself keeps
-    // reporting a clean completion. Below `RECONCILE_BATCH` the window still has
-    // room and healthy candidates continue to drain, just at a reduced rate.
+    // FIRST observation — so a member that can never be acted on would keep
+    // its low score and reappear at the head of every claim, and once
+    // `RECONCILE_BATCH` or more were permanently failing they would fill the
+    // whole claim window and head-of-line block every newer candidate. The
+    // drain prevents that by re-dating each member it defers for a reason of
+    // its own (a sidecar read or a delete that failed) to the current Valkey
+    // `TIME` after each batch (b.g65, D4; `ZADD XX GT`, later only), so a
+    // failing member moves behind the newer candidates and the window keeps
+    // draining. A failing member still returns on a later pass, once its new
+    // score ages past the grace.
     //
-    // No counter cell isolates it. `orphan_deferred` does not: the failing
+    // No counter cell isolates a permanently failing member. `orphan_deferred` does not: the failing
     // member lands in `seen`, so it counts as ACTED rather than deferred, while
     // a first-sighted candidate counts deferred on every healthy pass too (it
     // cannot expire in the pass that registered it). And the backlog gauge
@@ -2174,8 +2330,14 @@ async fn run_reconcile_tick(
     // thing that separates it from ordinary transient churn.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut retire_orphans: Vec<String> = Vec::new();
+    // Members deferred for a reason of their own (a sidecar read or a delete
+    // that failed), re-dated after each batch (b.g65, D4).
+    let mut redate_orphans: Vec<String> = Vec::new();
     let mut orphan_deleted: u64 = 0;
     let mut temp_deleted: u64 = 0;
+    // Members this phase has reached; the drain tests its deadline before
+    // each member after the first (b.g65, D2).
+    let mut members_reached: u64 = 0;
     // This phase's QUARTER of the pass budget. The dead-object phase gets the
     // next quarter and the collect phase the guaranteed second half. See
     // `ReconcilePassBudget` for why the three-way split is 1/4 : 1/4 : 1/2.
@@ -2196,8 +2358,23 @@ async fn run_reconcile_tick(
             // logged, and the elapse arm has already ticked the ceiling counter.
             break 'orphan_drain;
         }
+        // A cancel ends the drain rather than the pass, so the phase's
+        // counters and summary below still tally what earlier batches did;
+        // the dead-object phase then sees the token at its loop top, and the
+        // pass returns after it without starting the collect.
         if cancel.is_cancelled() {
-            return;
+            break 'orphan_drain;
+        }
+        // The gate before every claim, the first included (b.g65): the pass
+        // start's probe ran before the orphan enumeration, which can take up to
+        // half the pass budget, and a backup-lock holder can change during it.
+        let open = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break 'orphan_drain,
+            open = gate.may_continue() => open,
+        };
+        if !open {
+            break 'orphan_drain;
         }
 
         let register: &[String] = if register_on_this_claim {
@@ -2205,21 +2382,33 @@ async fn run_reconcile_tick(
         } else {
             &[]
         };
-        let expired =
-            match recon_claim_expired(client, &orphans_key, grace, RECONCILE_BATCH, register).await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        replica_id = %replica_id,
-                        candidate_count = candidates.len(),
-                        error = %e,
-                        "checkpoint reconciliation orphan claim failed; ending the orphan phase \
-                         this pass (candidates are re-registered next pass; nothing is lost)"
-                    );
-                    break 'orphan_drain;
-                }
-            };
+        let claim = recon_claim_expired(client, &orphans_key, grace, RECONCILE_BATCH, register);
+        // A claim that registers nothing is a read (`TIME` and
+        // `ZRANGEBYSCORE`), raced against `cancel` like every read before a
+        // member's first write; the one that registers this pass's
+        // candidates is a write, and runs to its own bound.
+        let claimed = if register.is_empty() {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => break 'orphan_drain,
+                claimed = claim => claimed,
+            }
+        } else {
+            claim.await
+        };
+        let expired = match claimed {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    replica_id = %replica_id,
+                    candidate_count = candidates.len(),
+                    error = %e,
+                    "checkpoint reconciliation orphan claim failed; ending the orphan phase \
+                     this pass (candidates are re-registered next pass; nothing is lost)"
+                );
+                break 'orphan_drain;
+            }
+        };
         register_on_this_claim = false;
 
         if expired.is_empty() {
@@ -2236,7 +2425,7 @@ async fn run_reconcile_tick(
         }
 
         // Set by any arm that must end the drain after this batch's retire
-        // lands — cancellation and lease loss. Retiring first is deliberate:
+        // lands — cancellation and the phase deadline. Retiring first is deliberate:
         // the work already happened, and re-examining a deleted stem next pass
         // is wasted LIST traffic even though it is harmless.
         let mut stop_drain = false;
@@ -2254,20 +2443,14 @@ async fn run_reconcile_tick(
                 continue;
             }
 
-            // Re-prove the lease immediately before each destructive step.
-            // Cheap: `ensure_held` only makes a round-trip when a renewal is
-            // actually due.
-            if lease.ensure_held(client, metrics).await == LeaseState::Lost {
-                tracing::warn!(
-                    replica_id = %replica_id,
-                    lock_value = %lease.identity(),
-                    "checkpoint reconciliation lost its leader lease mid-pass; aborting the \
-                     remainder (candidates stay registered with their original first-observed \
-                     timestamps, so the next pass resumes without re-serving the grace window)"
-                );
+            // The deadline before each member after the first (b.g65, D2), so
+            // one slow batch cannot overrun the phase's share by a whole claim.
+            // The members not reached keep their scores for the next pass.
+            if members_reached > 0 && Instant::now() >= deadline {
                 stop_drain = true;
                 break;
             }
+            members_reached += 1;
 
             match parse_reconcile_member(member) {
                 Some(ReconcileCandidate::Temp {
@@ -2304,6 +2487,7 @@ async fn run_reconcile_tick(
                             "checkpoint reconciliation could not reclaim leaked write-temp \
                              artifacts; leaving the candidate registered for the next pass"
                         );
+                        redate_orphans.push(member.clone());
                     }
                 },
                 Some(ReconcileCandidate::Stem {
@@ -2342,6 +2526,39 @@ async fn run_reconcile_tick(
                         CheckpointKind::Tail => "tail",
                     };
 
+                    // The orphan commit (b.g65, N3), before anything is read
+                    // or deleted: licensed only while no publish of this stem
+                    // has removed the member since the claim, and the license
+                    // announces the stem on `le:ckpt:{recon}:deleting`, which
+                    // refuses a publish of the stem for a grace. So a
+                    // re-publish of a failed generation and its reap never both
+                    // proceed: whichever lands second in Valkey stands down.
+                    match recon_orphan_commit(client, keys, member, grace).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                object_id,
+                                snap_seq,
+                                generation_kind,
+                                "checkpoint reconciliation found an orphan candidate healed by a \
+                                 publish of the same generation since its claim; nothing deleted"
+                            );
+                            retire_orphans.push(member.clone());
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                object_id,
+                                snap_seq,
+                                generation_kind,
+                                error = %e,
+                                "checkpoint reconciliation could not license an orphan's reap; \
+                                 leaving the candidate registered for the next pass"
+                            );
+                            continue;
+                        }
+                    }
+
                     // ── Pre-delete obligation, by family ──────────────────
                     //
                     // Exhaustive on `kind` (no `_` arm) so a third
@@ -2350,8 +2567,22 @@ async fn run_reconcile_tick(
                         CheckpointKind::Base => {
                             // Sidecar FIRST — the hashes must be recorded before
                             // the artifact naming them is deleted, or they leak
-                            // permanently.
-                            let hashes = match store.read_ext_refs_sidecar(&handle).await {
+                            // permanently. A cancel abandons the read and ends
+                            // the drain after this batch's retire. The stem is
+                            // left licensed and announced, nothing recorded or
+                            // deleted, the member still registered for the next
+                            // pass: as a failed read leaves it, except that a
+                            // failed read also re-dates the member and a
+                            // cancel leaves its score as it was.
+                            let read = tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => {
+                                    stop_drain = true;
+                                    break;
+                                }
+                                read = store.read_ext_refs_sidecar(&handle) => read,
+                            };
+                            let hashes = match read {
                                 Ok(set) => set,
                                 Err(e) => {
                                     tracing::warn!(
@@ -2365,13 +2596,17 @@ async fn run_reconcile_tick(
                                          next pass (deleting it now would strand the blobs it \
                                          references)"
                                     );
+                                    redate_orphans.push(member.clone());
                                     continue;
                                 }
                             };
 
                             let hash_count = hashes.len();
                             if let Err(e) = tombstones
-                                .record(hashes.into_iter().collect::<Vec<String>>())
+                                .record(
+                                    std::slice::from_ref(member),
+                                    hashes.into_iter().collect::<Vec<String>>(),
+                                )
                                 .await
                             {
                                 tracing::warn!(
@@ -2439,6 +2674,7 @@ async fn run_reconcile_tick(
                                  leaving the candidate registered for the next pass (a base's \
                                  hashes are already tombstoned, so nothing leaks meanwhile)"
                             );
+                            redate_orphans.push(member.clone());
                         }
                     }
                 }
@@ -2472,6 +2708,7 @@ async fn run_reconcile_tick(
             );
         }
         retire_orphans.clear();
+        redate_members(client, &orphans_key, &mut redate_orphans, replica_id).await;
 
         if stop_drain {
             break 'orphan_drain;
@@ -2503,18 +2740,29 @@ async fn run_reconcile_tick(
         // Deferred = registered this pass but never acted on — the drain's
         // leftovers, computed at the end rather than off the first claim so it
         // means the same thing it always did now that a pass makes many claims.
+        // Only the first claim that lands carries the registrations, so when
+        // none landed — the gate closed before it (b.g65), or it failed —
+        // nothing was registered and nothing is counted deferred.
+        let registered = if register_on_this_claim {
+            0
+        } else {
+            candidates.len()
+        };
         let acted = seen
             .iter()
             .filter(|m| candidate_set.contains(m.as_str()))
             .count();
         m.add_checkpoint_reconcile(
             "orphan_deferred",
-            candidates.len().saturating_sub(acted) as u64,
+            registered.saturating_sub(acted) as u64,
             replica_id,
         );
         m.add_checkpoint_reconcile("orphan_deleted", orphan_deleted, replica_id);
         m.add_checkpoint_reconcile("temp_deleted", temp_deleted, replica_id);
     }
+    summary.orphan_deleted = orphan_deleted;
+    summary.temp_deleted = temp_deleted;
+    summary.orphan_phase_ms = millis_u64(orphan_started.elapsed());
     // ── (c2) Reap dead objects ───────────────────────────────────────────
     // Runs even when the orphan phase ended on a claim error — or never ran at
     // all, because its enumeration failed or elapsed (b.vn6 review round 2, C2):
@@ -2529,6 +2777,7 @@ async fn run_reconcile_tick(
     // failure leaking into this phase — the phase still runs, deletes and
     // defers on its own evidence — it is the one absence-licensed verdict this
     // phase makes, and an empty listing alone cannot license it.
+    let dead_started = Instant::now();
     run_reconcile_dead_objects(
         client,
         keys,
@@ -2538,12 +2787,17 @@ async fn run_reconcile_tick(
         metrics,
         replica_id,
         cancel,
-        lease,
+        gate,
         budget,
         layers_populated,
         &listed_generation_oids,
+        summary,
     )
     .await;
+    summary.dead_phase_ms = millis_u64(dead_started.elapsed());
+    if cancel.is_cancelled() {
+        return;
+    }
 
     // ── (d) Collect ──────────────────────────────────────────────────────
     // Runs even when the orphan phase ended on a claim error, or never ran at
@@ -2554,10 +2808,16 @@ async fn run_reconcile_tick(
     // Step (a) does not enter its decision (b.oya, PD-F1a): an EMPTY live set
     // licenses deletes only on the evidence of the live-set walk's own listing,
     // the same request the set came from.
+    let collect_started = Instant::now();
     run_reconcile_collect(
-        client, keys, &tomb_key, store, config, grace, metrics, replica_id, cancel, lease, budget,
+        client, keys, &tomb_key, store, config, grace, metrics, replica_id, cancel, gate, budget,
+        heal, summary,
     )
     .await;
+    summary.collect_phase_ms = millis_u64(collect_started.elapsed());
+    if cancel.is_cancelled() {
+        return;
+    }
 
     // Backlog gauges, sampled once per pass. Published even when a phase
     // bailed — the numbers are still true, and their whole purpose is to show a
@@ -2609,11 +2869,14 @@ async fn run_reconcile_tick(
     }
 }
 
-/// What one `obj:hdr` probe says about a dead-object candidate (b.vn6).
+/// What one `obj:hdr` probe (and, for an unfenced header, one layer-mapping
+/// read) says about a dead-object candidate (b.vn6, b.g65).
 ///
-/// Three states rather than a `bool`, because "the header exists" is NOT the
+/// Four states rather than a `bool`, because "the header exists" is NOT the
 /// same claim as "the object is alive" and conflating them costs a permanent
-/// leak — see [`DeadObjectLiveness::LiveSuperseded`].
+/// leak — see [`DeadObjectLiveness::LiveSuperseded`] and
+/// [`DeadObjectLiveness::LiveUnmapped`]. Only `Live` retires a member without
+/// reaping it, and only `Dead` reaps; the other two defer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DeadObjectLiveness {
     /// No `seq` field. The object is provably dead and its generations are
@@ -2625,13 +2888,35 @@ enum DeadObjectLiveness {
     /// a live header, and the field form additionally reads a cursor-only
     /// phantom as dead.
     Dead,
-    /// `seq` present and no `superseded` flag — the object is genuinely alive.
+    /// `seq` present, no `superseded` flag, and the layer mapping the header
+    /// names (`session_id`, `layer_name`) maps to this object — the object is
+    /// genuinely alive.
     ///
     /// The reachable provenance is a DR restore that resurrected a
     /// previously-deleted `object_id`, whose generations are exactly the blobs
-    /// it was restored from. Nothing may be deleted, and the candidate is
-    /// retired: it is not a pending reclamation any more.
+    /// it was restored from: a restore only restores an object its layer
+    /// mapping names, and a session-backup re-adoption maps it too. Nothing
+    /// may be deleted, and the candidate is retired: it is not a pending
+    /// reclamation any more. The retire waits until every announcement of the
+    /// object is withdrawn from `le:ckpt:{recon}:deleting`, so no base the
+    /// restore kept stays announced (b.g65).
     Live,
+    /// `seq` present and no `superseded` flag, but no layer mapping names this
+    /// object: the mapping is absent, names another object, or is not a
+    /// string, or the header lacks `session_id` or `layer_name` (b.g65).
+    ///
+    /// The reachable provenance is a `DeleteLayer` still in progress, or one
+    /// stopped after its unmap — a step failing past its retries, a
+    /// store refusal, the RPC deadline or a client cancel mid-teardown. Such a
+    /// delete registers the object right after its unmap, before the header
+    /// goes, and `DeleteLayer` never sets `superseded`. Reading it as `Live`
+    /// would retire the member as a DR restore and leak the object's backups
+    /// for good, so like [`Self::LiveSuperseded`] it deletes nothing, retires
+    /// nothing and re-checks next pass; the header goes when the delete's
+    /// retry or the orphan sweep finishes the teardown, after which this reads
+    /// `Dead`. It never produces `Dead`, so it can never delete anything a
+    /// two-way reading would not.
+    LiveUnmapped,
     /// `seq` present alongside `superseded=1` — a `CreateLayer` overwrite
     /// marked this object dead, but the `cleanup_old_object_retrying` UNLINK
     /// that should have removed the header has not landed.
@@ -2648,12 +2933,18 @@ enum DeadObjectLiveness {
     LiveSuperseded,
 }
 
-/// One `HMGET obj:hdr seq superseded` on the maintenance pool, adjudicated into
-/// a [`DeadObjectLiveness`] (b.vn6).
+/// One `HMGET obj:hdr seq superseded session_id layer_name` on the
+/// maintenance pool and, for a standing header without the `superseded` flag,
+/// one `GET` of the layer mapping it names, adjudicated into a
+/// [`DeadObjectLiveness`] (b.vn6, b.g65).
 ///
-/// One round-trip for both fields: they are on the same hash, so a single
-/// `HMGET` is atomic with respect to Valkey's command loop and the two answers
-/// cannot describe different instants.
+/// One round-trip for the header's fields: they are on the same hash, so a
+/// single `HMGET` is atomic with respect to Valkey's command loop and the
+/// answers cannot describe different instants. The mapping lives on the
+/// session's slot, so it is a second command. A change between the two reads
+/// costs no safety: the mapping read never produces `Dead`, so the worst a race does
+/// is turn a retire into a deferral, or a deferral into the retire of an
+/// object whose mapping really does name it.
 ///
 /// The maintenance pool is acquired per call rather than held for the phase:
 /// the drain spends most of its time awaiting adapter calls, and
@@ -2661,29 +2952,61 @@ enum DeadObjectLiveness {
 /// genuinely in use.
 async fn probe_dead_object_liveness(
     client: &ValkeyClient,
-    header_key: &str,
+    keys: &KeySchema,
+    object_id: u64,
 ) -> Result<DeadObjectLiveness, fred::error::Error> {
+    let header_key = keys.obj_header(&object_id.to_string());
     let fields: Vec<Option<String>> = {
         let (maint_pool, _maint_token) = client.acquire_maintenance();
         // A command timeout is counted here; callers only log the error.
         maint_pool
             .next()
-            .hmget(header_key, vec!["seq", "superseded"])
+            .hmget(
+                &header_key,
+                vec!["seq", "superseded", "session_id", "layer_name"],
+            )
             .await
             .inspect_err(|e| {
                 FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(e)
             })?
     };
-    let seq = fields.first().and_then(Option::as_deref);
-    let superseded = fields.get(1).and_then(Option::as_deref);
-    Ok(match (seq, superseded) {
-        (None, _) => DeadObjectLiveness::Dead,
+    let field = |i: usize| fields.get(i).and_then(Option::as_deref);
+    match (field(0), field(1)) {
+        (None, _) => return Ok(DeadObjectLiveness::Dead),
         // Exactly the sentinel the overwrite path writes (`HSET superseded 1`),
         // matching the two read sites in `layer.rs`. Any other value is not a
-        // flag this service mints, and treating it as "alive" is the safe
-        // reading of an unknown.
-        (Some(_), Some("1")) => DeadObjectLiveness::LiveSuperseded,
-        (Some(_), _) => DeadObjectLiveness::Live,
+        // flag this service mints, and is read as no flag.
+        (Some(_), Some("1")) => return Ok(DeadObjectLiveness::LiveSuperseded),
+        (Some(_), _) => {}
+    }
+    // A standing, unfenced header is a live object only if its layer mapping
+    // names it; without both identity fields there is no mapping to check, and
+    // the safe reading of an unknown is "defer".
+    let mapped_to_this_object = match (field(2), field(3)) {
+        (Some(session_id), Some(layer_name)) => {
+            use fred::interfaces::KeysInterface;
+            let mapping_key = keys.layer_mapping(session_id, layer_name);
+            let mapped: Result<Option<String>, fred::error::Error> = {
+                let (maint_pool, _maint_token) = client.acquire_maintenance();
+                maint_pool.next().get(&mapping_key).await
+            };
+            match mapped {
+                Ok(Some(value)) => value.parse::<u64>() == Ok(object_id),
+                Ok(None) => false,
+                // A mapping key holding another type names no object.
+                Err(e) if crate::storage::client::is_wrongtype_reply(&e) => false,
+                Err(e) => {
+                    FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(&e);
+                    return Err(e);
+                }
+            }
+        }
+        _ => false,
+    };
+    Ok(if mapped_to_this_object {
+        DeadObjectLiveness::Live
+    } else {
+        DeadObjectLiveness::LiveUnmapped
     })
 }
 
@@ -2730,9 +3053,10 @@ async fn probe_dead_object_liveness(
 ///
 /// None needed here. Both callers are already behind the predicate that enables
 /// the delete-path producers (`LIVE_EDIT_CHECKPOINT_ENABLED` with a
-/// non-`Disabled` adapter): `main.rs` spawns the checkpoint loop under exactly
-/// it, and `BaseBootstrap::new` folds the same conjunction into its own
-/// `enabled` gate. So the ZSET has a consumer whenever this can run.
+/// non-`Disabled` adapter): `main.rs` spawns the checkpoint loop, and the
+/// checkpoint clean-up task that consumes the ZSET, under exactly it, and
+/// `BaseBootstrap::new` folds the same conjunction into its own `enabled`
+/// gate. So the ZSET has a consumer whenever this can run.
 ///
 /// Routed through `recon_register` — the data-pool, register-only entry point —
 /// rather than the maintenance pool the rest of the loop uses. It is one `ZADD
@@ -2764,6 +3088,52 @@ pub(super) async fn register_dead_object_after_refused_stamp(
     }
 }
 
+/// Withdraw every announcement of `object_id` from `le:ckpt:{recon}:deleting`
+/// before the dead-object phase retires its member as spared on a
+/// [`DeadObjectLiveness::Live`] verdict (b.g65). `true` when the withdrawal
+/// landed and the caller may retire; `false` (after a WARN) when it failed,
+/// and the caller must keep the member registered, re-dated (D4), so the next
+/// pass withdraws before it retires.
+///
+/// Why: the phase announces a base immediately before deleting it, after a
+/// liveness re-probe read `Dead`. If that delete failed and the object is then
+/// found restored — later in the same pass, or at the next pass's per-object
+/// early-out — the kept base would stay announced, and the collect would skip
+/// a stale not-found of its sidecar as an announced deletion (N2) and drop its
+/// hashes from the live set. The retire is the last moment anything would
+/// look at that object again, so the withdrawal guards it, and fails safe.
+///
+/// By key, not by listing (`storage::recon_fence::withdraw_object_announcements`:
+/// a `ZSCAN` of `:deleting` for the object's stems, then a plain `ZREM` of
+/// them, on the maintenance pool): it removes every announced stem of the
+/// object whatever a listing of its backups says — a listing that answers
+/// stale and omits a standing base cannot leave that base announced — and
+/// only that object's stems, so it removes nothing a deleter of another
+/// object relies on.
+async fn withdraw_before_spared_retire(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    object_id: u64,
+    replica_id: &str,
+) -> bool {
+    match withdraw_object_announcements(client, keys, object_id).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                replica_id = %replica_id,
+                object_id,
+                error = %e,
+                "checkpoint reconciliation found a dead-object candidate restored by a DR \
+                 restore but could not withdraw the deletion announcements of its backups; \
+                 keeping the candidate registered for the next pass rather than retiring it \
+                 (retiring with an announcement standing would let clean-up treat a not-found \
+                 read of a kept backup's sidecar as an announced deletion)"
+            );
+            false
+        }
+    }
+}
+
 /// The dead-object phase (b.vn6): reap every checkpoint generation belonging to
 /// an `object_id` the service KNOWS is gone.
 ///
@@ -2781,8 +3151,12 @@ pub(super) async fn register_dead_object_after_refused_stamp(
 ///
 /// # The input is positive evidence, and it must stay that way
 ///
-/// Members of `le:ckpt:{recon}:dead` are minted ONLY by the delete paths, at
-/// their success-only exits. Nothing infers them. See
+/// Members of `le:ckpt:{recon}:dead` are minted ONLY on observed deaths: by
+/// `DeleteLayer` right after its unmap (its commit point), with one
+/// more attempt at its success exit if that did not land; by the overwrite
+/// clean-up at its start, once the overwrite has unmapped the old object,
+/// with one more attempt after its teardown; and by the four refused-stamp
+/// arms below. The orphan sweep registers nothing. Nothing infers them. See
 /// [`KeySchema::checkpoint_reconcile_dead`] for why the inferential alternative
 /// — "no `obj:hdr` and no session→layer mapping" — is a DR-corpus-deleting bug:
 /// a live mapping is re-created only lazily by session-checkpoint apply, so
@@ -2838,56 +3212,102 @@ pub(super) async fn register_dead_object_after_refused_stamp(
 /// the guarantee rests on:
 ///
 /// - Once per **object**, before the listing — the cheap early-out that keeps a
-///   resurrected object from costing an adapter round-trip at all.
-/// - Once per **generation**, immediately before its `delete_layer_checkpoint`.
-///   Everything between the two is unbounded in the only sense that matters
-///   here: the listing, plus each generation's sidecar read and tombstone
-///   record, each bounded only by the adapter's per-call ceiling (180 s at the
-///   StorageApi defaults). And the lease does not cover the gap —
-///   `ensure_held` excludes a peer *reconciler*, while the writer that can
-///   resurrect an `object_id` is `apply_restore`, which holds no reconciliation
-///   lease at all.
+///   resurrected object from costing a listing, a sidecar read or a delete.
+///   Its retire costs only the withdrawal that precedes it (below): a `ZSCAN`
+///   and a `ZREM` of `le:ckpt:{recon}:deleting`.
+/// - Once per **generation**, after its sidecar read and before its tombstone
+///   record, stem announcement and `delete_layer_checkpoint`. Everything
+///   between the two is unbounded in the only sense that matters here: the
+///   listing, plus each generation's sidecar read, each bounded only by the
+///   adapter's per-call ceiling (180 s at the StorageApi defaults). And no
+///   lock covers the gap: the writer that can resurrect an `object_id` is
+///   `apply_restore`, which takes no part in the clean-up's lock at all.
 ///
 /// When the second probe finds the header standing, this phase stops deleting
 /// for that object immediately. Generations it already deleted this pass stay
 /// deleted: each was reaped while the object was provably dead at its own
 /// pre-delete probe, which is the strongest evidence available and exactly the
-/// evidence a single-generation object acts on.
+/// evidence a single-generation object acts on. Because the probe comes before
+/// the announcement, a generation it keeps was never announced on
+/// `le:ckpt:{recon}:deleting` (N2). Between the probe and the delete sits one
+/// `{recon}` round trip, the record and announcement, inside which a restore
+/// can still land unseen.
+///
+/// One announced generation can outlive its probe: a base whose delete failed
+/// after a `Dead` re-probe. It stays announced until the object's next
+/// re-probe — later in the same pass or, re-dated (D4), at the next pass. A
+/// `Live` verdict there (a restore kept that base) never retires the member
+/// with the announcement standing: every announcement of the object is
+/// withdrawn first ([`withdraw_before_spared_retire`]) — found on the key
+/// itself, not through a listing, so a listing that answers stale cannot hide
+/// one — and a withdrawal that fails keeps the member registered, re-dated, so
+/// the next pass tries again. With one clean-up runner, an announced kept base
+/// therefore lasts at most until the member's next re-probe.
+///
+/// Two runners — only while `le:gc:leader` changes hands — can still leave
+/// one. Runner B's re-probe reads `Dead`; a restore then lands; runner A
+/// probes `Live`, withdraws and retires the member, all inside B's one round
+/// trip between its probe and its announcement; B's announcement lands after
+/// A's withdrawal, and B's delete fails. B's re-date (`ZADD XX GT`) cannot
+/// re-create the retired member, so the kept base stays announced until a
+/// later announcement trims entries older than two graces or the key expires
+/// (24 h). This is part of the accepted probe-to-delete restore race above:
+/// its other outcome, B's delete succeeding, deletes the restored base.
 ///
 /// # A standing header is not always a live object
 ///
-/// The probe is three-valued, not a `bool`, and the third value is load-bearing
-/// (b.vn6 review round 1). A header carrying `superseded=1` belongs to an
-/// object a `CreateLayer` overwrite already killed — its
-/// `cleanup_old_object_retrying` UNLINK simply has not landed, and that failure is
-/// WARN-swallowed on the overwrite path. Treating it as a resurrection and
-/// retiring the member would discard the only record that the object owes a
-/// reclamation, and nothing else in the service enumerates a dead object again:
-/// a permanent leak reached *through* the safety re-check. So that state
-/// deletes nothing (the no-delete-on-a-live-header rule stays absolute) and
-/// retires nothing — the member keeps its original first-observation score and
-/// the next pass re-checks. Only [`DeadObjectLiveness::Live`] both spares and
-/// retires. See that enum for the full three-way argument.
+/// The probe is four-valued, not a `bool`, and the two deferring values are
+/// load-bearing. A header carrying `superseded=1` belongs to an object a
+/// `CreateLayer` overwrite already killed — its `cleanup_old_object_retrying`
+/// UNLINK simply has not landed, and that failure is WARN-swallowed on the
+/// overwrite path (b.vn6 review round 1). A header without the flag that no
+/// layer mapping names belongs to a `DeleteLayer` whose teardown has not
+/// finished: it registered the object right after its unmap, before the header
+/// goes (b.g65). Treating either as a resurrection and retiring the member
+/// would discard the only record that the object owes a reclamation, and
+/// nothing else in the service enumerates a dead object again: a permanent
+/// leak reached *through* the safety re-check. So both states delete nothing
+/// (the no-delete-on-a-live-header rule stays absolute) and retire nothing —
+/// the member is re-dated to now (D4) and the next pass re-checks. Only
+/// [`DeadObjectLiveness::Live`] — a standing, unflagged header that its layer
+/// mapping names, which is what a DR restore leaves — both spares and retires,
+/// once the object's announcements are withdrawn from `:deleting` (above). See
+/// that enum for the full argument.
 ///
 /// # Per-generation ordering, and what a partial failure leaves behind
 ///
-/// Per generation, in the exact order the orphan arm uses: read the ext-refs
-/// sidecar, tombstone those hashes, and only then delete the artifact — a base
-/// deleted before its sidecar is recorded strands every ext blob it named,
-/// permanently. A tail is routed past the sidecar read entirely (it carries
+/// Per generation: read the ext-refs sidecar, re-probe liveness, tombstone
+/// those hashes and announce the stem in one run, and only then delete the
+/// artifact. As in the orphan arm, the hashes are recorded before the delete —
+/// a base deleted before its sidecar is recorded strands every ext blob it
+/// named, permanently. A tail is routed past the sidecar read entirely (it carries
 /// none by design, SR-2.4), structurally rather than by relying on the read
 /// returning empty; the orphan arm argues that at length and the same argument
 /// applies verbatim.
 ///
 /// The member is retired only when EVERY generation for that object is gone.
-/// Any failure leaves it registered with its original `ZADD NX` score, so the
-/// next pass re-claims it and finishes the job — and because both the tombstone
-/// record and the delete are idempotent, the repeat costs nothing.
+/// Any failure leaves it registered — re-dated to now when the failure is the
+/// member's own (D4), at its existing score when the whole phase stopped — so a
+/// later pass re-claims it and finishes the job, and because both the
+/// tombstone record and the delete are idempotent, the repeat costs nothing.
 ///
-/// The lease is re-proven immediately before every destructive step, exactly as
-/// in the orphan phase. This phase opens no enumeration of its own — it claims
-/// from a ZSET and makes one targeted `list_layer_checkpoints` per claimed
-/// object — so there is no long read for the lease to be re-*acquired* across.
+/// No lease is held (b.g65): the gate ([`CleanupGate`]) is re-probed at this
+/// phase's start and at each drain iteration and only sheds load. This phase opens no store-wide
+/// enumeration of its own — it claims from a ZSET and makes one
+/// `list_layer_checkpoints` per claimed object, which on StorageApi lists that
+/// object's own prefix (one small page, falling back to the whole folder only
+/// if the storage service refuses a per-layer prefix) and on LocalDisk reads
+/// the local directory.
+///
+/// Its deadline is tested before each member after the first (b.g65, D2), so
+/// the phase overruns its share by at most one member's work, and a member it
+/// defers for a reason of its own — a standing `superseded=1` header, a
+/// standing header no layer mapping names, two listings that disagreed, a
+/// sidecar read or a delete that failed, a restored object whose
+/// announcements could not be withdrawn — is
+/// re-dated to now (D4), so 100 or more permanently deferring members cannot
+/// block the members behind them. `dead_retired` counts the members removed
+/// from the backlog (D5).
 ///
 /// `budget` is the pass budget; this phase runs against its `dead_deadline`,
 /// the second of the pass's three quarters. See [`ReconcilePassBudget`] for why
@@ -2915,8 +3335,8 @@ pub(super) async fn register_dead_object_after_refused_stamp(
 ///
 /// `listed_generation_oids` is the set of object ids whose generation artifact
 /// (`*.ompf` or `*.tail`) step (a)'s listing named. The per-object listing is
-/// a different request — on StorageApi another full `layers/` LIST — and on
-/// storage-api two listings in one pass can answer differently (a cached or
+/// a different request — on StorageApi a listing of the object's own prefix —
+/// and on storage-api two listings in one pass can answer differently (a cached or
 /// lagging not-found). So when the object's own listing is empty but (a) named
 /// one of its generations, the member is kept, `dead_deferred` ticks, and a
 /// WARN carrying [`DEAD_OBJECT_LISTINGS_DISAGREE_PHRASE`] says the two
@@ -2924,12 +3344,12 @@ pub(super) async fn register_dead_object_after_refused_stamp(
 /// claimable dead object's generations between (a) and this phase, so the
 /// WARN means a listing answered stale:
 ///
-/// - Under the held lease, the orphan act and the temp reap never touch
-///   generation artifacts, and object ids are never reused.
-/// - The one lease-less deleter is the base bootstrap's inline reap
+/// - The orphan act and the temp reap never touch generation artifacts, and
+///   object ids are never reused.
+/// - The one deleter outside the clean-up is the base bootstrap's inline reap
 ///   (`BaseBootstrap::reap_dead_base`), which deletes a dead object's
 ///   just-written base on any replica. It is kept away from this phase by the
-///   grace, not the lease. It runs right after its own publish, so within one
+///   grace. It runs right after its own publish, so within one
 ///   publish worst case (`pwc`) of the layer's deletion; the member's
 ///   `ZADD NX` score is no earlier than that deletion; and this phase's claim
 ///   cutoff is the Valkey `TIME` *at claim time* minus
@@ -2940,16 +3360,17 @@ pub(super) async fn register_dead_object_after_refused_stamp(
 ///   `grace − pwc` (2 × `pwc` at the 3× multiple).
 /// - That span is bounded by the pass budget, which is at most `grace`
 ///   ([`reconcile_drain_budget`]): this phase ends at `dead_deadline`, half
-///   the budget after the pass starts, plus at most one batch of overshoot,
-///   because the drain tests its deadline only after acting.
+///   the budget after the pass starts, plus at most one member's work, because
+///   the drain tests its deadline before each member after the first.
 ///
-/// The ordinary pass stays well inside that span. A pass that runs past it —
-/// a slow batch on StorageApi, where every claimed object costs a full
-/// `layers/` LIST — can see in (a) a base the reap then deletes before this
-/// phase claims the member: a one-off WARN and a one-pass deferral, with
-/// nothing deleted. A change that makes `grace − pwc` no longer exceed the
-/// (a)-to-claim span, or delays the bootstrap's reap, makes that the common
-/// case. Both listings stale together is a residual this cannot catch.
+/// The ordinary pass stays well inside that span. A pass that runs past it can
+/// see in (a) a base the reap then deletes before this phase claims the
+/// member: a one-off WARN and a one-pass deferral, with nothing deleted. So
+/// can a second clean-up runner that reaps the object between (a) and this
+/// phase (two runners overlap only around a takeover of `le:gc:leader`). A
+/// change that makes `grace − pwc` no longer exceed the (a)-to-claim span, or
+/// delays the bootstrap's reap, makes that the common case. Both listings
+/// stale together is a residual this cannot catch.
 #[allow(clippy::too_many_arguments)]
 async fn run_reconcile_dead_objects(
     client: &ValkeyClient,
@@ -2960,10 +3381,11 @@ async fn run_reconcile_dead_objects(
     metrics: Option<&SharedMetrics>,
     replica_id: &str,
     cancel: &CancellationToken,
-    lease: &mut CheckpointLease,
+    gate: &mut CleanupGate<'_>,
     budget: ReconcilePassBudget,
     layers_populated: bool,
     listed_generation_oids: &std::collections::HashSet<u64>,
+    summary: &mut CleanupPassSummary,
 ) {
     let dead_key = keys.checkpoint_reconcile_dead();
     let deadline = budget.dead_deadline;
@@ -2974,31 +3396,60 @@ async fn run_reconcile_dead_objects(
     // progress left this pass" instead of a spin.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut retire: Vec<String> = Vec::new();
+    // Members deferred for a reason of their own, re-dated after each batch
+    // (b.g65, D4): a standing `superseded=1` header, a standing header no
+    // layer mapping names, two listings that disagreed, a sidecar read or a
+    // delete that failed, a restored object whose announcements could not be
+    // withdrawn.
+    let mut redate: Vec<String> = Vec::new();
     let mut reaped: u64 = 0;
     let mut deferred: u64 = 0;
     let mut spared: u64 = 0;
+    // Members removed from the backlog this pass (b.g65, D5).
+    let mut retired: u64 = 0;
+    // Members this phase has reached; the drain tests its deadline before
+    // each member after the first (b.g65, D2).
+    let mut members_reached: u64 = 0;
 
     'dead_drain: loop {
         if cancel.is_cancelled() {
             break 'dead_drain;
         }
+        // The gate at the phase start and each drain iteration (b.g65),
+        // raced against `cancel` like every read before a member's first
+        // write.
+        let open = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break 'dead_drain,
+            open = gate.may_continue() => open,
+        };
+        if !open {
+            break 'dead_drain;
+        }
 
         // Pure claim — this phase registers nothing. Its producers are the
-        // delete paths, on the RPC thread, which is the whole basis of the
+        // paths that observe a death — `DeleteLayer` after its unmap, the
+        // overwrite clean-up once the overwrite unmapped the old object, and
+        // the refused-stamp arms — which is the whole basis of the
         // positive-evidence rule.
-        let expired =
-            match recon_claim_expired(client, &dead_key, grace, RECONCILE_BATCH, &[]).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(
-                        replica_id = %replica_id,
-                        error = %e,
-                        "checkpoint reconciliation dead-object claim failed; ending the \
-                         dead-object phase this pass (the ZSET is durable — nothing is lost)"
-                    );
-                    break 'dead_drain;
-                }
-            };
+        // A read (`TIME` and `ZRANGEBYSCORE`), raced against `cancel`.
+        let claimed = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break 'dead_drain,
+            claimed = recon_claim_expired(client, &dead_key, grace, RECONCILE_BATCH, &[]) => claimed,
+        };
+        let expired = match claimed {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    replica_id = %replica_id,
+                    error = %e,
+                    "checkpoint reconciliation dead-object claim failed; ending the \
+                     dead-object phase this pass (the ZSET is durable — nothing is lost)"
+                );
+                break 'dead_drain;
+            }
+        };
         if expired.is_empty() {
             break 'dead_drain;
         }
@@ -3010,12 +3461,21 @@ async fn run_reconcile_dead_objects(
             break 'dead_drain;
         }
 
+        summary.dead_claimed += batch.len() as u64;
         let mut stop_drain = false;
         for member in &batch {
             if cancel.is_cancelled() {
                 stop_drain = true;
                 break;
             }
+            // The deadline before each member after the first (b.g65, D2):
+            // one batch of slow listings cannot overrun the phase's share by a
+            // whole claim. The members not reached keep their scores.
+            if members_reached > 0 && Instant::now() >= deadline {
+                stop_drain = true;
+                break;
+            }
+            members_reached += 1;
 
             let Ok(object_id) = member.parse::<u64>() else {
                 tracing::warn!(
@@ -3031,13 +3491,26 @@ async fn run_reconcile_dead_objects(
 
             // Liveness re-check BEFORE anything destructive. See the rustdoc.
             // This is the cheap per-object early-out; the same probe is REPEATED
-            // immediately before every generation delete (b.vn6 review round 1),
-            // because everything between the two — the listing, and each
-            // generation's sidecar read and tombstone record — is bounded only
-            // by the adapter's per-call ceiling and the lease excludes a peer
-            // reconciler, never `apply_restore`.
-            let header_key = keys.obj_header(&object_id.to_string());
-            let liveness = match probe_dead_object_liveness(client, &header_key).await {
+            // before every generation's announcement and delete (b.vn6 review
+            // round 1, b.g65), because everything between the two — the
+            // listing, and each generation's sidecar read — is bounded only by
+            // the adapter's per-call ceiling, and no lock excludes
+            // `apply_restore`.
+            //
+            // This probe, the listing and each generation's sidecar read and
+            // re-probe are raced against `cancel`: a cancel abandons the read
+            // in flight and ends the drain after this batch's retire, with
+            // nothing written for this member and the member registered as it
+            // was.
+            let probed = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    stop_drain = true;
+                    break;
+                }
+                probed = probe_dead_object_liveness(client, keys, object_id) => probed,
+            };
+            let liveness = match probed {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!(
@@ -3056,13 +3529,23 @@ async fn run_reconcile_dead_objects(
             match liveness {
                 DeadObjectLiveness::Dead => {}
                 DeadObjectLiveness::Live => {
+                    // Withdraw before retire: an earlier pass may have
+                    // announced a base of this object and then failed to
+                    // delete it. The member is retired only once no stem of
+                    // the object is still announced.
+                    if !withdraw_before_spared_retire(client, keys, object_id, replica_id).await {
+                        redate.push(member.clone());
+                        deferred += 1;
+                        continue;
+                    }
                     tracing::info!(
                         replica_id = %replica_id,
                         object_id,
                         "checkpoint reconciliation found a dead-object candidate whose obj:hdr \
-                         is LIVE again and carries no superseded flag — a DR restore \
-                         resurrected this object_id — so its generations are spared and the \
-                         candidate retired; those blobs are what it was restored from"
+                         is LIVE again, carries no superseded flag and is named by its layer \
+                         mapping — a DR restore resurrected this object_id — so its \
+                         generations are spared and the candidate retired; those blobs are what \
+                         it was restored from"
                     );
                     spared += 1;
                     retire.push(member.clone());
@@ -3082,10 +3565,11 @@ async fn run_reconcile_dead_objects(
                     //
                     // So: delete nothing (the header is present, and the
                     // no-delete-on-a-live-header rule stays absolute) and leave
-                    // the member registered with its original first-observation
-                    // score, so the next pass re-checks. It resolves either way
-                    // — the Valkey orphan sweep or a later cleanup retires the
-                    // header, after which this reads `Dead`.
+                    // the member registered, re-dated to now (D4), so the next
+                    // pass re-checks without blocking the members behind it.
+                    // It resolves either way — the Valkey orphan sweep or a
+                    // later cleanup retires the header, after which this reads
+                    // `Dead`.
                     tracing::info!(
                         replica_id = %replica_id,
                         object_id,
@@ -3095,28 +3579,48 @@ async fn run_reconcile_dead_objects(
                          was deleted and the candidate stays registered for the next pass \
                          rather than being retired as spared"
                     );
+                    redate.push(member.clone());
+                    deferred += 1;
+                    continue;
+                }
+                DeadObjectLiveness::LiveUnmapped => {
+                    // NOT retired (b.g65). A standing header with no
+                    // `superseded` flag that no layer mapping names is a
+                    // `DeleteLayer` whose teardown has not finished — it
+                    // registered the object right after its unmap, before the
+                    // header goes — not a DR restore, which always maps what it
+                    // restores. Same disposition as `LiveSuperseded`: delete
+                    // nothing, keep the member re-dated (D4), re-check next
+                    // pass; the delete's retry or the orphan sweep removes the
+                    // header, after which this reads `Dead`.
+                    tracing::info!(
+                        replica_id = %replica_id,
+                        object_id,
+                        "{DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE}: the dead-object candidate's \
+                         obj:hdr still exists with no superseded flag and no layer mapping names \
+                         it, so its deletion is still in progress or was interrupted; nothing \
+                         was deleted, and its backups are kept until the store clean-up (the \
+                         delete's retry or the orphan sweep) removes it"
+                    );
+                    redate.push(member.clone());
                     deferred += 1;
                     continue;
                 }
             }
 
-            // Re-prove the lease before the first destructive step for this
-            // object. Cheap: `ensure_held` only round-trips when a renewal is
-            // actually due.
-            if lease.ensure_held(client, metrics).await == LeaseState::Lost {
-                tracing::warn!(
-                    replica_id = %replica_id,
-                    lock_value = %lease.identity(),
-                    "checkpoint reconciliation lost its leader lease mid dead-object phase; \
-                     aborting the remainder (candidates keep their original first-observed \
-                     timestamps, so the next pass resumes)"
-                );
-                stop_drain = true;
-                break;
-            }
-
-            let generations = match store.list_layer_checkpoints(object_id).await {
-                Ok(v) => v,
+            let listed = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    stop_drain = true;
+                    break;
+                }
+                listed = store.list_layer_checkpoints(object_id) => listed,
+            };
+            let generations = match listed {
+                Ok(v) => {
+                    summary.dead_listed += v.len() as u64;
+                    v
+                }
                 Err(e) => {
                     tracing::warn!(
                         replica_id = %replica_id,
@@ -3160,8 +3664,8 @@ async fn run_reconcile_dead_objects(
                     // object's own listing — a different request — came back
                     // empty (b.oya, PD-F1b). Ordinarily nothing deletes a
                     // claimable dead object's generations between the two: the
-                    // leased phases never touch generation artifacts, and the
-                    // lease-less base-bootstrap reap of any member claimed now
+                    // orphan phase never touches generation artifacts, and the
+                    // base-bootstrap reap of any member claimed now
                     // happened before (a) whenever the (a)-to-claim span is
                     // shorter than `grace − publish_worst_case`, which the pass
                     // budget keeps it (see the rustdoc). So one of them answered
@@ -3179,6 +3683,7 @@ async fn run_reconcile_dead_objects(
                          rather than retiring it as already clean (a recurring disagreement \
                          means the storage service answered one of the two listings stale)"
                     );
+                    redate.push(member.clone());
                     deferred += 1;
                     continue;
                 }
@@ -3191,36 +3696,47 @@ async fn run_reconcile_dead_objects(
             }
 
             let mut all_gone = true;
+            // A sidecar read or a delete of one of this object's generations
+            // failed: the member is re-dated (D4).
+            let mut member_failed = false;
             // Set when a pre-delete re-probe found the header standing again
             // (b.vn6 review round 1). It, not `all_gone`, decides this object's
             // disposition below, because "stop deleting" is the right answer for
             // both of its values while "retire" is right for only one.
             let mut resurrected: Option<DeadObjectLiveness> = None;
             for handle in generations {
-                if lease.ensure_held(client, metrics).await == LeaseState::Lost {
-                    tracing::warn!(
-                        replica_id = %replica_id,
-                        lock_value = %lease.identity(),
-                        object_id,
-                        "checkpoint reconciliation lost its leader lease part-way through a \
-                         dead object's generations; the remainder is left for the next pass"
-                    );
+                // Between generations — never between a delete and what
+                // follows it — a cancel stops this object's reap: the
+                // generations already deleted stay deleted, the rest stay for
+                // a later pass, and the member stays registered.
+                if cancel.is_cancelled() {
                     all_gone = false;
                     stop_drain = true;
                     break;
                 }
-
                 let snap_seq = handle.snap_seq;
                 // Pre-delete obligation, by family — exhaustive on `kind` (no
                 // `_` arm) so a third `CheckpointKind` cannot silently inherit
-                // either posture, exactly as in the orphan arm.
-                let generation_kind = match handle.kind {
+                // either posture, exactly as in the orphan arm. A base's
+                // sidecar is read first; its hashes are recorded and its stem
+                // announced only after the re-probe below, immediately before
+                // the delete.
+                let (generation_kind, sidecar_hashes) = match handle.kind {
                     CheckpointKind::Base => {
                         // Sidecar FIRST: the hashes must be recorded before the
                         // artifact naming them is deleted, or they leak
                         // permanently.
-                        let hashes = match store.read_ext_refs_sidecar(&handle).await {
-                            Ok(set) => set,
+                        let read = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                all_gone = false;
+                                stop_drain = true;
+                                break;
+                            }
+                            read = store.read_ext_refs_sidecar(&handle) => read,
+                        };
+                        match read {
+                            Ok(set) => ("base", Some(set)),
                             Err(e) => {
                                 tracing::warn!(
                                     replica_id = %replica_id,
@@ -3232,75 +3748,95 @@ async fn run_reconcile_dead_objects(
                                      ext-refs sidecar; leaving that generation in place \
                                      (deleting it now would strand the blobs it references)"
                                 );
+                                member_failed = true;
                                 all_gone = false;
                                 continue;
                             }
-                        };
-                        let hash_count = hashes.len();
-                        if let Err(e) = tombstones
-                            .record(hashes.into_iter().collect::<Vec<String>>())
-                            .await
-                        {
-                            tracing::warn!(
-                                replica_id = %replica_id,
-                                object_id,
-                                snap_seq,
-                                hash_count,
-                                error = %e,
-                                "checkpoint reconciliation could not tombstone a dead object's \
-                                 ext hashes; leaving that generation in place"
-                            );
-                            all_gone = false;
-                            continue;
                         }
-                        "base"
                     }
                     // A tail carries no ext-refs sidecar by design (SR-2.4,
                     // enforced at put time by `validate_tail_put`), so it names
-                    // no hashes and there is nothing to tombstone. Routed past
-                    // the read structurally rather than relying on it returning
-                    // empty — see the orphan arm for why that distinction is
-                    // load-bearing on a kind-blind adapter.
-                    CheckpointKind::Tail => "tail",
+                    // no hashes and there is nothing to tombstone or announce.
+                    // Routed past the read structurally rather than relying on
+                    // it returning empty — see the orphan arm for why that
+                    // distinction is load-bearing on a kind-blind adapter.
+                    CheckpointKind::Tail => ("tail", None),
                 };
 
-                // Liveness re-probe, immediately before the delete (b.vn6
-                // review round 1). The per-object probe above is the cheap
-                // early-out; this is the one the no-delete-on-a-live-header
-                // rule actually rests on.
+                // Liveness re-probe, BEFORE the deletion announcement and the
+                // delete (b.vn6 review round 1; b.g65). The per-object probe
+                // above is the cheap early-out; this is the one the
+                // no-delete-on-a-live-header rule actually rests on.
                 //
                 // What sits between them is not small: `list_layer_checkpoints`
-                // for the object, plus — per generation — a sidecar read and a
-                // tombstone record, each bounded only by the adapter's per-call
-                // ceiling (180 s at the StorageApi defaults). And the leader
-                // lease does not close the window: `ensure_held` excludes a peer
-                // *reconciler*, and the writer that can resurrect this
-                // `object_id` is `apply_restore`, which holds no reconciliation
-                // lease at all. So the object can become live in the middle of
-                // its own reap, and the generations still standing are precisely
-                // what the restore is built on.
+                // for the object, plus — per generation — a sidecar read, each
+                // bounded only by the adapter's per-call ceiling (180 s at the
+                // StorageApi defaults). And no lock closes the window: the
+                // writer that can resurrect this `object_id` is
+                // `apply_restore`, which takes no part in the clean-up's lock.
+                // So the object can become live in the middle of its own reap,
+                // and the generations still standing are precisely what the
+                // restore is built on.
                 //
-                // One extra `HMGET` per generation against the maintenance pool,
-                // on a phase that is already making an adapter round-trip per
+                // It runs before the announcement so that a generation this
+                // phase keeps is never left announced on
+                // `le:ckpt:{recon}:deleting`: whatever the verdict — `Live`,
+                // `LiveUnmapped`, `LiveSuperseded` or an error — nothing has
+                // been announced for this generation yet. An announcement on a
+                // kept base would let the collect skip a stale not-found of its
+                // sidecar as "announced" (N2) and drop its hashes from the live
+                // set. The price is one `{recon}` round trip (the record and
+                // announcement) between this probe and the delete, inside
+                // which a restore can still land unseen.
+                //
+                // One extra `HMGET` per generation against the maintenance pool
+                // (plus a mapping `GET` only when the header stands again), on
+                // a phase that is already making an adapter round-trip per
                 // generation. That is not a cost worth trading a delete of the
                 // only surviving copy for.
-                match probe_dead_object_liveness(client, &header_key).await {
+                let reprobed = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        all_gone = false;
+                        stop_drain = true;
+                        break;
+                    }
+                    reprobed = probe_dead_object_liveness(client, keys, object_id) => reprobed,
+                };
+                match reprobed {
                     Ok(DeadObjectLiveness::Dead) => {}
                     Ok(state) => {
-                        tracing::info!(
-                            replica_id = %replica_id,
-                            object_id,
-                            snap_seq,
-                            generation_kind,
-                            superseded = matches!(state, DeadObjectLiveness::LiveSuperseded),
-                            "checkpoint reconciliation found a dead object's obj:hdr standing \
-                             again part-way through reaping its generations; stopping here and \
-                             deleting nothing further for this object. Generations already \
-                             deleted this pass stay deleted — each was reaped while the object \
-                             was provably dead at its own pre-delete probe, which is the \
-                             strongest evidence this phase can have and the same evidence a \
-                             single-generation object acts on"
-                        );
+                        if state == DeadObjectLiveness::LiveUnmapped {
+                            tracing::info!(
+                                replica_id = %replica_id,
+                                object_id,
+                                snap_seq,
+                                generation_kind,
+                                "{DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE}: a dead object's \
+                                 obj:hdr stands again part-way through reaping its generations, \
+                                 with no superseded flag and no layer mapping naming it, so its \
+                                 deletion is still in progress or was interrupted; stopping here \
+                                 and deleting nothing further for this object. Generations \
+                                 already deleted this pass stay deleted, and the rest are kept \
+                                 until the store clean-up (the delete's retry or the orphan \
+                                 sweep) removes the header"
+                            );
+                        } else {
+                            tracing::info!(
+                                replica_id = %replica_id,
+                                object_id,
+                                snap_seq,
+                                generation_kind,
+                                superseded = matches!(state, DeadObjectLiveness::LiveSuperseded),
+                                "checkpoint reconciliation found a dead object's obj:hdr \
+                                 standing again part-way through reaping its generations; \
+                                 stopping here and deleting nothing further for this object. \
+                                 Generations already deleted this pass stay deleted — each was \
+                                 reaped while the object was provably dead at its own pre-delete \
+                                 probe, which is the strongest evidence this phase can have and \
+                                 the same evidence a single-generation object acts on"
+                            );
+                        }
                         resurrected = Some(state);
                         all_gone = false;
                         break;
@@ -3315,11 +3851,39 @@ async fn run_reconcile_dead_objects(
                              liveness immediately before deleting one of its generations; \
                              leaving the remainder in place for the next pass (deleting on an \
                              unknown liveness answer is the one direction this phase may not \
-                             take). A base's hashes are already tombstoned, so nothing leaks \
-                             meanwhile"
+                             take). Nothing was announced or deleted for this generation"
                         );
                         all_gone = false;
                         break;
+                    }
+                }
+
+                // Record the base's hashes and announce its stem, after the
+                // re-probe and immediately before the delete (N2).
+                if let Some(hashes) = sidecar_hashes {
+                    let hash_count = hashes.len();
+                    if let Err(e) = tombstones
+                        .record(
+                            &[reconcile_stem_member(
+                                object_id,
+                                snap_seq,
+                                CheckpointKind::Base,
+                            )],
+                            hashes.into_iter().collect::<Vec<String>>(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            replica_id = %replica_id,
+                            object_id,
+                            snap_seq,
+                            hash_count,
+                            error = %e,
+                            "checkpoint reconciliation could not tombstone a dead object's \
+                             ext hashes; leaving that generation in place"
+                        );
+                        all_gone = false;
+                        continue;
                     }
                 }
 
@@ -3349,6 +3913,7 @@ async fn run_reconcile_dead_objects(
                              next pass (a base's hashes are already tombstoned, so nothing \
                              leaks meanwhile)"
                         );
+                        member_failed = true;
                         all_gone = false;
                     }
                 }
@@ -3361,17 +3926,32 @@ async fn run_reconcile_dead_objects(
             // claimable, which is the retry.
             if let Some(state) = resurrected {
                 if matches!(state, DeadObjectLiveness::Live) {
-                    spared += 1;
-                    retire.push(member.clone());
+                    // Withdraw before retire: a base of this object whose
+                    // delete failed (earlier in this pass, or in an earlier
+                    // pass) is still announced. A withdrawal that does not
+                    // land keeps the member, re-dated, so the next pass
+                    // withdraws before it retires.
+                    if withdraw_before_spared_retire(client, keys, object_id, replica_id).await {
+                        spared += 1;
+                        retire.push(member.clone());
+                    } else {
+                        deferred += 1;
+                        redate.push(member.clone());
+                    }
                 } else {
-                    // `superseded=1`: dead object, un-cleaned header. Stays
+                    // `superseded=1`, or a header no layer mapping names: a
+                    // dead object whose header is not yet cleaned up. Stays
                     // registered for the same reason as at the early-out.
                     deferred += 1;
+                    redate.push(member.clone());
                 }
             } else if all_gone {
                 retire.push(member.clone());
             } else {
                 deferred += 1;
+                if member_failed {
+                    redate.push(member.clone());
+                }
             }
             if stop_drain {
                 break;
@@ -3382,16 +3962,20 @@ async fn run_reconcile_dead_objects(
         // does not remove what it returns, so an un-retired member is served
         // again by the very next claim and the drain would terminate on `seen`
         // instead of reaching the next batch.
-        if let Err(e) = recon_retire(client, &dead_key, &retire).await {
-            tracing::warn!(
-                replica_id = %replica_id,
-                retire_count = retire.len(),
-                error = %e,
-                "checkpoint reconciliation could not retire acted-on dead objects; they will \
-                 be re-examined next pass (the remedy is idempotent, so the repeat is harmless)"
-            );
+        match recon_retire(client, &dead_key, &retire).await {
+            Ok(()) => retired += retire.len() as u64,
+            Err(e) => {
+                tracing::warn!(
+                    replica_id = %replica_id,
+                    retire_count = retire.len(),
+                    error = %e,
+                    "checkpoint reconciliation could not retire acted-on dead objects; they will \
+                     be re-examined next pass (the remedy is idempotent, so the repeat is harmless)"
+                );
+            }
         }
         retire.clear();
+        redate_members(client, &dead_key, &mut redate, replica_id).await;
 
         if stop_drain {
             break 'dead_drain;
@@ -3414,113 +3998,128 @@ async fn run_reconcile_dead_objects(
         m.add_checkpoint_reconcile("dead_object_reaped", reaped, replica_id);
         m.add_checkpoint_reconcile("dead_deferred", deferred, replica_id);
         m.add_checkpoint_reconcile("dead_spared", spared, replica_id);
+        m.add_checkpoint_reconcile("dead_retired", retired, replica_id);
     }
+    summary.dead_reaped = reaped;
+    summary.dead_deferred = deferred;
+    summary.dead_retired = retired;
 }
 
-/// The collect half of the claim-then-collect protocol (b.9qd): delete the
-/// ext blobs whose tombstones have outlived the grace window and that the live
-/// set no longer references.
+/// The collect half of the claim-then-collect protocol (b.9qd, rebuilt in
+/// b.g65): delete the backup copies of ext values whose tombstones have
+/// outlived the grace window, that no retained backup's sidecar names, that
+/// Valkey no longer holds, and whose delete the `{recon}` fence licenses.
 ///
-/// Split out of [`run_reconcile_tick`] so the **one live-set read per pass**
-/// is structurally obvious. Reading it per layer — the shape the pre-b.9qd
-/// inline cascade had — costs K remote GETs per layer against a blob backend,
-/// i.e. K×N for the pass, for an answer that is identical every time.
+/// # One live-set read, anchored to its own clock (R1)
 ///
-/// A live-set read failure aborts ONLY this phase. The tombstones are durable,
-/// so every deferred hash is collected on a later pass; the alternative
-/// (guessing) is the over-delete this whole protocol exists to prevent.
+/// The live set is read once per pass through `list_live_ext_set` — on a blob
+/// backend a LIST plus one GET per sidecar, the most expensive call in the
+/// pass — and the deletes then run for up to the rest of the collect budget.
+/// Nothing that happens after the read can be seen in it, so the read alone
+/// licenses nothing. Immediately before it, the pass reads the `{recon}` clock
+/// `t0` (`storage::recon_fence::recon_clock_ms`) and sets
+/// `threshold = t0 − grace`. A hash may be deleted this pass only when its
+/// tombstone and its latest writer re-arm are both at or before the threshold:
+/// a re-arm at or before it means the writer's sidecar was visible before `t0`
+/// (a re-arm lands at most one publish worst case before its sidecar), so the
+/// walk saw it. The claim serves oldest first, so the first claimed member the
+/// fence finds newer than the threshold ends the drain. The license therefore
+/// does not depend on how old the snapshot is, only on the clock read before
+/// it — within one bound the fence checks against its own clock: a fence run
+/// more than one grace past `t0` licenses nothing, because by then a peer's
+/// trim of re-arms older than two graces may have removed one newer than the
+/// threshold.
 ///
-/// The live set is read through `list_live_ext_set` (the same walk as
-/// `list_referenced_ext_hashes`, plus its own listing's artifact count) and is
-/// deliberately consumed **fail-closed**: a malformed sidecar surfaces as
-/// `Permanent` and aborts the phase rather than being skipped, because
-/// skipping one sidecar under-counts the live set, and an under-counted live
-/// set is precisely an over-delete.
+/// # Per batch
 ///
-/// # One live-set read, many batches
+/// 1. The pass's gate ([`CleanupGate`]): `le:gc:leader` still held, and a
+///    current build leading backups.
+/// 2. Classify: a hash in the live set is **spared**.
+/// 3. **Valkey liveness (R4).** One `EXISTS le:ext:meta:{hash}` per remaining
+///    hash, on the maintenance pool. A value Valkey still holds is one a later
+///    backup can name — reused after its last reference was pruned (an undo, a
+///    re-upload, the same asset in another layer) — so it is **deferred**
+///    (`ext_deferred_live`) and its tombstone re-dated to now.
+/// 4. **The fence (R3).** `recon_ext_commit.lua` over the rest: licensed (and
+///    recorded on `le:ckpt:{recon}:collected` before the delete, so a writer
+///    that re-arms afterwards refuses its PUT), re-armed by a writer after the
+///    threshold (deferred, `ext_deferred_rearmed`, tombstone re-dated), or
+///    newer than the threshold — every hash, when the run is more than one
+///    grace past `t0` — (the drain ends after this batch).
+/// 5. For each licensed hash: `delete_ext_blob`, then the post-delete step
+///    (R5, `ext_backup_clear.lua` on the value's own meta). A meta that no
+///    longer exists means the value is gone from Valkey; otherwise the step
+///    withdraws the value's backup confirmation and stamps the clear, which
+///    declines any confirmation that started relying on the deleted copy, and
+///    the collect **heals**: it re-puts the value from Valkey, charged to the
+///    ext mirror's byte budget ([`CollectHeal`]), and confirms it
+///    (`ext_healed`). A store landed between the liveness check and the
+///    delete, so its mirror copy may have been erased. (A meta without data
+///    cannot reach this step: R4 defers a present meta, and outside the held
+///    DR restore Job nothing creates one between R4 and the delete — the GC
+///    deletes meta and data together, and every store writes both.) A delete and its
+///    post-delete step form one unit: cancellation is checked before the
+///    delete, never between the two. A hash whose delete, post-delete step or
+///    heal failed keeps its tombstone and `:collected` record, re-dated to
+///    now after the batch (D4), so hashes that keep failing cannot hold the
+///    head of the oldest-first claim.
+/// 6. **Settle (R6)**, one `recon_ext_settle.lua` per batch: spared hashes
+///    retire their tombstone and re-arm, except one with a `:collected`
+///    entry; deleted ones retire their tombstone unless a writer re-armed
+///    since the threshold; a delete of a value gone from Valkey re-dates its
+///    `:collected` entry to the settle time; a healed one drops its entry. A
+///    kept hash whose earlier delete was never settled (a crash, or a heal
+///    that found no budget or failed) is healed now (heal-on-keep). If Valkey
+///    no longer holds its bytes but holds its meta (the meta without data a
+///    DR restore's recount leaves, `storage::ext_reconcile`), the backup
+///    store is probed: a copy there settles the hash like a heal, with one
+///    INFO and no counter. If neither store holds it, a WARN names it
+///    (`ext_heal_unavailable`). A spared
+///    one is retired by a second settle only once healed; otherwise its
+///    tombstone stays, re-dated (D4), and a later pass that claims it again
+///    retries the heal while its `:collected` record lasts.
 ///
-/// The claim→act round repeats until the claim yields no new hash, the lease
-/// cannot be re-proven, or [`reconcile_drain_budget`] is spent — but
-/// `list_live_ext_set` still runs exactly **once**, at the top. That
-/// snapshot is the reason the budget's grace term exists: acting on a live set
-/// older than one grace window would re-open the very race the grace closes
-/// (see `reconcile_drain_budget`). Re-reading it per batch is the alternative
-/// and it is the wrong one — on a blob backend it is a LIST plus one GET per
-/// sidecar, the single most expensive operation in the pass.
+/// # A listed sidecar that reads absent (N2)
 ///
-/// `budget` is the pass budget minted once in [`reconcile_leader_tick`]; this
-/// phase runs against its `collect_deadline`, which is the *whole* pass budget
-/// and therefore leaves it at least half in hand — the orphan phase is capped
-/// at the other half rather than being free to consume everything (b.gg7 review
-/// round 2). That guarantee is the point of the split: a collect phase reduced
-/// to the loop's "always buys one batch" floor collects
-/// [`RECONCILE_BATCH`] hashes per pass, which at the default cadence is 100 per
-/// hour against a fleet-sized production rate — the non-convergence this pass
-/// exists to prevent. See [`ReconcilePassBudget`].
+/// The walk reports each sidecar its own listing named and then read absent
+/// ([`crate::checkpoint::store::LiveExtSet::absent`]). One is skipped
+/// (`listed_sidecar_skipped`) on evidence that skipping it drops no reference
+/// a retained backup needs: the same listing named no `.ompf` for it — its
+/// publish was unfinished when listed, so if it completes, its re-arm landed
+/// after `t0` and the fence refuses its hashes — or a deleter announced its
+/// stem on `le:ckpt:{recon}:deleting` before deleting it, having read and
+/// tombstoned its hashes and decided it is not retained. Any other absence —
+/// a stale not-found from the storage service, say — deletes and retires
+/// nothing this pass, counts `live_set_failed`, and a WARN names the files:
+/// absence alone never licenses a delete.
 ///
 /// # An empty live set deletes only when its own walk listed something (b.oya)
 ///
-/// An empty live set licenses deleting every claimed tombstone's blob, and it
-/// is also what a store at the wrong address, or one whose listing answers a
-/// not-found (none, cached, or lagging) while by-address deletes still work,
-/// returns — the last would delete blobs that retained backups still name,
-/// an unrecoverable DR loss. So the license rests on the **same request** the
-/// set came from: `LiveExtSet::listed_layer_artifacts`, the number of layer
-/// artifacts the walk's own `layers/` listing named. When the set is empty
-/// and that count is 0, the phase deletes nothing, retires nothing, ticks no
-/// `live_set_failed` (the read did not fail), logs one INFO with the
-/// tombstone count and returns before the re-acquire; the tombstones stay
-/// claimable for the next pass. Step (a)'s enumeration is a different request
-/// — on storage-api two listings in one pass can answer differently — so it
-/// does not enter this decision (PD-F1a): a failed or elapsed (a) does not
-/// withhold a collect whose own walk listed something, and a populated (a)
-/// cannot license a delete against an empty walk. The trait's fail-closed
-/// default reports a count of 0, so an adapter or decorator that does not
-/// produce the count only ever defers.
+/// An empty live set is also what a store at the wrong address, or one whose
+/// listing answers a not-found while by-address deletes still work, returns.
+/// So the license rests on the **same request** the set came from:
+/// `LiveExtSet::listed_layer_artifacts`. When the set is empty and that count
+/// is 0, the phase deletes nothing, retires nothing, ticks no
+/// `live_set_failed` (the read did not fail), and logs one INFO with the
+/// tombstone count. Step (a)'s enumeration is a different request and does not
+/// enter this decision (PD-F1a). The trait's fail-closed default reports a
+/// count of 0, so an adapter or decorator that does not produce the count only
+/// ever defers.
 ///
-/// Residual: a walk whose listing is populated but stale can omit a sidecar
-/// published since, and that is not detected here (tracked separately).
+/// # Failure posture
 ///
-/// # A listed sidecar that reads absent aborts the phase (b.oya)
+/// Every failure defers rather than guesses, and the tombstones are durable:
+/// a failed clock read, live-set read (a store error, a malformed sidecar, the
+/// collect-budget elapse — `live_set_failed`), liveness check or fence ends
+/// the phase with nothing deleted from that batch on; a failed delete or
+/// post-delete step keeps the hash's tombstone, re-dated, and its
+/// `:collected` record for a later pass. The live set is consumed fail-closed: a partial set is never
+/// deleted against.
 ///
-/// The StorageApi and LocalDisk `list_live_ext_set` read every ext-refs
-/// sidecar their own listing named (InMemory reads under one lock, so it
-/// cannot list a sidecar and then miss it). One that then reads absent by
-/// address is an inconsistency, not an empty sidecar: skipping it would
-/// under-count the live set, which is an over-delete. Those adapters therefore
-/// answer it with the typed `Transient` marker
-/// ([`CheckpointError::is_listed_sidecar_absent`]), naming the sidecar, and
-/// this phase deletes and retires nothing that pass. How it counts the abort
-/// depends on who holds the checkpoint lease, which this arm re-acquires
-/// ([`CheckpointLease::reacquire_after_enumeration`], the same call the
-/// success path makes):
-///
-/// - **`Lost`** — a peer holds `le:checkpoint:leader` (it claimed the lock
-///   while this walk outlasted the lease, and its lease-gated retention prune
-///   deletes exactly such sidecars), or the probe failed. The phase ends as a
-///   lease loss: one `debug` line naming the sidecar, no `live_set_failed`, no
-///   WARN; the lease counter ticks inside the re-acquire.
-/// - **`Held`** — this replica still leads, so no lease-gated deleter explains
-///   the absence. What remains is a deleter outside the lease (the base
-///   bootstrap's reap on a create/delete race, or `rollback_partial_publish`),
-///   a peer that led during the walk and then stopped refreshing the lock, or
-///   the store answering inconsistently (a stale not-found, or a listing that
-///   lags deletes). It counts: `live_set_failed`, a WARN carrying the error,
-///   and the next pass re-reads.
-///
-/// Every other live-set failure — a store error, a malformed sidecar, the
-/// collect-budget elapse — counts as `live_set_failed` whoever holds the
-/// lease: its cause does not depend on who leads, and on a store whose every
-/// walk outlasts the lease, routing it through the lease would hide it for
-/// good.
-///
-/// Residuals: a peer that claimed the lock mid-walk and then stopped
-/// refreshing before this replica re-acquires makes one pass count a routine
-/// prune as `live_set_failed` (one tick, no delete); a listing that lags
-/// deletes still counts under a held lease; and on a multi-replica store whose
-/// walk outlasts the lease, every collect ends as a lease loss — the hand-off
-/// itself, which predates this arm (the success path's re-acquire loses the
-/// same way).
+/// `budget` is the pass budget minted once in [`run_cleanup_pass`]; this phase
+/// runs against its `collect_deadline`, which is the *whole* pass budget and
+/// therefore leaves it at least half in hand (b.gg7 review round 2). See
+/// [`ReconcilePassBudget`].
 #[allow(clippy::too_many_arguments)]
 async fn run_reconcile_collect(
     client: &ValkeyClient,
@@ -3532,10 +4131,30 @@ async fn run_reconcile_collect(
     metrics: Option<&SharedMetrics>,
     replica_id: &str,
     cancel: &CancellationToken,
-    lease: &mut CheckpointLease,
+    gate: &mut CleanupGate<'_>,
     budget: ReconcilePassBudget,
+    heal: Option<&CollectHeal>,
+    summary: &mut CleanupPassSummary,
 ) {
-    let expired = match recon_claim_expired(client, tomb_key, grace, RECONCILE_BATCH, &[]).await {
+    // The gate at the phase start. Its reads, the claims, the live-set walk
+    // and its announcement check, and the gate and liveness reads of every
+    // batch are raced against `cancel`, biased toward it; nothing of a batch
+    // is written before them.
+    let open = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        open = gate.may_continue() => open,
+    };
+    if !open {
+        return;
+    }
+    // A read (`TIME` and `ZRANGEBYSCORE`), raced against `cancel`.
+    let claimed = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        claimed = recon_claim_expired(client, tomb_key, grace, RECONCILE_BATCH, &[]) => claimed,
+    };
+    let expired = match claimed {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(
@@ -3551,27 +4170,37 @@ async fn run_reconcile_collect(
         return;
     }
 
-    // ONE live-set read for the whole pass — see the doc-comment — preemptively
-    // bounded by what is left of this phase (b.gg7 review round 2).
-    //
-    // This is the single most expensive call the subsystem makes: on a blob
-    // backend a paginated LIST plus one GET per sidecar in the fleet. The
-    // adapter bounds it cooperatively at its own enumeration ceiling (540 s at
-    // the defaults, and twice over — once for the LIST, once for the GET
-    // fan-out), which is larger than the entire pass budget and would therefore
-    // sit on top of it rather than inside it.
-    //
-    // Preemptive is safe here for the same reason it is in the orphan phase and
-    // the recovery hooks: LIST + GET only. Nothing has been deleted at this
-    // point — the claim above merely stamped the tombstones as in-flight, and
-    // an unretired tombstone is re-served by the very next pass's claim.
-    //
-    // An elapse aborts ONLY the collect phase, taking the same arm a live-set
-    // read *failure* takes, and for the same reason: the phase consumes this
-    // set fail-closed, so a set we could not finish reading is a set we may not
-    // delete against. The tombstones persist and the next pass retries.
+    // R1: the snapshot clock, read immediately before the live-set walk.
+    let t0 = match recon_clock_ms(client, keys).await {
+        Ok(t0) => t0,
+        Err(e) => {
+            tracing::warn!(
+                replica_id = %replica_id,
+                tombstone_count = expired.len(),
+                error = %e,
+                "checkpoint reconciliation could not read the clean-up clock before its live-set \
+                 walk; skipping the collect phase this pass (tombstones are durable — nothing is \
+                 lost)"
+            );
+            return;
+        }
+    };
+
+    // ONE live-set read for the whole pass, preemptively bounded by what is
+    // left of this phase (b.gg7 review round 2): the adapter's own enumeration
+    // ceiling is larger than the whole pass budget and would otherwise sit on
+    // top of it. Preemptive is safe: LIST + GET only, nothing deleted yet, and
+    // an unretired tombstone is re-served by the next pass's claim.
     let live_set_bound = ReconcilePassBudget::enumeration_bound(budget.collect_deadline, grace);
-    let live = match tokio::time::timeout(live_set_bound, store.list_live_ext_set()).await {
+    summary.collect_bound_secs = live_set_bound.as_secs();
+    let walk_started = Instant::now();
+    let walk = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return,
+        walk = tokio::time::timeout(live_set_bound, store.list_live_ext_set()) => walk,
+    };
+    summary.walk_ms = millis_u64(walk_started.elapsed());
+    let live = match walk {
         Ok(Ok(set)) => set,
         Err(_elapsed) => {
             if let Some(m) = metrics {
@@ -3590,34 +4219,6 @@ async fn run_reconcile_collect(
             return;
         }
         Ok(Err(e)) => {
-            // A sidecar the walk itself listed that then read absent (b.oya)
-            // deletes nothing either way; what it decides is whether the abort
-            // counts as a live-set failure. While a peer holds the checkpoint
-            // lease — it claimed the lock while this walk outlasted the 30 s
-            // lease — that peer's lease-gated retention prune deletes exactly
-            // such sidecars, so the absence is routine and the collect ends as
-            // a lease loss, as the success path's re-acquire arm below does.
-            // While this replica still holds it, no lease-gated deleter
-            // explains the absence, so it falls through and counts. Only this
-            // one failure is lease-qualified: a store error, a malformed
-            // sidecar and the budget elapse do not depend on who leads, and on
-            // a store whose every walk outlasts the lease, routing them
-            // through the lease would hide them for good. See the rustdoc.
-            if e.is_listed_sidecar_absent()
-                && lease.reacquire_after_enumeration(client, metrics).await == LeaseState::Lost
-            {
-                tracing::debug!(
-                    replica_id = %replica_id,
-                    lock_value = %lease.identity(),
-                    error = %e,
-                    "checkpoint reconciliation's live ext-hash set walk read a listed ext-refs \
-                     sidecar as absent, and the leader lease is held elsewhere (a peer claimed \
-                     the lock during the walk and its lease-gated prune deletes such sidecars), \
-                     or could not be re-proven; skipping the collect phase with no delete and \
-                     no retire (tombstones are durable — the next pass resumes)"
-                );
-                return;
-            }
             if let Some(m) = metrics {
                 m.add_checkpoint_reconcile("live_set_failed", 1, replica_id);
             }
@@ -3633,12 +4234,74 @@ async fn run_reconcile_collect(
             return;
         }
     };
+    summary.walk_listed = live.listed_layer_artifacts;
 
-    // An empty live set is trusted only when the walk's OWN listing — the same
-    // request the set came from — named at least one layer artifact (b.oya,
-    // PD-F1a) — see the rustdoc. The read itself succeeded, so this is not
-    // `live_set_failed`; the claimed tombstones are left unretired and the
-    // next pass's claim re-serves them.
+    // N2: every listed sidecar that read absent is skipped on evidence, or
+    // the phase deletes nothing. See the rustdoc.
+    if !live.absent.is_empty() {
+        let (unfinished, base_listed): (Vec<_>, Vec<_>) =
+            live.absent.iter().partition(|a| !a.base_listed);
+        let stems: Vec<String> = base_listed
+            .iter()
+            .map(|a| reconcile_stem_member(a.object_id, a.snap_seq, CheckpointKind::Base))
+            .collect();
+        let announced = if stems.is_empty() {
+            Ok(Vec::new())
+        } else {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                announced = announced_stems(client, keys, &stems) => announced,
+            }
+        };
+        let unexplained: Vec<&str> = match &announced {
+            Ok(announced) => base_listed
+                .iter()
+                .zip(announced)
+                .filter(|(_, announced)| !**announced)
+                .map(|(a, _)| a.artifact.as_str())
+                .collect(),
+            // Unknown is not announced.
+            Err(_) => base_listed.iter().map(|a| a.artifact.as_str()).collect(),
+        };
+        if !unexplained.is_empty() {
+            if let Some(m) = metrics {
+                m.add_checkpoint_reconcile("live_set_failed", 1, replica_id);
+            }
+            tracing::warn!(
+                replica_id = %replica_id,
+                tombstone_count = expired.len(),
+                absent_sidecars = ?unexplained,
+                announcement_error = announced.as_ref().err().map(|e| e.to_string()),
+                "checkpoint reconciliation's live ext-hash set walk listed ext-refs sidecar(s) and \
+                 then read them absent, with no deletion announced for them and their backups \
+                 listed as complete; deleting and retiring nothing this pass (absence alone \
+                 never licenses a delete — a stale not-found from the storage service would \
+                 otherwise delete large values a retained backup still names; the tombstones \
+                 survive for the next pass)"
+            );
+            return;
+        }
+        summary.skipped_unfinished = unfinished.len() as u64;
+        summary.skipped_announced = base_listed.len() as u64;
+        if let Some(m) = metrics {
+            m.add_checkpoint_reconcile(
+                "listed_sidecar_skipped",
+                live.absent.len() as u64,
+                replica_id,
+            );
+        }
+        tracing::debug!(
+            replica_id = %replica_id,
+            unfinished = unfinished.len(),
+            announced = base_listed.len(),
+            "checkpoint reconciliation skipped listed ext-refs sidecars that read absent: their \
+             backups were unfinished when listed, or a deleter announced their deletion"
+        );
+    }
+
+    // An empty live set is trusted only when the walk's OWN listing named at
+    // least one layer artifact (b.oya, PD-F1a) — see the rustdoc.
     if live.hashes.is_empty() && live.listed_layer_artifacts == 0 {
         tracing::info!(
             replica_id = %replica_id,
@@ -3651,27 +4314,10 @@ async fn run_reconcile_collect(
         return;
     }
 
-    // The live-set read is the long one here, and it is what the lease has to
-    // be re-proven across — same reason as the orphan phase's re-acquire after
-    // `list_layer_artifacts`, and the deletes below are strictly destructive.
-    if lease.reacquire_after_enumeration(client, metrics).await == LeaseState::Lost {
-        tracing::debug!(
-            replica_id = %replica_id,
-            lock_value = %lease.identity(),
-            "checkpoint reconciliation could not re-prove its leader lease after reading the \
-             live ext-hash set; skipping the collect phase (tombstones are durable — the next \
-             pass resumes)"
-        );
-        return;
-    }
-
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut retire: Vec<String> = Vec::new();
-    let mut collected: u64 = 0;
-    let mut spared: u64 = 0;
+    let mut tally = CollectTally::default();
     // The whole pass budget: the orphan drain was capped at a quarter of it and
     // the dead-object drain at the next quarter, so at least half is still here.
-    // See `ReconcilePassBudget` for the 1/4 : 1/4 : 1/2 split.
     let deadline = budget.collect_deadline;
     let mut batch: Vec<String> = expired
         .into_iter()
@@ -3679,95 +4325,45 @@ async fn run_reconcile_collect(
         .collect();
 
     'collect_drain: loop {
-        let mut stop_drain = false;
-        for hash in &batch {
-            if cancel.is_cancelled() {
-                stop_drain = true;
-                break;
-            }
-            if live.hashes.contains(hash) {
-                // Still referenced — the tombstone was a false alarm, which is
-                // the safe direction by construction and exactly the
-                // over-delete the pre-b.9qd inline cascade would have
-                // committed.
-                spared += 1;
-                retire.push(hash.clone());
-                continue;
-            }
-            if lease.ensure_held(client, metrics).await == LeaseState::Lost {
-                tracing::warn!(
-                    replica_id = %replica_id,
-                    lock_value = %lease.identity(),
-                    "checkpoint reconciliation lost its leader lease mid-collect; aborting the \
-                     remainder (tombstones stay, so the next pass resumes)"
-                );
-                stop_drain = true;
-                break;
-            }
-            match store.delete_ext_blob(hash).await {
-                Ok(()) => {
-                    collected += 1;
-                    retire.push(hash.clone());
-                    // The backup copy is gone, so the value's confirmation no
-                    // longer holds. Valkey can still hold the value (no live
-                    // backup names it, which says nothing about Valkey), and
-                    // the cleared field makes the backup repair re-send it.
-                    // Best effort: a confirmation left standing is found
-                    // missing by the repair's daily audit, once it is a day
-                    // old. That covers a failed clear and, until b.g65's
-                    // fence closes it, a race the clear cannot: a mirror
-                    // upload or a repair existence check that answered just
-                    // before the delete can confirm the copy after this clear.
-                    if let Err(e) = clear_ext_backup(client, keys, hash).await {
-                        if let Some(m) = metrics {
-                            m.inc_checkpoint_ext_backup_mark_failed(EXT_BACKUP_MARK_OP_CLEAR);
-                        }
-                        tracing::warn!(
-                            replica_id = %replica_id,
-                            error = %e,
-                            "checkpoint reconciliation deleted an external value's backup copy but \
-                             could not clear its backup confirmation; the backup repair's daily \
-                             audit finds the copy missing and re-sends it if the store still holds \
-                             the value"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        replica_id = %replica_id,
-                        error_kind = checkpoint_error_kind(&e),
-                        error = %e,
-                        "checkpoint reconciliation delete_ext_blob failed; leaving the tombstone \
-                         for the next pass (delete_ext_blob is idempotent on missing, so the \
-                         retry is safe)"
-                    );
-                }
-            }
+        if cancel.is_cancelled() {
+            break 'collect_drain;
+        }
+        // The gate before every batch, the first included: the phase start's
+        // probe ran before the claim, the clock read and the live-set walk,
+        // and a backup-lock holder can change during them.
+        let open = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break 'collect_drain,
+            open = gate.may_continue() => open,
+        };
+        if !open {
+            break 'collect_drain;
         }
 
-        // Retire before the next claim — see the orphan drain's identical note:
-        // the claim script never removes what it returns, so an un-retired hash
-        // is simply re-served and the drain would stall on the `seen` guard.
-        if let Err(e) = recon_retire(client, tomb_key, &retire).await {
-            tracing::warn!(
-                replica_id = %replica_id,
-                retire_count = retire.len(),
-                error = %e,
-                "checkpoint reconciliation could not retire collected tombstones; they will be \
-                 re-examined next pass (a re-collect deletes an already-absent blob, which is a \
-                 no-op per the idempotency contract)"
-            );
-        }
-        retire.clear();
-
-        if stop_drain {
+        let outcome = collect_batch(
+            client,
+            keys,
+            tomb_key,
+            store,
+            metrics,
+            replica_id,
+            cancel,
+            heal,
+            t0,
+            grace,
+            &live.hashes,
+            &batch,
+            &mut tally,
+        )
+        .await;
+        if outcome != BatchEnd::Continue {
             break 'collect_drain;
         }
         if Instant::now() >= deadline {
             tracing::info!(
                 replica_id = %replica_id,
-                collected,
-                spared,
+                collected = tally.collected,
+                spared = tally.spared,
                 budget_secs = reconcile_drain_budget(config.reconcile_interval, grace).as_secs(),
                 "checkpoint reconciliation collect drain hit its wall-clock budget; the \
                  remaining tombstones are durable and are collected next pass"
@@ -3775,8 +4371,12 @@ async fn run_reconcile_collect(
             break 'collect_drain;
         }
 
-        let claimed = match recon_claim_expired(client, tomb_key, grace, RECONCILE_BATCH, &[]).await
-        {
+        let claimed = tokio::select! {
+            biased;
+            () = cancel.cancelled() => break 'collect_drain,
+            claimed = recon_claim_expired(client, tomb_key, grace, RECONCILE_BATCH, &[]) => claimed,
+        };
+        let claimed = match claimed {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
@@ -3798,16 +4398,456 @@ async fn run_reconcile_collect(
     }
 
     if let Some(m) = metrics {
-        m.add_checkpoint_reconcile("ext_collected", collected, replica_id);
-        m.add_checkpoint_reconcile("ext_spared", spared, replica_id);
+        m.add_checkpoint_reconcile("ext_collected", tally.collected, replica_id);
+        m.add_checkpoint_reconcile("ext_spared", tally.spared, replica_id);
+        m.add_checkpoint_reconcile("ext_deferred_live", tally.deferred_live, replica_id);
+        m.add_checkpoint_reconcile("ext_deferred_rearmed", tally.deferred_rearmed, replica_id);
+        m.add_checkpoint_reconcile("ext_healed", tally.healed, replica_id);
+        m.add_checkpoint_reconcile("ext_heal_unavailable", tally.heal_unavailable, replica_id);
     }
-    if collected > 0 || spared > 0 {
-        tracing::info!(
-            replica_id = %replica_id,
-            collected,
-            spared,
-            "checkpoint reconciliation collect phase completed"
+    summary.collected = tally.collected;
+    summary.spared = tally.spared;
+    summary.deferred_live = tally.deferred_live;
+    summary.deferred_rearmed = tally.deferred_rearmed;
+    summary.healed = tally.healed;
+}
+
+/// The collect's per-pass counts.
+#[derive(Debug, Default)]
+struct CollectTally {
+    collected: u64,
+    spared: u64,
+    deferred_live: u64,
+    deferred_rearmed: u64,
+    healed: u64,
+    heal_unavailable: u64,
+}
+
+/// How one collect batch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchEnd {
+    /// Claim the next batch.
+    Continue,
+    /// The fence found a member newer than the threshold: every later claim
+    /// is newer still, so the drain ends.
+    ThresholdReached,
+    /// A step failed or the pass was cancelled; the drain ends.
+    Stop,
+}
+
+/// One collect batch (see [`run_reconcile_collect`], "Per batch", steps 2–6).
+#[allow(clippy::too_many_arguments)]
+async fn collect_batch(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    tomb_key: &str,
+    store: &Arc<dyn CheckpointStore>,
+    metrics: Option<&SharedMetrics>,
+    replica_id: &str,
+    cancel: &CancellationToken,
+    heal: Option<&CollectHeal>,
+    t0_ms: u64,
+    grace: Duration,
+    live_hashes: &std::collections::HashSet<String>,
+    batch: &[String],
+    tally: &mut CollectTally,
+) -> BatchEnd {
+    // R1: the delete threshold. The fence derives the same value from `t0`.
+    let threshold_ms = t0_ms.saturating_sub(millis_u64(grace));
+
+    // 2. Classify.
+    let (spared, candidates): (Vec<String>, Vec<String>) =
+        batch.iter().cloned().partition(|h| live_hashes.contains(h));
+
+    // 3. R4: Valkey liveness, raced against `cancel`: the batch has written
+    // nothing yet.
+    let live = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return BatchEnd::Stop,
+        live = ext_values_live(client, keys, &candidates) => live,
+    };
+    let live = match live {
+        Ok(live) => live,
+        Err(e) => {
+            tracing::warn!(
+                replica_id = %replica_id,
+                candidate_count = candidates.len(),
+                error = %e,
+                "checkpoint reconciliation could not check whether claimed values are still held \
+                 in the store; ending the collect phase with nothing deleted from this batch on \
+                 (tombstones are durable)"
+            );
+            return BatchEnd::Stop;
+        }
+    };
+    let mut deferred_live: Vec<String> = Vec::new();
+    let mut not_live: Vec<String> = Vec::new();
+    for (hash, is_live) in candidates.into_iter().zip(live) {
+        if is_live {
+            deferred_live.push(hash);
+        } else {
+            not_live.push(hash);
+        }
+    }
+    if !deferred_live.is_empty() {
+        let mut redate = deferred_live.clone();
+        redate_members(client, tomb_key, &mut redate, replica_id).await;
+    }
+
+    // 4. R3: the delete-time fence.
+    let verdicts = match recon_ext_commit(client, keys, t0_ms, grace, &not_live).await {
+        Ok(verdicts) => verdicts,
+        Err(e) => {
+            tracing::warn!(
+                replica_id = %replica_id,
+                candidate_count = not_live.len(),
+                error = %e,
+                "checkpoint reconciliation could not license this batch's deletes; ending the \
+                 collect phase with nothing deleted from this batch on (tombstones are durable)"
+            );
+            return BatchEnd::Stop;
+        }
+    };
+    let mut licensed: Vec<String> = Vec::new();
+    let mut rearmed: Vec<String> = Vec::new();
+    let mut end = BatchEnd::Continue;
+    for (hash, verdict) in not_live.into_iter().zip(verdicts) {
+        match verdict {
+            CommitVerdict::Licensed => licensed.push(hash),
+            CommitVerdict::Rearmed => rearmed.push(hash),
+            CommitVerdict::TooYoung => end = BatchEnd::ThresholdReached,
+        }
+    }
+
+    // 5. Delete, then the post-delete step, per licensed hash.
+    let mut deleted: Vec<String> = Vec::new();
+    let mut gone: Vec<String> = Vec::new();
+    let mut healed: Vec<String> = Vec::new();
+    // Licensed hashes whose delete, post-delete step or heal failed: a
+    // member-specific deferral, re-dated after the batch (D4) so a hash that
+    // keeps failing cannot hold the head of the oldest-first claim.
+    let mut failed: Vec<String> = Vec::new();
+    for hash in licensed {
+        // Before the delete, never between it and its post-delete step.
+        if cancel.is_cancelled() {
+            end = BatchEnd::Stop;
+            break;
+        }
+        if let Err(e) = store.delete_ext_blob(&hash).await {
+            tracing::warn!(
+                replica_id = %replica_id,
+                error_kind = checkpoint_error_kind(&e),
+                error = %e,
+                "checkpoint reconciliation delete_ext_blob failed; keeping the tombstone and the \
+                 delete's record, moved behind the rest of the backlog, for a later pass \
+                 (delete_ext_blob is idempotent on missing, so the retry is safe)"
+            );
+            failed.push(hash);
+            continue;
+        }
+        tally.collected += 1;
+        match clear_ext_backup(client, keys, &hash).await {
+            // Gone from Valkey: nothing to withdraw and nothing to heal.
+            Ok(false) => {
+                deleted.push(hash.clone());
+                gone.push(hash);
+            }
+            // Still held: a store landed between the liveness check and the
+            // delete, and its mirror copy may have been erased. Put it back.
+            Ok(true) => match heal_from_valkey(client, keys, store, heal, &hash).await {
+                HealOutcome::Healed => {
+                    tally.healed += 1;
+                    deleted.push(hash.clone());
+                    healed.push(hash);
+                }
+                // `heal_from_valkey` never answers `CopyPresent` (only
+                // heal-on-keep's `kept_copy_check` does).
+                HealOutcome::Gone | HealOutcome::CopyPresent => {
+                    deleted.push(hash.clone());
+                    gone.push(hash);
+                }
+                // Tombstone and record kept: a later pass finds the value
+                // live, keeps it, and heals it then. The withdrawn
+                // confirmation makes the backup repair re-send it meanwhile.
+                HealOutcome::Failed => failed.push(hash),
+            },
+            Err(e) => {
+                if let Some(m) = metrics {
+                    m.inc_checkpoint_ext_backup_mark_failed(EXT_BACKUP_MARK_OP_CLEAR);
+                }
+                tracing::warn!(
+                    replica_id = %replica_id,
+                    error = %e,
+                    "checkpoint reconciliation deleted an external value's backup copy but could \
+                     not run its post-delete step; keeping the tombstone and the delete's record, \
+                     so a later pass re-checks the value and heals it if the store still holds \
+                     it"
+                );
+                failed.push(hash);
+            }
+        }
+    }
+    redate_members(client, tomb_key, &mut failed, replica_id).await;
+
+    // 6. Settle, then heal-on-keep.
+    let kept: Vec<String> = spared
+        .iter()
+        .chain(deferred_live.iter())
+        .chain(rearmed.iter())
+        .cloned()
+        .collect();
+    tally.spared += spared.len() as u64;
+    tally.deferred_live += deferred_live.len() as u64;
+    tally.deferred_rearmed += rearmed.len() as u64;
+    let unsettled = match recon_ext_settle(
+        client,
+        keys,
+        threshold_ms,
+        SettleGroups {
+            spared: &spared,
+            deleted: &deleted,
+            not_live: &gone,
+            healed: &healed,
+            kept: &kept,
+        },
+    )
+    .await
+    {
+        Ok(unsettled) => unsettled,
+        Err(e) => {
+            tracing::warn!(
+                replica_id = %replica_id,
+                error = %e,
+                "checkpoint reconciliation could not settle a collect batch; its tombstones and \
+                 records stay for the next pass (a repeated delete is a no-op)"
+            );
+            return BatchEnd::Stop;
+        }
+    };
+    // A spared hash with a `:collected` entry kept its tombstone in the
+    // settle: it is retired below only once healed, so a heal that fails, or
+    // finds the value gone from Valkey, is retried on a later pass while its
+    // delete record lasts.
+    let spared_set: std::collections::HashSet<&String> = spared.iter().collect();
+    let mut healed_on_keep: Vec<String> = Vec::new();
+    let mut healed_spared: Vec<String> = Vec::new();
+    let mut unhealed_spared: Vec<String> = Vec::new();
+    for hash in unsettled {
+        let is_spared = spared_set.contains(&hash);
+        let outcome = match heal_from_valkey(client, keys, store, heal, &hash).await {
+            HealOutcome::Gone => kept_copy_check(client, keys, store, &hash).await,
+            other => other,
+        };
+        match outcome {
+            HealOutcome::Healed => {
+                tally.healed += 1;
+                if is_spared {
+                    healed_spared.push(hash.clone());
+                }
+                healed_on_keep.push(hash);
+            }
+            HealOutcome::CopyPresent => {
+                // Settled with the healed group, with neither counter ticked:
+                // there was nothing to put back.
+                tracing::info!(
+                    replica_id = %replica_id,
+                    hash = %hash,
+                    "checkpoint reconciliation found a kept large value whose earlier copy \
+                     deletion was never settled; the backup store holds a copy again, so \
+                     nothing is put back"
+                );
+                if is_spared {
+                    healed_spared.push(hash.clone());
+                }
+                healed_on_keep.push(hash);
+            }
+            HealOutcome::Gone => {
+                tally.heal_unavailable += 1;
+                if is_spared {
+                    tracing::warn!(
+                        replica_id = %replica_id,
+                        hash = %hash,
+                        "checkpoint reconciliation found a kept large value whose backup copy an \
+                         earlier clean-up deleted, and the store no longer holds it to put back: \
+                         a retained backup naming it cannot restore it. Clean-up retries the put \
+                         on later passes while the delete's record lasts (24 h)"
+                    );
+                    unhealed_spared.push(hash);
+                } else {
+                    tracing::warn!(
+                        replica_id = %replica_id,
+                        hash = %hash,
+                        "checkpoint reconciliation found a kept large value whose backup copy an \
+                         earlier clean-up deleted, and the store no longer holds it to put back; \
+                         no backup this pass's walk read names it"
+                    );
+                }
+            }
+            HealOutcome::Failed => {
+                if is_spared {
+                    unhealed_spared.push(hash);
+                }
+            }
+        }
+    }
+    // Spared hashes whose heal did not land: a member-specific deferral (D4),
+    // moved behind the rest of the backlog so they cannot hold its head.
+    redate_members(client, tomb_key, &mut unhealed_spared, replica_id).await;
+    if !healed_on_keep.is_empty() {
+        if let Err(e) = recon_ext_settle(
+            client,
+            keys,
+            threshold_ms,
+            SettleGroups {
+                spared: &healed_spared,
+                healed: &healed_on_keep,
+                ..SettleGroups::default()
+            },
+        )
+        .await
+        {
+            tracing::warn!(
+                replica_id = %replica_id,
+                error = %e,
+                "checkpoint reconciliation re-put kept values but could not drop their delete \
+                 records or retire the spared ones' tombstones; the next pass re-puts them again \
+                 (idempotent)"
+            );
+        }
+    }
+    end
+}
+
+/// How a heal from Valkey ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealOutcome {
+    /// Re-put and confirmed (the confirmation is best effort).
+    Healed,
+    /// Valkey no longer holds the value's bytes (on the heal-on-keep path,
+    /// after [`kept_copy_check`]: and the backup store holds no copy).
+    Gone,
+    /// Heal-on-keep only ([`kept_copy_check`]): Valkey holds the value's
+    /// meta but not its bytes, and the backup store holds a copy, so there
+    /// is nothing to put back.
+    CopyPresent,
+    /// No heal is wired, the budget had no room, or a read or the upload
+    /// failed; the value's `:collected` record is kept for a later heal.
+    Failed,
+}
+
+/// Heal-on-keep's second look at a value [`heal_from_valkey`] found gone
+/// (w5x1 item 6). A meta with no bytes is the meta without data the DR
+/// restore Job's recount leaves for a value whose bytes only the backup
+/// store holds (`storage::ext_reconcile`): the un-hold follows a coverage
+/// check that found the copy, so the copy is probed (`ext_blob_exists`, under
+/// the same ceiling as the heal's upload). Present: [`HealOutcome::CopyPresent`].
+/// Absent, or no meta at all: [`HealOutcome::Gone`], whose WARN is then true —
+/// the bytes are in no store. A failed read or probe:
+/// [`HealOutcome::Failed`], so the record is kept and retried.
+async fn kept_copy_check(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    store: &Arc<dyn CheckpointStore>,
+    hash: &str,
+) -> HealOutcome {
+    let failed = |what: &str, error: String| {
+        tracing::warn!(
+            hash = %hash,
+            error = %error,
+            "checkpoint reconciliation could not check whether the backup store still holds a \
+             kept value ({what}); its delete record is kept for a later pass"
         );
+        HealOutcome::Failed
+    };
+    match ext_values_live(client, keys, &[hash.to_owned()]).await {
+        Ok(live) if live.first() == Some(&true) => {}
+        Ok(_) => return HealOutcome::Gone,
+        Err(e) => return failed("its meta read failed", e.to_string()),
+    }
+    let ceiling = store.publish_worst_case().max(EXT_BACKUP_MIN_AGE);
+    match tokio::time::timeout(ceiling, store.ext_blob_exists(hash)).await {
+        Ok(Ok(true)) => HealOutcome::CopyPresent,
+        Ok(Ok(false)) => HealOutcome::Gone,
+        Ok(Err(e)) => failed("its existence check failed", e.to_string()),
+        Err(_elapsed) => failed(
+            "its existence check timed out",
+            format!("{} s", ceiling.as_secs()),
+        ),
+    }
+}
+
+/// Re-put `hash` from Valkey into the backup store (the collect's heal, R5
+/// and R6): read its stamp and size, take its charge from the ext mirror's
+/// byte budget (waiting at most `cleanup::HEAL_RESERVE_WAIT`), read its
+/// bytes with the backup repair's reader (`storage::ext_backup::
+/// read_ext_value_bytes`, one buffer of the charged size), upload them under
+/// the upload limit, and confirm the copy with the heal's own Valkey read
+/// time as its reliance start. The heal runs no clean-up fence: the collect
+/// itself recorded the delete it is undoing.
+async fn heal_from_valkey(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    store: &Arc<dyn CheckpointStore>,
+    heal: Option<&CollectHeal>,
+    hash: &str,
+) -> HealOutcome {
+    let Some(heal) = heal else {
+        return HealOutcome::Failed;
+    };
+    let failed = |what: &str, error: String| {
+        tracing::warn!(
+            hash = %hash,
+            error = %error,
+            "checkpoint reconciliation could not put a value back into the backup store after \
+             deleting its copy ({what}); its delete record is kept for a later heal, and the \
+             backup repair re-sends it meanwhile"
+        );
+        HealOutcome::Failed
+    };
+    let stamp = match read_backup_marks(client, &[keys.ext_meta(hash)]).await {
+        Ok(marks) => match marks.into_iter().next() {
+            Some(marks) => marks.last_store_ms.unwrap_or_default(),
+            None => return failed("its stamp read answered nothing", String::new()),
+        },
+        Err(e) => return failed("its stamp read failed", e.to_string()),
+    };
+    let len = match stored_ext_value_len(client, keys, hash).await {
+        Ok(len) => len,
+        Err(e) => return failed("its size read failed", e.to_string()),
+    };
+    let Some(reservation) = heal.reserve(len).await else {
+        return failed(
+            "the ext mirror's byte budget had no room",
+            format!("{len} bytes"),
+        );
+    };
+    let reliance_start_ms = match valkey_time_ms(client).await {
+        Ok(ms) => ms,
+        Err(e) => return failed("the clock read failed", e.to_string()),
+    };
+    let bytes = match read_ext_value_bytes(client, keys, hash, reservation.reserved_len()).await {
+        Ok(ExtValueRead::Bytes(bytes)) => bytes,
+        Ok(ExtValueRead::Gone) => return HealOutcome::Gone,
+        Ok(ExtValueRead::Changed { now_len }) => {
+            return failed(
+                "the value changed under the read",
+                format!("now {now_len} bytes"),
+            )
+        }
+        Err(e) => return failed("its read failed", e.to_string()),
+    };
+    let bytes = reservation.wrap(bytes);
+    let upload_limit = store.publish_worst_case().max(EXT_BACKUP_MIN_AGE);
+    match tokio::time::timeout(upload_limit, store.put_ext_blob(hash, bytes)).await {
+        Ok(Ok(())) => {
+            heal.marks().confirm(hash, &stamp, reliance_start_ms).await;
+            HealOutcome::Healed
+        }
+        Ok(Err(e)) => failed("its upload failed", e.to_string()),
+        Err(_elapsed) => failed(
+            "its upload timed out",
+            format!("{} s", upload_limit.as_secs()),
+        ),
     }
 }
 
@@ -3892,7 +4932,14 @@ async fn leader_tick(
     // one — the round-trip's own latency is charged against us, not against
     // the lease (b.s5y).
     let acquire_started = Instant::now();
-    match try_acquire_leader_lock(client, &lock_key, &config.leader, LEADER_LOCK_TTL_MS).await {
+    match try_acquire_leader_lock(
+        client,
+        &lock_key,
+        &config.leader.checkpoint_lock_value(),
+        LEADER_LOCK_TTL_MS,
+    )
+    .await
+    {
         Ok(true) => {
             let mut lease = CheckpointLease::new(lock_key, config.leader.clone(), acquire_started);
             run_one_tick(
@@ -3922,7 +4969,7 @@ async fn leader_tick(
             }
             tracing::debug!(
                 replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
+                lock_value = %config.leader.checkpoint_lock_value(),
                 "checkpoint tick skipped: another replica holds the leader lock"
             );
         }
@@ -3935,7 +4982,7 @@ async fn leader_tick(
             // "too high".
             tracing::warn!(
                 replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
+                lock_value = %config.leader.checkpoint_lock_value(),
                 error = %e,
                 "checkpoint loop leader lock acquisition failed; skipping tick"
             );
@@ -3986,18 +5033,37 @@ async fn leader_tick(
 /// multi-tens-of-seconds walk on a large fleet, so without it the lease would
 /// lapse during enumeration and pass 2's first gate would abort the tick
 /// before a single layer was assembled — every tick, on exactly the fleets
-/// this design protects. A `Lost` verdict during pass 1 sets the same
-/// `scan_truncated` flag a SCAN error does and breaks: the walk is a prefix,
-/// so the tick forfeits its publish by the already-documented rule.
+/// this design protects. A `Lost` verdict during pass 1 sets the
+/// `scan_truncated` flag a walk that did not walk every primary sets (step 2)
+/// and breaks: the walk is a prefix, so the tick forfeits its publish by the
+/// already-documented rule.
 ///
 /// 2. SCAN `le:{*}:obj:hdr` on the maintenance pool through the orphan
-///    sweep's shared walk, `orphan_sweep::scan_keyspace`: on Cluster it uses
-///    `scan_cluster` so all shards are visited (otherwise the SCAN silently
-///    misses keys on sibling shards — same bug class as the orphan sweep), and
-///    a walk that ends before its terminal page — on Cluster, before every
-///    primary's — ends with an error item rather than silently, which this
-///    tick treats as a SCAN error (truncated, publish forfeited). The
-///    maintenance pool keeps the SCAN + HGETALL traffic off the hot data path.
+///    sweep's shared walk, `orphan_sweep::scan_keyspace`: on Cluster it walks
+///    every primary of a fresh slot map, each on a pinned node whose
+///    ownership it checks (a missed primary silently misses its keys — every
+///    backup there going stale), and a walk that cannot show its coverage
+///    ends with an error item after its last key rather than silently. A
+///    walk that did not walk a primary on the node that serves it, or that
+///    could not prove a pin's ownership and found the routing table its pins
+///    came from out of date (either way it re-syncs the walking pool
+///    member's routing table, so a later tick's walk on that member is
+///    complete once its re-sync succeeds; a failed or timed-out sync leaves
+///    the miss in place for the next walk, and each maintenance-pool member
+///    keeps its own table, so the miss can recur once per member), saw the
+///    slot map change or ended on a store fault is truncated: the tick
+///    forfeits its publish. A walk that walked every primary on its pin but
+///    could not prove a pin's ownership — an open slot, or an unusable or
+///    unreadable `CLUSTER NODES` with the routing table dividing the slots
+///    as the map does — is not: the tick logs a WARN and publishes, so a
+///    store that answers that way cannot freeze the pending-age gauges.
+///    That publish is not proof every layer was seen: an open slot may skip
+///    keys, the table comparison cannot see a change of primary that keeps
+///    every slot set (`storage::scan_guard`, *The table check*), and with no
+///    serving-process witness a failover or restart inside one walk can skip
+///    keys for that walk only, undetected. Pass 2 assembles every layer
+///    pass 1 found either way. The maintenance pool keeps the SCAN +
+///    HGETALL traffic off the hot data path.
 /// 3. For each header: HGETALL on the maintenance pool, then skip stale
 ///    headers. An empty result is a benign CreateLayer-overwrite race (header
 ///    just got UNLINKed); `superseded == 1` means a concurrent
@@ -4294,8 +5360,9 @@ async fn run_one_tick(
 ) {
     let prefix = keys.prefix();
     // The hash-tag braces are literal in the key, so `*` lives INSIDE them
-    // to match every object_id. Mirrors `orphan_sweep::sweep_orphaned_objects`.
-    let pattern = format!("{prefix}{{*}}:obj:hdr");
+    // to match every object_id. The orphan sweep's object walk uses the same
+    // accessor.
+    let pattern = keys.obj_header_scan_pattern();
 
     // Maintenance pool: SCAN + HGETALL + post-write HSET share this pool so
     // they cannot queue behind data-pool writers. `acquire_maintenance` also
@@ -4304,9 +5371,9 @@ async fn run_one_tick(
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let scan_client = maint_pool.next();
 
-    // The shared cluster-aware keyspace walk: a SCAN on every primary, ending
-    // with an error item — never silently — when a walk stopped before its
-    // terminal page (`orphan_sweep::complete_pages`).
+    // The shared keyspace walk: every primary of a fresh slot map, ending with
+    // an error item — never silently — when it cannot show it walked each on
+    // the node that serves it (`orphan_sweep::scan_keyspace`).
     let mut stream = scan_keyspace(scan_client, &pattern);
 
     let quiesce_ms = duration_to_ms_u64(config.quiesce);
@@ -4316,11 +5383,17 @@ async fn run_one_tick(
     // the SCAN stream is exhausted; the cancellation `return`s inside the loop
     // skip the publish deliberately.
     let mut pending_ages = PendingAgeAccumulator::default();
-    // Set when the walk yields an error item — a SCAN page that errored, or a
-    // walk that ended before its terminal page (a page dropped unanswered) —
-    // or when the lease is lost mid-walk. Either way the walk covered an
-    // arbitrary keyspace prefix, which would make the aggregates a maximum over
-    // that prefix, so a truncated tick publishes nothing.
+    // Set when the walk yields an error item for a walk that may have missed
+    // keys — a store fault that ended it early, a primary it did not walk on
+    // the node that serves it, an unproven pin's routing table found out of
+    // date, a slot map that changed under it — or when the lease is lost
+    // mid-walk. Either way the walk may have covered only part of the
+    // keyspace, which would make the aggregates a maximum over that part, so
+    // a truncated tick publishes nothing. A walk that walked every primary on
+    // its pin but could not prove a pin's ownership (an open slot, or an
+    // unusable or unreadable `CLUSTER NODES` with the table matching the map)
+    // does not set it, although it too may have missed keys (see the pass-1
+    // error arm).
     let mut scan_truncated = false;
     // Pass 1's output: every layer the gate said is due, to be assembled in
     // pass 2 after the whole keyspace has been enumerated and ordered
@@ -4379,7 +5452,7 @@ async fn run_one_tick(
             scan_truncated = true;
             tracing::warn!(
                 replica_id = %config.leader.service_label,
-                lock_value = %config.leader,
+                lock_value = %config.leader.checkpoint_lock_value(),
                 keys_enumerated,
                 "checkpoint loop lost its leader lease during pass 1; abandoning the tick \
                  before any layer is assembled (the keyspace walk is a prefix, so this \
@@ -4391,38 +5464,56 @@ async fn run_one_tick(
         let fred_key: fred::types::Key = match scan_result {
             Ok(k) => k,
             Err(e) => {
-                FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(&e);
-                // NOT "continue to the next page" — that was wrong. fred's
-                // scanner does not re-issue the SCAN after surfacing an error:
-                // `send_error` drops the scanner, so in centralized mode this
-                // ends the whole stream, and in Cluster mode the failing
-                // shard's walk is dropped while sibling shards keep streaming.
-                // The other errors this arm sees are `scan_keyspace`'s own,
-                // each the stream's only or last item: the truncation item, for
-                // a walk that ended before its terminal page because a page's
-                // command was dropped unanswered (the client's router ended
-                // with it in flight), which fred itself reports as a clean end;
-                // and the routing guard's, for a walk whose primaries changed
-                // while it started or whose routing table was unknown or empty.
-                // Either way this tick has seen an arbitrary PREFIX of the
-                // keyspace (for the guard's error, none of it), so every layer
-                // past the fault is invisible to it.
+                FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(e.fred());
+                // `scan_keyspace`'s error item is always the stream's last, so
+                // `continue` ends the walk.
                 //
-                // The per-layer counters are still honest (they only ever
-                // claim what was evaluated), but the tick's aggregate gauges
-                // are not: a maximum computed over a prefix that happens to
-                // exclude the stuck layer is a false all-clear, and gauge
-                // last-value semantics would keep exporting it. Flag the tick
-                // and suppress the publish below — same posture as the
-                // cancellation returns and `leader_tick`'s failed-lock arm:
-                // unknown is not zero.
-                scan_truncated = true;
-                tracing::warn!(
-                    error = %e,
-                    "checkpoint loop SCAN error; this tick's keyspace walk is truncated \
-                     (fred does not resume a faulted scanner) and its pending-age \
-                     aggregates will not be published"
-                );
+                // A walk that did not reach every primary on the node that
+                // serves it — a store fault that ended it early (a failed
+                // step, a refused node pin, a failed `CLUSTER SLOTS` read), a
+                // pin that reached a node serving other slots (at the walk's
+                // start the primary is left unwalked), an unproven pin whose
+                // routing table was out of date, or a slot map that changed
+                // under it — may have missed keys, and every layer
+                // there is invisible to this tick. The per-layer counters are
+                // still honest (they only ever claim what was evaluated), but
+                // the tick's aggregate gauges are not: a maximum computed over
+                // part of the keyspace that happens to exclude the stuck layer
+                // is a false all-clear, and gauge last-value semantics would
+                // keep exporting it. Flag the tick and suppress the publish
+                // below — same posture as the cancellation returns and
+                // `leader_tick`'s failed-lock arm: unknown is not zero.
+                //
+                // A walk that walked every primary of the fresh slot map on
+                // its pin and only could not prove a pin served its primary
+                // — an open slot, or an unusable or unreadable
+                // `CLUSTER NODES` with the routing table its pins came from
+                // dividing the slots as the map does — still publishes:
+                // suppressing it would freeze the gauges for as long as the
+                // store answers that way, and no pending-age alert could
+                // fire. It is not proof every header was seen: an open slot
+                // may skip keys, the table comparison cannot see a change of
+                // primary that keeps every slot set (`storage::scan_guard`,
+                // *The table check*), and with no serving-process witness a
+                // failover or restart inside one walk can skip keys for that
+                // walk only, undetected. Either way, pass 2 assembles every
+                // layer pass 1 found.
+                let truncated = !e.every_primary_walked();
+                scan_truncated |= truncated;
+                if truncated {
+                    tracing::warn!(
+                        error = %e,
+                        "checkpoint loop SCAN error; this tick's keyspace walk did not reach \
+                         every primary, so its pending-age aggregates will not be published"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %e,
+                        "checkpoint loop SCAN walk reached every primary, but a node's own slot \
+                         check could not confirm it serves its primary; this tick's pending-age \
+                         aggregates are still published"
+                    );
+                }
                 continue;
             }
         };
@@ -4752,13 +5843,14 @@ async fn run_one_tick(
         let last_checkpoint_seq = due.last_checkpoint_seq;
         let pending_age = due.pending_age;
 
-        // Cancellation check immediately before the assembler call: a
-        // graceful shutdown that fires after the gates pass but before we
-        // kick off the (much more expensive) snapshot fan-out exits here.
-        // We do NOT re-check once the assembler may have persisted a
-        // generation — then we MUST complete the cursor HSET so we don't
-        // leave a durable generation visible without its cursor. The only
-        // cancellation exit after the assembler is its
+        // Cancellation check before this layer's lease gate, and again
+        // after it, immediately before the assembler call: a graceful
+        // shutdown that fires before the gate, or during its refresh
+        // round-trip, exits here before we kick off the (much more
+        // expensive) snapshot fan-out. We do NOT re-check once the assembler
+        // may have persisted a generation — then we MUST complete the cursor
+        // HSET so we don't leave a durable generation visible without its
+        // cursor. The only cancellation exit after the assembler is its
         // `AssemblyDecision::ShuttingDown` answer, on which nothing was
         // written. Cancellation forfeits the publish (a departing replica
         // leaves no parting gauge value); lease loss does not.
@@ -4774,6 +5866,9 @@ async fn run_one_tick(
             *lease_loss_demotion = last_assembly_started;
             lease_lost_from = Some(idx);
             break;
+        }
+        if cancel.is_cancelled() {
+            return;
         }
 
         // Run the assembler. Per-layer failure does NOT abort the tick.
@@ -4831,7 +5926,21 @@ async fn run_one_tick(
                 lease_lost_from = Some(idx);
                 break;
             }
-            Ok(AssemblyDecision::SkippedNotQuiesced) => {
+            Ok(
+                decision @ (AssemblyDecision::SkippedNotQuiesced
+                | AssemblyDecision::DeferredCleanup),
+            ) => {
+                // Two skips share this arm: the unverified cut below, and the
+                // clean-up deferral (b.g65) — the assembler's pre-PUT clean-up
+                // fence refused the PUT because the checkpoint clean-up is
+                // deleting something this generation depends on, and
+                // `put_guard` already logged why. Both persisted nothing, so
+                // both leave every cursor column alone (the list below), count
+                // `result="skipped"` and fall back to a tail capture when the
+                // feature is on (a tail names no large value, and its own fence
+                // judges its own stem). Only the unverified cut ticks
+                // `stable_cut_total{unverified}`: the deferral's cut was proven.
+                //
                 // b.pw6: the assembler's proven read came back below its pin —
                 // a header-sequence regression (Spec SDD SR-4.1; the
                 // assembler's own WARN names the pin and the cut), the only
@@ -4865,17 +5974,28 @@ async fn run_one_tick(
                 // counters_sidecar} shape. The DR-exposure signal operators
                 // actually want lives on
                 // `live_edit_checkpoint_stable_cut_total{outcome="unverified"}`.
-                tracing::warn!(
-                    object_id,
-                    seq,
-                    last_checkpoint_seq,
-                    "checkpoint loop could not prove a stable cut for this layer (its header \
-                     sequence regressed below the pin; the assembler's WARN names both); skipping \
-                     it this tick without persisting (retried next tick)"
-                );
-                if let Some(m) = metrics {
-                    m.observe_checkpoint_stable_cut(false, &config.leader.service_label);
-                    m.inc_checkpoint_write("skipped", "layer");
+                if matches!(decision, AssemblyDecision::DeferredCleanup) {
+                    if let Some(m) = metrics {
+                        m.inc_checkpoint_write("skipped", "layer");
+                        m.add_checkpoint_reconcile(
+                            "publish_deferred",
+                            1,
+                            &config.leader.service_label,
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        object_id,
+                        seq,
+                        last_checkpoint_seq,
+                        "checkpoint loop could not prove a stable cut for this layer (its header \
+                         sequence regressed below the pin; the assembler's WARN names both); \
+                         skipping it this tick without persisting (retried next tick)"
+                    );
+                    if let Some(m) = metrics {
+                        m.observe_checkpoint_stable_cut(false, &config.leader.service_label);
+                        m.inc_checkpoint_write("skipped", "layer");
+                    }
                 }
                 // The flag gate is the FIRST thing on this arm that could cost
                 // a round-trip, so with the tail feature off the arm is exactly
@@ -4910,6 +6030,7 @@ async fn run_one_tick(
                     store,
                     keys,
                     config,
+                    cancel,
                     &mut pending_ages,
                     object_id,
                     seq,
@@ -5097,6 +6218,7 @@ async fn run_one_tick(
                     store,
                     keys,
                     config,
+                    cancel,
                     object_id,
                     seq,
                     outcome.snap_seq,
@@ -5187,7 +6309,7 @@ async fn run_one_tick(
         }
         tracing::warn!(
             replica_id = %config.leader.service_label,
-            lock_value = %config.leader,
+            lock_value = %config.leader.checkpoint_lock_value(),
             deferred_layers = total_due - start,
             total_due,
             "checkpoint loop aborted this tick's assembly pass after losing its leader lease; \
@@ -5208,8 +6330,8 @@ async fn run_one_tick(
             oldest_pending_age_secs = pending_ages.oldest_age_secs,
             layers_never_written = pending_ages.layers_never_written,
             "checkpoint loop suppressed this tick's pending-age aggregates: the SCAN was \
-             truncated by an earlier error, so the observed maximum covers only a prefix \
-             of the keyspace and would read as a false all-clear"
+             truncated by an earlier error, so the observed maximum covers only part of \
+             the keyspace and would read as a false all-clear"
         );
     } else {
         pending_ages.publish(
@@ -5273,6 +6395,14 @@ pub(super) const PRUNE_SKIPPED_EMPTY_LISTING_PHRASE: &str =
 /// breaks compilation instead of silently voiding an assertion.
 pub(super) const DEAD_OBJECT_LISTINGS_DISAGREE_PHRASE: &str =
     "two checkpoint listings in one reconciliation pass disagreed about a dead object";
+
+/// Leading phrase of the INFO [`run_reconcile_dead_objects`] emits when a dead
+/// object's header still stands, without the `superseded` flag, and no layer
+/// mapping names it ([`DeadObjectLiveness::LiveUnmapped`], b.g65): a deleted
+/// layer whose store clean-up has not finished. Nothing is deleted and the
+/// member is kept. Shared with the tests for the same reason as its siblings.
+pub(super) const DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE: &str =
+    "a deleted layer's store clean-up has not finished, so its backups are kept";
 
 /// One `HGET le:{object_id}:obj:hdr seq` on the maintenance pool, parsed.
 ///
@@ -5378,6 +6508,11 @@ async fn read_live_header_seq(
 /// itself, immediately before the prune (b.hka review round 2, path (c); the
 /// full argument is on
 /// [`RetentionPlan::generations_above_live_seq`](crate::checkpoint::retention::RetentionPlan::generations_above_live_seq)).
+///
+/// `cancel` is the loop's shutdown token: a cancelled loop starts no prune
+/// (checked before the gate, and raced against the post-write listing), and
+/// [`prune_old_generations`] races it against each unit's sidecar read and
+/// checks it again between lineage units.
 // Flat signature for the same reason `run_one_tick`'s is: every parameter has a
 // distinct type, so a transposition is a compile error, and bundling the
 // shared-for-the-tick handles into a context struct would obscure which
@@ -5392,15 +6527,23 @@ async fn prune_after_write(
     store: &Arc<dyn CheckpointStore>,
     keys: &KeySchema,
     config: &CheckpointLoopConfig,
+    cancel: &CancellationToken,
     object_id: u64,
     gate_seq: u64,
     sequence: u64,
     kind_label: &'static str,
 ) -> PostWriteVerdict {
+    // A cancelled loop starts no prune: the generation and its cursor are
+    // already written, so skipping costs one tick of retention lag, the same
+    // under-deletion every other skip here takes. `Continue`, not `Abort`: a
+    // cancel is not a lost lease, and the caller's next check returns.
+    if cancel.is_cancelled() {
+        return PostWriteVerdict::Continue;
+    }
     if lease.ensure_held(client, metrics).await == LeaseState::Lost {
         tracing::warn!(
             replica_id = %config.leader.service_label,
-            lock_value = %config.leader,
+            lock_value = %config.leader.checkpoint_lock_value(),
             object_id,
             sequence,
             write_kind = kind_label,
@@ -5425,7 +6568,15 @@ async fn prune_after_write(
     // generation is missing from the unit it belongs to. So a tick that writes
     // a tail pays exactly two listings (a snapshot tick, one), and that is the
     // intended shape.
-    match store.list_layer_checkpoints(object_id).await {
+    //
+    // A cancel that lands during the listing abandons it and starts no prune,
+    // as the check above does: nothing is deleted yet.
+    let listed = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return PostWriteVerdict::Continue,
+        listed = store.list_layer_checkpoints(object_id) => listed,
+    };
+    match listed {
         Ok(handles) if handles.is_empty() => {
             // Provably wrong (b.oya): this tick has just written and stamped a
             // generation for this object, and a dead-object reap needs a full
@@ -5542,12 +6693,19 @@ async fn prune_after_write(
             if prune_old_generations(
                 lease,
                 client,
-                &ExtTombstoneSink::new(client, keys, metrics, &config.leader.service_label),
+                &ExtTombstoneSink::new(
+                    client,
+                    keys,
+                    metrics,
+                    &config.leader.service_label,
+                    reconcile_grace(store.publish_worst_case()),
+                ),
                 store.as_ref(),
                 object_id,
                 live_seq,
                 handles,
                 config.retain_generations,
+                cancel,
             )
             .await
                 == PostWriteVerdict::Abort
@@ -5631,6 +6789,7 @@ pub(super) async fn attempt_tail_capture_fallback(
     store: &Arc<dyn CheckpointStore>,
     keys: &KeySchema,
     config: &CheckpointLoopConfig,
+    cancel: &CancellationToken,
     pending_ages: &mut PendingAgeAccumulator,
     object_id: u64,
     gate_seq: u64,
@@ -5686,6 +6845,7 @@ pub(super) async fn attempt_tail_capture_fallback(
                 store,
                 keys,
                 config,
+                cancel,
                 pending_ages,
                 object_id,
                 gate_seq,
@@ -5743,7 +6903,12 @@ pub(super) async fn attempt_tail_capture_fallback(
 
     let to_seq = match decision {
         TailCaptureDecision::Captured { to_seq, .. } => to_seq,
-        TailCaptureDecision::Refused(_) => {
+        TailCaptureDecision::Refused(refusal) => {
+            // The clean-up fence's deferral (b.g65) also counts where every
+            // producer's deferral is; its tail cell ticked above.
+            if let (TailCaptureRefusal::CleanupInFlight, Some(m)) = (refusal, metrics) {
+                m.add_checkpoint_reconcile("publish_deferred", 1, &config.leader.service_label);
+            }
             // Persist nothing — neither cursor column (SR-1.3's posture, the
             // same one the enclosing arm takes for the snapshot form). The
             // layer's commits are still un-persisted, so it samples pending.
@@ -5871,6 +7036,7 @@ pub(super) async fn attempt_tail_capture_fallback(
         store,
         keys,
         config,
+        cancel,
         object_id,
         gate_seq,
         to_seq,
@@ -6045,6 +7211,7 @@ async fn rebase_on_chain_full(
     store: &Arc<dyn CheckpointStore>,
     keys: &KeySchema,
     config: &CheckpointLoopConfig,
+    cancel: &CancellationToken,
     pending_ages: &mut PendingAgeAccumulator,
     object_id: u64,
     gate_seq: u64,
@@ -6125,7 +7292,7 @@ async fn rebase_on_chain_full(
     if lease.ensure_held(client, metrics).await == LeaseState::Lost {
         tracing::warn!(
             replica_id = %config.leader.service_label,
-            lock_value = %config.leader,
+            lock_value = %config.leader.checkpoint_lock_value(),
             object_id,
             "checkpoint loop lost its leader lease before starting a chain-collapse re-base; \
              nothing was gathered and the rest of the tick is aborted (the layer stays eligible \
@@ -6249,6 +7416,11 @@ async fn rebase_on_chain_full(
                 // (SR-8.2).
                 if refusal == RebaseRefusal::BasePut {
                     m.inc_checkpoint_write("error", "layer");
+                }
+                // The clean-up fence's deferral (b.g65) is not a failure; it
+                // is counted where every producer's deferral is.
+                if refusal == RebaseRefusal::Cleanup {
+                    m.add_checkpoint_reconcile("publish_deferred", 1, &config.leader.service_label);
                 }
             }
             pending_ages.observe_pending(metrics, object_id, pending_age);
@@ -6508,7 +7680,8 @@ async fn rebase_on_chain_full(
     // lineage stays complete and restorable until it prunes it as a unit.
     ChainFullVerdict::Settled(
         prune_after_write(
-            lease, client, metrics, store, keys, config, object_id, gate_seq, to_seq, "layer",
+            lease, client, metrics, store, keys, config, cancel, object_id, gate_seq, to_seq,
+            "layer",
         )
         .await,
     )
@@ -7251,6 +8424,15 @@ fn duration_to_ms_u64(d: Duration) -> u64 {
 /// steady-state cost is a clock read per unit, and a refresh is issued only
 /// when one is genuinely due.
 ///
+/// `cancel`, the loop's shutdown token, is checked at the same boundaries:
+/// before and during each unit's sidecar read (step 1; the read is raced
+/// against it and abandoned), before each unit's deletes and before the orphan
+/// bucket (step 3), never inside a unit. A cancelled prune returns
+/// [`PostWriteVerdict::Continue`]: it is no lease loss, and what it did not
+/// reach stays for a later tick. One stopped in step 1 deletes nothing and
+/// logs nothing; one stopped in step 3 logs one INFO naming the units and
+/// orphans it deferred, in place of the completion line.
+///
 /// **Never *inside* a unit.** A unit that has started must finish
 /// tails-then-base if it can. Aborting mid-unit is already the safe direction —
 /// the tails go first, so the residual is a `base + oldest tails` prefix, still
@@ -7409,6 +8591,7 @@ async fn prune_old_generations(
     live_seq: u64,
     handles: Vec<crate::checkpoint::store::CheckpointHandle>,
     retain: usize,
+    cancel: &CancellationToken,
 ) -> PostWriteVerdict {
     // Step 0: plan. `handles` goes in EXACTLY as the adapter returned it — no
     // filter, no dedupe, no re-sort. `plan_retention`'s adjacency grouping is
@@ -7527,7 +8710,16 @@ async fn prune_old_generations(
     let mut pruned_hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut deletable: Vec<LineageUnit> = Vec::with_capacity(plan.prune.len());
     for unit in plan.prune {
-        match store.read_ext_refs_sidecar(&unit.base).await {
+        // A cancelled loop stops before the next unit's read (the biased arm
+        // is polled first), and a cancel that lands during the read abandons
+        // it. Nothing is recorded or deleted yet, so the whole prune is left
+        // for a later tick, as when a tombstone record fails below.
+        let read = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return PostWriteVerdict::Continue,
+            read = store.read_ext_refs_sidecar(&unit.base) => read,
+        };
+        match read {
             Ok(set) => {
                 pruned_hashes.extend(set);
                 deletable.push(unit);
@@ -7560,8 +8752,18 @@ async fn prune_old_generations(
     // precedes every delete rather than each unit recording its own just before
     // it is deleted.
     let pruned_hashes_count = pruned_hashes.len();
+    // Every deletable unit's base stem is announced in the same run (b.g65),
+    // so a clean-up walk that lists one of their sidecars and then reads it
+    // absent can explain the absence instead of aborting its collect.
+    let pruned_stems: Vec<String> = deletable
+        .iter()
+        .map(|unit| reconcile_stem_member(object_id, unit.base.snap_seq, CheckpointKind::Base))
+        .collect();
     if let Err(e) = tombstones
-        .record(pruned_hashes.into_iter().collect::<Vec<String>>())
+        .record(
+            &pruned_stems,
+            pruned_hashes.into_iter().collect::<Vec<String>>(),
+        )
         .await
     {
         tracing::warn!(
@@ -7628,7 +8830,17 @@ async fn prune_old_generations(
     let mut deleted_unit_artifacts: usize = 0;
     let mut deferred_units_tail_failure: usize = 0;
     let mut lease_lost = false;
+    // Set when the loop's shutdown token stopped the delete phase: the units
+    // not entered, and the orphan bucket, stay for a later tick, as on a
+    // lease loss, but this is no lease loss.
+    let mut cancelled = false;
     for unit in deletable {
+        // A cancelled loop starts no further unit, and never stops inside
+        // one, for the reason the lease gate below gives.
+        if cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
         // Re-prove the lease immediately before each destructive UNIT, never
         // inside one: a unit that has started finishes tails-then-base if it
         // can, because a mid-unit abort's residual (`base + oldest tails`) is
@@ -7705,7 +8917,13 @@ async fn prune_old_generations(
         // The short-circuit is deliberate: once the unit loop has already lost
         // the lease there is nothing left to prove, and probing again would
         // only re-log the loss.
-        if lease_lost || lease.ensure_held(client, metrics).await == LeaseState::Lost {
+        if lease_lost {
+            orphan_bucket_deferred = pruned_orphan_tails;
+        } else if cancelled || cancel.is_cancelled() {
+            // A cancelled loop leaves the bucket for a later tick.
+            cancelled = true;
+            orphan_bucket_deferred = pruned_orphan_tails;
+        } else if lease.ensure_held(client, metrics).await == LeaseState::Lost {
             lease_lost = true;
             orphan_bucket_deferred = pruned_orphan_tails;
         } else {
@@ -7727,7 +8945,7 @@ async fn prune_old_generations(
     if lease_lost {
         tracing::warn!(
             replica_id = %lease.identity().service_label,
-            lock_value = %lease.identity(),
+            lock_value = %lease.lock_value(),
             object_id,
             pruned_units,
             deferred_units = planned_units.saturating_sub(pruned_units),
@@ -7744,6 +8962,28 @@ async fn prune_old_generations(
              and retries them (retention lags by one tick)"
         );
         return PostWriteVerdict::Abort;
+    }
+
+    // The shutdown terminal line: like the lease-loss WARN above it replaces
+    // the `info!` below, so a prune the loop's cancel stopped part-way says
+    // what it deferred rather than reading as complete. INFO, not WARN: a
+    // shutdown is not a fault. `Continue`: a cancel is no lease loss.
+    if cancelled {
+        tracing::info!(
+            object_id,
+            pruned_units,
+            deferred_units = planned_units.saturating_sub(pruned_units),
+            deferred_units_tail_failure,
+            deferred_orphan_tails = orphan_bucket_deferred,
+            deleted_unit_artifacts,
+            deleted_orphan_tails,
+            pruned_hashes_count,
+            "checkpoint retention prune stopped for shutdown before its next lineage unit or its \
+             orphan tails; every unit it started finished tails-before-base or was deferred whole \
+             on a failed tail delete, and the deferred units and orphans stay on the store for a \
+             later tick"
+        );
+        return PostWriteVerdict::Continue;
     }
 
     // One structured info log per prune — emit only when something actually
@@ -7853,7 +9093,7 @@ fn checkpoint_error_kind(err: &CheckpointError) -> &'static str {
 ///
 /// Driving both from in-crate against a live `TestValkey` is what makes the
 /// whole protocol assertable in milliseconds, with the grace supplied
-/// explicitly per test — exactly the seam `reconcile_leader_tick`'s doc-comment
+/// explicitly per test — exactly the seam `run_cleanup_pass`'s doc-comment
 /// describes, and with no env var, trait knob, or visibility widening that
 /// could weaken the real bound. Precedent: `lease_tests` below.
 #[cfg(test)]
@@ -7886,6 +9126,9 @@ pub(super) mod reconcile_support {
     pub(super) struct ReconcileHarness {
         pub(super) tv: TestValkey,
         pub(super) metrics: SharedMetrics,
+        /// The last harness-run pass's summary (D6), see
+        /// [`Self::last_summary`].
+        last_summary: std::sync::Mutex<Option<CleanupPassSummary>>,
     }
 
     impl ReconcileHarness {
@@ -7893,6 +9136,7 @@ pub(super) mod reconcile_support {
             Self {
                 tv: TestValkey::setup().await,
                 metrics: Arc::new(metrics_scrape_only(REPLICA)),
+                last_summary: std::sync::Mutex::new(None),
             }
         }
 
@@ -7924,24 +9168,106 @@ pub(super) mod reconcile_support {
             v
         }
 
-        /// Make `object_id`'s `obj:hdr` LIVE — i.e. give it a `seq` field, the
-        /// one predicate every liveness test in the service uses.
+        /// Make `object_id` RESURRECTED, as a DR restore leaves it: its
+        /// `obj:hdr` carries `seq`, `session_id` and `layer_name`, and the layer
+        /// mapping those name (`le:{sid}:layer:{hex(name)}`) holds `object_id`
+        /// (b.g65, D.ii).
         ///
-        /// Deliberately writes `seq` and not a full materialized header: the
-        /// dead-object phase's re-check is `HEXISTS obj:hdr seq`, matching the
-        /// conditional cursor stamp and the loop's own refusal, so `seq` is the
-        /// whole of what "live" means to the code under test.
-        pub(super) async fn set_header_live(&self, object_id: u64, seq: u64) {
-            use fred::interfaces::HashesInterface;
+        /// All four writes, because that is what the dead-object probe's `Live`
+        /// verdict needs: `seq` says a header stands, and the mapping naming
+        /// the object is what tells a restore (which only restores an object
+        /// its mapping names) from a `DeleteLayer` whose teardown has not
+        /// finished (`LiveUnmapped`, see [`Self::set_header_unmapped`]).
+        pub(super) async fn set_header_resurrected(&self, object_id: u64, seq: u64) {
+            use fred::interfaces::{HashesInterface, KeysInterface};
+            let (sid, layer) = Self::identity_of(object_id);
             let _: u64 = self
                 .client()
                 .pool
                 .hset(
                     self.keys().obj_header(&object_id.to_string()),
-                    vec![("seq", seq.to_string())],
+                    vec![
+                        ("seq", seq.to_string()),
+                        ("session_id", sid.clone()),
+                        ("layer_name", layer.clone()),
+                    ],
                 )
                 .await
-                .expect("seeding a live obj:hdr must succeed");
+                .expect("seeding a resurrected obj:hdr must succeed");
+            let _: () = self
+                .client()
+                .pool
+                .set(
+                    self.keys().layer_mapping(&sid, &layer),
+                    object_id.to_string(),
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("seeding the resurrected object's layer mapping must succeed");
+        }
+
+        /// The `(session_id, layer_name)` the header fixtures give
+        /// `object_id`: one layer per object, so two objects' mappings never
+        /// collide.
+        pub(super) fn identity_of(object_id: u64) -> (String, String) {
+            (
+                format!("dead-probe-session-{object_id}"),
+                format!("dead-probe-layer-{object_id}"),
+            )
+        }
+
+        /// Make `object_id`'s `obj:hdr` stand with `seq` and NO `superseded`
+        /// flag while no layer mapping names the object — the state a
+        /// `DeleteLayer` stopped after its unmap leaves (b.g65, D.ii):
+        /// the dead-object probe's `LiveUnmapped`, which defers.
+        ///
+        /// `mapping` says what the header's layer mapping holds; `None` writes
+        /// no mapping. `with_layer_name = false` leaves the header without its
+        /// `layer_name` field, so there is no mapping to look up at all.
+        pub(super) async fn set_header_unmapped(
+            &self,
+            object_id: u64,
+            seq: u64,
+            mapping: Option<&str>,
+            with_layer_name: bool,
+        ) {
+            use fred::interfaces::{HashesInterface, KeysInterface};
+            let (sid, layer) = Self::identity_of(object_id);
+            let mut fields = vec![("seq", seq.to_string()), ("session_id", sid.clone())];
+            if with_layer_name {
+                fields.push(("layer_name", layer.clone()));
+            }
+            let _: u64 = self
+                .client()
+                .pool
+                .hset(self.keys().obj_header(&object_id.to_string()), fields)
+                .await
+                .expect("seeding an unmapped obj:hdr must succeed");
+            if let Some(value) = mapping {
+                let _: () = self
+                    .client()
+                    .pool
+                    .set(
+                        self.keys().layer_mapping(&sid, &layer),
+                        value,
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("seeding the layer mapping must succeed");
+            }
+        }
+
+        /// The Valkey clock in ms (`TIME`), for asserting that a pass re-dated
+        /// a `{recon}` member (D4) to a score at or after a reading taken
+        /// before the pass.
+        pub(super) async fn valkey_now_ms(&self) -> u64 {
+            crate::storage::ext_backup::valkey_time_ms(self.client())
+                .await
+                .expect("TIME must succeed")
         }
 
         /// Make `object_id`'s `obj:hdr` live AND flag it `superseded=1` — the
@@ -7953,8 +9279,9 @@ pub(super) mod reconcile_support {
         /// [`super::DeadObjectLiveness`] adjudicates: `seq` present says "a
         /// header is standing", `superseded=1` says "and it belongs to an
         /// object an overwrite already killed". Only the pair reaches
-        /// `LiveSuperseded`; either alone reaches a different verdict, which is
-        /// the whole distinction the three-valued probe exists for.
+        /// `LiveSuperseded`; `seq` alone reaches `Live` or `LiveUnmapped`
+        /// (whether a layer mapping names the object), which is the
+        /// distinction the four-valued probe exists for.
         pub(super) async fn set_header_superseded(&self, object_id: u64, seq: u64) {
             use fred::interfaces::HashesInterface;
             let _: u64 = self
@@ -8030,7 +9357,13 @@ pub(super) mod reconcile_support {
         /// The tombstone sink `prune_old_generations` records through, wired to
         /// this harness's Valkey namespace and metrics.
         pub(super) fn sink(&self) -> ExtTombstoneSink<'_> {
-            ExtTombstoneSink::new(self.client(), self.keys(), Some(&self.metrics), REPLICA)
+            ExtTombstoneSink::new(
+                self.client(),
+                self.keys(),
+                Some(&self.metrics),
+                REPLICA,
+                Duration::ZERO,
+            )
         }
 
         /// Run one retention prune. Post-b.9qd this only *claims* — it records
@@ -8051,6 +9384,20 @@ pub(super) mod reconcile_support {
             handles: Vec<crate::checkpoint::store::CheckpointHandle>,
             retain: usize,
         ) -> PostWriteVerdict {
+            self.prune_cancellable(store, object_id, handles, retain, &CancellationToken::new())
+                .await
+        }
+
+        /// [`Self::prune`] under the loop's shutdown token `cancel`, so a test
+        /// can stop the prune part-way (b.jt5's checkpoint fold).
+        pub(super) async fn prune_cancellable(
+            &self,
+            store: &dyn CheckpointStore,
+            object_id: u64,
+            handles: Vec<crate::checkpoint::store::CheckpointHandle>,
+            retain: usize,
+            cancel: &CancellationToken,
+        ) -> PostWriteVerdict {
             let mut lease = self.lease();
             prune_old_generations(
                 &mut lease,
@@ -8065,6 +9412,35 @@ pub(super) mod reconcile_support {
                 u64::MAX,
                 handles,
                 retain,
+                cancel,
+            )
+            .await
+        }
+
+        /// [`prune_after_write`] for `object_id`, as the loop calls it after a
+        /// write, under the loop's shutdown token `cancel` (b.jt5's checkpoint
+        /// fold): the post-write listing comes from `store`, the lease is
+        /// [`Self::lease`]'s held one and the retention quota is
+        /// [`Self::config`]'s two.
+        pub(super) async fn prune_after_write_cancellable(
+            &self,
+            store: &Arc<dyn CheckpointStore>,
+            object_id: u64,
+            cancel: &CancellationToken,
+        ) -> PostWriteVerdict {
+            let mut lease = self.lease();
+            prune_after_write(
+                &mut lease,
+                self.client(),
+                Some(&self.metrics),
+                store,
+                self.keys(),
+                &self.config(),
+                cancel,
+                object_id,
+                u64::MAX,
+                u64::MAX,
+                "layer",
             )
             .await
         }
@@ -8072,19 +9448,26 @@ pub(super) mod reconcile_support {
         /// Run one full reconciliation pass (orphan claim → act → collect) at
         /// an explicit `grace`.
         ///
-        /// **Zero grace collapses the two-observation policy into one pass** —
-        /// the register and the claim are separate round-trips, so a member
-        /// registered at `t` is already at-or-below the `t − 0` cutoff. Use it
-        /// when the test is about the *action*; use a small positive grace plus
-        /// a sleep when the test is about the *deferral*.
+        /// **Do not pass a grace of zero or a few seconds to a pass that must
+        /// collect.** The collect's commit licenses nothing once its own clock
+        /// is more than one grace past the `t0` it read before its live-set
+        /// walk (R3, `recon_ext_commit.lua`), so at zero grace any millisecond
+        /// between that read and the commit refuses every hash, and at a few
+        /// seconds a loaded runner can do the same — a pass that silently
+        /// deletes nothing, timing-dependently. A test about the
+        /// *action* ages what it needs claimable instead — tombstones with
+        /// [`Self::reconcile_tombstones_aged`], candidates with
+        /// [`Self::pin_aged`] — and runs at the production grace floor; a test
+        /// about the *deferral* uses a small positive grace plus a sleep, and
+        /// asserts on a phase whose outcome that bound cannot change.
         pub(super) async fn reconcile(&self, store: &Arc<dyn CheckpointStore>, grace: Duration) {
-            // The fair-split pass budget `reconcile_leader_tick` mints in
+            // The fair-split pass budget `run_cleanup_pass` mints in
             // production (b.gg7). Derived the same way here rather than handed
             // a generous constant, so a change to `reconcile_drain_budget` or to
             // the phase split that would starve a pass shows up in these tests.
             //
             // The one departure: the budget is derived from the grace a
-            // production caller could actually supply. `reconcile_leader_tick`
+            // production caller could actually supply. `run_cleanup_pass`
             // gets its grace from `reconcile_grace(adapter.publish_worst_case())`,
             // which floors at `RECONCILE_GRACE_FLOOR` (60 s), so the sub-second
             // graces these tests pass — a *claim-eligibility* fiction that makes
@@ -8099,10 +9482,11 @@ pub(super) mod reconcile_support {
             // future once before consulting a zero deadline, but LocalDisk's
             // walks are `tokio::fs` (i.e. `spawn_blocking`) and return `Pending`
             // on that first poll often enough to measure — ~8.6% of 2 000
-            // attempts on an idle machine, and worse under suite load. Every
-            // zero-grace test in this module would inherit that as a flake whose
-            // signature is "the pass silently did nothing", which is exactly the
-            // failure they are written to detect.
+            // attempts on an idle machine, and worse under suite load. A test
+            // at a sub-floor grace would inherit a budget of that size, and
+            // with it a flake whose signature is "the pass silently did
+            // nothing", which is exactly the failure these tests are written to
+            // detect.
             //
             // Grace and budget are independent inputs to the pass; only the
             // budget is floored here, so the claim cutoff each test asks for is
@@ -8115,45 +9499,207 @@ pub(super) mod reconcile_support {
             self.reconcile_with_budget(store, grace, budget).await;
         }
 
+        /// Age every tombstone already on `le:ckpt:{recon}:tomb` to the epoch
+        /// ([`Self::age_out_zset_members`]), then run one pass at the
+        /// production `RECONCILE_GRACE_FLOOR`: "the collect a grace window
+        /// after the prune", without sleeping one out.
+        ///
+        /// Every hash recorded before the call is claimable and at or below the
+        /// commit's `t0 − grace` threshold, as it was at a zero grace, while
+        /// the commit's own bound — licensed only within one grace of `t0` —
+        /// has a minute of headroom rather than none. What the pass records
+        /// itself (an orphan's or a dead object's hashes) starts its own grace
+        /// and is not collected in the same pass, as in production. `:rearm` is
+        /// not aged, so a re-arm made just before the call still refuses its
+        /// hash.
+        pub(super) async fn reconcile_tombstones_aged(&self, store: &Arc<dyn CheckpointStore>) {
+            self.age_out_zset_members(&self.tomb_key()).await;
+            self.reconcile(store, crate::checkpoint::store::RECONCILE_GRACE_FLOOR)
+                .await;
+        }
+
         /// One reconciliation pass at an explicit [`ReconcilePassBudget`].
         ///
         /// Split out of [`Self::reconcile`] so a test can hand the pass a
         /// budget the orphan phase has already spent — the state b.gg7's
         /// fair-split change is *about*, and the only state in which "one
         /// budget, split" and "a fresh budget per phase" behave differently.
-        /// Production has no such seam: `reconcile_leader_tick` mints the budget
-        /// itself and threads it through both phases.
+        /// Production has no such seam: `run_cleanup_pass` mints the budget
+        /// itself and threads it through every phase.
+        ///
+        /// The pass runs behind the real [`CleanupGate`] (b.g65): this harness
+        /// first plants this replica's marked value on `le:checkpoint:leader`
+        /// when no holder is planted — a current build leading backups, which
+        /// the gate requires — and takes `le:gc:leader` for the harness's
+        /// identity, as the clean-up tick does before a pass (the gate only
+        /// reads it). No heal is wired.
         pub(super) async fn reconcile_with_budget(
             &self,
             store: &Arc<dyn CheckpointStore>,
             grace: Duration,
             budget: ReconcilePassBudget,
         ) {
-            let mut lease = self.lease();
-            run_reconcile_tick(
-                self.client(),
-                self.keys(),
+            self.reconcile_with_budget_and_heal(
                 store,
-                &self.config(),
-                Some(&self.metrics),
-                &CancellationToken::new(),
-                &mut lease,
                 grace,
                 budget,
+                None,
+                &CancellationToken::new(),
             )
             .await;
         }
 
-        /// One iteration of the reconciliation *timer* arm, including the
-        /// leader probe and the caller-side grace derivation.
+        /// [`Self::reconcile`] under the clean-up task's shutdown token
+        /// `cancel`, so a test can cancel the pass while it runs (b.jt5's
+        /// checkpoint fold). The summary is kept as for every harness pass.
+        pub(super) async fn reconcile_cancellable(
+            &self,
+            store: &Arc<dyn CheckpointStore>,
+            grace: Duration,
+            cancel: &CancellationToken,
+        ) {
+            let budget = ReconcilePassBudget::starting_now(
+                self.config().reconcile_interval,
+                grace.max(crate::checkpoint::store::RECONCILE_GRACE_FLOOR),
+            );
+            self.reconcile_with_budget_and_heal(store, grace, budget, None, cancel)
+                .await;
+        }
+
+        /// [`Self::reconcile`] with the collect's heal wired (R5/R6): the ext
+        /// mirror's byte budget the heal is charged to, and the marks it
+        /// confirms a re-put copy with.
+        pub(super) async fn reconcile_with_heal(
+            &self,
+            store: &Arc<dyn CheckpointStore>,
+            grace: Duration,
+            heal: &CollectHeal,
+        ) {
+            let budget = ReconcilePassBudget::starting_now(
+                self.config().reconcile_interval,
+                grace.max(crate::checkpoint::store::RECONCILE_GRACE_FLOOR),
+            );
+            self.reconcile_with_budget_and_heal(
+                store,
+                grace,
+                budget,
+                Some(heal),
+                &CancellationToken::new(),
+            )
+            .await;
+        }
+
+        /// The one body behind [`Self::reconcile_with_budget`],
+        /// [`Self::reconcile_with_heal`] and [`Self::reconcile_cancellable`].
+        async fn reconcile_with_budget_and_heal(
+            &self,
+            store: &Arc<dyn CheckpointStore>,
+            grace: Duration,
+            budget: ReconcilePassBudget,
+            heal: Option<&CollectHeal>,
+            cancel: &CancellationToken,
+        ) {
+            self.plant_current_build_checkpoint_leader().await;
+            let config = self.config();
+            // The tick's acquire before a pass (`cleanup::cleanup_tick`): the
+            // gate itself only reads `le:gc:leader`. The verdict is left to the
+            // gate, so a peer-held lock closes the pass at its first check.
+            let _ = crate::storage::external_values::try_acquire_gc_leader(
+                self.client(),
+                self.keys(),
+                &config.leader,
+                Some(&self.metrics),
+            )
+            .await;
+            let mut gate = CleanupGate::new(
+                self.client(),
+                self.keys(),
+                &config.leader,
+                Some(&self.metrics),
+            );
+            let mut summary = CleanupPassSummary::default();
+            run_reconcile_tick(
+                self.client(),
+                self.keys(),
+                store,
+                &config,
+                Some(&self.metrics),
+                cancel,
+                &mut gate,
+                grace,
+                budget,
+                heal,
+                &mut summary,
+            )
+            .await;
+            summary.deferred_older_build = gate.older_build_leads();
+            *self.last_summary.lock().expect("summary mutex") = Some(summary);
+        }
+
+        /// The [`CleanupPassSummary`] of the last pass this harness ran through
+        /// [`Self::reconcile_with_budget`] / [`Self::reconcile_with_heal`] (the
+        /// D6 summary line's fields).
+        pub(super) fn last_summary(&self) -> CleanupPassSummary {
+            self.last_summary
+                .lock()
+                .expect("summary mutex")
+                .take()
+                .expect("a pass ran through the harness")
+        }
+
+        /// Plant a PEER's claim on `le:gc:leader`: a current build's marked
+        /// value (`gc_lock_value`, the same protocol version) with a full TTL,
+        /// which `gc_leader_acquire.lua` leaves alone, so this replica's probe
+        /// answers "held elsewhere".
+        pub(super) async fn plant_gc_peer(&self) {
+            use fred::interfaces::KeysInterface;
+            let _: () = self
+                .client()
+                .pool
+                .set(
+                    self.keys().gc_leader_lock(),
+                    LeaderIdentity::new("gc-peer-replica", "gc-peer").gc_lock_value(),
+                    Some(fred::types::Expiration::PX(30_000)),
+                    None,
+                    false,
+                )
+                .await
+                .expect("planting the peer's le:gc:leader must succeed");
+        }
+
+        /// `le:checkpoint:leader` = this harness's marked value
+        /// ([`LeaderIdentity::checkpoint_lock_value`]), 30 s TTL, unless a
+        /// holder is already planted (`SET NX`): a current build leads backups,
+        /// so the clean-up gate lets a pass run, while a test that planted a
+        /// peer's (unmarked) claim keeps it.
+        pub(super) async fn plant_current_build_checkpoint_leader(&self) {
+            use fred::interfaces::KeysInterface;
+            let _: Option<String> = self
+                .client()
+                .pool
+                .set(
+                    self.keys().checkpoint_leader_lock(),
+                    harness_leader().checkpoint_lock_value(),
+                    Some(fred::types::Expiration::PX(30_000)),
+                    Some(fred::types::SetOptions::NX),
+                    false,
+                )
+                .await
+                .expect("planting le:checkpoint:leader must succeed");
+        }
+
+        /// One interval of the clean-up task (`checkpoint::cleanup`),
+        /// including the `le:gc:leader` probe and the caller-side grace
+        /// derivation. No heal is wired.
         pub(super) async fn leader_tick(&self, store: &Arc<dyn CheckpointStore>) {
-            reconcile_leader_tick(
+            crate::checkpoint::cleanup::cleanup_tick(
                 self.client(),
                 self.keys(),
                 store,
                 &self.config(),
                 Some(&self.metrics),
                 &CancellationToken::new(),
+                None,
             )
             .await;
         }
@@ -8234,8 +9780,8 @@ pub(super) mod reconcile_support {
         }
 
         /// `live_edit_checkpoint_lease_total{outcome, service=REPLICA}` — the
-        /// counter the pass's lease re-acquires tick (`lost` on a peer-held
-        /// lock).
+        /// checkpoint loop's lease counter. The clean-up pass holds no lease
+        /// (b.g65), so a pass never ticks it.
         pub(super) fn lease_counter(&self, outcome: &str) -> u64 {
             super::tick_support::lease_counter_for(&self.metrics, outcome, REPLICA)
         }
@@ -8259,7 +9805,9 @@ pub(super) mod reconcile_support {
         /// poll often enough to measure — ~8.6% of 2 000 attempts on an idle
         /// machine, against 0 of 4 000 for the in-memory adapter. The pass then
         /// silently does nothing, which is indistinguishable from the
-        /// regressions these tests exist to catch.
+        /// regressions these tests exist to catch. A zero grace also licenses
+        /// no collect delete once any time passes between the collect's `t0`
+        /// and its commit (R3), so it is no shortcut for the collect either.
         ///
         /// Pinning the member instead lets the pass run at a production-shaped
         /// grace while still acting in one pass, and it is the more faithful
@@ -8279,11 +9827,9 @@ pub(super) mod reconcile_support {
 
         /// Plant a *peer's* claim on the shared `le:checkpoint:leader` lock.
         ///
-        /// The harness's own [`Self::lease`] is locally-valid by construction,
-        /// so `ensure_held` never round-trips and the lease-loss arms are
-        /// unreachable — except at the `reacquire_after_enumeration` call
-        /// sites, which round-trip unconditionally. This is what makes those
-        /// return `Lost`.
+        /// The peer's value is unmarked — an older build leading backups — so
+        /// the clean-up gate ([`CleanupGate`]) skips the rest of a pass that
+        /// reads it (b.g65), and the retention prune's lease sees it as lost.
         pub(super) async fn plant_peer_leader_lock(&self) {
             plant_peer_leader_lock_on(self.client(), &self.keys().checkpoint_leader_lock()).await;
         }
@@ -8810,6 +10356,10 @@ mod tests {
             self.inner.ext_blob_exists(hash_hex).await
         }
 
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
+        }
+
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
             self.inner.delete_ext_blob(hash_hex).await
         }
@@ -9324,7 +10874,7 @@ mod tests {
         assert_blob_present(&*store, "x").await;
         assert_blob_present(&*store, "y").await;
 
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         assert_blob_present(&*store, "x").await;
         assert_blob_present(&*store, "y").await;
@@ -9384,7 +10934,7 @@ mod tests {
         assert!(remaining.iter().all(|handle| handle.snap_seq >= 2));
 
         // ── The collect half ─────────────────────────────────────────────
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         assert_blob_present(&*store, "x").await;
         assert_blob_present(&*store, "y").await;
@@ -9427,7 +10977,7 @@ mod tests {
         );
         assert_blob_present(&*store, "shared").await;
 
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         assert_blob_present(&*store, "shared").await;
         assert_blob_absent(&*store, "only-old-a").await;
@@ -9453,7 +11003,7 @@ mod tests {
 
         let handles = store.list_layer_checkpoints(oid).await.unwrap();
         h.prune(&*store, oid, handles, 2).await;
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         // After the first prune + collect: generation snap_seq=1 is gone and
         // its unique hash has been reclaimed.
@@ -9469,7 +11019,7 @@ mod tests {
         // tombstone set.
         let handles_again = store.list_layer_checkpoints(oid).await.unwrap();
         h.prune(&*store, oid, handles_again, 2).await;
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         assert_eq!(store.list_layer_checkpoints(oid).await.unwrap().len(), 2);
         assert_blob_absent(&*store, "h-1").await;
@@ -9604,7 +11154,7 @@ mod tests {
 
         // Collect what was recorded; the stranded generation's hash is
         // untouched because its generation is still live.
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
         assert_blob_absent(&*store, recorded_hash).await;
         assert_blob_present(&*store, stranded_hash).await;
         assert_blob_present(&*store, "new").await;
@@ -9620,7 +11170,7 @@ mod tests {
             "the next prune must catch up on the generation the failed read left behind"
         );
         assert_eq!(h.tombstones().await, vec![stranded_hash.to_string()]);
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
         assert_blob_absent(&*store, stranded_hash).await;
         assert_blob_present(&*store, "new").await;
     }
@@ -9716,7 +11266,7 @@ mod tests {
         h.prune(&*store, oid, handles, 2).await;
         assert_eq!(h.tombstones().await, sorted(&["uniq-a", "uniq-b"]));
 
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         let a_present = blob_present(&*store, "uniq-a").await;
         let b_present = blob_present(&*store, "uniq-b").await;
@@ -9735,7 +11285,7 @@ mod tests {
         assert_eq!(h.reconcile_counter("ext_collected"), 1);
 
         // Next pass: the injector has fired, so the retry succeeds.
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
         assert_blob_absent(&*store, "uniq-a").await;
         assert_blob_absent(&*store, "uniq-b").await;
         assert_blob_present(&*store, "new").await;
@@ -9782,7 +11332,7 @@ mod tests {
         );
         assert_eq!(h.tombstones().await, vec!["uniq-old".to_string()]);
 
-        h.reconcile(&store, Duration::ZERO).await;
+        h.reconcile_tombstones_aged(&store).await;
 
         assert_eq!(
             h.reconcile_counter("live_set_failed"),
@@ -13486,9 +15036,10 @@ mod tests {
     /// Production-shaped (`RECONCILE_GRACE_FLOOR` is 60 s) and handed in
     /// explicitly; the members are back-dated with
     /// [`ReconcileHarness::age_out_zset_members`] rather than waited out, so no
-    /// case here sleeps or reads a wall clock. `Duration::ZERO` would also act
-    /// in one pass, but it makes the grace the `adapter_ceiling` term of
-    /// `ReconcilePassBudget::enumeration_bound` too — see
+    /// case here sleeps or reads a wall clock. `Duration::ZERO` is no
+    /// substitute: it licenses no collect delete once any time passes between
+    /// the collect's `t0` and its commit (R3), and it also makes the grace the
+    /// `adapter_ceiling` term of `ReconcilePassBudget::enumeration_bound` — see
     /// [`ReconcileHarness::pin_aged`] for the measurement.
     const COLLECT_GRACE: Duration = Duration::from_secs(60);
 
@@ -14638,6 +16189,10 @@ mod tests {
             self.inner.ext_blob_exists(hash_hex).await
         }
 
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
+        }
+
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
             self.inner.delete_ext_blob(hash_hex).await
         }
@@ -14767,6 +16322,7 @@ mod tests {
                 h.tv.key_schema(),
                 Some(&h.metrics),
                 replica_id,
+                Duration::ZERO,
             ),
             store,
             object_id,
@@ -14776,6 +16332,7 @@ mod tests {
             u64::MAX,
             handles,
             retain,
+            &CancellationToken::new(),
         )
         .await
     }
@@ -15805,9 +17362,9 @@ mod cascade_inflight_generation_tests {
     //!
     //! The invariant is unchanged and matters more than ever, so
     //! [`prune_and_assert`] now drives both halves: prune, assert the
-    //! tombstones, then run one reconciliation pass **at a small positive
-    //! grace** and assert `h` and `retained` survive while `orphan` is
-    //! collected. The `ext_spared` cell of
+    //! tombstones, then run one reconciliation pass **at the production grace
+    //! floor, with the tombstones aged past it**, and assert `h` and
+    //! `retained` survive while `orphan` is collected. The `ext_spared` cell of
     //! `live_edit_checkpoint_reconcile_total` is the direct observation of the
     //! in-flight protection working.
     //!
@@ -15818,8 +17375,11 @@ mod cascade_inflight_generation_tests {
     //! flight is the two-observations-a-grace-apart rule. At zero grace that
     //! rule collapses and the pass would reap object 200 — correctly, by its
     //! own contract, but it would stop testing the thing this file is about.
-    //! So the fixture waits out a millisecond-scale grace instead, which
-    //! reproduces the production shape (defer on first sighting) in test time.
+    //! (A zero grace would also license no collect delete at all: the commit
+    //! refuses once its clock is more than one grace past the collect's `t0`.)
+    //! So only the tombstones are aged — pinned to the epoch rather than slept
+    //! out — and the pass registers object 200 on its first sighting and
+    //! defers it, the production shape.
     //!
     //! ## The bug
     //!
@@ -15942,25 +17502,10 @@ mod cascade_inflight_generation_tests {
         }
     }
 
-    /// Grace window the fixture runs at. Small enough to wait out in test
-    /// time, large enough that a candidate registered by the pass itself
-    /// cannot also be claimed by it — which is the whole reason it is not
-    /// zero (see the module doc).
-    ///
-    /// A full second rather than the 200 ms this started at: the quantity
-    /// being outrun is a *whole reconciliation pass* (an adapter enumeration,
-    /// a Lua claim round-trip, and the per-candidate work), and on a loaded CI
-    /// runner sharing one Valkey with the rest of the suite that can take
-    /// longer than 200 ms on its own. When it does, the pass that is supposed
-    /// to merely register a candidate finds it already aged out and reaps it —
-    /// the assertion fails in the "deferral did not happen" direction, which
-    /// reads exactly like the safety regression this file exists to catch. A
-    /// second of wall clock per deferral test is the cheap side of that trade.
-    const GRACE: Duration = Duration::from_secs(1);
-
-    /// Prune object 100 with `retain = 2`, then run ONE reconciliation pass a
-    /// grace window later, and assert the three blob outcomes plus the
-    /// tombstone bookkeeping that now carries them.
+    /// Prune object 100 with `retain = 2`, then run ONE reconciliation pass
+    /// with the prune's tombstones aged past the grace
+    /// ([`ReconcileHarness::reconcile_tombstones_aged`]), and assert the three
+    /// blob outcomes plus the tombstone bookkeeping that now carries them.
     ///
     /// `store` is taken as an `Arc<dyn CheckpointStore>` because
     /// `run_reconcile_tick` addresses the adapter through the trait object the
@@ -16002,12 +17547,11 @@ mod cascade_inflight_generation_tests {
             );
         }
 
-        // Wait out the grace so the tombstones are claimable, then collect.
-        // The slack scales with GRACE (see its doc): sleeping exactly the
-        // grace makes the claim a boundary race, and the assertion direction
-        // here is "aged out", so overshooting is always the safe side.
-        tokio::time::sleep(GRACE + Duration::from_millis(500)).await;
-        h.reconcile(store, GRACE).await;
+        // Age the tombstones past the grace, then collect, at the production
+        // grace floor (see the module doc): the in-flight generation is
+        // registered by this pass and deferred, and the collect's commit has
+        // a minute of headroom on its one-grace-past-`t0` bound.
+        h.reconcile_tombstones_aged(store).await;
 
         assert!(
             store
@@ -16387,8 +17931,9 @@ mod cascade_inflight_generation_tests {
 #[cfg(test)]
 mod reconcile_tests {
     //! b.9qd — the checkpoint-store reconciliation pass itself:
-    //! [`run_reconcile_tick`], [`run_reconcile_collect`], and the
-    //! [`reconcile_leader_tick`] timer arm above them.
+    //! [`run_reconcile_tick`], [`run_reconcile_collect`], and the clean-up
+    //! task's tick (`checkpoint::cleanup::cleanup_tick`, b.g65) that runs
+    //! [`run_cleanup_pass`] above them.
     //!
     //! ## Why in-crate
     //!
@@ -16429,8 +17974,35 @@ mod reconcile_tests {
     //!   enumeration (and the dead-object one also on that enumeration naming
     //!   none of the object's generations), the collect's delete against an
     //!   empty live set on the live-set walk's OWN listing; and a listed
-    //!   sidecar that reads absent aborting the collect — as `live_set_failed`
-    //!   while this replica leads, as a lease loss while a peer does.
+    //!   sidecar that reads absent aborting the collect unless the evidence
+    //!   explains it (b.g65, N2).
+    //! - the **b.g65 group** — the clean-up task's tick and gate beside the
+    //!   other tick tests (`non_leader_tick_*`, `a_tick_whose_maintenance_*`,
+    //!   `the_cleanup_gate_*`, `*_stops_at_its_first_claim_*` /
+    //!   `*_first_batch_*`: `le:gc:leader` and a current build leading
+    //!   backups, N1 and N5); the dead-object probe's four states and the
+    //!   interrupted `DeleteLayer` (T7–T10, amendment (D)); after the
+    //!   per-generation re-probe test, the dead reap's announcements — none on
+    //!   a base its re-probe keeps, and every announcement of a restored
+    //!   object withdrawn by key before its member retires, a failed
+    //!   withdrawal retiring nothing; the explained absences
+    //!   (`a_listed_sidecar_whose_*`, N2); and, from
+    //!   `collect_defers_a_tombstoned_value_*` to the end, the collect's
+    //!   delete-time license (the snapshot clock, the Valkey-liveness gate, the
+    //!   writer re-arm fence, the post-delete step and its heal, the settle and
+    //!   heal-on-keep, retried for a spared hash until it lands: R1–R8), the
+    //!   deleters' announcements, the dead phase's per-member deadline, the
+    //!   re-dating of deferred dead members and of failed collect deletes, and
+    //!   the summary (D2, D4–D6), and that the pass holds no Valkey slot across
+    //!   its store reads. The pass holds no
+    //!   `CheckpointLease`. Its gate reads two locks instead, so every
+    //!   harness-run pass first takes `le:gc:leader` for the harness's
+    //!   identity, as the clean-up tick does, and plants a current build's
+    //!   marked value on `le:checkpoint:leader` when no holder is planted.
+    //!   The gate tests plant a peer on either lock (`plant_gc_peer`,
+    //!   `plant_peer_leader_lock_on`) or change one mid-pass, and
+    //!   `the_cleanup_gate_reads_the_maintenance_lock_mid_pass_*` reads
+    //!   `le:gc:leader`'s value and TTL during the pass.
     //!
     //! LocalDisk is the default adapter under test: it is the only one whose
     //! `layers/` namespace a test can put into a partial-publish state without
@@ -16455,8 +18027,8 @@ mod reconcile_tests {
     ///
     /// A full second rather than the 200 ms this started at. The thing that
     /// has to fit inside the window is an entire reconciliation pass — an
-    /// adapter enumeration, a lease re-acquire, a Lua claim round-trip, and
-    /// the per-candidate work — and on a loaded runner sharing one Valkey with
+    /// adapter enumeration, the clean-up gate's probes, a Lua claim round-trip,
+    /// and the per-candidate work — and on a loaded runner sharing one Valkey with
     /// the rest of the suite that can exceed 200 ms by itself. When it does,
     /// the pass that is only supposed to *register* a candidate finds it
     /// already aged out and reaps it, and the failure reads exactly like the
@@ -16474,7 +18046,7 @@ mod reconcile_tests {
     /// [`ReconcileHarness::pin_aged`] on the members they need claimable.
     ///
     /// A minute — the production `RECONCILE_GRACE_FLOOR`, i.e. the smallest
-    /// grace `reconcile_leader_tick` can actually derive — rather than the
+    /// grace the clean-up task's tick can actually derive — rather than the
     /// `Duration::ZERO` these tests used to pass. Nothing sleeps it out (the
     /// pinning is what makes the members claimable), so its only effect is to
     /// keep the pass's derived quantities production-shaped; `pin_aged`'s
@@ -16982,31 +18554,108 @@ mod reconcile_tests {
         assert_eq!(h.backlog_gauge(), Some(0));
     }
 
-    /// T11 (b.wsx): a collect that deletes a value's backup copy clears the
-    /// value's backup confirmation (`backed_up_in`) on its Valkey meta, so the
-    /// next backup-repair pass finds the value owed and re-sends it from
-    /// Valkey, which still holds it: no live backup names a hash, which says
-    /// nothing about Valkey. Only the field goes: the meta's other fields
-    /// stay; a spared value keeps its confirmation; and the clear of a hash
-    /// Valkey does not hold creates no meta. Without the clear, the value
-    /// would read as backed up for a day, with no copy anywhere but Valkey.
+    /// Valkey holds `hash`: its `ext:data` is `bytes`, and its `ext:meta`
+    /// carries `ref_count`, `last_store_ms` = `stamp_ms` and, when given,
+    /// `backed_up_in` — the state the store path and a confirmed backup copy
+    /// leave.
+    async fn plant_valkey_value(
+        client: &ValkeyClient,
+        keys: &KeySchema,
+        hash: &str,
+        bytes: &[u8],
+        stamp_ms: u64,
+        backed_up_in: Option<&str>,
+    ) {
+        use crate::storage::ext_backup::BACKED_UP_IN_FIELD;
+        use fred::interfaces::HashesInterface;
+        let _: () = client
+            .pool
+            .set(keys.ext_data(hash), bytes.to_vec(), None, None, false)
+            .await
+            .expect("SET ext:data must succeed");
+        let mut fields = vec![
+            ("ref_count", "1".to_owned()),
+            ("last_store_ms", stamp_ms.to_string()),
+        ];
+        if let Some(confirmation) = backed_up_in {
+            fields.push((BACKED_UP_IN_FIELD, confirmation.to_owned()));
+        }
+        let _: u64 = client
+            .pool
+            .hset(keys.ext_meta(hash), fields)
+            .await
+            .expect("HSET ext:meta must succeed");
+    }
+
+    /// An [`ExtDeleteHook`] that, immediately before the collect's delete of
+    /// `target`, stores it in Valkey ([`plant_valkey_value`]) — a store landing
+    /// between the collect's Valkey-liveness check (R4) and its delete, the
+    /// window its post-delete step (R5) exists for.
+    fn store_lands_before_the_delete_of(
+        client: &ValkeyClient,
+        keys: &KeySchema,
+        target: &str,
+        bytes: Vec<u8>,
+        stamp_ms: u64,
+        backed_up_in: Option<String>,
+    ) -> ExtDeleteHook {
+        let (client, keys, target) = (client.clone(), keys.clone(), target.to_owned());
+        Arc::new(move |hash: String| {
+            let (client, keys, target, bytes, backed_up_in) = (
+                client.clone(),
+                keys.clone(),
+                target.clone(),
+                bytes.clone(),
+                backed_up_in.clone(),
+            );
+            Box::pin(async move {
+                if hash == target {
+                    plant_valkey_value(
+                        &client,
+                        &keys,
+                        &hash,
+                        &bytes,
+                        stamp_ms,
+                        backed_up_in.as_deref(),
+                    )
+                    .await;
+                }
+            })
+        })
+    }
+
+    /// T11 (b.wsx), on the b.g65 delete rule: a collect only deletes the backup
+    /// copy of a value Valkey does not hold (R4), so a value Valkey holds at
+    /// delete time is one a store landed for between the liveness check and
+    /// the delete. Its post-delete step (R5, `ext_backup_clear.lua`) clears the
+    /// confirmation (`backed_up_in`) of the copy it deleted and stamps
+    /// `backup_cleared_ms`; the meta's other fields stay, and the clear of a
+    /// hash Valkey does not hold creates no meta. With no heal wired the
+    /// delete's `:collected` record is kept, so a writer that started before
+    /// the delete refuses its upload, and once that window has passed the next
+    /// backup-repair pass finds the value owed and re-sends it from Valkey.
+    /// Without the clear, the value would read as backed up for a day, with no
+    /// copy anywhere but Valkey.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collect_clears_a_deleted_values_backup_confirmation_and_the_next_repair_pass_resends_it(
     ) {
         use crate::checkpoint::ext_backup_repair::{ExtBackupRepair, ExtBackupRepairTiming};
         use crate::checkpoint::ext_mirror::ext_mirror_channel;
-        use crate::storage::ext_backup::{valkey_time_ms, BACKED_UP_IN_FIELD};
+        use crate::storage::ext_backup::{
+            valkey_time_ms, BACKED_UP_IN_FIELD, BACKUP_CLEARED_MS_FIELD,
+        };
         use fred::interfaces::{HashesInterface, KeysInterface};
 
         const STORE_ID: &str = "0123456789abcdef";
         let h = ReconcileHarness::new().await;
         let (client, keys) = (h.tv.client(), h.tv.key_schema());
         let f = disk_fixture();
+        let (torn, store) = f.torn();
         let collected = format!("{:064x}", 0xc0_11ec7_u64);
         let spared = format!("{:064x}", 0x5_ba4ed_u64);
         let not_in_valkey = format!("{:064x}", 0xab5e47_u64);
 
-        f.store
+        store
             .put_layer_checkpoint(
                 9,
                 1,
@@ -17015,96 +18664,121 @@ mod reconcile_tests {
             )
             .await
             .expect("seeding the live generation must succeed");
-        f.plant_orphan(6, 1, &[&spared, &collected, &not_in_valkey])
-            .await;
         for hash in [&spared, &collected, &not_in_valkey] {
-            f.store
+            store
                 .put_ext_blob(hash, Bytes::from(format!("bytes-{hash}")))
                 .await
                 .expect("put_ext_blob");
         }
-        // Valkey holds `collected` and `spared`, each stored an hour ago and
-        // confirmed in the backup store a minute ago.
+        // Valkey holds `spared`, stored an hour ago and confirmed a minute
+        // ago; `collected` is stored again (same stamp, same confirmation)
+        // only once the collect has found it not live and is about to delete
+        // its copy.
         let pool = client.pool.clone();
         let now_ms = valkey_time_ms(client).await.expect("TIME");
-        let stamp = (now_ms - 3_600_000).to_string();
+        let stamp_ms = now_ms - 3_600_000;
         let confirmation = format!("{STORE_ID}:{}", now_ms - 60_000);
-        for hash in [&collected, &spared] {
-            let _: () = pool
-                .set(
-                    keys.ext_data(hash),
-                    format!("bytes-{hash}"),
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .expect("SET ext:data");
-            let _: u64 = pool
-                .hset(
-                    keys.ext_meta(hash),
-                    vec![
-                        ("ref_count", "1".to_owned()),
-                        ("last_store_ms", stamp.clone()),
-                        (BACKED_UP_IN_FIELD, confirmation.clone()),
-                    ],
-                )
-                .await
-                .expect("HSET ext:meta");
-        }
-        h.pin_aged(&h.orphans_key(), &["6.1"]).await;
+        plant_valkey_value(
+            client,
+            keys,
+            &spared,
+            format!("bytes-{spared}").as_bytes(),
+            stamp_ms,
+            Some(&confirmation),
+        )
+        .await;
+        torn.before_ext_delete(store_lands_before_the_delete_of(
+            client,
+            keys,
+            &collected,
+            format!("bytes-{collected}").into_bytes(),
+            stamp_ms,
+            Some(confirmation.clone()),
+        ));
         h.pin_aged(&h.tomb_key(), &[&spared, &collected, &not_in_valkey])
             .await;
 
-        h.reconcile(&f.store, ACT_GRACE).await;
+        h.reconcile(&store, ACT_GRACE).await;
 
         assert_eq!(
             h.reconcile_counter("ext_collected"),
             2,
-            "fixture self-check: the collect deleted the two unreferenced copies"
+            "fixture self-check: the collect deleted the two copies no backup names"
         );
         assert!(
-            f.store
+            store
                 .get_ext_blob(&collected)
                 .await
                 .expect("get_ext_blob")
                 .is_none(),
-            "fixture self-check: `collected`'s backup copy is gone"
+            "fixture self-check: `collected`'s backup copy is gone, and no heal is wired"
         );
-        let field = |hash: &str| {
+        let field = |hash: &str, name: &'static str| {
             let pool = pool.clone();
             let key = keys.ext_meta(hash);
             async move {
-                pool.hget::<Option<String>, _, _>(key, BACKED_UP_IN_FIELD)
+                pool.hget::<Option<String>, _, _>(key, name)
                     .await
-                    .expect("HGET backed_up_in")
+                    .expect("HGET ext:meta field")
             }
         };
         assert_eq!(
-            field(&collected).await,
+            field(&collected, BACKED_UP_IN_FIELD).await,
             None,
-            "the collect clears the confirmation of the copy it deleted"
+            "the post-delete step clears the confirmation of the copy it deleted"
         );
-        let stamp_left: Option<String> = pool
-            .hget(keys.ext_meta(&collected), "last_store_ms")
+        let cleared_at: u64 = field(&collected, BACKUP_CLEARED_MS_FIELD)
             .await
-            .expect("HGET last_store_ms");
+            .expect("the post-delete step stamps when it cleared")
+            .parse()
+            .expect("backup_cleared_ms is decimal ms");
+        assert!(
+            cleared_at >= now_ms,
+            "stamped on the Valkey clock, after the fixture's reading"
+        );
         assert_eq!(
-            stamp_left.as_deref(),
-            Some(stamp.as_str()),
+            field(&collected, "last_store_ms").await,
+            Some(stamp_ms.to_string()),
             "only the confirmation goes; the meta stays"
         );
         assert_eq!(
-            field(&spared).await.as_deref(),
+            field(&spared, BACKED_UP_IN_FIELD).await.as_deref(),
             Some(confirmation.as_str()),
-            "a spared value keeps its confirmation"
+            "a value the live set spares keeps its confirmation"
         );
         let created: u64 = pool
             .exists(keys.ext_meta(&not_in_valkey))
             .await
             .expect("EXISTS");
         assert_eq!(created, 0, "the clear creates no meta");
+        let record = h
+            .zscore(&keys.checkpoint_reconcile_collected(), &collected)
+            .await;
+        assert!(
+            record.is_some(),
+            "with no heal wired the delete's `:collected` record is kept for heal-on-keep"
+        );
+        assert_eq!(
+            h.tombstones().await,
+            vec![collected.clone()],
+            "and so is its tombstone; the others retire"
+        );
 
+        // Age the delete's record past the repair's reliance window, as the
+        // passage of an upload ceiling would: a repair pass that starts now
+        // relies on Valkey state read after the delete, so the fence lets its
+        // re-send through.
+        let _: () = pool
+            .zadd(
+                keys.checkpoint_reconcile_collected(),
+                Some(fred::types::SetOptions::XX),
+                None,
+                false,
+                false,
+                ((now_ms - 600_000) as f64, collected.as_str()),
+            )
+            .await
+            .expect("ZADD XX must succeed");
         let metrics = Arc::clone(&h.metrics);
         let (sender, _rx) = ext_mirror_channel(
             4,
@@ -17130,6 +18804,18 @@ mod reconcile_tests {
             upload_ceiling: Duration::from_secs(5),
             work_budget: Duration::from_secs(60),
         });
+        // The pass relies on the copy from its own Valkey clock read; a read in
+        // the clear's millisecond would decline its confirmation (the confirm
+        // script declines when `backup_cleared_ms` >= the reliance start), so
+        // wait until that clock is past the clear, as it is for any later pass.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while valkey_time_ms(client).await.expect("TIME") <= cleared_at {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Valkey's clock never passed {cleared_at}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let summary = repair
             .run_pass(&tokio_util::sync::CancellationToken::new())
             .await
@@ -17153,31 +18839,41 @@ mod reconcile_tests {
             Some(format!("bytes-{collected}").as_bytes()),
             "the repair re-sent Valkey's bytes"
         );
-        let reconfirmed = field(&collected).await.expect("the re-send is confirmed");
+        let reconfirmed = field(&collected, BACKED_UP_IN_FIELD)
+            .await
+            .expect("the re-send is confirmed: its reliance start is after the clear");
         assert!(
             reconfirmed.starts_with(&format!("{STORE_ID}:")),
             "{reconfirmed}"
         );
     }
 
-    /// b.wsx: a clear that fails after the collect deleted a backup copy is
-    /// counted (`checkpoint_ext_backup_mark_failed_total{op="clear"}`) and
-    /// leaves the meta as it was, and the collect carries on: the copy still
-    /// counts `ext_collected`, and the next hash's copy is deleted and its
-    /// confirmation cleared. The failure is a real `WRONGTYPE` from Valkey (the
-    /// first hash's meta key holds a string, so its `HDEL` fails), the only way
-    /// to fail the clear's command on the harness's real client; the hashes
-    /// share a tombstone score, so the claim hands them over in name order,
-    /// the poisoned one first.
+    /// b.wsx, on the b.g65 post-delete step: a clear that fails after the
+    /// collect deleted a backup copy is counted
+    /// (`checkpoint_ext_backup_mark_failed_total{op="clear"}`) and leaves the
+    /// meta as it was, and the collect carries on: the copy still counts
+    /// `ext_collected`, and the next hash's copy is deleted and its
+    /// confirmation cleared. Both tombstones and both `:collected` records are
+    /// kept — the failed step's so the next pass re-checks it, the cleared
+    /// one's because no heal is wired — so heal-on-keep can finish them.
+    ///
+    /// Both values are stored (the meta keys written) only once the collect
+    /// has found them not live and is about to delete each copy (R4 defers a
+    /// value Valkey holds before that). The failure is a real `WRONGTYPE` from
+    /// Valkey (the first hash's meta key holds a string, so its `HDEL` fails),
+    /// the only way to fail the clear's command on the harness's real client;
+    /// the hashes share a tombstone score, so the claim hands them over in
+    /// name order, the poisoned one first.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collect_counts_a_failed_clear_and_carries_on_to_the_next_hash() {
         use crate::observability::metrics::test_util::{render, sample_value};
         use crate::storage::ext_backup::BACKED_UP_IN_FIELD;
-        use fred::interfaces::HashesInterface;
+        use fred::interfaces::{HashesInterface, KeysInterface};
 
         let h = ReconcileHarness::new().await;
         let (client, keys) = (h.tv.client(), h.tv.key_schema());
         let f = disk_fixture();
+        let (torn, store) = f.torn();
         let poisoned = format!("{:064x}", 0x0bad_u64);
         let healthy = format!("{:064x}", 0xfeed_u64);
         assert!(
@@ -17187,7 +18883,7 @@ mod reconcile_tests {
 
         // A live generation, so the collect's own walk lists something and
         // its live set, which names neither hash, licenses the deletes.
-        f.store
+        store
             .put_layer_checkpoint(
                 9,
                 1,
@@ -17196,33 +18892,45 @@ mod reconcile_tests {
             )
             .await
             .expect("seeding the live generation must succeed");
-        f.plant_orphan(6, 1, &[&poisoned, &healthy]).await;
         for hash in [&poisoned, &healthy] {
-            f.store
+            store
                 .put_ext_blob(hash, Bytes::from(format!("bytes-{hash}")))
                 .await
                 .expect("put_ext_blob");
         }
-        let pool = client.pool.clone();
-        let _: () = pool
-            .set(keys.ext_meta(&poisoned), "not-a-hash", None, None, false)
-            .await
-            .expect("poisoning ext:meta must succeed");
         let confirmation = "0123456789abcdef:1760000000000".to_owned();
-        let _: u64 = pool
-            .hset(
-                keys.ext_meta(&healthy),
-                vec![
-                    ("ref_count", "1".to_owned()),
-                    (BACKED_UP_IN_FIELD, confirmation),
-                ],
-            )
-            .await
-            .expect("HSET ext:meta");
-        h.pin_aged(&h.orphans_key(), &["6.1"]).await;
+        let healthy_lands = store_lands_before_the_delete_of(
+            client,
+            keys,
+            &healthy,
+            format!("bytes-{healthy}").into_bytes(),
+            1,
+            Some(confirmation),
+        );
+        let (poison_client, poison_key) = (client.clone(), keys.ext_meta(&poisoned));
+        let poisoned_target = poisoned.clone();
+        torn.before_ext_delete(Arc::new(move |hash: String| {
+            let healthy_lands = Arc::clone(&healthy_lands);
+            let (client, key, target) = (
+                poison_client.clone(),
+                poison_key.clone(),
+                poisoned_target.clone(),
+            );
+            Box::pin(async move {
+                if hash == target {
+                    let _: () = client
+                        .pool
+                        .set(&key, "not-a-hash", None, None, false)
+                        .await
+                        .expect("poisoning ext:meta must succeed");
+                } else {
+                    healthy_lands(hash).await;
+                }
+            })
+        }));
         h.pin_aged(&h.tomb_key(), &[&poisoned, &healthy]).await;
 
-        h.reconcile(&f.store, ACT_GRACE).await;
+        h.reconcile(&store, ACT_GRACE).await;
 
         assert_eq!(
             h.reconcile_counter("ext_collected"),
@@ -17238,7 +18946,7 @@ mod reconcile_tests {
         assert_eq!(clear_failed, 1.0, "the failed clear is counted once");
         for hash in [&poisoned, &healthy] {
             assert!(
-                f.store
+                store
                     .get_ext_blob(hash)
                     .await
                     .expect("get_ext_blob")
@@ -17246,6 +18954,7 @@ mod reconcile_tests {
                 "{hash}'s backup copy is deleted"
             );
         }
+        let pool = client.pool.clone();
         let left: String = pool
             .get(keys.ext_meta(&poisoned))
             .await
@@ -17259,10 +18968,22 @@ mod reconcile_tests {
             cleared, None,
             "the collect carried on and cleared the next one"
         );
-        assert!(
-            h.tombstones().await.is_empty(),
-            "both tombstones are retired"
+        let mut kept = vec![poisoned.clone(), healthy.clone()];
+        kept.sort();
+        assert_eq!(
+            h.tombstones().await,
+            kept,
+            "both tombstones are kept for the next pass"
         );
+        for hash in [&poisoned, &healthy] {
+            assert!(
+                h.zscore(&keys.checkpoint_reconcile_collected(), hash)
+                    .await
+                    .is_some(),
+                "{hash}'s `:collected` record is kept, so a writer that started before the \
+                 delete refuses and heal-on-keep can re-put it"
+            );
+        }
     }
 
     // ── Write-temp reclamation ───────────────────────────────────────────
@@ -17972,23 +19693,73 @@ mod reconcile_tests {
         /// so the mutation lands exactly at the first cut point and every later
         /// generation sees the mutated state.
         mutate_header_after_first_delete:
-            std::sync::Mutex<Option<(ValkeyClient, String, HeaderMutation)>>,
+            std::sync::Mutex<Option<(ValkeyClient, KeySchema, u64, HeaderMutation)>>,
         delete_log: std::sync::Mutex<Vec<(u64, CheckpointKind)>>,
         sidecar_read_log: std::sync::Mutex<Vec<(u64, CheckpointKind)>>,
+        /// b.g65: run immediately BEFORE each `delete_ext_blob` is forwarded,
+        /// with the hash — the window between the collect's Valkey-liveness
+        /// check and its delete, where a store or a confirm can land.
+        before_ext_delete: std::sync::Mutex<Option<ExtDeleteHook>>,
+        /// Every hash `put_ext_blob` was called with, in call order (the
+        /// collect's heal and heal-on-keep).
+        ext_put_log: std::sync::Mutex<Vec<String>>,
+        /// Run synchronously inside each `put_ext_blob`, before it is
+        /// forwarded: a test reads what the heal holds while its upload is in
+        /// flight (the mirror budget's charge).
+        ext_put_observer: std::sync::Mutex<Option<ExtPutObserver>>,
+        /// b.g65 (D4): refuse every `delete_layer_checkpoint` of these object
+        /// ids cleanly, as [`Self::refuse_delete_at`] does for one generation —
+        /// members whose reap fails on every pass.
+        refuse_object_deletes: std::sync::Mutex<std::collections::HashSet<u64>>,
+        /// b.g65 (N2): when armed, each BASE delete records whether its stem
+        /// was already announced on `le:ckpt:{recon}:deleting` when the delete
+        /// was called, in [`Self::announced_at_delete`].
+        announce_probe: std::sync::Mutex<Option<(ValkeyClient, KeySchema)>>,
+        announced_at_delete: std::sync::Mutex<Vec<(u64, u64, bool)>>,
+        /// b.g65 (N3): run once, at the start of the FIRST
+        /// `delete_layer_checkpoint`, before anything is forwarded — a write
+        /// landing while one orphan of a claimed batch is being reaped, before
+        /// the next one's commit.
+        before_first_layer_delete: std::sync::Mutex<Option<LayerDeleteHook>>,
+        /// b.g65: when set, every `put_ext_blob` fails with a `Transient`
+        /// error (the collect's heal upload failing).
+        fail_ext_puts: std::sync::atomic::AtomicBool,
+        /// b.g65 (D4, the collect): `delete_ext_blob` of these hashes fails
+        /// with a `Transient` error before anything is forwarded — a blob
+        /// whose delete fails on every pass.
+        refuse_ext_deletes: std::sync::Mutex<std::collections::HashSet<String>>,
     }
 
+    /// See [`TornDeleteStore::before_first_layer_delete`].
+    type LayerDeleteHook =
+        Arc<dyn Fn(CheckpointHandle) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+    /// See [`TornDeleteStore::before_ext_delete`].
+    type ExtDeleteHook =
+        Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+    /// See [`TornDeleteStore::ext_put_observer`].
+    type ExtPutObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
     /// What [`TornDeleteStore::mutate_header_after_first_delete`] does to the
-    /// header when it fires (b.vn6 review round 1).
+    /// header when it fires (b.vn6 review round 1, b.g65 D.ii).
     ///
-    /// Three values because the pre-delete re-probe has three answers and each
-    /// one has a DIFFERENT disposition — spare-and-retire, defer-registered,
-    /// defer-registered-on-an-error — and a two-valued fixture could not tell
-    /// the second from the first.
+    /// Four values because the pre-delete re-probe has four answers that are
+    /// not one disposition — spare-and-retire (`Live`), defer-registered
+    /// (`Superseded` and `Unmapped`), defer-registered-on-an-error (`Poison`) —
+    /// and a fixture that planted only `seq` could not tell a restore from an
+    /// interrupted delete.
     #[derive(Clone, Copy, Debug)]
     enum HeaderMutation {
-        /// `HSET seq` — `DeadObjectLiveness::Live`, the DR restore that
-        /// resurrected this `object_id` while its reap was in flight.
+        /// `HSET seq session_id layer_name` and the layer mapping naming the
+        /// object — `DeadObjectLiveness::Live`, the DR restore that resurrected
+        /// this `object_id` while its reap was in flight (a restore only
+        /// restores an object its mapping names).
         Live,
+        /// `HSET seq session_id layer_name` with NO mapping —
+        /// `DeadObjectLiveness::LiveUnmapped`, a `DeleteLayer` whose teardown
+        /// has not finished (b.g65).
+        Unmapped,
         /// `HSET seq + superseded=1` — `DeadObjectLiveness::LiveSuperseded`, an
         /// overwrite whose `cleanup_old_object_retrying` UNLINK has not landed.
         Superseded,
@@ -18009,7 +19780,83 @@ mod reconcile_tests {
                 mutate_header_after_first_delete: std::sync::Mutex::new(None),
                 delete_log: std::sync::Mutex::new(Vec::new()),
                 sidecar_read_log: std::sync::Mutex::new(Vec::new()),
+                before_ext_delete: std::sync::Mutex::new(None),
+                ext_put_log: std::sync::Mutex::new(Vec::new()),
+                ext_put_observer: std::sync::Mutex::new(None),
+                refuse_object_deletes: std::sync::Mutex::new(std::collections::HashSet::new()),
+                announce_probe: std::sync::Mutex::new(None),
+                announced_at_delete: std::sync::Mutex::new(Vec::new()),
+                before_first_layer_delete: std::sync::Mutex::new(None),
+                fail_ext_puts: std::sync::atomic::AtomicBool::new(false),
+                refuse_ext_deletes: std::sync::Mutex::new(std::collections::HashSet::new()),
             })
+        }
+
+        /// Refuse every `delete_ext_blob` of `hashes` — see
+        /// [`Self::refuse_ext_deletes`].
+        fn refuse_ext_deletes_of<'h>(&self, hashes: impl IntoIterator<Item = &'h str>) {
+            self.refuse_ext_deletes
+                .lock()
+                .expect("refuse-ext-deletes mutex")
+                .extend(hashes.into_iter().map(str::to_owned));
+        }
+
+        /// Arm [`Self::before_first_layer_delete`].
+        fn before_first_layer_delete(&self, hook: LayerDeleteHook) {
+            *self
+                .before_first_layer_delete
+                .lock()
+                .expect("layer-delete hook mutex") = Some(hook);
+        }
+
+        /// Set [`Self::fail_ext_puts`].
+        fn set_fail_ext_puts(&self, on: bool) {
+            self.fail_ext_puts
+                .store(on, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Arm [`Self::announce_probe`].
+        fn probe_announcements(&self, client: &ValkeyClient, keys: &KeySchema) {
+            *self.announce_probe.lock().expect("announce-probe mutex") =
+                Some((client.clone(), keys.clone()));
+        }
+
+        /// `(object_id, snap_seq, announced)` per base delete, in call order.
+        fn announced_at_delete(&self) -> Vec<(u64, u64, bool)> {
+            self.announced_at_delete
+                .lock()
+                .expect("announced-at-delete mutex")
+                .clone()
+        }
+
+        /// Refuse every delete of `object_ids` — see
+        /// [`Self::refuse_object_deletes`].
+        fn refuse_deletes_of_objects(&self, object_ids: impl IntoIterator<Item = u64>) {
+            self.refuse_object_deletes
+                .lock()
+                .expect("refuse-objects mutex")
+                .extend(object_ids);
+        }
+
+        /// Arm [`Self::ext_put_observer`].
+        fn observe_ext_puts(&self, observer: ExtPutObserver) {
+            *self
+                .ext_put_observer
+                .lock()
+                .expect("ext-put observer mutex") = Some(observer);
+        }
+
+        /// Arm [`Self::before_ext_delete`].
+        fn before_ext_delete(&self, hook: ExtDeleteHook) {
+            *self
+                .before_ext_delete
+                .lock()
+                .expect("ext-delete hook mutex") = Some(hook);
+        }
+
+        /// Every hash `put_ext_blob` was called with, in call order.
+        fn ext_put_log(&self) -> Vec<String> {
+            self.ext_put_log.lock().expect("ext-put-log mutex").clone()
         }
 
         /// Arm the one-shot header mutation described on
@@ -18017,14 +19864,15 @@ mod reconcile_tests {
         fn mutate_header_after_first_delete(
             &self,
             client: &ValkeyClient,
-            header_key: &str,
+            keys: &KeySchema,
+            object_id: u64,
             how: HeaderMutation,
         ) {
             *self
                 .mutate_header_after_first_delete
                 .lock()
                 .expect("header-mutation mutex") =
-                Some((client.clone(), header_key.to_owned(), how));
+                Some((client.clone(), keys.clone(), object_id, how));
         }
 
         /// Tear the delete of `(sequence, kind)` — once — mid-way through the
@@ -18161,8 +20009,41 @@ mod reconcile_tests {
                 .lock()
                 .expect("delete-log mutex")
                 .push(entry);
+            let first_delete_hook = self
+                .before_first_layer_delete
+                .lock()
+                .expect("layer-delete hook mutex")
+                .take();
+            if let Some(hook) = first_delete_hook {
+                hook(handle.clone()).await;
+            }
+            let probe = self
+                .announce_probe
+                .lock()
+                .expect("announce-probe mutex")
+                .clone();
+            if let (Some((client, keys)), CheckpointKind::Base) = (probe, handle.kind) {
+                let score: Option<f64> = client
+                    .pool
+                    .zscore(
+                        keys.checkpoint_reconcile_deleting(),
+                        format!("{}.{}", handle.object_id, handle.snap_seq),
+                    )
+                    .await
+                    .expect("ZSCORE :deleting from inside the delete must succeed");
+                self.announced_at_delete
+                    .lock()
+                    .expect("announced-at-delete mutex")
+                    .push((handle.object_id, handle.snap_seq, score.is_some()));
+            }
 
-            if *self.refuse_delete_at.lock().expect("refuse mutex") == Some(entry) {
+            let refused_object = self
+                .refuse_object_deletes
+                .lock()
+                .expect("refuse-objects mutex")
+                .contains(&handle.object_id);
+            if refused_object || *self.refuse_delete_at.lock().expect("refuse mutex") == Some(entry)
+            {
                 return Err(CheckpointError::Transient {
                     source: format!(
                         "injected clean delete refusal for ({}, {}, {:?}) \
@@ -18197,15 +20078,38 @@ mod reconcile_tests {
                     .lock()
                     .expect("header-mutation mutex")
                     .take();
-                if let Some((client, key, how)) = armed {
+                if let Some((client, keys, object_id, how)) = armed {
+                    let key = keys.obj_header(&object_id.to_string());
+                    let (sid, layer) =
+                        super::reconcile_support::ReconcileHarness::identity_of(object_id);
                     match how {
-                        HeaderMutation::Live => {
-                            use fred::interfaces::HashesInterface;
+                        HeaderMutation::Live | HeaderMutation::Unmapped => {
+                            use fred::interfaces::{HashesInterface, KeysInterface};
                             let _: u64 = client
                                 .pool
-                                .hset(&key, vec![("seq", "1".to_string())])
+                                .hset(
+                                    &key,
+                                    vec![
+                                        ("seq", "1".to_string()),
+                                        ("session_id", sid.clone()),
+                                        ("layer_name", layer.clone()),
+                                    ],
+                                )
                                 .await
-                                .expect("resurrecting obj:hdr mid-reap must succeed");
+                                .expect("standing obj:hdr back up mid-reap must succeed");
+                            if matches!(how, HeaderMutation::Live) {
+                                let _: () = client
+                                    .pool
+                                    .set(
+                                        keys.layer_mapping(&sid, &layer),
+                                        object_id.to_string(),
+                                        None,
+                                        None,
+                                        false,
+                                    )
+                                    .await
+                                    .expect("mapping the resurrected object mid-reap must succeed");
+                            }
                         }
                         HeaderMutation::Superseded => {
                             use fred::interfaces::HashesInterface;
@@ -18259,6 +20163,24 @@ mod reconcile_tests {
         }
 
         async fn put_ext_blob(&self, hash_hex: &str, bytes: Bytes) -> Result<(), CheckpointError> {
+            self.ext_put_log
+                .lock()
+                .expect("ext-put-log mutex")
+                .push(hash_hex.to_owned());
+            let observer = self
+                .ext_put_observer
+                .lock()
+                .expect("ext-put observer mutex")
+                .clone();
+            if let Some(observe) = observer {
+                observe(hash_hex);
+            }
+            if self.fail_ext_puts.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(CheckpointError::Transient {
+                    source: "injected ext upload failure (TornDeleteStore::set_fail_ext_puts)"
+                        .into(),
+                });
+            }
             self.inner.put_ext_blob(hash_hex, bytes).await
         }
 
@@ -18270,7 +20192,33 @@ mod reconcile_tests {
             self.inner.ext_blob_exists(hash_hex).await
         }
 
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
+        }
+
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
+            let hook = self
+                .before_ext_delete
+                .lock()
+                .expect("ext-delete hook mutex")
+                .clone();
+            if let Some(hook) = hook {
+                hook(hash_hex.to_owned()).await;
+            }
+            if self
+                .refuse_ext_deletes
+                .lock()
+                .expect("refuse-ext-deletes mutex")
+                .contains(hash_hex)
+            {
+                return Err(CheckpointError::Transient {
+                    source: format!(
+                        "injected delete_ext_blob refusal for {hash_hex} \
+                         (TornDeleteStore::refuse_ext_deletes_of)"
+                    )
+                    .into(),
+                });
+            }
             self.inner.delete_ext_blob(hash_hex).await
         }
 
@@ -18439,7 +20387,7 @@ mod reconcile_tests {
         assert!(
             torn.delete_log().is_empty(),
             "nothing is double-deleted: the member is not in the candidate set, so the pass \
-             takes the retire arm BEFORE the lease re-proof and the destructive step. A pass \
+             takes the retire arm BEFORE the orphan commit and the destructive step. A pass \
              that acted anyway would synthesize a Tail handle at (150, 12) and issue a delete \
              against a stem retention already removed — harmless on an idempotent adapter, and \
              indistinguishable from the reap of a live generation on one that raced a re-publish"
@@ -19056,6 +21004,9 @@ mod reconcile_tests {
         );
 
         // ── Tick 1: the production call site registers and DEFERS ─────────
+        // A current build leads backups, so the clean-up gate lets the pass
+        // run (b.g65, N5).
+        h.plant_current_build_checkpoint_leader().await;
         h.leader_tick(&store).await;
         assert_eq!(
             h.orphan_candidates().await,
@@ -19131,7 +21082,7 @@ mod reconcile_tests {
         f.plant_orphan(5, 1, &["aa11"]).await;
         // A tombstone from an earlier prune, waiting to be collected.
         h.sink()
-            .record(vec!["dd44".to_string()])
+            .record(&[], vec!["dd44".to_string()])
             .await
             .expect("seeding a tombstone must succeed");
         h.pin_aged(&h.tomb_key(), &["dd44"]).await;
@@ -19403,72 +21354,282 @@ mod reconcile_tests {
         );
     }
 
-    /// A peer owns the leader lock by the time the orphan enumeration returns →
-    /// the pass stops **before registering anything**, let alone deleting.
+    /// An older build takes `le:checkpoint:leader` WHILE the orphan
+    /// enumeration runs → the clean-up gate stops the orphan drain at its
+    /// FIRST claim (b.g65, N5): nothing is registered, claimed or deleted, and
+    /// `orphan_deferred` counts 0.
     ///
-    /// The re-acquire exists because the enumeration is a single opaque adapter
-    /// call that can outlive the lock's TTL on its own, so the lease this
-    /// replica proved at the top of the tick means nothing by the time the call
-    /// comes back. Both outcomes of re-proving it matter and only one was
-    /// covered: `Held` is every other test in this module, `Lost` is this one.
+    /// The pass-start gate ran before the enumeration, which can take up to
+    /// half the pass budget; an older build's backup writers do not re-arm
+    /// before their PUTs, so an orphan reap licensed while one leads backups is
+    /// exactly what the gate exists to exclude. A gate skipped on the first
+    /// claim — because the pass-start probe "already ran" — would register the
+    /// fresh candidate and reap the aged one here.
     ///
-    /// The failure it guards is two replicas deleting concurrently. The pass
-    /// deletes generations and ext blobs, which is why it shares the *same*
-    /// lock as the destructive per-layer tick rather than taking one of its
-    /// own; a `Lost` that fell through to the act loop would be the exact
-    /// double-deletion window that arrangement exists to close.
-    ///
-    /// Registration is included in what must not happen. A `Lost` replica that
-    /// registered candidates would date them on its own observation, and the
-    /// real leader would then find members whose first-observed stamp came from
-    /// a pass that never looked at anything it acted on.
+    /// The candidates are not registered because the registrations ride the
+    /// first claim that lands, and none did; so none counts as deferred — a
+    /// count of every candidate would claim leftovers this pass never
+    /// registered. The pinned member is untouched for the next pass.
     #[tokio::test]
-    async fn orphan_phase_stops_when_the_lease_is_lost_at_the_post_enumeration_reacquire() {
+    async fn orphan_phase_stops_at_its_first_claim_when_an_older_build_takes_the_backup_lock_during_the_enumeration(
+    ) {
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
         f.plant_orphan(5, 1, &["aa11"]).await;
-        // Pinned aged, so the ONLY thing between this pass and a deletion is
-        // the re-acquire under test.
+        f.plant_orphan(6, 1, &["bb22"]).await;
+        // `5.1` is pinned aged, so the gate is the only thing between this
+        // pass and its reap; `6.1` is fresh, so the first claim would register
+        // it.
         h.pin_aged(&h.orphans_key(), &["5.1"]).await;
-        h.plant_peer_leader_lock().await;
+        let store =
+            HookedEnumerationStore::wrap_peer_claims_lock_during_layer_artifacts(&f.store, &h);
 
-        h.reconcile(&f.store, ACT_GRACE).await;
+        h.reconcile(&store, ACT_GRACE).await;
 
         assert_eq!(
             h.orphan_candidates().await,
             vec!["5.1".to_string()],
-            "the pinned candidate must still be there, un-retired — and nothing new registered \
-             beside it. A replica that has lost the lock does not get to date observations"
+            "the pinned member stays, un-retired, and the fresh candidate is NOT registered: the \
+             first claim, which carries the registrations, never ran"
         );
         assert!(
             f.exists("5.1.ext-refs.json") && f.exists("5.1.meta.json"),
-            "and nothing is deleted: the pass shares one lock with the destructive per-layer \
-             tick precisely so two replicas never delete concurrently"
+            "and nothing is deleted while an older build leads backups"
         );
+        assert_eq!(h.reconcile_counter("orphan_deleted"), 0);
+        assert_eq!(h.reconcile_counter("ext_tombstoned"), 0);
+        assert_eq!(
+            h.reconcile_counter("orphan_deferred"),
+            0,
+            "nothing was registered, so nothing is counted as registered-but-not-acted-on"
+        );
+        assert_eq!(
+            h.reconcile_counter("deferred_older_build"),
+            1,
+            "the gate counts the skipped pass once"
+        );
+        assert_eq!(
+            h.lease_counter("lost"),
+            0,
+            "and no lease is involved: the clean-up holds none"
+        );
+    }
+
+    /// The orphan drain's FIRST claim fails → `orphan_deferred` counts 0
+    /// (b.g65): the registrations ride the first claim that lands, so a pass
+    /// whose first claim errored registered nothing, and counting every
+    /// candidate as deferred would report leftovers that do not exist.
+    ///
+    /// The failure is a real `WRONGTYPE`: `le:ckpt:{recon}:orphans` holds a
+    /// string, so the claim script's first `ZADD` fails.
+    ///
+    /// Positive control: the drain was reached and its claim is what failed
+    /// (the claim-failure WARN), the gate stayed open (`deferred_older_build`
+    /// 0), and the pass went on past the orphan phase (its collect deleted an
+    /// aged, unreferenced value). Without it, `orphan_deferred == 0` would
+    /// also hold for a pass that ended before the orphan drain.
+    #[tokio::test]
+    async fn an_orphan_drain_whose_first_claim_fails_counts_nothing_deferred() {
+        const COLLECTED: &str = "c1a1f0";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(COLLECTED, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.pin_aged(&h.tomb_key(), &[COLLECTED]).await;
+        let _: () =
+            h.tv.client()
+                .pool
+                .set(h.orphans_key(), "not-a-zset", None, None, false)
+                .await
+                .expect("poisoning the orphan key must succeed");
+
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile(&f.store, ACT_GRACE)).await;
+
+        assert!(
+            warns.contains("orphan claim failed"),
+            "the drain was reached and its claim failed; got:\n{warns}"
+        );
+        assert_eq!(h.reconcile_counter("deferred_older_build"), 0);
+        assert_eq!(
+            h.reconcile_counter("ext_collected"),
+            1,
+            "the pass went on to its collect phase"
+        );
+        assert_eq!(
+            h.reconcile_counter("orphan_deferred"),
+            0,
+            "the first claim failed, so this pass registered nothing"
+        );
+        assert_eq!(h.reconcile_counter("orphan_deleted"), 0);
+        assert!(f.exists("5.1.ext-refs.json"), "and nothing is deleted");
+    }
+
+    /// **N3 at the pass (b.g65):** a stem re-published between the orphan
+    /// claim and its commit is not reaped, and the re-put generation survives
+    /// intact. Two orphans are claimed in one batch; while the first (`5.1`)
+    /// is being reaped, a writer re-publishes the second stem (`6.1`) through
+    /// the production publish path, whose re-arm removes `6.1` from
+    /// `:orphans`. The second member's commit then finds it gone and is
+    /// refused: nothing of `6.1` is read or deleted, the member is retired,
+    /// and the generation reads back as the writer put it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_orphan_republished_between_its_claim_and_its_commit_is_not_reaped() {
+        const REPUBLISHED: &[u8] = b"the re-published generation";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        f.plant_orphan(6, 1, &["bb22"]).await;
+        h.pin_aged(&h.orphans_key(), &["5.1", "6.1"]).await;
+        // The re-publish's liveness probe must read object 6 as live.
+        h.set_header_resurrected(6, 1).await;
+        let (torn, store) = f.torn();
+        {
+            let (client, keys, inner) = (
+                h.tv.client().clone(),
+                h.tv.key_schema().clone(),
+                Arc::clone(&f.store),
+            );
+            torn.before_first_layer_delete(Arc::new(move |handle: CheckpointHandle| {
+                let (client, keys, inner) = (client.clone(), keys.clone(), Arc::clone(&inner));
+                Box::pin(async move {
+                    assert_eq!(handle.object_id, 5, "fixture: 5.1 is reaped first");
+                    let written = crate::checkpoint::put_guard::put_layer_checkpoint_if_live(
+                        Some(crate::checkpoint::put_guard::ObjectLivenessProbe::new(
+                            &client, &keys,
+                        )),
+                        inner.as_ref(),
+                        6,
+                        1,
+                        Bytes::from_static(REPUBLISHED),
+                        meta_with_sidecar(1, &["bb22"]),
+                        Instant::now(),
+                        "test re-publish",
+                    )
+                    .await
+                    .expect("the re-publish lands");
+                    assert!(written.is_some(), "fixture: the re-publish was written");
+                })
+            }));
+        }
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            h.reconcile_counter("orphan_deleted"),
+            1,
+            "5.1, reaped before the re-publish, stays reaped"
+        );
+        assert!(!f.exists("5.1.ext-refs.json") && !f.exists("5.1.meta.json"));
+        assert_eq!(
+            torn.delete_log.lock().expect("delete-log mutex").len(),
+            1,
+            "the one delete is 5.1's: nothing of 6.1 is deleted"
+        );
+        assert_eq!(
+            torn.sidecar_read_log
+                .lock()
+                .expect("sidecar-read-log mutex")
+                .len(),
+            1,
+            "and only 5.1's sidecar was read"
+        );
+        let handles = store
+            .list_layer_checkpoints(6)
+            .await
+            .expect("list_layer_checkpoints");
+        assert_eq!(handles.len(), 1, "the re-put generation is listed");
+        let blob = store
+            .get_layer_checkpoint(&handles[0])
+            .await
+            .expect("get_layer_checkpoint")
+            .expect("the re-put generation reads back");
+        assert_eq!(
+            blob.bytes.as_ref(),
+            REPUBLISHED,
+            "intact, as the writer put it"
+        );
+        assert!(
+            h.orphan_candidates().await.is_empty(),
+            "both members are retired"
+        );
+    }
+
+    /// The orphan commit FAILS (b.g65, N3): the candidate stays registered and
+    /// nothing is read or deleted. The failure is a real `WRONGTYPE`:
+    /// `le:ckpt:{recon}:deleting` holds a string, so the commit's announcement
+    /// `ZADD` fails after its `:orphans` read succeeds.
+    #[tokio::test]
+    async fn an_orphan_whose_commit_fails_stays_registered_and_nothing_is_read_or_deleted() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        h.pin_aged(&h.orphans_key(), &["5.1"]).await;
+        let _: () =
+            h.tv.client()
+                .pool
+                .set(
+                    h.tv.key_schema().checkpoint_reconcile_deleting(),
+                    "not-a-zset",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("poisoning :deleting must succeed");
+        let (torn, store) = f.torn();
+
+        let ((), warns) = super::tick_support::capture_warns(h.reconcile(&store, ACT_GRACE)).await;
+
+        assert!(
+            warns.contains("could not license an orphan's reap"),
+            "the commit was reached and failed; got:\n{warns}"
+        );
+        assert_eq!(
+            h.orphan_candidates().await,
+            vec!["5.1".to_string()],
+            "the candidate stays registered for the next pass"
+        );
+        assert!(
+            torn.sidecar_read_log
+                .lock()
+                .expect("sidecar-read-log mutex")
+                .is_empty(),
+            "nothing is read"
+        );
+        assert!(
+            torn.delete_log.lock().expect("delete-log mutex").is_empty(),
+            "nothing is deleted"
+        );
+        assert!(f.exists("5.1.ext-refs.json") && f.exists("5.1.meta.json"));
         assert_eq!(h.reconcile_counter("orphan_deleted"), 0);
         assert_eq!(h.reconcile_counter("ext_tombstoned"), 0);
     }
 
-    /// Same arm, collect phase: a peer owns the lock by the time the live-set
-    /// read returns → no blob is deleted and no tombstone is retired.
+    /// An older build takes `le:checkpoint:leader` WHILE the collect's
+    /// live-set walk runs → the clean-up gate stops the collect at its FIRST
+    /// batch (b.g65, N5): no blob is deleted and no tombstone retired.
     ///
-    /// The collect's re-acquire guards the longer read of the two (a LIST plus
-    /// one GET per sidecar in the fleet) and the more dangerous act: the
-    /// tombstones it retires are claims, and retiring one without acting on it
-    /// drops the record permanently.
+    /// The collect's phase-start gate ran before its claim, its clock read and
+    /// the walk — the longest read in the pass. An older build's backup writers
+    /// do not re-arm before their PUTs, so a delete licensed while one leads
+    /// backups would not be covered by the writer fence. A gate skipped on the
+    /// first batch would delete `dd44`, which no sidecar names, here.
     ///
     /// # Reaching the subject
     ///
-    /// The peer claims the lock **inside** the live-set walk
-    /// ([`HookedEnumerationStore::wrap_peer_claims_lock_during_live_set_walk`]).
-    /// A lock planted before the pass would be found by the orphan phase's
-    /// post-enumeration re-acquire, which ends the pass before the collect
-    /// starts. The store is populated and its one sidecar is readable, so the
-    /// live set is non-empty and read without error, and the post-read
-    /// re-acquire is the only thing between this pass and deleting `dd44`,
-    /// which no sidecar names.
+    /// The holder flips **inside** the live-set walk
+    /// ([`HookedEnumerationStore::wrap_peer_claims_lock_during_live_set_walk`]),
+    /// after every earlier gate probe of the pass. The store is populated and
+    /// its one sidecar is readable, so the live set is non-empty and read
+    /// without error.
     #[tokio::test]
-    async fn collect_phase_stops_when_the_lease_is_lost_at_the_post_read_reacquire() {
+    async fn collect_phase_stops_at_its_first_batch_when_an_older_build_takes_the_backup_lock_during_the_walk(
+    ) {
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
         seed_unrelated_live_backup(&*f.store).await;
@@ -19477,13 +21638,12 @@ mod reconcile_tests {
             .await
             .expect("put_ext_blob");
         h.sink()
-            .record(vec!["dd44".to_string()])
+            .record(&[], vec!["dd44".to_string()])
             .await
             .expect("seeding a tombstone must succeed");
         h.age_out_zset_members(&h.tomb_key()).await;
         let store =
             HookedEnumerationStore::wrap_peer_claims_lock_during_live_set_walk(&f.store, &h);
-        let lost_before = h.lease_counter("lost");
 
         h.reconcile(&store, ACT_GRACE).await;
 
@@ -19499,21 +21659,434 @@ mod reconcile_tests {
                 .await
                 .expect("get_ext_blob")
                 .is_some(),
-            "and the bytes must survive — a lost lease means a peer may be mid-publish against \
-             the very generation this pass would have deleted against"
+            "and the bytes must survive — an older build's writers may be publishing a backup \
+             that names this value without re-arming it"
         );
         assert_eq!(h.reconcile_counter("ext_collected"), 0);
         assert_eq!(h.reconcile_counter("ext_spared"), 0);
         assert_eq!(
             h.reconcile_counter("live_set_failed"),
             0,
-            "the live-set read succeeded; the pass ended on the lease, not on the read"
+            "the live-set read succeeded; the pass ended on the gate, not on the read"
+        );
+        assert_eq!(h.reconcile_counter("deferred_older_build"), 1);
+        assert!(
+            h.last_summary().deferred_older_build,
+            "and the pass summary says why it stopped"
+        );
+    }
+
+    /// One reading of `le:gc:leader` taken during a pass: where it was taken,
+    /// the key's `PTTL` in ms, and its value.
+    type GcLockReading = (&'static str, i64, Option<String>);
+
+    /// `le:gc:leader`'s remaining TTL (`PTTL`, ms) and value, read off the
+    /// side of the pass.
+    async fn gc_lock_state(client: &ValkeyClient, keys: &KeySchema) -> (i64, Option<String>) {
+        let key = keys.gc_leader_lock();
+        let pttl: i64 = client.pool.pttl(&key).await.expect("PTTL le:gc:leader");
+        let value: Option<String> = client.pool.get(&key).await.expect("GET le:gc:leader");
+        (pttl, value)
+    }
+
+    /// The clean-up gate's mid-pass checks READ `le:gc:leader` and never
+    /// refresh it (b.g65, doc review #3(b)). The lock is taken and refreshed
+    /// only by the tick's acquire before a pass; during the pass only the GC
+    /// task's progress-gated ticker keeps it, so a replica whose GC loop died
+    /// or wedged loses the key on schedule and its clean-up pass ends. A gate
+    /// that refreshed on every check would keep the key alive for as long as
+    /// the pass ran, and a peer could not take it over.
+    ///
+    /// # Reaching the subject
+    ///
+    /// The harness acquires the lock (full TTL) before the pass, as the tick
+    /// does. Inside the orphan enumeration — after the pass-start gate, before
+    /// every later check — the test shortens the key's TTL to [`SHORT_MS`].
+    /// The checks that follow (the orphan drain's first claim, the dead phase's
+    /// start, the collect's start and its first batch) all pass, because the
+    /// value is this replica's: the orphan is reaped and three tombstoned
+    /// values collected. The TTL is read inside the live-set walk, before each
+    /// collect delete and after the pass, and must never rise above the
+    /// shortened value or go back up between readings; the value must stay
+    /// this replica's throughout. A refresh at any of those checks sets the
+    /// TTL back to the full `LEADER_LOCK_TTL_MS` (30 s), far above
+    /// [`SHORT_MS`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_gate_reads_the_maintenance_lock_mid_pass_and_never_refreshes_it() {
+        /// The TTL the test shortens the key to: well under the 30 s a refresh
+        /// writes, and well over any pass this test runs, so the key never
+        /// lapses on its own.
+        const SHORT_MS: i64 = 12_000;
+        const COLLECTED: [&str; 3] = ["c0aa01", "c0aa02", "c0aa03"];
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client().clone(), h.tv.key_schema().clone());
+        let own = super::reconcile_support::harness_leader().gc_lock_value();
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        h.pin_aged(&h.orphans_key(), &["5.1"]).await;
+        seed_unrelated_live_backup(&*f.store).await;
+        for hash in COLLECTED {
+            f.store
+                .put_ext_blob(hash, Bytes::from_static(b"bytes"))
+                .await
+                .expect("put_ext_blob");
+        }
+        h.sink()
+            .record(&[], COLLECTED.iter().map(|s| (*s).to_string()).collect())
+            .await
+            .expect("seeding the tombstones must succeed");
+        h.age_out_zset_members(&h.tomb_key()).await;
+
+        let readings: Arc<std::sync::Mutex<Vec<GcLockReading>>> = Arc::default();
+        let record = {
+            let (client, keys, readings) = (client.clone(), keys.clone(), Arc::clone(&readings));
+            move |at: &'static str| {
+                let (client, keys, readings) =
+                    (client.clone(), keys.clone(), Arc::clone(&readings));
+                async move {
+                    let (pttl, value) = gc_lock_state(&client, &keys).await;
+                    readings
+                        .lock()
+                        .expect("readings mutex")
+                        .push((at, pttl, value));
+                }
+            }
+        };
+        let (torn, torn_store) = f.torn();
+        {
+            let record = record.clone();
+            torn.before_ext_delete(Arc::new(move |_hash: String| {
+                let record = record.clone();
+                Box::pin(async move { record("before a collect delete").await })
+            }));
+        }
+        let walked = {
+            let record = record.clone();
+            HookedEnumerationStore::wrap_on_live_set_walk(
+                &torn_store,
+                Arc::new(move || {
+                    let record = record.clone();
+                    Box::pin(async move { record("in the live-set walk").await })
+                }),
+            )
+        };
+        let store = {
+            let (client, keys, record) = (client.clone(), keys.clone(), record.clone());
+            HookedEnumerationStore::wrap_on_layer_artifacts(
+                &walked,
+                Arc::new(move || {
+                    let (client, keys, record) = (client.clone(), keys.clone(), record.clone());
+                    Box::pin(async move {
+                        let shortened: bool = client
+                            .pool
+                            .pexpire(keys.gc_leader_lock(), SHORT_MS, None)
+                            .await
+                            .expect("PEXPIRE le:gc:leader");
+                        assert!(shortened, "fixture: the harness's acquire took the key");
+                        record("after the shortening").await;
+                    })
+                }),
+            )
+        };
+
+        h.reconcile(&store, ACT_GRACE).await;
+        record("after the pass").await;
+
+        assert_eq!(
+            h.reconcile_counter("orphan_deleted"),
+            1,
+            "non-vacuity: the gate let the orphan drain run after the shortening"
         );
         assert_eq!(
-            h.lease_counter("lost") - lost_before,
-            1,
-            "and the loss is counted, at the post-read re-acquire"
+            h.reconcile_counter("ext_collected"),
+            COLLECTED.len() as u64,
+            "non-vacuity: the gate let the collect's first batch run after the shortening"
         );
+        let readings = readings.lock().expect("readings mutex").clone();
+        let places: Vec<&str> = readings.iter().map(|(at, _, _)| *at).collect();
+        assert_eq!(
+            places,
+            vec![
+                "after the shortening",
+                "in the live-set walk",
+                "before a collect delete",
+                "before a collect delete",
+                "before a collect delete",
+                "after the pass",
+            ],
+            "fixture: every reading was taken where the test placed it"
+        );
+        for (at, pttl, value) in &readings {
+            assert_eq!(
+                value.as_deref(),
+                Some(own.as_str()),
+                "{at}: the gate never writes le:gc:leader, so it still holds this replica's \
+                 value: {readings:?}"
+            );
+            assert!(
+                *pttl > 0 && *pttl <= SHORT_MS,
+                "{at}: le:gc:leader's TTL is {pttl} ms, above the {SHORT_MS} ms the test \
+                 shortened it to — a gate check refreshed the lock mid-pass: {readings:?}"
+            );
+        }
+        for pair in readings.windows(2) {
+            assert!(
+                pair[1].1 <= pair[0].1,
+                "le:gc:leader's TTL went back up between {:?} and {:?}: a gate check refreshed \
+                 it: {readings:?}",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// How [`gate_ends_the_pass_on_a_mid_pass_gc_lock_change`] changes one of
+    /// the gate's two locks mid-pass.
+    #[derive(Clone, Copy, Debug)]
+    enum MidPassGcLock {
+        /// A peer's marked value on `le:gc:leader` with a full TTL: another
+        /// replica holds the lock.
+        Peer,
+        /// `le:gc:leader` is gone: the lock lapsed and nobody holds it.
+        Lapsed,
+        /// `le:gc:leader` is a hash, so the gate's `GET` fails with a real
+        /// `WRONGTYPE`: the read errors.
+        Unreadable,
+        /// `le:checkpoint:leader` is a hash, so the gate's second read — which
+        /// build leads backups — fails with a real `WRONGTYPE`. The pass ends
+        /// with a WARN, and the stop is NOT counted as an older build leading
+        /// backups.
+        BackupLockUnreadable,
+    }
+
+    impl MidPassGcLock {
+        /// The WARN the gate logs when this change closes it; `None` for the
+        /// changes it reports at INFO.
+        fn warn(self) -> Option<&'static str> {
+            match self {
+                Self::Peer | Self::Lapsed => None,
+                Self::Unreadable => Some("could not re-probe the maintenance leader lock"),
+                Self::BackupLockUnreadable => Some("could not read which build leads backups"),
+            }
+        }
+    }
+
+    /// The peer value [`MidPassGcLock::Peer`] plants.
+    fn gc_peer_value() -> String {
+        LeaderIdentity::new("gc-peer-replica", "gc-peer").gc_lock_value()
+    }
+
+    /// The gate ends the pass at its next check once `le:gc:leader` no longer
+    /// holds this replica's value or cannot be read, or `le:checkpoint:leader`
+    /// cannot be read: nothing is deleted after the change, what the pass
+    /// finished before it stays done, the gate writes nothing to the key, and
+    /// the next pass that holds the lock does the rest. The read errors end
+    /// the pass with a WARN.
+    ///
+    /// The change lands inside the collect's live-set walk: after the orphan
+    /// phase has reaped `5.1` (before the change) and before the collect's
+    /// first batch, whose gate check must close. `dd44`, tombstoned and named
+    /// by no backup, survives with its bytes. It is not an older build leading
+    /// backups, so `deferred_older_build` stays 0. Then the key is cleared and
+    /// a second pass, with the harness's acquire, collects `dd44`: the first
+    /// pass stopped on the gate, not on anything about the fixture.
+    async fn gate_ends_the_pass_on_a_mid_pass_gc_lock_change(change: MidPassGcLock) {
+        use fred::interfaces::HashesInterface;
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client().clone(), h.tv.key_schema().clone());
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        h.pin_aged(&h.orphans_key(), &["5.1"]).await;
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob("dd44", Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.sink()
+            .record(&[], vec!["dd44".to_string()])
+            .await
+            .expect("seeding a tombstone must succeed");
+        h.age_out_zset_members(&h.tomb_key()).await;
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let store = {
+            let (client, keys, fired) = (client.clone(), keys.clone(), Arc::clone(&fired));
+            HookedEnumerationStore::wrap_on_live_set_walk(
+                &f.store,
+                Arc::new(move || {
+                    let (client, keys, fired) = (client.clone(), keys.clone(), Arc::clone(&fired));
+                    Box::pin(async move {
+                        if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        let key = keys.gc_leader_lock();
+                        match change {
+                            MidPassGcLock::Peer => {
+                                let _: () = client
+                                    .pool
+                                    .set(
+                                        &key,
+                                        gc_peer_value(),
+                                        Some(fred::types::Expiration::PX(30_000)),
+                                        None,
+                                        false,
+                                    )
+                                    .await
+                                    .expect("planting the peer's le:gc:leader");
+                            }
+                            MidPassGcLock::Lapsed => {
+                                let _: u64 = client.pool.del(&key).await.expect("DEL le:gc:leader");
+                            }
+                            MidPassGcLock::Unreadable => {
+                                let _: u64 = client.pool.del(&key).await.expect("DEL le:gc:leader");
+                                let _: u64 = client
+                                    .pool
+                                    .hset(&key, vec![("not", "a-string")])
+                                    .await
+                                    .expect("HSET le:gc:leader");
+                            }
+                            MidPassGcLock::BackupLockUnreadable => {
+                                let key = keys.checkpoint_leader_lock();
+                                let _: u64 = client
+                                    .pool
+                                    .del(&key)
+                                    .await
+                                    .expect("DEL le:checkpoint:leader");
+                                let _: u64 = client
+                                    .pool
+                                    .hset(&key, vec![("not", "a-string")])
+                                    .await
+                                    .expect("HSET le:checkpoint:leader");
+                            }
+                        }
+                    })
+                }),
+            )
+        };
+
+        let ((), warns) = super::tick_support::capture_warns(h.reconcile(&store, ACT_GRACE)).await;
+
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "fixture: the change landed inside the walk"
+        );
+        if let Some(warn) = change.warn() {
+            assert!(
+                warns.contains(warn),
+                "{change:?}: the gate ends the pass with its WARN ({warn:?}); got:\n{warns}"
+            );
+        }
+        assert_eq!(
+            h.reconcile_counter("orphan_deleted"),
+            1,
+            "{change:?}: the orphan reaped before the change stays reaped"
+        );
+        assert!(!f.exists("5.1.ext-refs.json") && !f.exists("5.1.meta.json"));
+        assert_eq!(
+            h.tombstones().await,
+            vec!["aa11".to_string(), "dd44".to_string()],
+            "{change:?}: dd44's tombstone survives un-retired (aa11's is the orphan reap's)"
+        );
+        assert!(
+            f.store
+                .get_ext_blob("dd44")
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "{change:?}: nothing is deleted after the change"
+        );
+        assert_eq!(h.reconcile_counter("ext_collected"), 0, "{change:?}");
+        assert_eq!(
+            h.reconcile_counter("live_set_failed"),
+            0,
+            "{change:?}: the walk read fine; the pass ended on the gate"
+        );
+        assert_eq!(
+            h.reconcile_counter("deferred_older_build"),
+            0,
+            "{change:?}: this change is not an older build leading backups"
+        );
+        assert!(!h.last_summary().deferred_older_build, "{change:?}");
+        let key = keys.gc_leader_lock();
+        match change {
+            MidPassGcLock::Peer => {
+                let value: Option<String> = client.pool.get(&key).await.expect("GET");
+                assert_eq!(
+                    value,
+                    Some(gc_peer_value()),
+                    "the gate leaves the peer's lock alone"
+                );
+            }
+            MidPassGcLock::Lapsed => {
+                let n: u64 = client.pool.exists(&key).await.expect("EXISTS");
+                assert_eq!(
+                    n, 0,
+                    "the gate does not take a lapsed lock mid-pass: only the tick's acquire \
+                     before a pass takes it"
+                );
+            }
+            MidPassGcLock::Unreadable => {
+                let kind: String = client.pool.r#type(&key).await.expect("TYPE");
+                assert_eq!(kind, "hash", "the gate wrote nothing to the key");
+            }
+            MidPassGcLock::BackupLockUnreadable => {
+                let kind: String = client
+                    .pool
+                    .r#type(keys.checkpoint_leader_lock())
+                    .await
+                    .expect("TYPE");
+                assert_eq!(kind, "hash", "the gate wrote nothing to the backup lock");
+            }
+        }
+
+        let _: u64 = client.pool.del(&key).await.expect("DEL le:gc:leader");
+        // The harness plants a current build's backup lock again when none is
+        // planted.
+        let _: u64 = client
+            .pool
+            .del(keys.checkpoint_leader_lock())
+            .await
+            .expect("DEL le:checkpoint:leader");
+        h.age_out_zset_members(&h.tomb_key()).await;
+        h.reconcile(&store, ACT_GRACE).await;
+        assert!(
+            f.store
+                .get_ext_blob("dd44")
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "{change:?}: the next pass that holds the lock collects dd44, so the first pass \
+             stopped on the gate"
+        );
+    }
+
+    /// Another replica's value on `le:gc:leader` mid-pass ends the pass — see
+    /// [`gate_ends_the_pass_on_a_mid_pass_gc_lock_change`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_gate_ends_the_pass_when_a_peer_holds_the_maintenance_lock_mid_pass() {
+        gate_ends_the_pass_on_a_mid_pass_gc_lock_change(MidPassGcLock::Peer).await;
+    }
+
+    /// `le:gc:leader` absent mid-pass ends the pass, and the gate does not
+    /// take the lapsed lock — see
+    /// [`gate_ends_the_pass_on_a_mid_pass_gc_lock_change`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_gate_ends_the_pass_when_the_maintenance_lock_lapses_mid_pass() {
+        gate_ends_the_pass_on_a_mid_pass_gc_lock_change(MidPassGcLock::Lapsed).await;
+    }
+
+    /// A failed read of `le:gc:leader` mid-pass (a real `WRONGTYPE`) ends the
+    /// pass — see [`gate_ends_the_pass_on_a_mid_pass_gc_lock_change`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_gate_ends_the_pass_when_its_maintenance_lock_read_fails_mid_pass() {
+        gate_ends_the_pass_on_a_mid_pass_gc_lock_change(MidPassGcLock::Unreadable).await;
+    }
+
+    /// A failed read of `le:checkpoint:leader` mid-pass (a real `WRONGTYPE`)
+    /// ends the pass with a WARN and does not count `deferred_older_build` —
+    /// see [`gate_ends_the_pass_on_a_mid_pass_gc_lock_change`].
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_cleanup_gate_ends_the_pass_when_its_backup_lock_read_fails_mid_pass() {
+        gate_ends_the_pass_on_a_mid_pass_gc_lock_change(MidPassGcLock::BackupLockUnreadable).await;
     }
 
     // ── The preemptive enumeration bounds (b.gg7 review round 2) ─────────
@@ -19528,6 +22101,10 @@ mod reconcile_tests {
     // adapter these bounds exist for, since the pathology being bounded is a
     // remote namespace walk that keeps answering slowly.
 
+    /// The action an enumeration hook runs — see [`EnumerationHook::OnLiveSetWalk`]
+    /// and [`EnumerationHook::OnLayerArtifacts`].
+    type LiveSetWalkAction = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
     /// Which phase-opening enumeration a [`EnumerationHook::Stall`] hangs in.
     #[derive(Clone, Copy)]
     enum StalledEnumeration {
@@ -19539,23 +22116,36 @@ mod reconcile_tests {
     }
 
     /// What [`HookedEnumerationStore`] does before delegating a phase-opening
-    /// enumeration.
+    /// enumeration, a per-object listing or a sidecar read, or after a
+    /// generation delete.
     enum EnumerationHook {
         /// That enumeration never answers: it sleeps
         /// [`HookedEnumerationStore::STALL`] first.
         Stall(StalledEnumeration),
-        /// The collect's live-set walk first plants a peer's claim on
+        /// The collect's live-set walk first plants a peer's unmarked claim on
         /// `le:checkpoint:leader` ([`plant_peer_leader_lock_on`]), then answers
-        /// normally. It stands in for the routine race the collect's lease
-        /// re-acquires exist for: the walk does not renew the 30 s lease, so on
-        /// a large store a peer claims the lock mid-walk, and that peer's
-        /// retention prune deletes sidecars the walk listed. The race itself is
-        /// nondeterministic; this places the claim inside the walk, after every
-        /// earlier lease re-acquire of the pass.
+        /// normally. It stands in for an older build taking the backup lock
+        /// during the walk — the longest read in the pass — which the clean-up
+        /// gate must see at the collect's first batch (b.g65, N5). The race
+        /// itself is nondeterministic; this places the flip inside the walk,
+        /// after every earlier gate probe of the pass.
         PeerClaimsLockDuringLiveSetWalk {
             client: Box<ValkeyClient>,
             lock_key: String,
         },
+        /// The same flip inside the orphan phase's `list_layer_artifacts`,
+        /// after the pass-start gate and before the orphan drain's first claim.
+        PeerClaimsLockDuringLayerArtifacts {
+            client: Box<ValkeyClient>,
+            lock_key: String,
+        },
+        /// Run an arbitrary action inside the live-set walk, before the inner
+        /// walk — i.e. after the collect's claim and its snapshot clock read.
+        OnLiveSetWalk(LiveSetWalkAction),
+        /// Run an arbitrary action inside the orphan phase's
+        /// `list_layer_artifacts`, before the inner enumeration — i.e. after
+        /// the pass-start gate and before every later gate check of the pass.
+        OnLayerArtifacts(LiveSetWalkAction),
         /// `list_layer_checkpoints(object_id)` answers `Ok(vec![])` whatever
         /// the inner store holds; every other call, the step-(a)
         /// `list_layer_artifacts` included, answers from the inner store. It
@@ -19563,6 +22153,21 @@ mod reconcile_tests {
         /// stale (a cached or lagging not-found) while the pass's own
         /// enumeration named the object's generation (b.oya, PD-F1b).
         ObjectListingAnswersEmpty { object_id: u64 },
+        /// Run an arbitrary action inside every per-object
+        /// `list_layer_checkpoints`, before the inner listing — the
+        /// dead-object phase's listing of a member's generations.
+        OnObjectListing(LiveSetWalkAction),
+        /// Run an arbitrary action inside every `read_ext_refs_sidecar`,
+        /// before the inner read.
+        OnSidecarRead(LiveSetWalkAction),
+        /// Run an arbitrary action once the `nth` `delete_layer_checkpoint`
+        /// (counting from 1) has landed on the inner store, before the call
+        /// returns.
+        AfterNthDelete {
+            nth: usize,
+            deletes: std::sync::atomic::AtomicUsize,
+            action: LiveSetWalkAction,
+        },
     }
 
     /// A `CheckpointStore` that delegates everything to a real inner store,
@@ -19608,6 +22213,45 @@ mod reconcile_tests {
             })
         }
 
+        /// Run `action` inside the live-set walk — see
+        /// [`EnumerationHook::OnLiveSetWalk`].
+        fn wrap_on_live_set_walk(
+            inner: &Arc<dyn CheckpointStore>,
+            action: LiveSetWalkAction,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::OnLiveSetWalk(action),
+            })
+        }
+
+        /// Run `action` inside the orphan enumeration — see
+        /// [`EnumerationHook::OnLayerArtifacts`].
+        fn wrap_on_layer_artifacts(
+            inner: &Arc<dyn CheckpointStore>,
+            action: LiveSetWalkAction,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::OnLayerArtifacts(action),
+            })
+        }
+
+        /// Plant a peer's claim on `h`'s backup lock inside the orphan
+        /// enumeration — see [`EnumerationHook::PeerClaimsLockDuringLayerArtifacts`].
+        fn wrap_peer_claims_lock_during_layer_artifacts(
+            inner: &Arc<dyn CheckpointStore>,
+            h: &ReconcileHarness,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::PeerClaimsLockDuringLayerArtifacts {
+                    client: Box::new(h.tv.client().clone()),
+                    lock_key: h.tv.key_schema().checkpoint_leader_lock(),
+                },
+            })
+        }
+
         /// Answer `object_id`'s per-object listing empty — see
         /// [`EnumerationHook::ObjectListingAnswersEmpty`].
         fn wrap_object_listing_answers_empty(
@@ -19617,6 +22261,47 @@ mod reconcile_tests {
             Arc::new(Self {
                 inner: Arc::clone(inner),
                 hook: EnumerationHook::ObjectListingAnswersEmpty { object_id },
+            })
+        }
+
+        /// Run `action` inside every per-object listing — see
+        /// [`EnumerationHook::OnObjectListing`].
+        fn wrap_on_object_listing(
+            inner: &Arc<dyn CheckpointStore>,
+            action: LiveSetWalkAction,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::OnObjectListing(action),
+            })
+        }
+
+        /// Run `action` inside every sidecar read — see
+        /// [`EnumerationHook::OnSidecarRead`].
+        fn wrap_on_sidecar_read(
+            inner: &Arc<dyn CheckpointStore>,
+            action: LiveSetWalkAction,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::OnSidecarRead(action),
+            })
+        }
+
+        /// Run `action` once the `nth` generation delete has landed — see
+        /// [`EnumerationHook::AfterNthDelete`].
+        fn wrap_after_nth_delete(
+            inner: &Arc<dyn CheckpointStore>,
+            nth: usize,
+            action: LiveSetWalkAction,
+        ) -> Arc<dyn CheckpointStore> {
+            Arc::new(Self {
+                inner: Arc::clone(inner),
+                hook: EnumerationHook::AfterNthDelete {
+                    nth,
+                    deletes: std::sync::atomic::AtomicUsize::new(0),
+                    action,
+                },
             })
         }
 
@@ -19630,8 +22315,14 @@ mod reconcile_tests {
                 EnumerationHook::PeerClaimsLockDuringLiveSetWalk { client, lock_key } => {
                     plant_peer_leader_lock_on(client, lock_key).await;
                 }
+                EnumerationHook::OnLiveSetWalk(action) => action().await,
                 EnumerationHook::Stall(StalledEnumeration::LayerArtifacts)
-                | EnumerationHook::ObjectListingAnswersEmpty { .. } => {}
+                | EnumerationHook::PeerClaimsLockDuringLayerArtifacts { .. }
+                | EnumerationHook::OnLayerArtifacts(_)
+                | EnumerationHook::ObjectListingAnswersEmpty { .. }
+                | EnumerationHook::OnObjectListing(_)
+                | EnumerationHook::OnSidecarRead(_)
+                | EnumerationHook::AfterNthDelete { .. } => {}
             }
         }
     }
@@ -19676,6 +22367,9 @@ mod reconcile_tests {
                     return Ok(Vec::new());
                 }
             }
+            if let EnumerationHook::OnObjectListing(action) = &self.hook {
+                action().await;
+            }
             self.inner.list_layer_checkpoints(object_id).await
         }
 
@@ -19683,7 +22377,18 @@ mod reconcile_tests {
             &self,
             handle: crate::checkpoint::store::CheckpointHandle,
         ) -> Result<(), CheckpointError> {
-            self.inner.delete_layer_checkpoint(handle).await
+            let deleted = self.inner.delete_layer_checkpoint(handle).await;
+            if let EnumerationHook::AfterNthDelete {
+                nth,
+                deletes,
+                action,
+            } = &self.hook
+            {
+                if deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == *nth {
+                    action().await;
+                }
+            }
+            deleted
         }
 
         async fn put_session_checkpoint(
@@ -19722,6 +22427,10 @@ mod reconcile_tests {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -19767,17 +22476,24 @@ mod reconcile_tests {
             &self,
             handle: &crate::checkpoint::store::CheckpointHandle,
         ) -> Result<std::collections::HashSet<String>, CheckpointError> {
+            if let EnumerationHook::OnSidecarRead(action) = &self.hook {
+                action().await;
+            }
             self.inner.read_ext_refs_sidecar(handle).await
         }
 
         async fn list_layer_artifacts(
             &self,
         ) -> Result<Vec<crate::checkpoint::store::LayerArtifact>, CheckpointError> {
-            if matches!(
-                self.hook,
-                EnumerationHook::Stall(StalledEnumeration::LayerArtifacts)
-            ) {
-                tokio::time::sleep(Self::STALL).await;
+            match &self.hook {
+                EnumerationHook::Stall(StalledEnumeration::LayerArtifacts) => {
+                    tokio::time::sleep(Self::STALL).await;
+                }
+                EnumerationHook::PeerClaimsLockDuringLayerArtifacts { client, lock_key } => {
+                    plant_peer_leader_lock_on(client, lock_key).await;
+                }
+                EnumerationHook::OnLayerArtifacts(action) => action().await,
+                _ => {}
             }
             self.inner.list_layer_artifacts().await
         }
@@ -19803,8 +22519,8 @@ mod reconcile_tests {
     /// Two seconds rather than the 200 ms these could nominally use, for the
     /// same reason [`GRACE`] is a full second: the *unstalled* phase of each
     /// test has to complete a real pass inside its half — an adapter
-    /// enumeration, a lease re-acquire and a Lua claim round-trip against a
-    /// Valkey shared with the rest of the suite — and a phase that ran out of
+    /// enumeration, the clean-up gate's probes and a Lua claim round-trip
+    /// against a Valkey shared with the rest of the suite — and a phase that ran out of
     /// budget because the runner was busy would fail in exactly the direction
     /// the assertion is looking for.
     ///
@@ -19867,7 +22583,7 @@ mod reconcile_tests {
         // claimable: this is how "only the orphan phase" is distinguishable
         // from "the whole pass".
         h.sink()
-            .record(vec!["dd44".to_string()])
+            .record(&[], vec!["dd44".to_string()])
             .await
             .expect("seeding a tombstone must succeed");
         h.age_out_zset_members(&h.tomb_key()).await;
@@ -19936,7 +22652,7 @@ mod reconcile_tests {
         // tombstone still inside its grace would make the phase return early
         // and the bound would never be reached.
         h.sink()
-            .record(vec!["dd44".to_string()])
+            .record(&[], vec!["dd44".to_string()])
             .await
             .expect("seeding a tombstone must succeed");
         h.age_out_zset_members(&h.tomb_key()).await;
@@ -20041,12 +22757,19 @@ mod reconcile_tests {
 
     // ── Draining (b.9qd review round 2) ──────────────────────────────────
 
-    /// Grace the two drain tests run at, deliberately longer than [`GRACE`].
+    /// Grace the orphan drain test runs at, deliberately longer than
+    /// [`GRACE`].
     ///
-    /// It is a **claim cutoff only**, and it is the number these tests sleep
-    /// out twice, so it is kept as short as the aging assertions allow. Three
+    /// It is a **claim cutoff only**, and it is the number that test sleeps
+    /// out, so it is kept as short as the aging assertions allow. Three
     /// seconds against ~150 local deletes leaves ample room for the second
     /// batch to be reached without the sleep dominating the suite.
+    ///
+    /// The two collect drain tests run at [`ACT_GRACE`] with the backlog aged
+    /// instead: the collect's commit licenses nothing once its clock is more
+    /// than one grace past the `t0` it read before its walk (R3), and every
+    /// batch of a drain commits against that one `t0` — three seconds across
+    /// ~150 deletes on a loaded runner is not a margin that bound can rely on.
     ///
     /// It used to double as the pass budget — the drain's ceiling is
     /// `min(reconcile_interval / 4, grace)` and the harness's interval is an
@@ -20095,13 +22818,12 @@ mod reconcile_tests {
                 .expect("put_ext_blob");
         }
         h.sink()
-            .record(hashes.clone())
+            .record(&[], hashes.clone())
             .await
             .expect("recording the backlog must succeed");
 
         // Age the whole backlog past the grace, then run ONE pass.
-        tokio::time::sleep(DRAIN_GRACE + SLACK).await;
-        h.reconcile(&f.store, DRAIN_GRACE).await;
+        h.reconcile_tombstones_aged(&f.store).await;
 
         assert_eq!(
             h.reconcile_counter("ext_collected"),
@@ -20143,7 +22865,7 @@ mod reconcile_tests {
     /// pass could claim orphan-budget + orphan-read + collect-budget +
     /// collect-read — up to 4× what `RECONCILE_DRAIN_INTERVAL_DIVISOR` exists
     /// to guarantee. A regression to per-phase deadlines shows up here as all
-    /// 150 collected, because a freshly-minted `DRAIN_GRACE` budget is ample.
+    /// 150 collected, because a freshly-minted budget is ample.
     ///
     /// **One batch, not zero, and that is deliberate.** Review round 2 also
     /// wrapped the live-set read in a preemptive
@@ -20184,7 +22906,7 @@ mod reconcile_tests {
                 .expect("put_ext_blob");
         }
         h.sink()
-            .record(hashes.clone())
+            .record(&[], hashes.clone())
             .await
             .expect("recording the backlog must succeed");
 
@@ -20198,7 +22920,7 @@ mod reconcile_tests {
         let spent = Instant::now() - Duration::from_millis(1);
         h.reconcile_with_budget(
             &store,
-            DRAIN_GRACE,
+            ACT_GRACE,
             ReconcilePassBudget {
                 enumerate_deadline: Instant::now() + BOUND_BUDGET,
                 orphan_deadline: spent,
@@ -20291,15 +23013,20 @@ mod reconcile_tests {
     /// The two halves of [`reconcile_drain_budget`]'s `min`, and which one wins
     /// where.
     ///
-    /// Both terms guard a different failure and neither is redundant, so a
+    /// Both terms guard a different property and neither is redundant, so a
     /// simplification to either one alone has to fail here:
     ///
-    /// - the **interval fraction** keeps a pass from running into its own next
-    ///   tick and starving the per-layer and counters ticks that share the
-    ///   leader lock;
-    /// - the **grace** keeps a pass from acting on a snapshot older than one
-    ///   grace window, which is the staleness bound the whole
-    ///   register-then-act policy rests on.
+    /// - the **interval fraction** bounds clean-up's hourly load on the
+    ///   storage service. There is no shared lock to protect (b.g65): the pass
+    ///   runs on its own task under `le:gc:leader`, and the backup loop never
+    ///   pauses for it;
+    /// - the **grace** keeps the dead-object phase's span from step (a)'s
+    ///   listing to its claims inside `grace − publish_worst_case`, the bound
+    ///   its "listings disagree" verdict rests on.
+    ///
+    /// The budget is not the collect's staleness bound: R1 is. The collect's
+    /// license is anchored to the `{recon}` clock it reads just before its
+    /// walk, so a longer pass only shrinks what is due.
     ///
     /// Pinned as arithmetic because that is what it is; the behavioural halves
     /// are the two "spends the deadline it was handed" tests above.
@@ -20310,16 +23037,16 @@ mod reconcile_tests {
         assert_eq!(
             reconcile_drain_budget(Duration::from_secs(3600), Duration::from_secs(540)),
             Duration::from_secs(540),
-            "a pass may never act on a snapshot older than one grace window, however much \
-             scheduling room the interval leaves"
+            "the dead-object phase's span from its step-(a) listing to its claims must stay \
+             inside one grace window, however much room the interval leaves"
         );
-        // A short interval with a long grace: now the scheduling bound is the
+        // A short interval with a long grace: now the load bound is the
         // tighter one and the pass gets a quarter of its interval.
         assert_eq!(
             reconcile_drain_budget(Duration::from_secs(120), Duration::from_secs(540)),
             Duration::from_secs(30),
-            "four consecutive fully-budgeted passes must still fit inside one interval, or the \
-             pass starves the per-layer and counters ticks it shares a leader lock with"
+            "a pass may spend at most a quarter of its interval, which bounds clean-up's load \
+             on the storage service per interval"
         );
         // Equal terms: no off-by-one in either direction.
         assert_eq!(
@@ -20431,10 +23158,565 @@ mod reconcile_tests {
         }
     }
 
-    // ── The timer arm ────────────────────────────────────────────────────
+    // ── Shutdown: a cancelled pass and a cancelled prune (b.jt5) ─────────
+    //
+    // The clean-up task's token reaches the pass: every read before a
+    // member's first write is raced against it, and a cancel abandons the
+    // read in flight, leaving the member registered with nothing written for
+    // it. The cancel is placed by the store's own hook, inside the read it
+    // stalls (or right after a delete lands), so where it lands is
+    // deterministic.
 
-    /// [`reconcile_leader_tick`] on a replica that is NOT the leader skips the
-    /// pass entirely and publishes a **zero** backlog.
+    /// A hook action that cancels `cancel` and then stalls for
+    /// [`HookedEnumerationStore::STALL`]: the read it runs inside answers
+    /// within the test only if the pass abandons it.
+    fn cancel_then_stall(cancel: &CancellationToken) -> LiveSetWalkAction {
+        let cancel = cancel.clone();
+        Arc::new(move || {
+            let cancel = cancel.clone();
+            Box::pin(async move {
+                cancel.cancel();
+                tokio::time::sleep(HookedEnumerationStore::STALL).await;
+            })
+        })
+    }
+
+    /// A hook action that cancels `cancel`.
+    fn cancel_now(cancel: &CancellationToken) -> LiveSetWalkAction {
+        let cancel = cancel.clone();
+        Arc::new(move || {
+            let cancel = cancel.clone();
+            Box::pin(async move { cancel.cancel() })
+        })
+    }
+
+    /// Where [`a_pass_cancelled_in_a_stalled_read_returns_at_once_and_writes_nothing`]
+    /// stalls the pass and cancels it: inside one store read it makes before
+    /// a member's first write.
+    #[derive(Debug, Clone, Copy)]
+    enum StalledRead {
+        /// The pass-start step (a) enumeration, `list_layer_artifacts`.
+        StepAEnumeration,
+        /// The orphan phase's read of a base stem's ext-refs sidecar, after
+        /// the stem's orphan commit and before its hashes are recorded.
+        OrphanSidecar,
+        /// The dead-object phase's per-object listing of a member.
+        DeadObjectListing,
+        /// The dead-object phase's read of a generation's ext-refs sidecar.
+        DeadObjectSidecar,
+        /// The collect's live-set walk.
+        LiveSetWalk,
+    }
+
+    /// **A shutdown during a stalled read ends the pass at once, with nothing
+    /// written.** Each case cancels the clean-up's token inside one store read
+    /// the pass makes before a member's first write, and stalls that read for
+    /// [`HookedEnumerationStore::STALL`]: the pass returns long before the
+    /// read would answer, deletes and records nothing, and leaves every
+    /// member it had not finished registered at its score — the orphan stem
+    /// on `le:ckpt:{recon}:orphans` with its artifacts in the store, the dead
+    /// object on `le:ckpt:{recon}:dead` with its generation in the store, the
+    /// tombstone on `le:ckpt:{recon}:tomb` with its copy. Each case seeds the
+    /// members its phase reaches: the orphan for the orphan phase (with the
+    /// tombstone, which the pass would reach next), the dead object for the
+    /// dead-object phase (no orphan, whose sidecar read would come first),
+    /// the tombstone for the collect (the dead-object phase would otherwise
+    /// reap the dead object before it), and all three for step (a), which
+    /// comes before every phase. The 10-21 stuck pod was most likely in the
+    /// dead-object listing.
+    #[tokio::test]
+    async fn a_pass_cancelled_in_a_stalled_read_returns_at_once_and_writes_nothing() {
+        const OID: u64 = 320;
+        const ORPHAN_OID: u64 = 321;
+        const ORPHAN_MEMBER: &str = "321.1";
+        const ORPHAN_HASH: &str = "jt5-orphan-hash";
+        const DEAD_HASH: &str = "jt5-dead-hash";
+        const TOMB_HASH: &str = "jt5-tomb-hash";
+
+        for read in [
+            StalledRead::StepAEnumeration,
+            StalledRead::OrphanSidecar,
+            StalledRead::DeadObjectListing,
+            StalledRead::DeadObjectSidecar,
+            StalledRead::LiveSetWalk,
+        ] {
+            let (orphan, dead, tomb) = match read {
+                StalledRead::StepAEnumeration => (true, true, true),
+                StalledRead::OrphanSidecar => (true, false, true),
+                StalledRead::DeadObjectListing | StalledRead::DeadObjectSidecar => {
+                    (false, true, false)
+                }
+                StalledRead::LiveSetWalk => (false, false, true),
+            };
+            let h = ReconcileHarness::new().await;
+            let f = disk_fixture();
+            seed_unrelated_live_backup(&*f.store).await;
+            if orphan {
+                f.plant_orphan(ORPHAN_OID, 1, &[ORPHAN_HASH]).await;
+                h.pin_aged(&h.orphans_key(), &[ORPHAN_MEMBER]).await;
+            }
+            let member = OID.to_string();
+            if dead {
+                seed_live_base(&*f.store, OID, 1, &[DEAD_HASH]).await;
+                h.pin_aged(&h.dead_key(), &[member.as_str()]).await;
+            }
+            if tomb {
+                f.store
+                    .put_ext_blob(TOMB_HASH, Bytes::from_static(b"bytes"))
+                    .await
+                    .expect("put_ext_blob");
+                h.pin_aged(&h.tomb_key(), &[TOMB_HASH]).await;
+            }
+            let orphan_score = h.zscore(&h.orphans_key(), ORPHAN_MEMBER).await;
+            let dead_score = h.zscore(&h.dead_key(), &member).await;
+            let tomb_score = h.zscore(&h.tomb_key(), TOMB_HASH).await;
+            let tombstones = h.tombstones().await;
+            let cancel = CancellationToken::new();
+            let action = cancel_then_stall(&cancel);
+            let store = match read {
+                StalledRead::StepAEnumeration => {
+                    HookedEnumerationStore::wrap_on_layer_artifacts(&f.store, action)
+                }
+                StalledRead::DeadObjectListing => {
+                    HookedEnumerationStore::wrap_on_object_listing(&f.store, action)
+                }
+                StalledRead::OrphanSidecar | StalledRead::DeadObjectSidecar => {
+                    HookedEnumerationStore::wrap_on_sidecar_read(&f.store, action)
+                }
+                StalledRead::LiveSetWalk => {
+                    HookedEnumerationStore::wrap_on_live_set_walk(&f.store, action)
+                }
+            };
+
+            let started = Instant::now();
+            h.reconcile_cancellable(&store, ACT_GRACE, &cancel).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                cancel.is_cancelled(),
+                "{read:?}: fixture: the pass reached the stalled read"
+            );
+            assert!(
+                elapsed < HookedEnumerationStore::STALL / 2,
+                "{read:?}: the cancel, not the read, ended the pass: took {elapsed:?}"
+            );
+            assert_eq!(
+                h.tombstones().await,
+                tombstones,
+                "{read:?}: nothing is recorded"
+            );
+            if orphan {
+                for artifact in ["321.1.ext-refs.json", "321.1.meta.json"] {
+                    assert!(
+                        f.exists(artifact),
+                        "{read:?}: the orphan's `{artifact}` is not deleted"
+                    );
+                }
+                assert_eq!(
+                    h.zscore(&h.orphans_key(), ORPHAN_MEMBER).await,
+                    orphan_score,
+                    "{read:?}: the orphan stays registered, at its score"
+                );
+                assert_eq!(h.reconcile_counter("orphan_deleted"), 0, "{read:?}");
+            }
+            if dead {
+                assert_eq!(
+                    listing(&*f.store, OID).await,
+                    vec![(1, CheckpointKind::Base)],
+                    "{read:?}: the dead object's generation is not deleted"
+                );
+                assert_eq!(
+                    h.zscore(&h.dead_key(), &member).await,
+                    dead_score,
+                    "{read:?}: the dead object stays registered, at its score"
+                );
+                assert_eq!(h.reconcile_counter("dead_object_reaped"), 0, "{read:?}");
+            }
+            if tomb {
+                assert!(
+                    f.store
+                        .get_ext_blob(TOMB_HASH)
+                        .await
+                        .expect("get_ext_blob")
+                        .is_some(),
+                    "{read:?}: the tombstoned copy is not deleted"
+                );
+                assert_eq!(
+                    h.zscore(&h.tomb_key(), TOMB_HASH).await,
+                    tomb_score,
+                    "{read:?}: the tombstone stays claimed, at its score"
+                );
+                assert_eq!(h.reconcile_counter("ext_collected"), 0, "{read:?}");
+                assert_eq!(
+                    h.reconcile_counter("live_set_failed"),
+                    0,
+                    "{read:?}: an abandoned walk is a shutdown, not a failed walk"
+                );
+            }
+        }
+    }
+
+    /// **A shutdown during a stalled Valkey read ends the pass at once, with
+    /// nothing written.** The Valkey-side partner of
+    /// [`a_pass_cancelled_in_a_stalled_read_returns_at_once_and_writes_nothing`]:
+    /// the read is the collect's announcement check (`announced_stems`, one
+    /// `ZMSCORE` on the maintenance pool) for a listed sidecar that read
+    /// absent, and the server, not the store, holds it. Inside the live-set
+    /// walk — after the collect's gate, claim and clock read — every
+    /// maintenance connection is parked behind a server-side `BLPOP`
+    /// ([`stall_pool`](crate::storage::test_support::stall_pool)); the walk
+    /// then lists base 660's dangling sidecar, so the next maintenance
+    /// command is the check, which queues behind the block. Once the server
+    /// has read it (the connection's `tot-net-in` grows) the clean-up's
+    /// token is cancelled. The pass returns while the stall still holds,
+    /// well inside the test client's 5 s command timeout, counts no
+    /// live-set failure, deletes nothing and leaves the tombstone claimed at
+    /// its score.
+    ///
+    /// The check rather than a `{recon}` claim: every claim follows the
+    /// gate's two `GET`s on the same pool with no store call between them,
+    /// so a pool stall cannot land after the gate and before the claim,
+    /// while the walk's store hook places it right before the check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pass_cancelled_in_a_stalled_valkey_read_returns_at_once_and_writes_nothing() {
+        use crate::storage::test_support::{release_all, stall_pool, ConnStall};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// How long the pass gets to return after the cancel: under the test
+        /// client's 5 s command timeout, so a pass still waiting for the
+        /// queued check cannot be ended by that timeout in time.
+        const PROMPT: Duration = Duration::from_secs(2);
+        /// Deadline on the whole arrangement, the release included.
+        const BUDGET: Duration = Duration::from_secs(30);
+        const NAMED: &str = "jt5-named-behind-an-absent-sidecar";
+
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let sidecar = seed_named_blob_behind_base_660(&h, &f, NAMED).await;
+        crate::checkpoint::adapters::plant_dangling_sidecar(&sidecar);
+        let tomb_score = h.zscore(&h.tomb_key(), NAMED).await;
+
+        // The stalls, with each connection's `tot-net-in` as it was parked.
+        type Parked = Vec<(ConnStall, u64)>;
+        let parked: Arc<std::sync::Mutex<Option<Parked>>> = Arc::default();
+        let stall_the_maintenance_pool: LiveSetWalkAction = {
+            let parked = Arc::clone(&parked);
+            let stalled = Arc::new(AtomicBool::new(false));
+            let pool = h.tv.client().maintenance_pool.clone();
+            let observer = h.tv.client().pool.next().clone();
+            let prefix = format!("{}conn-stall:maintenance:", h.tv.prefix());
+            Arc::new(move || {
+                let first = !stalled.swap(true, Ordering::SeqCst);
+                let parked = Arc::clone(&parked);
+                let pool = pool.clone();
+                let observer = observer.clone();
+                let prefix = prefix.clone();
+                Box::pin(async move {
+                    if !first {
+                        return;
+                    }
+                    let mut stalls = Vec::new();
+                    for stall in stall_pool(&pool, &observer, &prefix).await {
+                        let read = stall.net_in().await.expect("the stalled connection is up");
+                        stalls.push((stall, read));
+                    }
+                    *parked.lock().unwrap() = Some(stalls);
+                })
+            })
+        };
+        let store =
+            HookedEnumerationStore::wrap_on_live_set_walk(&f.store, stall_the_maintenance_pool);
+        let cancel = CancellationToken::new();
+        let returned = AtomicBool::new(false);
+
+        let pass = async {
+            h.reconcile_cancellable(&store, ACT_GRACE, &cancel).await;
+            returned.store(true, Ordering::SeqCst);
+        };
+        let cancel_during_the_check = async {
+            let stalls = loop {
+                if let Some(stalls) = parked.lock().unwrap().take() {
+                    break stalls;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            'sent: loop {
+                for (stall, parked_at) in &stalls {
+                    if stall.net_in().await.is_some_and(|now| now > *parked_at) {
+                        break 'sent;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+            let cancelled_at = Instant::now();
+            while !returned.load(Ordering::SeqCst) && cancelled_at.elapsed() < PROMPT {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut still_stalled = true;
+            for (stall, _) in &stalls {
+                still_stalled &= stall.is_blocked().await;
+            }
+            let returned_while_stalled = returned.load(Ordering::SeqCst) && still_stalled;
+            release_all(stalls.into_iter().map(|(stall, _)| stall).collect()).await;
+            returned_while_stalled
+        };
+        let ((), returned_while_stalled) = tokio::time::timeout(BUDGET, async {
+            tokio::join!(pass, cancel_during_the_check)
+        })
+        .await
+        .expect("the pass returns once its stall is released");
+
+        assert!(
+            h.last_summary().walk_listed > 0,
+            "fixture: the walk finished, so the cancel landed in the check after it"
+        );
+        assert!(
+            returned_while_stalled,
+            "the cancel, not the check's answer or its command timeout, ended the pass: it \
+             returned within {PROMPT:?} of the cancel, while the stall still held"
+        );
+        assert_eq!(
+            h.reconcile_counter("live_set_failed"),
+            0,
+            "an abandoned check is a shutdown, not a failed walk"
+        );
+        assert_eq!(h.reconcile_counter("listed_sidecar_skipped"), 0);
+        assert_eq!(h.reconcile_counter("ext_collected"), 0);
+        assert!(
+            f.store
+                .get_ext_blob(NAMED)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "the tombstoned copy is not deleted"
+        );
+        assert_eq!(
+            h.zscore(&h.tomb_key(), NAMED).await,
+            tomb_score,
+            "the tombstone stays claimed, at its score"
+        );
+    }
+
+    /// A shutdown that lands as the orphan drain's first batch finishes ends
+    /// the drain, not the pass's bookkeeping: the batch's reaps are still
+    /// tallied in the pass summary and on `orphan_deleted`, and the second
+    /// batch stays registered for the next pass. The cancel lands as the
+    /// batch's last delete does, so the drain sees it only at its next round.
+    #[tokio::test]
+    async fn an_orphan_drain_cancelled_after_its_first_batch_still_tallies_that_batch() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let count = RECONCILE_BATCH + 50;
+        for i in 0..count {
+            f.plant_orphan_meta_only(1_000 + i as u64, 1).await;
+        }
+        // Pass 1: register and defer, all of them.
+        h.reconcile(&f.store, DRAIN_GRACE).await;
+        assert_eq!(h.orphan_candidates().await.len(), count, "fixture");
+        tokio::time::sleep(DRAIN_GRACE + SLACK).await;
+
+        // Pass 2, a grace later, cancelled as its RECONCILE_BATCH-th delete —
+        // the first batch's last — lands.
+        let cancel = CancellationToken::new();
+        let store = HookedEnumerationStore::wrap_after_nth_delete(
+            &f.store,
+            RECONCILE_BATCH,
+            cancel_now(&cancel),
+        );
+        h.reconcile_cancellable(&store, DRAIN_GRACE, &cancel).await;
+
+        assert!(
+            cancel.is_cancelled(),
+            "fixture: the first batch's deletes all landed"
+        );
+        assert_eq!(
+            h.last_summary().orphan_deleted,
+            RECONCILE_BATCH as u64,
+            "the pass summary counts the batch the cancelled drain finished"
+        );
+        assert_eq!(
+            h.reconcile_counter("orphan_deleted"),
+            RECONCILE_BATCH as u64,
+            "and so does the counter"
+        );
+        assert_eq!(
+            h.orphan_candidates().await.len(),
+            count - RECONCILE_BATCH,
+            "the second batch stays registered"
+        );
+    }
+
+    /// A retention prune stopped by the loop's shutdown token after its first
+    /// lineage unit finishes that unit, starts no other, returns `Continue`
+    /// (a shutdown is not a lost lease), and logs the one INFO saying what it
+    /// pruned and what it deferred, in place of its completion line.
+    #[tokio::test]
+    async fn a_prune_cancelled_after_its_first_unit_logs_what_it_deferred_and_continues() {
+        const OID: u64 = 330;
+        const STOPPED: &str = "checkpoint retention prune stopped for shutdown before its next \
+                               lineage unit or its orphan tails; every unit it started finished \
+                               tails-before-base or was deferred whole on a failed tail delete, \
+                               and the deferred units and orphans stay on the store for a later \
+                               tick";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        for seq in 1..=5_u64 {
+            seed_live_base(&*f.store, OID, seq, &[&format!("jt5-prune-hash-{seq}")]).await;
+        }
+        let planted = handles(&*f.store, OID).await;
+        let cancel = CancellationToken::new();
+        // The oldest unit's base is its only artifact, so the first delete
+        // finishes it.
+        let store = HookedEnumerationStore::wrap_after_nth_delete(&f.store, 1, cancel_now(&cancel));
+
+        // Retain 2 of 5: units 1, 2 and 3 are planned, oldest first.
+        let (verdict, logs) = super::tick_support::capture_json_logs(
+            tracing::Level::INFO,
+            h.prune_cancellable(&*store, OID, planted, 2, &cancel),
+        )
+        .await;
+
+        assert_eq!(verdict, PostWriteVerdict::Continue);
+        let mut survivors = kind_seq(&handles(&*f.store, OID).await);
+        survivors.sort_by_key(|(seq, _)| *seq);
+        assert_eq!(
+            survivors,
+            vec![
+                (2, CheckpointKind::Base),
+                (3, CheckpointKind::Base),
+                (4, CheckpointKind::Base),
+                (5, CheckpointKind::Base),
+            ],
+            "the first unit was pruned, the two after it deferred, the newest two retained"
+        );
+        let stopped: Vec<&serde_json::Value> = logs
+            .iter()
+            .filter(|r| r["fields"]["message"] == STOPPED)
+            .collect();
+        assert_eq!(stopped.len(), 1, "one shutdown line: {logs:#?}");
+        let line = stopped[0];
+        assert_eq!(line["level"], "INFO", "{line}");
+        for (field, value) in [
+            ("object_id", OID),
+            ("pruned_units", 1),
+            ("deferred_units", 2),
+            ("deferred_units_tail_failure", 0),
+            ("deferred_orphan_tails", 0),
+            ("deleted_unit_artifacts", 1),
+            ("deleted_orphan_tails", 0),
+            ("pruned_hashes_count", 3),
+        ] {
+            assert_eq!(line["fields"][field], value, "{field}: {line}");
+        }
+        assert!(
+            !logs.iter().any(|r| r["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("checkpoint retention prune completed"))),
+            "a stopped prune does not also report itself complete: {logs:#?}"
+        );
+    }
+
+    /// Where [`a_prune_cancelled_in_a_stalled_read_deletes_nothing_and_logs_nothing`]
+    /// stalls the retention prune and cancels it: inside one store read it
+    /// makes before its first tombstone or delete.
+    #[derive(Debug, Clone, Copy)]
+    enum StalledPruneRead {
+        /// `prune_after_write`'s post-write listing of the layer.
+        PostWriteListing,
+        /// `prune_old_generations`' read of the first planned unit's base
+        /// sidecar (step 1).
+        UnitSidecar,
+    }
+
+    /// **A shutdown during a stalled prune read ends the prune at once, with
+    /// nothing written and nothing logged.** Each case cancels the loop's
+    /// token inside one read the prune makes before anything is recorded or
+    /// deleted, and stalls that read for [`HookedEnumerationStore::STALL`]:
+    /// the prune returns `Continue` (a shutdown is not a lost lease) long
+    /// before the read would answer, every generation survives, no hash is
+    /// tombstoned, and no line is logged, the stopped-prune INFO included,
+    /// since nothing was planned or deferred. The post-write listing is
+    /// driven through `prune_after_write`, with the live header at the newest
+    /// generation, so only the cancel stands between the listing and a
+    /// prune of three units; the unit's sidecar through
+    /// `prune_old_generations`, whose first planned unit's read is the one
+    /// stalled.
+    #[tokio::test]
+    async fn a_prune_cancelled_in_a_stalled_read_deletes_nothing_and_logs_nothing() {
+        const OID: u64 = 331;
+
+        for read in [
+            StalledPruneRead::PostWriteListing,
+            StalledPruneRead::UnitSidecar,
+        ] {
+            let h = ReconcileHarness::new().await;
+            let f = disk_fixture();
+            for seq in 1..=5_u64 {
+                seed_live_base(&*f.store, OID, seq, &[&format!("jt5-stalled-prune-{seq}")]).await;
+            }
+            let planted = handles(&*f.store, OID).await;
+            let cancel = CancellationToken::new();
+            let action = cancel_then_stall(&cancel);
+
+            let started = Instant::now();
+            let (verdict, logs) = match read {
+                StalledPruneRead::PostWriteListing => {
+                    h.set_header_resurrected(OID, 5).await;
+                    let store = HookedEnumerationStore::wrap_on_object_listing(&f.store, action);
+                    super::tick_support::capture_json_logs(
+                        tracing::Level::INFO,
+                        h.prune_after_write_cancellable(&store, OID, &cancel),
+                    )
+                    .await
+                }
+                StalledPruneRead::UnitSidecar => {
+                    let store = HookedEnumerationStore::wrap_on_sidecar_read(&f.store, action);
+                    // Retain 2 of 5: units 1, 2 and 3 are planned.
+                    super::tick_support::capture_json_logs(
+                        tracing::Level::INFO,
+                        h.prune_cancellable(&*store, OID, planted, 2, &cancel),
+                    )
+                    .await
+                }
+            };
+            let elapsed = started.elapsed();
+
+            assert!(
+                cancel.is_cancelled(),
+                "{read:?}: fixture: the prune reached the stalled read"
+            );
+            assert!(
+                elapsed < HookedEnumerationStore::STALL / 2,
+                "{read:?}: the cancel, not the read, ended the prune: took {elapsed:?}"
+            );
+            assert_eq!(verdict, PostWriteVerdict::Continue, "{read:?}");
+            assert_eq!(
+                listing(&*f.store, OID).await.len(),
+                5,
+                "{read:?}: every generation survives"
+            );
+            assert!(
+                h.tombstones().await.is_empty(),
+                "{read:?}: no hash is tombstoned"
+            );
+            assert!(
+                logs.is_empty(),
+                "{read:?}: a prune cancelled before it records anything logs nothing: {logs:#?}"
+            );
+        }
+    }
+
+    // ── The clean-up task's tick (b.g65, N1) ─────────────────────────────
+
+    /// The clean-up task's tick (`checkpoint::cleanup::cleanup_tick`) on a
+    /// replica that does NOT hold `le:gc:leader` skips the pass entirely and
+    /// publishes a **zero** backlog on both gauges.
+    ///
+    /// A peer of the same build holds the lock with a full TTL, which the GC
+    /// lock's takeover leaves alone; a current build leads backups, so the
+    /// maintenance lock is the only reason the pass does not run.
     ///
     /// The zero publish is required, not cosmetic: an OTel `Gauge` never
     /// decays, so a demoted leader that kept exporting its last observed
@@ -20445,20 +23727,8 @@ mod reconcile_tests {
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
         f.plant_orphan(5, 1, &["aa11"]).await;
-
-        // A peer owns the shared checkpoint leader lock.
-        let _: () =
-            h.tv.client()
-                .pool
-                .set(
-                    h.tv.key_schema().checkpoint_leader_lock(),
-                    "some-other-replica",
-                    Some(fred::types::Expiration::EX(30)),
-                    None,
-                    false,
-                )
-                .await
-                .expect("planting the peer's lock must succeed");
+        h.plant_current_build_checkpoint_leader().await;
+        h.plant_gc_peer().await;
 
         h.leader_tick(&f.store).await;
 
@@ -20472,14 +23742,110 @@ mod reconcile_tests {
         );
         assert!(
             h.orphan_candidates().await.is_empty(),
-            "a non-leader must not even register candidates — the pass shares the lock with \
-             the destructive per-layer tick precisely so two replicas never delete concurrently"
+            "a non-holder of the maintenance lock does not even register candidates — the lock \
+             sheds duplicate clean-up load"
         );
         assert!(f.exists("5.1.ext-refs.json"));
+        assert_eq!(
+            h.reconcile_counter("deferred_older_build"),
+            0,
+            "and the backup-lock gate was never reached"
+        );
     }
 
-    /// [`reconcile_leader_tick`] on the leader runs the pass with the grace
-    /// **derived from the adapter**, not zero.
+    /// A tick whose `le:gc:leader` probe FAILS publishes nothing on either
+    /// backlog gauge and runs no pass (b.g65, N1): unknown is not zero. The
+    /// failure is a real `WRONGTYPE` — the lock key holds a list, so the
+    /// acquire script's `GET` errors.
+    #[tokio::test]
+    async fn a_tick_whose_maintenance_lock_probe_fails_publishes_no_backlog_reading() {
+        use fred::interfaces::ListInterface;
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        f.plant_orphan(5, 1, &["aa11"]).await;
+        h.plant_current_build_checkpoint_leader().await;
+        let _: i64 =
+            h.tv.client()
+                .pool
+                .lpush(h.tv.key_schema().gc_leader_lock(), "not-a-string-lock")
+                .await
+                .expect("LPUSH must succeed");
+
+        h.leader_tick(&f.store).await;
+
+        assert_eq!(
+            h.backlog_gauge(),
+            None,
+            "no reading was taken, so none is published"
+        );
+        assert_eq!(h.dead_backlog_gauge(), None);
+        assert!(h.orphan_candidates().await.is_empty(), "and no pass ran");
+    }
+
+    /// The clean-up gate (b.g65, N5): a pass while `le:checkpoint:leader` is
+    /// absent, or holds an older build's UNMARKED value, deletes and registers
+    /// nothing, counts `deferred_older_build` once, and still publishes both
+    /// backlog gauges. An older build's backup writers do not re-arm before
+    /// their PUTs, so the collect's delete rule does not cover them; the gate
+    /// is what keeps a rolling upgrade from running the new clean-up beside
+    /// them.
+    ///
+    /// The orphan and the tombstone are pinned aged, so the gate is the only
+    /// thing between the pass and a delete.
+    #[tokio::test]
+    async fn the_cleanup_gate_skips_the_pass_while_an_older_build_or_no_replica_leads_backups() {
+        for older in [false, true] {
+            let h = ReconcileHarness::new().await;
+            let f = disk_fixture();
+            seed_unrelated_live_backup(&*f.store).await;
+            f.plant_orphan(5, 1, &["aa11"]).await;
+            f.store
+                .put_ext_blob("g65-n5-tomb", Bytes::from_static(b"bytes"))
+                .await
+                .expect("put_ext_blob");
+            h.pin_aged(&h.orphans_key(), &["5.1"]).await;
+            h.pin_aged(&h.tomb_key(), &["g65-n5-tomb"]).await;
+            if older {
+                // An older build's bare `service_label:instance`.
+                h.plant_peer_leader_lock().await;
+            }
+
+            h.leader_tick(&f.store).await;
+
+            let case = if older {
+                "unmarked holder"
+            } else {
+                "no holder"
+            };
+            assert!(
+                f.exists("5.1.ext-refs.json") && f.exists("5.1.meta.json"),
+                "{case}: the aged orphan is not reaped"
+            );
+            assert!(
+                f.store
+                    .get_ext_blob("g65-n5-tomb")
+                    .await
+                    .expect("get_ext_blob")
+                    .is_some(),
+                "{case}: the aged tombstone's blob is not collected"
+            );
+            assert_eq!(
+                h.orphan_candidates().await,
+                vec!["5.1".to_string()],
+                "{case}"
+            );
+            assert_eq!(h.reconcile_counter("deferred_older_build"), 1, "{case}");
+            assert_eq!(
+                h.backlog_gauge(),
+                Some(1),
+                "{case}: the backlog gauges are still published"
+            );
+            assert_eq!(h.dead_backlog_gauge(), Some(0), "{case}");
+        }
+    }
+
+    /// The clean-up task's tick on the `le:gc:leader` holder runs the pass with
+    /// the grace **derived from the adapter**, not zero.
     ///
     /// The harness supplies an explicit grace everywhere else, so this is the
     /// one test that proves the real call site still derives one: LocalDisk's
@@ -20491,6 +23857,9 @@ mod reconcile_tests {
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
         f.plant_orphan(5, 1, &["aa11"]).await;
+        // A current build leads backups, so the clean-up gate lets the pass
+        // run (b.g65, N5).
+        h.plant_current_build_checkpoint_leader().await;
 
         h.leader_tick(&f.store).await;
 
@@ -20543,12 +23912,13 @@ mod reconcile_tests {
         }
         assert_eq!(
             CHECKPOINT_RECONCILE_OUTCOMES.len(),
-            10,
+            18,
             "the vocabulary is pinned: adding an outcome without adding it to \
              CHECKPOINT_RECONCILE_OUTCOMES materialises a series only on first occurrence, \
              which is exactly what the seeding exists to prevent. Ten since b.vn6 added the \
              dead-object phase's three cells (`dead_object_reaped`, `dead_deferred`, \
-             `dead_spared`) to the original seven"
+             `dead_spared`) to the original seven; eighteen since b.g65 added the clean-up \
+             fence's eight"
         );
     }
 
@@ -20563,7 +23933,10 @@ mod reconcile_tests {
         let f = disk_fixture();
 
         h.sink()
-            .record(vec!["h1".to_string(), "h2".to_string(), "h3".to_string()])
+            .record(
+                &[],
+                vec!["h1".to_string(), "h2".to_string(), "h3".to_string()],
+            )
             .await
             .expect("recording tombstones must succeed");
 
@@ -20858,6 +24231,11 @@ mod reconcile_tests {
     /// rather than a tear: the claim is "the stem survives whole and the next
     /// pass completes it", and a torn stem would make the second pass an
     /// observation about an orphan instead.
+    ///
+    /// The failed member is re-dated to the pass's Valkey clock (b.g65, D4),
+    /// so the oldest-first claim reaches the members behind it; pass 2 ages it
+    /// again with [`ReconcileHarness::pin_aged`], standing in for the grace a
+    /// production retry waits out.
     #[tokio::test]
     async fn a_dead_object_whose_delete_fails_stays_registered_and_the_next_pass_finishes_it() {
         let h = ReconcileHarness::new().await;
@@ -20870,6 +24248,7 @@ mod reconcile_tests {
 
         // ── Pass 1: the delete is refused ────────────────────────────────
         torn.refuse_delete_at((4, CheckpointKind::Base));
+        let before_ms = h.valkey_now_ms().await;
         h.reconcile(&store, ACT_GRACE).await;
 
         assert_eq!(
@@ -20881,10 +24260,19 @@ mod reconcile_tests {
         assert_eq!(
             h.dead_candidates().await,
             vec!["302".to_string()],
-            "and the member stays registered WITH ITS ORIGINAL SCORE, which is the retry: retiring \
-             on a failed reap would forget the object and leak its generations forever"
+            "and the member stays registered, which is the retry: retiring on a failed reap would \
+             forget the object and leak its generations forever"
         );
-        assert_eq!(h.zscore(&h.dead_key(), "302").await, Some(0.0));
+        let score = h
+            .zscore(&h.dead_key(), "302")
+            .await
+            .expect("the member is still registered");
+        assert!(
+            score >= before_ms as f64,
+            "and its score is re-dated to this pass's clock (D4: {score} >= {before_ms}), so a \
+             member whose delete keeps failing moves behind the members after it instead of \
+             heading every claim"
+        );
         assert_eq!(h.reconcile_counter("dead_deferred"), 1);
         assert_eq!(h.reconcile_counter("dead_object_reaped"), 0);
         assert_eq!(
@@ -20902,8 +24290,9 @@ mod reconcile_tests {
              pairing, and it is the order that keeps a successful delete from stranding blobs"
         );
 
-        // ── Pass 2: the adapter recovers ─────────────────────────────────
+        // ── Pass 2: the adapter recovers, a grace later ──────────────────
         torn.allow_deletes();
+        h.pin_aged(&h.dead_key(), &["302"]).await;
         h.reconcile(&store, ACT_GRACE).await;
 
         assert!(
@@ -21006,6 +24395,11 @@ mod reconcile_tests {
     /// Retiring rather than leaving it registered is the other half: a live
     /// object re-examined every pass forever would make the backlog gauge
     /// permanently non-zero and hide a real one.
+    ///
+    /// "Live again" means what a restore leaves (b.g65, D.ii): a header with
+    /// its identity fields AND the layer mapping naming the object. A header
+    /// no mapping names is `LiveUnmapped` and defers instead
+    /// (`a_registered_dead_object_whose_header_stands_unmapped_is_deferred_then_reaped`).
     #[tokio::test]
     async fn a_registered_dead_object_whose_header_is_live_again_is_spared_and_retired() {
         let h = ReconcileHarness::new().await;
@@ -21016,7 +24410,7 @@ mod reconcile_tests {
         seed_live_base(&*store, OID, 9, &["vn6-restored-hash"]).await;
         h.pin_aged(&h.dead_key(), &["304"]).await;
         // The restore landed between the death and this pass.
-        h.set_header_live(OID, 9).await;
+        h.set_header_resurrected(OID, 9).await;
         torn.clear_logs();
 
         h.reconcile(&store, ACT_GRACE).await;
@@ -21029,8 +24423,8 @@ mod reconcile_tests {
         );
         assert!(
             torn.delete_log().is_empty(),
-            "and nothing is addressed for deletion at all: the spare happens BEFORE the lease \
-             re-proof and before `list_layer_checkpoints`, so no destructive step is even reached"
+            "and nothing is addressed for deletion at all: the spare happens before \
+             `list_layer_checkpoints`, so no destructive step is even reached"
         );
         assert!(
             h.tombstones().await.is_empty(),
@@ -21045,6 +24439,261 @@ mod reconcile_tests {
         assert_eq!(h.reconcile_counter("dead_spared"), 1);
         assert_eq!(h.reconcile_counter("dead_object_reaped"), 0);
         assert_eq!(h.reconcile_counter("dead_deferred"), 0);
+    }
+
+    /// How the header of a T7 case stands with no layer mapping naming its
+    /// object (b.g65, D.ii).
+    #[derive(Clone, Copy, Debug)]
+    enum UnmappedHeader {
+        /// The header names a layer whose mapping is absent: a `DeleteLayer`
+        /// stopped after its unmap.
+        MappingAbsent,
+        /// The mapping names another object: the layer was deleted and
+        /// re-created.
+        MappingNamesAnotherObject,
+        /// The mapping key holds a hash, not a string (`WRONGTYPE` on the
+        /// probe's `GET`): it names no object.
+        MappingIsNotAString,
+        /// The header has no `layer_name`, so there is no mapping to check.
+        HeaderMissingLayerName,
+    }
+
+    /// **T7 (b.g65, D.ii).** A registered dead object whose `obj:hdr` still
+    /// stands — `seq` present, no `superseded` flag — while no layer mapping
+    /// names the object is `LiveUnmapped`: pass 1 deletes nothing, keeps the
+    /// member re-dated later, counts `dead_deferred` (never `dead_spared`) and
+    /// logs the INFO carrying [`DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE`].
+    /// Once the header is gone, pass 2 reaps the generation and retires the
+    /// member.
+    ///
+    /// This is the state a `DeleteLayer` leaves when it stops after its mapping
+    /// `DEL`, which now registers the object (D.i) before its teardown. Read
+    /// as `Live` — the two-way reading — pass 1 retires the member as a DR
+    /// restore and the generation survives forever. Between the passes the
+    /// member is aged with `ZADD XX` (never [`ReconcileHarness::pin_aged`],
+    /// which creates a missing member and would hide that retirement).
+    #[tokio::test]
+    async fn a_registered_dead_object_whose_header_stands_unmapped_is_deferred_then_reaped() {
+        use fred::interfaces::{HashesInterface, KeysInterface};
+
+        let cases = [
+            (UnmappedHeader::MappingAbsent, 340_u64),
+            (UnmappedHeader::MappingNamesAnotherObject, 341),
+            (UnmappedHeader::MappingIsNotAString, 342),
+            (UnmappedHeader::HeaderMissingLayerName, 343),
+        ];
+        for (case, oid) in cases {
+            let h = ReconcileHarness::new().await;
+            let f = disk_fixture();
+            let (torn, store) = f.torn();
+            let member = oid.to_string();
+
+            seed_live_base(&*store, oid, 5, &["d-ii-unmapped-hash"]).await;
+            h.pin_aged(&h.dead_key(), &[member.as_str()]).await;
+            match case {
+                UnmappedHeader::MappingAbsent => {
+                    h.set_header_unmapped(oid, 5, None, true).await;
+                }
+                UnmappedHeader::MappingNamesAnotherObject => {
+                    let other = (oid + 1_000).to_string();
+                    h.set_header_unmapped(oid, 5, Some(other.as_str()), true)
+                        .await;
+                }
+                UnmappedHeader::MappingIsNotAString => {
+                    h.set_header_unmapped(oid, 5, None, true).await;
+                    let (sid, layer) = ReconcileHarness::identity_of(oid);
+                    let _: u64 =
+                        h.tv.client()
+                            .pool
+                            .hset(
+                                h.tv.key_schema().layer_mapping(&sid, &layer),
+                                vec![("not", "a-string")],
+                            )
+                            .await
+                            .expect("planting a hash at the mapping key must succeed");
+                }
+                UnmappedHeader::HeaderMissingLayerName => {
+                    let own = oid.to_string();
+                    h.set_header_unmapped(oid, 5, Some(own.as_str()), false)
+                        .await;
+                }
+            }
+            torn.clear_logs();
+
+            // ── Pass 1: the header stands, unmapped ──────────────────────────
+            let before_ms = h.valkey_now_ms().await;
+            let ((), infos) = super::tick_support::capture_logs(
+                tracing::Level::INFO,
+                h.reconcile(&store, ACT_GRACE),
+            )
+            .await;
+
+            assert!(
+                torn.delete_log().is_empty(),
+                "{case:?}: nothing is deleted while the header stands"
+            );
+            assert_eq!(
+                kind_seq(&handles(&*store, oid).await),
+                vec![(5, CheckpointKind::Base)],
+                "{case:?}: the generation survives pass 1"
+            );
+            let score = h.zscore(&h.dead_key(), &member).await.unwrap_or_else(|| {
+                panic!(
+                    "{case:?}: the member must stay registered — retiring it here is the two-way \
+                     reading that takes an interrupted DeleteLayer for a DR restore and leaks the \
+                     object's backups for good"
+                )
+            });
+            assert!(
+                score >= before_ms as f64,
+                "{case:?}: and re-dated later (D4: {score} >= {before_ms})"
+            );
+            assert_eq!(h.reconcile_counter("dead_deferred"), 1, "{case:?}");
+            assert_eq!(
+                h.reconcile_counter("dead_spared"),
+                0,
+                "{case:?}: an unmapped header is not a resurrection"
+            );
+            let object_field = format!("object_id={oid}");
+            assert!(
+                infos.lines().any(
+                    |line| line.contains(DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE)
+                        && line.contains(&object_field)
+                ),
+                "{case:?}: the deferral is logged with the unfinished-retirement phrase, naming \
+                 the object; got:\n{infos}"
+            );
+
+            // ── The teardown finishes; pass 2 a grace later ──────────────────
+            let _: i64 =
+                h.tv.client()
+                    .pool
+                    .del(h.tv.key_schema().obj_header(&member))
+                    .await
+                    .expect("DEL obj:hdr must succeed");
+            let _: () =
+                h.tv.client()
+                    .pool
+                    .zadd(
+                        h.dead_key(),
+                        Some(fred::types::SetOptions::XX),
+                        None,
+                        false,
+                        false,
+                        (0.0, member.as_str()),
+                    )
+                    .await
+                    .expect("ZADD XX must succeed");
+            h.reconcile(&store, ACT_GRACE).await;
+
+            assert!(
+                listing(&*store, oid).await.is_empty(),
+                "{case:?}: with the header gone the generation is reaped"
+            );
+            assert!(
+                h.dead_candidates().await.is_empty(),
+                "{case:?}: and the member retired"
+            );
+            assert_eq!(h.reconcile_counter("dead_object_reaped"), 1, "{case:?}");
+            assert_eq!(h.reconcile_counter("dead_spared"), 0, "{case:?}");
+        }
+    }
+
+    /// **T10 (b.g65, D.i), end to end.** A real `DeleteLayer` whose teardown
+    /// fails after the header's `UNLINK` (one attempt, a later teardown page
+    /// failing) answers `Aborted` — and the object it deleted is registered on
+    /// the dead-object set anyway, so the clean-up's dead-object phase reaps
+    /// its checkpoint generation a grace later and retires the member.
+    ///
+    /// Before (D) the registration ran only at the delete's success exit, so
+    /// this delete left the object unregistered; with its header gone no sweep
+    /// could find it again, and its backups leaked for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupted_delete_layer_is_registered_dead_and_its_backups_are_reaped() {
+        use crate::error::ServiceError;
+        use crate::storage::layer::LayerStore;
+        use fred::interfaces::HashesInterface;
+        let h = ReconcileHarness::new().await;
+        let ext = Arc::new(crate::storage::external_values::MockExternalValueStore::new());
+        let session_id = crate::storage::session::SessionStore::new(
+            h.tv.client().clone(),
+            h.tv.key_schema().clone(),
+        )
+        .create("t10", "/t10", "t10-user")
+        .await
+        .expect("session creation must succeed");
+        let faults = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from([
+            Some(fred::error::Error::new(
+                fred::error::ErrorKind::Timeout,
+                "injected teardown page failure",
+            )),
+        ])));
+        let ls = LayerStore::new(h.tv.client().clone(), h.tv.key_schema().clone(), 4096)
+            .with_dead_object_registration(true)
+            .with_update_layer_retry_max_attempts(1)
+            .with_retirement_teardown_faults_for_test(Arc::clone(&faults));
+        let state = crate::domain::types::ObjectState {
+            sequence_num: 1,
+            first_version: 1,
+            source_format: "usda".to_owned(),
+            ..Default::default()
+        };
+        let oid = ls
+            .create_layer(&session_id, "t10-layer", "t10-user", &state, ext.clone())
+            .await
+            .expect("create_layer must succeed");
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        seed_live_base(&*f.store, oid, 1, &["t10-hash"]).await;
+
+        let result = ls.delete_layer(&session_id, "t10-layer", ext.clone()).await;
+
+        assert!(
+            matches!(result, Err(ServiceError::Aborted(_))),
+            "fixture: the injected teardown failure ends the one attempt; got {result:?}"
+        );
+        assert!(
+            faults.lock().expect("faults mutex").is_empty(),
+            "fixture: the teardown took the fault"
+        );
+        let header: Option<String> =
+            h.tv.client()
+                .pool
+                .hget(h.tv.key_schema().obj_header(&oid.to_string()), "seq")
+                .await
+                .expect("HGET must succeed");
+        assert_eq!(header, None, "fixture: the header went before the failure");
+        let member = oid.to_string();
+        assert!(
+            h.zscore(&h.dead_key(), &member).await.is_some(),
+            "the interrupted delete registered its object dead"
+        );
+
+        // A grace later: aged with `ZADD XX`, which cannot create the member.
+        let _: () =
+            h.tv.client()
+                .pool
+                .zadd(
+                    h.dead_key(),
+                    Some(fred::types::SetOptions::XX),
+                    None,
+                    false,
+                    false,
+                    (0.0, member.as_str()),
+                )
+                .await
+                .expect("ZADD XX must succeed");
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert!(
+            listing(&*f.store, oid).await.is_empty(),
+            "the deleted layer's checkpoint generation is reaped"
+        );
+        assert_eq!(h.reconcile_counter("dead_object_reaped"), 1);
+        assert!(
+            h.dead_candidates().await.is_empty(),
+            "and the member retired"
+        );
     }
 
     /// An unparseable member is retired without action.
@@ -21077,7 +24726,7 @@ mod reconcile_tests {
     }
 
     /// The dead-object phase spends the deadline it was HANDED, stopping after
-    /// one batch rather than draining.
+    /// one member rather than draining.
     ///
     /// The sibling of the orphan and collect budget cases, and it matters for
     /// the same reason: the three phases share one pass budget
@@ -21098,8 +24747,12 @@ mod reconcile_tests {
     /// for a reason that has nothing to do with the deadline the phase was
     /// handed.
     ///
-    /// **One batch, not zero, and that is deliberate:** the loop tests its
-    /// deadline only after acting, so a spent budget buys exactly one batch.
+    /// **One member, not zero and not a batch (b.g65, D2):** the drain tests
+    /// its deadline before each member after the first, so a spent budget buys
+    /// exactly one member and the pass still makes some progress. Testing it
+    /// only per batch let one claim of slow per-object listings overrun the
+    /// phase's share by a whole batch — the shape that used a development
+    /// deployment's whole 540 s pass and left the collect a bound of 0.
     #[tokio::test]
     async fn dead_object_phase_spends_the_deadline_it_was_handed_rather_than_minting_its_own() {
         let h = ReconcileHarness::new().await;
@@ -21129,11 +24782,17 @@ mod reconcile_tests {
 
         assert_eq!(
             h.dead_candidates().await.len(),
-            50,
-            "exactly one batch of {RECONCILE_BATCH} retired. Draining all {} would mean the phase \
-             minted its own budget and the handed deadline is not a bound — whereupon an \
-             oversized dead backlog could consume the whole pass and starve the collect",
+            members.len() - 1,
+            "exactly one member retired. Draining all {} would mean the phase minted its own \
+             budget and the handed deadline is not a bound — whereupon an oversized dead backlog \
+             could consume the whole pass and starve the collect; retiring a whole batch of \
+             {RECONCILE_BATCH} would mean the deadline is tested per batch, not per member (D2)",
             members.len()
+        );
+        assert_eq!(
+            h.reconcile_counter("dead_retired"),
+            1,
+            "and `dead_retired` counts the one member removed from the backlog (D5)"
         );
     }
 
@@ -21262,6 +24921,7 @@ mod reconcile_tests {
             h.pin_aged(&h.dead_key(), &["320"]).await;
             torn.clear_logs();
 
+            let before_ms = h.valkey_now_ms().await;
             h.reconcile(&store, ACT_GRACE).await;
 
             assert!(
@@ -21282,19 +24942,30 @@ mod reconcile_tests {
             assert_eq!(
                 h.dead_candidates().await,
                 vec!["320".to_string()],
-                "{step:?}: the member stays registered with its original score — that is the \
-                 retry, and retiring it here would forget the object and leak its generations \
-                 forever"
+                "{step:?}: the member stays registered — that is the retry, and retiring it here \
+                 would forget the object and leak its generations forever"
             );
-            assert_eq!(
-                h.zscore(&h.dead_key(), "320").await,
-                Some(0.0),
-                "{step:?}: and the score is the ORIGINAL first-observation one, not a refreshed \
-                 stamp. Membership alone does not say that: a phase that re-registered the member \
-                 on the way out would still be listed here, while pushing the claim cutoff a full \
-                 grace window into the future on every failed pass — a candidate that can never \
-                 age out is a leak wearing the shape of a retry"
-            );
+            let score = h
+                .zscore(&h.dead_key(), "320")
+                .await
+                .expect("the member is still registered");
+            match step {
+                // A failure of this member's own sidecar read is re-dated
+                // (b.g65, D4), so a member that keeps failing moves behind
+                // the members after it instead of heading every claim.
+                ReapStep::SidecarRead => assert!(
+                    score >= before_ms as f64,
+                    "{step:?}: the score is re-dated to this pass's clock ({score} >= \
+                     {before_ms})"
+                ),
+                // A failed tombstone write is a store failure, not this
+                // member's: the re-date script would fail on the same store,
+                // and D4 re-dates only member-specific deferrals.
+                _ => assert_eq!(
+                    score, 0.0,
+                    "{step:?}: a store-side failure leaves the score where it was"
+                ),
+            }
             assert_eq!(h.reconcile_counter("dead_object_reaped"), 0, "{step:?}");
             assert_eq!(
                 h.reconcile_counter("dead_deferred"),
@@ -21356,9 +25027,9 @@ mod reconcile_tests {
     ///
     /// So the answer is the third one: delete nothing (the
     /// no-delete-on-a-live-header rule stays absolute) and retire nothing (the
-    /// member keeps its original first-observation score and the next pass
-    /// re-checks, by which time the Valkey orphan sweep or a retried cleanup has
-    /// removed the header and it reads `Dead`).
+    /// member is re-dated to now, b.g65 D4, and a later pass re-checks, by
+    /// which time the Valkey orphan sweep or a retried cleanup has removed the
+    /// header and it reads `Dead`).
     #[tokio::test]
     async fn a_dead_object_whose_header_carries_the_superseded_flag_is_deferred_not_spared() {
         let h = ReconcileHarness::new().await;
@@ -21373,6 +25044,7 @@ mod reconcile_tests {
         h.set_header_superseded(OID, 5).await;
         torn.clear_logs();
 
+        let before_ms = h.valkey_now_ms().await;
         h.reconcile(&store, ACT_GRACE).await;
 
         assert!(
@@ -21393,11 +25065,15 @@ mod reconcile_tests {
              object with un-cleaned bookkeeping, and retiring it as `spared` would drop the only \
              record that its generations owe a reclamation"
         );
-        assert_eq!(
-            h.zscore(&h.dead_key(), "321").await,
-            Some(0.0),
-            "and keep its original first-observation score, so the next pass claims it \
-             immediately rather than re-serving a grace window"
+        let score = h
+            .zscore(&h.dead_key(), "321")
+            .await
+            .expect("the member is still registered");
+        assert!(
+            score >= before_ms as f64,
+            "and its score is re-dated to this pass's clock (b.g65, D4: {score} >= {before_ms}): \
+             a header that stays standing must not head every claim and block the members behind \
+             it; the next pass a grace later re-checks it"
         );
         assert_eq!(
             h.reconcile_counter("dead_deferred"),
@@ -21449,7 +25125,7 @@ mod reconcile_tests {
         assert!(
             torn.delete_log().is_empty(),
             "an unreadable header is not a dead one — nothing may be addressed for deletion, and \
-             the probe runs BEFORE the lease re-proof and before `list_layer_checkpoints`, so no \
+             the probe runs before `list_layer_checkpoints`, so no \
              destructive step is even reached"
         );
         assert_eq!(
@@ -21473,26 +25149,27 @@ mod reconcile_tests {
     /// # Why the cheap per-object early-out is not enough
     ///
     /// What sits between the two probes is not small: `list_layer_checkpoints`
-    /// for the object, plus — per generation — a sidecar read and a tombstone
-    /// record, each bounded only by the adapter's per-call ceiling (180 s at the
-    /// StorageApi defaults). And the leader lease does not close the window:
-    /// `ensure_held` excludes a peer *reconciler*, while the writer that can
-    /// resurrect an `object_id` is `apply_restore`, which holds no
-    /// reconciliation lease at all. So the object can become live in the middle
-    /// of its own reap, and the generations still standing are precisely what
-    /// the restore is built on.
+    /// for the object, plus — per generation — a sidecar read, each bounded
+    /// only by the adapter's per-call ceiling (180 s at the StorageApi
+    /// defaults). And no lock closes the window: the writer that can
+    /// resurrect an `object_id` is `apply_restore`, which takes no part in the
+    /// clean-up's lock. So the object can become live in the middle of its own
+    /// reap, and the generations still standing are precisely what the restore
+    /// is built on.
     ///
-    /// # The three arms are three DISPOSITIONS, not three flavours of one
+    /// # The four arms are three DISPOSITIONS, not four flavours of one
     ///
-    /// - `Live` — spare and RETIRE. The object is genuinely alive; leaving it
-    ///   registered would re-examine a live object every pass forever and pin
-    ///   the backlog gauge permanently non-zero.
-    /// - `Superseded` — spare and stay REGISTERED, for the reason the early-out
-    ///   twin above gives at length.
+    /// - `Live` (a header AND the layer mapping naming the object) — spare and
+    ///   RETIRE. The object is genuinely alive; leaving it registered would
+    ///   re-examine a live object every pass forever and pin the backlog gauge
+    ///   permanently non-zero.
+    /// - `Superseded` and `Unmapped` (a header no mapping names, b.g65 D.ii) —
+    ///   spare and stay REGISTERED, for the reasons the early-out twins above
+    ///   give at length.
     /// - a probe ERROR — spare and stay registered. "Unknown liveness" is the
     ///   one direction this phase may not resolve by deleting.
     ///
-    /// All three share the other half of the contract, and it is the
+    /// All four share the other half of the contract, and it is the
     /// counter-intuitive half: the generation already deleted this pass STAYS
     /// deleted. It was reaped while the object was provably dead at its own
     /// pre-delete probe — the strongest evidence available, and exactly the
@@ -21506,6 +25183,7 @@ mod reconcile_tests {
         // `(mutation, expected surviving members, spared, deferred)`.
         let cases: &[(HeaderMutation, &[&str], u64, u64)] = &[
             (HeaderMutation::Live, &[], 1, 0),
+            (HeaderMutation::Unmapped, &["322"], 0, 1),
             (HeaderMutation::Superseded, &["322"], 0, 1),
             (HeaderMutation::Poison, &["322"], 0, 1),
         ];
@@ -21531,11 +25209,7 @@ mod reconcile_tests {
             );
 
             h.pin_aged(&h.dead_key(), &["322"]).await;
-            torn.mutate_header_after_first_delete(
-                h.tv.client(),
-                &h.tv.key_schema().obj_header(&OID.to_string()),
-                mutation,
-            );
+            torn.mutate_header_after_first_delete(h.tv.client(), h.tv.key_schema(), OID, mutation);
             torn.clear_logs();
 
             h.reconcile(&store, ACT_GRACE).await;
@@ -21566,8 +25240,9 @@ mod reconcile_tests {
                     .iter()
                     .map(|m| (*m).to_string())
                     .collect::<Vec<_>>(),
-                "{mutation:?}: only a genuinely LIVE header retires the member. The other two \
-                 states are 'this object still owes a reclamation and we could not finish it', \
+                "{mutation:?}: only a genuinely LIVE header retires the member. The other three \
+                 states (unmapped, superseded, unreadable) are 'this object still owes a \
+                 reclamation and we could not finish it', \
                  and dropping the member would make that debt unrecoverable"
             );
             assert_eq!(h.reconcile_counter("dead_spared"), spared, "{mutation:?}");
@@ -21577,6 +25252,465 @@ mod reconcile_tests {
                 "{mutation:?}"
             );
         }
+    }
+
+    /// **No announcement on a kept generation (b.g65, F1).** The dead reap
+    /// re-probes a generation's liveness BEFORE it records that base's hashes
+    /// and announces its stem on `le:ckpt:{recon}:deleting`, so a base the
+    /// re-probe keeps is never announced and its hashes are never
+    /// tombstoned, whatever the verdict — `Live`, `LiveUnmapped`,
+    /// `LiveSuperseded` or a probe error: a standing announcement on a kept
+    /// base would let the collect skip a stale not-found on its sidecar as an
+    /// announced deletion (N2) and drop its hashes from the live set.
+    ///
+    /// Two bases, so the cut lands on a BASE (only bases are announced): base
+    /// 41 is reaped, the header stands up (or is poisoned) inside its delete,
+    /// and base 40 is re-probed and kept. The pass runs at [`ACT_GRACE`], so
+    /// a tombstone recorded during it is not yet claimable and a recorded
+    /// `g65-withdraw-old` would still be on `:tomb` afterwards.
+    ///
+    /// The `Unmapped` row also pins the per-generation re-probe's INFO: it
+    /// carries [`DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE`] and the object id,
+    /// and no other verdict's line does.
+    #[tokio::test]
+    async fn a_dead_reap_never_announces_a_base_its_re_probe_keeps() {
+        // `(mutation, base 41's stem still announced after the pass)`: a
+        // `Live` verdict retires the member only after withdrawing every
+        // announcement of the object, the reaped 41's included; every other
+        // verdict keeps the member, and 41's announcement with it.
+        //
+        // What the kept base 40 must never carry is gathered across all four
+        // verdicts and asserted once, so a failure names every verdict that
+        // leaks rather than only the first.
+        let mut kept_base_leaks: Vec<String> = Vec::new();
+        for (mutation, reaped_announced_after) in [
+            (HeaderMutation::Live, false),
+            (HeaderMutation::Unmapped, true),
+            (HeaderMutation::Superseded, true),
+            (HeaderMutation::Poison, true),
+        ] {
+            let h = ReconcileHarness::new().await;
+            let f = disk_fixture();
+            let (torn, store) = f.torn();
+            const OID: u64 = 323;
+            seed_live_base(&*store, OID, 40, &["g65-withdraw-old"]).await;
+            seed_live_base(&*store, OID, 41, &["g65-withdraw-new"]).await;
+            h.pin_aged(&h.dead_key(), &["323"]).await;
+            torn.mutate_header_after_first_delete(h.tv.client(), h.tv.key_schema(), OID, mutation);
+
+            let ((), infos) = super::tick_support::capture_logs(
+                tracing::Level::INFO,
+                h.reconcile(&store, ACT_GRACE),
+            )
+            .await;
+
+            assert_eq!(
+                torn.delete_log(),
+                vec![(41, CheckpointKind::Base)],
+                "{mutation:?}: fixture — base 41 reaped, then the re-probe of base 40 stopped the \
+                 reap"
+            );
+            // The header was absent at the pass's early-out probe, so only the
+            // per-generation re-probe of base 40 can log the
+            // unfinished-retirement phrase, and only on its `LiveUnmapped`
+            // verdict.
+            let unfinished_logged = infos.lines().any(|line| {
+                line.contains(DEAD_OBJECT_RETIREMENT_UNFINISHED_PHRASE)
+                    && line.contains("object_id=323")
+            });
+            assert_eq!(
+                unfinished_logged,
+                matches!(mutation, HeaderMutation::Unmapped),
+                "{mutation:?}: the per-generation re-probe's INFO carries the \
+                 unfinished-retirement phrase, naming the object, exactly when it reads \
+                 `LiveUnmapped`; got:\n{infos}"
+            );
+            let deleting = h.tv.key_schema().checkpoint_reconcile_deleting();
+            assert_eq!(
+                h.zscore(&deleting, "323.41").await.is_some(),
+                reaped_announced_after,
+                "{mutation:?}: the reaped base's stem was announced before its delete, and only a \
+                 spared retire withdraws it"
+            );
+            let tombstones = h.tombstones().await;
+            assert!(
+                tombstones.contains(&"g65-withdraw-new".to_string()),
+                "{mutation:?}: fixture — the reaped base 41's hash was recorded: {tombstones:?}"
+            );
+            assert_eq!(
+                kind_seq(&handles(&*store, OID).await),
+                vec![(40, CheckpointKind::Base)],
+                "{mutation:?}: base 40 survives either way"
+            );
+            if h.zscore(&deleting, "323.40").await.is_some() {
+                kept_base_leaks.push(format!("{mutation:?}: stem 323.40 announced"));
+            }
+            if tombstones.contains(&"g65-withdraw-old".to_string()) {
+                kept_base_leaks.push(format!("{mutation:?}: hash g65-withdraw-old tombstoned"));
+            }
+        }
+        assert!(
+            kept_base_leaks.is_empty(),
+            "base 40's re-probe runs before its record and announcement and keeps the base, so \
+             its stem is never announced and its hashes never tombstoned, whatever the verdict; \
+             got: {kept_base_leaks:?}"
+        );
+    }
+
+    /// Every member of `le:ckpt:{recon}:deleting` naming `object_id`'s stems
+    /// (`<object_id>.…`), sorted.
+    async fn announced_for(h: &ReconcileHarness, object_id: u64) -> Vec<String> {
+        let prefix = format!("{object_id}.");
+        let mut v: Vec<String> = h
+            .zmembers(&h.tv.key_schema().checkpoint_reconcile_deleting())
+            .await
+            .into_iter()
+            .filter(|m| m.starts_with(&prefix))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Plant `members` on `le:ckpt:{recon}:deleting` at the Valkey clock — a
+    /// deleter's announcement of each, made just now, so no announcement the
+    /// pass makes trims it.
+    async fn plant_announcements(h: &ReconcileHarness, members: &[&str]) {
+        let now = h.valkey_now_ms().await;
+        for member in members {
+            let _: () =
+                h.tv.client()
+                    .pool
+                    .zadd(
+                        h.tv.key_schema().checkpoint_reconcile_deleting(),
+                        None,
+                        None,
+                        false,
+                        false,
+                        (now as f64, *member),
+                    )
+                    .await
+                    .expect("ZADD :deleting must succeed");
+        }
+    }
+
+    /// Replace `le:ckpt:{recon}:deleting` with a string, so the withdrawal's
+    /// `ZSCAN` of it fails with a real `WRONGTYPE`.
+    async fn poison_deleting_key(client: &ValkeyClient, keys: &KeySchema) {
+        let _: () = client
+            .pool
+            .set(
+                keys.checkpoint_reconcile_deleting(),
+                "not-a-zset",
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("poisoning :deleting must succeed");
+    }
+
+    /// **Withdraw before retire, same pass (b.g65).** Base 52's delete fails
+    /// after its announcement; base 51 is then reaped and a restore stands
+    /// the object back up, mapped, inside 51's delete, so base 50's re-probe
+    /// reads `Live` and the member is retired as spared. Before it retires,
+    /// every announcement of the object is withdrawn — 52's, whose delete
+    /// failed and which the restore keeps, and 51's — so nothing of the
+    /// object stays announced once nothing will look at it again. Left
+    /// standing, 52's announcement would let the collect skip a stale
+    /// not-found of a kept base's sidecar (N2).
+    #[tokio::test]
+    async fn a_failed_base_delete_then_a_live_re_probe_retires_with_nothing_announced() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        const OID: u64 = 326;
+        for seq in [50, 51, 52] {
+            seed_live_base(&*store, OID, seq, &[]).await;
+        }
+        torn.refuse_delete_at((52, CheckpointKind::Base));
+        torn.mutate_header_after_first_delete(
+            h.tv.client(),
+            h.tv.key_schema(),
+            OID,
+            HeaderMutation::Live,
+        );
+        h.pin_aged(&h.dead_key(), &["326"]).await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            torn.delete_log(),
+            vec![(52, CheckpointKind::Base), (51, CheckpointKind::Base)],
+            "fixture: 52's delete was refused, 51 was reaped, and 50's re-probe read `Live`"
+        );
+        assert_eq!(
+            kind_seq(&handles(&*store, OID).await),
+            vec![(52, CheckpointKind::Base), (50, CheckpointKind::Base)],
+            "fixture: the failed 52 and the kept 50 stand"
+        );
+        assert_eq!(
+            announced_for(&h, OID).await,
+            Vec::<String>::new(),
+            "no stem of the object stays announced after the spared retire"
+        );
+        assert!(
+            h.dead_candidates().await.is_empty(),
+            "the member is retired"
+        );
+        assert_eq!(h.reconcile_counter("dead_spared"), 1);
+        assert_eq!(h.reconcile_counter("dead_deferred"), 0);
+    }
+
+    /// **Withdraw before retire, next pass (b.g65).** Pass 1 announces base
+    /// 60 and its delete fails, so the member is re-dated and 60 stays
+    /// announced. A restore then maps the object back; pass 2's per-object
+    /// early-out reads `Live` and retires the member as spared — after
+    /// withdrawing 60's announcement, so the base the restore kept is not
+    /// left announced with nothing to look at it again.
+    #[tokio::test]
+    async fn a_failed_base_delete_then_a_live_early_out_next_pass_retires_with_nothing_announced() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        const OID: u64 = 327;
+        seed_live_base(&*store, OID, 60, &[]).await;
+        torn.refuse_delete_at((60, CheckpointKind::Base));
+        h.pin_aged(&h.dead_key(), &["327"]).await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            announced_for(&h, OID).await,
+            vec!["327.60".to_string()],
+            "fixture: pass 1 announced 60 and its delete failed"
+        );
+        assert_eq!(h.dead_candidates().await, vec!["327".to_string()]);
+
+        h.set_header_resurrected(OID, 1).await;
+        h.pin_aged(&h.dead_key(), &["327"]).await;
+        torn.clear_logs();
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert!(
+            torn.delete_log().is_empty(),
+            "fixture: pass 2 stopped at the per-object early-out"
+        );
+        assert_eq!(
+            announced_for(&h, OID).await,
+            Vec::<String>::new(),
+            "the early-out withdrew 60's announcement before the spared retire"
+        );
+        assert!(
+            h.dead_candidates().await.is_empty(),
+            "the member is retired"
+        );
+        assert_eq!(h.reconcile_counter("dead_spared"), 1);
+        assert_eq!(
+            kind_seq(&handles(&*store, OID).await),
+            vec![(60, CheckpointKind::Base)],
+            "the restored base stands"
+        );
+    }
+
+    /// A pass whose withdrawal before a spared retire fails: the member stays
+    /// registered, re-dated past `before_ms`, counted `dead_deferred` and not
+    /// `dead_spared`, and the WARN names the failed withdrawal.
+    async fn assert_withdrawal_failure_kept_the_member(
+        h: &ReconcileHarness,
+        member: &str,
+        before_ms: u64,
+        warns: &str,
+    ) {
+        let score = h
+            .zscore(&h.dead_key(), member)
+            .await
+            .unwrap_or_else(|| panic!("member {member} must stay registered, not be retired"));
+        assert!(
+            score >= before_ms as f64,
+            "member {member} is re-dated (D4) so the next pass retries: score {score}, pass \
+             start {before_ms}"
+        );
+        assert_eq!(h.reconcile_counter("dead_deferred"), 1);
+        assert_eq!(h.reconcile_counter("dead_spared"), 0);
+        assert!(
+            warns
+                .lines()
+                .any(|l| l.contains("could not withdraw the deletion announcements")),
+            "the WARN names the failed withdrawal; got:\n{warns}"
+        );
+    }
+
+    /// **A failed withdrawal retires nothing, early-out (b.g65).** The object
+    /// reads `Live` at the per-object early-out, and the withdrawal before the
+    /// spared retire fails (`:deleting` answers `WRONGTYPE`): the member is
+    /// kept, re-dated, and deferred — the retire waits for a withdrawal that
+    /// lands, so a kept base can never be left announced by it.
+    #[tokio::test]
+    async fn a_failed_withdrawal_at_the_live_early_out_re_dates_the_member_and_retires_nothing() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        const OID: u64 = 328;
+        seed_live_base(&*f.store, OID, 70, &[]).await;
+        h.set_header_resurrected(OID, 1).await;
+        h.pin_aged(&h.dead_key(), &["328"]).await;
+        poison_deleting_key(h.tv.client(), h.tv.key_schema()).await;
+        let before = h.valkey_now_ms().await;
+
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile(&f.store, ACT_GRACE)).await;
+
+        assert_withdrawal_failure_kept_the_member(&h, "328", before, &warns).await;
+    }
+
+    /// **A failed withdrawal retires nothing, same pass (b.g65).** Base 81 is
+    /// announced and reaped; `:deleting` is then made unreadable (from inside
+    /// 81's delete, after its announcement) and a restore maps the object
+    /// back, so base 80's re-probe reads `Live`. The withdrawal before the
+    /// spared retire fails: the member is kept, re-dated, and deferred.
+    #[tokio::test]
+    async fn a_failed_withdrawal_after_a_live_re_probe_re_dates_the_member_and_retires_nothing() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        const OID: u64 = 329;
+        seed_live_base(&*store, OID, 80, &[]).await;
+        seed_live_base(&*store, OID, 81, &[]).await;
+        {
+            let (client, keys) = (h.tv.client().clone(), h.tv.key_schema().clone());
+            torn.before_first_layer_delete(Arc::new(move |_handle: CheckpointHandle| {
+                let (client, keys) = (client.clone(), keys.clone());
+                Box::pin(async move { poison_deleting_key(&client, &keys).await })
+            }));
+        }
+        torn.mutate_header_after_first_delete(
+            h.tv.client(),
+            h.tv.key_schema(),
+            OID,
+            HeaderMutation::Live,
+        );
+        h.pin_aged(&h.dead_key(), &["329"]).await;
+        let before = h.valkey_now_ms().await;
+
+        let ((), warns) = super::tick_support::capture_warns(h.reconcile(&store, ACT_GRACE)).await;
+
+        assert_eq!(
+            torn.delete_log(),
+            vec![(81, CheckpointKind::Base)],
+            "fixture: 81 was reaped and 80's re-probe read `Live`"
+        );
+        assert_withdrawal_failure_kept_the_member(&h, "329", before, &warns).await;
+    }
+
+    /// **A walk cut short retires nothing (b.g65).** The withdrawal's `ZSCAN`
+    /// of `:deleting` ends without its terminal page (the scan-walk
+    /// truncation seam, armed for this test's own key), so the withdrawal
+    /// cannot know it found every announcement: it fails, and the member is
+    /// kept, re-dated, and deferred.
+    #[tokio::test]
+    async fn a_withdrawal_whose_scan_is_cut_short_re_dates_the_member_and_retires_nothing() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        const OID: u64 = 332;
+        seed_live_base(&*f.store, OID, 75, &[]).await;
+        plant_announcements(&h, &["332.75"]).await;
+        h.set_header_resurrected(OID, 1).await;
+        h.pin_aged(&h.dead_key(), &["332"]).await;
+        let before = h.valkey_now_ms().await;
+        let _armed = crate::storage::orphan_sweep::arm_scan_walk_truncation_for_test(
+            &h.tv.key_schema().checkpoint_reconcile_deleting(),
+            0,
+        );
+
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile(&f.store, ACT_GRACE)).await;
+
+        assert_withdrawal_failure_kept_the_member(&h, "332", before, &warns).await;
+        assert_eq!(
+            announced_for(&h, OID).await,
+            vec!["332.75".to_string()],
+            "nothing was withdrawn on a walk that did not finish"
+        );
+    }
+
+    /// **Withdraw by key, early-out (b.g65).** The object's announcements are
+    /// found on `:deleting` itself, not through a listing of its backups: two
+    /// planted stems name sequences the object's listing does not (a stale
+    /// listing omitting a base whose earlier delete failed reads the same),
+    /// and after the early-out's spared retire nothing of the object is
+    /// announced. Object `3301`'s announcement, a neighbour sharing the
+    /// leading digits, keeps its place.
+    #[tokio::test]
+    async fn the_live_early_out_withdraws_announcements_its_listing_does_not_name() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        const OID: u64 = 330;
+        seed_live_base(&*f.store, OID, 90, &[]).await;
+        plant_announcements(&h, &["330.88", "330.89", "3301.5"]).await;
+        h.set_header_resurrected(OID, 1).await;
+        h.pin_aged(&h.dead_key(), &["330"]).await;
+        assert_eq!(
+            listing(&*f.store, OID).await,
+            vec![(90, CheckpointKind::Base)],
+            "fixture: the listing names neither 88 nor 89"
+        );
+
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert_eq!(
+            announced_for(&h, OID).await,
+            Vec::<String>::new(),
+            "every announcement of the object is withdrawn, listed or not"
+        );
+        assert_eq!(
+            announced_for(&h, 3301).await,
+            vec!["3301.5".to_string()],
+            "another object's announcement stays"
+        );
+        assert!(
+            h.dead_candidates().await.is_empty(),
+            "the member is retired"
+        );
+        assert_eq!(h.reconcile_counter("dead_spared"), 1);
+    }
+
+    /// **Withdraw by key, same pass (b.g65).** As the early-out case, at the
+    /// per-generation re-probe's `Live` verdict: a planted announcement of a
+    /// base no listing names (`331.94`) is withdrawn with the reaped 96's
+    /// before the spared retire.
+    #[tokio::test]
+    async fn a_live_re_probe_withdraws_announcements_the_listing_does_not_name() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        const OID: u64 = 331;
+        seed_live_base(&*store, OID, 95, &[]).await;
+        seed_live_base(&*store, OID, 96, &[]).await;
+        plant_announcements(&h, &["331.94"]).await;
+        torn.mutate_header_after_first_delete(
+            h.tv.client(),
+            h.tv.key_schema(),
+            OID,
+            HeaderMutation::Live,
+        );
+        h.pin_aged(&h.dead_key(), &["331"]).await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            torn.delete_log(),
+            vec![(96, CheckpointKind::Base)],
+            "fixture: 96 was reaped and 95's re-probe read `Live`"
+        );
+        assert_eq!(
+            announced_for(&h, OID).await,
+            Vec::<String>::new(),
+            "the unlisted 94 and the reaped 96 are both withdrawn"
+        );
+        assert!(
+            h.dead_candidates().await.is_empty(),
+            "the member is retired"
+        );
+        assert_eq!(h.reconcile_counter("dead_spared"), 1);
     }
 
     /// b.vn6 review round 1 — a spent **orphan** deadline does NOT bound the
@@ -21978,7 +26112,7 @@ mod reconcile_tests {
     /// # The disposition
     ///
     /// `all_gone` is false and no re-probe found the header standing, so the
-    /// object is DEFERRED and stays registered at its original score — correct,
+    /// object is DEFERRED and stays registered, re-dated (b.g65, D4) — correct,
     /// and the half that matters: the newest generation still owes a reap, and
     /// retiring the member would be the permanent leak. The backlog gauge reads
     /// `1` for the same reason, which is what makes a fleet stuck this way
@@ -22014,6 +26148,7 @@ mod reconcile_tests {
         h.pin_aged(&h.dead_key(), &["327"]).await;
         torn.clear_logs();
 
+        let before_ms = h.valkey_now_ms().await;
         h.reconcile(&store, ACT_GRACE).await;
 
         assert_eq!(
@@ -22070,11 +26205,14 @@ mod reconcile_tests {
             "the member stays registered — generation 41 still owes a reap, and retiring here \
              would leave it as storage nothing in the service ever enumerates again"
         );
-        assert_eq!(
-            h.zscore(&h.dead_key(), "327").await,
-            Some(0.0),
-            "at its original first-observation score, so the next pass claims it immediately \
-             rather than re-serving a grace window"
+        let score = h
+            .zscore(&h.dead_key(), "327")
+            .await
+            .expect("the member is still registered");
+        assert!(
+            score >= before_ms as f64,
+            "re-dated to this pass's clock (b.g65, D4: {score} >= {before_ms}): a member whose \
+             sidecar read keeps failing moves behind the members after it"
         );
         assert_eq!(
             h.dead_backlog_gauge(),
@@ -22776,7 +26914,7 @@ mod reconcile_tests {
 
     /// G7 (PD-F1b) — a dead object whose own listing comes back empty while
     /// this pass's step (a) named one of its generations is NOT retired as
-    /// already clean: the member stays at its original score,
+    /// already clean: the member stays registered, re-dated (b.g65, D4),
     /// `dead_deferred` ticks, nothing is reaped, and the WARN says the two
     /// listings disagreed.
     ///
@@ -22817,7 +26955,7 @@ mod reconcile_tests {
 
     /// The G7 body: dead object `object_id` really holds `generation`, the
     /// store answers its per-object listing `Ok(vec![])`, and one pass must
-    /// keep the member at its original score, tick `dead_deferred`, reap
+    /// keep the member, re-dated, tick `dead_deferred`, reap
     /// nothing, leave the generation in place and WARN that the listings
     /// disagreed, naming the object.
     async fn assert_disagreeing_listings_keep_the_dead_member(
@@ -22854,6 +26992,7 @@ mod reconcile_tests {
              through the hooked store"
         );
 
+        let before_ms = h.valkey_now_ms().await;
         let ((), warns) = super::tick_support::capture_warns(h.reconcile(&store, ACT_GRACE)).await;
 
         assert_eq!(
@@ -22863,10 +27002,14 @@ mod reconcile_tests {
              {object_id}, so its empty per-object listing is one of two listings that disagreed, \
              not evidence that the object is clean"
         );
-        assert_eq!(
-            h.zscore(&h.dead_key(), &member).await,
-            Some(0.0),
-            "{generation:?}: at its original score, so the next pass re-checks it at once"
+        let score = h
+            .zscore(&h.dead_key(), &member)
+            .await
+            .expect("the member is still registered");
+        assert!(
+            score >= before_ms as f64,
+            "{generation:?}: re-dated to this pass's clock (b.g65, D4: {score} >= {before_ms}), \
+             so a disagreement that recurs does not head every claim; a later pass re-checks it"
         );
         assert_eq!(h.reconcile_counter("dead_deferred"), 1, "{generation:?}");
         assert_eq!(
@@ -23161,9 +27304,11 @@ mod reconcile_tests {
         assert_eq!(h.reconcile_counter("live_set_failed"), 0);
     }
 
-    /// Decider S1, at the collect: a sidecar the live-set walk listed that
-    /// then reads absent aborts the collect — no blob deleted, the tombstone
-    /// kept, `live_set_failed` +1.
+    /// Decider S1, at the collect, and N2's third arm (b.g65): a sidecar the
+    /// live-set walk listed that then reads absent, whose base the same
+    /// listing names complete and whose stem no deleter announced, aborts the
+    /// collect — no blob deleted, the tombstone kept, `live_set_failed` +1,
+    /// and a WARN naming the file.
     ///
     /// Base 660's sidecar names `NAMED`, which is tombstoned and aged. Its
     /// sidecar is swapped for a dangling symlink, so the LocalDisk walk names
@@ -23172,9 +27317,12 @@ mod reconcile_tests {
     /// live backup keeps the store populated and the rest of the live set
     /// non-empty, so the empty-live-set guard is not what spares `NAMED`.
     ///
-    /// Pre-fix the walk skipped the absent sidecar, returned a live set
-    /// without `NAMED`, and the collect deleted it while base 660 — whose
-    /// sidecar might only be unreadable, not gone — still named it.
+    /// Absence alone never licenses a delete: a stale not-found from the
+    /// storage service would otherwise delete a value base 660 — whose
+    /// sidecar might only be unreadable, not gone — still names. The two
+    /// explained absences are
+    /// `a_listed_sidecar_whose_backup_was_unfinished_when_listed_is_skipped_and_the_rest_collected`
+    /// and `a_listed_sidecar_whose_stem_a_deleter_announced_is_skipped_and_the_rest_collected`.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_listed_sidecar_that_reads_absent_aborts_the_collect_with_no_delete() {
@@ -23184,8 +27332,21 @@ mod reconcile_tests {
         let sidecar = seed_named_blob_behind_base_660(&h, &f, NAMED).await;
         crate::checkpoint::adapters::plant_dangling_sidecar(&sidecar);
 
-        h.reconcile(&f.store, ACT_GRACE).await;
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile(&f.store, ACT_GRACE)).await;
 
+        assert!(
+            warns
+                .lines()
+                .any(|line| line.contains("660.1.ext-refs.json")
+                    && line.contains("no deletion announced")),
+            "the WARN names the file that read absent; got:\n{warns}"
+        );
+        assert_eq!(
+            h.reconcile_counter("listed_sidecar_skipped"),
+            0,
+            "an unexplained absence is not a skip"
+        );
         assert!(
             f.store
                 .get_ext_blob(NAMED)
@@ -23228,68 +27389,123 @@ mod reconcile_tests {
         f.layers.join("660.1.ext-refs.json")
     }
 
-    /// Decider S1 (revised), C2: a listed sidecar that reads absent while a
-    /// PEER holds `le:checkpoint:leader` ends the collect as a lease loss — no
-    /// blob deleted, the tombstone kept, no `live_set_failed`, and the lease's
-    /// `lost` count up by one.
+    /// N2, first arm (b.g65): a listed sidecar that reads absent while the
+    /// SAME listing names no `.ompf` for its stem — a publish unfinished when
+    /// the walk passed it — is skipped (`listed_sidecar_skipped`), and the
+    /// collect goes on to delete what no other sidecar names.
     ///
-    /// The peer claims the lock inside the live-set walk
-    /// ([`EnumerationHook::PeerClaimsLockDuringLiveSetWalk`]), so the
-    /// collect's re-acquire on the failure arm finds it held elsewhere. That
-    /// peer's lease-gated
-    /// retention prune deletes exactly such sidecars, so the absence is
-    /// routine and must not count toward `LiveEditBackupCleanupBlocked`.
-    /// Before the revision this arm counted `live_set_failed` whoever led.
+    /// Safe because such a publish, if it completes, re-arms its hashes after
+    /// the collect's snapshot clock and the delete-time fence refuses them; if
+    /// it never completes it is not a backup. Before b.g65 any listed sidecar
+    /// that read absent aborted the collect, so `OTHER` survived.
+    ///
+    /// Stem 661 holds only a dangling sidecar (no OMPF, no meta) — the
+    /// residual a publish leaves between its first and second artifact, made
+    /// absent on read.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_listed_sidecar_that_reads_absent_under_a_peer_held_lease_ends_as_a_lease_loss() {
-        const NAMED: &str = "oya-named-under-a-peer-lease";
+    async fn a_listed_sidecar_whose_backup_was_unfinished_when_listed_is_skipped_and_the_rest_collected(
+    ) {
+        const OTHER: &str = "g65-n2-unfinished-other";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.plant_orphan_sidecar_only(661, 1, &["g65-n2-unfinished-named"])
+            .await;
+        crate::checkpoint::adapters::plant_dangling_sidecar(&f.layers.join("661.1.ext-refs.json"));
+        f.store
+            .put_ext_blob(OTHER, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.pin_aged(&h.tomb_key(), &[OTHER]).await;
+
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert_eq!(
+            h.reconcile_counter("listed_sidecar_skipped"),
+            1,
+            "the unfinished backup's absent sidecar is skipped on evidence"
+        );
+        assert_eq!(h.reconcile_counter("live_set_failed"), 0);
+        assert!(
+            f.store
+                .get_ext_blob(OTHER)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "and the collect deletes what no retained backup names"
+        );
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        let summary = h.last_summary();
+        assert_eq!(
+            (summary.skipped_unfinished, summary.skipped_announced),
+            (1, 0),
+            "the pass summary counts the skip by reason (D6)"
+        );
+    }
+
+    /// N2, second arm (b.g65): a listed sidecar that reads absent although the
+    /// same listing names its base complete is skipped when a deleter
+    /// announced the stem on `le:ckpt:{recon}:deleting` — it read and
+    /// tombstoned the base's hashes and decided the base is not retained — and
+    /// the collect deletes the value the base named.
+    ///
+    /// The announcement is planted here exactly as the deleters write it (the
+    /// orphan spelling `660.1`, scored now). Before b.g65 the collect aborted
+    /// on any such absence, so `NAMED` survived and every routine prune that
+    /// overlapped a walk stalled the clean-up.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listed_sidecar_whose_stem_a_deleter_announced_is_skipped_and_the_rest_collected() {
+        const NAMED: &str = "g65-n2-named-by-an-announced-base";
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
         let sidecar = seed_named_blob_behind_base_660(&h, &f, NAMED).await;
         crate::checkpoint::adapters::plant_dangling_sidecar(&sidecar);
-        let store =
-            HookedEnumerationStore::wrap_peer_claims_lock_during_live_set_walk(&f.store, &h);
-        let lost_before = h.lease_counter("lost");
+        let now_ms = h.valkey_now_ms().await;
+        let _: () =
+            h.tv.client()
+                .pool
+                .zadd(
+                    h.tv.key_schema().checkpoint_reconcile_deleting(),
+                    None,
+                    None,
+                    false,
+                    false,
+                    (now_ms as f64, "660.1"),
+                )
+                .await
+                .expect("announcing the stem must succeed");
 
-        h.reconcile(&store, ACT_GRACE).await;
+        h.reconcile(&f.store, ACT_GRACE).await;
 
+        assert_eq!(h.reconcile_counter("listed_sidecar_skipped"), 1);
+        assert_eq!(h.reconcile_counter("live_set_failed"), 0);
         assert!(
             f.store
                 .get_ext_blob(NAMED)
                 .await
                 .expect("get_ext_blob")
-                .is_some(),
-            "`{NAMED}` must survive: a listed sidecar that reads absent never licenses a delete"
+                .is_none(),
+            "the announced base is not retained, so the value it named is collected"
         );
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        let summary = h.last_summary();
         assert_eq!(
-            h.tombstones().await,
-            vec![NAMED.to_string()],
-            "the tombstone stays for the next pass"
-        );
-        assert_eq!(
-            h.reconcile_counter("live_set_failed"),
-            0,
-            "a peer holds the lease, so its prune explains the absence: the collect ends as a \
-             lease loss, not a live-set failure"
-        );
-        assert_eq!(h.reconcile_counter("ext_collected"), 0);
-        assert_eq!(
-            h.lease_counter("lost") - lost_before,
-            1,
-            "and it is counted where a lease loss is counted"
+            (summary.skipped_unfinished, summary.skipped_announced),
+            (0, 1)
         );
     }
 
-    /// Decider S1 (revised), C3 — scope: only the listed-sidecar-absent marker
-    /// is lease-qualified. A MALFORMED sidecar under the same peer-held lease
-    /// still counts `live_set_failed`, deletes nothing, and never consults the
-    /// lease (no `lost` tick).
+    /// A MALFORMED sidecar counts `live_set_failed`, deletes nothing, and the
+    /// collect's WARN names the file (b.g65 sub-task C: the error's Display
+    /// carries the artifact, `MalformedExtRefsSidecar`).
     ///
-    /// Its cause does not depend on who leads, and on a store whose every walk
-    /// outlasts the lease, routing it through the lease would hide it for good.
+    /// Unlike an absent sidecar, a malformed one is never skipped: it is not
+    /// evidence that a deleter or an unfinished publish explains, so N2 does
+    /// not apply.
     #[tokio::test]
-    async fn a_malformed_sidecar_under_a_peer_held_lease_still_counts_as_a_live_set_failure() {
+    async fn a_malformed_sidecar_counts_as_a_live_set_failure_and_its_warn_names_the_file() {
         const NAMED: &str = "oya-named-by-a-malformed-sidecar";
         let h = ReconcileHarness::new().await;
         let f = disk_fixture();
@@ -23297,11 +27513,9 @@ mod reconcile_tests {
         tokio::fs::write(&sidecar, b"not-json{{{".as_slice())
             .await
             .expect("overwriting the sidecar with malformed bytes must succeed");
-        let store =
-            HookedEnumerationStore::wrap_peer_claims_lock_during_live_set_walk(&f.store, &h);
-        let lost_before = h.lease_counter("lost");
 
-        h.reconcile(&store, ACT_GRACE).await;
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile(&f.store, ACT_GRACE)).await;
 
         assert!(
             f.store
@@ -23312,16 +27526,1906 @@ mod reconcile_tests {
             "no blob is deleted on a live set that could not be read"
         );
         assert_eq!(h.tombstones().await, vec![NAMED.to_string()]);
-        assert_eq!(
-            h.reconcile_counter("live_set_failed"),
-            1,
-            "a malformed sidecar counts whoever holds the lease"
+        assert_eq!(h.reconcile_counter("live_set_failed"), 1);
+        assert_eq!(h.reconcile_counter("listed_sidecar_skipped"), 0);
+        assert_eq!(h.reconcile_counter("ext_collected"), 0);
+        let path = sidecar.display().to_string();
+        assert!(
+            warns
+                .lines()
+                .any(|line| line.contains(&path) && line.contains("malformed")),
+            "the WARN names the malformed file ({path}); got:\n{warns}"
         );
+    }
+
+    // ── b.g65: the collect's delete-time license (R1–R8) ─────────────────
+    //
+    // Every case seeds an unrelated live backup, so the live set is non-empty
+    // and the walk's own listing named something: the b.oya empty-set guard is
+    // never what spares a value here.
+
+    /// **S2 (R4).** A tombstoned value no retained backup names, but which
+    /// Valkey still holds (`le:ext:meta:{H}` present), is DEFERRED, not
+    /// collected: its copy survives, `ext_deferred_live` ticks, and its
+    /// tombstone is re-dated to the pass's clock so the claim moves past it.
+    ///
+    /// A value Valkey holds is one a later backup can name — reused after its
+    /// last reference was pruned (an undo, a re-upload, the same asset in
+    /// another layer) — and nothing would ever re-create a deleted copy:
+    /// before b.g65 the collect deleted it here. No write path can protect
+    /// this case; only the Valkey check does.
+    #[tokio::test]
+    async fn collect_defers_a_tombstoned_value_valkey_still_holds_and_re_dates_its_tombstone() {
+        const H: &str = "g65-s2-still-in-valkey";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(H, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        plant_valkey_value(h.tv.client(), h.tv.key_schema(), H, b"bytes", 1, None).await;
+        h.pin_aged(&h.tomb_key(), &[H]).await;
+
+        let before_ms = h.valkey_now_ms().await;
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert!(
+            f.store
+                .get_ext_blob(H)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "a value Valkey still holds keeps its backup copy"
+        );
+        assert_eq!(h.reconcile_counter("ext_deferred_live"), 1);
+        assert_eq!(h.reconcile_counter("ext_collected"), 0);
+        let score = h
+            .zscore(&h.tomb_key(), H)
+            .await
+            .expect("the tombstone is kept");
+        assert!(
+            score >= before_ms as f64,
+            "and re-dated to this pass's clock ({score} >= {before_ms}), so it does not head \
+             every claim while the value stays live"
+        );
+        assert_eq!(
+            h.zscore(&h.tv.key_schema().checkpoint_reconcile_collected(), H)
+                .await,
+            None,
+            "nothing was licensed, so nothing is recorded as collected"
+        );
+    }
+
+    /// A `CheckpointStore` decorator over the disk fixture's adapter whose
+    /// live-set walk, AFTER the inner walk has listed and read everything,
+    /// publishes a base through the production publish path
+    /// (`put_guard::put_layer_checkpoint_if_live`, with a probe) — a base
+    /// assembled while the collect walked, whose sidecar the walk could not
+    /// see.
+    struct PublishesDuringTheWalk {
+        inner: Arc<dyn CheckpointStore>,
+        client: ValkeyClient,
+        keys: KeySchema,
+        object_id: u64,
+        snap_seq: u64,
+        hashes: Vec<String>,
+        published: std::sync::Mutex<Option<Result<bool, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointStore for PublishesDuringTheWalk {
+        async fn put_layer_checkpoint(
+            &self,
+            object_id: u64,
+            snap_seq: u64,
+            ompf: Bytes,
+            meta: CheckpointMeta,
+        ) -> Result<CheckpointHandle, CheckpointError> {
+            self.inner
+                .put_layer_checkpoint(object_id, snap_seq, ompf, meta)
+                .await
+        }
+        async fn get_latest_layer_checkpoint(
+            &self,
+            object_id: u64,
+        ) -> Result<Option<crate::checkpoint::store::CheckpointBlob>, CheckpointError> {
+            self.inner.get_latest_layer_checkpoint(object_id).await
+        }
+        async fn get_layer_checkpoint(
+            &self,
+            handle: &CheckpointHandle,
+        ) -> Result<Option<crate::checkpoint::store::CheckpointBlob>, CheckpointError> {
+            self.inner.get_layer_checkpoint(handle).await
+        }
+        async fn list_layer_checkpoints(
+            &self,
+            object_id: u64,
+        ) -> Result<Vec<CheckpointHandle>, CheckpointError> {
+            self.inner.list_layer_checkpoints(object_id).await
+        }
+        async fn delete_layer_checkpoint(
+            &self,
+            handle: CheckpointHandle,
+        ) -> Result<(), CheckpointError> {
+            self.inner.delete_layer_checkpoint(handle).await
+        }
+        async fn put_session_checkpoint(
+            &self,
+            session_id: &str,
+            body: Bytes,
+            meta: CheckpointMeta,
+        ) -> Result<CheckpointHandle, CheckpointError> {
+            self.inner
+                .put_session_checkpoint(session_id, body, meta)
+                .await
+        }
+        async fn get_session_checkpoint(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<crate::checkpoint::store::CheckpointBlob>, CheckpointError> {
+            self.inner.get_session_checkpoint(session_id).await
+        }
+        async fn delete_session_checkpoint(&self, session_id: &str) -> Result<(), CheckpointError> {
+            self.inner.delete_session_checkpoint(session_id).await
+        }
+        async fn list_session_checkpoint_ids(&self) -> Result<Vec<String>, CheckpointError> {
+            self.inner.list_session_checkpoint_ids().await
+        }
+        async fn put_ext_blob(&self, hash_hex: &str, bytes: Bytes) -> Result<(), CheckpointError> {
+            self.inner.put_ext_blob(hash_hex, bytes).await
+        }
+        async fn get_ext_blob(&self, hash_hex: &str) -> Result<Option<Bytes>, CheckpointError> {
+            self.inner.get_ext_blob(hash_hex).await
+        }
+        async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
+            self.inner.ext_blob_exists(hash_hex).await
+        }
+        async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
+            self.inner.delete_ext_blob(hash_hex).await
+        }
+        async fn put_counters_sidecar(&self, body: Bytes) -> Result<(), CheckpointError> {
+            self.inner.put_counters_sidecar(body).await
+        }
+        async fn get_counters_sidecar(&self) -> Result<Option<Bytes>, CheckpointError> {
+            self.inner.get_counters_sidecar().await
+        }
+        async fn list_all_object_ids(&self) -> Result<Vec<u64>, CheckpointError> {
+            self.inner.list_all_object_ids().await
+        }
+        async fn list_referenced_ext_hashes(
+            &self,
+        ) -> Result<std::collections::HashSet<String>, CheckpointError> {
+            self.inner.list_referenced_ext_hashes().await
+        }
+        async fn list_live_ext_set(
+            &self,
+        ) -> Result<crate::checkpoint::LiveExtSet, CheckpointError> {
+            let walked = self.inner.list_live_ext_set().await;
+            let hashes: Vec<&str> = self.hashes.iter().map(String::as_str).collect();
+            let published = crate::checkpoint::put_guard::put_layer_checkpoint_if_live(
+                Some(crate::checkpoint::put_guard::ObjectLivenessProbe::new(
+                    &self.client,
+                    &self.keys,
+                )),
+                &*self.inner,
+                self.object_id,
+                self.snap_seq,
+                Bytes::from_static(b"ompf"),
+                meta_with_sidecar(self.snap_seq, &hashes),
+                Instant::now(),
+                "reconcile-test publish during the walk",
+            )
+            .await;
+            *self.published.lock().expect("published mutex") =
+                Some(published.map(|h| h.is_some()).map_err(|e| e.to_string()));
+            walked
+        }
+        async fn read_ext_refs_sidecar(
+            &self,
+            handle: &CheckpointHandle,
+        ) -> Result<std::collections::HashSet<String>, CheckpointError> {
+            self.inner.read_ext_refs_sidecar(handle).await
+        }
+        async fn list_layer_artifacts(
+            &self,
+        ) -> Result<Vec<crate::checkpoint::store::LayerArtifact>, CheckpointError> {
+            self.inner.list_layer_artifacts().await
+        }
+        async fn delete_layer_temp_artifacts(
+            &self,
+            object_id: u64,
+            snap_seq: u64,
+        ) -> Result<usize, CheckpointError> {
+            self.inner
+                .delete_layer_temp_artifacts(object_id, snap_seq)
+                .await
+        }
+        fn publish_worst_case(&self) -> Duration {
+            self.inner.publish_worst_case()
+        }
+    }
+
+    /// **S1 (R2 and R3, not R4).** A base naming `H` publishes through the
+    /// production path while the collect walks — after the walk's listing, so
+    /// the live set does not name `H` — and `H` is not in Valkey, so the
+    /// liveness gate does not save it. The writer's pre-PUT re-arm lands after
+    /// the collect's snapshot threshold, so the delete-time fence refuses
+    /// (`ext_deferred_rearmed`), re-dates the tombstone, and the blob the new
+    /// base names survives. Before b.g65 the collect deleted it: an
+    /// unrestorable backup.
+    #[tokio::test]
+    async fn collect_refuses_to_delete_a_value_a_base_published_during_its_walk_names() {
+        const H: &str = "g65-s1-named-by-a-base-published-mid-walk";
+        const OID: u64 = 670;
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(H, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.pin_aged(&h.tomb_key(), &[H]).await;
+        // The publishing layer is live, so the pre-PUT liveness probe lets it
+        // through to the fence.
+        h.set_header_resurrected(OID, 1).await;
+        let decorated = Arc::new(PublishesDuringTheWalk {
+            inner: Arc::clone(&f.store),
+            client: h.tv.client().clone(),
+            keys: h.tv.key_schema().clone(),
+            object_id: OID,
+            snap_seq: 1,
+            hashes: vec![H.to_string()],
+            published: std::sync::Mutex::new(None),
+        });
+        let store: Arc<dyn CheckpointStore> = decorated.clone();
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            decorated.published.lock().expect("published mutex").clone(),
+            Some(Ok(true)),
+            "fixture: the base published during the walk"
+        );
+        assert!(
+            f.store
+                .get_ext_blob(H)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "the value the new base names keeps its backup copy"
+        );
+        assert_eq!(h.reconcile_counter("ext_deferred_rearmed"), 1);
         assert_eq!(h.reconcile_counter("ext_collected"), 0);
         assert_eq!(
-            h.lease_counter("lost") - lost_before,
+            h.reconcile_counter("ext_deferred_live"),
             0,
-            "and the failure arm does not consult the lease for it"
+            "R4 played no part"
+        );
+        assert!(
+            h.zscore(&h.tomb_key(), H).await.expect("tombstone kept") > 0.0,
+            "and the tombstone is re-dated (`XX GT`), so the drain moves past it"
+        );
+    }
+
+    /// **R1 anchoring.** The delete threshold is the `{recon}` clock read
+    /// immediately before the live-set walk, minus the grace — fixed for the
+    /// whole pass. A tombstone first recorded after that threshold, claimed by
+    /// a LATER batch of the same pass, is not deleted this pass (the fence
+    /// answers too young and the drain ends) and is deleted by the next.
+    ///
+    /// The late tombstone is recorded from inside the walk at the walk's own
+    /// Valkey clock minus the grace, so it is claimable at the pass's next
+    /// claim and still newer than the threshold; `EARLY`, aged, fills the
+    /// first batch. Before b.g65 the collect had no threshold and deleted it
+    /// in the pass whose snapshot predates it.
+    #[tokio::test]
+    async fn collect_anchors_its_delete_threshold_to_the_clock_read_before_its_walk() {
+        const EARLY: &str = "g65-r1-early";
+        const LATE: &str = "g65-r1-late";
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        for hash in [EARLY, LATE] {
+            f.store
+                .put_ext_blob(hash, Bytes::from_static(b"bytes"))
+                .await
+                .expect("put_ext_blob");
+        }
+        h.pin_aged(&h.tomb_key(), &[EARLY]).await;
+        let (client, tomb_key) = (h.tv.client().clone(), h.tomb_key());
+        let store = HookedEnumerationStore::wrap_on_live_set_walk(
+            &f.store,
+            Arc::new(move || {
+                let (client, tomb_key) = (client.clone(), tomb_key.clone());
+                Box::pin(async move {
+                    // Strictly after the snapshot clock, which the collect read
+                    // just before this walk.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    let walk_ms = crate::storage::ext_backup::valkey_time_ms(&client)
+                        .await
+                        .expect("TIME");
+                    let score = walk_ms.saturating_sub(millis_u64(ACT_GRACE));
+                    let _: () = client
+                        .pool
+                        .zadd(&tomb_key, None, None, false, false, (score as f64, LATE))
+                        .await
+                        .expect("recording the late tombstone must succeed");
+                })
+            }),
+        );
+
+        // ── Pass 1 ───────────────────────────────────────────────────────
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert!(
+            f.store
+                .get_ext_blob(EARLY)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "fixture: the first batch's member is collected"
+        );
+        assert!(
+            f.store
+                .get_ext_blob(LATE)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "a tombstone newer than this pass's snapshot threshold is not deleted against that \
+             snapshot, though a later batch of the same pass claimed it"
+        );
+        assert_eq!(h.tombstones().await, vec![LATE.to_string()]);
+
+        // ── Pass 2: a fresh snapshot, whose threshold is past it ─────────
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert!(
+            f.store
+                .get_ext_blob(LATE)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "the next pass, anchored to a later clock, collects it"
+        );
+        assert!(h.tombstones().await.is_empty());
+    }
+
+    /// A storage-api Enumerate over [`by_address_storage_api`]'s objects map
+    /// that answers by prefix, as storage-api does: a folder prefix (ending in
+    /// `/`) lists every object under it after `folder_delay`, and a partial
+    /// name (`layers/<oid>.`) lists that layer's objects at once; a prefix
+    /// naming nothing answers 404. `folder_delay` stands in for a whole-folder
+    /// listing of a large store — a development deployment measured about
+    /// 3–5 s for one — while a per-layer listing is one small page.
+    struct PrefixListing {
+        objects: BlindObjects,
+        folder_delay: Duration,
+    }
+
+    impl wiremock::Respond for PrefixListing {
+        fn respond(&self, request: &wiremock::Request) -> wiremock::ResponseTemplate {
+            use wiremock::ResponseTemplate;
+            let Some(encoded) = request
+                .url
+                .path()
+                .strip_prefix("/v1alpha/fileobject/data-objects/")
+            else {
+                return ResponseTemplate::new(400);
+            };
+            let Ok(prefix) = percent_encoding::percent_decode_str(encoded).decode_utf8() else {
+                return ResponseTemplate::new(400);
+            };
+            let items: Vec<serde_json::Value> = self
+                .objects
+                .lock()
+                .expect("fake objects mutex")
+                .keys()
+                .filter(|address| address.starts_with(prefix.as_ref()))
+                .map(|address| serde_json::json!({ "resource_address": address }))
+                .collect();
+            if items.is_empty() {
+                return ResponseTemplate::new(404);
+            }
+            let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_continuation_handle": null,
+                "items": items,
+            }));
+            if prefix.ends_with('/') {
+                response.set_delay(self.folder_delay)
+            } else {
+                response
+            }
+        }
+    }
+
+    /// **The development deployment's failure, end to end (b.g65: N4 + D2).**
+    /// A store whose whole-folder `layers/` listing is slow, more than one
+    /// claim (`RECONCILE_BATCH`) of deleted layers that are already clean, and
+    /// an aged tombstone no backup names: the pass makes progress on the
+    /// dead-object backlog AND its collect gets the time to read the live set
+    /// and collect the value.
+    ///
+    /// Before b.g65 each dead member cost one whole-folder listing and the
+    /// phase tested its deadline only once per claim of 100, so on a
+    /// development deployment one claim used the whole 540 s pass and the
+    /// collect started with a bound of 0 (`live_set_failed` on every pass,
+    /// nothing ever collected). Per-layer listings make each member one small
+    /// page (N4), and the per-member deadline caps an overrun at one member
+    /// (D2). Here the folder listing takes 200 ms against a 4 s pass: a claim
+    /// of 100 whole-folder listings would take 20 s.
+    ///
+    /// Either change alone keeps this test green, so its fail-on-old proof is
+    /// the pre-b.g65 shape with both D2 and N4 off. Each half is pinned on its
+    /// own: D2 by
+    /// `dead_object_phase_spends_the_deadline_it_was_handed_rather_than_minting_its_own`,
+    /// N4 by the `n4_per_layer_listing_tests` in `adapters::storage_api`.
+    #[tokio::test]
+    async fn slow_folder_listings_and_a_large_dead_backlog_leave_the_collect_its_time() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::Mock;
+        const UNREFERENCED: &str = "g65-slow-folder-unreferenced";
+        const PASS_BUDGET: Duration = Duration::from_secs(4);
+        let h = ReconcileHarness::new().await;
+        let (store, objects, server, _token_dir) = by_address_storage_api().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1alpha/fileobject/data-objects/"))
+            .respond_with(PrefixListing {
+                objects: Arc::clone(&objects),
+                folder_delay: Duration::from_millis(200),
+            })
+            .mount(&server)
+            .await;
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(UNREFERENCED, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.pin_aged(&h.tomb_key(), &[UNREFERENCED]).await;
+        let members: Vec<String> = (0..RECONCILE_BATCH + 10)
+            .map(|i| (12_000 + i).to_string())
+            .collect();
+        let refs: Vec<&str> = members.iter().map(String::as_str).collect();
+        h.pin_aged(&h.dead_key(), &refs).await;
+
+        let start = Instant::now();
+        h.reconcile_with_budget(
+            &store,
+            ACT_GRACE,
+            ReconcilePassBudget {
+                enumerate_deadline: start + PASS_BUDGET / 2,
+                orphan_deadline: start + PASS_BUDGET / 4,
+                dead_deadline: start + PASS_BUDGET / 2,
+                collect_deadline: start + PASS_BUDGET,
+            },
+        )
+        .await;
+
+        // The subject is the collect's time, not the dead phase's throughput:
+        // how many of the members the dead share retires depends on the
+        // runner, so only "it made progress" is asserted of it.
+        assert!(
+            h.reconcile_counter("dead_retired") >= 1,
+            "the dead-object phase made progress on the backlog"
+        );
+        assert_eq!(
+            h.reconcile_counter("live_set_failed"),
+            0,
+            "the collect's live-set walk had the time to finish"
+        );
+        assert!(
+            store
+                .get_ext_blob(UNREFERENCED)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "and the collect deleted the value no backup names"
+        );
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        let summary = h.last_summary();
+        assert!(
+            summary.collect_bound_secs > 0,
+            "the collect started with time left in its budget (D6's bound)"
+        );
+        assert_eq!(summary.collected, 1, "D6: collected");
+        assert!(summary.walk_listed > 0, "D6: the walk's own listing size");
+    }
+
+    /// **N2's precondition (b.g65):** every deleter of a base generation
+    /// announces its stem on `le:ckpt:{recon}:deleting` BEFORE it deletes the
+    /// generation — the retention prune, the orphan reap and the dead-object
+    /// reap here (the bootstrap's dead-base reap in
+    /// `first_base_bootstrap_test`). The store reads the announcement inside
+    /// each base delete. A collect whose walk listed such a base and then reads
+    /// its sidecar absent can only skip it on that announcement; a deleter that
+    /// announced after deleting would turn every prune that overlapped a walk
+    /// into an aborted collect, or — skipped without evidence — a lost value.
+    #[tokio::test]
+    async fn every_clean_up_deleter_announces_a_base_stem_before_deleting_it() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        torn.probe_announcements(h.tv.client(), h.tv.key_schema());
+        seed_unrelated_live_backup(&*store).await;
+        // The prune's victim: base 400.10 under a newer base 400.20.
+        seed_live_base(&*store, 400, 10, &["n2-prune-hash"]).await;
+        seed_live_base(&*store, 400, 20, &["n2-kept-hash"]).await;
+        // The orphan reap's victim: a stem with no OMPF.
+        f.plant_orphan(401, 1, &["n2-orphan-hash"]).await;
+        h.pin_aged(&h.orphans_key(), &["401.1"]).await;
+        // The dead reap's victim: a deleted layer's base.
+        seed_live_base(&*store, 402, 5, &["n2-dead-hash"]).await;
+        h.pin_aged(&h.dead_key(), &["402"]).await;
+
+        let listed = handles(&*store, 400).await;
+        h.prune(&*store, 400, listed, 1).await;
+        h.reconcile(&store, ACT_GRACE).await;
+
+        let mut seen = torn.announced_at_delete();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![(400, 10, true), (401, 1, true), (402, 5, true)],
+            "each deleter's base delete found its stem already announced"
+        );
+    }
+
+    /// **D4, dead phase.** A full claim (`RECONCILE_BATCH`) of dead members
+    /// that defer on every pass — each header still stands with
+    /// `superseded=1` — does not block the newer members behind it: each
+    /// deferred member is re-dated to the pass's clock (`ZADD XX GT`), so the
+    /// next claim of the same pass reaches the newer members and retires them.
+    ///
+    /// Before b.g65 a deferred member kept its first-observation score, the
+    /// claim (oldest first, 100 at a time) re-served the same 100 on every
+    /// claim and every pass, and nothing newer was ever reached — the stuck
+    /// backlog a flat dead-object gauge hides.
+    #[tokio::test]
+    async fn a_full_claim_of_permanently_deferring_dead_members_does_not_block_newer_ones() {
+        let h = ReconcileHarness::new().await;
+        let store: Arc<dyn CheckpointStore> = Arc::new(InMemoryCheckpointStore::new());
+        seed_unrelated_live_backup(&*store).await;
+        let stuck: Vec<u64> = (0..RECONCILE_BATCH as u64).map(|i| 13_000 + i).collect();
+        for oid in &stuck {
+            h.set_header_superseded(*oid, 1).await;
+        }
+        let stuck_members: Vec<String> = stuck.iter().map(u64::to_string).collect();
+        let refs: Vec<&str> = stuck_members.iter().map(String::as_str).collect();
+        h.pin_aged(&h.dead_key(), &refs).await;
+        // Newer than every stuck member, and claimable: first sighted at 1 ms
+        // past the epoch.
+        let newer = ["13900", "13901", "13902"];
+        for member in newer {
+            let _: () =
+                h.tv.client()
+                    .pool
+                    .zadd(h.dead_key(), None, None, false, false, (1.0, member))
+                    .await
+                    .expect("ZADD must succeed");
+        }
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        let left = h.dead_candidates().await;
+        for member in newer {
+            assert!(
+                !left.contains(&member.to_string()),
+                "the newer member {member} is reached and retired behind a full claim of \
+                 deferring ones"
+            );
+        }
+        assert_eq!(
+            left.len(),
+            stuck.len(),
+            "the deferring members stay registered"
+        );
+        assert_eq!(h.reconcile_counter("dead_deferred"), stuck.len() as u64);
+        assert_eq!(
+            h.reconcile_counter("dead_retired"),
+            newer.len() as u64,
+            "D5"
+        );
+    }
+
+    /// **D4, orphan phase.** A full claim of orphan stems whose reap fails on
+    /// every pass (the store refuses their delete) does not block the newer
+    /// orphans behind them: each failed member is re-dated, so the next claim
+    /// of the same pass reaches the newer stems and reaps them. Before b.g65
+    /// the failing members kept their scores and headed every claim.
+    #[tokio::test]
+    async fn a_full_claim_of_permanently_failing_orphans_does_not_block_newer_ones() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        let failing: Vec<u64> = (0..RECONCILE_BATCH as u64).map(|i| 14_000 + i).collect();
+        for oid in &failing {
+            f.plant_orphan_sidecar_only(*oid, 1, &[]).await;
+        }
+        torn.refuse_deletes_of_objects(failing.iter().copied());
+        let failing_members: Vec<String> = failing.iter().map(|oid| format!("{oid}.1")).collect();
+        let refs: Vec<&str> = failing_members.iter().map(String::as_str).collect();
+        h.pin_aged(&h.orphans_key(), &refs).await;
+        let newer = [14_900_u64, 14_901];
+        for oid in newer {
+            f.plant_orphan_sidecar_only(oid, 1, &[]).await;
+            let _: () =
+                h.tv.client()
+                    .pool
+                    .zadd(
+                        h.orphans_key(),
+                        None,
+                        None,
+                        false,
+                        false,
+                        (1.0, format!("{oid}.1").as_str()),
+                    )
+                    .await
+                    .expect("ZADD must succeed");
+        }
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        for oid in newer {
+            assert!(
+                !f.exists(&format!("{oid}.1.ext-refs.json")),
+                "the newer orphan {oid}.1 is reached and reaped behind a full claim of failing \
+                 ones"
+            );
+        }
+        assert!(
+            failing
+                .iter()
+                .all(|oid| f.exists(&format!("{oid}.1.ext-refs.json"))),
+            "fixture: every failing orphan's delete was refused"
+        );
+        assert_eq!(h.reconcile_counter("orphan_deleted"), newer.len() as u64);
+        let left = h.orphan_candidates().await;
+        assert_eq!(
+            left.len(),
+            failing.len(),
+            "the failing members stay registered for a later pass; the reaped ones retire"
+        );
+    }
+
+    /// **D6 (b.g65):** every clean-up pass the task runs ends with ONE INFO
+    /// summary line carrying each phase's duration and listing size, the
+    /// dead-object tally, the collect's bound, walk time and outcome, the
+    /// skipped absent sidecars by reason, and whether an older build stopped
+    /// the pass — the line that would have answered the development
+    /// deployment's "where does the pass go" question from a single read.
+    #[tokio::test]
+    async fn a_cleanup_pass_logs_one_summary_line_with_every_field() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        h.plant_current_build_checkpoint_leader().await;
+
+        let ((), infos) =
+            super::tick_support::capture_logs(tracing::Level::INFO, h.leader_tick(&f.store)).await;
+
+        let summaries: Vec<&str> = infos
+            .lines()
+            .filter(|line| line.contains("checkpoint clean-up pass complete"))
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "one summary line per pass; got:\n{infos}"
+        );
+        for field in [
+            "elapsed_ms=",
+            "orphan_listing_ms=",
+            "orphan_listed=",
+            "orphan_phase_ms=",
+            "orphan_deleted=",
+            "temp_deleted=",
+            "dead_phase_ms=",
+            "dead_claimed=",
+            "dead_listed_generations=",
+            "dead_retired=",
+            "dead_deferred=",
+            "dead_reaped=",
+            "collect_phase_ms=",
+            "collect_bound_secs=",
+            "walk_ms=",
+            "walk_listed=",
+            "collected=",
+            "spared=",
+            "deferred_live=",
+            "deferred_rearmed=",
+            "healed=",
+            "skipped_unfinished_sidecars=",
+            "skipped_announced_sidecars=",
+            "deferred_older_build=false",
+        ] {
+            assert!(
+                summaries[0].contains(field),
+                "the summary carries `{field}`: {}",
+                summaries[0]
+            );
+        }
+    }
+
+    /// `live_edit_valkey_pool_in_use{pool}` as rendered from `metrics`.
+    fn pool_in_use(metrics: &Metrics, pool: &str) -> Option<f64> {
+        crate::observability::metrics::test_util::sample_value(
+            &crate::observability::metrics::test_util::render(metrics),
+            "live_edit_valkey_pool_in_use",
+            &[("pool", pool)],
+        )
+    }
+
+    /// **Decider obligation (b), first half (b.g65):** the clean-up pass holds
+    /// no Valkey pool token while it waits on the backup store. The pass is
+    /// parked, in turn, at each of its three store waits:
+    ///
+    /// - the orphan phase's `list_layer_artifacts`;
+    /// - the collect's live-set walk, its longest HTTP read (a LIST plus one
+    ///   GET per sidecar);
+    /// - the collect's blob delete, between its Valkey-liveness check and the
+    ///   post-delete step.
+    ///
+    /// At each, `valkey_pool_in_use` reads 0 for every pool a pass could hold:
+    /// `txn` (the only exclusive pool), `maintenance` and `snapshot`. The
+    /// series are zero-seeded, so a 0 alone does not show tokens are counted.
+    /// The positive control at the first park takes a maintenance token on the
+    /// same client, sees the gauge read 1, drops it and sees 0 again.
+    /// Released, the pass finishes and collects.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_cleanup_pass_holds_no_valkey_pool_token_while_it_waits_on_the_store() {
+        use crate::storage::client::{POOL_LABEL_MAINTENANCE, POOL_LABEL_SNAPSHOT, POOL_LABEL_TXN};
+        const H: &str = "g65-b-walk-holds-nothing";
+        const PARKS: [&str; 3] = ["orphan listing", "live-set walk", "collect delete"];
+        let h = Arc::new(ReconcileHarness::new().await);
+        h.tv.client()
+            .install_observability_hooks(Arc::clone(&h.metrics))
+            .await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(H, Bytes::from_static(b"bytes"))
+            .await
+            .expect("put_ext_blob");
+        h.pin_aged(&h.tomb_key(), &[H]).await;
+
+        // Each park point reports its name, then waits for its own permit.
+        let (parked_tx, mut parked_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let gates: Arc<[tokio::sync::Semaphore; 3]> = Arc::new([
+            tokio::sync::Semaphore::new(0),
+            tokio::sync::Semaphore::new(0),
+            tokio::sync::Semaphore::new(0),
+        ]);
+        let park = {
+            let (parked_tx, gates) = (parked_tx.clone(), Arc::clone(&gates));
+            move |at: usize| {
+                let (parked_tx, gates) = (parked_tx.clone(), Arc::clone(&gates));
+                async move {
+                    parked_tx.send(PARKS[at]).expect("the test is listening");
+                    let _open = gates[at].acquire().await.expect("the gate is never closed");
+                }
+            }
+        };
+        let (torn, torn_store) = f.torn();
+        {
+            let park = park.clone();
+            torn.before_ext_delete(Arc::new(move |_hash: String| {
+                let park = park.clone();
+                Box::pin(async move { park(2).await })
+            }));
+        }
+        let walked = {
+            let park = park.clone();
+            HookedEnumerationStore::wrap_on_live_set_walk(
+                &torn_store,
+                Arc::new(move || {
+                    let park = park.clone();
+                    Box::pin(async move { park(1).await })
+                }),
+            )
+        };
+        let store = {
+            let park = park.clone();
+            HookedEnumerationStore::wrap_on_layer_artifacts(
+                &walked,
+                Arc::new(move || {
+                    let park = park.clone();
+                    Box::pin(async move { park(0).await })
+                }),
+            )
+        };
+        let pass = {
+            let (h, store) = (Arc::clone(&h), Arc::clone(&store));
+            tokio::spawn(async move { h.reconcile(&store, ACT_GRACE).await })
+        };
+
+        for (i, expected) in PARKS.iter().enumerate() {
+            let at = tokio::time::timeout(Duration::from_secs(10), parked_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("the pass reaches its {expected}"))
+                .expect("the park channel stays open");
+            assert_eq!(at, *expected, "fixture: the parks come in pass order");
+            for pool in [POOL_LABEL_TXN, POOL_LABEL_MAINTENANCE, POOL_LABEL_SNAPSHOT] {
+                assert_eq!(
+                    pool_in_use(&h.metrics, pool),
+                    Some(0.0),
+                    "no `{pool}` token is held while the pass waits on the store at its {at}"
+                );
+            }
+            if i == 0 {
+                let (_maint_pool, token) = h.tv.client().acquire_maintenance();
+                assert_eq!(
+                    pool_in_use(&h.metrics, POOL_LABEL_MAINTENANCE),
+                    Some(1.0),
+                    "positive control: a held maintenance token on this client is counted"
+                );
+                drop(token);
+                assert_eq!(
+                    pool_in_use(&h.metrics, POOL_LABEL_MAINTENANCE),
+                    Some(0.0),
+                    "positive control: and released when it drops"
+                );
+            }
+            gates[i].add_permits(1);
+        }
+
+        tokio::time::timeout(Duration::from_secs(10), pass)
+            .await
+            .expect("the pass finishes once every park is released")
+            .expect("the pass does not panic");
+        assert!(
+            f.store
+                .get_ext_blob(H)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "and collects"
+        );
+    }
+
+    /// The collect's heal fixture: an ext mirror budget of `budget_bytes` and
+    /// marks under `store_id`, and the sender (to hold or read the budget).
+    fn heal_fixture(
+        h: &ReconcileHarness,
+        budget_bytes: u64,
+        store_id: &str,
+    ) -> (
+        CollectHeal,
+        crate::checkpoint::ext_mirror::ExtMirrorSender,
+        crate::checkpoint::ext_mirror::ExtMirrorReceiver,
+    ) {
+        let (sender, receiver) = crate::checkpoint::ext_mirror::ext_mirror_channel(
+            4,
+            std::num::NonZeroU64::new(budget_bytes).expect("non-zero budget"),
+            Arc::clone(&h.metrics),
+        );
+        let marks = crate::storage::ext_backup::ExtBackupMarks::new(
+            h.tv.client().clone(),
+            h.tv.key_schema().clone(),
+            store_id.to_owned(),
+            Some(Arc::clone(&h.metrics)),
+        );
+        (CollectHeal::new(sender.clone(), marks), sender, receiver)
+    }
+
+    /// **R5 heal.** A store lands for `H` between the collect's liveness check
+    /// and its delete (the decorator writes the meta and data just before the
+    /// delete). The post-delete step finds the value live and the collect
+    /// heals: it re-puts the bytes from Valkey, charged to the ext mirror's
+    /// byte budget while the upload is in flight, confirms the copy
+    /// (`backed_up_in` under this store id), drops the delete's `:collected`
+    /// record and retires the tombstone; `ext_healed` ticks. Without the heal
+    /// the store's own mirror copy, possibly erased by the delete, would be the
+    /// only route back, and the value would read as backed up with no copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_heals_a_value_stored_between_its_liveness_check_and_its_delete() {
+        use crate::storage::ext_backup::BACKED_UP_IN_FIELD;
+        use fred::interfaces::HashesInterface;
+        const STORE_ID: &str = "0123456789abcdef";
+        const VALUE_LEN: usize = 4096;
+        let hash = format!("{:064x}", 0x4ea1_u64);
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client(), h.tv.key_schema());
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(&hash, Bytes::from_static(b"stale-copy"))
+            .await
+            .expect("put_ext_blob");
+        let value = vec![0x5a_u8; VALUE_LEN];
+        torn.before_ext_delete(store_lands_before_the_delete_of(
+            client,
+            keys,
+            &hash,
+            value.clone(),
+            1,
+            None,
+        ));
+        let (heal, sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+        // The heal's reliance start is a Valkey `TIME` read taken after the
+        // clear, and the confirm declines when `backup_cleared_ms` ≥ it (both
+        // in milliseconds), so a heal that reads the clock in the clear's own
+        // millisecond is declined — the specified tie-break, whose cost is one
+        // later existence check by the backup repair. To assert the
+        // confirmation deterministically, the whole budget is held until the
+        // clear has landed and 2 ms have passed: the heal reserves only after
+        // that, so its clock read is always in a later millisecond.
+        let held = sender
+            .try_reserve(64 * 1024 - 1024)
+            .expect("fixture: the test takes the whole budget");
+        let release = {
+            let (client, keys, hash) = (client.clone(), keys.clone(), hash.clone());
+            tokio::spawn(async move {
+                let cleared = async {
+                    loop {
+                        let cleared: Option<String> = client
+                            .pool
+                            .hget(
+                                keys.ext_meta(&hash),
+                                crate::storage::ext_backup::BACKUP_CLEARED_MS_FIELD,
+                            )
+                            .await
+                            .expect("HGET backup_cleared_ms");
+                        if cleared.is_some() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                };
+                let _ = tokio::time::timeout(Duration::from_secs(10), cleared).await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                drop(held);
+            })
+        };
+        let charged_during_upload = Arc::new(std::sync::Mutex::new(None));
+        {
+            let (sender, charged) = (sender.clone(), Arc::clone(&charged_during_upload));
+            torn.observe_ext_puts(Arc::new(move |_hash: &str| {
+                *charged.lock().expect("charged mutex") =
+                    Some(sender.budget_bytes() - sender.available_budget_bytes());
+            }));
+        }
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        torn.ext_put_log.lock().expect("ext-put-log mutex").clear();
+
+        h.reconcile_with_heal(&store, ACT_GRACE, &heal).await;
+        release.await.expect("the budget hold is released");
+
+        assert_eq!(
+            torn.ext_put_log(),
+            vec![hash.clone()],
+            "one re-put, of the healed value"
+        );
+        assert_eq!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .as_deref(),
+            Some(value.as_slice()),
+            "the backup copy is Valkey's bytes again"
+        );
+        assert_eq!(
+            charged_during_upload.lock().expect("charged mutex").clone(),
+            Some(crate::checkpoint::ext_mirror::item_charge_kib(VALUE_LEN as u64) * 1024),
+            "the heal's bytes are charged to the mirror's byte budget while its upload is in \
+             flight, at the value's charge — the read is never outside the budget"
+        );
+        assert_eq!(
+            sender.available_budget_bytes(),
+            sender.budget_bytes(),
+            "and the charge is returned once the upload is done"
+        );
+        assert_eq!(h.reconcile_counter("ext_healed"), 1);
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        assert_eq!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await,
+            None,
+            "a healed value's delete record is dropped"
+        );
+        assert!(h.tombstones().await.is_empty(), "and its tombstone retired");
+        let confirmation: Option<String> = client
+            .pool
+            .hget(keys.ext_meta(&hash), BACKED_UP_IN_FIELD)
+            .await
+            .expect("HGET backed_up_in");
+        assert!(
+            confirmation
+                .as_deref()
+                .is_some_and(|c| c.starts_with(&format!("{STORE_ID}:"))),
+            "the re-put copy is confirmed (its reliance start is the heal's own read, after the \
+             clear): {confirmation:?}"
+        );
+    }
+
+    /// **The heal's budget charge, and heal-on-keep (R5, R6).** With the ext
+    /// mirror's byte budget full, the heal gets no reservation within its wait:
+    /// it uploads nothing, and the delete's `:collected` record and the
+    /// tombstone are kept (`ext_healed` 0). Once the budget has room, the next
+    /// pass finds the value still live, keeps it (R4), sees the unsettled
+    /// record and heals it then — heal-on-keep — dropping the record.
+    ///
+    /// The test observes the upload only (`ext_put_log`); that the heal also
+    /// reads nothing from Valkey without a reservation is not observable here.
+    /// The failed-upload arm of the same rule is
+    /// `a_heal_whose_upload_fails_keeps_its_record_and_heals_on_keep`.
+    ///
+    /// Takes about 5 s: pass 1 waits out the heal's whole reservation wait
+    /// (`HEAL_RESERVE_WAIT`), because the arm under test is the one reached
+    /// only when that wait ends with no room.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heal_with_no_budget_room_uploads_nothing_and_keeps_its_record_for_heal_on_keep() {
+        const STORE_ID: &str = "0123456789abcdef";
+        const BUDGET: u64 = 8 * 1024;
+        let hash = format!("{:064x}", 0x4ea2_u64);
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client(), h.tv.key_schema());
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(&hash, Bytes::from_static(b"stale-copy"))
+            .await
+            .expect("put_ext_blob");
+        let value = vec![0x6b_u8; 2048];
+        torn.before_ext_delete(store_lands_before_the_delete_of(
+            client,
+            keys,
+            &hash,
+            value.clone(),
+            1,
+            None,
+        ));
+        let (heal, sender, _rx) = heal_fixture(&h, BUDGET, STORE_ID);
+        // The largest value whose charge is the whole budget: its size in KiB
+        // plus the one-KiB per-item allowance.
+        let held = sender
+            .try_reserve(BUDGET - 1024)
+            .expect("the test takes the whole budget");
+        assert_eq!(sender.available_budget_bytes(), 0, "fixture: no room");
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        torn.ext_put_log.lock().expect("ext-put-log mutex").clear();
+
+        // ── Pass 1: the budget has no room ───────────────────────────────
+        h.reconcile_with_heal(&store, ACT_GRACE, &heal).await;
+
+        assert!(
+            torn.ext_put_log().is_empty(),
+            "no reservation, so no upload"
+        );
+        assert_eq!(h.reconcile_counter("ext_healed"), 0);
+        assert!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await
+                .is_some(),
+            "the delete's record is kept for a later heal"
+        );
+        assert_eq!(
+            h.tombstones().await,
+            vec![hash.clone()],
+            "and so is the tombstone"
+        );
+        assert!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "fixture: the copy is deleted and not yet healed"
+        );
+
+        // ── Pass 2: room again; the value is still live and kept ─────────
+        drop(held);
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        h.reconcile_with_heal(&store, ACT_GRACE, &heal).await;
+
+        assert_eq!(
+            torn.ext_put_log(),
+            vec![hash.clone()],
+            "heal-on-keep re-puts it"
+        );
+        assert_eq!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .as_deref(),
+            Some(value.as_slice())
+        );
+        assert_eq!(
+            h.reconcile_counter("ext_deferred_live"),
+            1,
+            "pass 2 kept it (R4)"
+        );
+        assert_eq!(h.reconcile_counter("ext_healed"), 1);
+        assert_eq!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await,
+            None,
+            "and drops the record once the copy is back"
+        );
+    }
+
+    /// **A heal whose upload fails (R5).** A store lands for `H` between the
+    /// collect's liveness check and its delete, so the collect heals; the
+    /// heal's upload fails. The delete's `:collected` record and the
+    /// tombstone are kept (`ext_healed` 0), the tombstone re-dated behind the
+    /// backlog (D4), the copy stays deleted, and the heal's budget charge is
+    /// returned. With uploads working again, the next
+    /// pass keeps the value (R4) and heals it on keep, dropping the record.
+    /// Dropping the record on a failed upload would leave a value whose
+    /// backup copy is gone with nothing that ever puts it back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heal_whose_upload_fails_keeps_its_record_and_heals_on_keep() {
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0x4ea3_u64);
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client(), h.tv.key_schema());
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(&hash, Bytes::from_static(b"stale-copy"))
+            .await
+            .expect("put_ext_blob");
+        let value = vec![0x7c_u8; 2048];
+        torn.before_ext_delete(store_lands_before_the_delete_of(
+            client,
+            keys,
+            &hash,
+            value.clone(),
+            1,
+            None,
+        ));
+        let (heal, sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        torn.ext_put_log.lock().expect("ext-put-log mutex").clear();
+        torn.set_fail_ext_puts(true);
+        let before = h.valkey_now_ms().await;
+
+        // ── Pass 1: the heal's upload fails ──────────────────────────────
+        h.reconcile_with_heal(&store, ACT_GRACE, &heal).await;
+
+        assert_eq!(
+            torn.ext_put_log(),
+            vec![hash.clone()],
+            "fixture: the heal tried its upload"
+        );
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        assert_eq!(h.reconcile_counter("ext_healed"), 0);
+        assert!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await
+                .is_some(),
+            "the delete's record is kept for a later heal"
+        );
+        assert_eq!(
+            h.tombstones().await,
+            vec![hash.clone()],
+            "and so is the tombstone"
+        );
+        assert!(
+            h.zscore(&h.tomb_key(), &hash)
+                .await
+                .is_some_and(|s| s >= before as f64),
+            "re-dated behind the backlog (D4, F5), so a heal that keeps failing cannot hold the \
+             head of the oldest-first claim"
+        );
+        assert!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "the copy stays deleted"
+        );
+        assert_eq!(
+            sender.available_budget_bytes(),
+            sender.budget_bytes(),
+            "the heal's charge is returned"
+        );
+
+        // ── Pass 2: uploads work; the value is still live and kept ───────
+        torn.set_fail_ext_puts(false);
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        h.reconcile_with_heal(&store, ACT_GRACE, &heal).await;
+
+        assert_eq!(h.reconcile_counter("ext_healed"), 1, "healed on keep");
+        assert_eq!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .as_deref(),
+            Some(value.as_slice())
+        );
+        assert_eq!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await,
+            None,
+            "and the record is dropped once the copy is back"
+        );
+    }
+
+    /// **Heal-on-keep, value gone (R6).** A hash the live set spares, whose
+    /// copy an earlier collect deleted (its `:collected` record still there,
+    /// never settled) while Valkey no longer holds the value: there is nothing
+    /// to put back. The pass counts `ext_heal_unavailable` and WARNs naming the
+    /// hash — a retained backup names a value no copy is left of.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heal_on_keep_of_a_value_valkey_no_longer_holds_warns_naming_the_hash() {
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0x4ea3_u64);
+        let h = ReconcileHarness::new().await;
+        let keys = h.tv.key_schema();
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        seed_live_base(&*f.store, 671, 1, &[&hash]).await;
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        h.pin_aged(&keys.checkpoint_reconcile_collected(), &[&hash])
+            .await;
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+
+        let ((), warns) =
+            super::tick_support::capture_warns(h.reconcile_with_heal(&f.store, ACT_GRACE, &heal))
+                .await;
+
+        assert_eq!(h.reconcile_counter("ext_spared"), 1);
+        assert_eq!(h.reconcile_counter("ext_heal_unavailable"), 1);
+        assert_eq!(h.reconcile_counter("ext_healed"), 0);
+        assert!(
+            warns
+                .lines()
+                .any(|line| line.contains(&hash) && line.contains("no longer holds it")),
+            "the WARN names the hash; got:\n{warns}"
+        );
+    }
+
+    /// A spared hash with an unsettled delete record, as heal-on-keep finds
+    /// it (F3): base `<object_id>.1` names `hash`, so the collect's live set
+    /// spares it; its tombstone and a re-arm sit at the epoch, claimable; and
+    /// `:collected` holds the record of an earlier delete of its backup copy
+    /// that was never settled (a crash, or a heal that could not run).
+    async fn seed_spared_hash_with_a_delete_record(
+        h: &ReconcileHarness,
+        store: &dyn CheckpointStore,
+        object_id: u64,
+        hash: &str,
+    ) {
+        let keys = h.tv.key_schema();
+        seed_unrelated_live_backup(store).await;
+        seed_live_base(store, object_id, 1, &[hash]).await;
+        h.pin_aged(&h.tomb_key(), &[hash]).await;
+        h.pin_aged(&keys.checkpoint_reconcile_rearm(), &[hash])
+            .await;
+        let now = h.valkey_now_ms().await;
+        let _: () =
+            h.tv.client()
+                .pool
+                .zadd(
+                    keys.checkpoint_reconcile_collected(),
+                    None,
+                    None,
+                    false,
+                    false,
+                    ((now - 1_000) as f64, hash),
+                )
+                .await
+                .expect("ZADD :collected must succeed");
+    }
+
+    /// After a pass whose heal-on-keep of the spared `hash` did not land:
+    /// the hash keeps its tombstone, re-dated past `before_ms` (D4), its
+    /// re-arm and its delete record, so a later pass claims it again and
+    /// retries the heal.
+    async fn assert_spared_hash_kept_for_a_later_heal(
+        h: &ReconcileHarness,
+        hash: &str,
+        before_ms: u64,
+    ) {
+        let keys = h.tv.key_schema();
+        let tomb = h.zscore(&h.tomb_key(), hash).await;
+        assert!(
+            tomb.is_some_and(|s| s >= before_ms as f64),
+            "the tombstone stays, re-dated behind the backlog: {tomb:?}, pass start {before_ms}"
+        );
+        assert!(
+            h.zscore(&keys.checkpoint_reconcile_rearm(), hash)
+                .await
+                .is_some(),
+            "the re-arm stays"
+        );
+        assert!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), hash)
+                .await
+                .is_some(),
+            "and the delete record"
+        );
+    }
+
+    /// After a pass whose heal-on-keep of the spared `hash` landed: the
+    /// tombstone, the re-arm and the delete record are all gone.
+    async fn assert_spared_hash_retired_once_healed(h: &ReconcileHarness, hash: &str) {
+        let keys = h.tv.key_schema();
+        assert_eq!(h.reconcile_counter("ext_healed"), 1, "healed on keep");
+        assert_eq!(
+            h.zscore(&h.tomb_key(), hash).await,
+            None,
+            "tombstone retired"
+        );
+        assert_eq!(
+            h.zscore(&keys.checkpoint_reconcile_rearm(), hash).await,
+            None,
+            "re-arm retired"
+        );
+        assert_eq!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), hash).await,
+            None,
+            "delete record dropped"
+        );
+    }
+
+    /// **Heal-on-keep retries for a spared hash, value gone (F3).** Pass 1
+    /// finds the value gone from Valkey (`ext_heal_unavailable`): there is
+    /// nothing to put back, but a retained backup names the hash, so its
+    /// tombstone and re-arm are kept — the tombstone re-dated — rather than
+    /// retired with the record left behind, where no claim would ever serve
+    /// the hash again. Once the value is stored again, the next pass claims
+    /// it, heals it, and retires it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spared_hash_whose_heal_finds_the_value_gone_is_kept_until_a_later_heal() {
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0xf3a1_u64);
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_spared_hash_with_a_delete_record(&h, &*f.store, 673, &hash).await;
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+        let before = h.valkey_now_ms().await;
+
+        h.reconcile_with_heal(&f.store, ACT_GRACE, &heal).await;
+
+        assert_eq!(
+            h.reconcile_counter("ext_heal_unavailable"),
+            1,
+            "fixture: Valkey no longer holds the value"
+        );
+        assert_spared_hash_kept_for_a_later_heal(&h, &hash, before).await;
+
+        let value = vec![0x3f_u8; 1024];
+        plant_valkey_value(h.tv.client(), h.tv.key_schema(), &hash, &value, 1, None).await;
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        h.reconcile_with_heal(&f.store, ACT_GRACE, &heal).await;
+
+        assert_spared_hash_retired_once_healed(&h, &hash).await;
+        assert_eq!(
+            f.store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .as_deref(),
+            Some(value.as_slice()),
+            "the copy is back"
+        );
+    }
+
+    /// **Heal-on-keep retries for a spared hash, heal failed (F3).** Pass 1
+    /// has no heal wired (`HealOutcome::Failed`, as a full mirror budget, a
+    /// failed read or a failed upload give): the spared hash keeps its
+    /// tombstone, re-dated, its re-arm and its record. The next pass, with the
+    /// heal wired, claims it again, heals it and retires it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spared_hash_whose_heal_fails_is_kept_until_a_later_heal() {
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0xf3a2_u64);
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_spared_hash_with_a_delete_record(&h, &*f.store, 674, &hash).await;
+        let value = vec![0x3e_u8; 1024];
+        plant_valkey_value(h.tv.client(), h.tv.key_schema(), &hash, &value, 1, None).await;
+        let before = h.valkey_now_ms().await;
+
+        h.reconcile(&f.store, ACT_GRACE).await;
+
+        assert_eq!(h.reconcile_counter("ext_spared"), 1, "fixture: spared");
+        assert_eq!(h.reconcile_counter("ext_healed"), 0, "fixture: no heal ran");
+        assert_spared_hash_kept_for_a_later_heal(&h, &hash, before).await;
+
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        h.reconcile_with_heal(&f.store, ACT_GRACE, &heal).await;
+
+        assert_spared_hash_retired_once_healed(&h, &hash).await;
+    }
+
+    /// **D4, the collect: a failed blob delete (b.g65, F5).** A licensed
+    /// hash whose `delete_ext_blob` fails keeps its tombstone and its delete
+    /// record for a later pass, and the tombstone is re-dated to the pass's
+    /// clock, behind the rest of the backlog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_licensed_hash_whose_blob_delete_fails_is_re_dated_behind_the_backlog() {
+        let hash = format!("{:064x}", 0xf5a1_u64);
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(&hash, Bytes::from_static(b"copy"))
+            .await
+            .expect("put_ext_blob");
+        torn.refuse_ext_deletes_of([hash.as_str()]);
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        let before = h.valkey_now_ms().await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert!(
+            h.zscore(&h.tv.key_schema().checkpoint_reconcile_collected(), &hash)
+                .await
+                .is_some(),
+            "fixture: the fence licensed the delete and recorded it"
+        );
+        assert_eq!(
+            h.reconcile_counter("ext_collected"),
+            0,
+            "fixture: the delete failed"
+        );
+        assert!(
+            store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "fixture: the copy stands"
+        );
+        let tomb = h.zscore(&h.tomb_key(), &hash).await;
+        assert!(
+            tomb.is_some_and(|s| s >= before as f64),
+            "the tombstone is kept and re-dated: {tomb:?}, pass start {before}"
+        );
+    }
+
+    /// **D4, the collect: a failed post-delete step (b.g65, F5).** A licensed
+    /// hash whose blob delete lands but whose post-delete step
+    /// (`ext_backup_clear.lua`) fails — its meta reads `WRONGTYPE`, planted
+    /// just before the delete — keeps its tombstone and its record, the
+    /// tombstone re-dated to the pass's clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_licensed_hash_whose_post_delete_step_fails_is_re_dated_behind_the_backlog() {
+        let hash = format!("{:064x}", 0xf5a2_u64);
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        store
+            .put_ext_blob(&hash, Bytes::from_static(b"copy"))
+            .await
+            .expect("put_ext_blob");
+        {
+            let (client, meta) = (h.tv.client().clone(), h.tv.key_schema().ext_meta(&hash));
+            torn.before_ext_delete(Arc::new(move |_hash: String| {
+                let (client, meta) = (client.clone(), meta.clone());
+                Box::pin(async move {
+                    let _: () = client
+                        .pool
+                        .set(&meta, "not-a-hash", None, None, false)
+                        .await
+                        .expect("poisoning ext:meta must succeed");
+                })
+            }));
+        }
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        let before = h.valkey_now_ms().await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert_eq!(
+            h.reconcile_counter("ext_collected"),
+            1,
+            "fixture: the delete landed"
+        );
+        assert!(
+            h.zscore(&h.tv.key_schema().checkpoint_reconcile_collected(), &hash)
+                .await
+                .is_some(),
+            "the delete record is kept"
+        );
+        let tomb = h.zscore(&h.tomb_key(), &hash).await;
+        assert!(
+            tomb.is_some_and(|s| s >= before as f64),
+            "the tombstone is kept and re-dated: {tomb:?}, pass start {before}"
+        );
+    }
+
+    /// **D4, the collect: head of line (b.g65, F5).** A full claim
+    /// (`RECONCILE_BATCH`) of licensed hashes whose blob delete fails on every
+    /// pass does not block the newer collectable hash behind them: each
+    /// failed hash is re-dated after its batch, so the next claim of the same
+    /// pass reaches the newer one and collects it. Without the re-date the
+    /// failing hashes kept their scores, headed every claim, and the drain
+    /// ended on a claim of hashes it had already tried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_claim_of_permanently_failing_blob_deletes_does_not_block_newer_ones() {
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        let (torn, store) = f.torn();
+        seed_unrelated_live_backup(&*store).await;
+        let failing: Vec<String> = (0..RECONCILE_BATCH as u64)
+            .map(|i| format!("{:064x}", 0xf5_0000 + i))
+            .collect();
+        torn.refuse_ext_deletes_of(failing.iter().map(String::as_str));
+        let refs: Vec<&str> = failing.iter().map(String::as_str).collect();
+        h.pin_aged(&h.tomb_key(), &refs).await;
+        // Newer than every failing hash, and claimable: tombstoned 1 ms past
+        // the epoch.
+        let newer = format!("{:064x}", 0xf5_ffff_u64);
+        store
+            .put_ext_blob(&newer, Bytes::from_static(b"copy"))
+            .await
+            .expect("put_ext_blob");
+        let _: () =
+            h.tv.client()
+                .pool
+                .zadd(
+                    h.tomb_key(),
+                    None,
+                    None,
+                    false,
+                    false,
+                    (1.0, newer.as_str()),
+                )
+                .await
+                .expect("ZADD must succeed");
+        let before = h.valkey_now_ms().await;
+
+        h.reconcile(&store, ACT_GRACE).await;
+
+        assert!(
+            store
+                .get_ext_blob(&newer)
+                .await
+                .expect("get_ext_blob")
+                .is_none(),
+            "the newer hash is reached and collected behind a full claim of failing ones"
+        );
+        assert_eq!(h.zscore(&h.tomb_key(), &newer).await, None);
+        assert_eq!(h.reconcile_counter("ext_collected"), 1);
+        for hash in &failing {
+            let tomb = h.zscore(&h.tomb_key(), hash).await;
+            assert!(
+                tomb.is_some_and(|s| s >= before as f64),
+                "failing {hash} stays tombstoned, re-dated: {tomb:?}"
+            );
+        }
+    }
+
+    // ── The DR restore Job's recount and the collect (gate w5x1) ──────────
+    //
+    // After an un-hold every pod restarts and the collect runs before any
+    // restored layer has written a backup: it reads only the listed backups'
+    // sidecars and whether `le:ext:meta:{h}` exists (R4). The restore Job's
+    // authoritative recount (`storage::ext_reconcile::recount_authoritative`)
+    // is what keeps a value's last copy from that collect, in two shapes, T1
+    // and T2. Each runs the real recount (with a `before_write` that never
+    // refuses; the Job's permit is pinned end to end in the dr tests) and the
+    // real collect, and asserts the copy first, so a red run names the loss.
+    //
+    // Fail-on-old, each by an in-place perturbation (red, then green once
+    // restored): T1 with `ext_ref_count_set.lua` creating no missing meta
+    // (its `none` arm writing nothing) — the collect deletes the copy; T2
+    // with the recount's targets leaving the owed releases out — the GC
+    // drains the count to 0 and deletes the value, and the collect deletes
+    // the copy. R-heal with heal-on-keep's copy probe skipped — the pass
+    // WARNs and counts the value unavailable although its copy is present.
+
+    /// Object `object_id`'s header, one field row naming `hash` and its
+    /// index member, and an `obj:ext` field counting it: a layer the restore
+    /// left standing, as the recount's object walk reads it.
+    async fn seed_object_naming(h: &ReconcileHarness, object_id: u64, hash: &str) {
+        use fred::interfaces::HashesInterface;
+        let (client, keys) = (h.tv.client(), h.tv.key_schema());
+        let oid = object_id.to_string();
+        let member = KeySchema::field_member("1", "default");
+        let _: () = client
+            .pool
+            .hset(keys.obj_header(&oid), [("seq", "5")])
+            .await
+            .expect("HSET obj:hdr must succeed");
+        let _: () = client
+            .pool
+            .hset(
+                keys.obj_field_from_member(&oid, &member),
+                [("hash", hash), ("size", "5")],
+            )
+            .await
+            .expect("HSET the value row must succeed");
+        let _: () = client
+            .pool
+            .zadd(
+                keys.obj_fields_index(&oid),
+                None,
+                None,
+                false,
+                false,
+                (1.0, member.as_str()),
+            )
+            .await
+            .expect("ZADD obj:flds must succeed");
+        let _: () = client
+            .pool
+            .hset(keys.obj_ext_index(&oid), [(hash, "1")])
+            .await
+            .expect("HSET obj:ext must succeed");
+    }
+
+    /// The restore Job's recount over the harness's keyspace, which must
+    /// complete.
+    async fn recount_now(h: &ReconcileHarness) {
+        crate::storage::ext_reconcile::recount_authoritative(
+            h.tv.client(),
+            h.tv.key_schema(),
+            || async { Ok::<(), ()>(()) },
+        )
+        .await
+        .expect("the recount completes");
+    }
+
+    /// `hash`'s `ref_count`, `None` when its meta is absent.
+    async fn ref_count_of(h: &ReconcileHarness, hash: &str) -> Option<u64> {
+        use fred::interfaces::HashesInterface;
+        let raw: Option<String> =
+            h.tv.client()
+                .pool
+                .hget(h.tv.key_schema().ext_meta(hash), "ref_count")
+                .await
+                .expect("HGET ref_count must succeed");
+        raw.map(|v| v.parse().expect("a decimal count"))
+    }
+
+    /// Whether Valkey holds `hash`'s bytes.
+    async fn data_held(h: &ReconcileHarness, hash: &str) -> bool {
+        h.tv.client()
+            .pool
+            .exists::<bool, _>(h.tv.key_schema().ext_data(hash))
+            .await
+            .expect("EXISTS ext:data must succeed")
+    }
+
+    /// **T1 (gate w5x1, item 5).** A survivor's value h, added after its
+    /// last backup, whose Valkey slot the incident lost: the survivor's
+    /// `obj:ext` names h, Valkey holds no meta and no data for it, no listed
+    /// backup's sidecar names it, its backup copy is present, and an aged
+    /// tombstone for it (from before the incident) waits with no re-arm.
+    /// The recount creates h's meta at 1 with no data, so the collect after
+    /// the un-hold finds it live (R4) and defers it: the copy survives,
+    /// `ext_deferred_live` 1. Fail-on-old: with no missing meta created, the
+    /// collect deletes the last copy (`ext_collected` 1).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t1_the_recount_keeps_the_collect_from_deleting_a_survivors_value_whose_slot_was_lost()
+    {
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0x7171_u64);
+        let h = ReconcileHarness::new().await;
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(&hash, Bytes::from_static(b"value"))
+            .await
+            .expect("put_ext_blob");
+        seed_object_naming(&h, 7_101, &hash).await;
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+
+        recount_now(&h).await;
+        let count = ref_count_of(&h, &hash).await;
+        h.reconcile_with_heal(&f.store, ACT_GRACE, &heal).await;
+
+        assert!(
+            f.store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "the value's last copy survives the collect after the un-hold"
+        );
+        assert_eq!(h.reconcile_counter("ext_deferred_live"), 1);
+        assert_eq!(h.reconcile_counter("ext_collected"), 0);
+        assert_eq!(count, Some(1), "the recount created h's meta at 1");
+        assert!(
+            !data_held(&h, &hash).await,
+            "with no data: only the copy holds the bytes"
+        );
+    }
+
+    /// **T2 (gate w5x1, item 5).** A tail-carried value h the restore Job
+    /// backfilled (meta and data at 1, the backfill's `+1`), which a
+    /// restored object names, while a release of h from before the hold
+    /// waits on `{gc}:pending`; its backup copy is present, an aged
+    /// tombstone waits, and no listed sidecar names h. The recount sets h to
+    /// 2 (the object plus the owed release); the GC then drains the release
+    /// to 1 and the value stays; the collect defers it, so the copy
+    /// survives. Fail-on-old: with the owed releases left out of the
+    /// targets, the recount leaves 1, the GC drains it to 0 and deletes the
+    /// value, and the collect deletes the last copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t2_the_recount_counts_a_pre_hold_release_so_the_gc_and_the_collect_keep_the_value() {
+        use crate::storage::external_values::{
+            process_pending_gc, ExtRelease, GcPolicy, ValkeyExternalValueStore,
+        };
+        use fred::interfaces::SetsInterface;
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash_bytes = [0x72_u8; 32];
+        let hash = crate::storage::keys::sha256_to_hex(&hash_bytes);
+        let h = ReconcileHarness::new().await;
+        let (client, keys) = (h.tv.client(), h.tv.key_schema());
+        let f = disk_fixture();
+        seed_unrelated_live_backup(&*f.store).await;
+        f.store
+            .put_ext_blob(&hash, Bytes::from_static(b"value"))
+            .await
+            .expect("put_ext_blob");
+        seed_object_naming(&h, 7_201, &hash).await;
+        plant_valkey_value(client, keys, &hash, b"value", 1, None).await;
+        let _: u64 = client
+            .pool
+            .sadd(
+                keys.ext_pending(),
+                ExtRelease::retirement(hash_bytes, 7_299).member(),
+            )
+            .await
+            .expect("SADD pending must succeed");
+        h.pin_aged(&h.tomb_key(), &[&hash]).await;
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+
+        recount_now(&h).await;
+        let after_recount = ref_count_of(&h, &hash).await;
+        let gc = ValkeyExternalValueStore::new(client.clone(), keys.clone());
+        process_pending_gc(&gc, None, GcPolicy::IMMEDIATE).await;
+        let pending: Vec<String> = client
+            .pool
+            .smembers(keys.ext_pending())
+            .await
+            .expect("SMEMBERS pending must succeed");
+        let after_gc = (ref_count_of(&h, &hash).await, data_held(&h, &hash).await);
+        h.reconcile_with_heal(&f.store, ACT_GRACE, &heal).await;
+
+        assert!(
+            f.store
+                .get_ext_blob(&hash)
+                .await
+                .expect("get_ext_blob")
+                .is_some(),
+            "the value's last copy survives the GC drain and the collect"
+        );
+        assert_eq!(after_recount, Some(2), "the object plus the owed release");
+        assert!(pending.is_empty(), "fixture: the GC drained the release");
+        assert_eq!(after_gc, (Some(1), true), "the drain leaves the value at 1");
+        assert_eq!(h.reconcile_counter("ext_deferred_live"), 1);
+        assert_eq!(h.reconcile_counter("ext_collected"), 0);
+    }
+
+    /// **R-heal (PD-3).** Heal-on-keep of a spared hash whose delete record
+    /// was never settled, when Valkey holds the recount's meta without data:
+    /// with the backup copy present, nothing is put back and nothing is
+    /// wrong — no WARN, `ext_heal_unavailable` 0, `ext_healed` 0, one INFO,
+    /// and the tombstone, the re-arm and the record are settled. With the
+    /// copy absent the value's bytes are in no store, and the pass WARNs and
+    /// counts it unavailable, as before. Fail-on-old: with the copy probe
+    /// skipped, the present-copy case WARNs and counts it unavailable too
+    /// (24 h of false alarms after every restore).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heal_on_keep_of_a_meta_without_data_warns_only_when_the_copy_is_gone() {
+        use fred::interfaces::HashesInterface;
+        const STORE_ID: &str = "0123456789abcdef";
+        for copy_present in [true, false] {
+            let hash = format!("{:064x}", 0xbea1_u64);
+            let h = ReconcileHarness::new().await;
+            let keys = h.tv.key_schema();
+            let f = disk_fixture();
+            seed_spared_hash_with_a_delete_record(&h, &*f.store, 675, &hash).await;
+            let _: () =
+                h.tv.client()
+                    .pool
+                    .hset(keys.ext_meta(&hash), [("ref_count", "1")])
+                    .await
+                    .expect("HSET the recount's meta must succeed");
+            if copy_present {
+                f.store
+                    .put_ext_blob(&hash, Bytes::from_static(b"value"))
+                    .await
+                    .expect("put_ext_blob");
+            }
+            let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+
+            let ((), logs) = super::tick_support::capture_logs(
+                tracing::Level::INFO,
+                h.reconcile_with_heal(&f.store, ACT_GRACE, &heal),
+            )
+            .await;
+
+            let warned = logs
+                .lines()
+                .any(|l| l.contains(" WARN ") && l.contains(&hash));
+            assert_eq!(h.reconcile_counter("ext_healed"), 0, "nothing was put back");
+            if copy_present {
+                assert!(!warned, "no WARN with the copy present:\n{logs}");
+                assert_eq!(h.reconcile_counter("ext_heal_unavailable"), 0);
+                assert!(
+                    logs.lines().any(|l| l.contains(" INFO ")
+                        && l.contains(&hash)
+                        && l.contains("the backup store holds a copy again")),
+                    "one INFO says so:\n{logs}"
+                );
+                for (what, key) in [
+                    ("tombstone", h.tomb_key()),
+                    ("re-arm", keys.checkpoint_reconcile_rearm()),
+                    ("delete record", keys.checkpoint_reconcile_collected()),
+                ] {
+                    assert_eq!(h.zscore(&key, &hash).await, None, "the {what} is settled");
+                }
+            } else {
+                assert!(warned, "the bytes are in no store, so it WARNs:\n{logs}");
+                assert_eq!(h.reconcile_counter("ext_heal_unavailable"), 1);
+            }
+        }
+    }
+
+    /// **R-heal, a failed probe (PD-3).** The same heal-on-keep of the
+    /// recount's meta without data, when the backup store's existence check
+    /// fails: nothing is known about the copy, so the heal is `Failed` — its
+    /// delete record is kept for a later pass, nothing is counted
+    /// unavailable or healed, and the one WARN says the check failed, never
+    /// that the value is in no store. Needs `test-checkpoint-fault-injection`
+    /// (the probe's failure is injected); the probe's timeout arm, bounded
+    /// by the adapter's publish worst case, is not exercised.
+    #[cfg(feature = "test-checkpoint-fault-injection")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heal_on_keep_of_a_meta_without_data_whose_probe_fails_keeps_its_delete_record() {
+        use fred::interfaces::HashesInterface;
+        const STORE_ID: &str = "0123456789abcdef";
+        let hash = format!("{:064x}", 0xbea2_u64);
+        let h = ReconcileHarness::new().await;
+        let keys = h.tv.key_schema();
+        let f = disk_fixture_with_injector(Arc::new(super::tests::AlwaysErrInjector(
+            "ext_blob_exists",
+        )));
+        seed_spared_hash_with_a_delete_record(&h, &*f.store, 676, &hash).await;
+        let _: () =
+            h.tv.client()
+                .pool
+                .hset(keys.ext_meta(&hash), [("ref_count", "1")])
+                .await
+                .expect("HSET the recount's meta must succeed");
+        f.store
+            .put_ext_blob(&hash, Bytes::from_static(b"value"))
+            .await
+            .expect("put_ext_blob");
+        let (heal, _sender, _rx) = heal_fixture(&h, 64 * 1024, STORE_ID);
+
+        let ((), logs) = super::tick_support::capture_logs(
+            tracing::Level::INFO,
+            h.reconcile_with_heal(&f.store, ACT_GRACE, &heal),
+        )
+        .await;
+
+        let warns: Vec<&str> = logs
+            .lines()
+            .filter(|l| l.contains(" WARN ") && l.contains(&hash))
+            .collect();
+        assert_eq!(warns.len(), 1, "one WARN for the value:\n{logs}");
+        assert!(
+            warns[0].contains("could not check whether the backup store still holds a kept value")
+                && warns[0].contains("its existence check failed"),
+            "the WARN says the check failed:\n{logs}"
+        );
+        assert_eq!(h.reconcile_counter("ext_heal_unavailable"), 0);
+        assert_eq!(h.reconcile_counter("ext_healed"), 0);
+        assert!(
+            h.zscore(&keys.checkpoint_reconcile_collected(), &hash)
+                .await
+                .is_some(),
+            "the delete record is kept for a later pass"
         );
     }
 }
@@ -23692,17 +29796,27 @@ mod gate_tests {
 ///   publish call; driving it would mean racing a `CancellationToken` against
 ///   a SCAN page boundary for a five-line control-flow claim.
 /// - **The truncated-SCAN bypass** — a tick whose walk yielded an error item
-///   (a SCAN page that errored, or a walk that ended before its terminal page)
-///   sets `scan_truncated` and publishes nothing, because a maximum over an
-///   arbitrary keyspace prefix is a false all-clear that gauge last-value
-///   semantics would keep exporting. `scan_truncated` is a local in
-///   `run_one_tick`, set only by a live walk or a pass-1 lease loss, so it has
-///   no seam at this layer; the walk side is driven end to end instead,
-///   through `orphan_sweep`'s scan-walk truncation seam, by
-///   `lease_tests::tick_whose_pass_1_walk_ends_before_its_terminal_page_forfeits_the_aggregates`
+///   for a walk that did not reach every primary (`every_primary_walked()`
+///   false: a store fault ended it, a primary was left unwalked, an unproven
+///   pin's routing table was out of date, or the slot map changed) sets
+///   `scan_truncated` and publishes nothing, because a
+///   maximum over part of the keyspace is a false all-clear that gauge
+///   last-value semantics would keep exporting; an error item for a walk
+///   that walked every primary but could not prove a node's ownership, with
+///   the routing table matching its map, does not set it. `scan_truncated`
+///   is a local in `run_one_tick`, set only by a live walk or a pass-1 lease
+///   loss, so it has no seam at this layer; the walk side is driven end to
+///   end instead, through `storage::scan_guard`'s walk seam, by
+///   `lease_tests::tick_whose_pass_1_walk_does_not_reach_every_primary_forfeits_the_aggregates`
+///   (a failed step) and, cluster-gated,
+///   `lease_tests::cluster_tick_whose_pass_1_walk_found_a_stale_routing_table_forfeits_the_aggregates`
+///   (an out-of-date table)
 ///   (`test-checkpoint-fault-injection` fault-injects the *adapter*, not the
-///   Valkey client). The accumulator cannot observe it at all — suppression
-///   happens at the call site, one `if` above `publish`.
+///   Valkey client). The publishing half has no standalone seam (a
+///   standalone walk reads no `CLUSTER NODES`, so records no unproven
+///   ownership); its walk side is the cluster-gated walk tests'. The
+///   accumulator cannot observe either — suppression happens at the call
+///   site, one `if` above `publish`.
 /// - **The cursor-HSET-failure arm** — a layer whose blob landed but whose
 ///   cursor HSET failed is still pending to every later reader, so it records
 ///   via [`PendingAgeAccumulator::observe_pending`]. Reaching it needs the
@@ -24709,9 +30823,9 @@ pub(super) mod tick_support {
         LeaderIdentity::new(REPLICA_ID, TEST_LEADER_INSTANCE)
     }
 
-    /// [`test_leader`]'s lock value — what "our" lock holds.
+    /// [`test_leader`]'s checkpoint lock value (marked, b.g65) — what "our" lock holds.
     pub(super) fn our_lock_value() -> String {
-        test_leader().lock_value()
+        test_leader().checkpoint_lock_value()
     }
 
     /// A peer replica's identity — the value a "stolen lock" carries.
@@ -24736,7 +30850,8 @@ pub(super) mod tick_support {
     }
 
     /// [`lease_counter`] for an explicit `service` label — the reconciliation
-    /// harness labels its metrics with its own replica id.
+    /// harness labels its metrics with its own replica id (it reads the cells
+    /// to show a clean-up pass, which holds no lease, never ticks them).
     pub(super) fn lease_counter_for(metrics: &Metrics, outcome: &str, service: &str) -> u64 {
         sample_value(
             &render(metrics),
@@ -24757,12 +30872,15 @@ pub(super) mod tick_support {
 
     /// An `Instant` `d` in the past. `checked_sub` rather than `-` so the
     /// failure mode on a machine whose monotonic clock is younger than `d`
-    /// (only reachable within seconds of boot) is a named assertion instead of
-    /// an arithmetic panic.
+    /// (only reachable within the first minutes after boot) is a named
+    /// assertion instead of an arithmetic panic.
     fn instant_ago(d: Duration) -> Instant {
-        Instant::now()
-            .checked_sub(d)
-            .expect("monotonic clock must be at least LEASE_RENEW_INTERVAL past boot")
+        Instant::now().checked_sub(d).unwrap_or_else(|| {
+            panic!(
+                "fixture premise: the monotonic clock must be at least {d:?} past boot to \
+                 back-date a test lease's last refresh by that much"
+            )
+        })
     }
 
     /// A lease that believes it is held until `held_until_in` from now and
@@ -24782,15 +30900,216 @@ pub(super) mod tick_support {
         )
     }
 
+    /// A local lease deadline no test reaches: above nextest's 120 s kill
+    /// (`.config/nextest.toml`, 40 s × 3), so a lease built with it cannot
+    /// take the overshoot arm before its first refresh replaces the deadline,
+    /// however long the test runs up to that refresh.
+    pub(super) const FAR_DEADLINE: Duration = Duration::from_secs(600);
+
+    /// Server-side TTL for a leader lock whose TTL is not under test
+    /// (test-writing guide § Synchronization Patterns, rule (b): stage it far
+    /// ahead). Above nextest's 120 s kill, so no test outlives it.
+    pub(super) const WHOLE_TEST_LOCK_TTL_MS: i64 = 600_000;
+
+    /// The TTL of a [`lease_held_for_whole_test`] lease: three times
+    /// [`FAR_DEADLINE`], so its renewal interval (`ttl / 3`) is
+    /// [`FAR_DEADLINE`] too. It is never sent: no refresh of such a lease
+    /// falls due before nextest's kill, so no `PEXPIRE` carries it.
+    pub(super) const WHOLE_TEST_LEASE_TTL: Duration =
+        Duration::from_secs(3 * FAR_DEADLINE.as_secs());
+
+    /// The TTL of a [`lease_refreshed_only_at_its_first_gate`] lease, which
+    /// its one refresh `PEXPIRE`s the lock to. Below
+    /// [`WHOLE_TEST_LOCK_TTL_MS`], so a lock staged with
+    /// [`set_lock_for_whole_test`] reads a PTTL at or under this only once
+    /// that refresh has landed.
+    pub(super) const ONCE_REFRESH_TTL_MS: i64 = 360_000;
+
+    /// [`ONCE_REFRESH_TTL_MS`] as the lease's TTL. Its renewal interval
+    /// (`ttl / 3`, 120 s) is what keeps the second refresh past nextest's
+    /// 120 s kill.
+    pub(super) const ONCE_REFRESH_TTL: Duration = Duration::from_millis(ONCE_REFRESH_TTL_MS as u64);
+
+    /// A test-leader lease with the given TTL and deadlines, holding the lock
+    /// as our marked value. Every test lease that is not [`lease_for`]'s
+    /// production-TTL shape is built here.
+    fn lease_with(
+        lock_key: &str,
+        ttl: Duration,
+        held_until: Instant,
+        last_refresh: Instant,
+    ) -> CheckpointLease {
+        // The marked lock value from the one place a test lease takes it, so
+        // the struct literal below cannot drift from `with_deadlines`.
+        let lock_value = lease_for(lock_key, FAR_DEADLINE, Duration::ZERO)
+            .lock_value()
+            .to_owned();
+        CheckpointLease {
+            inner: LeaderLease::with_deadlines(
+                lock_key.to_owned(),
+                test_leader(),
+                ttl,
+                held_until,
+                last_refresh,
+            )
+            .with_lock_value(lock_value),
+        }
+    }
+
+    /// A lease that stays held for the whole test, whatever the test does
+    /// before or between its gates (test-writing guide § Synchronization
+    /// Patterns, rule (b)): use it wherever the lease is not the test's
+    /// subject.
+    ///
+    /// Its local deadline is [`FAR_DEADLINE`] away and it was refreshed just
+    /// now with a [`WHOLE_TEST_LEASE_TTL`] TTL, so its next refresh is also
+    /// [`FAR_DEADLINE`] away. Both are past nextest's 120 s kill, so no gate
+    /// and no [`TickLeaseKeeper`] wake refreshes it or finds it overrun in a
+    /// test nextest does not kill first: pass 1's whole-keyspace SCAN, a hot
+    /// writer's warm-up and a loaded scheduler bound nothing. Its lease
+    /// counters stay at zero.
+    ///
+    /// No gate reaches the store through it, but stage the lock as ours with
+    /// [`set_lock_for_whole_test`] anyway, so the store holds what a held
+    /// lease implies.
+    pub(super) fn lease_held_for_whole_test(lock_key: &str) -> CheckpointLease {
+        let now = Instant::now();
+        lease_with(lock_key, WHOLE_TEST_LEASE_TTL, now + FAR_DEADLINE, now)
+    }
+
+    /// A lease whose FIRST gate refreshes it, and whose next refresh falls due
+    /// only past nextest's 120 s kill: for a test whose subject is that one
+    /// refresh, counted exactly (`renewed == 1`).
+    ///
+    /// Built with a local deadline [`FAR_DEADLINE`] away and a last refresh
+    /// one renewal interval (`ONCE_REFRESH_TTL / 3`, 120 s) ago, so its first
+    /// `ensure_held` is due and refreshes, `PEXPIRE`ing the lock to
+    /// [`ONCE_REFRESH_TTL_MS`]; the next refresh is due 120 s after that
+    /// gate, however late it ran. Stage the lock as ours with
+    /// [`set_lock_for_whole_test`] first, so the refresh finds it held and a
+    /// PTTL at or under [`ONCE_REFRESH_TTL_MS`] proves the refresh landed.
+    ///
+    /// Premise: the monotonic clock is at least 120 s past boot, which the
+    /// back-dated last refresh needs; `instant_ago` panics by name if not.
+    pub(super) fn lease_refreshed_only_at_its_first_gate(lock_key: &str) -> CheckpointLease {
+        lease_with(
+            lock_key,
+            ONCE_REFRESH_TTL,
+            Instant::now() + FAR_DEADLINE,
+            instant_ago(ONCE_REFRESH_TTL / 3),
+        )
+    }
+
+    /// The per-test hang guard (test-writing guide § Synchronization
+    /// Patterns): a test takes one deadline this far from its start
+    /// ([`hang_guard_deadline`]) and bounds every positive wait and every
+    /// tick drive with it, so a regression that never reaches the awaited
+    /// state fails by name instead of being SIGKILLed silently. Below
+    /// nextest's 120 s kill (`.config/nextest.toml`, 40 s × 3). It is a hang
+    /// guard, not a timing claim: a healthy run reaches its state far inside
+    /// it, and a load-dependent count of ticks or probes never stands in for
+    /// it.
+    pub(super) const TEST_HANG_GUARD: Duration = Duration::from_secs(90);
+
+    /// The deadline [`TEST_HANG_GUARD`] from now. Take it once, at the start
+    /// of the test.
+    pub(super) fn hang_guard_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + TEST_HANG_GUARD
+    }
+
+    /// The TTL of a [`lease_lapsing_one_ttl_after_its_first_gate`] lease: the
+    /// lapse, measured from the first gate.
+    pub(super) const ANCHORED_LAPSE_TTL: Duration = Duration::from_millis(500);
+
+    /// The first put's block in a test whose lease lapses
+    /// [`ANCHORED_LAPSE_TTL`] after its first gate. Any delay at or above that
+    /// TTL places the lapse before the next gate; the extra 500 ms only makes
+    /// the inequality obvious to a reader.
+    pub(super) const ANCHORED_LAPSE_PUT_DELAY: Duration = Duration::from_secs(1);
+
+    /// A lease that lapses `ttl` after its FIRST gate, however late that gate
+    /// runs.
+    ///
+    /// Built with a refresh already due, a local deadline [`FAR_DEADLINE`]
+    /// away, and `ttl` as the lease's TTL. Its first `ensure_held` (pass 2's
+    /// gate 0) therefore refreshes, and `LeaderLease::ensure_held` sets
+    /// `held_until = now_at_gate + ttl`: the lapse is anchored at that gate,
+    /// after pass 1, however long pass 1 took. Pass 1 SCANs the whole
+    /// keyspace that every concurrent test shares, so nothing bounds it, and a
+    /// deadline measured from lease construction is a race against it. A wait
+    /// of at least `ttl` after gate 0 (a first-put delay, see
+    /// [`TestStore::with_first_put_delay`]) then puts the NEXT gate's `now` at
+    /// or past `held_until`, and that gate takes the overshoot arm. The one
+    /// clock relation left is "late gate ≥ early gate + delay", which load
+    /// only makes more true.
+    ///
+    /// Premises: gate 0 is the first gate, and no lease gate runs between it
+    /// and that wait.
+    ///
+    /// - Gate 0 is first because pass 1's keepalive counts only this test's
+    ///   matched `obj:hdr` keys: the SCAN's MATCH pattern carries the test's
+    ///   key prefix (`KeySchema::obj_header_scan_pattern`), so the keys of
+    ///   other tests that the walk passes over do not count. The tests that
+    ///   use this seed fewer than [`SCAN_PAGE`] headers, so the keepalive
+    ///   never fires. A test with `SCAN_PAGE` or more headers would anchor the
+    ///   lapse at a keepalive inside pass 1 instead, and the rest of the walk
+    ///   would race it.
+    /// - Nothing gates after gate 0 before the wait: the atomic read never
+    ///   polls the keeper, and the re-base gate runs only on `ChainFull`,
+    ///   which these fixtures never reach. So never use this lease off the
+    ///   atomic path — with [`fenced_path_client`], or on a layer above the
+    ///   atomic-read limits. There the keeper refreshes every `ttl / 3`
+    ///   (about 167 ms at [`ANCHORED_LAPSE_TTL`]) against a lock `PEXPIRE`d
+    ///   to `ttl`, so a keeper wake more than one TTL late would overshoot or
+    ///   find the lock lapsed mid-read: the wall-clock upper bound this lease
+    ///   exists to remove. The tail tick test relies on
+    ///   [`unprovable_cut_client`] keeping the shipped atomic-read limits.
+    ///
+    /// The TTL is the lapse mechanism and is NOT under test: the refresh
+    /// cadence (`ttl / 3`) and the refresh `PEXPIRE` value are not
+    /// production's. A test that pins either uses [`lease_for`], whose
+    /// production TTL `CheckpointLease::with_deadlines` keeps.
+    ///
+    /// Stage the lock as ours with [`set_lock_for_whole_test`] first: gate 0's
+    /// refresh must find it held, and that refresh shortens it to `ttl`, so a
+    /// later tick re-stages it.
+    pub(super) fn lease_lapsing_one_ttl_after_its_first_gate(
+        lock_key: &str,
+        ttl: Duration,
+    ) -> CheckpointLease {
+        lease_with(
+            lock_key,
+            ttl,
+            Instant::now() + FAR_DEADLINE,
+            instant_ago(ttl),
+        )
+    }
+
     /// SET `lock_key = value` with a [`SHORT_LOCK_TTL_MS`] expiry.
+    ///
+    /// Use only where an assertion reads the lock's PTTL and no pass 1 runs
+    /// before that read — a direct `ensure_held` call, never a tick: the 8 s
+    /// TTL lapses under anything that outlives it, and pass 1's
+    /// whole-keyspace SCAN is unbounded. Everything else uses
+    /// [`set_lock_for_whole_test`].
     pub(super) async fn set_lock(tv: &TestValkey, lock_key: &str, value: &str) {
+        set_lock_with_ttl(tv, lock_key, value, SHORT_LOCK_TTL_MS).await;
+    }
+
+    /// SET `lock_key = value` with a [`WHOLE_TEST_LOCK_TTL_MS`] expiry: the
+    /// lock's TTL is not under test, so no test outlives it.
+    pub(super) async fn set_lock_for_whole_test(tv: &TestValkey, lock_key: &str, value: &str) {
+        set_lock_with_ttl(tv, lock_key, value, WHOLE_TEST_LOCK_TTL_MS).await;
+    }
+
+    async fn set_lock_with_ttl(tv: &TestValkey, lock_key: &str, value: &str, ttl_ms: i64) {
         let _: () = tv
             .client()
             .pool
             .set(
                 lock_key,
                 value,
-                Some(fred::types::Expiration::PX(SHORT_LOCK_TTL_MS)),
+                Some(fred::types::Expiration::PX(ttl_ms)),
                 None,
                 false,
             )
@@ -24874,6 +31193,36 @@ pub(super) mod tick_support {
         capture_logs(tracing::Level::WARN, future).await
     }
 
+    /// [`capture_logs`], as JSON records (`{"level", "fields": {"message",
+    /// ..}}`), for a test that pins a line's level and structured fields: an
+    /// absent field is then a missing key, not a substring that happens not
+    /// to match.
+    pub(super) async fn capture_json_logs<F, T>(
+        level: tracing::Level,
+        future: F,
+    ) -> (T, Vec<serde_json::Value>)
+    where
+        F: std::future::Future<Output = T>,
+    {
+        let buf = Arc::new(StdMutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(CapturingWriter(buf.clone()))
+            .with_max_level(level)
+            .with_ansi(false)
+            .finish();
+        let value = future
+            .with_subscriber(tracing::Dispatch::new(subscriber))
+            .await;
+        let text = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        let records = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("each captured line is JSON"))
+            .collect();
+        (value, records)
+    }
+
     // ── Test CheckpointStore ─────────────────────────────────────────────
 
     /// `InMemoryCheckpointStore` plus three test seams:
@@ -24887,9 +31236,12 @@ pub(super) mod tick_support {
     ///   per-`object_id` put failure.
     ///
     /// The delay is what lets a test place the lease's expiry *between* two
-    /// layers without waiting on [`LEASE_RENEW_INTERVAL`]: set `held_until` a
-    /// second out, make the first layer's assembly take longer than that, and
-    /// the pre-prune `ensure_held` lands on the overshoot arm deterministically.
+    /// gates without waiting on [`LEASE_RENEW_INTERVAL`]. The delay is a lower
+    /// bound on the gap between the gate before the put and the gate after it,
+    /// so the deadline it beats must be anchored at the gate before the put
+    /// ([`lease_lapsing_one_ttl_after_its_first_gate`]), never at lease
+    /// construction: what runs between construction and that gate (pass 1) is
+    /// unbounded, and a construction-anchored deadline races it.
     ///
     /// The failure seam pairs with it to reproduce the *starvation* shape the
     /// head-of-line demotion exists for: a layer whose assembly burns the whole
@@ -24975,7 +31327,18 @@ pub(super) mod tick_support {
         fail_ext_puts: bool,
         empty_listings: AtomicBool,
         put_landed_hook: Option<PutLandedHook>,
+        /// b.g65 (R7): run once, inside the FIRST `get_layer_checkpoint`,
+        /// before it answers: the hook, then a sleep of the duration. See
+        /// [`TestStore::stalling_first_get`].
+        first_get_stall: StdMutex<Option<(GetStallHook, Duration)>>,
+        /// b.g65 (R7): what `publish_worst_case` answers instead of the inner
+        /// store's. See [`TestStore::with_publish_worst_case`].
+        publish_worst_case: Option<Duration>,
     }
+
+    /// The action [`TestStore::stalling_first_get`] runs inside the first
+    /// member fetch.
+    pub(super) type GetStallHook = Arc<dyn Fn() -> BoxedTestFuture + Send + Sync>;
 
     /// An async callback fired inside `put_layer_checkpoint` AFTER the
     /// generation has landed and immediately before the call returns (b.vn6).
@@ -25035,7 +31398,26 @@ pub(super) mod tick_support {
                 fail_ext_puts: false,
                 empty_listings: AtomicBool::new(false),
                 put_landed_hook: None,
+                first_get_stall: StdMutex::new(None),
+                publish_worst_case: None,
             }
+        }
+
+        /// Stall the FIRST `get_layer_checkpoint` (the re-base's gather): run
+        /// `hook`, then sleep `stall`, then answer. It places a write inside a
+        /// producer's read window, after its reliance start and well before
+        /// its PUT (b.g65, R7).
+        pub(super) fn stalling_first_get(self, hook: GetStallHook, stall: Duration) -> Self {
+            *self.first_get_stall.lock().expect("get-stall mutex") = Some((hook, stall));
+            self
+        }
+
+        /// Answer `publish_worst_case` with `d`: the clean-up fence adds it to
+        /// the producer's reliance window, so a small value makes the window
+        /// almost all reliance time.
+        pub(super) fn with_publish_worst_case(mut self, d: Duration) -> Self {
+            self.publish_worst_case = Some(d);
+            self
         }
 
         /// While `on`, every `list_layer_checkpoints` answers `Ok(vec![])`
@@ -25191,6 +31573,11 @@ pub(super) mod tick_support {
 
     #[async_trait]
     impl CheckpointStore for TestStore {
+        fn publish_worst_case(&self) -> Duration {
+            self.publish_worst_case
+                .unwrap_or_else(|| self.inner.publish_worst_case())
+        }
+
         async fn put_layer_checkpoint(
             &self,
             object_id: u64,
@@ -25258,6 +31645,11 @@ pub(super) mod tick_support {
                 return Err(CheckpointError::Transient {
                     source: "injected member-fetch failure (TestStore::failing_gets_at)".into(),
                 });
+            }
+            let stall = self.first_get_stall.lock().expect("get-stall mutex").take();
+            if let Some((hook, stall)) = stall {
+                hook().await;
+                tokio::time::sleep(stall).await;
             }
             self.inner.get_layer_checkpoint(handle).await
         }
@@ -25331,6 +31723,10 @@ pub(super) mod tick_support {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -26071,17 +32467,19 @@ pub(super) mod tick_support {
         (delta, Bytes::from(ompf))
     }
 
-    /// Upper bound on [`HotWriter::wait_until_quiet`]'s probe loop.
-    ///
-    /// Two thousand 1 ms probes ≈ 2 s of wall clock, the same shape and the same
-    /// budget [`HotWriter::wait_until_hot`] already uses — comfortably inside
-    /// `.config/nextest.toml`'s 40 s slow mark. The bound exists so a writer that
-    /// never parks fails with a fixture-shaped message instead of hanging until
-    /// the harness SIGKILLs the process and prints nothing.
-    const QUIET_POLL_ATTEMPTS: usize = 2_000;
+    /// Hang guard on each of [`HotWriter`]'s waits ([`HotWriter::wait_until_hot`],
+    /// [`HotWriter::wait_until_quiet`]) and on the self-guard's resume poll:
+    /// wall clock, never a count of probes, because a probe's cost (a
+    /// scheduler slot, an `HGETALL` against the shared Valkey) depends on load
+    /// and a count would be a time limit in disguise. A healthy writer meets
+    /// each wait in milliseconds; the guard exists so a writer that never
+    /// commits or never parks fails with a fixture-shaped message instead of
+    /// hanging until the harness SIGKILLs the process and prints nothing. Below
+    /// [`TEST_HANG_GUARD`], so the writer's own message wins.
+    const WRITER_HANG_GUARD: Duration = Duration::from_secs(30);
 
-    /// Interval between [`HotWriter::wait_until_quiet`] probes, and the interval
-    /// a paused writer parks for between re-reads of the pause flag.
+    /// Interval between [`HotWriter`]'s probes, and the interval a paused
+    /// writer parks for between re-reads of the pause flag.
     ///
     /// This is a PROBE INTERVAL, not a synchronisation delay: every wait in this
     /// module resolves on observable state (the writer's `idle` flag, then the
@@ -26269,20 +32667,19 @@ pub(super) mod tick_support {
         ///
         /// Polls a counter rather than sleeping a guessed interval — a bare
         /// `sleep` here would be exactly the coordination-by-timing the test
-        /// guide forbids.
+        /// guide forbids — under [`WRITER_HANG_GUARD`].
         pub(super) async fn wait_until_hot(&self, n: u64) {
-            for _ in 0..2_000 {
-                if self.commits.load(Ordering::Relaxed) >= n {
-                    return;
+            let hot = tokio::time::timeout(WRITER_HANG_GUARD, async {
+                while self.commits.load(Ordering::Relaxed) < n {
+                    tokio::time::sleep(QUIET_POLL_INTERVAL).await;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-            panic!(
-                "hot writer never landed {n} commits: {}",
-                WriterReport {
-                    commits: self.commits.load(Ordering::Relaxed),
-                    error: self.error.lock().expect("writer-error mutex").clone(),
-                }
+            })
+            .await;
+            assert!(
+                hot.is_ok(),
+                "hot writer never landed {n} commits within its {WRITER_HANG_GUARD:?} hang guard: \
+                 {}",
+                self.report()
             );
         }
 
@@ -26311,11 +32708,11 @@ pub(super) mod tick_support {
         ///    downstream actually read, so a writer that lied about being idle
         ///    still fails here.
         ///
-        /// Bounded by [`QUIET_POLL_ATTEMPTS`] × [`QUIET_POLL_INTERVAL`], and the
-        /// exhaustion panic quotes the [`WriterReport`] for the same reason every
-        /// other precondition failure in this module does: a writer that DIED and
-        /// a writer that is ignoring the pause flag produce the same symptom
-        /// otherwise.
+        /// Both predicates together are bounded by one [`WRITER_HANG_GUARD`],
+        /// and each exhaustion panic quotes the [`WriterReport`] for the same
+        /// reason every other precondition failure in this module does: a
+        /// writer that DIED and a writer that is ignoring the pause flag produce
+        /// the same symptom otherwise.
         pub(super) async fn wait_until_quiet(&self, tv: &TestValkey, object_id: u64) -> u64 {
             assert!(
                 self.paused.load(Ordering::Relaxed),
@@ -26323,33 +32720,40 @@ pub(super) mod tick_support {
                  wait: a running writer commits continuously, so the only way this could \
                  return is a coincidence between two probes"
             );
-            for _ in 0..QUIET_POLL_ATTEMPTS {
-                if self.idle.load(Ordering::Relaxed) {
-                    break;
+            let deadline = tokio::time::Instant::now() + WRITER_HANG_GUARD;
+            let parked = tokio::time::timeout_at(deadline, async {
+                while !self.idle.load(Ordering::Relaxed) {
+                    tokio::time::sleep(QUIET_POLL_INTERVAL).await;
                 }
-                tokio::time::sleep(QUIET_POLL_INTERVAL).await;
-            }
+            })
+            .await;
             assert!(
-                self.idle.load(Ordering::Relaxed),
-                "the hot writer never parked within {QUIET_POLL_ATTEMPTS} probes of pause(): {}",
+                parked.is_ok(),
+                "the hot writer never parked within its {WRITER_HANG_GUARD:?} hang guard of \
+                 pause(): {}",
                 self.report()
             );
 
-            let mut previous: Option<u64> = None;
-            for _ in 0..QUIET_POLL_ATTEMPTS {
-                let seq = header_seq(tv, object_id).await;
-                if previous == Some(seq) {
-                    return seq;
+            let settled = tokio::time::timeout_at(deadline, async {
+                let mut previous: Option<u64> = None;
+                loop {
+                    let seq = header_seq(tv, object_id).await;
+                    if previous == Some(seq) {
+                        return seq;
+                    }
+                    previous = Some(seq);
+                    tokio::time::sleep(QUIET_POLL_INTERVAL).await;
                 }
-                previous = Some(seq);
-                tokio::time::sleep(QUIET_POLL_INTERVAL).await;
-            }
-            panic!(
-                "layer {object_id}'s obj:hdr seq never held still across two consecutive reads \
-                 after the writer reported itself parked — something other than this HotWriter \
-                 is committing to it: {}",
-                self.report()
-            );
+            })
+            .await;
+            settled.unwrap_or_else(|_| {
+                panic!(
+                    "layer {object_id}'s obj:hdr seq never held still across two consecutive \
+                     reads within the writer's {WRITER_HANG_GUARD:?} hang guard after it reported \
+                     itself parked — something other than this HotWriter is committing to it: {}",
+                    self.report()
+                )
+            })
         }
 
         /// Snapshot the writer's state WITHOUT stopping it — the shape a
@@ -26435,9 +32839,9 @@ pub(super) mod tick_support {
 
     // ── The bounded cycle driver ─────────────────────────────────────────
 
-    /// What the winning tick of a bounded drive moved.
+    /// What the winning tick of a drive moved.
     ///
-    /// # The three widened fields
+    /// # The widened fields
     ///
     /// `ticks` / `unverified` / `tail_captured` / `skipped_layer` /
     /// `success_layer_tail` are the landed set, untouched. `rebased`,
@@ -26445,12 +32849,19 @@ pub(super) mod tick_support {
     /// `t3.dfh.be.hm.hq` — a multi-cycle lifecycle asserts `tail_total{rebased}`
     /// +1 and `writes_total{success, layer}` +1 on the collapse tick, and a
     /// VERIFIED stable-cut decision on the natural-supersession one, none of
-    /// which the landed five could express. Adding fields rather than replacing
-    /// any is what keeps every existing consumer reading exactly what it read.
+    /// which the landed five could express. `tail_captured_capped` was added
+    /// the same way (b.2d8): a capture whose window holds more than
+    /// `max_entries` commits persists a cap-bounded prefix and counts
+    /// `captured_capped` instead of `captured`, and how far a hot writer runs
+    /// ahead of the lineage head depends on load, so a test whose subject is
+    /// "exactly one capture landed" sums the two. Adding fields rather than
+    /// replacing any is what keeps every existing consumer reading exactly
+    /// what it read.
     pub(super) struct TickDeltas {
         pub(super) ticks: usize,
         pub(super) unverified: u64,
         pub(super) tail_captured: f64,
+        pub(super) tail_captured_capped: f64,
         pub(super) skipped_layer: f64,
         pub(super) success_layer_tail: f64,
         pub(super) rebased: f64,
@@ -26470,6 +32881,7 @@ pub(super) mod tick_support {
         unverified: u64,
         stable_cut_verified: u64,
         tail_captured: f64,
+        tail_captured_capped: f64,
         rebased: f64,
         skipped_layer: f64,
         success_layer_tail: f64,
@@ -26482,6 +32894,7 @@ pub(super) mod tick_support {
                 unverified: stable_cut_cell(metrics, "unverified"),
                 stable_cut_verified: stable_cut_cell(metrics, "verified"),
                 tail_captured: tail_cell(metrics, "captured").expect("zero-seeded"),
+                tail_captured_capped: tail_cell(metrics, "captured_capped").expect("zero-seeded"),
                 rebased: tail_cell(metrics, "rebased").expect("zero-seeded"),
                 skipped_layer: writes_cell(metrics, "skipped", "layer").expect("zero-seeded"),
                 success_layer_tail: writes_cell(metrics, "success", "layer_tail")
@@ -26495,6 +32908,7 @@ pub(super) mod tick_support {
                 ticks,
                 unverified: self.unverified - before.unverified,
                 tail_captured: self.tail_captured - before.tail_captured,
+                tail_captured_capped: self.tail_captured_capped - before.tail_captured_capped,
                 skipped_layer: self.skipped_layer - before.skipped_layer,
                 success_layer_tail: self.success_layer_tail - before.success_layer_tail,
                 rebased: self.rebased - before.rebased,
@@ -26543,6 +32957,14 @@ pub(super) mod tick_support {
     /// need, and a bare integer at the call site is unreviewable — a lifecycle
     /// test's phases legitimately differ (a capture lands in one tick, a
     /// re-base needs the chain to reach K first).
+    ///
+    /// A tick budget is for a phase whose tick count is itself the claim —
+    /// "this arm is reached on its first tick" — and only under a lease that
+    /// no gate can lose ([`lease_held_for_whole_test`]), where the count is
+    /// deterministic. A drive that only has to get there EVENTUALLY uses
+    /// [`drive_until_state`], whose only bound is the test's wall-clock hang
+    /// guard: a count of ticks is a time limit in disguise when what each
+    /// tick must achieve depends on scheduling.
     ///
     /// The predicate takes OWNED clones (both are `Arc`s) rather than
     /// references, so a call site can write `|store, _metrics| async move { … }`
@@ -26608,6 +33030,61 @@ pub(super) mod tick_support {
         match drive_until(driver, lease, demotion, budget, predicate).await {
             Some(deltas) => deltas,
             None => panic!("{}", drive_exhaustion_report(driver, what, budget).await),
+        }
+    }
+
+    /// Drive `run_one_tick` until `predicate` holds, bounded only by the
+    /// test's hang-guard `deadline` ([`hang_guard_deadline`]), never by a
+    /// count of ticks (test-writing guide § Synchronization Patterns): how
+    /// many ticks a hot-writer fixture needs before its state holds depends on
+    /// scheduling, so a count would be a wall-clock bound in disguise.
+    ///
+    /// Returns the WINNING tick's deltas, measured per-iteration exactly as
+    /// [`drive_until`]'s are. On expiry it panics with
+    /// [`drive_exhaustion_report`] over the ticks it spent, naming the guard;
+    /// a tick in flight at the deadline is dropped, and a fenced read's lease
+    /// guard spawns its release as it drops.
+    pub(super) async fn drive_until_state<P, Fut>(
+        driver: &TickDriver<'_>,
+        lease: &mut CheckpointLease,
+        demotion: &mut Option<u64>,
+        deadline: tokio::time::Instant,
+        what: &str,
+        mut predicate: P,
+    ) -> TickDeltas
+    where
+        P: FnMut(Arc<TestStore>, SharedMetrics) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let cancel = CancellationToken::new();
+        let mut ticks = 0usize;
+        let reached = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let before = TickCells::read(driver.metrics);
+                run_one_tick(
+                    driver.client,
+                    driver.keys,
+                    driver.store,
+                    driver.config,
+                    Some(driver.metrics),
+                    &cancel,
+                    lease,
+                    demotion,
+                )
+                .await;
+                if predicate(Arc::clone(driver.test_store), Arc::clone(driver.metrics)).await {
+                    return TickCells::read(driver.metrics).since(&before, ticks);
+                }
+            }
+        })
+        .await;
+        match reached {
+            Ok(deltas) => deltas,
+            Err(_) => panic!(
+                "{}\n  hang guard: the test's {TEST_HANG_GUARD:?} deadline passed first",
+                drive_exhaustion_report(driver, what, ticks).await
+            ),
         }
     }
 
@@ -26788,20 +33265,23 @@ pub(super) mod tick_support {
         );
 
         writer.resume();
-        // Bounded poll on observable state, exactly as `wait_until_hot` does —
-        // "the seq moved" is the predicate, not an elapsed interval.
-        let mut resumed_at = quiesced_at;
-        for _ in 0..QUIET_POLL_ATTEMPTS {
-            resumed_at = header_seq(&tv, layer.object_id).await;
-            if resumed_at > quiesced_at {
-                break;
+        // A poll on observable state under the writer's wall-clock hang guard,
+        // exactly as `wait_until_hot` does — "the seq moved" is the predicate,
+        // not an elapsed interval or a count of probes.
+        let resumed = tokio::time::timeout(WRITER_HANG_GUARD, async {
+            loop {
+                let seq = header_seq(&tv, layer.object_id).await;
+                if seq > quiesced_at {
+                    return seq;
+                }
+                tokio::time::sleep(QUIET_POLL_INTERVAL).await;
             }
-            tokio::time::sleep(QUIET_POLL_INTERVAL).await;
-        }
+        })
+        .await;
         assert!(
-            resumed_at > quiesced_at,
-            "resume() must restart the writer: the layer's seq is still {resumed_at} after \
-             {QUIET_POLL_ATTEMPTS} probes, so the parked writer never woke: {}",
+            resumed.is_ok(),
+            "resume() must restart the writer: the layer's seq is still {quiesced_at} after the \
+             writer's {WRITER_HANG_GUARD:?} hang guard, so the parked writer never woke: {}",
             writer.report()
         );
 
@@ -26953,6 +33433,10 @@ pub(super) mod tick_support {
     /// claim under test is the INSTRUMENT's (deltas are per-iteration and the
     /// widened fields are populated), not the loop's — the loop's snapshot arm
     /// is pinned by `lease_tests` and by the integration metrics suite.
+    ///
+    /// The lease and lock are held for the whole test (rule (b)), so no gate
+    /// can lose them however long pass 1 takes: the one-tick count below is
+    /// then deterministic, and it is this test's subject, so it stays a count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn drive_until_reports_the_winning_ticks_deltas_including_the_widened_cells() {
         let tv = TestValkey::setup().await;
@@ -26961,13 +33445,13 @@ pub(super) mod tick_support {
         let object_id = oids[0];
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let driver = TickDriver {
@@ -27027,6 +33511,11 @@ pub(super) mod tick_support {
         assert_eq!(
             deltas.tail_captured, 0.0,
             "the tail flag is off in `due_everything_config`, so no capture is possible"
+        );
+        assert_eq!(
+            deltas.tail_captured_capped, 0.0,
+            "and no capped capture either: the widened `tail_captured_capped` field must read 0 \
+             on a tick that took the snapshot arm, or it is wired to the wrong cell"
         );
     }
 
@@ -27118,8 +33607,26 @@ mod lease_tests {
     //! `spawn_checkpoint_loop` from an integration binary, the cheapest
     //! observation of a *refresh* costs 10 s of real time and the cheapest
     //! observation of an *overshoot* costs 30 s. Constructing the
-    //! `CheckpointLease` directly lets every arm run in milliseconds and —
-    //! because the deadline is an input rather than a race — deterministically.
+    //! `CheckpointLease` directly lets every arm run in milliseconds. For the
+    //! `ensure_held_*` tests, which call [`CheckpointLease::ensure_held`]
+    //! directly, it is also deterministic: the deadline is an input rather
+    //! than a race. A tick-level test is different: its first gate runs after
+    //! pass 1, which nothing bounds, so a deadline or a refresh anchored at
+    //! construction races pass 1, and so does the 8 s lock `set_lock` stages.
+    //! So a tick test takes one of three shapes, by subject (test-writing
+    //! guide § Synchronization Patterns): a test whose subject is not the
+    //! lease holds the lease and the lock for the whole test
+    //! ([`tick_support::lease_held_for_whole_test`],
+    //! [`tick_support::set_lock_for_whole_test`]; rule (b)); a test whose
+    //! subject is a lapse anchors it at the first gate
+    //! ([`tick_support::lease_lapsing_one_ttl_after_its_first_gate`]; rule
+    //! (d)); and a test whose subject is a refresh at a gate either counts the
+    //! first gate's refresh exactly
+    //! ([`tick_support::lease_refreshed_only_at_its_first_gate`]) or steals the
+    //! lock before it. Group 2 keeps `set_lock`'s 8 s lock: it calls
+    //! [`CheckpointLease::ensure_held`] directly, with no pass 1 before its
+    //! PTTL read. Every positive wait in a tick test takes that test's one
+    //! hang-guard deadline ([`tick_support::hang_guard_deadline`]).
     //!
     //! The precedent for a live-Valkey `#[cfg(test)]` module in `src/` is
     //! `src/checkpoint/session.rs::tests` and `src/checkpoint/recovery.rs`.
@@ -27141,6 +33648,7 @@ mod lease_tests {
     //! - Group 6 — [`TickLeaseKeeper`] beside a fenced snapshot read: a read
     //!   that outlasts the lease it began with keeps it, and a lease lost
     //!   mid-read ends the walk with nothing persisted and the fence released.
+    //!   Its last test guards the fence-lease staging below.
     //! - Group 7 — [`ShutdownAwareKeeper`] (post-completion review F12): its
     //!   two stops, pure (cancel → `ShuttingDown`, the wrapped keeper's loss →
     //!   `LeaseLost`, both ready at once → `ShuttingDown`), and graceful
@@ -27148,6 +33656,16 @@ mod lease_tests {
     //!   `RETRY_AFTER`: the tick returns at once, persists and counts nothing,
     //!   demotes nothing, forfeits the publish, and the held fence is
     //!   released, not left to lapse.
+    //! - Group 8 — the loop's shutdown token around a layer's unit (b.jt5): a
+    //!   cancel during pass 2's lease refresh starts no assembly, and a cancel
+    //!   as a PUT lands still stamps the cursor but starts no prune.
+    //!
+    //! The Group 6 and 7 tests that hold a fenced read's window open with the
+    //! one-shot hold or delay seam also stage that read's own fence lease past
+    //! nextest's kill ([`stage_fence_lease_for_whole_test`], rule (b)), and
+    //! assert it once the window is reached. No fence renewal then has to
+    //! land while the window is held, so the window ends only by the test's
+    //! own event, however loaded the runner or the store.
 
     use fred::interfaces::{KeysInterface, ListInterface};
 
@@ -27610,6 +34128,11 @@ mod lease_tests {
     ///    pending; suppressing here would throw away a complete observation at
     ///    exactly the moment the loop is falling behind.
     /// 4. A WARN names the abort with the deferred count.
+    ///
+    /// The peer's lock is staged for the whole test and the lease's local
+    /// deadline is [`FAR_DEADLINE`] (rule (b)), so however long pass 1 runs
+    /// the first gate meets the peer's lock, not a lapsed key or an overrun
+    /// deadline.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_aborts_before_the_first_layer_when_the_lock_was_stolen() {
         let tv = TestValkey::setup().await;
@@ -27617,7 +34140,7 @@ mod lease_tests {
         let oids = seed_layers(&tv, 3).await;
         let lock_key = keys.checkpoint_leader_lock();
         // A peer now owns the lock — the "stolen mid-tick" state.
-        set_lock(&tv, &lock_key, PEER_ID).await;
+        set_lock_for_whole_test(&tv, &lock_key, PEER_ID).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
@@ -27626,7 +34149,7 @@ mod lease_tests {
         let cancel = CancellationToken::new();
         // Refresh is due on the first `ensure_held`, so pass 2 probes the lock
         // immediately rather than coasting on the local deadline.
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, LEASE_RENEW_INTERVAL);
 
         // No demotion is owed: this tick has no predecessor.
         let mut demotion: Option<u64> = None;
@@ -27693,30 +34216,25 @@ mod lease_tests {
     ///   harmless.
     /// - The walk stops there: the remaining layers get no generation at all.
     ///
-    /// # Why this test is deliberately slow (~8 s)
+    /// # Where the lapse is placed
     ///
-    /// The lapse has to be placed *between* two specific `ensure_held` calls
-    /// that are separated only by the first layer's assembly, and the lease
-    /// deadline is a `std::time::Instant` that `tokio::time::pause()` cannot
-    /// move. So the separation is bought with real time, and the margin either
-    /// side of it is the test's entire flake budget:
+    /// The lapse has to fall *between* two specific `ensure_held` calls that
+    /// are separated only by the first layer's assembly. The lease lapses
+    /// [`ANCHORED_LAPSE_TTL`] after its first gate
+    /// ([`lease_lapsing_one_ttl_after_its_first_gate`]): that gate refreshes,
+    /// and the deadline is measured from it, so pass 1 can take as long as it
+    /// likes. Layer 0's put then blocks for [`ANCHORED_LAPSE_PUT_DELAY`], at
+    /// least the TTL, so the pre-prune gate sees `now >= held_until`.
     ///
-    /// - the top-of-loop gate for layer 0 must see `now < held_until` — margin
-    ///   = `HELD_FOR` (4 s), consumed by pass 1's SCAN + three HGETALLs;
-    /// - the pre-prune gate must see `now >= held_until` — margin =
-    ///   `FIRST_PUT_DELAY - HELD_FOR` (4 s).
+    /// # "No round-trip" at the pre-prune gate
     ///
-    /// A 2:1 delay-to-deadline ratio is what makes both margins whole seconds.
-    /// Under nextest's 40 s slow mark this is comfortable, and the alternative
-    /// — a few hundred milliseconds of margin — is a test that fails on a
-    /// loaded CI runner and gets muted.
+    /// Gate 0's refresh `PEXPIRE`d the lock, so its PTTL cannot tell whether
+    /// the pre-prune gate refreshed too. Instead, once layer 0's put lands,
+    /// the store's put hook replaces the lock with a LIST. The overshoot arm
+    /// returns before touching the store, so `refresh_error` stays 0; a
+    /// refresh there would raise `WRONGTYPE` on the LIST and count it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_writes_the_cursor_but_skips_the_prune_when_the_lease_lapses_mid_layer() {
-        /// How long the lease believes it is held for.
-        const HELD_FOR: Duration = Duration::from_secs(4);
-        /// How long the first layer's `put_layer_checkpoint` blocks.
-        const FIRST_PUT_DELAY: Duration = Duration::from_secs(8);
-
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let oids = seed_layers(&tv, 3).await;
@@ -27724,21 +34242,46 @@ mod lease_tests {
         // so the tiebreak decides and the lowest object_id goes first.
         let first = *oids.iter().min().expect("three layers were seeded");
         let lock_key = keys.checkpoint_leader_lock();
-        // The lock stays OURS for the whole test, so the abort can only come
-        // from the local overshoot arm — not from a steal.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Ours, so gate 0's anchoring refresh is renewed and the abort can
+        // only come from the local overshoot arm — not from a steal.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
-        let test_store = Arc::new(TestStore::new().with_first_put_delay(FIRST_PUT_DELAY));
+        // After layer 0's generation lands (the only put before the abort),
+        // turn the lock into a LIST: any refresh after that raises
+        // `WRONGTYPE`. See "No round-trip" above.
+        let poison_the_lock: PutLandedHook = {
+            let client = tv.client().clone();
+            let lock_key = lock_key.clone();
+            Arc::new(move |_object_id, _snap_seq| {
+                let client = client.clone();
+                let lock_key = lock_key.clone();
+                Box::pin(async move {
+                    let _: () = client
+                        .pool
+                        .del(&lock_key)
+                        .await
+                        .expect("DEL the leader lock from inside the PUT must succeed");
+                    let _: i64 = client
+                        .pool
+                        .lpush(&lock_key, "not-a-string-lock")
+                        .await
+                        .expect("LPUSH the leader lock from inside the PUT must succeed");
+                })
+            })
+        };
+        let test_store = Arc::new(
+            TestStore::new()
+                .with_first_put_delay(ANCHORED_LAPSE_PUT_DELAY)
+                .with_put_landed_hook(poison_the_lock),
+        );
         preseed_three_generations(&test_store, first).await;
 
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        // The lease is constructed LAST, immediately before the tick, so
-        // `held_until` is measured from the tick's own start rather than from
-        // fixture setup.
-        let mut lease = lease_for(&lock_key, HELD_FOR, Duration::ZERO);
+        // Lapses ANCHORED_LAPSE_TTL after gate 0, however long pass 1 takes.
+        let mut lease = lease_lapsing_one_ttl_after_its_first_gate(&lock_key, ANCHORED_LAPSE_TTL);
 
         let mut demotion: Option<u64> = None;
         let (_, logs) = capture_warns(run_one_tick(
@@ -27762,12 +34305,15 @@ mod lease_tests {
         assert_eq!(lease_counter(&metrics, "lost"), 1);
         assert_eq!(
             lease_counter(&metrics, "renewed"),
-            0,
-            "the overshoot arm returns before the refresh probe, so nothing was renewed"
+            1,
+            "only gate 0's anchoring refresh renewed: the overshoot arm returns before the \
+             refresh probe"
         );
-        assert!(
-            pttl(&tv, &lock_key).await <= SHORT_LOCK_TTL_MS,
-            "and no PEXPIRE was issued either — the overshoot arm is round-trip-free"
+        assert_eq!(
+            lease_counter(&metrics, "refresh_error"),
+            0,
+            "and the pre-prune gate issued no refresh either: the lock was a LIST by then, so a \
+             refresh would have raised WRONGTYPE — the overshoot arm is round-trip-free"
         );
 
         // The cursor HSET is deliberately NOT lease-gated.
@@ -27835,6 +34381,15 @@ mod lease_tests {
     ///
     /// Without this, a regression that made `ensure_held` always return `Lost`
     /// would still satisfy the two abort tests.
+    ///
+    /// The refresh is the subject, so it is counted exactly, against a lease
+    /// whose first gate refreshes and whose next refresh is not due before
+    /// nextest's kill ([`lease_refreshed_only_at_its_first_gate`]): neither
+    /// pass 1 nor a slow walk can add a second refresh or overrun the
+    /// deadline. The lock is staged for the whole test (rule (b)), so the
+    /// refresh finds it held however long pass 1 ran, and the refresh
+    /// `PEXPIRE`s it from that TTL down to [`ONCE_REFRESH_TTL_MS`] — the PTTL
+    /// question that shows the renewal reached the real lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_renews_mid_walk_and_completes_when_the_lease_is_genuinely_held() {
         let tv = TestValkey::setup().await;
@@ -27848,7 +34403,7 @@ mod lease_tests {
         let oids = seed_layers_with_seq(&tv, 3, 100).await;
         let first = *oids.iter().min().expect("three layers were seeded");
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         preseed_three_generations(&test_store, first).await;
@@ -27857,7 +34412,7 @@ mod lease_tests {
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_refreshed_only_at_its_first_gate(&lock_key);
 
         let mut demotion: Option<u64> = None;
         let (_, logs) = capture_warns(run_one_tick(
@@ -27881,14 +34436,18 @@ mod lease_tests {
             lease_counter(&metrics, "renewed"),
             1,
             "exactly one refresh round-trip: the first `ensure_held` is due, and it resets \
-             `last_refresh`, so the remaining five checks in this sub-second walk resolve \
-             locally. The counter measures refresh DECISIONS, not iterations"
+             `last_refresh`, so the remaining five checks of the walk resolve locally — the next \
+             refresh is not due for a whole renewal interval (120 s). The counter measures \
+             refresh DECISIONS, not iterations"
         );
         assert_eq!(lease_counter(&metrics, "lost"), 0);
         assert_eq!(lease_counter(&metrics, "refresh_error"), 0);
+        let ttl = pttl(&tv, &lock_key).await;
         assert!(
-            pttl(&tv, &lock_key).await > SHORT_LOCK_TTL_MS,
-            "the renewal must have extended the real lock in Valkey"
+            ttl > 0 && ttl <= ONCE_REFRESH_TTL_MS,
+            "the renewal must have reached the real lock in Valkey: it was staged at \
+             {WHOLE_TEST_LOCK_TTL_MS} ms, and only the refresh's PEXPIRE brings it to \
+             {ONCE_REFRESH_TTL_MS} ms or under; got {ttl} ms"
         );
         // Four generations existed at prune time: the pre-seeded 90/91/92 and
         // the 100 this tick just wrote. `retain_generations = 2` must keep the
@@ -27974,14 +34533,16 @@ mod lease_tests {
         let keys = tv.key_schema().clone();
         let (never_written, older, newer) = seed_three_layers_in_known_urgency_order(&tv).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // The lease is not this test's subject: held for the whole test
+        // (rule (b)), so pass 1 cannot cost the walk its lease.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         run_one_tick(
@@ -28023,36 +34584,33 @@ mod lease_tests {
     /// Two ticks against one store, with no hand-set demotion state — tick 1
     /// must *produce* the demotion that tick 2 consumes:
     ///
-    /// - Tick 1: the never-written layer's put blocks past the lease deadline
-    ///   and then FAILS. Failing matters — a successful put would advance the
-    ///   cursor and the skip-if-no-commits gate would drop the layer from tick
-    ///   2 entirely, making the demotion assertion vacuous. The next
-    ///   iteration's lease gate takes the overshoot arm and aborts, blaming the
-    ///   layer that was mid-assembly.
-    /// - Tick 2: the lease is healthy. All three layers are still due and
-    ///   their urgency is unchanged, so the *only* thing that can move the
+    /// - Tick 1: the lease lapses [`ANCHORED_LAPSE_TTL`] after its first gate
+    ///   ([`lease_lapsing_one_ttl_after_its_first_gate`]), so pass 1 can take
+    ///   as long as it likes. The never-written layer's put blocks for
+    ///   [`ANCHORED_LAPSE_PUT_DELAY`], at least that TTL, and then FAILS.
+    ///   Failing matters — a successful put would advance the cursor and the
+    ///   skip-if-no-commits gate would drop the layer from tick 2 entirely,
+    ///   making the demotion assertion vacuous. The next iteration's lease
+    ///   gate takes the overshoot arm and aborts, blaming the layer that was
+    ///   mid-assembly.
+    /// - Tick 2: the lease is healthy — the lock is re-staged as ours and the
+    ///   local deadline is [`FAR_DEADLINE`]. All three layers are still due
+    ///   and their urgency is unchanged, so the *only* thing that can move the
     ///   never-written layer off the head is the demotion.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_demotes_the_layer_that_burned_the_previous_ticks_lease() {
-        /// Tick 1's lease deadline, and the block the first put sits in. Same
-        /// 2:1 ratio (and same rationale) as
-        /// `tick_writes_the_cursor_but_skips_the_prune_when_the_lease_lapses_mid_layer`:
-        /// the lapse has to be placed between two `ensure_held` calls separated
-        /// only by one assembly, and `Instant` deadlines cannot be faked.
-        const HELD_FOR: Duration = Duration::from_secs(2);
-        const FIRST_PUT_DELAY: Duration = Duration::from_secs(4);
-
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let (never_written, older, newer) = seed_three_layers_in_known_urgency_order(&tv).await;
         let lock_key = keys.checkpoint_leader_lock();
-        // Ours for the whole test: both ticks' verdicts come from the local
-        // deadline, never from a steal.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Ours at every gate that refreshes, so no verdict comes from a steal.
+        // Gate 0's anchoring refresh cuts it to ANCHORED_LAPSE_TTL and it
+        // lapses during tick 1, so it is re-staged before tick 2.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(
             TestStore::new()
-                .with_first_put_delay(FIRST_PUT_DELAY)
+                .with_first_put_delay(ANCHORED_LAPSE_PUT_DELAY)
                 .failing_puts_for(never_written),
         );
         let store: Arc<dyn CheckpointStore> = test_store.clone();
@@ -28065,7 +34623,8 @@ mod lease_tests {
         let mut demotion: Option<u64> = None;
 
         // ── Tick 1: the lease-burner aborts the tick ─────────────────────
-        let mut lease = lease_for(&lock_key, HELD_FOR, Duration::ZERO);
+        // Lapses ANCHORED_LAPSE_TTL after gate 0, however long pass 1 takes.
+        let mut lease = lease_lapsing_one_ttl_after_its_first_gate(&lock_key, ANCHORED_LAPSE_TTL);
         run_one_tick(
             tv.client(),
             &keys,
@@ -28078,6 +34637,16 @@ mod lease_tests {
         )
         .await;
 
+        assert_eq!(
+            lease_counter(&metrics, "renewed"),
+            1,
+            "fixture precondition: gate 0 refreshed the lease, which anchors its lapse there"
+        );
+        assert_eq!(
+            lease_counter(&metrics, "lost"),
+            1,
+            "fixture precondition: the gate after the delayed put lost the lease"
+        );
         assert_eq!(
             test_store.put_order(),
             vec![never_written],
@@ -28092,7 +34661,11 @@ mod lease_tests {
         );
 
         // ── Tick 2: the demoted layer goes last ──────────────────────────
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        // Re-stage the lock: gate 0's anchoring refresh cut its TTL to
+        // ANCHORED_LAPSE_TTL, so it has lapsed by now, and tick 2's due
+        // refresh would find nothing and abort before a single layer.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, LEASE_RENEW_INTERVAL);
         run_one_tick(
             tv.client(),
             &keys,
@@ -28189,16 +34762,20 @@ mod lease_tests {
         }
 
         let lock_key = keys.checkpoint_leader_lock();
-        // A peer owns the lock before the tick starts.
-        set_lock(&tv, &lock_key, PEER_ID).await;
+        // A peer owns the lock before the tick starts, for the whole test
+        // (rule (b)): seeding these headers and the SCAN that walks them are
+        // unbounded, and the keepalive must meet the peer's lock, not a lapsed
+        // key.
+        set_lock_for_whole_test(&tv, &lock_key, PEER_ID).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        // Refresh due immediately, so the first keepalive probes the real lock.
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        // Refresh due immediately, so the first keepalive probes the real lock;
+        // the local deadline is out of the way however long the walk takes.
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, LEASE_RENEW_INTERVAL);
         let mut demotion: Option<u64> = None;
 
         let (_, logs) = capture_warns(run_one_tick(
@@ -28252,30 +34829,43 @@ mod lease_tests {
         );
     }
 
-    /// b.zt3 T-W5 — a pass-1 walk that ends before its terminal page is a
-    /// truncated walk, not a walk of the whole keyspace, so the tick forfeits
-    /// its pending-age aggregates (no false all-clear) and says so.
+    /// b.zt3 T-W5 (re-targeted by b.hyw, T5) — a pass-1 walk that ended on a
+    /// store fault did not walk every primary, so the tick forfeits its
+    /// pending-age aggregates (no false all-clear) and says so.
     ///
-    /// fred ends a SCAN stream with no error when a page's command is dropped
-    /// unanswered (its client's router ended with the page in flight); pass 1
-    /// walks through `orphan_sweep::scan_keyspace`, whose `complete_pages`
-    /// turns that end into an error item, which this tick's error arm reads as
-    /// `scan_truncated`. The walk is cut before its first page by
-    /// `orphan_sweep`'s scan-walk truncation seam, keyed by pass 1's pattern
-    /// (which carries this test's prefix). The two seeded layers are due, so
-    /// the control tick, with the walk whole, assembles both and publishes.
+    /// Pass 1 walks through `orphan_sweep::scan_keyspace`, whose error item
+    /// for a walk a store fault ended answers `every_primary_walked() ==
+    /// false`, which this tick's error arm reads as `scan_truncated` (policy
+    /// 3). The walk's first `SCAN` step fails on every attempt through
+    /// `storage::scan_guard`'s walk seam (`StepError`), keyed by pass 1's
+    /// pattern (which carries this test's prefix), so the walk ends before
+    /// any header. The two seeded layers are due, so the control tick, with
+    /// the walk whole, assembles both and publishes.
     ///
-    /// Fail-on-old, by in-place perturbation: with `complete_pages`'
-    /// end-of-stream check ending the stream without its error, the cut-short
-    /// walk reads as an empty keyspace, the aggregates are published, and the
+    /// Policy 3's other half — a walk that walked every primary but could not
+    /// prove a node's ownership still publishes, with a WARN — has no
+    /// standalone seam: a standalone coverage walk reads no `CLUSTER NODES`,
+    /// so it records no such reason. Its walk side is the cluster-gated
+    /// `scan_guard_test` / `orphan_sweep` tests', and its tick side the
+    /// cluster-gated
+    /// [`cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes`]
+    /// below.
+    ///
+    /// The lease is not under test: the lock is staged for the whole test
+    /// and the local deadline is [`FAR_DEADLINE`], with no refresh due, so
+    /// neither bounds how long pass 1's walk of the shared keyspace takes.
+    ///
+    /// Fail-on-old, by in-place perturbation: with the pass-1 error arm's
+    /// `scan_truncated |= truncated` removed, the failed walk reads as an
+    /// empty keyspace, the aggregates are published, and the
     /// `never_written_gauge(..) == None` assertion goes red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tick_whose_pass_1_walk_ends_before_its_terminal_page_forfeits_the_aggregates() {
+    async fn tick_whose_pass_1_walk_does_not_reach_every_primary_forfeits_the_aggregates() {
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layers = seed_layers(&tv, 2).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
@@ -28286,8 +34876,14 @@ mod lease_tests {
 
         let pattern = format!("{}{{*}}:obj:hdr", keys.prefix());
         // The one guard for pass 1's walk; dropped before the control tick.
-        let armed = crate::storage::orphan_sweep::arm_scan_walk_truncation_for_test(&pattern, 0);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let armed = crate::storage::scan_guard::arm_walk_fault_for_test(
+            &pattern,
+            crate::storage::scan_guard::WalkFault::StepError {
+                step: 0,
+                times: u32::MAX,
+            },
+        );
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, Duration::ZERO);
         let (_, logs) = capture_warns(run_one_tick(
             tv.client(),
             &keys,
@@ -28304,15 +34900,15 @@ mod lease_tests {
         assert_eq!(
             never_written_gauge(&metrics),
             None,
-            "the aggregates must be FORFEITED: a walk that ended before its terminal page saw an \
-             arbitrary prefix of the keyspace (here none of it), so its maximum is a false \
-             all-clear"
+            "the aggregates must be FORFEITED: a walk a store fault ended saw only part of the \
+             keyspace (here none of it), so its maximum is a false all-clear"
         );
         assert!(
-            logs.contains(&format!(
-                "SCAN walk `{pattern}` ended after 0 of 1 terminal page(s)"
-            )),
-            "the SCAN-error WARN must carry the truncation text. Captured WARNs:\n{logs}"
+            logs.contains("did not reach every primary")
+                && logs.contains(&format!("a SCAN step of {pattern} failed"))
+                && logs.contains("test seam: step 0 of a SCAN walk failed before it was sent"),
+            "the pass-1 WARN must say the walk did not reach every primary and carry the walk's \
+             error. Captured WARNs:\n{logs}"
         );
         assert!(
             logs.contains("suppressed this tick's pending-age aggregates"),
@@ -28326,7 +34922,7 @@ mod lease_tests {
 
         // Control: the same tick with the walk whole sees both layers and
         // publishes.
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, Duration::ZERO);
         run_one_tick(
             tv.client(),
             &keys,
@@ -28349,6 +34945,117 @@ mod lease_tests {
         );
     }
 
+    /// b.hyw TR4 (a) — policy 3's publishing half, on a real multi-shard
+    /// cluster: a pass-1 walk that walked every primary but could not prove a
+    /// node's ownership (the first primary's start `CLUSTER NODES`, read 0,
+    /// forged with an open slot through `storage::scan_guard`'s walk seam,
+    /// keyed by pass 1's pattern) still publishes the tick's pending-age
+    /// aggregates, with the WARN that says so, and assembles every seeded
+    /// layer. Suppressing them would freeze the gauges for as long as the
+    /// store answers that way. The forfeiting half is
+    /// [`tick_whose_pass_1_walk_does_not_reach_every_primary_forfeits_the_aggregates`].
+    ///
+    /// The lease is not under test: the lock is staged for the whole test
+    /// and the local deadline is [`FAR_DEADLINE`], with no refresh due.
+    ///
+    /// **Cluster-gated**: skips (a `SKIP:` line) when
+    /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset; CI's `test-cluster:` job runs
+    /// it (lib target, `test-fault-injection` not needed: the seam is
+    /// compiled into every test build of the crate).
+    ///
+    /// Fail-on-old (not run in this sandbox, which has no cluster): with the
+    /// pass-1 error arm's `truncated` forced to `true`, the aggregates are
+    /// withheld and `never_written_gauge(..).is_some()` goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes(
+    ) {
+        use fred::interfaces::ClusterInterface;
+
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
+            eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
+            return;
+        };
+        let tv = TestValkey::setup_with_url(cluster_url, 4).await;
+        let routing = tv
+            .client()
+            .pool
+            .next()
+            .cached_cluster_state()
+            .expect("a connected cluster client has a routing table");
+        let first = routing
+            .get_server(0)
+            .cloned()
+            .expect("the table names slot 0's owner");
+        let mut first_ranges: Vec<String> = routing
+            .slots()
+            .iter()
+            .filter(|range| range.primary == first)
+            .map(|range| format!("{}-{}", range.start, range.end))
+            .collect();
+        first_ranges.sort_unstable();
+        let open_slot_line = format!(
+            "0000000000000000000000000000000000000001 127.0.0.1:7000@17000 myself,master - 0 0 1 \
+             connected {} [42->-0000000000000000000000000000000000000002]\n",
+            first_ranges.join(" ")
+        );
+
+        let keys = tv.key_schema().clone();
+        let layers = seed_layers(&tv, 2).await;
+        let lock_key = keys.checkpoint_leader_lock();
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let test_store = Arc::new(TestStore::new());
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let metrics = fresh_metrics();
+        let config = due_everything_config(2);
+        let cancel = CancellationToken::new();
+        let mut demotion: Option<u64> = None;
+
+        let pattern = format!("{}{{*}}:obj:hdr", keys.prefix());
+        let armed = crate::storage::scan_guard::arm_walk_fault_for_test(
+            &pattern,
+            crate::storage::scan_guard::WalkFault::ClusterNodesReply {
+                read: 0,
+                reply: open_slot_line,
+            },
+        );
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, Duration::ZERO);
+        let (_, logs) = capture_warns(run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &config,
+            Some(&metrics),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        ))
+        .await;
+        drop(armed);
+
+        assert!(
+            logs.contains("aggregates are still published")
+                && logs.contains("found a slot migrating"),
+            "the pass-1 WARN must say the aggregates are still published and carry the open \
+             slot. Captured WARNs:\n{logs}"
+        );
+        assert!(
+            !logs.contains("suppressed this tick's pending-age aggregates"),
+            "a walk that walked every primary is not truncated. Captured WARNs:\n{logs}"
+        );
+        assert!(
+            never_written_gauge(&metrics).is_some(),
+            "the aggregates are published"
+        );
+        let mut put = test_store.put_order();
+        put.sort_unstable();
+        let mut seeded = layers.clone();
+        seeded.sort_unstable();
+        assert_eq!(put, seeded, "pass 2 assembles every layer pass 1 found");
+        println!(
+            "CLUSTER-GATED RAN: cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // Group 6 — the lease beside a fenced read (Spec SDD SR-11.5)
     // ─────────────────────────────────────────────────────────────────────
@@ -28356,22 +35063,153 @@ mod lease_tests {
     // A fenced read of a layer above the atomic-read limits runs beside
     // [`TickLeaseKeeper`], which refreshes the tick's lease whenever a refresh
     // falls due and ends the read the moment the lease cannot be re-proven.
-    // Both cases hold the read's first fan-out window back with the
-    // `test-fault-injection` delay seam, so the read is still under its fence
-    // when the lease's schedule comes round — no race for a scheduler to lose.
-    // `LEADER_LOCK_TTL_MS` is a constant, so the lease is placed on its arm by
-    // constructing it back-dated ([`lease_for`]), never by a config seam.
+    // Both cases keep the read's first fan-out window from being issued, so
+    // the read is still under its fence when the lease's schedule comes round:
+    // the keeper case parks it on the `test-fault-injection` hold seam until
+    // the keeper has refreshed twice, and the lease-lost case delays it far
+    // past the test.
+    //
+    // Those seams are one-shot: a broken attempt's retry runs without them.
+    // So each case first stages the read's own fence lease past nextest's
+    // kill ([`stage_fence_lease_for_whole_test`], test-writing guide
+    // § Synchronization Patterns, rule (b)): no fence renewal has to land
+    // while the window is held, so the window ends only by the test's own
+    // event, and each case asserts the lease it was granted outlasts its hang
+    // guard ([`assert_fence_lease_outlasts`]). The last test in this group
+    // guards the staging itself.
+    // `LEADER_LOCK_TTL_MS` is a constant, so the tick's leader lease is
+    // placed on its arm by constructing it back-dated ([`lease_for`]), never
+    // by a config seam.
 
-    /// Hold `client`'s next fenced fan-out window back for `delay` before its
-    /// first command is issued (then issue it for real).
-    fn delay_the_next_fenced_window(client: &ValkeyClient, delay: Duration) {
+    /// Park `client`'s next fenced fan-out window before its first command is
+    /// issued, until the returned hold is released (then issue it for real).
+    fn hold_the_next_fenced_window(
+        client: &ValkeyClient,
+    ) -> std::sync::Arc<crate::storage::diff_read::SnapshotReadHold> {
         let injector =
             std::sync::Arc::new(crate::storage::diff_read::ObjectSnapshotReadFaultInjector::new());
-        injector.push_delay_at(
-            crate::storage::diff_read::ObjectSnapshotReadFaultTarget::next_read(),
-            delay,
-        );
+        let hold = injector
+            .push_hold_at(crate::storage::diff_read::ObjectSnapshotReadFaultTarget::next_read());
         client.install_object_snapshot_read_fault_injector_for_test(injector);
+        hold
+    }
+
+    /// A layer size whose fence lease outlasts nextest's 120 s kill: the
+    /// size [`stage_fence_lease_for_whole_test`] stages. At this size
+    /// `hold(L)` is about 2,658.5 s, so `lease(L) = hold(L)/4` is about
+    /// 664.6 s and its renewal period about 166 s: no renewal of the lease
+    /// falls due before the kill. Bytes are the items at the fitted 16.1 B
+    /// per item (`snapshot_fence::cost::FITTED_BYTES_PER_ITEM`).
+    const WHOLE_TEST_FENCE_SIZE: crate::storage::snapshot_fence::LayerSize =
+        crate::storage::snapshot_fence::LayerSize {
+            items: 700_000_000,
+            bytes: 11_270_000_000,
+        };
+
+    /// Take a fenced read's own fence lease off the test's path (test-writing
+    /// guide § Synchronization Patterns, rule (b)): stage
+    /// [`WHOLE_TEST_FENCE_SIZE`] as `object_id`'s stored fence size, which
+    /// the acquire uses in place of the reader's estimate, so the lease the
+    /// read is granted lasts past nextest's kill and no renewal has to land
+    /// while a test holds its window open. Call it before the read's acquire.
+    ///
+    /// Asserts, from `reader`'s own fence coefficients, that the staged size
+    /// gives a lease of at least [`FAR_DEADLINE`]. The key is given the same
+    /// expiry, so it is still there when the read acquires; the grant then
+    /// sets the key's expiry itself.
+    ///
+    /// Valid only where a larger staged size lengthens, never shrinks,
+    /// anything the reader derives from it: the checkpoint's fenced read takes
+    /// no capacity, and its only derived wait cap, `reader_wait_max(L)`, only
+    /// lengthens.
+    async fn stage_fence_lease_for_whole_test(
+        tv: &TestValkey,
+        reader: &ValkeyClient,
+        object_id: u64,
+    ) {
+        use fred::interfaces::HashesInterface;
+        let lease_ms = crate::storage::snapshot_fence::coefficients(reader)
+            .timing(WHOLE_TEST_FENCE_SIZE)
+            .lease_ms;
+        assert!(
+            lease_ms >= FAR_DEADLINE.as_millis() as f64,
+            "fixture: the staged fence size must give a lease ({lease_ms} ms) of at least \
+             {FAR_DEADLINE:?}, past nextest's 120 s kill"
+        );
+        let fence_key = tv.key_schema().obj_snapshot_fence(&object_id.to_string());
+        let _: () = tv
+            .client()
+            .pool
+            .hset(
+                &fence_key,
+                [
+                    ("size_e", WHOLE_TEST_FENCE_SIZE.items.to_string()),
+                    ("size_b", WHOLE_TEST_FENCE_SIZE.bytes.to_string()),
+                ],
+            )
+            .await
+            .expect("staging the fence size must succeed");
+        let _: i64 = tv
+            .client()
+            .pool
+            .pexpire(&fence_key, FAR_DEADLINE.as_millis() as i64, None)
+            .await
+            .expect("staging the fence key's expiry must succeed");
+    }
+
+    /// The store's clock (`TIME`), in milliseconds.
+    async fn store_now_ms(tv: &TestValkey) -> i64 {
+        use fred::interfaces::LuaInterface;
+        tv.client()
+            .pool
+            .eval(
+                "local t = redis.call('TIME') \
+                 return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)",
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            )
+            .await
+            .expect("the store clock must be readable")
+    }
+
+    /// Assert `object_id`'s fence holds exactly one live reader, whose lease
+    /// deadline (`r:<token>`) is at least `bound` past the store's clock.
+    ///
+    /// Call it once the read is inside its held window: with
+    /// [`stage_fence_lease_for_whole_test`] the lease has about 664 s left,
+    /// and without it, or with the size staged on another object or after
+    /// the grant, about 2 s. The fields are read before the clock, so the
+    /// remainder read is never more than the lease really has.
+    async fn assert_fence_lease_outlasts(tv: &TestValkey, object_id: u64, bound: Duration) {
+        use fred::interfaces::HashesInterface;
+        let fields: std::collections::HashMap<String, String> = tv
+            .client()
+            .pool
+            .hgetall(tv.key_schema().obj_snapshot_fence(&object_id.to_string()))
+            .await
+            .expect("HGETALL the snapshot fence must succeed");
+        let now_ms = store_now_ms(tv).await;
+        let deadlines: Vec<i64> = fields
+            .iter()
+            .filter(|(name, _)| name.starts_with("r:"))
+            .map(|(name, value)| {
+                value.parse().unwrap_or_else(|_| {
+                    panic!("fence reader field {name} must hold a deadline in ms; got {value:?}")
+                })
+            })
+            .collect();
+        assert_eq!(
+            deadlines.len(),
+            1,
+            "fixture: the held read is the fence's one reader; fields: {fields:?}"
+        );
+        let remaining_ms = deadlines[0] - now_ms;
+        assert!(
+            remaining_ms >= bound.as_millis() as i64,
+            "the held read's own fence lease must outlast {bound:?} by the store's clock, so no \
+             fence renewal has to land while the window is held \
+             (stage_fence_lease_for_whole_test, rule (b)); it has {remaining_ms} ms left"
+        );
     }
 
     /// The live reader fields (`r:<token>`) on `object_id`'s snapshot fence.
@@ -28387,55 +35225,119 @@ mod lease_tests {
     }
 
     /// **A fenced read longer than the lease as it stood when the read began
-    /// keeps the lease.** The lease is back-dated to two seconds before its
+    /// keeps the lease.** The lease is back-dated to `remaining` before its
     /// deadline and past its refresh point, and the read's first window is
-    /// held back for one renewal interval and two seconds more: without the
-    /// keeper the lease lapses mid-read and the next gate takes the overshoot
-    /// arm. The keeper refreshes at once and again one interval later — two
-    /// `renewed` ticks, both while the read is under its fence — and the read
+    /// parked on the hold seam until the keeper has refreshed twice and the
+    /// deadline the lease began with has passed: without the keeper the lease
+    /// lapses mid-read. The keeper refreshes at once and again one renewal
+    /// interval later — both while the read is under its fence — and the read
     /// is persisted as a verified base.
+    ///
+    /// # Sized by rule (c), ordered by events
+    ///
+    /// The lease's cadence is the subject, so its production TTL stays
+    /// (`LEADER_LOCK_TTL_MS`, renewed every third of it) and `remaining` is
+    /// the one time bound left: the assembler's store calls before the keeper's
+    /// first look (`STORE_CALLS_BEFORE_THE_KEEPER`) must finish inside it, or
+    /// the first refresh finds the deadline overrun. Each of those calls either
+    /// answers within the client's command timeout or has already failed in
+    /// the client, so `remaining` is that many command timeouts, read from the
+    /// client (test-writing guide § Synchronization Patterns, rule (c)); the
+    /// test then fails only when a call runs later than the bound past which
+    /// the service's own commands fail. `remaining` must stay within two
+    /// thirds of the TTL, the slack a refresh due every third of it leaves.
+    /// Everything after the first refresh is ordered by events: the window is
+    /// released only once the keeper is parked beside it, `renewed` reads 2,
+    /// and the lease's original deadline is behind us. The lock is staged for
+    /// the whole test (rule (b)), so only a refresh's `PEXPIRE` can bring its
+    /// PTTL down to `LEADER_LOCK_TTL_MS`.
+    ///
+    /// The read's own fence lease is not the subject either, so it is taken
+    /// off the path by rule (b) too: staged past nextest's kill
+    /// ([`stage_fence_lease_for_whole_test`], asserted once the window is
+    /// parked), so the parked window stays the read's first attempt however
+    /// late its fence renewals would run. Only the leader lease stays under
+    /// rule (c).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn keeper_refreshes_the_lease_throughout_a_fenced_read_that_outlasts_it() {
-        /// What remained of the lease when the read began.
-        const REMAINING: Duration = Duration::from_secs(2);
-        /// How long the read's first window is held back: past `REMAINING`,
-        /// and past one refresh interval, so the keeper has to refresh twice.
-        const HELD_BACK: Duration =
-            Duration::from_millis(LEADER_LOCK_TTL_MS / 3 + REMAINING.as_millis() as u64);
+        use fred::interfaces::ClientLike;
 
+        /// The store calls the assembler makes before the keeper's first look
+        /// (`load_consistent_snapshot`'s two).
+        const STORE_CALLS_BEFORE_THE_KEEPER: u32 = 2;
+
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         // A layer with sections, so the forced-low limits put it above them.
         let oid = seed_driven_layer(&tv, S0).await.object_id;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let store = crate::checkpoint::adapters::InMemoryCheckpointStore::new();
 
+        let lease_ttl = Duration::from_millis(LEADER_LOCK_TTL_MS);
+        let command_timeout = tv
+            .client()
+            .pool
+            .next()
+            .perf_config()
+            .default_command_timeout;
+        // What remained of the lease when the read began.
+        let remaining = command_timeout * STORE_CALLS_BEFORE_THE_KEEPER;
+        assert!(
+            remaining * 3 <= lease_ttl * 2,
+            "fixture: {STORE_CALLS_BEFORE_THE_KEEPER} command timeouts ({remaining:?}) must fit \
+             in two thirds of the lease TTL ({lease_ttl:?}), the slack a refresh due every third \
+             of the TTL leaves"
+        );
+
         // Above the atomic-read limits, so the assembler takes the fenced read.
         let client = fenced_path_client(&tv);
-        delay_the_next_fenced_window(&client, HELD_BACK);
-        let mut lease = lease_for(
-            &lock_key,
-            REMAINING,
-            Duration::from_millis(LEADER_LOCK_TTL_MS) - REMAINING,
-        );
-        let lapsed_at = Instant::now() + REMAINING;
+        stage_fence_lease_for_whole_test(&tv, &client, oid).await;
+        let hold = hold_the_next_fenced_window(&client);
+        let mut lease = lease_for(&lock_key, remaining, lease_ttl - remaining);
+        let lapsed_at = Instant::now() + remaining;
 
-        let decision = assemble_layer_checkpoint(
-            &client,
-            &keys,
-            oid,
-            &store,
-            REPLICA_ID,
-            &mut TickLeaseKeeper {
-                lease: &mut lease,
-                client: &client,
-                metrics: Some(&metrics),
-            },
-        )
-        .await
-        .expect("the assembly must decide, not fail");
+        let read = async {
+            assemble_layer_checkpoint(
+                &client,
+                &keys,
+                oid,
+                &store,
+                REPLICA_ID,
+                &mut TickLeaseKeeper {
+                    lease: &mut lease,
+                    client: &client,
+                    metrics: Some(&metrics),
+                },
+            )
+            .await
+        };
+        let release = async {
+            while !hold.is_parked() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_fence_lease_outlasts(&tv, oid, TEST_HANG_GUARD).await;
+            while !(lease_counter(&metrics, "renewed") >= 2 && Instant::now() > lapsed_at) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            hold.release();
+        };
+        let (decision, ()) =
+            tokio::time::timeout_at(deadline, async { tokio::join!(read, release) })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                    "within the test's {TEST_HANG_GUARD:?} hang guard the read must park under its \
+                     fence, the keeper must refresh twice beside it, and the released read must \
+                     finish; renewed = {}, lost = {}, parked = {}",
+                    lease_counter(&metrics, "renewed"),
+                    lease_counter(&metrics, "lost"),
+                    hold.is_parked()
+                )
+                });
+        let decision = decision.expect("the assembly must decide, not fail");
 
         assert!(
             Instant::now() > lapsed_at,
@@ -28448,11 +35350,11 @@ mod lease_tests {
             ),
             other => panic!("a held lease must let the fenced read persist; got {other:?}"),
         }
-        assert_eq!(
-            lease_counter(&metrics, "renewed"),
-            2,
+        assert!(
+            lease_counter(&metrics, "renewed") >= 2,
             "the keeper refreshed beside the read: once at once (the refresh was already due) \
-             and once a renewal interval later, while the window was still held back"
+             and once a renewal interval later, while the window was still parked. A third \
+             refresh during a slow fan-out after the release is legitimate"
         );
         assert_eq!(lease_counter(&metrics, "lost"), 0);
         assert_eq!(
@@ -28460,28 +35362,63 @@ mod lease_tests {
             LeaseState::Held,
             "and the lease is still held after the read, past the deadline it began with"
         );
+        let ttl = pttl(&tv, &lock_key).await;
         assert!(
-            pttl(&tv, &lock_key).await > SHORT_LOCK_TTL_MS,
-            "the refresh landed on the lock itself (PEXPIRE to the full TTL)"
+            ttl > 0 && ttl <= LEADER_LOCK_TTL_MS as i64,
+            "the refresh landed on the lock itself: it was staged at {WHOLE_TEST_LOCK_TTL_MS} ms, \
+             and only a refresh's PEXPIRE brings it to the lease's {LEADER_LOCK_TTL_MS} ms; got \
+             {ttl} ms"
         );
     }
 
-    /// **A lease lost mid fenced read ends the walk.** The lock is a peer's
-    /// before the tick (the gate does not probe: no refresh is due), and the
-    /// keeper's refresh three seconds into the read finds it gone while the read's
-    /// first window is still held back. The assembly ends `LeaseLost`: nothing
-    /// is persisted, the read's fence lease is released in the background, the
-    /// walk stops before the second layer, the reading layer is demoted for
-    /// the next tick, and both layers are drained as still pending.
+    /// **A lease lost mid fenced read ends the walk.** The lock is ours when
+    /// the tick starts. Once the read is inside its first fan-out window, under
+    /// its fence (held back far past this test), a peer takes the lock, and the
+    /// keeper's next refresh finds it the peer's. The assembly ends
+    /// `LeaseLost`: nothing is persisted, the read's fence lease is released in
+    /// the background, the walk stops before the second layer, the reading
+    /// layer is demoted for the next tick, and both layers are drained as
+    /// still pending.
+    ///
+    /// # Ordered by events, not by a clock
+    ///
+    /// The loss here is a steal, not a lapse: the local deadline is
+    /// [`FAR_DEADLINE`] until the first refresh and the lock is staged for the
+    /// whole test, so neither bounds what runs before the keeper looks. The
+    /// steal waits for the read to reach its held-back window, so nothing that
+    /// runs before it — pass 1, the gate, the fence acquire — is bounded
+    /// either.
+    ///
+    /// The keeper's first refresh falls due `KEEPER_FIRST_LOOK` after the
+    /// lease is built. That is only a lower bound on when the keeper looks, so
+    /// an idle run takes about that long. A refresh that comes before the
+    /// steal — at gate 0 when pass 1 ran long, or beside the read before it
+    /// reached its window — finds the lock still ours and renews, and the
+    /// keeper looks again one [`LEASE_RENEW_INTERVAL`] later, after the steal.
+    /// That run is ten seconds longer and reaches the same verdict.
+    ///
+    /// The read reaching its window, the tick's end and the fence's background
+    /// release are all bounded by the test's one hang-guard deadline, below
+    /// nextest's 120 s kill, so a tick that waits out the held-back window
+    /// fails by name.
+    ///
+    /// The read's own fence lease is staged past nextest's kill
+    /// ([`stage_fence_lease_for_whole_test`], rule (b); asserted before the
+    /// steal), so no fence renewal has to land while the window is held back:
+    /// a starved renewal cannot break the held attempt and leave its retry to
+    /// run, unheld, to a persisted base before the steal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_lease_lost_during_a_fenced_read_persists_nothing_releases_the_fence_and_stops() {
-        /// How long the first fenced window is held back — far past the
-        /// keeper's refresh three seconds in, so the read is under its fence
-        /// when the lease is lost.
-        const HELD_BACK: Duration = Duration::from_secs(10);
-        /// Bound on the fence lease's background release.
-        const RELEASE_BUDGET: Duration = Duration::from_secs(10);
+        /// How long the first fenced window is held back — far past this
+        /// test, so with the read's own fence lease staged past it too
+        /// ([`stage_fence_lease_for_whole_test`]), only the lease loss can end
+        /// the read.
+        const HELD_BACK: Duration = Duration::from_secs(600);
+        /// When the keeper's first refresh falls due, after the lease is
+        /// built: a lower bound, never a deadline (see the doc above).
+        const KEEPER_FIRST_LOOK: Duration = Duration::from_secs(3);
 
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         // Both NeverWritten: urgency ties and the tiebreak (object id
@@ -28492,7 +35429,8 @@ mod lease_tests {
         let second = seed_layers_with_seq(&tv, 1, S0).await[0];
         assert!(reading < second, "fixture: the reading layer sorts first");
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, PEER_ID).await;
+        // Ours until the steal below: any refresh before it renews.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         let store: Arc<dyn CheckpointStore> = test_store.clone();
@@ -28501,18 +35439,17 @@ mod lease_tests {
         let cancel = CancellationToken::new();
         let mut demotion: Option<u64> = None;
         let client = fenced_path_client(&tv);
-        delay_the_next_fenced_window(&client, HELD_BACK);
-        // Held for 30 s, refreshed three seconds short of a renewal interval
-        // ago: the gate before the layer answers from the deadline alone, and
-        // the keeper's refresh falls due three seconds into the tick — inside
-        // the held-back read.
+        stage_fence_lease_for_whole_test(&tv, &client, reading).await;
+        let injector = hold_back_the_next_fenced_window(&client, HELD_BACK);
+        // Never overshoots (FAR_DEADLINE); first refresh due KEEPER_FIRST_LOOK
+        // from now, with production's TTL and cadence.
         let mut lease = lease_for(
             &lock_key,
-            Duration::from_secs(30),
-            LEASE_RENEW_INTERVAL - Duration::from_secs(3),
+            FAR_DEADLINE,
+            LEASE_RENEW_INTERVAL - KEEPER_FIRST_LOOK,
         );
 
-        let (_, logs) = capture_warns(run_one_tick(
+        let tick = capture_warns(run_one_tick(
             &client,
             &keys,
             &store,
@@ -28521,8 +35458,40 @@ mod lease_tests {
             &cancel,
             &mut lease,
             &mut demotion,
-        ))
-        .await;
+        ));
+        let steal = async {
+            tokio::time::timeout_at(deadline, async {
+                // In the held-back window (the delay was taken) and under the
+                // fence (a reader field is live).
+                loop {
+                    if injector.delays_remaining() == 0
+                        && !fence_readers(&tv, reading).await.is_empty()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the read did not reach its held-back window under its fence within the \
+                     test's {TEST_HANG_GUARD:?} hang guard"
+                )
+            });
+            assert_fence_lease_outlasts(&tv, reading, TEST_HANG_GUARD).await;
+            set_lock_for_whole_test(&tv, &lock_key, PEER_ID).await;
+        };
+        let ((_, logs), ()) =
+            tokio::time::timeout_at(deadline, async { tokio::join!(tick, steal) })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the tick did not end within the test's {TEST_HANG_GUARD:?} hang guard: \
+                         the keeper must end the read once the lock is a peer's, long before the \
+                         held-back window would"
+                    )
+                });
 
         assert_eq!(
             test_store.put_order(),
@@ -28559,7 +35528,7 @@ mod lease_tests {
                 .contains_key("last_checkpoint_seq"),
             "no cursor was stamped for the reading layer"
         );
-        let released = tokio::time::timeout(RELEASE_BUDGET, async {
+        let released = tokio::time::timeout_at(deadline, async {
             while !fence_readers(&tv, reading).await.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -28568,7 +35537,8 @@ mod lease_tests {
         assert!(
             released.is_ok(),
             "the abandoned read's fence lease is released in the background (its reader field \
-             gone) well before the held-back window would have ended; still live: {:?}",
+             gone) within the test's {TEST_HANG_GUARD:?} hang guard, long before the held-back \
+             window would have ended; still live: {:?}",
             fence_readers(&tv, reading).await
         );
         assert_eq!(
@@ -28576,6 +35546,154 @@ mod lease_tests {
             Some(PEER_ID),
             "the losing replica leaves the peer's lock alone"
         );
+    }
+
+    /// **A held fenced read whose fence lease is staged for the whole test
+    /// needs no renewal to stay unbroken** — the premise every held-window
+    /// test in Groups 6 and 7 rests on ([`stage_fence_lease_for_whole_test`]).
+    ///
+    /// The read's first fan-out window is parked on the hold seam with every
+    /// fence renewal stalled (`stall_fence_renewals`), and released only once
+    /// the store's clock has passed the deadline an unstaged grant of this
+    /// layer would have written: its epoch's start plus the lease of the
+    /// size the assembler estimates for the layer from its atomic read's
+    /// `TOO_LARGE` answer, which an unstaged acquire uses. An unstaged lease
+    /// has then lapsed unrenewed, its release answers `BROKEN`, and the read
+    /// counts a `fence_broken` attempt before a retry writes it; the staged
+    /// lease is still live, so the one attempt verifies.
+    ///
+    /// Ordered by events: the wait is on the store's clock passing that
+    /// deadline, never a sleep, and every wait is bounded by the test's one
+    /// hang guard. The read takes no leader lease ([`NoLeaseToKeep`]).
+    ///
+    /// [`NoLeaseToKeep`]: crate::checkpoint::assembler::NoLeaseToKeep
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_held_fenced_read_with_its_fence_lease_staged_for_the_whole_test_needs_no_renewal() {
+        use crate::observability::metrics::test_util::{render, sample_value};
+        use crate::storage::diff_read::{SnapshotReadConsumer, SnapshotReadOf};
+        use crate::storage::snapshot_fence::LayerSize;
+        use fred::interfaces::HashesInterface;
+
+        let deadline = hang_guard_deadline();
+        let tv = TestValkey::setup().await;
+        let metrics = fresh_metrics();
+        tv.client()
+            .install_observability_hooks(Arc::clone(&metrics))
+            .await;
+        let keys = tv.key_schema().clone();
+        let oid = seed_driven_layer(&tv, S0).await.object_id;
+        let fence_key = keys.obj_snapshot_fence(&oid.to_string());
+        let store = crate::checkpoint::adapters::InMemoryCheckpointStore::new();
+
+        // Above the atomic-read limits, so the assembler takes the fenced read.
+        let client = fenced_path_client(&tv);
+        // The lease an unstaged acquire grants: sized from the estimate the
+        // assembler takes from this same atomic read's TOO_LARGE answer.
+        let estimate = match crate::storage::diff_read::read_object_snapshot(
+            &client,
+            &keys,
+            &oid.to_string(),
+            SnapshotReadConsumer::Checkpoint,
+        )
+        .await
+        .expect("the atomic read must answer")
+        {
+            SnapshotReadOf::TooLarge(answer) => LayerSize::from_too_large(&answer, None),
+            SnapshotReadOf::Snapshot(_) => {
+                panic!("fixture: the layer is above fenced_path_client's atomic-read limits")
+            }
+        };
+        let unstaged_lease_ms = crate::storage::snapshot_fence::coefficients(&client)
+            .timing(estimate)
+            .lease_ms
+            .ceil() as i64;
+        stage_fence_lease_for_whole_test(&tv, &client, oid).await;
+        let injector =
+            std::sync::Arc::new(crate::storage::diff_read::ObjectSnapshotReadFaultInjector::new());
+        let hold = injector
+            .push_hold_at(crate::storage::diff_read::ObjectSnapshotReadFaultTarget::next_read());
+        injector.stall_fence_renewals(true);
+        client
+            .install_object_snapshot_read_fault_injector_for_test(std::sync::Arc::clone(&injector));
+
+        let read = async {
+            assemble_layer_checkpoint(
+                &client,
+                &keys,
+                oid,
+                &store,
+                REPLICA_ID,
+                &mut crate::checkpoint::assembler::NoLeaseToKeep,
+            )
+            .await
+        };
+        let release = async {
+            settle(deadline, "the read parking in its held window", || async {
+                hold.is_parked()
+            })
+            .await;
+            let epoch_start: i64 = tv
+                .client()
+                .pool
+                .hget::<Option<String>, _, _>(&fence_key, "epoch_start")
+                .await
+                .expect("HGET the fence's epoch_start must succeed")
+                .expect("the held read started an epoch on the fence")
+                .parse()
+                .expect("epoch_start is an integer ms");
+            let unstaged_deadline = epoch_start + unstaged_lease_ms;
+            settle(
+                deadline,
+                "the store's clock passing the deadline an unstaged grant would have written",
+                || async { store_now_ms(&tv).await > unstaged_deadline },
+            )
+            .await;
+            hold.release();
+        };
+        let (decision, ()) =
+            tokio::time::timeout_at(deadline, async { tokio::join!(read, release) })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "within the test's {TEST_HANG_GUARD:?} hang guard the read must park, \
+                         the store's clock pass an unstaged lease's deadline, and the released \
+                         read finish; parked = {}",
+                        hold.is_parked()
+                    )
+                });
+        let decision = decision.expect("the assembly must decide, not fail");
+
+        let snapshot_reads = |outcome: &str| {
+            sample_value(
+                &render(&metrics),
+                "live_edit_snapshot_read_total",
+                &[
+                    ("consumer", "checkpoint"),
+                    ("path", "fenced"),
+                    ("outcome", outcome),
+                ],
+            )
+            .unwrap_or(0.0) as u64
+        };
+        assert_eq!(
+            snapshot_reads("fence_broken"),
+            0,
+            "the held attempt kept its staged fence lease through a renewal-free hold past an \
+             unstaged lease's deadline, so its release verified it rather than answering BROKEN"
+        );
+        assert_eq!(
+            snapshot_reads("ok"),
+            1,
+            "fixture: the one fenced read was counted on this registry, so the zero above is a \
+             reading, not an unhooked registry"
+        );
+        match decision {
+            AssemblyDecision::Written(outcome) => assert_eq!(
+                outcome.snap_seq, S0,
+                "the held read's verified cut is persisted"
+            ),
+            other => panic!("the held fenced read must persist its cut; got {other:?}"),
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -28587,8 +35705,9 @@ mod lease_tests {
     // [`TickLeaseKeeper`], plus the loop's cancellation token. The pure tests
     // drive the wrapper over stand-in keepers; the tick tests hold a fenced
     // read where graceful shutdown would otherwise wait it out — under its
-    // fence (the delay seam, far longer than the test) or in a writers' gap's
-    // `RETRY_AFTER` — and cancel the token there.
+    // fence (the delay seam, far longer than the test, with the read's own
+    // fence lease staged past it: [`stage_fence_lease_for_whole_test`]) or
+    // in a writers' gap's `RETRY_AFTER` — and cancel the token there.
 
     /// A keeper whose lease is lost once `lost` is notified.
     struct LosesWhen(Arc<tokio::sync::Notify>);
@@ -28675,8 +35794,10 @@ mod lease_tests {
         }
     }
 
-    /// [`delay_the_next_fenced_window`], returning the injector so a test can
-    /// tell when the read reached the held-back window.
+    /// Hold `client`'s next fenced fan-out window back for `delay` before its
+    /// first command is issued (then issue it for real), returning the
+    /// injector so a test can tell when the read reached the held-back window
+    /// (its delay was taken).
     fn hold_back_the_next_fenced_window(
         client: &ValkeyClient,
         delay: Duration,
@@ -28692,30 +35813,24 @@ mod lease_tests {
         injector
     }
 
-    /// Bound on a tick stopped by graceful shutdown, from the cancellation's
-    /// arrival — a deadline, not a timing claim: the healthy path returns at
-    /// once, and a tick that waited its fenced read out would take the read's
-    /// whole held-back window or writers' gap, both far longer.
-    const SHUTDOWN_TICK_BUDGET: Duration = Duration::from_secs(20);
-
-    /// Bound on the read reaching the point the test cancels at, and on the
-    /// dropped read's tracked cleanups draining.
-    const SHUTDOWN_SETTLE_BUDGET: Duration = Duration::from_secs(10);
-
-    /// Poll `cond` every 5 ms until it holds, within
-    /// [`SHUTDOWN_SETTLE_BUDGET`].
-    async fn settle<F, Fut>(what: &str, mut cond: F)
+    /// Poll `cond` every 5 ms until it holds, within the test's hang-guard
+    /// `deadline` ([`hang_guard_deadline`]) — an event wait, never a budget
+    /// measured from some earlier point: what runs before the event (pass 1's
+    /// whole-keyspace SCAN, the fence acquire) is unbounded.
+    async fn settle<F, Fut>(deadline: tokio::time::Instant, what: &str, mut cond: F)
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
-        tokio::time::timeout(SHUTDOWN_SETTLE_BUDGET, async {
+        tokio::time::timeout_at(deadline, async {
             while !cond().await {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .unwrap_or_else(|_| panic!("{what} did not happen within {SHUTDOWN_SETTLE_BUDGET:?}"));
+        .unwrap_or_else(|_| {
+            panic!("{what} did not happen within the test's {TEST_HANG_GUARD:?} hang guard")
+        });
     }
 
     /// What a tick stopped by graceful shutdown left behind, for
@@ -28792,8 +35907,9 @@ mod lease_tests {
 
     /// The two tick shutdown tests' shared arrangement: two NeverWritten
     /// layers (the tiebreak, object id ascending, puts the reading one first;
-    /// the second is never reached), the lock this replica's, a fresh store
-    /// and registry, and the forced-low client, so the reading layer is read
+    /// the second is never reached), the lock this replica's — our marked
+    /// value, staged for the whole test (rule (b)) — a fresh store and
+    /// registry, and the forced-low client, so the reading layer is read
     /// through the fenced read.
     struct ShutdownTickFx {
         tv: TestValkey,
@@ -28821,7 +35937,7 @@ mod lease_tests {
             let reading = seed_driven_layer(&tv, S0).await.object_id;
             let second = seed_layers_with_seq(&tv, 1, S0).await[0];
             assert!(reading < second, "fixture: the reading layer sorts first");
-            set_lock(&tv, &keys.checkpoint_leader_lock(), REPLICA_ID).await;
+            set_lock_for_whole_test(&tv, &keys.checkpoint_leader_lock(), &our_lock_value()).await;
             let test_store = Arc::new(TestStore::new());
             let store: Arc<dyn CheckpointStore> = test_store.clone();
             let client = fenced_path_client(&tv);
@@ -28838,12 +35954,16 @@ mod lease_tests {
 
         /// Run one tick, with its WARNs captured, and cancel the loop's token
         /// once `ready` holds (`point` names it); the tick must then return
-        /// within [`SHUTDOWN_TICK_BUDGET`], long before `waited_out` would
-        /// have ended. The lease is held and refreshed just now, so no
-        /// refresh falls due while the test runs and the keeper's only stop
-        /// is the cancellation. Returns the WARNs and the demotion.
+        /// within the test's hang-guard `deadline`, long before `waited_out`
+        /// would have ended. Both are ordered by events: the cancel waits for
+        /// `ready` however long pass 1 and the fence acquire take, and nothing
+        /// is measured from the tick's start. The lease is held for the whole
+        /// test ([`lease_held_for_whole_test`]), so no refresh falls due while
+        /// the test runs and the keeper's only stop is the cancellation.
+        /// Returns the WARNs and the demotion.
         async fn run_until_cancelled<F, Fut>(
             &self,
+            deadline: tokio::time::Instant,
             point: &str,
             waited_out: &str,
             ready: F,
@@ -28855,11 +35975,7 @@ mod lease_tests {
             let config = due_everything_config(2);
             let cancel = CancellationToken::new();
             let mut demotion: Option<u64> = None;
-            let mut lease = lease_for(
-                &self.keys.checkpoint_leader_lock(),
-                Duration::from_secs(30),
-                Duration::ZERO,
-            );
+            let mut lease = lease_held_for_whole_test(&self.keys.checkpoint_leader_lock());
             let tick = capture_warns(run_one_tick(
                 &self.client,
                 &self.keys,
@@ -28871,20 +35987,19 @@ mod lease_tests {
                 &mut demotion,
             ));
             let shut_down = async {
-                settle(point, ready).await;
+                settle(deadline, point, ready).await;
                 cancel.cancel();
             };
             let ((_, logs), ()) =
-                tokio::time::timeout(SHUTDOWN_SETTLE_BUDGET + SHUTDOWN_TICK_BUDGET, async {
-                    tokio::join!(tick, shut_down)
-                })
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "the tick returns once the loop is cancelled, long before {waited_out} \
-                         would end"
-                    )
-                });
+                tokio::time::timeout_at(deadline, async { tokio::join!(tick, shut_down) })
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "the tick returns once the loop is cancelled, long before {waited_out} \
+                             would end; it did not return within the test's {TEST_HANG_GUARD:?} \
+                             hang guard"
+                        )
+                    });
             (logs, demotion)
         }
 
@@ -28909,32 +36024,58 @@ mod lease_tests {
     /// is tracked on the client (what `ValkeyClient::quit` waits for); once
     /// none is in flight the fence holds no reader field: released, not left
     /// to lapse (a lapse removes nothing).
+    ///
+    /// Every wait is bounded by the test's one hang guard (rule (b) for the
+    /// lease and lock, which are held for the whole test); the held-back
+    /// window outlasts it, so a tick that waited the window out fails at the
+    /// guard, by name. The read's own fence lease is held for the whole test
+    /// too ([`stage_fence_lease_for_whole_test`], rule (b); asserted before
+    /// the cancel), so no fence renewal has to land while the window is held
+    /// back: a starved renewal cannot break the held attempt and leave its
+    /// retry to run, unheld, to a persisted base before the cancel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_shutdown_during_a_fenced_read_returns_at_once_persists_nothing_and_releases_the_fence(
     ) {
-        /// How long the first fenced window is held back: far past
-        /// [`SHUTDOWN_TICK_BUDGET`], so only the cancellation can end the
-        /// tick in time.
-        const HELD_BACK: Duration = Duration::from_secs(60);
+        /// How long the first fenced window is held back: past nextest's
+        /// 120 s kill and so past the test's hang guard, so with the read's
+        /// own fence lease staged past it too
+        /// ([`stage_fence_lease_for_whole_test`]), only the cancellation can
+        /// end the tick in time.
+        const HELD_BACK: Duration = Duration::from_secs(600);
+        const _: () = assert!(
+            HELD_BACK.as_secs() > TEST_HANG_GUARD.as_secs(),
+            "fixture: the held-back window must outlast the hang guard"
+        );
 
+        let deadline = hang_guard_deadline();
         let fx = ShutdownTickFx::new(false).await;
+        stage_fence_lease_for_whole_test(&fx.tv, &fx.client, fx.reading).await;
         let injector = hold_back_the_next_fenced_window(&fx.client, HELD_BACK);
 
         let (logs, demotion) = fx
             .run_until_cancelled(
+                deadline,
                 "the read reaching its held-back window under its fence",
                 "the held-back window",
                 || async {
-                    injector.delays_remaining() == 0
-                        && !fence_readers(&fx.tv, fx.reading).await.is_empty()
+                    let inside = injector.delays_remaining() == 0
+                        && !fence_readers(&fx.tv, fx.reading).await.is_empty();
+                    if inside {
+                        // Checked here, before the cancel drops the read and
+                        // its lease is released.
+                        assert_fence_lease_outlasts(&fx.tv, fx.reading, TEST_HANG_GUARD).await;
+                    }
+                    inside
                 },
             )
             .await;
 
         assert_shutdown_left_nothing(fx.stopped(&logs, demotion), "fence held").await;
-        settle("the dropped read's tracked cleanups draining", || async {
-            fx.client.fence_guard_cleanups_inflight() == 0
-        })
+        settle(
+            deadline,
+            "the dropped read's tracked cleanups draining",
+            || async { fx.client.fence_guard_cleanups_inflight() == 0 },
+        )
         .await;
         assert_eq!(
             fence_readers(&fx.tv, fx.reading).await,
@@ -28951,22 +36092,38 @@ mod lease_tests {
     /// returns at once — not when the gap would end and the read run — with
     /// nothing persisted, counted or demoted; the read never held a lease, so
     /// there is none to release.
+    ///
+    /// The gap is staged past the test's hang guard, and at a size whose
+    /// `reader_wait_max(L)` covers the gap and the guard together (both
+    /// asserted): it is still open at the read's first acquire however long
+    /// pass 1 takes, the read sleeps it out rather than refusing it, and a
+    /// tick that slept it out fails at the guard. Every wait is bounded by
+    /// the test's one hang guard; the lease and lock are held for the whole
+    /// test (rule (b)).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_shutdown_while_a_fenced_read_waits_out_a_writers_gap_returns_at_once_and_persists_nothing(
     ) {
-        use fred::interfaces::{HashesInterface, LuaInterface};
+        use fred::interfaces::HashesInterface;
 
-        /// How far past the store's clock the staged gap ends: under the
-        /// layer's `reader_wait_max(L)` (asserted below), far past
-        /// [`SHUTDOWN_SETTLE_BUDGET`].
-        const GAP_MS: i64 = 15_000;
-        /// The size the gap is staged at, which the acquire uses.
+        /// How far past the store's clock the staged gap ends: past the
+        /// test's hang guard, and under the layer's `reader_wait_max(L)`
+        /// with the guard added (asserted below).
+        const GAP_MS: i64 = 300_000;
+        const _: () = assert!(
+            GAP_MS as u64 > TEST_HANG_GUARD.as_secs() * 1_000,
+            "fixture: the gap must outlast the hang guard"
+        );
+        /// The size the gap is staged at, which the acquire uses: large
+        /// enough that `reader_wait_max(L)` (about 520 s here, from
+        /// `FenceCoefficients::timing`) exceeds the gap plus the hang guard,
+        /// so the read sleeps the gap out for as long as the test can run.
         const STAGED: crate::storage::snapshot_fence::LayerSize =
             crate::storage::snapshot_fence::LayerSize {
-                items: 150_216,
-                bytes: 1_799_752,
+                items: 12_000_000,
+                bytes: 144_000_000,
             };
 
+        let deadline = hang_guard_deadline();
         let fx = ShutdownTickFx::new(true).await;
         let cap = crate::storage::snapshot_fence::read::CappedFenceWait::new(
             &fx.client,
@@ -28975,22 +36132,12 @@ mod lease_tests {
         )
         .cap(STAGED);
         assert!(
-            Duration::from_millis(GAP_MS as u64) < cap,
-            "fixture: the gap ({GAP_MS} ms) is under reader_wait_max(L) ({cap:?}), so the read \
-             sleeps it out"
+            Duration::from_millis(GAP_MS as u64) + TEST_HANG_GUARD < cap,
+            "fixture: the gap ({GAP_MS} ms) plus the hang guard ({TEST_HANG_GUARD:?}) is under \
+             reader_wait_max(L) ({cap:?}), so the read sleeps the gap out however late it \
+             arrives and for as long as the test can run"
         );
-        let now_ms: i64 = fx
-            .tv
-            .client()
-            .pool
-            .eval(
-                "local t = redis.call('TIME') \
-                 return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)",
-                Vec::<String>::new(),
-                Vec::<String>::new(),
-            )
-            .await
-            .expect("the store clock must be readable");
+        let now_ms = store_now_ms(&fx.tv).await;
         let fence_key = fx.keys.obj_snapshot_fence(&fx.reading.to_string());
         let _: () = fx
             .tv
@@ -29024,6 +36171,7 @@ mod lease_tests {
 
         let (logs, demotion) = fx
             .run_until_cancelled(
+                deadline,
                 "the read being answered RETRY_AFTER for the gap",
                 "the gap",
                 || async { retry_after_gap() >= 1.0 },
@@ -29040,6 +36188,355 @@ mod lease_tests {
             fx.client.fence_guard_cleanups_inflight(),
             0,
             "and spawned no cleanup"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Group 8 — the loop's shutdown token at pass 2's lease gate and after
+    // a write (b.jt5's checkpoint fold)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// **Shutdown after a generation is written.** The token is cancelled as
+    /// the layer's PUT lands. The layer's unit runs to its end — the cursor
+    /// is stamped, since a durable generation without its cursor would be
+    /// re-assembled forever — but the retention prune after it does not
+    /// start: the three older generations it would have pruned survive, and
+    /// nothing is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tick_cancelled_as_its_put_lands_stamps_the_cursor_and_starts_no_prune() {
+        /// Above the pre-seeded generations' sequences, so the written one is
+        /// the newest and a prune would delete two of those.
+        const SEQ: u64 = 100;
+        let tv = TestValkey::setup().await;
+        let keys = tv.key_schema().clone();
+        let oid = seed_layers_with_seq(&tv, 1, SEQ).await[0];
+        let lock_key = keys.checkpoint_leader_lock();
+        // The lease is not the subject: held for the whole test (rule (b)).
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let cancel = CancellationToken::new();
+        let cancel_as_it_lands: PutLandedHook = {
+            let cancel = cancel.clone();
+            Arc::new(move |_, _| {
+                let cancel = cancel.clone();
+                Box::pin(async move { cancel.cancel() })
+            })
+        };
+        let test_store = Arc::new(TestStore::new().with_put_landed_hook(cancel_as_it_lands));
+        preseed_three_generations(&test_store, oid).await;
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let mut lease = lease_held_for_whole_test(&lock_key);
+        let mut demotion: Option<u64> = None;
+
+        run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &due_everything_config(2),
+            Some(&fresh_metrics()),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        )
+        .await;
+
+        assert!(cancel.is_cancelled(), "fixture: the PUT landed");
+        assert_eq!(test_store.put_order(), vec![oid]);
+        assert_eq!(
+            header(&tv, oid)
+                .await
+                .get("last_checkpoint_seq")
+                .map(String::as_str),
+            Some("100"),
+            "the written generation's cursor is stamped"
+        );
+        let ops = test_store.op_log();
+        let put_at = ops
+            .iter()
+            .position(|op| *op == ("put", oid))
+            .expect("the PUT is logged");
+        assert!(
+            !ops[put_at..].contains(&("list", oid)),
+            "the prune never started: it lists the lineage first, and nothing was listed after \
+             the PUT: {ops:?}"
+        );
+        assert_eq!(
+            test_store.delete_log(),
+            Vec::new(),
+            "so nothing was deleted"
+        );
+        assert_eq!(
+            test_store
+                .list_layer_checkpoints(oid)
+                .await
+                .expect("list_layer_checkpoints must succeed")
+                .len(),
+            4,
+            "the three pre-seeded generations and the written one all survive"
+        );
+    }
+
+    /// Runs its action once, synchronously, on the first event whose message
+    /// starts with `prefix`: a hook at a point of a tick no store call
+    /// reaches.
+    struct OnEvent {
+        prefix: &'static str,
+        action: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    /// An event's `message`, read with [`tracing::field::Visit`].
+    struct MessageOf(String);
+
+    impl tracing::field::Visit for MessageOf {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for OnEvent {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = MessageOf(String::new());
+            event.record(&mut message);
+            if message.0.starts_with(self.prefix) {
+                if let Some(action) = self.action.lock().unwrap().take() {
+                    action();
+                }
+            }
+        }
+    }
+
+    /// **Shutdown during pass 2's lease refresh.** The tick's lease is due a
+    /// refresh at pass 2's first gate, and the token is cancelled while that
+    /// refresh's round trip is in flight: after the gate the tick re-checks
+    /// the token and returns, so no assembly starts — nothing is put and no
+    /// cursor is stamped — though the refresh itself landed.
+    ///
+    /// The placement is deterministic. Pass 1 and the gate both use the
+    /// maintenance pool, so the pool is stalled between them: the layer is
+    /// marked as the last tick's lease-loss demotion, which makes the tick
+    /// log one DEBUG line after pass 1 and before pass 2, and a tracing layer
+    /// stalls every maintenance connection behind a server-side `BLPOP`
+    /// ([`stall_pool`]) synchronously on that line. The refresh then queues
+    /// behind the block; once the server has read it (the connection's
+    /// `tot-net-in` grows), the test cancels and releases the stall.
+    ///
+    /// The refresh is the subject, so its due time stays production's, but
+    /// nothing else bounds the test: the lock is staged for the whole test
+    /// and the local deadline is [`FAR_DEADLINE`] (rule (b)), so the gate's
+    /// refresh finds the lock held however long pass 1 ran, and the tick and
+    /// its stall are bounded only by the test's hang guard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tick_cancelled_during_pass_twos_lease_refresh_starts_no_assembly() {
+        use crate::storage::test_support::{block_on_spawned, release_all, stall_pool, ConnStall};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let deadline = hang_guard_deadline();
+        let tv = TestValkey::setup().await;
+        let keys = tv.key_schema().clone();
+        let oid = seed_layers(&tv, 1).await[0];
+        let lock_key = keys.checkpoint_leader_lock();
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let test_store = Arc::new(TestStore::new());
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let metrics = fresh_metrics();
+        let config = due_everything_config(2);
+        let cancel = CancellationToken::new();
+        // Never overshoots (FAR_DEADLINE), last refreshed past the renew
+        // interval ago: the first gate refreshes.
+        let mut lease = lease_for(
+            &lock_key,
+            FAR_DEADLINE,
+            LEASE_RENEW_INTERVAL + Duration::from_secs(1),
+        );
+        let mut demotion: Option<u64> = Some(oid);
+
+        // The stalls, with each connection's `tot-net-in` as it was parked.
+        type Parked = Vec<(ConnStall, u64)>;
+        let parked: Arc<std::sync::Mutex<Option<Parked>>> = Arc::new(std::sync::Mutex::new(None));
+        let stall_the_maintenance_pool: Box<dyn FnOnce() + Send> = {
+            let parked = Arc::clone(&parked);
+            let pool = tv.client().maintenance_pool.clone();
+            let observer = tv.client().pool.next().clone();
+            let prefix = format!("{}conn-stall:maintenance:", tv.prefix());
+            let runtime = tokio::runtime::Handle::current();
+            Box::new(move || {
+                let stalls = block_on_spawned(&runtime, async move {
+                    let mut stalls = Vec::new();
+                    for stall in stall_pool(&pool, &observer, &prefix).await {
+                        let read = stall.net_in().await.expect("the stalled connection is up");
+                        stalls.push((stall, read));
+                    }
+                    stalls
+                })
+                .unwrap_or_else(|_| panic!("stalling the maintenance pool did not finish"));
+                *parked.lock().unwrap() = Some(stalls);
+            })
+        };
+        let subscriber = tracing_subscriber::registry().with(OnEvent {
+            prefix: "checkpoint loop demoting the layer",
+            action: std::sync::Mutex::new(Some(stall_the_maintenance_pool)),
+        });
+
+        let tick = run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &config,
+            Some(&metrics),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        )
+        .with_subscriber(tracing::Dispatch::new(subscriber));
+        let cancel_during_the_refresh = async {
+            let stalls = loop {
+                if let Some(stalls) = parked.lock().unwrap().take() {
+                    break stalls;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            'sent: loop {
+                for (stall, parked_at) in &stalls {
+                    if stall.net_in().await.is_some_and(|now| now > *parked_at) {
+                        break 'sent;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            cancel.cancel();
+            release_all(stalls.into_iter().map(|(stall, _)| stall).collect()).await;
+        };
+        tokio::time::timeout_at(deadline, async {
+            tokio::join!(tick, cancel_during_the_refresh)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the tick returns once its refresh answers; the stall, the cancel and the tick did \
+                 not all finish within the test's {TEST_HANG_GUARD:?} hang guard"
+            )
+        });
+
+        assert_eq!(
+            lease_counter(&metrics, "renewed"),
+            1,
+            "fixture: the refresh round trip ran to its end, the cancel inside it"
+        );
+        assert_eq!(
+            test_store.put_order(),
+            Vec::<u64>::new(),
+            "no assembly started after the gate"
+        );
+        assert!(
+            !header(&tv, oid).await.contains_key("last_checkpoint_seq"),
+            "and no cursor was stamped"
+        );
+    }
+
+    /// b.87a — policy 3's forfeiting half for a walk that walked every
+    /// primary on its pin but whose routing table was out of date, on a real
+    /// multi-shard cluster. Through `storage::scan_guard`'s walk seam, keyed
+    /// by pass 1's pattern: the first primary's start `CLUSTER NODES` (read
+    /// 0) has no myself line, so that pin's ownership is unproven and the
+    /// walk compares its map with the table its pins came from, and that
+    /// comparison (check 0) is forged to differ (`TablePartitionDiffers`).
+    /// The walk records `StaleTable`, re-syncs the table and loses coverage,
+    /// so the tick forfeits its pending-age aggregates with the WARN that
+    /// says the walk did not reach every primary, carrying the out-of-date
+    /// table. The pins were the real owners, so pass 1 still found every
+    /// seeded layer and pass 2 assembles them all. Policy 3's publishing half
+    /// is
+    /// [`cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes`]
+    /// (an open slot), and its store-fault half
+    /// [`tick_whose_pass_1_walk_does_not_reach_every_primary_forfeits_the_aggregates`].
+    ///
+    /// The lease is not under test: the lock is staged for the whole test
+    /// and the local deadline is [`FAR_DEADLINE`], with no refresh due.
+    ///
+    /// **Cluster-gated**: skips (a `SKIP:` line) when
+    /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset; CI's `test-cluster:` job runs
+    /// it (lib target: the seam is compiled into every test build of the
+    /// crate).
+    ///
+    /// Fail-on-old (stated, not run in this sandbox, which has no cluster):
+    /// with `StaleTable` left out of `scan_guard::loses_coverage`'s
+    /// coverage-losing reasons (and `check_table`'s `coverage_lost = true`
+    /// dropped with it), the walk answers `every_primary_walked() == true`,
+    /// the tick publishes, and `never_written_gauge(..) == None` goes red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_tick_whose_pass_1_walk_found_a_stale_routing_table_forfeits_the_aggregates() {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
+            eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
+            return;
+        };
+        let tv = TestValkey::setup_with_url(cluster_url, 4).await;
+        let keys = tv.key_schema().clone();
+        let layers = seed_layers(&tv, 2).await;
+        let lock_key = keys.checkpoint_leader_lock();
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let test_store = Arc::new(TestStore::new());
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let metrics = fresh_metrics();
+        let config = due_everything_config(2);
+        let cancel = CancellationToken::new();
+        let mut demotion: Option<u64> = None;
+
+        let pattern = format!("{}{{*}}:obj:hdr", keys.prefix());
+        let armed = [
+            crate::storage::scan_guard::arm_walk_fault_for_test(
+                &pattern,
+                crate::storage::scan_guard::WalkFault::ClusterNodesReply {
+                    read: 0,
+                    reply: String::new(),
+                },
+            ),
+            crate::storage::scan_guard::arm_walk_fault_for_test(
+                &pattern,
+                crate::storage::scan_guard::WalkFault::TablePartitionDiffers { check: 0 },
+            ),
+        ];
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, Duration::ZERO);
+        let (_, logs) = capture_warns(run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &config,
+            Some(&metrics),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        ))
+        .await;
+        drop(armed);
+
+        assert_eq!(
+            never_written_gauge(&metrics),
+            None,
+            "the aggregates must be FORFEITED: an unproven pin from an out-of-date routing table \
+             may have read a node that does not serve its primary"
+        );
+        assert!(
+            logs.contains("did not reach every primary") && logs.contains("out of date"),
+            "the pass-1 WARN must say the walk did not reach every primary and carry the \
+             out-of-date table. Captured WARNs:\n{logs}"
+        );
+        assert!(
+            logs.contains("suppressed this tick's pending-age aggregates"),
+            "and the forfeited publish must say so. Captured WARNs:\n{logs}"
+        );
+        let mut put = test_store.put_order();
+        put.sort_unstable();
+        let mut seeded = layers.clone();
+        seeded.sort_unstable();
+        assert_eq!(put, seeded, "pass 2 assembles every layer pass 1 found");
+        println!(
+            "CLUSTER-GATED RAN: cluster_tick_whose_pass_1_walk_found_a_stale_routing_table_forfeits_the_aggregates"
         );
     }
 }
@@ -29084,9 +36581,17 @@ mod tail_tick_tests {
     //!   the arm is reached at all; that the prune runs on the tail arm; that a
     //!   lease lost across a capture unit aborts and demotes). Each carries an
     //!   explicit **precondition assertion** naming the arm it needed, and each
-    //!   hot-writer fixture drives `run_one_tick` in a **bounded** loop — the
-    //!   writer supplies the commits a tail covers, and a tick can still find
-    //!   none above the lineage head yet.
+    //!   hot-writer fixture drives `run_one_tick` until its state holds, bounded
+    //!   only by the test's wall-clock hang guard
+    //!   ([`tick_support::hang_guard_deadline`]), never by a count of ticks —
+    //!   the writer supplies the commits a tail covers, a tick can still find
+    //!   none above the lineage head yet, and how many ticks that takes
+    //!   depends on scheduling. The lease and lock of every test whose subject
+    //!   is not the lease are held for the whole test
+    //!   ([`tick_support::lease_held_for_whole_test`],
+    //!   [`tick_support::set_lock_for_whole_test`]; test-writing guide
+    //!   § Synchronization Patterns, rule (b)), so no gate can abort a tick
+    //!   however long pass 1 or the writer's warm-up runs.
     //! - `helper_*` — the deterministic semantics matrix (cursor pair shape,
     //!   metric arms, pending-age arms), asserted against the helper directly
     //!   over a hand-planted base and a stream written before the call. No writer
@@ -29184,19 +36689,6 @@ mod tail_tick_tests {
     /// skip that commit; a head one lower would place the floor below it.
     const LINEAGE_BASE_SEQ: u64 = S0 - 1;
 
-    /// Upper bound on how many `run_one_tick` calls a hot-writer fixture may
-    /// spend waiting for its arm.
-    ///
-    /// Six, and far more headroom than the fixtures need: on the
-    /// [`unprovable_cut_client`] each tick that reaches the assembler pays one
-    /// atomic read and a header read, then the capture's own reads, so the
-    /// armed layer reaches the fallback on the first tick that finds a commit
-    /// above its lineage head — which [`WARM_UP_COMMITS`] guarantees before the
-    /// first one. Six ticks is a worst case of a few seconds, comfortably
-    /// inside `.config/nextest.toml`'s 40 s slow mark and far inside its 120 s
-    /// hard kill, which matters because a SIGKILLed test prints nothing at all.
-    const MAX_TICKS: usize = 6;
-
     /// The recognisable `restore_seq_bump` the flag-off test plants, borrowed
     /// from `case_d`'s `PLANTED_RESTORE_BUMP`.
     const PLANTED_RESTORE_BUMP: &str = "4242";
@@ -29265,18 +36757,17 @@ mod tail_tick_tests {
     }
 
     /// Drive `run_one_tick` until `object_id`'s listing holds a `Tail` handle,
-    /// or [`MAX_TICKS`] ticks have run.
+    /// bounded only by the test's hang-guard `deadline`.
     ///
     /// Returns the deltas the WINNING tick produced — measured per-iteration
     /// rather than across the whole loop, so "these counters moved on the SAME
     /// layer-tick" stays an assertion about one tick, which is the SR-8.2 claim.
     ///
-    /// A thin wrapper over [`drive_until`] since `t3.dfh.be.hm.hq`, which hoisted
-    /// the per-iteration measurement into `tick_support` so a lifecycle test and
-    /// this module's capture fixtures share one driver. The signature, the
-    /// [`MAX_TICKS`] bound and the returned deltas are unchanged; every caller
-    /// below is untouched. Keeping a second hand-rolled copy of the measurement
-    /// is exactly how the two would drift apart on the next widening.
+    /// A thin wrapper over [`drive_until_state`], so a lifecycle test and this
+    /// module's capture fixtures share one driver and one per-iteration
+    /// measurement; a second hand-rolled copy is exactly how the two would
+    /// drift apart on the next widening. On expiry it panics with
+    /// [`drive_exhaustion_report`], which quotes `writer`.
     ///
     /// The ticks run on [`unprovable_cut_client`], armed for `object_id`: a
     /// tail is captured only on a tick whose assembly persisted nothing, which
@@ -29293,8 +36784,10 @@ mod tail_tick_tests {
         metrics: &SharedMetrics,
         lease: &mut CheckpointLease,
         demotion: &mut Option<u64>,
+        writer: &HotWriter,
+        deadline: tokio::time::Instant,
         object_id: u64,
-    ) -> Option<TickDeltas> {
+    ) -> TickDeltas {
         let client = unprovable_cut_client(tv, object_id);
         let driver = TickDriver {
             tv,
@@ -29305,13 +36798,14 @@ mod tail_tick_tests {
             config,
             metrics,
             object_id,
-            writer: None,
+            writer: Some(writer),
         };
-        drive_until(
+        drive_until_state(
             &driver,
             lease,
             demotion,
-            MAX_TICKS,
+            deadline,
+            "a Tail generation to land through the capture fallback",
             |store, _metrics| async move { captured_tail(&store, object_id).await.is_some() },
         )
         .await
@@ -29338,11 +36832,12 @@ mod tail_tick_tests {
     /// `case_d`'s idea, reused so all three are covered by one read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_with_the_flag_off_never_calls_the_store_and_never_touches_the_tail_metrics() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let _: u64 = tv
             .client()
@@ -29363,7 +36858,7 @@ mod tail_tick_tests {
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         // The unprovable-cut seam, armed for this layer, is the route to the
@@ -29374,26 +36869,30 @@ mod tail_tick_tests {
         // this the first tick races the writer's start-up (see WARM_UP_COMMITS).
         writer.wait_until_hot(WARM_UP_COMMITS).await;
 
-        // Bounded — see MAX_TICKS. It stops the instant the arm is reached, so
-        // the "zero puts" claim below is about the ticks that reached it.
+        // Ticks until the arm is reached, bounded by the test's hang guard,
+        // not a tick count. It stops the instant the arm is reached, so the
+        // "zero puts" claim below is about the ticks that reached it.
         let mut ticks = 0usize;
-        for tick in 1..=MAX_TICKS {
-            ticks = tick;
-            run_one_tick(
-                &client,
-                &keys,
-                &store,
-                &config,
-                Some(&metrics),
-                &cancel,
-                &mut lease,
-                &mut demotion,
-            )
-            .await;
-            if stable_cut_cell(&metrics, "unverified") >= 1 {
-                break;
+        let reached = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                run_one_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    Some(&metrics),
+                    &cancel,
+                    &mut lease,
+                    &mut demotion,
+                )
+                .await;
+                if stable_cut_cell(&metrics, "unverified") >= 1 {
+                    break;
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
 
         // PRECONDITION, asserted first and naming the arm the fixture needed: a
@@ -29401,10 +36900,11 @@ mod tail_tick_tests {
         // which never reached `SkippedNotQuiesced` also never touched the tail
         // metrics.
         assert!(
-            stable_cut_cell(&metrics, "unverified") >= 1,
-            "fixture never reached AssemblyDecision::SkippedNotQuiesced in {ticks} tick(s) \
-             ({report}): the armed unprovable-cut seam must make the assembler judge its read \
-             regressed, and every assertion below is vacuous without it"
+            reached.is_ok() && stable_cut_cell(&metrics, "unverified") >= 1,
+            "fixture never reached AssemblyDecision::SkippedNotQuiesced in {ticks} tick(s) within \
+             the test's {TEST_HANG_GUARD:?} hang guard ({report}): the armed unprovable-cut seam \
+             must make the assembler judge its read regressed, and every assertion below is \
+             vacuous without it"
         );
         assert!(
             writes_cell(&metrics, "skipped", "layer").expect("zero-seeded") >= 1.0,
@@ -29484,8 +36984,10 @@ mod tail_tick_tests {
     /// This is the module's ONE reachability test, and it deliberately asserts
     /// little beyond reachability plus the SR-8.2 healthy signature — the
     /// coupled counter movement only a real tick can show:
-    /// `stable_cut_total{unverified}` and `tail_total{captured}` rise on the
-    /// SAME tick (a tail success does NOT suppress the unverified tick; the two
+    /// `stable_cut_total{unverified}` and one capture outcome
+    /// (`tail_total{captured}`, or `{captured_capped}` when the writer's lead
+    /// outgrew `max_entries`) rise on the SAME tick (a tail success does NOT
+    /// suppress the unverified tick; the two
     /// together are what an operator alerts on), alongside the arm's pre-existing
     /// `writes_total{skipped, layer}` tick, which stays truthful because the
     /// snapshot FORM really was skipped.
@@ -29495,11 +36997,12 @@ mod tail_tick_tests {
     /// below; re-asserting it here would buy nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_reaches_the_capture_fallback_when_the_assembly_persists_nothing() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         preseed_three_generations(&test_store, layer.object_id).await;
@@ -29509,13 +37012,20 @@ mod tail_tick_tests {
         // quota), so nothing here depends on retention. The prune's own
         // behaviour on this arm is the next test.
         let config = tail_enabled_config(8);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
         // Meet the tick with commits already above the lineage head: without
         // this the first tick races the writer's start-up (see WARM_UP_COMMITS).
         writer.wait_until_hot(WARM_UP_COMMITS).await;
+        // PRECONDITION: the arm reached, evidenced by an artifact. The drive
+        // panics at the hang guard otherwise, with the tail outcomes and the
+        // listing: either the seam did not fire — so the assembler wrote a
+        // base and the fallback was never reached — or the capture refused
+        // (check that the newest pre-seeded base sits at exactly S0, the
+        // sequence the layer was created at, so the read window opens at the
+        // writer's first commit).
         let deltas = tick_until_tail_captured(
             &tv,
             &keys,
@@ -29525,21 +37035,12 @@ mod tail_tick_tests {
             &metrics,
             &mut lease,
             &mut demotion,
+            &writer,
+            deadline,
             layer.object_id,
         )
         .await;
         let report = writer.stop().await;
-
-        // PRECONDITION first: the arm reached, evidenced by an artifact.
-        let deltas = deltas.unwrap_or_else(|| {
-            panic!(
-                "no Tail generation landed in {MAX_TICKS} ticks ({report}). \
-                 Either the seam did not fire — so the assembler wrote a base and the fallback \
-                 was never reached — or the capture refused: check that the newest pre-seeded \
-                 base sits at exactly {S0}, the sequence the layer was created at, so the read \
-                 window opens at the writer's first commit"
-            )
-        });
         let tail = captured_tail(&test_store, layer.object_id)
             .await
             .expect("the loop returned only after observing one");
@@ -29549,12 +37050,18 @@ mod tail_tick_tests {
             "the winning tick must ALSO have ticked stable_cut_total{{unverified}}: a tail \
              success does not suppress it — SR-8.2's healthy signature is {{unverified rising, \
              tail captured rising}} together, and suppressing it would hide the DR-exposure \
-             signal operators alert on. Reached on tick {}",
+             signal operators alert on. Reached on tick {} ({report})",
             deltas.ticks
         );
         assert_eq!(
-            deltas.tail_captured, 1.0,
-            "exactly one tail_total{{captured}} tick on the winning tick"
+            deltas.tail_captured + deltas.tail_captured_capped,
+            1.0,
+            "exactly one capture outcome on the winning tick: `captured`, or `captured_capped` \
+             when the hot writer ran more than `max_entries` commits ahead of the lineage head \
+             (a load-dependent lead) and the capture persisted a cap-bounded prefix. Got \
+             captured = {}, captured_capped = {}",
+            deltas.tail_captured,
+            deltas.tail_captured_capped
         );
         assert!(
             deltas.skipped_layer >= 1.0,
@@ -29610,27 +37117,32 @@ mod tail_tick_tests {
     /// reason the tail survives have moved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_capture_success_runs_the_prune_and_counts_lineage_units() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        // Genuinely ours: the prune is lease-gated, so a stolen lock would skip
-        // it and the test would pass for the wrong reason.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Genuinely ours, for the whole test (rule (b)): the prune is
+        // lease-gated, so a stolen or lapsed lock would skip it and the test
+        // would pass for the wrong reason.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         preseed_three_generations(&test_store, layer.object_id).await;
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
         let config = tail_enabled_config(2);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
         // Meet the tick with commits already above the lineage head: without
         // this the first tick races the writer's start-up (see WARM_UP_COMMITS).
         writer.wait_until_hot(WARM_UP_COMMITS).await;
-        let deltas = tick_until_tail_captured(
+        // PRECONDITION first: the arm reached. The drive panics at the hang
+        // guard otherwise; the retention assertions below describe the tail
+        // arm's prune and are vacuous without a tail.
+        tick_until_tail_captured(
             &tv,
             &keys,
             &store,
@@ -29639,17 +37151,13 @@ mod tail_tick_tests {
             &metrics,
             &mut lease,
             &mut demotion,
+            &writer,
+            deadline,
             layer.object_id,
         )
         .await;
-        let report = writer.stop().await;
+        writer.stop().await;
 
-        // PRECONDITION first: the arm reached.
-        assert!(
-            deltas.is_some(),
-            "no Tail generation landed in {MAX_TICKS} ticks ({report}); the \
-             retention assertions below describe the tail arm's prune and are vacuous without one"
-        );
         // Second precondition: no SNAPSHOT landed either. A tick whose assembly
         // was not skipped would write a base above 92 and legitimately prune
         // both 90 and 91 — which would read as this test's expected outcome only
@@ -29720,9 +37228,10 @@ mod tail_tick_tests {
         let oids = seed_layers_with_seq(&tv, 1, 100).await;
         let oid = *oids.first().expect("one layer was seeded");
         let lock_key = keys.checkpoint_leader_lock();
-        // Genuinely ours: the prune is lease-gated, so a stolen lock would skip
-        // it and the delete log would be empty for the wrong reason.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Genuinely ours, for the whole test (rule (b)): the prune is
+        // lease-gated, so a stolen or lapsed lock would skip it and the delete
+        // log would be empty for the wrong reason.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_base(&test_store, oid, 90).await;
@@ -29733,7 +37242,7 @@ mod tail_tick_tests {
         let metrics = fresh_metrics();
         let config = due_everything_config(1);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         run_one_tick(
@@ -29816,23 +37325,18 @@ mod tail_tick_tests {
     /// restoring it to the head of the urgency order the demotion would be
     /// untestable through this arm.
     ///
-    /// # Why this one is deliberately slow (~10 s)
+    /// # Where the lapse is placed
     ///
-    /// Same reason as its snapshot-arm sibling: the lapse has to be placed
-    /// between two `ensure_held` calls separated only by the capture unit, and
-    /// the lease deadline is a `std::time::Instant` that `tokio::time::pause()`
-    /// cannot move. The 2:1 delay-to-deadline ratio buys whole seconds of margin
-    /// either side, and there is no bounded retry loop here because a lease
-    /// deadline cannot be re-armed per attempt.
+    /// As in its snapshot-arm sibling: the lapse has to fall between two
+    /// `ensure_held` calls separated only by the capture unit. Tick 1's lease
+    /// lapses [`ANCHORED_LAPSE_TTL`] after its first gate
+    /// ([`lease_lapsing_one_ttl_after_its_first_gate`]), so pass 1 and the hot
+    /// writer's load can take as long as they like before it. The tail's put
+    /// blocks for [`ANCHORED_LAPSE_PUT_DELAY`], at least that TTL, so the
+    /// pre-prune gate sees the deadline passed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_lost_lease_after_a_captured_tail_skips_the_prune_and_demotes_the_capturing_layer()
     {
-        /// How long the lease believes it is held for.
-        const HELD_FOR: Duration = Duration::from_secs(4);
-        /// How long the tail's `put_layer_checkpoint` blocks — long enough that
-        /// the pre-prune `ensure_held` is guaranteed to see the deadline passed.
-        const FIRST_PUT_DELAY: Duration = Duration::from_secs(8);
-
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         // Created FIRST, so it takes the lower object id. Both layers are
@@ -29847,11 +37351,12 @@ mod tail_tick_tests {
         );
 
         let lock_key = keys.checkpoint_leader_lock();
-        // Ours for the whole test: both verdicts come from the local deadline,
-        // never from a steal.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Ours at every gate that refreshes, so no verdict comes from a steal.
+        // Gate 0's anchoring refresh cuts it to ANCHORED_LAPSE_TTL and it
+        // lapses during tick 1, so it is re-staged before tick 2.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
-        let test_store = Arc::new(TestStore::new().with_first_put_delay(FIRST_PUT_DELAY));
+        let test_store = Arc::new(TestStore::new().with_first_put_delay(ANCHORED_LAPSE_PUT_DELAY));
         preseed_three_generations(&test_store, hot.object_id).await;
         let store: Arc<dyn CheckpointStore> = test_store.clone();
         let metrics = fresh_metrics();
@@ -29869,9 +37374,8 @@ mod tail_tick_tests {
         writer.wait_until_hot(WARM_UP_COMMITS).await;
 
         // ── Tick 1: the capture unit runs the lease down ─────────────────
-        // The lease is constructed LAST so `held_until` is measured from the
-        // tick's own start rather than from fixture setup.
-        let mut lease = lease_for(&lock_key, HELD_FOR, Duration::ZERO);
+        // Lapses ANCHORED_LAPSE_TTL after gate 0, however long pass 1 takes.
+        let mut lease = lease_lapsing_one_ttl_after_its_first_gate(&lock_key, ANCHORED_LAPSE_TTL);
         let (_, logs) = capture_warns(run_one_tick(
             &client,
             &keys,
@@ -29955,15 +37459,15 @@ mod tail_tick_tests {
         let now = now_unix_ms();
         stamp_last_checkpoint_ms(&tv, hot.object_id, now.saturating_sub(600_000)).await;
         stamp_last_checkpoint_ms(&tv, second, now.saturating_sub(1_000)).await;
-        // Re-take the lock. Tick 1 ran for at least `FIRST_PUT_DELAY` — longer
-        // than the [`SHORT_LOCK_TTL_MS`] the fixture stamps — so the real key
-        // has expired by now and tick 2's refresh probe
-        // would find nothing and report `Lost` before reaching a single layer.
-        // That is correct production behaviour and simply not what this half of
-        // the test is about.
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        // Re-take the lock. Tick 1's anchoring refresh at gate 0 cut its TTL to
+        // `ANCHORED_LAPSE_TTL`, and tick 1 ran for at least
+        // `ANCHORED_LAPSE_PUT_DELAY` after that, so the real key has expired by
+        // now and tick 2's refresh probe would find nothing and report `Lost`
+        // before reaching a single layer. That is correct production behaviour
+        // and simply not what this half of the test is about.
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_for(&lock_key, FAR_DEADLINE, LEASE_RENEW_INTERVAL);
         run_one_tick(
             &client,
             &keys,
@@ -30070,14 +37574,15 @@ mod tail_tick_tests {
         let store: Arc<dyn CheckpointStore> = test_store.clone();
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         // retain = 8 parks the shared prune this helper ends with: one base plus
         // one tail is under any plausible quota, so nothing here depends on it.
         let config = tail_enabled_config(8);
-        // `last_refresh_ago = ZERO` keeps `ensure_held` on its no-round-trip arm,
-        // so the lease is a constant rather than a second thing under test.
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        // Held for the whole test (rule (b)): every `ensure_held` stays on its
+        // no-round-trip arm, so the lease is a constant rather than a second
+        // thing under test.
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -30089,6 +37594,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             // `gate_seq`, which since b.hka review round 2 is a LOG FIELD ONLY:
@@ -30277,10 +37783,10 @@ mod tail_tick_tests {
         );
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let config = tail_enabled_config(1);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -30292,6 +37798,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             STALE_GATE_SEQ,
@@ -30375,10 +37882,10 @@ mod tail_tick_tests {
         );
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let config = tail_enabled_config(1);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -30390,6 +37897,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             // The SAME stale gate value the sibling passes. If this reached
@@ -30458,9 +37966,10 @@ mod tail_tick_tests {
     /// anti-vacuity setting available: since the round-2 fix neither may reach
     /// `plan_retention`, and if either still did, the guard would count zero
     /// generations above live and the two header cases below would prune
-    /// instead of declining. The lease is genuinely held with
-    /// `last_refresh_ago = ZERO`, so `ensure_held` stays on its no-round-trip
-    /// arm and leadership is a constant rather than a second thing under test.
+    /// instead of declining. The lease and lock are genuinely held for the
+    /// whole test ([`lease_held_for_whole_test`]; rule (b)), so `ensure_held`
+    /// stays on its no-round-trip arm and leadership is a constant rather than
+    /// a second thing under test.
     async fn drive_prune_after_write(
         tv: &TestValkey,
         keys: &KeySchema,
@@ -30469,8 +37978,8 @@ mod tail_tick_tests {
         object_id: u64,
     ) -> (PostWriteVerdict, String) {
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(tv, &lock_key, &our_lock_value()).await;
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        set_lock_for_whole_test(tv, &lock_key, &our_lock_value()).await;
+        let mut lease = lease_held_for_whole_test(&lock_key);
         capture_warns(prune_after_write(
             &mut lease,
             tv.client(),
@@ -30478,6 +37987,7 @@ mod tail_tick_tests {
             store,
             keys,
             config,
+            &CancellationToken::new(),
             object_id,
             u64::MAX,
             u64::MAX,
@@ -30758,10 +38268,10 @@ mod tail_tick_tests {
         let store: Arc<dyn CheckpointStore> = test_store.clone();
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let config = tail_enabled_config(8);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -30773,6 +38283,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             // `gate_seq` — a LOG FIELD ONLY since b.hka review round 2 (the
@@ -30856,10 +38367,10 @@ mod tail_tick_tests {
         let store: Arc<dyn CheckpointStore> = test_store.clone();
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let config = tail_enabled_config(8);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -30871,6 +38382,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             // `gate_seq`, which since b.hka review round 2 is a LOG FIELD ONLY:
@@ -30946,13 +38458,13 @@ mod tail_tick_tests {
         let oid = layer.object_id;
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         // retain = 8 parks the shared prune's DELETEs; the prune's own listing
         // still runs and is counted, which is the point of the exact sequence
         // asserted below rather than a bare `list` count.
         let config = tail_enabled_config(8);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
         assert!(
@@ -30969,6 +38481,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             oid,
             // `gate_seq`, which since b.hka review round 2 is a LOG FIELD ONLY:
@@ -31024,16 +38537,6 @@ mod tail_tick_tests {
     //   however hot it is, through the fenced read with its writer held off;
     // - that the chain-at-K tick still reaches the fallback and its re-base;
     // - and what a capture-success tick costs in listings.
-
-    /// Ticks the SR-4.4 *natural* re-base fixture may spend once the seam is
-    /// disarmed (a verified snapshot superseding the lineage — not the SR-4.1
-    /// chain-collapse re-base, which this fixture never reaches).
-    ///
-    /// Three is ample and is not a race budget: every read proves its cut, so
-    /// the FIRST tick is expected to land the base. The margin absorbs a tick
-    /// that finds no commit above the cursor yet, nothing more — which is why it
-    /// is below [`MAX_TICKS`].
-    const REBASE_MAX_TICKS: usize = 3;
 
     /// K for the chain-at-the-bound fixture, set on the config rather than taken
     /// from `TailCaptureConfig::default`'s 8 so the bound is reached with ONE
@@ -31093,19 +38596,14 @@ mod tail_tick_tests {
     /// (`checkpoint::recovery`) involved. That is exactly why the assertions
     /// below expect the capture fallback never to be reached at all.
     ///
-    /// The `refused_*`, `rebased` and stable-cut snapshots are read either side
-    /// of that ONE `run_one_tick` call rather than across the loop, so each
-    /// claim is about the re-basing tick and not about the capture ticks that
-    /// preceded it. `rebased` flat is a SEPARATE claim from the refusal sweep:
-    /// a tick that re-based through `rebase_on_chain_full` would leave a fresh
-    /// `Base` above the lineage with every `refused_*` cell still flat, so the
-    /// natural supersession claim would have no subject.
+    /// `verified` is read either side of that ONE `run_one_tick` call, so it is
+    /// about the re-basing tick alone. The `unverified`, `refused_*` and
+    /// `rebased` cells are not carried here: the test reads them once before
+    /// and once after the whole of phase 2, because every phase-2 tick must
+    /// leave them flat, not only the one that lands the base. Phase 1's capture
+    /// ticks, which do move them, are outside that window.
     struct RebaseTick {
         base_seq: u64,
-        refused_before: Vec<(&'static str, f64)>,
-        refused_after: Vec<(&'static str, f64)>,
-        rebased_before: f64,
-        rebased_after: f64,
         verified: u64,
     }
 
@@ -31116,14 +38614,20 @@ mod tail_tick_tests {
     /// atomic-read ceiling, so the read the production regression arm judges is
     /// the fenced one — run for real, under its fence — and the tick still takes
     /// the fallback.
+    ///
+    /// The test ticks until a tick reaches that decision, bounded only by its
+    /// hang guard: a fenced read whose own fence lease misses a renewal under
+    /// load ends without a decision and costs a tick, so a count of ticks
+    /// would be a scheduling bound.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_skipped_by_a_regression_on_the_fenced_read_counts_unverified_and_captures_the_tail(
     ) {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         preseed_three_generations(&test_store, layer.object_id).await;
@@ -31132,7 +38636,7 @@ mod tail_tick_tests {
         // retain = 8 parks the prune, so nothing here depends on retention.
         let config = tail_enabled_config(8);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
@@ -31142,37 +38646,43 @@ mod tail_tick_tests {
         let client = fenced_path_client(&tv);
         client.arm_unprovable_checkpoint_cut_for_test(layer.object_id);
 
-        let mut winning: Option<(usize, u64, f64)> = None;
-        for tick in 1..=MAX_TICKS {
-            let unverified_before = stable_cut_cell(&metrics, "unverified");
-            let captured_before = tail_cell(&metrics, "captured").expect("zero-seeded");
-            run_one_tick(
-                &client,
-                &keys,
-                &store,
-                &config,
-                Some(&metrics),
-                &cancel,
-                &mut lease,
-                &mut demotion,
-            )
-            .await;
-            let unverified = stable_cut_cell(&metrics, "unverified") - unverified_before;
-            if unverified >= 1 {
-                winning = Some((
-                    tick,
-                    unverified,
-                    tail_cell(&metrics, "captured").expect("zero-seeded") - captured_before,
-                ));
-                break;
-            }
+        // One capture outcome: `captured`, or `captured_capped` when the writer
+        // ran more than `max_entries` commits ahead of the lineage head.
+        fn capture_outcomes(metrics: &Metrics) -> f64 {
+            tail_cell(metrics, "captured").expect("zero-seeded")
+                + tail_cell(metrics, "captured_capped").expect("zero-seeded")
         }
+        let mut ticks = 0usize;
+        let winning = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let unverified_before = stable_cut_cell(&metrics, "unverified");
+                let captured_before = capture_outcomes(&metrics);
+                run_one_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    Some(&metrics),
+                    &cancel,
+                    &mut lease,
+                    &mut demotion,
+                )
+                .await;
+                let unverified = stable_cut_cell(&metrics, "unverified") - unverified_before;
+                if unverified >= 1 {
+                    return (unverified, capture_outcomes(&metrics) - captured_before);
+                }
+            }
+        })
+        .await;
         let report = writer.stop().await;
 
-        let (tick, unverified, captured) = winning.unwrap_or_else(|| {
+        let (unverified, captured) = winning.unwrap_or_else(|_| {
             panic!(
-                "fixture never reached AssemblyDecision::SkippedNotQuiesced in {MAX_TICKS} \
-                 tick(s) ({report}): the armed seam must make the fenced read's cut regressed"
+                "fixture never reached AssemblyDecision::SkippedNotQuiesced in {ticks} tick(s) \
+                 within the test's {TEST_HANG_GUARD:?} hang guard ({report}): the armed seam must \
+                 make the fenced read's cut regressed"
             )
         });
         assert_eq!(
@@ -31183,12 +38693,13 @@ mod tail_tick_tests {
         );
         assert_eq!(
             unverified, 1,
-            "the skipped tick counts one unverified decision (tick {tick})"
+            "the skipped tick counts one unverified decision (tick {ticks})"
         );
         assert_eq!(
             captured, 1.0,
             "and the same tick falls back to tail capture: the seam's whole purpose is to reach \
-             the fallback through the production regression arm"
+             the fallback through the production regression arm. Exactly one capture outcome — \
+             `captured`, or `captured_capped` when the writer's lead outgrew `max_entries`"
         );
     }
 
@@ -31203,13 +38714,26 @@ mod tail_tick_tests {
     /// content is checked against its claimed cut — the hot field carries the
     /// nonce of exactly the commit at `snap_seq` — which is the b.pw6 property
     /// restated for a read taken while writers queue at the fence.
+    ///
+    /// Both phases tick until their state holds, bounded only by the test's
+    /// hang guard: a fenced read whose own fence lease misses a renewal under
+    /// load ends without a decision and costs a tick, so a count of ticks
+    /// would be a scheduling bound. That unbounded phase 2 is why its claims
+    /// are swept across EVERY phase-2 tick, not only the one that lands the
+    /// base: no phase-2 tick may count `unverified`, any `refused_*` cell, or
+    /// `rebased`, and the tick that lands the base is a verified one. A fenced
+    /// read that ends without a decision moves none of those cells, so the
+    /// sweep does not depend on load; a tick whose cut went unproven before a
+    /// later tick verified does move them, and fails here — with no tick
+    /// budget, nothing else would catch it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_tail_covered_hot_layer_lands_a_fenced_base_above_its_lineage_once_provable() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         preseed_three_generations(&test_store, layer.object_id).await;
@@ -31220,13 +38744,16 @@ mod tail_tick_tests {
         // below cannot be a survivor of a prune that deleted its siblings.
         let config = tail_enabled_config(8);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         // Phase 1 — reach a captured tail through the seam.
         let writer = HotWriter::spawn(&tv, &layer);
         writer.wait_until_hot(WARM_UP_COMMITS).await;
-        let captured = tick_until_tail_captured(
+        // PRECONDITION: a Tail generation landed (the drive panics at the hang
+        // guard otherwise), or there is no lineage for a later tick to
+        // supersede and the SR-4.4 claim below has no subject.
+        tick_until_tail_captured(
             &tv,
             &keys,
             &store,
@@ -31235,15 +38762,11 @@ mod tail_tick_tests {
             &metrics,
             &mut lease,
             &mut demotion,
+            &writer,
+            deadline,
             layer.object_id,
         )
         .await;
-        assert!(
-            captured.is_some(),
-            "PRECONDITION: no Tail generation landed in {MAX_TICKS} ticks ({}), so there is no \
-             lineage for a later tick to supersede and the SR-4.4 claim below has no subject",
-            writer.report()
-        );
         let tail = captured_tail(&test_store, layer.object_id)
             .await
             .expect("the loop returned only after observing one");
@@ -31253,48 +38776,49 @@ mod tail_tick_tests {
         tv.client()
             .disarm_unprovable_checkpoint_cut_for_test(layer.object_id);
         let client = fenced_path_client(&tv);
-        let mut landed: Option<RebaseTick> = None;
-        for _ in 1..=REBASE_MAX_TICKS {
-            let refused_before = refused_tail_cells(&metrics);
-            let rebased_before = tail_cell(&metrics, "rebased").expect("zero-seeded");
-            let verified_before = stable_cut_cell(&metrics, "verified");
-            run_one_tick(
-                &client,
-                &keys,
-                &store,
-                &config,
-                Some(&metrics),
-                &cancel,
-                &mut lease,
-                &mut demotion,
-            )
-            .await;
-            let refused_after = refused_tail_cells(&metrics);
-            let rebased_after = tail_cell(&metrics, "rebased").expect("zero-seeded");
-            if let Some(base_seq) = surviving_base_seqs(&test_store, layer.object_id)
-                .await
-                .into_iter()
-                .find(|seq| *seq > tail.seq())
-            {
-                landed = Some(RebaseTick {
-                    base_seq,
-                    refused_before,
-                    refused_after,
-                    rebased_before,
-                    rebased_after,
-                    verified: stable_cut_cell(&metrics, "verified") - verified_before,
-                });
-                break;
+        // Read once, before the first phase-2 tick and after phase 1's capture
+        // ticks (which do move them), and compared once the base has landed:
+        // the claims they carry hold for every phase-2 tick.
+        let unverified_before_phase_2 = stable_cut_cell(&metrics, "unverified");
+        let refused_before_phase_2 = refused_tail_cells(&metrics);
+        let rebased_before_phase_2 = tail_cell(&metrics, "rebased").expect("zero-seeded");
+        let mut ticks = 0usize;
+        let landed = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let verified_before = stable_cut_cell(&metrics, "verified");
+                run_one_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    Some(&metrics),
+                    &cancel,
+                    &mut lease,
+                    &mut demotion,
+                )
+                .await;
+                if let Some(base_seq) = surviving_base_seqs(&test_store, layer.object_id)
+                    .await
+                    .into_iter()
+                    .find(|seq| *seq > tail.seq())
+                {
+                    return RebaseTick {
+                        base_seq,
+                        verified: stable_cut_cell(&metrics, "verified") - verified_before,
+                    };
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
 
-        let rebase = landed.unwrap_or_else(|| {
+        let rebase = landed.unwrap_or_else(|_| {
             panic!(
-                "no Base landed above the captured tail ({}) in {REBASE_MAX_TICKS} ticks \
-                 ({report}). Every read proves its cut, so the first tick after the regression \
-                 cleared should have written one — a hot layer above the atomic-read limits \
-                 whose lineage cannot be superseded is the failure this pins",
+                "no Base landed above the captured tail ({}) in {ticks} tick(s) within the test's \
+                 {TEST_HANG_GUARD:?} hang guard ({report}). Every read proves its cut, so a tick \
+                 after the regression cleared should have written one — a hot layer above the \
+                 atomic-read limits whose lineage cannot be superseded is the failure this pins",
                 tail.seq()
             )
         });
@@ -31317,15 +38841,26 @@ mod tail_tick_tests {
             "the re-basing tick is a VERIFIED stable-cut decision — the fenced read proved it"
         );
         assert_eq!(
-            rebase.refused_after, rebase.refused_before,
-            "no tail refusal may be counted on the tick that re-based: the assembler proved its \
-             cut, so the capture fallback was never reached at all"
+            stable_cut_cell(&metrics, "unverified"),
+            unverified_before_phase_2,
+            "no phase-2 tick may count an UNVERIFIED stable-cut decision ({ticks} tick(s)): the \
+             regression is gone, so every read that reached a decision proved its cut. A tick \
+             that failed to prove it before a later one verified is the 'lineage cannot be \
+             superseded' class this test pins, and the winning tick's own cells cannot see it"
         );
         assert_eq!(
-            rebase.rebased_after, rebase.rebased_before,
-            "and NOTHING may be counted on `rebased` either: that is SR-4.1's chain-collapse \
-             compose, and a moved cell here means the Base was COMPOSED rather than assembled \
-             from a proven cut"
+            refused_tail_cells(&metrics),
+            refused_before_phase_2,
+            "no tail refusal may be counted on ANY phase-2 tick ({ticks} tick(s)): every read \
+             proved its cut, so the capture fallback was never reached at all"
+        );
+        assert_eq!(
+            tail_cell(&metrics, "rebased").expect("zero-seeded"),
+            rebased_before_phase_2,
+            "and NOTHING may be counted on `rebased` on any phase-2 tick either: that is SR-4.1's \
+             chain-collapse compose, and a moved cell means the Base was COMPOSED rather than \
+             assembled from a proven cut. A separate claim from the refusal sweep — a compose \
+             re-base leaves every `refused_*` cell flat"
         );
 
         // The base carries exactly the state at its claimed cut. The writer's
@@ -31382,13 +38917,17 @@ mod tail_tick_tests {
     /// one's. Do NOT "fix" this test by planting one — a refusing re-base
     /// demonstrates the reachability just as well and without a second moving
     /// part.
+    ///
+    /// It ticks until a tick reaches a stable-cut decision, bounded only by
+    /// the test's hang guard, never by a tick count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_at_the_chain_bound_still_reaches_the_fallback_and_refuses_chain_full() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_tail_headed_lineage(&test_store, layer.object_id).await;
@@ -31398,7 +38937,7 @@ mod tail_tick_tests {
         // The planted lineage sits AT the bound.
         config.tail.max_chain = CHAIN_BOUND;
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
@@ -31407,38 +38946,42 @@ mod tail_tick_tests {
         // The seam, so the tick reaches the fallback at all (see the module
         // header).
         let client = unprovable_cut_client(&tv, layer.object_id);
-        let mut winning: Option<(u64, f64)> = None;
-        for _ in 1..=MAX_TICKS {
-            let unverified_before = stable_cut_cell(&metrics, "unverified");
-            let chain_full_before = tail_cell(&metrics, "refused_chain_full").expect("zero-seeded");
-            run_one_tick(
-                &client,
-                &keys,
-                &store,
-                &config,
-                Some(&metrics),
-                &cancel,
-                &mut lease,
-                &mut demotion,
-            )
-            .await;
-            let unverified = stable_cut_cell(&metrics, "unverified") - unverified_before;
-            if unverified >= 1 {
-                winning = Some((
-                    unverified,
-                    tail_cell(&metrics, "refused_chain_full").expect("zero-seeded")
-                        - chain_full_before,
-                ));
-                break;
+        let mut ticks = 0usize;
+        let winning = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let unverified_before = stable_cut_cell(&metrics, "unverified");
+                let chain_full_before =
+                    tail_cell(&metrics, "refused_chain_full").expect("zero-seeded");
+                run_one_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    Some(&metrics),
+                    &cancel,
+                    &mut lease,
+                    &mut demotion,
+                )
+                .await;
+                let unverified = stable_cut_cell(&metrics, "unverified") - unverified_before;
+                if unverified >= 1 {
+                    return (
+                        unverified,
+                        tail_cell(&metrics, "refused_chain_full").expect("zero-seeded")
+                            - chain_full_before,
+                    );
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
 
-        let (unverified, chain_full) = winning.unwrap_or_else(|| {
+        let (unverified, chain_full) = winning.unwrap_or_else(|_| {
             panic!(
-                "fixture never reached AssemblyDecision::SkippedNotQuiesced in {MAX_TICKS} \
-                 tick(s) ({report}): the chain-full refusal lives past that arm, so there is \
-                 nothing below to assert"
+                "fixture never reached AssemblyDecision::SkippedNotQuiesced in {ticks} tick(s) \
+                 within the test's {TEST_HANG_GUARD:?} hang guard ({report}): the chain-full \
+                 refusal lives past that arm, so there is nothing below to assert"
             )
         });
         assert!(
@@ -31472,14 +39015,18 @@ mod tail_tick_tests {
     /// The prune's listing is deliberately never collapsed onto the capture's —
     /// it has to observe the generation this tick just wrote — which is why the
     /// ORDER, not a bare count, is the assertion.
+    ///
+    /// It ticks until a tick captures, bounded only by the test's hang guard,
+    /// never by a tick count; each tick's op log is sliced on its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_capture_success_pays_the_captures_listing_and_the_prunes_and_no_third() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let oid = layer.object_id;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_tail_headed_lineage(&test_store, oid).await;
@@ -31489,7 +39036,7 @@ mod tail_tick_tests {
         // the whole point of asserting a sequence rather than a delete count.
         let config = tail_enabled_config(8);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
@@ -31502,38 +39049,42 @@ mod tail_tick_tests {
         // op-log read below is a PER-TICK slice against a length snapshotted
         // immediately before `run_one_tick`.
         let client = unprovable_cut_client(&tv, oid);
-        let mut winning: Option<Vec<(&'static str, u64)>> = None;
-        for _ in 1..=MAX_TICKS {
-            let ops_before = test_store.op_log().len();
-            let tail_writes_before =
-                writes_cell(&metrics, "success", "layer_tail").expect("zero-seeded");
-            run_one_tick(
-                &client,
-                &keys,
-                &store,
-                &config,
-                Some(&metrics),
-                &cancel,
-                &mut lease,
-                &mut demotion,
-            )
-            .await;
-            let mut ops = test_store.op_log();
-            let this_tick = ops.split_off(ops_before);
-            if writes_cell(&metrics, "success", "layer_tail").expect("zero-seeded")
-                - tail_writes_before
-                >= 1.0
-            {
-                winning = Some(this_tick);
-                break;
+        let mut ticks = 0usize;
+        let winning = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let ops_before = test_store.op_log().len();
+                let tail_writes_before =
+                    writes_cell(&metrics, "success", "layer_tail").expect("zero-seeded");
+                run_one_tick(
+                    &client,
+                    &keys,
+                    &store,
+                    &config,
+                    Some(&metrics),
+                    &cancel,
+                    &mut lease,
+                    &mut demotion,
+                )
+                .await;
+                let mut ops = test_store.op_log();
+                let this_tick = ops.split_off(ops_before);
+                if writes_cell(&metrics, "success", "layer_tail").expect("zero-seeded")
+                    - tail_writes_before
+                    >= 1.0
+                {
+                    return this_tick;
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
 
-        let ops = winning.unwrap_or_else(|| {
+        let ops = winning.unwrap_or_else(|_| {
             panic!(
-                "no tail was captured in {MAX_TICKS} tick(s) ({report}), so there is no \
-                 capture-success tick whose listing cost this test could measure"
+                "no tail was captured in {ticks} tick(s) within the test's {TEST_HANG_GUARD:?} \
+                 hang guard ({report}), so there is no capture-success tick whose listing cost \
+                 this test could measure"
             )
         });
         assert_eq!(
@@ -31940,11 +39491,11 @@ mod tail_tick_tests {
     ) -> ChainAtKOutcome {
         let keys = tv.key_schema().clone();
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(tv, &lock_key, &our_lock_value()).await;
-        // `last_refresh_ago = ZERO` keeps both `ensure_held` gates (the re-base's
-        // own, and the prune's) on their no-round-trip arm, so the lease is a
-        // constant rather than a second thing under test.
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        set_lock_for_whole_test(tv, &lock_key, &our_lock_value()).await;
+        // Held for the whole test (rule (b)): both `ensure_held` gates (the
+        // re-base's own, and the prune's) stay on their no-round-trip arm, so
+        // the lease is a constant rather than a second thing under test.
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
         let store: Arc<dyn CheckpointStore> = test_store.clone();
 
@@ -31962,6 +39513,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             config,
+            &CancellationToken::new(),
             pending_ages,
             object_id,
             // `gate_seq`, which since b.hka review round 2 is a LOG FIELD ONLY:
@@ -33014,20 +40566,22 @@ mod tail_tick_tests {
     /// proves its cut however hot the layer is, so the only difference between
     /// the rows is whether the unprovable-cut seam is armed.
     ///
-    /// # Why the loop is bounded rather than a single tick
+    /// # Why the test ticks until the base lands rather than once
     ///
-    /// The first tick is expected to land the base. [`REBASE_MAX_TICKS`]' margin
-    /// absorbs a tick that finds no commit above the cursor yet and nothing
-    /// more — and the `rebased`-flat sweep above is what keeps the extra ticks
-    /// from hiding a different producer.
+    /// The first tick is expected to land the base. The test ticks until it
+    /// has, bounded only by its hang guard rather than a tick count, so a tick
+    /// that finds no commit above the cursor yet costs nothing — and the
+    /// `rebased`-flat sweep above is what keeps the extra ticks from hiding a
+    /// different producer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_at_the_chain_bound_with_a_provable_cut_supersedes_its_lineage_and_never_rebases()
     {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_rebasable_lineage(&test_store, layer.object_id, replayable_record(S0, 50_000)).await;
@@ -33036,7 +40590,7 @@ mod tail_tick_tests {
         let mut config = tail_enabled_config(REBASE_RETAIN_PARKED);
         // The one knob that puts the planted lineage AT the bound.
         config.tail.max_chain = CHAIN_BOUND;
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         // Commits above the lineage head, and the writer keeps running: the
@@ -33053,41 +40607,43 @@ mod tail_tick_tests {
         )
         .await;
 
-        let mut winning: Option<BoundRowTick> = None;
         let mut ticks = 0usize;
         let mut rebased_across_the_loop = 0.0_f64;
-        for _ in 1..=REBASE_MAX_TICKS {
-            ticks += 1;
-            let tick = run_bound_row_tick(
-                &tv,
-                &keys,
-                &store,
-                &config,
-                &metrics,
-                &mut lease,
-                &mut demotion,
-                layer.object_id,
-            )
-            .await;
-            rebased_across_the_loop += tick.rebased;
-            let landed = surviving_base_seqs(&test_store, layer.object_id)
-                .await
-                .into_iter()
-                .any(|seq| seq > S0);
-            if landed {
-                winning = Some(tick);
-                break;
+        let winning = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let tick = run_bound_row_tick(
+                    &tv,
+                    &keys,
+                    &store,
+                    &config,
+                    &metrics,
+                    &mut lease,
+                    &mut demotion,
+                    layer.object_id,
+                )
+                .await;
+                rebased_across_the_loop += tick.rebased;
+                let landed = surviving_base_seqs(&test_store, layer.object_id)
+                    .await
+                    .into_iter()
+                    .any(|seq| seq > S0);
+                if landed {
+                    return tick;
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
 
-        let tick = winning.unwrap_or_else(|| {
+        let tick = winning.unwrap_or_else(|_| {
             panic!(
-                "no Base landed above the lineage head ({S0}) in {ticks} tick(s) ({report}). The \
-                 layer's cut is provable and its chain is AT K, so the assembler's read should have \
-                 verified — a red run here is the 'chain at K ⇒ skip the stable cut, the fallback \
-                 will cover it' mis-implementation, under which a layer at the bound could only \
-                 ever be superseded by a compose re-base"
+                "no Base landed above the lineage head ({S0}) in {ticks} tick(s) within the test's \
+                 {TEST_HANG_GUARD:?} hang guard ({report}). The layer's cut is provable and its \
+                 chain is AT K, so the assembler's read should have verified — a red run here is \
+                 the 'chain at K ⇒ skip the stable cut, the fallback will cover it' \
+                 mis-implementation, under which a layer at the bound could only ever be \
+                 superseded by a compose re-base"
             )
         });
 
@@ -33182,14 +40738,18 @@ mod tail_tick_tests {
     /// RESULT (a verified snapshot standing above the lineage) is the
     /// observable. That is the whole reason the two rows are a pair and neither
     /// is stated as sufficient alone.
+    ///
+    /// It ticks until a tick re-bases, bounded only by the test's hang guard,
+    /// never by a tick count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tick_skipped_at_the_chain_bound_falls_back_to_the_compose_rebase_after_attempt_one_ran(
     ) {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_rebasable_lineage(&test_store, layer.object_id, replayable_record(S0, 51_000)).await;
@@ -33197,7 +40757,7 @@ mod tail_tick_tests {
         let metrics = fresh_metrics();
         let mut config = tail_enabled_config(REBASE_RETAIN_PARKED);
         config.tail.max_chain = CHAIN_BOUND;
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         let writer = HotWriter::spawn(&tv, &layer);
@@ -33216,34 +40776,38 @@ mod tail_tick_tests {
         )
         .await;
 
-        let mut winning: Option<BoundRowTick> = None;
-        for _ in 1..=MAX_TICKS {
-            let tick = run_bound_row_tick(
-                &tv,
-                &keys,
-                &store,
-                &config,
-                &metrics,
-                &mut lease,
-                &mut demotion,
-                layer.object_id,
-            )
-            .await;
-            if tick.rebased >= 1.0 {
-                winning = Some(tick);
-                break;
+        let mut ticks = 0usize;
+        let winning = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let tick = run_bound_row_tick(
+                    &tv,
+                    &keys,
+                    &store,
+                    &config,
+                    &metrics,
+                    &mut lease,
+                    &mut demotion,
+                    layer.object_id,
+                )
+                .await;
+                if tick.rebased >= 1.0 {
+                    return tick;
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
         let bases_now = surviving_base_seqs(&test_store, layer.object_id).await;
 
-        let tick = winning.unwrap_or_else(|| {
+        let tick = winning.unwrap_or_else(|_| {
             panic!(
-                "no tick moved `rebased` in {MAX_TICKS} tick(s) ({report}). Two readings, and the \
-                 at-the-bound precondition has already ruled out the third: either the tick never \
-                 reached `SkippedNotQuiesced` (the seam did not fire, and the listing now holds a \
-                 Base above the lineage), or the `ChainFull` refusal was not intercepted and \
-                 turned into a compose re-base at all. Bases were {bases_now:?}"
+                "no tick moved `rebased` in {ticks} tick(s) within the test's {TEST_HANG_GUARD:?} \
+                 hang guard ({report}). Two readings, and the at-the-bound precondition has \
+                 already ruled out the third: either the tick never reached `SkippedNotQuiesced` \
+                 (the seam did not fire, and the listing now holds a Base above the lineage), or \
+                 the `ChainFull` refusal was not intercepted and turned into a compose re-base at \
+                 all. Bases were {bases_now:?}"
             )
         });
 
@@ -33334,13 +40898,18 @@ mod tail_tick_tests {
     /// these two producers, not about retention's policy, which is
     /// `t2.dfh.be.mk`'s: [`REBASE_RETAIN_PARKED`] parks the prune's deletes so
     /// any delete observed here could only be a producer's.
+    ///
+    /// Each phase ticks until its producer has landed, bounded only by the
+    /// test's one hang guard, never by a tick count; every tick's cursor is
+    /// recorded, so the monotonicity sweep covers the ticks in between.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rebase_at_s_then_a_verified_snapshot_above_it_both_survive_under_a_rising_cursor() {
+        let deadline = hang_guard_deadline();
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let layer = seed_driven_layer(&tv, S0).await;
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_rebasable_lineage(&test_store, layer.object_id, replayable_record(S0, 52_000)).await;
@@ -33348,7 +40917,7 @@ mod tail_tick_tests {
         let metrics = fresh_metrics();
         let mut config = tail_enabled_config(REBASE_RETAIN_PARKED);
         config.tail.max_chain = CHAIN_BOUND;
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         // Every cursor reading the test takes, in order. Asserted non-decreasing
@@ -33372,31 +40941,35 @@ mod tail_tick_tests {
         )
         .await;
 
-        let mut rebase: Option<BoundRowTick> = None;
-        for _ in 1..=MAX_TICKS {
-            let tick = run_bound_row_tick(
-                &tv,
-                &keys,
-                &store,
-                &config,
-                &metrics,
-                &mut lease,
-                &mut demotion,
-                layer.object_id,
-            )
-            .await;
-            cursors.push(tick.cursor_after);
-            if tick.rebased >= 1.0 {
-                rebase = Some(tick);
-                break;
+        let mut ticks = 0usize;
+        let rebase = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let tick = run_bound_row_tick(
+                    &tv,
+                    &keys,
+                    &store,
+                    &config,
+                    &metrics,
+                    &mut lease,
+                    &mut demotion,
+                    layer.object_id,
+                )
+                .await;
+                cursors.push(tick.cursor_after);
+                if tick.rebased >= 1.0 {
+                    return tick;
+                }
             }
-        }
+        })
+        .await;
         let report = writer.stop().await;
-        let rebase = rebase.unwrap_or_else(|| {
+        let rebase = rebase.unwrap_or_else(|_| {
             panic!(
                 "PRECONDITION: the first half of the interleaving never happened — no tick moved \
-                 `rebased` in {MAX_TICKS} tick(s) ({report}), so there is no re-based artifact at \
-                 S for the snapshot below to land above"
+                 `rebased` in {ticks} tick(s) within the test's {TEST_HANG_GUARD:?} hang guard \
+                 ({report}), so there is no re-based artifact at S for the snapshot below to land \
+                 above"
             )
         });
         assert!(
@@ -33430,35 +41003,38 @@ mod tail_tick_tests {
         // ── Phase 2: the regression is gone ⇒ a verified snapshot lands at S'
         tv.client()
             .disarm_unprovable_checkpoint_cut_for_test(layer.object_id);
-        let mut snapshot: Option<BoundRowTick> = None;
-        for _ in 1..=REBASE_MAX_TICKS {
-            let tick = run_bound_row_tick(
-                &tv,
-                &keys,
-                &store,
-                &config,
-                &metrics,
-                &mut lease,
-                &mut demotion,
-                layer.object_id,
-            )
-            .await;
-            cursors.push(tick.cursor_after);
-            if surviving_base_seqs(&test_store, layer.object_id)
-                .await
-                .into_iter()
-                .any(|seq| seq > S0)
-            {
-                snapshot = Some(tick);
-                break;
+        let mut ticks = 0usize;
+        let snapshot = tokio::time::timeout_at(deadline, async {
+            loop {
+                ticks += 1;
+                let tick = run_bound_row_tick(
+                    &tv,
+                    &keys,
+                    &store,
+                    &config,
+                    &metrics,
+                    &mut lease,
+                    &mut demotion,
+                    layer.object_id,
+                )
+                .await;
+                cursors.push(tick.cursor_after);
+                if surviving_base_seqs(&test_store, layer.object_id)
+                    .await
+                    .into_iter()
+                    .any(|seq| seq > S0)
+                {
+                    return tick;
+                }
             }
-        }
+        })
+        .await;
         let bases_now = surviving_base_seqs(&test_store, layer.object_id).await;
-        let snapshot = snapshot.unwrap_or_else(|| {
+        let snapshot = snapshot.unwrap_or_else(|_| {
             panic!(
-                "no Base landed ABOVE the re-based head ({S0}) in {REBASE_MAX_TICKS} tick(s) \
-                 after the seam was disarmed ({report}); the second half of the interleaving \
-                 never happened. Bases were {bases_now:?}"
+                "no Base landed ABOVE the re-based head ({S0}) in {ticks} tick(s) within the \
+                 test's {TEST_HANG_GUARD:?} hang guard after the seam was disarmed ({report}); \
+                 the second half of the interleaving never happened. Bases were {bases_now:?}"
             )
         });
         assert!(
@@ -34680,7 +42256,7 @@ mod tail_tick_tests {
         let oids = seed_layers(&tv, 1).await;
         let object_id = oids[0];
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
         let test_store =
             Arc::new(TestStore::new().with_put_landed_hook(unlink_the_put_layers_header(&tv)));
@@ -34688,7 +42264,7 @@ mod tail_tick_tests {
         let metrics = fresh_metrics();
         let config = due_everything_config(2);
         let cancel = CancellationToken::new();
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), LEASE_RENEW_INTERVAL);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut demotion: Option<u64> = None;
 
         run_one_tick(
@@ -34756,10 +42332,10 @@ mod tail_tick_tests {
         let store: Arc<dyn CheckpointStore> = test_store.clone();
 
         let lock_key = keys.checkpoint_leader_lock();
-        set_lock(&tv, &lock_key, &our_lock_value()).await;
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
         let metrics = fresh_metrics();
         let config = tail_enabled_config(8);
-        let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+        let mut lease = lease_held_for_whole_test(&lock_key);
         let mut pending_ages = PendingAgeAccumulator::default();
         let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
 
@@ -34771,6 +42347,7 @@ mod tail_tick_tests {
             &store,
             &keys,
             &config,
+            &CancellationToken::new(),
             &mut pending_ages,
             layer.object_id,
             // `gate_seq` — a LOG FIELD ONLY since b.hka review round 2. The
@@ -34920,6 +42497,403 @@ mod tail_tick_tests {
         );
         assert_dead_registration_is_fresh(&tv, object_id, "the re-base arm").await;
     }
+
+    // ── b.g65: the clean-up fence on each loop producer ─────────────────
+    //
+    // Every producer of a layer generation publishes through
+    // `put_guard::put_layer_checkpoint_if_live`, whose clean-up fence (the
+    // writer re-arm, R2) runs before the adapter PUT and refuses it (R7) —
+    // here because `le:ckpt:{recon}:rearm` holds a string, so the re-arm
+    // cannot be recorded (P3, fail closed), or because a deleter announced the
+    // generation's stem. The first three cases — the assembler, the tail
+    // capture and the re-base — each pin a refusal with NO PUT, the direct
+    // evidence that the fence runs BEFORE the PUT on that producer's own path
+    // (decider obligation (a)); the producer's deferral cell and
+    // `reconcile_total{publish_deferred}`; and a PUT once the fence clears.
+    // The base bootstrap's twin is in
+    // `tests/integration/checkpoint/first_base_bootstrap_test.rs`. The last
+    // case pins, on the re-base only, that the fence's lookback runs from the
+    // producer's reliance start rather than from its PUT; it refuses and never
+    // PUTs.
+
+    /// `le:ckpt:{recon}:rearm` as a string: every re-arm answers `WRONGTYPE`.
+    async fn poison_rearm(tv: &TestValkey) {
+        use fred::interfaces::KeysInterface;
+        let _: () = tv
+            .client()
+            .pool
+            .set(
+                tv.key_schema().checkpoint_reconcile_rearm(),
+                "not-a-zset",
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect("poisoning :rearm must succeed");
+    }
+
+    async fn unpoison_rearm(tv: &TestValkey) {
+        use fred::interfaces::KeysInterface;
+        let _: i64 = tv
+            .client()
+            .pool
+            .del(tv.key_schema().checkpoint_reconcile_rearm())
+            .await
+            .expect("DEL :rearm must succeed");
+    }
+
+    /// One tail capture of `object_id` through
+    /// [`attempt_tail_capture_fallback`], under a genuinely held lease.
+    async fn capture_once(
+        tv: &TestValkey,
+        store: &Arc<dyn CheckpointStore>,
+        config: &CheckpointLoopConfig,
+        metrics: &SharedMetrics,
+        pending_ages: &mut PendingAgeAccumulator,
+        object_id: u64,
+    ) -> PostWriteVerdict {
+        let keys = tv.key_schema().clone();
+        let lock_key = keys.checkpoint_leader_lock();
+        let mut lease = lease_held_for_whole_test(&lock_key);
+        let (maint_pool, _maint_token) = tv.client().acquire_maintenance();
+        attempt_tail_capture_fallback(
+            &mut lease,
+            tv.client(),
+            maint_pool,
+            Some(metrics),
+            store,
+            &keys,
+            config,
+            &CancellationToken::new(),
+            pending_ages,
+            object_id,
+            u64::MAX,
+            PendingAge::Age(SYNTHETIC_PENDING_AGE_SECS),
+            FossilGuard::Clear,
+        )
+        .await
+    }
+
+    /// `live_edit_checkpoint_reconcile_total{outcome="publish_deferred"}`.
+    fn publish_deferred(metrics: &Metrics) -> u64 {
+        sample_value(
+            &render(metrics),
+            "live_edit_checkpoint_reconcile_total",
+            &[("outcome", "publish_deferred"), ("service", REPLICA_ID)],
+        )
+        .expect("publish_deferred is zero-seeded") as u64
+    }
+
+    /// The ASSEMBLER (the snapshot arm): a fence that cannot record its re-arm
+    /// refuses the snapshot's PUT — no store write, the layer stays due
+    /// (`writes_total{skipped, layer}`, `publish_deferred`), no cursor stamp —
+    /// and the next tick, with the fence clear, writes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_whose_cleanup_fence_refuses_is_not_written_and_the_next_tick_writes_it() {
+        let tv = TestValkey::setup().await;
+        let keys = tv.key_schema().clone();
+        let oid = seed_driven_layer(&tv, S0).await.object_id;
+        let lock_key = keys.checkpoint_leader_lock();
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let test_store = Arc::new(TestStore::new());
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let metrics = fresh_metrics();
+        let config = due_everything_config(2);
+        let cancel = CancellationToken::new();
+        let mut lease = lease_held_for_whole_test(&lock_key);
+        let mut demotion: Option<u64> = None;
+        poison_rearm(&tv).await;
+
+        run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &config,
+            Some(&metrics),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        )
+        .await;
+
+        assert!(
+            test_store.put_order().is_empty(),
+            "the fence ran before the PUT and refused it: nothing was written"
+        );
+        assert_eq!(writes_cell(&metrics, "skipped", "layer"), Some(1.0));
+        assert_eq!(
+            writes_cell(&metrics, "error", "layer"),
+            Some(0.0),
+            "a deferral, not an error"
+        );
+        assert_eq!(publish_deferred(&metrics), 1);
+        assert!(
+            !header(&tv, oid).await.contains_key("last_checkpoint_seq"),
+            "no cursor stamp: the layer stays due"
+        );
+
+        unpoison_rearm(&tv).await;
+        run_one_tick(
+            tv.client(),
+            &keys,
+            &store,
+            &config,
+            Some(&metrics),
+            &cancel,
+            &mut lease,
+            &mut demotion,
+        )
+        .await;
+        assert_eq!(
+            test_store.put_order(),
+            vec![oid],
+            "the fence cleared, so the PUT runs"
+        );
+    }
+
+    /// TAIL CAPTURE, for the stem reason (R7): while a deleter's announcement
+    /// of the tail's own stem (`<oid>.<to_seq>.tail`) on
+    /// `le:ckpt:{recon}:deleting` is within the grace, the capture refuses its
+    /// PUT (`tail_total{refused_cleanup_in_flight}`, `publish_deferred`) and
+    /// persists nothing; once the announcement is older than the grace the
+    /// same capture PUTs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tail_capture_refused_by_its_stems_announcement_persists_nothing_until_it_ages() {
+        use fred::interfaces::SortedSetsInterface;
+        const COMMITS: u64 = 3;
+        let tv = TestValkey::setup().await;
+        let keys = tv.key_schema().clone();
+        let test_store = Arc::new(TestStore::new());
+        let (layer, to_seq) = plant_capturable_lineage(&tv, &test_store, COMMITS).await;
+        let store: Arc<dyn CheckpointStore> = test_store.clone();
+        let lock_key = keys.checkpoint_leader_lock();
+        set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
+        let metrics = fresh_metrics();
+        let config = tail_enabled_config(8);
+        let stem = format!("{}.{to_seq}.tail", layer.object_id);
+        let now_ms = crate::storage::ext_backup::valkey_time_ms(tv.client())
+            .await
+            .expect("TIME");
+        let _: () = tv
+            .client()
+            .pool
+            .zadd(
+                keys.checkpoint_reconcile_deleting(),
+                None,
+                None,
+                false,
+                false,
+                (now_ms as f64, stem.as_str()),
+            )
+            .await
+            .expect("announcing the tail stem must succeed");
+
+        let mut pending_ages = PendingAgeAccumulator::default();
+        capture_once(
+            &tv,
+            &store,
+            &config,
+            &metrics,
+            &mut pending_ages,
+            layer.object_id,
+        )
+        .await;
+
+        assert_eq!(
+            test_store.put_count(),
+            0,
+            "the fence ran before the PUT and refused it: nothing was written"
+        );
+        assert_eq!(tail_cell(&metrics, "refused_cleanup_in_flight"), Some(1.0));
+        assert_eq!(tail_cell(&metrics, "captured"), Some(0.0));
+        assert_eq!(publish_deferred(&metrics), 1);
+
+        let grace_ms = crate::checkpoint::store::reconcile_grace(store.publish_worst_case())
+            .as_millis() as u64;
+        let _: () = tv
+            .client()
+            .pool
+            .zadd(
+                keys.checkpoint_reconcile_deleting(),
+                None,
+                None,
+                false,
+                false,
+                ((now_ms - grace_ms - 1_000) as f64, stem.as_str()),
+            )
+            .await
+            .expect("ageing the announcement must succeed");
+        capture_once(
+            &tv,
+            &store,
+            &config,
+            &metrics,
+            &mut pending_ages,
+            layer.object_id,
+        )
+        .await;
+        assert_eq!(
+            tail_cell(&metrics, "captured"),
+            Some(1.0),
+            "past the grace the same capture PUTs"
+        );
+    }
+
+    /// The RE-BASE (chain collapse): a fence that cannot record its re-arm
+    /// refuses the composed base's PUT — `RebaseRefusal::Cleanup`, folded onto
+    /// `tail_total{refused_chain_full}` plus `publish_deferred` — and nothing
+    /// is written; `rebased` does not move. With the fence clear, the next
+    /// chain-at-K tick writes the composed base and counts `rebased`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebase_whose_cleanup_fence_refuses_writes_no_base_and_the_next_tick_rebases() {
+        let tv = TestValkey::setup().await;
+        let test_store = Arc::new(TestStore::new());
+        let object_id = seed_chain_at_k_layer(&tv).await;
+        plant_rebasable_lineage(&test_store, object_id, replayable_record(S0, 47_000)).await;
+        poison_rearm(&tv).await;
+        let metrics = fresh_metrics();
+        let mut pending_ages = PendingAgeAccumulator::default();
+
+        let out = drive_chain_at_k_tick(
+            &tv,
+            &test_store,
+            &metrics,
+            &mut pending_ages,
+            object_id,
+            FossilGuard::Clear,
+        )
+        .await;
+
+        assert_eq!(
+            out.count("put"),
+            0,
+            "the fence ran before the composed base's PUT and refused it. Ops were {:?}",
+            out.ops
+        );
+        assert_eq!(tail_cell(&metrics, "refused_chain_full"), Some(1.0));
+        assert_eq!(tail_cell(&metrics, "rebased"), Some(0.0));
+        assert_eq!(publish_deferred(&metrics), 1);
+
+        unpoison_rearm(&tv).await;
+        let out = drive_chain_at_k_tick(
+            &tv,
+            &test_store,
+            &metrics,
+            &mut pending_ages,
+            object_id,
+            FossilGuard::Clear,
+        )
+        .await;
+        assert!(
+            out.count("put") >= 1,
+            "the fence cleared, so the composed base's PUT runs. Ops were {:?}",
+            out.ops
+        );
+        assert_eq!(
+            tail_cell(&metrics, "rebased"),
+            Some(1.0),
+            "and the collapse lands"
+        );
+        assert_eq!(
+            tail_cell(&metrics, "refused_chain_full"),
+            Some(1.0),
+            "the earlier refusal is the only one"
+        );
+    }
+
+    /// R7's reliance start, on the RE-BASE (b.g65): the fence's lookback runs
+    /// from when the producer began reading the state it publishes, not from
+    /// its PUT. The store answers a `publish_worst_case` of 200 ms and stalls
+    /// the re-base's gather (its first member fetch) for 1.5 s; inside that
+    /// stall the collect records the delete of the backup copy of the value
+    /// the composed base names (`:collected`, scored at that moment). At the
+    /// PUT the record is about 1.5 s old: inside the re-base's reliance window
+    /// (≥ 1.5 s + 200 ms), so the fence refuses and nothing is written. A
+    /// lookback measured from the PUT (200 ms) would miss it and write a base
+    /// naming a value whose backup copy was just deleted.
+    ///
+    /// One producer is enough to pin the rule; the re-base is the one whose
+    /// read window a store seam can stretch (the assembler and the bootstrap
+    /// read Valkey, and a tail names no external values).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebase_refuses_a_value_collected_during_its_gather_well_before_its_put() {
+        use fred::interfaces::SortedSetsInterface;
+        const PUBLISH_WORST_CASE: Duration = Duration::from_millis(200);
+        const GATHER_STALL: Duration = Duration::from_millis(1_500);
+        let tv = TestValkey::setup().await;
+        // The hash `ext_bearing_record` names (its 32 bytes are all 0xE7).
+        let collected_hash = "e7".repeat(32);
+        let hook: GetStallHook = {
+            let (client, keys, hash) = (
+                tv.client().clone(),
+                tv.key_schema().clone(),
+                collected_hash.clone(),
+            );
+            Arc::new(move || {
+                let (client, keys, hash) = (client.clone(), keys.clone(), hash.clone());
+                Box::pin(async move {
+                    let now_ms = crate::storage::ext_backup::valkey_time_ms(&client)
+                        .await
+                        .expect("TIME");
+                    let _: () = client
+                        .pool
+                        .zadd(
+                            keys.checkpoint_reconcile_collected(),
+                            None,
+                            None,
+                            false,
+                            false,
+                            (now_ms as f64, hash.as_str()),
+                        )
+                        .await
+                        .expect("recording the collect's delete must succeed");
+                })
+            })
+        };
+        let test_store = Arc::new(
+            TestStore::new()
+                .with_publish_worst_case(PUBLISH_WORST_CASE)
+                .stalling_first_get(hook, GATHER_STALL),
+        );
+        let object_id = seed_chain_at_k_layer(&tv).await;
+        plant_rebasable_lineage(&test_store, object_id, ext_bearing_record(S0)).await;
+        let metrics = fresh_metrics();
+        let mut pending_ages = PendingAgeAccumulator::default();
+
+        let out = drive_chain_at_k_tick(
+            &tv,
+            &test_store,
+            &metrics,
+            &mut pending_ages,
+            object_id,
+            FossilGuard::Clear,
+        )
+        .await;
+
+        let recorded: Option<f64> = tv
+            .client()
+            .pool
+            .zscore(
+                tv.key_schema().checkpoint_reconcile_collected(),
+                collected_hash.as_str(),
+            )
+            .await
+            .expect("ZSCORE :collected");
+        assert!(
+            recorded.is_some(),
+            "fixture: the gather's stall recorded the delete"
+        );
+        assert_eq!(
+            out.count("put"),
+            0,
+            "the fence measured from the gather and refused the composed base. Ops were {:?}",
+            out.ops
+        );
+        assert_eq!(tail_cell(&metrics, "rebased"), Some(0.0));
+        assert_eq!(tail_cell(&metrics, "refused_chain_full"), Some(1.0));
+        assert_eq!(publish_deferred(&metrics), 1);
+    }
 }
 
 #[cfg(test)]
@@ -35055,7 +43029,7 @@ mod fossil_guard_and_listing_tests {
             let keys = tv.key_schema().clone();
             let oid = seed_layer_with_a_prior_cursor(&tv).await;
             let lock_key = keys.checkpoint_leader_lock();
-            set_lock(&tv, &lock_key, &our_lock_value()).await;
+            set_lock_for_whole_test(&tv, &lock_key, &our_lock_value()).await;
 
             let test_store = Arc::new(TestStore::new());
             let store: Arc<dyn CheckpointStore> = test_store.clone();
@@ -35063,7 +43037,7 @@ mod fossil_guard_and_listing_tests {
             let mut config = due_everything_config(2);
             config.tail.enabled = tail_enabled;
             let cancel = CancellationToken::new();
-            let mut lease = lease_for(&lock_key, Duration::from_secs(30), Duration::ZERO);
+            let mut lease = lease_held_for_whole_test(&lock_key);
             let mut demotion: Option<u64> = None;
 
             run_one_tick(
@@ -35279,23 +43253,27 @@ mod rebase_lifecycle_tests {
     //!   explicit `1 base + K tails` FETCH bound is `t3.dfh.be.hm.za`; a
     //!   verified snapshot superseding mid-lifecycle is `t3.dfh.be.hm.bk`.
     //!
-    //! # The lease is sized above the whole drive, deliberately
+    //! # The lease and lock are held for the whole drive, deliberately
     //!
     //! `CheckpointLease` is renewed only BETWEEN pass-2 units and beside a
     //! fenced snapshot read (`TickLeaseKeeper`); this drive's reads are atomic
     //! and its captures and re-bases are never renewed across, so a lapse
-    //! truncates the walk and turns a lifecycle assertion into a lease flake. Two knobs, both sized far
-    //! above the documented worst case: the lease's own `held_until`
-    //! ([`LIFECYCLE_LEASE_TTL`]) and the leader lock's server-side TTL
-    //! ([`LIFECYCLE_LOCK_TTL_MS`]). The second is why this module does not use
-    //! `tick_support::set_lock`: its `SHORT_LOCK_TTL_MS` is 8 s, chosen so
-    //! `lease_tests` can ask yes/no questions about a PTTL, and a drive that
-    //! outlives it turns the first due refresh into `Ok(false)` → `Lost`.
+    //! truncates the walk and turns a lifecycle assertion into a lease flake.
+    //! The lease is not this module's subject, so every drive runs under
+    //! [`lease_held_for_whole_test`] with the lock staged by
+    //! [`set_lock_for_whole_test`] (test-writing guide § Synchronization
+    //! Patterns, rule (b)): no gate refreshes the lease or finds it overrun
+    //! before nextest's kill, however long a phase or the gap between two
+    //! phases runs.
     //!
     //! # Budget table
     //!
     //! Every drive is bounded by a NAMED per-phase constant; no call site passes
-    //! a literal. What each exhaustion MEANS:
+    //! a literal. These are tick counts rather than a wall-clock hang guard
+    //! because the count is each phase's claim: with the lease held for the
+    //! whole drive, the atomic read and the unprovable-cut seam make each
+    //! phase's arm reachable on its first tick by construction, so a phase that
+    //! needs more is the regression, not load. What each exhaustion MEANS:
     //!
     //! | Budget | Value | Exhaustion means |
     //! |---|---|---|
@@ -35555,17 +43533,18 @@ mod rebase_lifecycle_tests {
     //! | Budget | Value | Exhaustion means |
     //! |---|---|---|
     //! | [`TICKS_PER_SUPERSESSION`] | 3 | with the seam disarmed, the quiesced layer's assembler never wrote a base — the natural supersession this row exists for did not happen |
-    //! | [`RESUME_WARM_UP_COMMITS`] | 20 | (not a tick budget) the writer never restarted after `resume()`; bounded by `HotWriter::wait_until_hot`'s own 2 000 x 1 ms poll |
-    //! | the quiesce poll | 2 000 x 1 ms ≈ 2 s | `HotWriter::wait_until_quiet`'s `QUIET_POLL_ATTEMPTS` x `QUIET_POLL_INTERVAL`, spent TWICE in series (the writer's `idle` flag, then two equal `obj:hdr seq` reads). A bounded observable-state poll, never a sleep standing in for a predicate |
+    //! | [`RESUME_WARM_UP_COMMITS`] | 20 | (not a tick budget) the writer never restarted after `resume()`; bounded by `HotWriter::wait_until_hot`'s own wall-clock hang guard (`WRITER_HANG_GUARD`, 30 s) |
+    //! | the quiesce poll | `WRITER_HANG_GUARD` (30 s) | `HotWriter::wait_until_quiet`'s two predicates in series (the writer's `idle` flag, then two equal `obj:hdr seq` reads), polled every `QUIET_POLL_INTERVAL` under one wall-clock hang guard — never a count of probes, whose cost depends on load, and never a sleep standing in for a predicate |
     //!
     //! [`TICKS_PER_CAPTURE`] and [`TICKS_PER_REBASE`] are consumed unchanged,
     //! through [`phase_a_grow`], [`phase_b_collapse`] and [`phase_d_resume`].
     //!
     //! **Incremental worst case.** Six bounded drives at 3 ticks each — 18
     //! ticks at one atomic read plus a capture or collapse each (see the summed
-    //! worst case above) — plus at most ~4 s of bounded polling: well inside
-    //! `.config/nextest.toml`'s 40 s slow mark and far inside its 120 s hard
-    //! kill (which matters: a SIGKILLed test prints nothing at all).
+    //! worst case above) — plus the writer's two waits, which a healthy writer
+    //! meets in milliseconds: well inside `.config/nextest.toml`'s 40 s slow
+    //! mark and far inside its 120 s hard kill (which matters: a SIGKILLed test
+    //! prints nothing at all).
     //!
     //! **Measured** over five consecutive
     //! `cargo nextest run -j 4 -p live-edit --lib
@@ -35781,8 +43760,6 @@ mod rebase_lifecycle_tests {
 
     use std::fmt::Write as _;
 
-    use fred::interfaces::KeysInterface;
-
     use super::tick_support::*;
     use super::*;
     use crate::checkpoint::lineage::{gather_restore_lineage, no_deadline, GatheredLineage};
@@ -35816,39 +43793,19 @@ mod rebase_lifecycle_tests {
 
     /// Ticks one capture may spend.
     ///
-    /// Three, not `MAX_TICKS`' six: the seam skips every assembly of the layer
-    /// and the writer keeps commits above the lineage head, so the first tick
-    /// is expected to capture. See the module header's budget table for the
-    /// summed worst case.
+    /// Three: the seam skips every assembly of the layer and the writer keeps
+    /// commits above the lineage head, so with the lease held for the whole
+    /// drive the first tick is expected to capture. See the module header's
+    /// budget table for the summed worst case.
     const TICKS_PER_CAPTURE: usize = 3;
 
     /// Ticks the collapse may spend once the chain is AT the bound.
     ///
     /// The bound is a PRECONDITION of the drive rather than something it waits
     /// for, so the first tick is expected to re-base. The margin absorbs a tick
-    /// whose gate arithmetic lands a millisecond early — the same reading
-    /// `tail_tick_tests`' `REBASE_MAX_TICKS` carries, and not a race budget.
+    /// whose gate arithmetic lands a millisecond early, and is not a race
+    /// budget.
     const TICKS_PER_REBASE: usize = 3;
-
-    /// `held_until` for this module's lease, and the reason it is minutes rather
-    /// than the 30 s every one-or-two-tick fixture in this file uses.
-    ///
-    /// `ensure_held`'s FIRST arm is `now >= held_until` → `Lost` with no refresh
-    /// probe, so a lease that lapses mid-drive skips every destructive step
-    /// silently. Sized more than an order of magnitude above the documented
-    /// worst case; see the module header.
-    const LIFECYCLE_LEASE_TTL: Duration = Duration::from_secs(600);
-
-    /// Server-side TTL for the leader lock this module plants — the second half
-    /// of the same argument.
-    ///
-    /// `ensure_held` refreshes on `LEASE_RENEW_INTERVAL` (10 s), and a refresh
-    /// against a LAPSED key answers `Ok(false)` → `Lost`. `tick_support`'s
-    /// `SHORT_LOCK_TTL_MS` is 8 s — deliberately short so `lease_tests` can ask
-    /// yes/no questions about a PTTL — so a drive that outlives it would lose
-    /// the lease on its first due refresh. This value keeps that refresh on its
-    /// healthy `Ok(true)` arm for the whole drive.
-    const LIFECYCLE_LOCK_TTL_MS: i64 = 600_000;
 
     /// `max_entries` for this module's captures, and the third fixture ceiling
     /// raised for the same reason [`WIDE_STREAM_MAXLEN`] is.
@@ -35901,27 +43858,10 @@ mod rebase_lifecycle_tests {
         writer: HotWriter,
     }
 
-    /// SET the leader lock with a TTL that outlives the whole drive.
-    ///
-    /// Deliberately not `tick_support::set_lock`; see [`LIFECYCLE_LOCK_TTL_MS`].
-    async fn set_lifecycle_lock(tv: &TestValkey, lock_key: &str) {
-        let _: () = tv
-            .client()
-            .pool
-            .set(
-                lock_key,
-                our_lock_value(),
-                Some(fred::types::Expiration::PX(LIFECYCLE_LOCK_TTL_MS)),
-                None,
-                false,
-            )
-            .await
-            .expect("SET leader lock must succeed");
-    }
-
-    /// The whole fixture: a wide layer at [`S0`], a DECODABLE base at `S0`, a
-    /// hot writer warmed past its start-up race, and the cursor stamped after
-    /// that warm-up.
+    /// The whole fixture: a wide layer at [`S0`], the leader lock staged as
+    /// ours for the whole test ([`set_lock_for_whole_test`]), a DECODABLE base
+    /// at `S0`, a hot writer warmed past its start-up race, and the cursor
+    /// stamped after that warm-up.
     ///
     /// Every one of these is a requirement rather than a taste:
     ///
@@ -35943,7 +43883,7 @@ mod rebase_lifecycle_tests {
     ///   [`WIDE_STREAM_MAXLEN`] raises for stream trimming.
     async fn lifecycle_fixture(tv: &TestValkey, keys: &KeySchema) -> LifecycleFixture {
         let layer = seed_driven_layer(tv, S0).await;
-        set_lifecycle_lock(tv, &keys.checkpoint_leader_lock()).await;
+        set_lock_for_whole_test(tv, &keys.checkpoint_leader_lock(), &our_lock_value()).await;
 
         let test_store = Arc::new(TestStore::new());
         plant_decodable_base(&test_store, layer.object_id, S0).await;
@@ -35965,11 +43905,6 @@ mod rebase_lifecycle_tests {
             metrics: fresh_metrics(),
             writer,
         }
-    }
-
-    /// The lease every phase of one drive shares. See [`LIFECYCLE_LEASE_TTL`].
-    fn lifecycle_lease(lock_key: &str) -> CheckpointLease {
-        lease_for(lock_key, LIFECYCLE_LEASE_TTL, Duration::ZERO)
     }
 
     // ── Observation helpers ──────────────────────────────────────────────
@@ -36231,10 +44166,13 @@ mod rebase_lifecycle_tests {
         }
         let _ = write!(
             out,
-            "\n    last_refresh: {} ms ago (LEASE_RENEW_INTERVAL = {} ms)",
+            "\n    last_refresh: {} ms ago (next refresh due in {} ms)",
             now.saturating_duration_since(lease.last_refresh())
                 .as_millis(),
-            LEASE_RENEW_INTERVAL.as_millis()
+            lease
+                .next_refresh_due()
+                .saturating_duration_since(now)
+                .as_millis()
         );
         for outcome in ["renewed", "lost", "refresh_error"] {
             let _ = write!(
@@ -36251,11 +44189,10 @@ mod rebase_lifecycle_tests {
     /// lease diagnostic when the budget runs out.
     ///
     /// A thin local wrapper rather than a widening of
-    /// [`drive_until_expecting`]: the lease is a lifecycle-fixture concern, the
-    /// shared instrument's other consumers drive one or two ticks and cannot
-    /// lose a lease, and adding a parameter to the shared entry point would
-    /// churn every landed call site for a line of output only this module can
-    /// act on.
+    /// [`drive_until_expecting`]: the lease diagnostic is a lifecycle-fixture
+    /// concern — this module's drives carry one lease across many ticks — and
+    /// adding a parameter to the shared entry point would churn every landed
+    /// call site for a line of output only this module acts on.
     async fn drive_phase<P, Fut>(
         driver: &TickDriver<'_>,
         lease: &mut CheckpointLease,
@@ -36842,7 +44779,7 @@ mod rebase_lifecycle_tests {
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let fixture = lifecycle_fixture(&tv, &keys).await;
-        let mut lease = lifecycle_lease(&keys.checkpoint_leader_lock());
+        let mut lease = lease_held_for_whole_test(&keys.checkpoint_leader_lock());
         let mut demotion: Option<u64> = None;
 
         // The unprovable-cut seam, so every tick takes the fallback — see the
@@ -37131,7 +45068,7 @@ mod rebase_lifecycle_tests {
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let fixture = lifecycle_fixture(&tv, &keys).await;
-        let mut lease = lifecycle_lease(&keys.checkpoint_leader_lock());
+        let mut lease = lease_held_for_whole_test(&keys.checkpoint_leader_lock());
         let mut demotion: Option<u64> = None;
 
         // The unprovable-cut seam for every step but the supersession, which
@@ -37910,7 +45847,7 @@ mod rebase_lifecycle_tests {
         let tv = TestValkey::setup().await;
         let keys = tv.key_schema().clone();
         let fixture = lifecycle_fixture(&tv, &keys).await;
-        let mut lease = lifecycle_lease(&keys.checkpoint_leader_lock());
+        let mut lease = lease_held_for_whole_test(&keys.checkpoint_leader_lock());
         let mut demotion: Option<u64> = None;
 
         // The unprovable-cut seam, so every tick takes the fallback — see the

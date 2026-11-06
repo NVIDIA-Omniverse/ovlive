@@ -27,9 +27,7 @@
 //! - [`CatchUpGate`] bounds catch-ups running at once
 //!   (`LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS`). A catch-up holds a slot
 //!   only across its backing-store reads and its build — where a subscribe's
-//!   memory is spent — and, in rollback mode
-//!   (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) on a same-object reconnect,
-//!   the cluster stream-reader wait; never across a send, so a join storm queues here
+//!   memory is spent — never across a send, so a join storm queues here
 //!   instead of allocating every catch-up at once, and a slow client cannot
 //!   hold a slot. A shared fenced-read flight (`storage::snapshot_flights`)
 //!   is one unit of catch-up work: it holds one slot from its read, through
@@ -204,10 +202,14 @@ pub enum AdmissionRefusal {
     WaiterCap,
     /// The session was cancelled (deleted, or missing from the live store).
     Cancelled,
-    /// The service is shutting down: the subscription's enrolled shutdown
-    /// token fired (born cancelled once graceful shutdown's paced stream
-    /// ending has begun, or cancelled in its batch of it), or
-    /// `ValkeyClient::quit` closed the gate. The client retries elsewhere.
+    /// The subscription's enrolled shutdown token fired (born cancelled once
+    /// graceful shutdown's paced stream ending has begun, or cancelled in its
+    /// batch of it; or cancelled by the disaster-recovery hold ending, or born
+    /// cancelled after it), or `ValkeyClient::quit` closed the gate. The two
+    /// legs are one refusal here, because this module knows nothing of why a
+    /// token fired: the caller, which holds the token, maps the token leg by
+    /// the cause recorded on it (a hold's), and everything else as a shutdown.
+    /// The client retries.
     ShuttingDown,
 }
 
@@ -1764,7 +1766,7 @@ mod tests {
 
         let a = g.acquire(no_deadline(), CATCHUP).await.unwrap();
         let b = g
-            .acquire(no_deadline(), SnapshotReadConsumer::CatchupLegacyPerCommit)
+            .acquire(no_deadline(), SnapshotReadConsumer::Checkpoint)
             .await
             .unwrap();
         assert_eq!(
@@ -1777,7 +1779,7 @@ mod tests {
         );
         assert_eq!(read_waits(&metrics, CATCHUP), Some(1));
         assert_eq!(
-            read_waits(&metrics, SnapshotReadConsumer::CatchupLegacyPerCommit),
+            read_waits(&metrics, SnapshotReadConsumer::Checkpoint),
             Some(1)
         );
         assert_eq!(

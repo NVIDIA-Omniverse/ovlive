@@ -14,11 +14,23 @@
 // limitations under the License.
 
 //! A per-replica byte budget, [`MemoryBudget`] (Spec SDD SR-7.2), of which a
-//! replica holds two instances:
+//! replica holds three instances:
 //!
 //! - **the catch-up memory budget `T`** (`ValkeyClient::catchup_build_budget`),
 //!   which catch-up flights, structural cache cold starts and audits reserve
-//!   from — what the rest of these docs describe unless they name the other;
+//!   from — what the rest of these docs describe unless they name another;
+//! - **the catch-up payload budget `D_c`**
+//!   (`ValkeyClient::catchup_payload_budget`), which every catch-up payload
+//!   reserves from after its external values' lengths are probed and before
+//!   their first byte is read; the grant is split across the payload's pages
+//!   ([`MemoryGrant::split_off`]), each repaying its share when the stream has
+//!   sent it (`storage::ompf_payload`). Values a catch-up restores through the
+//!   checkpoint adapter before that are reserved from it too, in batches, each
+//!   batch's grant split into one share per value that is repaid when the
+//!   value's write-back returns, its bytes dropped; so nothing of a restore is
+//!   held while the payload reserves, and the value is read back in ranges
+//!   like every other. One restored during the reads is a forced top-up while
+//!   its bytes are held. Closed at shutdown with `T`;
 //! - **the retirement allowance `R_ref`** (`LayerStore::retirement_budget`),
 //!   which external-value clean-up of a retiring object reserves from:
 //!   `DeleteLayer`, the `CreateLayer` overwrite's cleanup body and the orphan
@@ -29,7 +41,8 @@
 //!   shrinks to its page once its release returns.
 //!
 //! Each instance ticks its own metric series ([`BudgetSeries`]): `R_ref`'s
-//! traffic never moves the catch-up gauges operators read against `T`.
+//! and `D_c`'s traffic never moves the catch-up gauges operators read against
+//! `T`.
 //!
 //! A budget of bytes, not a count of catch-ups: layer sizes span orders of
 //! magnitude, so a count cannot bound memory (the catch-up slot,
@@ -100,8 +113,9 @@
 //! **Waits** ([`MemoryBudget::reserve`]) take an optional deadline (a caller
 //! with no capacity budget of its own passes none, as every retirement does)
 //! and end [`CatchUpRefusal::Closed`] once the budget's shutdown call runs:
-//! [`MemoryBudget::close`] for the catch-up budget, which refuses everything
-//! after it, and [`MemoryBudget::end_waits`] for `R_ref` (the first step of
+//! [`MemoryBudget::close`] for the catch-up budget and the catch-up payload
+//! budget, which refuses everything after it, and [`MemoryBudget::end_waits`]
+//! for `R_ref` (the first step of
 //! `LayerStore::wait_for_cleanup`), which refuses only a reservation that
 //! would have to wait and still grants one that fits.
 //! Like the catch-up slot and read-permit waits, session cancellation and
@@ -117,7 +131,9 @@ use tokio::sync::Notify;
 use crate::observability::metrics::{
     SharedMetrics, CATCHUP_BUILD_ADMISSION_RESULT_CANCELLED,
     CATCHUP_BUILD_ADMISSION_RESULT_IMMEDIATE, CATCHUP_BUILD_ADMISSION_RESULT_REFUSED_TIMEOUT,
-    CATCHUP_BUILD_ADMISSION_RESULT_WAITED, RETIREMENT_WAIT_OUTCOME_CANCELLED,
+    CATCHUP_BUILD_ADMISSION_RESULT_WAITED, CATCHUP_PAYLOAD_WAIT_OUTCOME_CANCELLED,
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_IMMEDIATE, CATCHUP_PAYLOAD_WAIT_OUTCOME_REFUSED_TIMEOUT,
+    CATCHUP_PAYLOAD_WAIT_OUTCOME_WAITED, RETIREMENT_WAIT_OUTCOME_CANCELLED,
     RETIREMENT_WAIT_OUTCOME_IMMEDIATE, RETIREMENT_WAIT_OUTCOME_WAITED,
 };
 use crate::storage::subscriber_admission::CatchUpRefusal;
@@ -286,6 +302,46 @@ impl BudgetSeries for RetirementSeries {
                 BudgetWaitOutcome::TimedOut | BudgetWaitOutcome::Cancelled => {
                     RETIREMENT_WAIT_OUTCOME_CANCELLED
                 }
+            },
+        );
+    }
+
+    fn record_try_grant(&self, _m: &SharedMetrics) {}
+}
+
+/// The catch-up payload budget `D_c`'s series (`ValkeyClient::catchup_payload_budget`):
+/// `live_edit_catchup_payload_budget_{reserved,overcommit}_bytes` and
+/// `live_edit_catchup_payload_wait_seconds{outcome}`. It has no admission
+/// counter, and a non-blocking grant, which no catch-up takes, records
+/// nothing on it.
+#[derive(Debug)]
+pub struct CatchUpPayloadSeries;
+
+/// [`CatchUpPayloadSeries`], the series the catch-up payload budget ticks.
+pub static CATCHUP_PAYLOAD_SERIES: CatchUpPayloadSeries = CatchUpPayloadSeries;
+
+impl BudgetSeries for CatchUpPayloadSeries {
+    fn add_reserved(&self, m: &SharedMetrics, delta: i64) {
+        m.add_catchup_payload_budget_reserved_bytes(delta);
+    }
+
+    fn add_overcommit(&self, m: &SharedMetrics, delta: i64) {
+        m.add_catchup_payload_budget_overcommit_bytes(delta);
+    }
+
+    fn record_wait(
+        &self,
+        m: &SharedMetrics,
+        waited: std::time::Duration,
+        outcome: BudgetWaitOutcome,
+    ) {
+        m.observe_catchup_payload_wait(
+            waited,
+            match outcome {
+                BudgetWaitOutcome::Immediate => CATCHUP_PAYLOAD_WAIT_OUTCOME_IMMEDIATE,
+                BudgetWaitOutcome::Waited => CATCHUP_PAYLOAD_WAIT_OUTCOME_WAITED,
+                BudgetWaitOutcome::TimedOut => CATCHUP_PAYLOAD_WAIT_OUTCOME_REFUSED_TIMEOUT,
+                BudgetWaitOutcome::Cancelled => CATCHUP_PAYLOAD_WAIT_OUTCOME_CANCELLED,
             },
         );
     }
@@ -735,6 +791,32 @@ impl MemoryGrant {
     /// Bytes this grant holds, in whole KiB.
     pub fn bytes(&self) -> u64 {
         self.kib.saturating_mul(KIB)
+    }
+
+    /// Moves `bytes` (rounded up to KiB, at most what this grant holds) of
+    /// this grant into a grant of its own, which repays them when it drops;
+    /// `None` when that is nothing. The budget's totals do not change: the
+    /// memory is held in two guards instead of one. A catch-up payload's
+    /// grant is split across its pages this way, so each page repays its own
+    /// share when it is dropped (`storage::ompf_payload`).
+    pub fn split_off(&mut self, bytes: u64) -> Option<MemoryGrant> {
+        let kib = kib_for_bytes(bytes).min(self.kib);
+        if kib == 0 {
+            return None;
+        }
+        self.kib -= kib;
+        Some(MemoryGrant {
+            budget: Arc::clone(&self.budget),
+            kib,
+            metrics: self.metrics.clone(),
+        })
+    }
+
+    /// A forced top-up of `bytes` on this grant's budget
+    /// ([`MemoryBudget::top_up`]): for memory already resident beside the
+    /// grant, held for as long as that memory is.
+    pub fn top_up_on_budget(&self, bytes: u64) -> MemoryTopUp {
+        self.budget.top_up(bytes)
     }
 
     /// Gives back everything above `bytes` (rounded up to KiB) and wakes the
@@ -2302,5 +2384,144 @@ mod tests {
             "the catch-up budget's traffic must not reach the retirement series"
         );
         drop((grant, top));
+    }
+
+    // ── The catch-up payload budget's series and page grants (b.ntm) ────────
+
+    const PAYLOAD_RESERVED_GAUGE: &str = "live_edit_catchup_payload_budget_reserved_bytes";
+    const PAYLOAD_OVERCOMMIT_GAUGE: &str = "live_edit_catchup_payload_budget_overcommit_bytes";
+    const PAYLOAD_WAIT_COUNT: &str = "live_edit_catchup_payload_wait_seconds_count";
+
+    /// A catch-up payload budget ([`CATCHUP_PAYLOAD_SERIES`]) of `total_kib`
+    /// and the registry it ticks.
+    fn payload_budget_with_metrics(total_kib: u64) -> (Arc<MemoryBudget>, SharedMetrics) {
+        let metrics: SharedMetrics =
+            Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
+        let b = Arc::new(MemoryBudget::with_series(
+            total_kib,
+            Arc::new(StdMutex::new(Some(metrics.clone()))),
+            &CATCHUP_PAYLOAD_SERIES,
+        ));
+        (b, metrics)
+    }
+
+    /// `live_edit_catchup_payload_wait_seconds_count{outcome}` for each of
+    /// [`crate::observability::metrics::CATCHUP_PAYLOAD_WAIT_OUTCOMES`], 0
+    /// before the first observation.
+    fn payload_waits(metrics: &SharedMetrics) -> [u64; 4] {
+        let text = render(metrics);
+        let outcomes: [&str; 4] = crate::observability::metrics::CATCHUP_PAYLOAD_WAIT_OUTCOMES
+            .try_into()
+            .expect("four outcomes");
+        outcomes.map(|outcome| {
+            sample_value(&text, PAYLOAD_WAIT_COUNT, &[("outcome", outcome)]).map_or(0, |v| v as u64)
+        })
+    }
+
+    /// T15: the catch-up payload budget `D_c` ticks its own series and none of
+    /// the catch-up budget's or the retirement allowance's, though all tick
+    /// one registry: a grant and a top-up move its reserved and over-commit
+    /// gauges and return them to 0; each `reserve` records one wait under its
+    /// outcome — `immediate`, `waited`, `refused_timeout` for a deadline
+    /// already passed, `cancelled` for a closed budget (its shutdown call);
+    /// and the catch-up budget's gauges, admission cells and wait histogram
+    /// and the retirement series never move.
+    #[tokio::test(start_paused = true)]
+    async fn the_catch_up_payload_series_ticks_its_own_gauges_and_waits_and_no_other_series() {
+        assert_eq!(
+            crate::observability::metrics::CATCHUP_PAYLOAD_WAIT_OUTCOMES,
+            ["immediate", "waited", "refused_timeout", "cancelled"],
+            "the wait outcomes"
+        );
+        let (b, metrics) = payload_budget_with_metrics(16);
+        let grant = reserve_now(&b, 12 * KIB).await;
+        let top = b.top_up(2 * KIB);
+        assert_eq!(
+            (
+                gauge(&metrics, PAYLOAD_RESERVED_GAUGE),
+                gauge(&metrics, PAYLOAD_OVERCOMMIT_GAUGE)
+            ),
+            ((12 * KIB) as i64, (2 * KIB) as i64)
+        );
+        let mut queued = wait(&b, 4 * KIB);
+        assert_queued(&mut queued, "12 + 2 of 16 KiB leave 2").await;
+        drop(top);
+        let waited = assert_granted(&mut queued, "the repaid top-up frees room").await;
+        let past = tokio::time::Instant::now() - Duration::from_millis(1);
+        assert!(matches!(
+            b.reserve(16 * KIB, Some(past)).await,
+            Err(CatchUpRefusal::TimedOut)
+        ));
+        b.close();
+        assert!(matches!(
+            poll_once(&mut wait(&b, KIB)).await,
+            Poll::Ready(Err(CatchUpRefusal::Closed))
+        ));
+        assert_eq!(payload_waits(&metrics), [1, 1, 1, 1]);
+        drop((grant, waited));
+        assert_eq!(
+            (
+                gauge(&metrics, PAYLOAD_RESERVED_GAUGE),
+                gauge(&metrics, PAYLOAD_OVERCOMMIT_GAUGE)
+            ),
+            (0, 0),
+            "everything given back"
+        );
+        assert_eq!(
+            (
+                gauge(&metrics, RESERVED_GAUGE),
+                gauge(&metrics, OVERCOMMIT_GAUGE),
+                waits_observed(&metrics),
+                gauge(&metrics, RETIREMENT_RESERVED_GAUGE),
+                gauge(&metrics, RETIREMENT_OVERCOMMIT_GAUGE),
+                retirement_waits(&metrics),
+            ),
+            (0, 0, 0, 0, 0, [0, 0, 0]),
+            "neither the catch-up budget's series nor the retirement allowance's moved"
+        );
+        for result in crate::observability::metrics::CATCHUP_BUILD_ADMISSION_RESULTS {
+            assert_eq!(admissions(&metrics, result), 0, "result={result}");
+        }
+    }
+
+    /// `split_off` moves part of a grant into a grant of its own (rounded up
+    /// to KiB, at most what is left), the budget's totals unchanged, and each
+    /// repays its own share when dropped: how a catch-up payload's grant is
+    /// spread over its pages. Nothing left to split is `None`.
+    #[tokio::test]
+    async fn split_off_spreads_a_grant_over_guards_that_each_repay_their_share() {
+        let (b, metrics) = payload_budget_with_metrics(16);
+        let mut grant = reserve_now(&b, 10 * KIB).await;
+        let first = grant.split_off(KIB + 1).expect("2 KiB, rounded up");
+        let second = grant.split_off(100 * KIB).expect("at most what is left");
+        assert_eq!(
+            (first.bytes(), second.bytes(), grant.bytes()),
+            (2 * KIB, 8 * KIB, 0)
+        );
+        assert!(grant.split_off(KIB).is_none(), "nothing is left to split");
+        assert_eq!(b.reserved_bytes(), 10 * KIB, "the totals do not change");
+        drop(second);
+        assert_eq!(
+            (b.reserved_bytes(), gauge(&metrics, PAYLOAD_RESERVED_GAUGE)),
+            (2 * KIB, (2 * KIB) as i64)
+        );
+        drop((first, grant));
+        assert_eq!(b.reserved_bytes(), 0);
+    }
+
+    /// `top_up_on_budget` is a forced top-up on the grant's own budget: never
+    /// waits, even on a full or closed budget, counted as over-commit while
+    /// held — how bytes restored through the checkpoint adapter during a
+    /// catch-up's fill are charged.
+    #[tokio::test]
+    async fn top_up_on_budget_is_a_forced_overcommit_on_the_grants_budget() {
+        let (b, _) = payload_budget_with_metrics(16);
+        let grant = reserve_now(&b, 16 * KIB).await;
+        b.close();
+        let top = grant.top_up_on_budget(5 * KIB);
+        assert_eq!(b.overcommit_bytes(), 5 * KIB);
+        drop(top);
+        assert_eq!(b.overcommit_bytes(), 0);
+        drop(grant);
     }
 }

@@ -219,7 +219,6 @@ async fn setup_cluster_checkpoint_harness(cluster_url: String) -> ClusterCheckpo
         build_session_recovery_hook_for_e2e(&tv, Arc::clone(&store), cfg, Arc::clone(&metrics));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store,
@@ -363,7 +362,7 @@ async fn cluster_recovery_round_trip_against_three_shard_cluster() {
     // Skip-on-missing per the orphan-sweep cluster-test pattern at
     // `tests/integration/storage/orphan_sweep_test.rs:952-957`. The repo
     // does not ship a cluster harness, so this test is opt-in.
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

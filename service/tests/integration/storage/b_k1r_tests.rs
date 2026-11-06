@@ -54,9 +54,9 @@ use live_edit::config::UpdateLayerBackend;
 use live_edit::domain::types::ObjectState;
 use live_edit::error::ServiceError;
 use live_edit::storage::diff_read::{
-    compute_diff_at_cut, header_to_object_state, read_object_snapshot, snapshot_to_object_state,
-    AtomicSnapshot, DiffCase, DiffResponse, ExtValueReads, SnapshotRead, SnapshotReadConsumer,
-    SubscriberState,
+    compute_faithful_full_content_at_cut, header_to_object_state, read_object_snapshot,
+    snapshot_to_object_state, AtomicSnapshot, DiffCase, DiffCut, DiffResponse, ExtValueReads,
+    SnapshotRead, SnapshotReadConsumer,
 };
 use live_edit::storage::external_values::MockExternalValueStore;
 use live_edit::storage::layer::LayerStore;
@@ -483,9 +483,7 @@ async fn create_layer_overwrite_unlinks_10k_section_keys_via_chunking() {
 // `parse_u64(..., "seq").map(|_| parse_u64(object_id))` gate that degraded
 // `oid` to 0 whenever `seq` was missing — so the loaded snapshot looked
 // like it belonged to object 0, which then propagated into
-// `ObjectState.object_id` and broke the regime selection logic
-// (`DiffEngine::plan` compares `have_object_id != state.object_id` as part
-// of the FullContent-vs-Incremental decision).
+// `ObjectState.object_id` and into every build from it.
 //
 // The new-build tests cover three slot positions of the "current seq":
 //
@@ -493,11 +491,11 @@ async fn create_layer_overwrite_unlinks_10k_section_keys_via_chunking() {
 //     (the initial seq is always 1 after the +1 inside apply_delta). We
 //     simulate it by seeding a header manually with `seq=0` and verifying
 //     `snapshot_to_object_state` returns the correct `object_id` AND that
-//     `DiffEngine::plan` (via `compute_diff_at_cut`) picks FullContent.
-//   - current_seq == 1 is the CreateLayer default; a version=0 subscriber
-//     gets FullContent with one commit's worth of content.
-//   - current_seq > 1 (e.g. 3): an updated layer; same FullContent path
-//     because have_version=0 forces Case 1 regardless.
+//     the full-state build (`compute_faithful_full_content_at_cut`) from that
+//     read succeeds at a cut on the same object.
+//   - current_seq == 1 is the CreateLayer default; the full-state build
+//     carries one commit's worth of content.
+//   - current_seq > 1 (e.g. 4): an updated layer; the same full-state build.
 
 /// `read_object_snapshot` of `object_id` for `consumer`, which must answer
 /// with a snapshot.
@@ -515,33 +513,52 @@ async fn read_snapshot(
     }
 }
 
-/// A version=0 subscriber's legacy diff of `object_id`, built the way the
-/// service builds it: one atomic catch-up read, then `compute_diff_at_cut`.
-async fn version_zero_diff(tv: &TestValkey, object_id: u64) -> DiffResponse {
+/// A brand-new subscriber's full state of `object_id`, built the way the
+/// service builds it: one atomic catch-up read, then
+/// `compute_faithful_full_content_at_cut`. Asserts first that the domain state
+/// the build plans from (`snapshot_to_object_state`) carries the caller's
+/// `object_id` — the H-stor-8 property — and that the build's cut is an atomic
+/// one at the header's sequence.
+async fn full_state_build(tv: &TestValkey, object_id: u64) -> DiffResponse {
     let snapshot = read_snapshot(tv, &object_id.to_string(), SnapshotReadConsumer::Catchup).await;
-    let subscriber = SubscriberState {
-        have_object_id: object_id,
-        have_version: 0,
-    };
-    compute_diff_at_cut(
+    assert_eq!(
+        snapshot_to_object_state(&snapshot.state).object_id,
+        object_id,
+        "the domain state a catch-up plans from must carry the caller-supplied object_id \
+         (post-b.k1r), never object 0"
+    );
+    let ext_store = mock_ext_store();
+    let resp = compute_faithful_full_content_at_cut(
         &snapshot,
-        &subscriber,
-        mock_ext_store().as_ref(),
+        ext_store.as_ref(),
         ExtValueReads::recover_for_test(),
         None,
         "test",
     )
     .await
-    .expect("the diff build must succeed")
+    .expect("the full-state build must succeed")
     .into_ready()
     .expect("a build with fetch-on-miss never answers Missing")
+    .restored_for_test(ext_store.as_ref())
+    .await
+    .expect("the full-state layout's restores must succeed")
+    .fill(ext_store.as_ref(), None)
+    .await
+    .expect("the full-state payload must fill")
+    .into_ready()
+    .expect("a build with fetch-on-miss never answers Missing");
+    assert!(
+        matches!(resp.cut, DiffCut::Atomic { cut, .. } if cut == snapshot.cut),
+        "the build is labelled with the read's own cut, {}; got {:?}",
+        snapshot.cut,
+        resp.cut
+    );
+    resp
 }
 
-/// H-stor-8: version=0 subscriber catch-up correctly routes through the
-/// FullContent regime regardless of the object's `current_seq` value. The
-/// fix ensures `ObjectState.object_id` reflects the caller-supplied
-/// `object_id` so the regime dispatch doesn't fall through to a mismatched-
-/// object-id branch.
+/// H-stor-8: a brand-new subscriber's full-state build plans from a state
+/// carrying the caller-supplied `object_id`, whatever the object's
+/// `current_seq`, and is labelled with the read's cut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_read_version_zero_subscriber_full_content_at_seq_zero() {
     let tv = TestValkey::setup().await;
@@ -550,8 +567,7 @@ async fn diff_read_version_zero_subscriber_full_content_at_seq_zero() {
 
     // Seed a synthetic header with `seq=0`. A real CreateLayer never
     // produces seq=0 (the initial write advances to seq=1), so this is an
-    // intentionally-adversarial shape that exercises the regime dispatch
-    // edge case where `state.sequence_num == have_version == 0`.
+    // intentionally-adversarial shape: a read and a build at sequence 0.
     let object_id: u64 = 424242;
     let oid_str = object_id.to_string();
     let header_key = keys.obj_header(&oid_str);
@@ -591,15 +607,13 @@ async fn diff_read_version_zero_subscriber_full_content_at_seq_zero() {
     );
     assert_eq!(snap.sequence_num, 0);
 
-    // Regime dispatch: a version=0 subscriber at have_object_id = object_id
-    // must receive FullContent regardless of current_seq. The OMPF payload
-    // can be empty (no sections / fields), but the case must be FullContent.
-    let resp = version_zero_diff(&tv, object_id).await;
+    // The full-state build from that read: the OMPF payload can be empty
+    // (no sections / fields), but the build is the full content at seq 0.
+    let resp = full_state_build(&tv, object_id).await;
     assert_eq!(
         resp.case,
         DiffCase::FullContent,
-        "have_version=0 must always route to FullContent regardless of current_seq \
-         (regime dispatch case 1 in DiffEngine::plan)"
+        "the full-state build at current_seq=0 is FullContent"
     );
 }
 
@@ -704,11 +718,9 @@ async fn diff_read_non_numeric_object_id_surfaces_internal() {
     }
 }
 
-/// H-stor-8 — end-to-end: create_layer (seq=1) then a version=0 subscriber
-/// gets FullContent with the seeded content. This pins the normal-case
-/// regime dispatch in a shape that is guaranteed NOT to pre-exist in the
-/// compute_diff_test suite: the critical contract is that the regime is
-/// FullContent regardless of current_seq ∈ {1, >1}.
+/// H-stor-8 — end-to-end: create_layer (seq=1) then a brand-new subscriber's
+/// full-state build: planned from the caller's `object_id`, labelled with the
+/// read's cut, for current_seq ∈ {1, >1}.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_read_version_zero_subscriber_full_content_at_seq_one() {
     let tv = TestValkey::setup().await;
@@ -716,17 +728,16 @@ async fn diff_read_version_zero_subscriber_full_content_at_seq_one() {
     let session_id = create_test_session(&tv).await;
     let oid = create_test_layer(&ls, &session_id, "bk1r-regime-seq1").await;
 
-    let resp = version_zero_diff(&tv, oid).await;
+    let resp = full_state_build(&tv, oid).await;
     assert_eq!(
         resp.case,
         DiffCase::FullContent,
-        "current_seq=1 with have_version=0 must be FullContent (regime 1)"
+        "the full-state build at current_seq=1 is FullContent"
     );
 }
 
 /// H-stor-8 — current_seq > 1: create + several updates to advance seq,
-/// then a version=0 subscriber. Still FullContent because have_version=0
-/// is the dominant regime-1 trigger.
+/// then a brand-new subscriber's full-state build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn diff_read_version_zero_subscriber_full_content_at_seq_greater_than_one() {
     let tv = TestValkey::setup().await;
@@ -765,13 +776,11 @@ async fn diff_read_version_zero_subscriber_full_content_at_seq_greater_than_one(
         "test preconditions: seq must have advanced past 1; got {current_seq}"
     );
 
-    let resp = version_zero_diff(&tv, oid).await;
+    let resp = full_state_build(&tv, oid).await;
     assert_eq!(
         resp.case,
         DiffCase::FullContent,
-        "current_seq={current_seq} with have_version=0 must be FullContent (regime 1); \
-         pre-b.k1r the snapshot loader's `oid` mis-assignment could have surfaced as \
-         a different case selection under some header shapes"
+        "the full-state build at current_seq={current_seq} is FullContent"
     );
 }
 

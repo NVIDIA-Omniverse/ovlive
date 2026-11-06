@@ -48,11 +48,17 @@
 //! Two of the tests below pin a *key* that must not survive, rather than a
 //! value that differs:
 //!
-//! - [`reset_deletes_the_root_children_key_and_drops_it_from_the_index`] — the
-//!   synthetic root `0` is never a section, so `apply_reset`'s per-section loop
-//!   could not emit its `DeleteChildrenList`. Pre-b.ot3 a reset left
-//!   `le:{oid}:obj:ch:0` populated with dead ids and `"0"` in `obj:chs`, which
-//!   the next snapshot load read straight back into `state.children[0]`.
+//! - [`reset_of_a_rootless_layer_deletes_the_root_children_key_and_drops_it_from_the_index`]
+//!   — the synthetic root `0` is never a section, so `apply_reset`'s
+//!   per-section loop could not emit its `DeleteChildrenList`. Pre-b.ot3 a
+//!   reset left `le:{oid}:obj:ch:0` populated with dead ids and `"0"` in
+//!   `obj:chs`, which the next snapshot load read straight back into
+//!   `state.children[0]`. A reset leaving no top-level section is refused on a
+//!   layer that had one (SDD §9.7), so the test resets a layer whose root lists
+//!   only a ghost; its sibling
+//!   [`reset_rewrites_the_root_children_key_to_its_own_top_level_sections`]
+//!   covers a reset that restates a top-level section, which rewrites the
+//!   root's list and so cannot see this leak.
 //! - [`child_under_a_ghost_parent_cascaded_in_one_delta_leaves_no_key_and_survives_unlisted`]
 //!   — a row created under a ghost id (listed, no row of its own) inside the
 //!   delta that cascades the ghost's lister away. Pre-b.ot3 the inline
@@ -62,7 +68,7 @@
 //!   §10.4), so no commit writes the key and the row survives as an orphan
 //!   the cascade cannot reach.
 //!
-//! The reset test guards a leak on a `noeviction` store, of the same family as
+//! The root-less reset test guards a leak on a `noeviction` store, of the same family as
 //! b.9fn / b.jdr (whose own coverage lives in `b_9fn_tests.rs`) — bounded
 //! there by the `obj:chs`-driven retirement inventory, but live-object state
 //! corruption until then. The ghost test guards the no-list rule: no key is
@@ -72,6 +78,7 @@ use std::sync::Arc;
 
 use fred::interfaces::{KeysInterface, ListInterface, SetsInterface};
 
+use live_edit::domain::layer_root::has_top_level_section;
 use live_edit::domain::types::{ObjectState, Section};
 use live_edit::storage::external_values::MockExternalValueStore;
 use live_edit::storage::layer::LayerStore;
@@ -360,7 +367,20 @@ async fn persisted_shape(tv: &TestValkey, oid: u64) -> PersistedShape {
 // =============================================================================
 
 /// A reset delta over a layer with top-level sections must leave
-/// `le:{oid}:obj:ch:0` **absent** and `"0"` out of `obj:chs`.
+/// `le:{oid}:obj:ch:0` holding exactly the reset's own top-level sections — no
+/// id of a section the reset erased — and every erased section's children key
+/// gone.
+///
+/// Under the layer-root rule (SDD §9.7) `update_layer` refuses a reset that
+/// would leave such a layer with no top-level section, so the reset here
+/// restates one (section `RESET_TOP`, a new id). That reset rewrites the
+/// root's list itself, which hides the root-key leak described below from
+/// this test: the finalizer's delete of the root's key for a reset that
+/// leaves no section is pinned through the commit route by
+/// [`reset_of_a_rootless_layer_deletes_the_root_children_key_and_drops_it_from_the_index`],
+/// on a layer with no top-level section to lose. What this test pins is the
+/// end state of a reset that keeps one: no dead id under the root, and no
+/// erased section's list left behind.
 ///
 /// `apply_reset` erases `state.children` wholesale but its per-section loop can
 /// only emit a `DeleteChildrenList` for ids that had a `state.sections` row.
@@ -397,7 +417,11 @@ async fn persisted_shape(tv: &TestValkey, oid: u64) -> PersistedShape {
 /// fix red; it is owned by follow-up issue **b.evm** ("Reset leaves
 /// dangling-parent children keys and obj:chs members in place (sdd.md §7.7)").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reset_deletes_the_root_children_key_and_drops_it_from_the_index() {
+async fn reset_rewrites_the_root_children_key_to_its_own_top_level_sections() {
+    /// The one top-level section the reset restates: an id the created layer
+    /// does not hold, so a surviving old id cannot pass for it.
+    const RESET_TOP: u64 = 9;
+
     let tv = TestValkey::setup().await;
     let ls = layer_store(&tv);
     let session_id = create_test_session(&tv).await;
@@ -442,6 +466,7 @@ async fn reset_deletes_the_root_children_key_and_drops_it_from_the_index() {
         Some(OwnedDelta {
             is_diff: true,
             base_version: 0,
+            struct_commands: vec![change_cmd(0, RESET_TOP, "NewTop", 0)],
             source_format: "usda".to_string(),
             ..Default::default()
         }),
@@ -450,6 +475,118 @@ async fn reset_deletes_the_root_children_key_and_drops_it_from_the_index() {
     )
     .await
     .expect("reset update_layer must succeed");
+
+    let snapshot = read_object_state_for_test(tv.client(), tv.key_schema(), &oid.to_string())
+        .await
+        .expect("snapshot load must succeed");
+    assert_eq!(
+        snapshot.children.get(&0),
+        Some(&vec![RESET_TOP]),
+        "the root's children key must hold exactly the reset's own top-level section, no dead \
+         id of a section the reset erased"
+    );
+    // The per-section arm still works: every erased section's list is gone.
+    assert!(
+        !children_key_exists(&tv, oid, 1).await,
+        "a live section's children key is deleted by the reset's own loop"
+    );
+    assert_eq!(
+        children_index(&tv, oid).await,
+        vec!["0".to_string()],
+        "only the root's list survives a reset that erased every other section (SDD §7.7: \
+         member ⟺ key exists)"
+    );
+}
+
+/// The reset that leaves **no** section, through the commit route: it must
+/// leave `le:{oid}:obj:ch:0` **absent** and `"0"` out of `obj:chs`.
+///
+/// This is the leak [`reset_rewrites_the_root_children_key_to_its_own_top_level_sections`]
+/// describes, which that test cannot see: there the reset restates a
+/// top-level section, so the root's list is rewritten whatever the
+/// registration loop does. Here nothing writes the root's list, so only the
+/// finalizer's delete — reached through `apply_reset` marking the root dirty
+/// before its clear — removes it. Without that, the key keeps the erased ids
+/// and the next snapshot read loads them back into `state.children[0]`.
+///
+/// A reset leaving no top-level section is refused on a layer that had one
+/// (SDD §9.7), so the layer here has none to lose: the root lists only a
+/// ghost (an id with no row), and the section rows hang under another ghost.
+/// The root's list is still stored, loaded by every snapshot read, and the
+/// reset still has to delete it. Stored state can hold such a list: a create
+/// writes the lists it is given verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_of_a_rootless_layer_deletes_the_root_children_key_and_drops_it_from_the_index() {
+    /// The id the root lists, with no row of its own.
+    const GHOST_TOP: u64 = 4242;
+    /// The parent of the layer's section rows, with no row of its own.
+    const GHOST_PARENT: u64 = 77;
+
+    let tv = TestValkey::setup().await;
+    let ls = layer_store(&tv);
+    let session_id = create_test_session(&tv).await;
+
+    let mut state = ObjectState {
+        sequence_num: 1,
+        first_version: 1,
+        source_format: "usda".to_string(),
+        ..Default::default()
+    };
+    state
+        .sections
+        .insert(1, section(1, GHOST_PARENT, "World", 0));
+    state.sections.insert(3, section(3, 1, "Cube", 0));
+    state.children.insert(0, vec![GHOST_TOP]);
+    state.children.insert(1, vec![3]);
+    assert!(
+        !has_top_level_section(&state),
+        "fixture: the layer has no top-level section, so an empty reset is not refused"
+    );
+
+    let oid = ls
+        .create_layer(
+            &session_id,
+            "rootless-reset-layer",
+            "b-ot3",
+            &state,
+            mock_ext_store(),
+        )
+        .await
+        .expect("create_layer must succeed");
+
+    // Precondition: without these the post-reset assertions are vacuous.
+    let loaded = read_object_state_for_test(tv.client(), tv.key_schema(), &oid.to_string())
+        .await
+        .expect("snapshot load must succeed");
+    assert_eq!(
+        loaded.children.get(&0),
+        Some(&vec![GHOST_TOP]),
+        "fixture precondition: the snapshot read loads the root's list"
+    );
+    assert!(
+        children_index(&tv, oid).await.contains(&"0".to_string()),
+        "fixture precondition: the root must be indexed before the reset"
+    );
+    assert!(
+        children_key_exists(&tv, oid, 1).await,
+        "fixture precondition: section 1's children key must exist before the reset"
+    );
+
+    ls.update_layer_relayed(
+        &session_id,
+        "rootless-reset-layer",
+        oid,
+        Some(OwnedDelta {
+            is_diff: true,
+            base_version: 0,
+            source_format: "usda".to_string(),
+            ..Default::default()
+        }),
+        WRITER,
+        0,
+    )
+    .await
+    .expect("an empty reset of a layer with no top-level section must commit");
 
     assert!(
         !children_key_exists(&tv, oid, 0).await,
@@ -494,6 +631,10 @@ async fn reset_deletes_the_root_children_key_and_drops_it_from_the_index() {
 async fn child_under_a_ghost_parent_cascaded_in_one_delta_leaves_no_key_and_survives_unlisted() {
     const GHOST: u64 = 4242;
     const ORPHAN: u64 = 5;
+    /// A second top-level section the delta leaves alone, so deleting
+    /// section 1 keeps a top-level section: an update leaving none is refused
+    /// (SDD §9.7).
+    const ANCHOR: u64 = 2;
 
     let tv = TestValkey::setup().await;
     let ls = layer_store(&tv);
@@ -506,7 +647,10 @@ async fn child_under_a_ghost_parent_cascaded_in_one_delta_leaves_no_key_and_surv
         ..Default::default()
     };
     state.sections.insert(1, section(1, 0, "World", 0));
-    state.children.insert(0, vec![1]);
+    state
+        .sections
+        .insert(ANCHOR, section(ANCHOR, 0, "Anchor", 1));
+    state.children.insert(0, vec![1, ANCHOR]);
     // Section 1 lists an id that has no row — a ghost. Stored state can hold
     // this (SDD §10.4 tolerates the dual of it), and a snapshot read
     // `LRANGE`s section 1's list back verbatim, so the engine meets it.
@@ -555,14 +699,16 @@ async fn child_under_a_ghost_parent_cascaded_in_one_delta_leaves_no_key_and_surv
         read_object_state_for_test(tv.client(), tv.key_schema(), &batched_oid.to_string())
             .await
             .expect("snapshot load must succeed");
+    let mut sections: Vec<(u64, u64)> = snapshot
+        .sections
+        .values()
+        .map(|s| (s.section_id, s.parent_id))
+        .collect();
+    sections.sort_unstable();
     assert_eq!(
-        snapshot
-            .sections
-            .values()
-            .map(|s| (s.section_id, s.parent_id))
-            .collect::<Vec<_>>(),
-        vec![(ORPHAN, GHOST)],
-        "section 1 is gone and the orphan survives under the ghost"
+        sections,
+        vec![(ANCHOR, 0), (ORPHAN, GHOST)],
+        "section 1 is gone, the anchor is untouched and the orphan survives under the ghost"
     );
     assert!(
         snapshot.children.values().all(|l| !l.contains(&ORPHAN)),
@@ -764,18 +910,26 @@ async fn large_subtree_delete_persists_identically_to_one_command_per_delta() {
 // 4. Mixed conflict sequence — persisted equivalence
 // =============================================================================
 
-/// A duplicate-name conflict sequence — rename-duplicate, create, move,
-/// reorder, delete — must persist identically whether committed as one delta
-/// or five.
+/// A collision sequence with a cascade on every collision path — a same-parent
+/// rename, a create, a cross-parent move (edge 5), and a create onto a name a
+/// stored pair holds — then a reorder and a delete, must persist identically
+/// whether committed as one delta or six.
+///
+/// Every row and command here is an attribute, so each collision is in one
+/// slot, and each cascades its occupant with its subtree (SDD §9.3; ovlive's
+/// `occupant`, `Create` and `Move`). The stored pair, two attributes named `D`
+/// under parent 1, is the shape only an earlier build's same-parent rename
+/// wrote: the create onto `D` cascades the lower id and leaves the other
+/// beside it.
 ///
 /// The domain-side twin
 /// (`apply_delta_mixed_conflict_sequence_matches_one_per_delta`) compares the
 /// in-memory state; this compares what actually landed, which is where the
 /// coalesced children writes and the `obj:chs` membership fork are observable.
 /// The lowest-`section_id` tie-break (b.ot3 P2) is what makes the two runs
-/// comparable at all: pre-fix the conflict target came from a `HashMap`'s
-/// layout, so the two layers could legally have cascade-deleted different
-/// subtrees.
+/// comparable over the stored pair: pre-fix the conflict target came from a
+/// `HashMap`'s layout, so the two layers could legally have cascade-deleted
+/// different subtrees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_conflict_sequence_persists_identically_to_one_command_per_delta() {
     let tv = TestValkey::setup().await;
@@ -794,9 +948,15 @@ async fn mixed_conflict_sequence_persists_identically_to_one_command_per_delta()
         state.sections.insert(10, section(10, 1, "A", 0));
         state.sections.insert(20, section(20, 1, "B", 1));
         state.sections.insert(30, section(30, 1, "C", 2));
+        // A stored same-kind pair, as an earlier build's rename left it: 60
+        // (with a child, 61) and 70, both attributes named "D".
+        state.sections.insert(60, section(60, 1, "D", 3));
+        state.sections.insert(61, section(61, 60, "child-of-60", 0));
+        state.sections.insert(70, section(70, 1, "D", 4));
         state.sections.insert(40, section(40, 2, "Mover", 0));
         state.children.insert(0, vec![1, 2]);
-        state.children.insert(1, vec![10, 20, 30]);
+        state.children.insert(1, vec![10, 20, 30, 60, 70]);
+        state.children.insert(60, vec![61]);
         state.children.insert(2, vec![40]);
         state
     }
@@ -817,15 +977,24 @@ async fn mixed_conflict_sequence_persists_identically_to_one_command_per_delta()
     }
     let (batched_oid, reference_oid) = (oids[0], oids[1]);
 
+    // Parent 1's list after each command, in its stored key order.
     let cmds = vec![
-        // Rename 20 onto 10's name — two "A" siblings under parent 1.
+        // Rename 20 onto 10's name: the rename cascades the occupant, 10, and
+        // 20 holds "A". [20, 30, 60, 70]
         move_cmd(20, 1, 1, "A"),
-        // Create onto "A" → cascades the LOWEST holder, 10.
+        // Create onto "A": cascades its occupant, 20; 50 is appended.
+        // [30, 60, 70, 50]
         create_cmd(1, 50, "A"),
-        // Move onto "A" → holders are now {20, 50}; the lowest is 20.
+        // Move onto "A" from parent 2 (edge 5): cascades the occupant, 50; 40
+        // is appended. [30, 60, 70, 40]
         move_cmd(40, 2, 1, "A"),
-        // Verbatim order over what is left.
-        reorder_cmd(1, vec![50, 30, 40]),
+        // Create onto "D", which the stored pair holds: cascades the LOWEST,
+        // 60, with its child 61; 70 stays beside 80. [30, 70, 40, 80]
+        create_cmd(1, 80, "D"),
+        // Every child listed, in this order; 50, gone, is ignored.
+        // [80, 30, 40, 70]
+        reorder_cmd(1, vec![50, 80, 30, 40, 70]),
+        // [80, 40, 70]
         delete_cmd(30),
     ];
     commit_batched(
@@ -847,16 +1016,25 @@ async fn mixed_conflict_sequence_persists_identically_to_one_command_per_delta()
 
     assert_eq!(
         children_list(&tv, batched_oid, 1).await,
-        vec!["50".to_string(), "40".to_string()],
+        vec!["80".to_string(), "40".to_string(), "70".to_string()],
         "the settled order of parent 1's list"
     );
-    assert!(
-        !batched
-            .sections
-            .iter()
-            .any(|(sid, ..)| *sid == 10 || *sid == 20),
-        "both conflict resolutions took the lowest-id holder: {:?}",
-        batched.sections
+    assert_eq!(
+        batched.tombstone_ids,
+        vec![10, 20, 30, 50, 60, 61],
+        "each collision cascaded its occupant — the stored pair's lowest, 60, \
+         with its child — and the delete took 30"
+    );
+    let under_parent_1: Vec<(u64, &str)> = batched
+        .sections
+        .iter()
+        .filter(|(_, parent, ..)| *parent == 1)
+        .map(|(sid, _, name, ..)| (*sid, name.as_str()))
+        .collect();
+    assert_eq!(
+        under_parent_1,
+        vec![(40, "A"), (70, "D"), (80, "D")],
+        "the pair's other member, 70, stays beside the created 80"
     );
     assert_eq!(
         children_list(&tv, batched_oid, 2).await,
@@ -968,6 +1146,11 @@ async fn many_siblings_in_one_delta_persist_as_one_ordered_list() {
 /// no row (SDD §10.4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_then_recreate_parent_in_one_delta_persists_identically_to_one_command_per_delta() {
+    /// A second top-level section no command touches, so the reference's
+    /// lone `DeleteSection` commit keeps a top-level section: an update
+    /// leaving none is refused (SDD §9.7).
+    const ANCHOR: u64 = 4;
+
     let tv = TestValkey::setup().await;
     let ls = layer_store(&tv);
     let session_id = create_test_session(&tv).await;
@@ -984,7 +1167,10 @@ async fn delete_then_recreate_parent_in_one_delta_persists_identically_to_one_co
         // Section 2 has a child of its own, so `obj:ch:2` exists and the
         // cascade really has a second list to delete and un-index.
         state.sections.insert(3, section(3, 2, "G", 0));
-        state.children.insert(0, vec![1]);
+        state
+            .sections
+            .insert(ANCHOR, section(ANCHOR, 0, "Anchor", 1));
+        state.children.insert(0, vec![1, ANCHOR]);
         state.children.insert(1, vec![2]);
         state.children.insert(2, vec![3]);
         state
@@ -1055,8 +1241,8 @@ async fn delete_then_recreate_parent_in_one_delta_persists_identically_to_one_co
     );
     assert_eq!(
         children_list(&tv, batched_oid, 0).await,
-        vec!["1".to_string()],
-        "the root lists the re-created section"
+        vec![ANCHOR.to_string(), "1".to_string()],
+        "the root lists the untouched anchor, then the re-created section"
     );
     // The other half of the §7.7 biconditional, on a parent that really did
     // go away: the cascaded section 2's list, which existed before the delta
@@ -1080,8 +1266,8 @@ async fn delete_then_recreate_parent_in_one_delta_persists_identically_to_one_co
     survivors.sort_unstable();
     assert_eq!(
         survivors,
-        vec![1, 9],
-        "the re-created section and its new child survive; the cascaded \
+        vec![1, ANCHOR, 9],
+        "the re-created section, the anchor and the new child survive; the cascaded \
          subtree does not: {:?}",
         snapshot.sections
     );

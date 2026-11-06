@@ -67,6 +67,31 @@
 //! ([`fanout_arena_dirty_decay_ms`]); the feature is in no default or
 //! release build (`Cargo.toml`, `scripts/check-measurement-features.sh`, and
 //! the Dockerfile's measurement-feature gate).
+//!
+//! # The DR Job's purge
+//!
+//! [`purge_all_arenas`] runs `arena.<MALLCTL_ARENAS_ALL>.purge`
+//! (`arena.4096.purge`): jemalloc returns every initialised arena's unused
+//! dirty pages to the OS at once: the automatic arenas, the huge arena, and
+//! every manual arena, the fan-out arena included (`arenas.create` raises
+//! the count the purge walks). With `all`, dirty pages skip the muzzy state
+//! and go back with `MADV_DONTNEED`, so resident memory falls immediately
+//! (the vendored jemalloc 5.3.0: `doc/jemalloc.xml.in` on `arena.<i>.purge`,
+//! `src/ctl.c` `arena_i_purge_ctl`, `src/pac.c`). `purge`, not
+//! `arena.<i>.decay`: a decay purges only the share the decay curve allows
+//! at the current time, so just-freed pages would stay. Thread caches are
+//! not flushed; their residue is bounded per thread.
+//!
+//! It is the accept-loss Job's allocator purge, which its value removal
+//! runs around each of its transactions (`dr::job::execute::discard`,
+//! D5; the library declares the hook, `storage::allocator_purge`, because it
+//! cannot call this allocator). Only `main.rs`'s `run_dr_job` installs it,
+//! and only on linux-gnu, where this module exists; no serving process
+//! purges explicitly, and the server keeps jemalloc's decay schedule (SDD
+//! §21.2 rejects a per-window purge for the fan-out). A purge from a tokio
+//! task blocks its thread while it walks the arenas, so the hook runs it on
+//! the blocking pool; while a background thread or another purge is
+//! purging an arena, the call skips that arena rather than wait.
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
@@ -211,6 +236,28 @@ fn write<T: MallctlValue>(name: &CStr, mut value: T) -> Result<(), c_int> {
     }
 }
 
+/// Run one `mallctl` that takes and returns no value (a "void" control such
+/// as `arena.<i>.purge`); jemalloc's error code (an `errno` value) when it
+/// rejects the name. Allocates nothing.
+fn run_void(name: &CStr) -> Result<(), c_int> {
+    // SAFETY: `name` is NUL-terminated; no old value is read and no new value
+    // is passed (null, null, null, 0), as a void control requires.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(rc)
+    }
+}
+
 /// Advance jemalloc's statistics epoch so the next `stats.*` read reflects
 /// current state rather than the last refresh.
 fn advance_epoch() -> Option<()> {
@@ -276,6 +323,20 @@ pub(crate) fn resident_bytes() -> Option<u64> {
 /// the vendored jemalloc 5.3.0; `src/ctl.c` merges each initialised arena,
 /// manual ones included, into it).
 const MALLCTL_ARENAS_ALL: u32 = 4096;
+
+/// The purge control of every arena: `arena.<MALLCTL_ARENAS_ALL>.purge`
+/// (module docs, *The DR Job's purge*). A test pins it to
+/// [`MALLCTL_ARENAS_ALL`].
+const PURGE_ALL_ARENAS: &CStr = c"arena.4096.purge";
+
+/// Return every arena's unused dirty pages to the OS now (module docs, *The
+/// DR Job's purge*): `true` when jemalloc accepted the request. One void
+/// `mallctl`; allocates nothing. The DR Job's allocator purge
+/// (`live_edit::storage::allocator_purge`), installed only by `main.rs`'s
+/// `run_dr_job`.
+pub(crate) fn purge_all_arenas() -> bool {
+    run_void(PURGE_ALL_ARENAS).is_ok()
+}
 
 /// Bytes in dirty pages — freed by the service, not yet purged back to the OS
 /// — after advancing the statistics epoch, split between the fan-out arena
@@ -885,6 +946,26 @@ mod tests {
         );
     }
 
+    /// Serialises the tests that purge jemalloc's arenas with the tests that
+    /// assert dirty pages rise. A purge returns every arena's dirty pages to
+    /// the OS, process-wide, and plain `cargo test` runs this module's tests
+    /// on concurrent threads in one process: a purge between a test's free
+    /// and its reading would empty the dirty figure it asserts rose. So
+    /// **every test here that purges (`purge_all_arenas`, or anything that
+    /// calls it), and every test that asserts dirty pages rise, holds
+    /// [`purge_lock`] for its whole body.** Nextest runs each test in its own
+    /// process, so there it is uncontended.
+    static PURGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take [`PURGE_LOCK`]. A test that panicked while holding it poisons
+    /// it; the lock guards no data, so the next test takes it anyway rather
+    /// than failing too.
+    fn purge_lock() -> std::sync::MutexGuard<'static, ()> {
+        PURGE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// b.fsz MR-D4 (D4-T10): the `live_edit_jemalloc_dirty_bytes` source reads
     /// live statistics. Its two figures are whole pages, the `fanout` figure
     /// present exactly when the fan-out arena is set up, and the `automatic`
@@ -896,6 +977,8 @@ mod tests {
     fn dirty_bytes_reads_whole_pages_and_rises_when_freed_pages_wait_for_purging() {
         const BLOCK: usize = 1 << 20;
         const BLOCKS: usize = 64;
+        // No purge may run between the free and the reading below.
+        let _purge = purge_lock();
         let page = read::<usize>(c"arenas.page").expect("`arenas.page` must be readable") as u64;
         let (before, fanout) = dirty_bytes().expect(
             "`stats.arenas.<i>.pdirty` must be readable: without it the \
@@ -923,6 +1006,129 @@ mod tests {
              in the automatic arenas until decay purges them, but the figure rose by {rise} \
              (from {before} to {after}): the reading is stale or of the wrong arena",
             BLOCKS * BLOCK
+        );
+    }
+
+    /// The DR Job's purge names every arena: its control is
+    /// `arena.<MALLCTL_ARENAS_ALL>.purge`, and jemalloc accepts it. With
+    /// `arena.0` it would purge one arena only, and with `.decay` only the
+    /// decay curve's share.
+    #[test]
+    fn the_dr_jobs_purge_names_every_arena_and_jemalloc_accepts_it() {
+        let _purge = purge_lock();
+        assert_eq!(
+            PURGE_ALL_ARENAS.to_str().expect("ASCII"),
+            format!("arena.{MALLCTL_ARENAS_ALL}.purge")
+        );
+        assert!(
+            purge_all_arenas(),
+            "jemalloc accepts `{PURGE_ALL_ARENAS:?}`"
+        );
+    }
+
+    /// The blocks the real-purge tests free: 64 × 1 MiB, below the huge
+    /// threshold (so each goes back to its arena, not the huge arena) and
+    /// above the thread cache's sizes (so none stays cached).
+    const PURGED_BLOCK: usize = 1 << 20;
+    const PURGED_BLOCKS: usize = 64;
+
+    /// How often a real-purge test purges before it gives up: a purge skips
+    /// an arena a background thread is purging at that moment
+    /// (`src/pac.c`, `decay->purging`), so a test purges again, 10 ms apart,
+    /// up to this many times. A healthy run needs one.
+    const PURGE_ATTEMPTS: usize = 50;
+
+    /// Arena `index`'s dirty pages (`stats.arenas.<index>.pdirty`), after
+    /// advancing the statistics epoch.
+    fn arena_dirty_pages(index: u32) -> u64 {
+        advance_epoch().expect("the statistics epoch advances");
+        let name = CString::new(format!("stats.arenas.{index}.pdirty")).expect("no NUL");
+        read::<usize>(&name).expect("`stats.arenas.<i>.pdirty` is readable") as u64
+    }
+
+    /// W-T6 (1), the DR Job's purge reaches a manual arena, as it must reach
+    /// the fan-out arena: 64 MiB freed by a thread bound to a fresh manual
+    /// arena (`arenas.create`) leave it dirty pages; after
+    /// [`purge_all_arenas`] (accepted) the arena holds none. Fails with the
+    /// purge naming `arena.0` or `.decay` (in-place perturbations of
+    /// `PURGE_ALL_ARENAS`): the manual arena keeps its dirty pages.
+    #[test]
+    fn the_dr_jobs_purge_returns_a_manual_arenas_dirty_pages() {
+        let _purge = purge_lock();
+        let index = create_arena().expect("a manual arena");
+        std::thread::spawn(move || {
+            write::<u32>(c"thread.arena", index).expect("bind this thread to the manual arena");
+            let blocks: Vec<Vec<u8>> = (0..PURGED_BLOCKS)
+                .map(|_| black_box(vec![1u8; PURGED_BLOCK]))
+                .collect();
+            drop(black_box(blocks));
+        })
+        .join()
+        .expect("the allocating thread ran");
+        let freed = arena_dirty_pages(index);
+        assert!(
+            freed > 0,
+            "fixture: the freed blocks leave manual arena {index} dirty pages"
+        );
+
+        let mut left = freed;
+        for _ in 0..PURGE_ATTEMPTS {
+            assert!(purge_all_arenas(), "jemalloc accepts the purge");
+            left = arena_dirty_pages(index);
+            if left == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            left, 0,
+            "the purge returns every dirty page of manual arena {index} ({freed} before)"
+        );
+    }
+
+    /// W-T6 (2), the DR Job's purge reaches the automatic arenas: from a
+    /// purged start, this thread frees 64 MiB, which raises the automatic
+    /// arenas' dirty figure ([`dirty_bytes`]) by at least a quarter of it
+    /// (as [`dirty_bytes_reads_whole_pages_and_rises_when_freed_pages_wait_for_purging`]
+    /// asserts; jemalloc reuses some freed extents at once); then
+    /// [`purge_all_arenas`] (accepted) lowers it by at least ¾ of that rise.
+    /// A concurrent sibling test (plain `cargo test`) can add dirty pages of
+    /// its own between the readings, which only shrinks the fall, hence ¾.
+    /// Fails with the purge naming `.decay` (in-place perturbation of
+    /// `PURGE_ALL_ARENAS`): the decay curve returns only a sliver of
+    /// just-freed pages.
+    #[test]
+    fn the_dr_jobs_purge_returns_the_automatic_arenas_dirty_pages() {
+        let _purge = purge_lock();
+        assert!(purge_all_arenas(), "jemalloc accepts the purge");
+        let (start, _) = dirty_bytes().expect("readable");
+        let blocks: Vec<Vec<u8>> = (0..PURGED_BLOCKS)
+            .map(|_| black_box(vec![1u8; PURGED_BLOCK]))
+            .collect();
+        drop(black_box(blocks));
+        let (freed, _) = dirty_bytes().expect("readable");
+        let rise = freed.saturating_sub(start);
+        assert!(
+            rise >= (PURGED_BLOCKS * PURGED_BLOCK / 4) as u64,
+            "fixture: freeing {} B leaves at least a quarter dirty; the figure rose by {rise} B",
+            PURGED_BLOCKS * PURGED_BLOCK
+        );
+        let floor = rise / 4 * 3;
+
+        let mut fall = 0;
+        for _ in 0..PURGE_ATTEMPTS {
+            assert!(purge_all_arenas(), "jemalloc accepts the purge");
+            let (purged, _) = dirty_bytes().expect("readable");
+            fall = freed.saturating_sub(purged);
+            if fall >= floor {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            fall >= floor,
+            "the purge lowers the automatic arenas' dirty figure by at least {floor} B, ¾ of \
+             the {rise} B the free added, from {freed} B; it fell by {fall} B"
         );
     }
 

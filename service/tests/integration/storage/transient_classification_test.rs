@@ -345,11 +345,12 @@ async fn session_get_base_path_real_call_classifies_transient_via_mapper() {
 // real cascade against a clean Valkey and commits.
 //
 // Pre-b.fd9 there was no retry loop around the cascade — a transient blip
-// after step 2 (DEL mapping) would have surfaced `Internal` with the
-// mapping gone but the rest of the layer's keys still in Valkey. Post-
-// b.fd9 the retry loop catches the Aborted and re-runs from step 2; every
-// individual step is idempotent (DEL, XADD `*`, UNLINK, PEXPIRE, SREM) so
-// the second pass commits cleanly.
+// after step 2 (then a mapping `DEL`) would have surfaced `Internal` with
+// the mapping gone but the rest of the layer's keys still in Valkey. Post-
+// b.fd9 the retry loop catches the Aborted and re-runs the body: its later
+// steps are idempotent (XADD `*`, UNLINK, PEXPIRE), and step 2's unmap is
+// sent again only until one send settled, so the second pass commits
+// cleanly. The fault here fires at the top of the body, before the unmap.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_layer_retries_transient_aborted_and_commits() {
@@ -359,7 +360,7 @@ async fn delete_layer_retries_transient_aborted_and_commits() {
     let tv = TestValkey::setup().await;
 
     let cooked = ServiceError::Aborted(format!(
-        "transient I/O: DEL layer mapping failed ({}): synthetic mid-cascade blip",
+        "transient I/O: synthetic blip at the top of the delete body ({})",
         FredErrorKind::Timeout.to_str()
     ));
     let queue: Arc<Mutex<VecDeque<ServiceError>>> =
@@ -426,7 +427,7 @@ async fn delete_layer_retry_budget_exhaustion_surfaces_unavailable_not_internal(
     let queue: Arc<Mutex<VecDeque<ServiceError>>> = Arc::new(Mutex::new(
         std::iter::repeat_with(|| {
             ServiceError::Aborted(format!(
-                "transient I/O: DEL layer mapping failed ({}): synthetic blip",
+                "transient I/O: synthetic blip at the top of the delete body ({})",
                 FredErrorKind::Timeout.to_str()
             ))
         })

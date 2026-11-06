@@ -39,13 +39,14 @@ use super::upload_admission::{
     CommitPath, DeltaFootprint, UploadCommitCharge, UploadRefusal, UploadReservation, UploadRpc,
 };
 use crate::checkpoint::RecoveryOutcome;
+use crate::domain::layer_root::{build_creation_state, CreationState};
 use crate::domain::ompf::OmpfContainer;
-use crate::domain::types::ObjectState;
 use crate::domain::validation::{
     validate_client_id, validate_delta_bounds, validate_layer_name, validate_operation_id,
     validate_session_id,
 };
 use crate::error::{RefusalDetail, ServiceError};
+use crate::observability::metrics::UPLOAD_PHASE_PROCESSING;
 use crate::storage::chain_gate::{ChainGate, ChainLink, GateExit};
 use crate::storage::commit_charge::CommitCharge;
 use crate::storage::ext_release_gate::ExtReleaseRefusal;
@@ -53,8 +54,8 @@ use crate::storage::external_values::{
     delta_external_hashes, prepare_external_values, store_external_values, PreparedExternalValues,
 };
 use crate::storage::layer::{
-    operation_request_digest, outcome_unknown_after_retry, CreateOperation, Operation,
-    OperationOutcome,
+    operation_request_digest, outcome_unknown_after_retry, CreateCommitMarker, CreateOperation,
+    Operation, OperationOutcome,
 };
 
 /// The wire value of a storage-side [`OperationOutcome`].
@@ -80,12 +81,18 @@ fn wire_outcome(outcome: OperationOutcome) -> i32 {
 ///    applied only if its stream ended with END_STREAM: a stream reset, lost
 ///    or ended any other way — before or after the header — is `CANCELLED`
 ///    with nothing created or mapped. A header followed by END_STREAM is a
-///    valid empty upload.
+///    valid upload with no content, which creates the layer holding only its
+///    root section (step 6). Each chunk grows the reservation at once, never
+///    waiting: in the upload budget, or in the free overflow slot when no
+///    processing step is queued (logged once, "upload runs beyond the upload
+///    budget", phase `receiving`); otherwise `UNAVAILABLE`, nothing applied.
 /// 5. With an operation id: answer from its record if an earlier call already
 ///    committed it (`ALREADY_COMMITTED`, or `ALREADY_EXISTS` for a different
 ///    request), before the external-value store and object-id allocation. An
 ///    `ALREADY_COMMITTED` answer still parses the re-sent bytes, to re-spawn
-///    the recorded object's first base (step 8).
+///    the recorded object's first base (step 8) — unless the rebuild supplied
+///    the root section, which the replica that committed the original may not
+///    have done.
 /// 6. Parse, in two processing steps: hold the parse charge, parse the OMPF
 ///    delta, run the per-delta checks on it (§9.4 caps, name characters,
 ///    sample times, self-parenting; `INVALID_ARGUMENT` before the processing
@@ -93,10 +100,15 @@ fn wire_outcome(outcome: OperationOutcome) -> i32 {
 ///    create; then store its external values — first waiting at the
 ///    external-value release budget when the container carries external parts
 ///    (`UNAVAILABLE`, nothing applied, if it stays full for the call's
-///    remaining deadline less a margin) — and apply the delta (or create an empty ObjectState for empty
-///    content). Neither processing step is refused for size: each waits, up
-///    to the RPC deadline, for room in the upload budget or for the overflow
-///    slot, where the upload runs beyond the budget.
+///    remaining deadline less a margin) — and build the layer's first state
+///    from the content
+///    ([`build_creation_state`](crate::domain::layer_root::build_creation_state),
+///    SDD §9.7): content that leaves the layer completely empty, no content
+///    included, gets the service-supplied root section, and content that
+///    leaves sections or value rows but no top-level section is refused
+///    `INVALID_ARGUMENT`. Neither processing step is refused for size: each
+///    waits, up to the RPC deadline, for room in the upload budget or for the
+///    overflow slot, where the upload runs beyond the budget.
 /// 7. Persist object to Valkey via LayerStore, return object_id and the
 ///    operation outcome. A session deleted since step 2 is refused at the
 ///    commit point, `NOT_FOUND "session was deleted"`, with nothing mapped.
@@ -104,7 +116,10 @@ fn wire_outcome(outcome: OperationOutcome) -> i32 {
 ///    it fails the call.
 /// 8. Spawn the SR-7.1 creation-time first-base bootstrap for the layer's
 ///    object — the one this call created, or the recorded one on an
-///    `ALREADY_COMMITTED` answer. Post-commit and best-effort: the committed
+///    `ALREADY_COMMITTED` answer, except when this call supplied the root
+///    section (step 6): the replica that committed the recorded object may
+///    not have, so this call's state need not be that object's. Post-commit
+///    and best-effort: the committed
 ///    `ObjectState` is *moved* into a task on the shared checkpoint
 ///    `TaskTracker`, and nothing the bootstrap does can fail this RPC. The gate
 ///    and every failure arm live inside
@@ -117,13 +132,18 @@ fn wire_outcome(outcome: OperationOutcome) -> i32 {
 /// object_id). With one, a re-send of a create that committed is answered from
 /// the `le:{sid}:createop:{operation_id}` record and allocates nothing (see
 /// `LayerStore::create_layer_with_operation`). A drop before the commit point
-/// leaves external values with non-zero refcounts that the GC sweep reclaims on
-/// next pass, and a materialized object no mapping names, which the orphan
-/// sweep reclaims. The mapping flip, the layers-index entry and the operation
-/// record are one atomic script, so either all or none commit — never a
-/// half-registered layer. A client reset after its END_STREAM cancels the call,
-/// not the upload: hyper drops this handler the next time it waits, as a
-/// deadline does, so the same contract holds.
+/// leaves a materialized object no mapping names, which the orphan sweep
+/// reclaims, and the call's pre-flight external-value increments, which no
+/// path of the call releases: a materialized orphan holds them, and the
+/// sweep's retirement of it gives them back once; increments no
+/// materialization took up are drained by the reference-count reconciler
+/// (SDD §11.1). Releasing them on the way out would release them twice, since
+/// the call cannot tell whether its materialization landed. The mapping flip,
+/// the layers-index entry and the operation record are one atomic script, so
+/// either all or none commit — never a half-registered layer. A client reset
+/// after its END_STREAM cancels the call, not the upload: hyper drops this
+/// handler the next time it waits, as a deadline does, so the same contract
+/// holds.
 ///
 /// **NotFound recovery (SDD SR-2.7).** Step 2's `get_base_path` call funnels
 /// through [`SessionBasePathCache::get_base_path`](super::session_cache::SessionBasePathCache::get_base_path),
@@ -143,16 +163,27 @@ fn wire_outcome(outcome: OperationOutcome) -> i32 {
 ///
 /// **A refusal before the commit.** Every failure passes
 /// [`refused_before_commit`] before it is logged and answered: a plain
-/// `UNAVAILABLE` raised before the commit marker — set immediately before
-/// step 7's `LayerStore::create_layer_with_operation` — is answered carrying
-/// `UPSTREAM_UNAVAILABLE` (this call applied nothing). Steps 1–6 write no
+/// `UNAVAILABLE` raised before the commit marker is answered carrying
+/// `UPSTREAM_UNAVAILABLE` (this call applied nothing). The marker is set
+/// inside step 7, by `LayerStore::create_layer_with_operation`, at the call's
+/// first client-visible write
+/// ([`CreateCommitMarker`](crate::storage::layer::CreateCommitMarker)):
+/// before an overwrite fences the object it replaces, or after a commit run
+/// that did not fail with exactly `Routing` "Too many redirections.", the one
+/// failure that proves the commit script did not run. Steps 1–6 write no
 /// client-visible state: the reads and the permission check write nothing, a
 /// lazy session restore on the base-path read restores state this call did
 /// not write, the operation-record read writes only on an answer that is not
 /// an error, and the external-value pre-store leaves only reference counts
 /// and blobs the garbage collector and the reference-count reconciler drain.
-/// No step before the marker writes client-visible state; a step that would
-/// must move the marker before itself.
+/// Nor does step 7 before the marker: the object-id allocation, the
+/// materialization of the new object (whatever its failure) and a commit run
+/// refused by a redirect leave at most an object no mapping names, which no
+/// client can reach and the orphan sweep reclaims. Before the marker the call
+/// releases none of its pre-flight external-value increments on an error;
+/// see the deadline-drop contract above. No step before the marker writes
+/// client-visible state; a step that would must set the marker before
+/// itself.
 pub async fn handle_create_layer(
     svc: &LiveEditService,
     request: Request<Streaming<CreateLayerRequest>>,
@@ -222,9 +253,17 @@ async fn create_layer_inner(
 
     // Step 4: Read the content under the reservation. A stream that did not
     // end with END_STREAM is refused `CANCELLED` here, before anything below
-    // stores or commits.
+    // stores or commits. Its receive growth may take the free overflow slot.
     ctx.at(RpcStage::Body);
-    let ompf_bytes = read_upload_body(stream, svc.max_layer_size, &mut reservation).await?;
+    let ompf_bytes = read_upload_body(
+        stream,
+        svc.max_layer_size,
+        &mut reservation,
+        true,
+        session_id,
+        layer_name,
+    )
+    .await?;
 
     // The client operation id, when one was sent, with its request digest over
     // the bytes exactly as streamed. Hashed only after the write-permission
@@ -245,14 +284,20 @@ async fn create_layer_inner(
     // creation-time first base, because the original call may never have
     // reached its own spawn (its reply was lost after the commit point — the
     // case operation ids exist for). The re-sent bytes are byte-identical to
-    // the original's (equal digests), so the state rebuilt here IS the state
-    // that object was created with. A duplicate spawn for an object that
-    // already has its first base is a no-op by the bootstrap's own guards (see
-    // `BaseBootstrap::spawn_creation_base`). A parse failure here — not
-    // expected, since the original parsed — only costs the re-spawn, and is
-    // logged; the answer stands. So does a refused growth of the reservation
-    // for that parse: the upload budget being full costs the re-spawn, not
-    // the answer.
+    // the original's (equal digests), and the rebuild runs the same creation
+    // step (`build_creation_state`), so when the content kept its own
+    // top-level section the state rebuilt here IS the state that object was
+    // created with. When the rebuild supplied the root section (SDD §9.7) it
+    // need not be: the replica that committed the original may predate the
+    // supplied root and have committed the layer empty, so the re-spawn is
+    // skipped, and logged. A duplicate spawn for an object that already has
+    // its first base is a no-op by the bootstrap's own guards (see
+    // `BaseBootstrap::spawn_creation_base`). A rebuild failure here only
+    // costs the re-spawn, and is logged; the answer stands. That includes a
+    // refused growth of the reservation for that parse (the upload budget
+    // being full) and the creation step's refusal of content that left data
+    // but no top-level section, which an original committed by a replica that
+    // predates that refusal can carry.
     if let Some(op) = operation.as_ref() {
         ctx.at(RpcStage::Resolve);
         if let Some(answered) = svc
@@ -263,7 +308,19 @@ async fn create_layer_inner(
         {
             ctx.at(RpcStage::Parse);
             match creation_state_for_resend(&ompf_bytes, &mut reservation) {
-                Ok(state) => svc
+                Ok(CreationState {
+                    root_supplied: true,
+                    ..
+                }) => log_supplied_root_spawn_skipped(
+                    session_id,
+                    layer_name,
+                    answered.object_id,
+                    op.operation_id(),
+                ),
+                Ok(CreationState {
+                    state,
+                    root_supplied: false,
+                }) => svc
                     .base_bootstrap
                     .spawn_creation_base(answered.object_id, state),
                 Err(e) => tracing::warn!(
@@ -311,16 +368,9 @@ async fn create_layer_inner(
         ctx,
     )
     .await?;
-    let mut state = ObjectState::default();
     // Track per-delta observability stats so the gRPC layer can surface
     // counters the pure-domain engine cannot reach (b.39x item 7).
     let mut stats = crate::domain::delta::ApplyDeltaStats::default();
-    // b.ot3: CreateLayer materializes the object from `ObjectState` (see
-    // `LayerStore::create_layer` / `queue_object_state`), never from the
-    // delta's mutation list — it dropped that list on the floor after
-    // paying to build it, which is where the measured 244 MiB from a
-    // 289 KiB delta went. Discard the mutations at the source instead.
-    let mut sink = crate::domain::delta::MutationSink::Discard;
     // The external-value hashes stored (and so pre-incremented) for this call,
     // carried with the operation so a call answered from an earlier call's
     // record can hand them back.
@@ -373,13 +423,26 @@ async fn create_layer_inner(
         }
     }
 
-    // Apply delta to fresh ObjectState. Empty content (SDD §8.3) still gets a
-    // version increment: `apply_delta_into` on no delta does this.
-    crate::domain::delta::apply_delta_into(&mut state, owned, &mut sink, &mut stats)
-        .map_err(ServiceError::from)?;
+    // Build the layer's first state from the content, at sequence 1 (SDD
+    // §9.7). Content that leaves the layer completely empty — no content
+    // included (SDD §8.3) — gets the service-supplied root section; content
+    // that leaves sections or value rows but no top-level section is refused
+    // `INVALID_ARGUMENT` here, like a duplicate section id: nothing is
+    // created or mapped, the reservation drops, and the external values
+    // pre-stored above are drained by the GC and the reference-count
+    // reconciler. The rule lives in this creation step rather than in the
+    // delta engine, which must keep reproducing stored history. The step
+    // discards the engine's mutation list (b.ot3): the object is
+    // materialized from the state (`LayerStore::create_layer` /
+    // `queue_object_state`), never from that list.
+    let CreationState {
+        state,
+        root_supplied,
+    } = build_creation_state(owned, &mut stats).map_err(ServiceError::from)?;
 
     // Bump the "silently-skipped CreateSection" counter exactly once per
-    // RPC. Zero is a no-op inside the helper (b.39x item 7).
+    // RPC, from the content's own apply (a supplied root's apply is not
+    // counted). Zero is a no-op inside the helper (b.39x item 7).
     svc.metrics.inc_delta_create_section_skipped_missing_parent(
         stats.create_section_skipped_missing_parent,
     );
@@ -391,14 +454,19 @@ async fn create_layer_inner(
     // object the layer the call answers OK: nothing after it fails the call
     // (see `LayerStore::create_layer_with_operation`).
     ctx.at(RpcStage::Storage);
-    // The commit marker ([`refused_before_commit`]): from here on a plain
-    // `UNAVAILABLE` is answered as it is, because the commit — allocation,
-    // materialization, the mapping flip — can apply part or all of the call,
-    // and a replacement whose commit was left in doubt can still take effect
-    // after the answer. No step before this marker writes client-visible
-    // state; a step that would must move the marker before itself.
-    ctx.commit_started();
-    let commit = svc
+    // The commit marker ([`refused_before_commit`]) is the store's to set, at
+    // the call's first client-visible write (`CreateCommitMarker`): before an
+    // overwrite's fence, or after a commit run that may have mapped the new
+    // object. From there on a plain `UNAVAILABLE` is answered as it is,
+    // because the commit may have applied the call, and a replacement whose
+    // commit was left in doubt can still take effect after the answer. An
+    // error returned with the marker clear applied nothing: the allocation,
+    // the materialization and any commit run refused by a redirect before it
+    // ran leave at most an unmapped object for the orphan sweep. No step
+    // before the marker writes client-visible state; a step that would must
+    // set the marker before itself.
+    let commit_marker = CreateCommitMarker::new();
+    let commit = match svc
         .layer_store
         .create_layer_with_operation(
             session_id,
@@ -407,23 +475,39 @@ async fn create_layer_inner(
             &state,
             svc.ext_value_store.clone(),
             operation.map(|op| op.with_prestored_ext_hashes(prestored_ext_hashes)),
+            &commit_marker,
         )
         .await
-        .map_err(|e| -> Status { e.into() })?;
+    {
+        Ok(commit) => commit,
+        Err(e) => {
+            if commit_marker.is_set() {
+                ctx.commit_started();
+            }
+            return Err(e.into());
+        }
+    };
     let object_id = commit.object_id;
 
     // An `AlreadyCommitted` answer is not this call's object: a concurrent
     // call with the same operation id committed first, and the store already
     // logged it. It is not "completed" here, but its first base is still
-    // spawned for the RECORDED object: `state` was built from bytes
-    // byte-identical to the winner's (equal digests), so it is the state that
-    // object was created with, and a duplicate spawn is a no-op by the
-    // bootstrap's own guards.
-    if commit.outcome != OperationOutcome::AlreadyCommitted {
+    // spawned for the RECORDED object when this call kept the content's own
+    // top-level section: `state` was then built, by the same creation step,
+    // from bytes byte-identical to the winner's (equal digests), so it is the
+    // state that object was created with, and a duplicate spawn is a no-op by
+    // the bootstrap's own guards. When this call supplied the root, the
+    // winner may be a replica that predates the supplied root and committed
+    // the layer empty, so the spawn is skipped, as on a re-send.
+    let already_committed = commit.outcome == OperationOutcome::AlreadyCommitted;
+    if !already_committed {
+        // `root_supplied` is recorded only when the root was supplied: a
+        // `None` field is left off the event.
         tracing::info!(
             session_id = %session_id,
             layer_name = %layer_name,
             object_id,
+            root_supplied = root_supplied.then_some(true),
             "CreateLayer completed"
         );
     }
@@ -433,7 +517,11 @@ async fn create_layer_inner(
     // task on the shared checkpoint `TaskTracker`, so this call adds no
     // synchronous work to the commit path beyond a gate read. The three-way
     // gate and every failure arm live inside the unit.
-    svc.base_bootstrap.spawn_creation_base(object_id, state);
+    if already_committed && root_supplied {
+        log_supplied_root_spawn_skipped(session_id, layer_name, object_id, &header.operation_id);
+    } else {
+        svc.base_bootstrap.spawn_creation_base(object_id, state);
+    }
 
     Ok(Response::new(CreateLayerResponse {
         object_id,
@@ -461,8 +549,12 @@ async fn create_layer_inner(
 ///    applied only if its stream ended with END_STREAM: a stream reset, lost
 ///    or ended any other way — before or after the header — is `CANCELLED`
 ///    with nothing committed. A header followed by END_STREAM is a valid
-///    empty update. With an operation_id on an unchained call, start the one
-///    call-start read of its start record.
+///    empty update. Each chunk grows the reservation at once, never waiting:
+///    in the upload budget, or — on an unchained call only — in the free
+///    overflow slot when no processing step is queued (logged once, "upload
+///    runs beyond the upload budget", phase `receiving`); otherwise
+///    `UNAVAILABLE`, nothing applied. With an operation_id on an unchained
+///    call, start the one call-start read of its start record.
 ///
 ///    Step 5b: a chained call then waits in the chain gate
 ///    ([`await_chain_predecessor`], `storage::chain_gate`) until the latest
@@ -495,7 +587,10 @@ async fn create_layer_inner(
 ///    on the per-replica structural cache committed by the script's
 ///    `seq`-fenced structural mode; or the WATCH/MULTI/EXEC slow path: apply
 ///    delta, persist, publish the stream entry — or answer a re-sent
-///    operation from its record. The call's summary goes on the failure log
+///    operation from its record. A structural plan that would take the layer
+///    from at least one top-level section to none is refused
+///    `INVALID_ARGUMENT` on either structural route before anything is
+///    committed (SDD §9.7). The call's summary goes on the failure log
 ///    context.
 /// 8. Return sequence_num + server_timestamp + operation_outcome.
 ///
@@ -665,20 +760,27 @@ fn chained_invalid_argument(ctx: &RpcLogContext, status: Status) -> Status {
 /// The `UPSTREAM_UNAVAILABLE` choke point (SDD §18.1): the status a
 /// `CreateLayer` / `UpdateLayer` is answered with in place of `status`.
 ///
-/// - An `UNAVAILABLE` with no detail, raised before the call's commit started
+/// - An `UNAVAILABLE` with no detail, raised before the call's commit marker
 ///   ([`RpcLogContext::is_commit_started`]): the same message, carrying
 ///   [`UPSTREAM_UNAVAILABLE`](crate::error::refusal_reason::UPSTREAM_UNAVAILABLE)
 ///   and its retry hint ([`RefusalDetail::upstream_unavailable`]). A
-///   dependency the call needed before its commit — the backing store, the
-///   auth backend, the backup store of a lazy restore — was unavailable, and
-///   no step before the commit marker writes client-visible state, so this
-///   call applied nothing.
+///   dependency the call needed — the backing store, the auth backend, the
+///   backup store of a lazy restore — was unavailable before any part of its
+///   commit took effect, and no step before the commit marker writes
+///   client-visible state, so this call applied nothing. `UpdateLayer` sets
+///   the marker before its first commit attempt. `CreateLayer`'s is set by
+///   the store at the call's first client-visible write
+///   ([`CreateCommitMarker`](crate::storage::layer::CreateCommitMarker)), so
+///   its allocation and materialization failures, and a new layer's commit
+///   whose every run was refused by a redirect before the script ran, come
+///   before it.
 /// - Anything else unchanged: another code; an `UNAVAILABLE` that already
 ///   carries a detail (an upload-capacity, shutdown, release-budget,
 ///   store-refusal or chain-gate refusal keeps its own reason); and every
-///   `UNAVAILABLE` from the commit on — retry exhaustion, overtaken, a
-///   `CreateLayer` commit-stage refusal, an outcome-unknown answer after a
-///   counted retry, the recovery re-issue — whose commit may have been sent.
+///   `UNAVAILABLE` from the marker on — retry exhaustion, overtaken, an
+///   overwrite or a commit run that may have run, an outcome-unknown answer
+///   after a counted retry, the recovery re-issue — whose commit may have
+///   taken effect.
 ///
 /// Keyed on the status code and the marker, not on the `ServiceError`
 /// variant or the step, so no pre-commit `UNAVAILABLE` can bypass it, and a
@@ -893,9 +995,20 @@ async fn update_layer_inner(
 
     // Step 5: Read the content under the reservation. A stream that did not
     // end with END_STREAM is refused `CANCELLED` here, before the start-record
-    // read, the chain gate and anything below that stores or commits.
+    // read, the chain gate and anything below that stores or commits. An
+    // unchained call's receive growth may take the free overflow slot; a
+    // chained call's may not, because it waits in the chain gate next and must
+    // hold no slot there (`grpc::upload_admission` module docs).
     ctx.at(RpcStage::Body);
-    let ompf_bytes = read_upload_body(stream, svc.max_layer_size, &mut reservation).await?;
+    let ompf_bytes = read_upload_body(
+        stream,
+        svc.max_layer_size,
+        &mut reservation,
+        chain.is_none(),
+        session_id,
+        layer_name,
+    )
+    .await?;
 
     // Step 5b: a chained call waits for its predecessor, holding only its
     // reservation (`F` + content). It runs here, awaited inline — no task
@@ -1223,7 +1336,7 @@ async fn update_layer_inner(
         // `CheckpointError::NotFound` → `RecoveryOutcome::NotRecoverable` →
         // this arm surfaces the original `NotFound` having written nothing.
         // Both retirement orderings cooperate with that guard by
-        // construction: `delete_layer` DELs the mapping BEFORE the header
+        // construction: `delete_layer` unmaps the layer BEFORE the header
         // UNLINK, and a CreateLayer overwrite flips the mapping to a fresh
         // object_id — so by the time a commit can observe either retirement,
         // the guard's read already fails. Pre-existing property; stated here
@@ -1776,11 +1889,14 @@ impl UploadLengths {
 /// ([`UploadReservation::reserve_processing`]). Never refused for size; it
 /// waits, up to the RPC deadline, for room or for the slot.
 ///
-/// An upload that enters the overflow slot logs one INFO line, "upload runs
-/// beyond the upload budget". The wait races the graceful shutdown's `begun`
-/// token: a shutdown while waiting answers the shared shutdown status and
-/// marks the completion shutdown-caused (stage `parse`), with nothing applied
-/// — the external-value store and the commit have not run.
+/// An upload that enters the overflow slot at this step logs one INFO line,
+/// "upload runs beyond the upload budget", phase `processing`; one that
+/// entered it while receiving logged it then ([`read_upload_body`]), and
+/// its steps book on the slot in place. The wait races the graceful
+/// shutdown's `begun` token: a shutdown while waiting answers the shared
+/// shutdown status and marks the completion shutdown-caused (stage `parse`),
+/// with nothing applied — the external-value store and the commit have not
+/// run.
 async fn reserve_processing_step(
     svc: &LiveEditService,
     reservation: &mut UploadReservation,
@@ -1797,6 +1913,7 @@ async fn reserve_processing_step(
             if grant.entered_overflow {
                 log_upload_runs_beyond_budget(
                     reservation,
+                    UPLOAD_PHASE_PROCESSING,
                     session_id,
                     layer_name,
                     target,
@@ -1834,19 +1951,26 @@ fn parse_create_payload(
 /// Rebuild the creation state of a `CreateLayer` re-send answered
 /// `ALREADY_COMMITTED`, for the recorded object's first-base re-spawn.
 ///
-/// The same two charges, parse, per-delta checks and apply as the create path,
-/// minus the external-value store: the original call already stored (and
-/// mirrored) those values, and storing them again would take references
-/// nothing releases. No delta counters are bumped — the original call counted
-/// its delta.
+/// The same two charges, parse, per-delta checks and creation step
+/// ([`build_creation_state`]) as the create path, minus the external-value
+/// store: the original call already stored (and mirrored) those values, and
+/// storing them again would take references nothing releases. No delta
+/// counters are bumped — the original call counted its delta.
+///
+/// The caller re-spawns only from a state that kept the content's own
+/// top-level section; a rebuild that supplied the root section skips the
+/// re-spawn ([`log_supplied_root_spawn_skipped`]). A refusal by the creation
+/// step is reachable: an original whose content left data but no top-level
+/// section, committed by a replica that predates that refusal.
 ///
 /// The charges are taken in budget or not at all, without waiting
 /// ([`UploadReservation::try_grow_in_budget`]): the re-spawn is best-effort,
-/// so a refusal only skips it.
+/// so a refusal only skips it. An upload that took the overflow slot while
+/// receiving books them on its slot in place instead.
 fn creation_state_for_resend(
     ompf_bytes: &[u8],
     reservation: &mut UploadReservation,
-) -> Result<ObjectState, ServiceError> {
+) -> Result<CreationState, ServiceError> {
     let container = parse_container(ompf_bytes)?;
     let lengths = UploadLengths::of(ompf_bytes, &container);
     reservation
@@ -1865,12 +1989,32 @@ fn creation_state_for_resend(
             lengths.processing_charge(CommitPath::Create, DeltaFootprint::of(owned.as_ref())),
         )
         .map_err(UploadRefusal::into_service_error)?;
-    let mut state = ObjectState::default();
     let mut stats = crate::domain::delta::ApplyDeltaStats::default();
-    let mut sink = crate::domain::delta::MutationSink::Discard;
-    crate::domain::delta::apply_delta_into(&mut state, owned, &mut sink, &mut stats)
-        .map_err(ServiceError::from)?;
-    Ok(state)
+    Ok(build_creation_state(owned, &mut stats)?)
+}
+
+/// Log that a `CreateLayer` answered `ALREADY_COMMITTED` — a re-send, or the
+/// loser of a race between two calls with one operation id — skips the
+/// recorded object's first-base spawn because this call supplied the root
+/// section (SDD §9.7). The replica that committed the recorded object may
+/// predate the supplied root, so this call's state need not be the state that
+/// object was created with, and a first base built from it could describe a
+/// layer that never existed.
+fn log_supplied_root_spawn_skipped(
+    session_id: &str,
+    layer_name: &str,
+    object_id: u64,
+    operation_id: &str,
+) {
+    tracing::info!(
+        session_id = %session_id,
+        layer_name = %layer_name,
+        object_id,
+        operation_id = %operation_id,
+        "CreateLayer answered ALREADY_COMMITTED with a supplied root section; its first-base \
+         spawn is skipped, since the replica that committed the original may not have \
+         supplied the root"
+    );
 }
 
 /// Debug-build tripwire for the SR-1.2 ompf-classification invariant:
@@ -1884,10 +2028,9 @@ fn creation_state_for_resend(
 /// delta and the restore would replay a no-op over a real state change,
 /// minting a generation whose claimed coverage exceeds its actual content —
 /// the b.pw6 defect class this subsystem exists to forbid. `SubscribeReadLayer`
-/// relies on the same classification: its steady state and its rollback-mode
-/// in-window replay send such an entry (above sequence 1) as the empty delta
-/// with no read, so a live subscriber would silently miss the commit's
-/// changes too.
+/// relies on the same classification: its steady state sends such an entry
+/// (above sequence 1) as the empty delta with no read, so a live subscriber
+/// would silently miss the commit's changes too.
 ///
 /// **This predicate is tautological today, and that is the point.** In
 /// `handle_update_layer` both `owned` and `relay_ompf` derive from the same

@@ -46,8 +46,8 @@
 //!
 //! | Test | Needs a cluster? | What it pins |
 //! |---|---|---|
-//! | [`watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] | yes | the deterministic regression — *both* teardown sites (the **explicit** `unwatch_pinned()` and the `Drop`-time one) reach the watching node for tags spread across every primary, and an unpinned teardown demonstrably does not |
-//! | [`session_duplicate_then_structural_update_commits_without_a_retry`] | yes | the field shape — the two real call sites, back to back, on one pooled connection |
+//! | [`cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] | yes | the deterministic regression — *both* teardown sites (the **explicit** `unwatch_pinned()` and the `Drop`-time one) reach the watching node for tags spread across every primary, and an unpinned teardown demonstrably does not |
+//! | [`cluster_session_duplicate_then_structural_update_commits_without_a_retry`] | yes | the field shape — the two real call sites, back to back, on one pooled connection |
 //! | [`pinned_unwatch_clears_the_watch_on_a_centralized_store`] | no | the non-regression the fix could plausibly have broken: a `cluster_hash`-pinned UNWATCH must still work against a non-clustered server |
 //! | [`mark_watched_object_keys_share_one_slot_derived_from_the_hash_tag`] | no | the key-schema co-location `mark_watched`'s `debug_assert` encodes |
 //! | [`mark_watched_cross_slot_keys_trip_the_debug_assert`] | no | that the `debug_assert` actually fires |
@@ -73,16 +73,16 @@
 //! inline-gate idiom in `client_test.rs` and `cluster_subscriber_test.rs`. So
 //! this module compiles and passes everywhere; CI's `test-cluster:` job — which
 //! sets `LIVE_EDIT_TEST_CLUSTER_URL=redis-cluster://127.0.0.1:7000` and runs
-//! the unfiltered workspace suite under nextest — is what actually executes
-//! those two bodies. Neither carries `#[ignore]` and neither sits behind a
-//! cargo feature, so there is no CI-side filter to keep in sync and no
+//! the tests `test_support::CLUSTER_GATED_FILTERSET` selects by name — is what
+//! actually executes those two bodies. Neither carries `#[ignore]` and neither
+//! sits behind a cargo feature, and both names start `cluster_`, so no
 //! `.gitlab-ci.yml` change is needed for pickup. Locally, `bash
 //! scripts/dev-valkey.sh cluster-up` brings up the same 3-shard cluster
 //! (Linux-only — it relies on Docker `--network host`).
 //!
 //! Skipping is the only soft failure. Once the URL is set nothing degrades
 //! quietly: [`cluster_fixture`] asserts `is_clustered()`, and
-//! [`watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] fails loudly
+//! [`cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] fails loudly
 //! if its tags did not actually spread across the primaries it needs.
 //!
 //! # Wait budgets vs. nextest's hang-killer
@@ -133,7 +133,7 @@ use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, StructCommand};
 
 /// One deadline covering a whole cluster scenario body (every WATCH, UNWATCH,
 /// mutation and EXEC in it). The healthy path is a few hundred round trips at
-/// worst — [`watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] is
+/// worst — [`cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] is
 /// the big one at three arms × [`TAG_COUNT`] tags — and finishes in well under
 /// a second against a local cluster; 45 s leaves roughly two orders of
 /// magnitude of headroom over that, and keeps the 120 s hang-killer as a
@@ -182,7 +182,7 @@ const TRACKER_DRAIN_BUDGET: Duration = Duration::from_secs(15);
 /// the set straddles all three primaries of the `scripts/dev-valkey.sh
 /// cluster-up` topology several times over rather than by luck — the slots are
 /// a pure function of these literals, so the spread is identical on every run.
-/// [`watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] re-derives
+/// [`cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] re-derives
 /// and asserts the spread instead of trusting this comment.
 const TAG_COUNT: usize = 12;
 
@@ -196,7 +196,7 @@ const TAG_COUNT: usize = 12;
 /// `TestValkey::setup_with_url` panics if the cluster is unreachable, so a
 /// configured-but-down cluster fails loudly rather than skipping.
 async fn cluster_fixture(valkey_pool_size: u32) -> Option<TestValkey> {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); \
              run `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run \
@@ -487,7 +487,7 @@ async fn exec_set(guard: &WatchGuard, key: &str, value: &str) -> FredValue {
 /// primary would reduce this to a slow re-run of the single-node `watch_leak`
 /// test while still reporting cluster coverage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watch_guard_pinned_unwatch_clears_the_watch_on_every_shard() {
+async fn cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard() {
     let Some(tv) = cluster_fixture(1).await else {
         return;
     };
@@ -717,7 +717,7 @@ async fn watch_guard_pinned_unwatch_clears_the_watch_on_every_shard() {
 /// A leaked `{hex(base_path)}` WATCH only bites the update when the two slots
 /// happen to co-reside on one primary, so pre-fix this test fails some of the
 /// time rather than every time — which is why
-/// [`watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] above exists
+/// [`cluster_watch_guard_pinned_unwatch_clears_the_watch_on_every_shard`] above exists
 /// and is the deterministic guard. Post-fix it is deterministically green,
 /// so it carries no flake risk in the gating job. Its value is composition:
 /// it is the only place the two production call sites are exercised in cluster
@@ -725,7 +725,7 @@ async fn watch_guard_pinned_unwatch_clears_the_watch_on_every_shard() {
 /// b.ji8 was reported from) the pre-fix residue is not an abort at all but a
 /// hard `CROSSSLOT`, which this test would surface as an outright failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_duplicate_then_structural_update_commits_without_a_retry() {
+async fn cluster_session_duplicate_then_structural_update_commits_without_a_retry() {
     let Some(tv) = cluster_fixture(1).await else {
         return;
     };
@@ -1112,8 +1112,8 @@ async fn unwatch_failure_counts_both_sites_with_retry_only_at_drop() {
     cfg.valkey_pool_size = 1;
     cfg.subscriber_pool_size = 1;
     cfg.valkey_command_timeout_ms = NON_FUNNEL_COMMAND_TIMEOUT_MS;
-    let Ok(client) = live_edit::storage::test_support::connect_test_client(&cfg).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = live_edit::storage::test_support::connect_test_client_or_skip(&cfg).await
+    else {
         return;
     };
 
@@ -1399,20 +1399,25 @@ fn watch_guard_construction_sites_attach_metrics() {
         }
     }
 
-    // Non-vacuity: the four production call sites are
+    // Non-vacuity: the seven production call sites are
     // `LayerStore::update_layer_once_watch_attempt`, `SessionStore::create_once`,
     // `checkpoint::residue::wipe_restore_residue` (b.f4t — the DR restore's
     // pre-write residue wipe, and the only one whose committed effect is an
-    // irreversible `UNLINK`), and `LayerStore::write_restored_object` (b.h4m —
-    // the DR restore's own materialization, fenced on `obj:hdr` being absent).
+    // irreversible `UNLINK`), `LayerStore::write_restored_object` (b.h4m —
+    // the DR restore's own materialization, fenced on `obj:hdr` being absent),
+    // and the DR Jobs' three: `storage::layer::dr_restore`'s
+    // `fenced_restore_txn` (its batches and header) and `seq_fenced_txn`
+    // (the clear-flags write, and accept-loss's value-removal batches and
+    // header), and `storage::dr_write`'s `mapping_cas`.
     // A scan that found none would pass while asserting nothing.
     assert_eq!(
-        sites, 4,
-        "expected exactly the four production `WatchGuard::new(` sites \
+        sites, 7,
+        "expected exactly the seven production `WatchGuard::new(` sites \
          (update_layer_once_watch_attempt, create_once, checkpoint::residue::wipe_restore_residue, \
-         LayerStore::write_restored_object) but found {sites}. A new WATCH site is fine — update \
-         this count and make sure it chains `.with_metrics(...)` — but a count of 0 means the \
-         needle stopped matching and this guard is asserting nothing"
+         LayerStore::write_restored_object, dr_restore::fenced_restore_txn, \
+         dr_restore::seq_fenced_txn, dr_write::mapping_cas) but found {sites}. A new \
+         WATCH site is fine — update this count and make sure it chains `.with_metrics(...)` — \
+         but a count of 0 means the needle stopped matching and this guard is asserting nothing"
     );
     assert!(
         violations.is_empty(),

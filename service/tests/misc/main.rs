@@ -31,10 +31,25 @@ mod common;
 
 mod auth_builder;
 mod config_validation;
+// The Job binary's held-store run needs the `TestValkey` fixture and a binary
+// built with `test-support` (the test-only key prefix); its refusal test
+// needs neither.
+mod dr_job_binary;
+mod dr_job_rules;
+// The real binary in held mode needs the `TestValkey` fixture and a binary
+// built with `test-support` (the test-only key prefix), and sends SIGTERM.
+#[cfg(all(unix, feature = "test-support"))]
+mod held_mode_binary;
+// The hold marker's single deleter (ADD 9): source scans, no Valkey.
+mod hold_unhold_scan;
+mod hold_wiring_scan;
 mod ompf_adversarial_corpus;
 mod oodf_bridge_visibility_test;
 mod otlp_tls_export_binary;
 mod service_token_startup_warns;
 mod startup_log_binary;
+#[cfg(unix)]
+mod startup_signal_binary;
 mod tail_codec_adversarial_corpus;
+mod test_only_key_prefix;
 mod test_only_unvalidated_tokens;

@@ -16,8 +16,9 @@
 //! Shared scanners over the service's Lua scripts, for the source guards that
 //! read them: `b_1jt_rollout_tests` (who may write the GC `pending` set and
 //! `inflight` scores), `ext_blob_reader_guard_test` (no script reads blob
-//! bytes) and `script_migration_guard_test` (no writing script that can tear
-//! runs while its slot migrates).
+//! bytes), `script_migration_guard_test` (no writing script that can tear
+//! runs while its slot migrates) and `script_error_reply_guard_test` (no
+//! script's error text begins with data it read or was passed).
 //!
 //! Static: reads source files, needs no Valkey and no feature. The scanners'
 //! own self-tests are in `script_migration_guard_test`.

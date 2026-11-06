@@ -84,6 +84,24 @@ class SessionEventKind(IntEnum):
     JOINED = 2
     LEFT = 3
     MESSAGE = 4
+    MERGE_OWNER = 5
+
+
+class MergeOwnerAction(IntEnum):
+    CLAIM = 1
+    RELEASE = 2
+    VERIFY = 3
+
+
+class MergeOwnerOutcome(IntEnum):
+    NONE = 0
+    GRANTED = 1
+    HELD_BY_OTHER = 2
+    RELEASED = 3
+    NOT_HELD = 4
+    NOT_ELIGIBLE = 5
+    UNAUTHENTICATED = 6
+    UNAVAILABLE = 7
 
 
 class Severity(IntEnum):
@@ -103,12 +121,39 @@ class DiagnosticFieldKind(IntEnum):
 
 @dataclass(frozen=True)
 class SessionEvent:
+    """A join's event. The merge_owner_* fields are the join's advisory merge-owner view as of the event; a
+    MERGE_OWNER event's connection_id and user_name name the holder, None when nobody holds the lease."""
     kind: SessionEventKind
     result: Result
     connection_id: str | None
     user_name: str | None
     app_name: str | None
     bytes: bytes
+    merge_owner_supported: bool = False
+    merge_owner_held: bool = False
+    merge_owner_outcome: MergeOwnerOutcome | int = MergeOwnerOutcome.NONE
+    merge_owner_epoch: int = 0
+
+
+@dataclass(frozen=True)
+class MergeOwnerState:
+    """The service's answer to a merge-owner request."""
+    outcome: MergeOwnerOutcome | int
+    owner_connection_id: str | None
+    owner_user_name: str | None
+    epoch: int
+    supported: bool
+    held: bool
+
+
+@dataclass(frozen=True)
+class MergeOwner:
+    """A join's advisory merge-owner view. supported: the join opted in and its latest connection negotiated the
+    lease; held: the join is READY and the service last named it the holder; owned: it named any live holder."""
+    supported: bool
+    held: bool
+    owned: bool
+    epoch: int
 
 
 @dataclass(frozen=True)
@@ -257,6 +302,9 @@ def _record(cls, value):
         result["state"] = State(result["state"])
     if cls is SessionEvent:
         result["kind"] = SessionEventKind(result["kind"])
+    for name in ("merge_owner_outcome", "outcome"):
+        if name in result and result[name] in MergeOwnerOutcome._value2member_map_:
+            result[name] = MergeOwnerOutcome(result[name])
     if cls is DiagnosticField:
         result["kind"] = DiagnosticFieldKind(result["kind"])
     if cls is DiagnosticRecord:
@@ -354,7 +402,7 @@ class Request:
     def _outcome(self):
         if self._operation == "list_sessions":
             return self._result, self._payload if self._payload is not None else []
-        if self._operation in ("create_session", "stat_layer"):
+        if self._operation in ("create_session", "stat_layer", "request_merge_owner"):
             return self._result, self._payload
         return self._result
 
@@ -419,6 +467,8 @@ class Request:
                                     self._payload = _record(CreatedSession, payload)
                                 elif self._operation == "stat_layer":
                                     self._payload = _record(LayerInfo, payload)
+                                elif self._operation == "request_merge_owner":
+                                    self._payload = _record(MergeOwnerState, payload)
                     break
         except BaseException:
             self._bridge_failure()
@@ -632,9 +682,12 @@ class Runtime:
             return endpoint
 
     def join_session(self, uri: str, app_name: str, callback: Callable[[SessionEvent], Any], *,
-                     max_events: int = 256, max_bytes: int = 1048576) -> Session:
+                     max_events: int = 256, max_bytes: int = 1048576, merge_owner: bool = False) -> Session:
+        """Joins a session; merge_owner asks the service for the advisory merge-owner lease on this join."""
         if not callable(callback):
             raise TypeError("callback must be callable")
+        if type(merge_owner) is not bool:
+            raise TypeError("merge_owner must be bool")
         if (type(max_events) is not int or not 1 <= max_events <= 4096 or
                 type(max_bytes) is not int or not 1 <= max_bytes <= 16 * 1024 * 1024):
             raise ValueError("require 1 <= max_events <= 4096 and 1 <= max_bytes <= 16777216")
@@ -652,7 +705,7 @@ class Runtime:
                 self._sessions.add(session)
                 session._thread.start()
                 started = True
-                result, native = _live.join_session(uri, app_name, max_events, max_bytes)
+                result, native = _live.join_session(uri, app_name, max_events, max_bytes, merge_owner)
                 session._native = native
                 if result != Result.OK:
                     raise LiveError(result)
@@ -772,6 +825,7 @@ class Session:
         self._delivery_result = Result.OK
         self._resource_event = SessionEvent(SessionEventKind.CONNECTION, Result.RESOURCE_EXHAUSTED,
                                             None, None, None, b"")
+        self._owner_view = (False, 0)
         self._internal_event = SessionEvent(SessionEventKind.CONNECTION, Result.INTERNAL_ERROR,
                                             None, None, None, b"")
         self._thread = threading.Thread(target=self._consume, name="omni.usd.live.session", daemon=True)
@@ -819,6 +873,7 @@ class Session:
                 if result != Result.OK:
                     raise LiveError(result)
                 event = _record(SessionEvent, value)
+                self._owner_view = (event.merge_owner_supported, event.merge_owner_epoch)
                 self._emit(event)
                 del event, value
         except BaseException as error:
@@ -838,7 +893,15 @@ class Session:
                             self._leave_lock.release()
                 except BaseException:
                     _log_failure("Live session transport cleanup failed")
-            self._emit(self._resource_event if result == Result.RESOURCE_EXHAUSTED else self._internal_event)
+            terminal = self._resource_event if result == Result.RESOURCE_EXHAUSTED else self._internal_event
+            try:
+                # The terminal event repeats the latest merge-owner view, holding nothing because delivery stops.
+                supported, epoch = self._owner_view
+                if supported or epoch:
+                    terminal = replace(terminal, merge_owner_supported=supported, merge_owner_epoch=epoch)
+            except BaseException:
+                pass  # Under memory exhaustion the preallocated event still reports the failure.
+            self._emit(terminal)
         finally:
             self._callback = None
             self._done.set()
@@ -890,6 +953,27 @@ class Session:
 
     def send_message_with_callback(self, data: bytes, callback: Callable[[Result], Any]) -> Request:
         return _start("send_message", (self, data), callback)
+
+    @property
+    def merge_owner(self) -> MergeOwner:
+        """The join's advisory merge-owner view. supported False means the lease is not in force for this join:
+        it did not opt in, or its service does not implement the lease, and the host keeps its static owner
+        rule."""
+        return _record(MergeOwner, _query(self._native.merge_owner()))
+
+    def request_merge_owner(self, action: MergeOwnerAction, *, timeout_ms: int = 30000):
+        """Sends CLAIM, RELEASE or VERIFY on the join's current connection and returns (Result, MergeOwnerState).
+
+        UNSUPPORTED means the lease is not in force for this join; the host keeps its static owner rule. A CLAIM
+        keeps the intent to own across reconnects until a RELEASE; send VERIFY right before a merge."""
+        return _blocking("request_merge_owner", (self, _action(action)), timeout_ms)
+
+    def request_merge_owner_async(self, action: MergeOwnerAction):
+        return _async("request_merge_owner", (self, _action(action)))
+
+    def request_merge_owner_with_callback(self, action: MergeOwnerAction,
+                                          callback: Callable[[Result, MergeOwnerState | None], Any]) -> Request:
+        return _start("request_merge_owner", (self, _action(action)), callback)
 
     def __enter__(self):
         return self
@@ -1092,8 +1176,9 @@ def register_endpoint(authority: str, **options) -> Endpoint:
 
 
 def join_session(uri: str, app_name: str, callback: Callable[[SessionEvent], Any], *,
-                 max_events: int = 256, max_bytes: int = 1048576) -> Session:
-    return _current().join_session(uri, app_name, callback, max_events=max_events, max_bytes=max_bytes)
+                 max_events: int = 256, max_bytes: int = 1048576, merge_owner: bool = False) -> Session:
+    return _current().join_session(uri, app_name, callback, max_events=max_events, max_bytes=max_bytes,
+                                   merge_owner=merge_owner)
 
 
 def unregister_endpoint(endpoint: Endpoint, timeout_ms: int = 30000) -> Result:
@@ -1171,10 +1256,16 @@ def _start(operation, args, callback=None, internal=False):
     return owner._submit(operation, native_args, callback, internal)
 
 
+def _action(action):
+    if isinstance(action, bool) or not isinstance(action, int) or action not in MergeOwnerAction._value2member_map_:
+        raise ValueError("action must be a MergeOwnerAction")
+    return int(action)
+
+
 def _failure(operation, result):
     if operation == "list_sessions":
         return Result(result), []
-    if operation in ("create_session", "stat_layer"):
+    if operation in ("create_session", "stat_layer", "request_merge_owner"):
         return Result(result), None
     return Result(result)
 

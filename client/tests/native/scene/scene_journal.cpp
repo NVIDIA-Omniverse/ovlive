@@ -153,6 +153,441 @@ struct Fixture {
     }
     void applyPeer(const LayerProgress::Work& work, const std::string& bytes) { journal.apply(work,bytes); progress.applied(work.id); }
 };
+// A restore that fits alone but not beside the pending intents' replay work
+// waits, and the replacement still applies; once those intents retire, the
+// next application admits it.
+void restoreWaitsForPendingReplayWork() {
+    context = "a restore beside pending replay work waits for its retirement";
+    std::string replace;
+    {
+        EnvelopeInput metadata; Command c{}; c.kind = Command::Kind::Create; c.section = 900; c.parent = 1;
+        c.name = "W"; c.sectionType = SdfSpecTypePrim; metadata.commands = {c}; replace = encodeEnvelope(metadata);
+    }
+    // Pending intents whose records address a section no scene holds fill
+    // the replay work budget without growing the scene that scales it.
+    const auto filler = [](size_t size) {
+        EnvelopeInput metadata; metadata.fields = {{999, 0, "blob", {}}};
+        return encodeUsdEnvelope(metadata, DecodedValues{{VtValue(std::string(size, 'x'))}, {}});
+    };
+    struct Trial {
+        std::unique_ptr<Fixture> fixture;
+        uint64_t notes = 0;
+        std::vector<uint64_t> fillers;
+        size_t submits = 0;
+    };
+    // A fixture whose pending work leaves `gap` of the post-replacement
+    // budget, with the replacement applied; null when that application
+    // itself exceeds the budget.
+    const auto trial = [&](size_t gap) {
+        SceneJournal::Limits limits;
+        limits.maxReplayWork = size_t(1) << 20;
+        Trial t{std::make_unique<Fixture>(limits)};
+        auto& f = *t.fixture;
+        f.journal.restoreWith(f.submitter());
+        const auto base = f.journal.snapshot()->visible;
+        // /W is an implicit container, as SdfCreatePrimInLayer creates it.
+        const auto created = f.journal.submitCaptured(base, capturedLog(base, [](SdfAbstractData& data) {
+            data.CreateSpec(SdfPath("/W"), SdfSpecTypePrim);
+            data.Set(SdfPath("/W"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+            data.CreateSpec(SdfPath("/W/Box"), SdfSpecTypePrim);
+            data.Set(SdfPath("/W/Box"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierDef));
+            data.Set(SdfPath("/W/Box"), TfToken("marker"), VtValue(5));
+            data.Set(SdfPath("/W"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Box")}));
+            data.Set(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren,
+                     VtValue(std::vector<TfToken>{TfToken("P"), TfToken("W")}));
+        }), f.submitter());
+        f.applyLocal(f.ack(created, 11));
+        // A pending edit makes the restored copy large, while the peer's
+        // Create deletes only the committed, small subtree.
+        const auto noted = f.journal.snapshot()->visible;
+        t.notes = f.journal.submitCaptured(noted, capturedLog(noted, [](SdfAbstractData& data) {
+            for (const char* note : {"note0", "note1", "note2", "note3"})
+                data.Set(SdfPath("/W/Box"), TfToken(note), VtValue(std::string(8000, 'n')));
+        }), f.submitter());
+        // The budget of the scene the replacement leaves, which bounds the
+        // replay beside it and the restore's admission.
+        const auto budget = f.journal.effectiveLimits(*buildSceneCandidate(base, replace)).maxReplayWork;
+        for (size_t size = 16384; size >= 16;) {
+            const auto used = f.journal.snapshot()->replayWork;
+            if (used + gap > budget) break;
+            try {
+                t.fillers.push_back(f.local(filler(std::min(size, (budget - gap - used) / 4 + 16))));
+            } catch (OmniUsdLiveResult) { size /= 2; } catch (const DecodeError&) { size /= 2; }
+        }
+        t.submits = f.submits;
+        try {
+            f.applyPeer(f.peer(replace, 12), replace);
+        } catch (OmniUsdLiveResult) { t.fixture.reset(); }
+        return t;
+    };
+    // The smallest gap whose replacement applies; its restore must wait.
+    Trial waiting;
+    for (size_t gap = 1024; gap <= (size_t(1) << 18) && !waiting.fixture; gap *= 2) waiting = trial(gap);
+    check(bool(waiting.fixture), "no fixture applied the replacement");
+    auto& f = *waiting.fixture;
+    auto now = f.journal.snapshot();
+    check(!waiting.fillers.empty() && f.submits == waiting.submits &&
+          now->pending.size() == waiting.fillers.size() + 1 &&
+          now->visible->sectionForPath(SdfPath("/W/Box")) == 0 && now->submissionFault == OMNI_USD_LIVE_OK,
+          "a restore beside pending replay work did not wait");
+    uint64_t sequence = 13;
+    f.applyLocal(f.ack(waiting.notes, sequence++));
+    for (const auto id : waiting.fillers) f.applyLocal(f.ack(id, sequence++));
+    now = f.journal.snapshot();
+    check(f.submits == waiting.submits + 1 && now->pending.size() == 1 &&
+          now->visible->sectionForPath(SdfPath("/W/Box")) != 0 &&
+          now->visible->pathForSection(900) == SdfPath("/W") &&
+          now->visible->data()->Get(SdfPath("/W/Box"), TfToken("marker")) == VtValue(5) &&
+          now->visible->data()->Get(SdfPath("/W/Box"), TfToken("note3")) == VtValue(std::string(8000, 'n')),
+          "the waiting restore was not admitted once the pending work retired");
+}
+// A restore merges the children of this writer's replaced copy into the
+// section a peer holds at the same path when either one is an implicit
+// container, and the authored prim's fields win in both commit orders: a
+// typed Racks this writer authored gives Rack_1 and its own prim fields to
+// the peer's later implicit Racks, and this writer's implicit Racks gives
+// Rack_1 to the peer's later typed Racks, which keeps its fields. Either way
+// /W/Racks ends a `def Xform` of kind component holding Rack_1 and Rack_2.
+// When a third writer's implicit Racks replaces the adopted one while the
+// restore is pending, the next restore adopts that one in turn.
+void restoreMergesIntoEitherImplicitContainer() {
+    for (const bool authored : {true, false}) {
+        context = authored ? "a restore adopts a peer's implicit container with an authored copy's prim fields" :
+                             "a restore merges an implicit copy's children into a peer's authored prim";
+        Fixture f;
+        f.journal.restoreWith(f.submitter());
+        const auto base = f.journal.snapshot()->visible;
+        // /W is an implicit container; Racks is typed or implicit.
+        const auto created = f.journal.submitCaptured(base, capturedLog(base, [&](SdfAbstractData& data) {
+            data.CreateSpec(SdfPath("/W"), SdfSpecTypePrim);
+            data.Set(SdfPath("/W"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+            data.CreateSpec(SdfPath("/W/Racks"), SdfSpecTypePrim);
+            data.Set(SdfPath("/W/Racks"), SdfFieldKeys->Specifier,
+                     VtValue(authored ? SdfSpecifierDef : SdfSpecifierOver));
+            if (authored) {
+                data.Set(SdfPath("/W/Racks"), SdfFieldKeys->TypeName, VtValue(TfToken("Xform")));
+                data.Set(SdfPath("/W/Racks"), SdfFieldKeys->Kind, VtValue(TfToken("component")));
+            }
+            data.CreateSpec(SdfPath("/W/Racks/Rack_1"), SdfSpecTypePrim);
+            data.Set(SdfPath("/W/Racks/Rack_1"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierDef));
+            data.Set(SdfPath("/W/Racks/Rack_1"), TfToken("marker"), VtValue(1));
+            data.Set(SdfPath("/W/Racks"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Rack_1")}));
+            data.Set(SdfPath("/W"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Racks")}));
+            data.Set(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren,
+                     VtValue(std::vector<TfToken>{TfToken("P"), TfToken("W")}));
+        }), f.submitter());
+        f.applyLocal(f.ack(created, 11));
+        // A peer's /W, with a Racks of the given kind and a child, as one update.
+        const auto peerW = [](uint64_t w, bool typed, const char* child, int marker) {
+            EnvelopeInput metadata;
+            DecodedValues values;
+            const auto create = [&](uint64_t section, uint64_t parent, const char* name) {
+                Command c{}; c.kind = Command::Kind::Create; c.section = section; c.parent = parent; c.name = name;
+                c.sectionType = SdfSpecTypePrim; metadata.commands.push_back(c);
+            };
+            const auto field = [&](uint64_t section, const char* name, VtValue value) {
+                metadata.fields.push_back({section, metadata.fields.size(), name, {}});
+                values.fields.push_back(std::move(value));
+            };
+            create(w, 1, "W"); create(w + 1, w, "Racks"); create(w + 2, w + 1, child);
+            field(w, "specifier", VtValue(SdfSpecifierOver));
+            field(w + 1, "specifier", VtValue(typed ? SdfSpecifierDef : SdfSpecifierOver));
+            if (typed) {
+                field(w + 1, "typeName", VtValue(TfToken("Xform")));
+                field(w + 1, "kind", VtValue(TfToken("component")));
+            }
+            field(w + 2, "specifier", VtValue(SdfSpecifierDef));
+            field(w + 2, "marker", VtValue(marker));
+            return encodeUsdEnvelope(metadata, values);
+        };
+        // /W/Racks of `scene` is the authored, typed Racks.
+        const auto typed = [](const WireScene& scene) {
+            const auto& data = *scene.data();
+            const SdfPath racks("/W/Racks");
+            return data.Get(racks, SdfFieldKeys->Specifier) == VtValue(SdfSpecifierDef) &&
+                data.Get(racks, SdfFieldKeys->TypeName) == VtValue(TfToken("Xform")) &&
+                data.Get(racks, SdfFieldKeys->Kind) == VtValue(TfToken("component"));
+        };
+        // The peer's /W replaces this writer's; its Racks is the other kind.
+        const auto replace = peerW(900, !authored, "Rack_2", 2);
+        const auto submits = f.submits;
+        f.applyPeer(f.peer(replace, 12), replace);
+        auto now = f.journal.snapshot();
+        {
+            const auto& scene = *now->visible;
+            check(f.submits == submits + 1 && now->pending.size() == 1, "no restore was submitted");
+            check(scene.sectionForPath(SdfPath("/W")) == 900 && scene.sectionForPath(SdfPath("/W/Racks")) == 901 &&
+                  scene.sectionForPath(SdfPath("/W/Racks/Rack_2")) == 902, "the peer's sections do not hold their paths");
+            const auto rack = scene.sectionForPath(SdfPath("/W/Racks/Rack_1"));
+            check(rack != 0 && scene.data()->Get(SdfPath("/W/Racks/Rack_1"), TfToken("marker")) == VtValue(1),
+                  "Rack_1 was not restored under the peer's Racks");
+            check(typed(scene), "the section at /W/Racks is not the authored, typed Racks");
+            const auto& restore = *now->pending.back().intent;
+            check(restore.adopted == (authored ? std::vector<uint64_t>{901} : std::vector<uint64_t>{}) &&
+                  restore.round == 1, "the restore did not adopt exactly the peer's implicit Racks");
+            // The restore's only record of a section it does not create is
+            // the authored Racks' prim fields on the peer's container.
+            const auto envelope = decodeEnvelope(restore.bytes);
+            for (const auto& field : envelope.fields)
+                if (field.section == 901)
+                    check(authored && field.name != "primChildren", "the restore wrote a record of a peer's section");
+        }
+        if (!authored) continue;
+        // A third writer's implicit /W replaces the peer's while the restore
+        // is pending: the next restore adopts its implicit Racks.
+        const auto again = peerW(950, false, "Rack_3", 3);
+        f.applyPeer(f.peer(again, 13), again);
+        now = f.journal.snapshot();
+        const auto& scene = *now->visible;
+        check(f.submits == submits + 2 && now->pending.size() == 2, "the replaced restore was not restored again");
+        check(scene.sectionForPath(SdfPath("/W/Racks")) == 951 && typed(scene) &&
+              scene.data()->Get(SdfPath("/W/Racks/Rack_1"), TfToken("marker")) == VtValue(1) &&
+              scene.sectionForPath(SdfPath("/W/Racks/Rack_3")) == 952,
+              "the pending restore's prim fields and child did not follow to the third writer's Racks");
+        const auto& restore = *now->pending.back().intent;
+        check(restore.adopted == std::vector<uint64_t>{951} && restore.round == 2,
+              "the second restore did not adopt the third writer's Racks in the next round");
+    }
+}
+// A long session that keeps creating implicit containers and authored
+// children that a peer's Create replaces, restores and then deletes leaves
+// no section of them behind, so the journal's section bookkeeping stays
+// within its sweep bound however long the session runs. A container that
+// stays in the scene throughout keeps its bookkeeping: a peer's replacement
+// of it at the end is reported and restored.
+void bookkeepingStaysBounded() {
+    context = "the journal's section bookkeeping stays bounded over a long session";
+    Fixture f;
+    f.journal.restoreWith(f.submitter());
+    std::vector<SceneJournal::ReplacedSection> replaced;
+    f.journal.observeReplaced([&](const SceneJournal::ReplacedSection& section) { replaced.push_back(section); });
+    uint64_t sequence = 11;
+    // An implicit container `name` holding an authored Box, created and
+    // committed by this writer.
+    const auto createContainer = [&](const std::string& name) {
+        const auto base = f.journal.snapshot()->visible;
+        std::vector<TfToken> roots;
+        for (const auto& child : base->data()->Get(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren)
+                                     .GetWithDefault<std::vector<TfToken>>())
+            roots.push_back(child);
+        roots.emplace_back(name);
+        const SdfPath container("/" + name), box = container.AppendChild(TfToken("Box"));
+        const auto id = f.journal.submitCaptured(base, capturedLog(base, [&](SdfAbstractData& data) {
+            data.CreateSpec(container, SdfSpecTypePrim);
+            data.Set(container, SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+            data.CreateSpec(box, SdfSpecTypePrim);
+            data.Set(box, SdfFieldKeys->Specifier, VtValue(SdfSpecifierDef));
+            data.Set(box, TfToken("marker"), VtValue(1));
+            data.Set(container, SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Box")}));
+            data.Set(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren, VtValue(roots));
+        }), f.submitter());
+        f.applyLocal(f.ack(id, sequence++));
+    };
+    // A peer's Create of `section` at `name` replaces this writer's
+    // container; the journal restores Box under it, and the restore commits.
+    const auto replace = [&](uint64_t section, const std::string& name) {
+        EnvelopeInput metadata; Command c{}; c.kind = Command::Kind::Create; c.section = section; c.parent = 1;
+        c.name = name; c.sectionType = SdfSpecTypePrim; metadata.commands = {c};
+        const auto bytes = encodeEnvelope(metadata);
+        const auto submits = f.submits;
+        f.applyPeer(f.peer(bytes, sequence++), bytes);
+        const auto now = f.journal.snapshot();
+        check(f.submits == submits + 1 && now->pending.size() == 1 &&
+              now->visible->sectionForPath(SdfPath("/" + name + "/Box")) != 0, "the replaced container was not restored");
+        f.applyLocal(f.ack(now->pending.back().id, sequence++));
+    };
+    createContainer("Keep");
+    const auto keep = f.journal.snapshot()->authoritative->sectionForPath(SdfPath("/Keep"));
+    // Each cycle leaves three entries without the sweep: the replaced Box,
+    // its restored copy and the copy's round.
+    constexpr size_t cycles = SceneJournal::kMinSweep / 2;
+    size_t peak = 0;
+    for (size_t cycle = 0; cycle < cycles; ++cycle) {
+        const uint64_t peer = 1000000 + cycle;
+        createContainer("W");
+        replace(peer, "W");
+        EnvelopeInput metadata; Command c{}; c.kind = Command::Kind::Delete; c.section = peer; c.parent = 1;
+        metadata.commands = {c};
+        const auto erase = encodeEnvelope(metadata);
+        f.applyPeer(f.peer(erase, sequence), erase);
+        ++sequence;
+        const auto tracked = f.journal.trackedForTest();
+        peak = std::max(peak, tracked.created + tracked.containers + tracked.restored);
+    }
+    check(replaced.size() == cycles, "a cycle's replacement was not reported once");
+    // Without the sweep the bookkeeping would hold three entries a cycle.
+    check(peak < SceneJournal::kMinSweep + 8 && 3 * cycles > peak + 1024,
+          "the section bookkeeping grew with the session instead of the scene");
+    replace(2000000, "Keep");
+    check(replaced.size() == cycles + 1 && replaced.back().section == keep && replaced.back().restored,
+          "the sweep forgot a container the scene still holds");
+}
+// Admits an intent that creates the implicit container /Ballast holding
+// `count` implicit containers, two bookkeeping entries a section, on the
+// journal's visible scene.
+uint64_t submitBallast(Fixture& f, size_t count) {
+    const auto base = f.journal.snapshot()->visible;
+    std::vector<TfToken> roots;
+    for (const auto& child : base->data()->Get(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren)
+                                 .GetWithDefault<std::vector<TfToken>>())
+        roots.push_back(child);
+    roots.emplace_back("Ballast");
+    return f.journal.submitCaptured(base, capturedLog(base, [&](SdfAbstractData& data) {
+        const SdfPath ballast("/Ballast");
+        data.CreateSpec(ballast, SdfSpecTypePrim);
+        data.Set(ballast, SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+        std::vector<TfToken> children;
+        for (size_t index = 0; index < count; ++index) {
+            children.emplace_back("C" + std::to_string(index));
+            const auto child = ballast.AppendChild(children.back());
+            data.CreateSpec(child, SdfSpecTypePrim);
+            data.Set(child, SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+        }
+        data.Set(ballast, SdfChildrenKeys->PrimChildren, VtValue(children));
+        data.Set(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren, VtValue(roots));
+    }), f.submitter());
+}
+// More ballast children than one sweep threshold's worth of entries.
+constexpr size_t kBallast = SceneJournal::kMinSweep / 2 + 64;
+// A Create of this writer's that a later pending intent hides from the
+// visible scene still commits, so a sweep while both are pending keeps its
+// bookkeeping: this writer's implicit container C under P, a pending Delete
+// of P, a sweep, a peer's move of C out of P and the Delete's commit leave C
+// live and this writer's, so a peer's later replacement of C is reported
+// and restored.
+void bookkeepingKeepsHiddenPendingCreates() {
+    context = "a sweep keeps the sections a pending intent creates that a later one hides";
+    Fixture f;
+    f.journal.restoreWith(f.submitter());
+    std::vector<SceneJournal::ReplacedSection> replaced;
+    f.journal.observeReplaced([&](const SceneJournal::ReplacedSection& section) { replaced.push_back(section); });
+    const auto base = f.journal.snapshot()->visible;
+    const auto created = f.journal.submitCaptured(base, capturedLog(base, [](SdfAbstractData& data) {
+        data.CreateSpec(SdfPath("/P/C"), SdfSpecTypePrim);
+        data.Set(SdfPath("/P/C"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+        data.CreateSpec(SdfPath("/P/C/Box"), SdfSpecTypePrim);
+        data.Set(SdfPath("/P/C/Box"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierDef));
+        data.Set(SdfPath("/P/C/Box"), TfToken("marker"), VtValue(7));
+        data.Set(SdfPath("/P/C"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Box")}));
+        data.Set(SdfPath("/P"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("C")}));
+    }), f.submitter());
+    const auto c = f.journal.snapshot()->visible->sectionForPath(SdfPath("/P/C"));
+    const auto erased = f.local(deleteParent());
+    const auto ballast = submitBallast(f, kBallast);
+    check(c != 0 && !f.journal.snapshot()->visible->containsSection(c), "the pending Delete did not hide C");
+    // An unrelated peer edit sweeps while all three intents are pending.
+    uint64_t sequence = 11;
+    const auto stamp = edit(1, "stamp");
+    f.applyPeer(f.peer(stamp, sequence++), stamp);
+    check(!f.journal.snapshot()->authoritative->containsSection(c), "C committed before the sweep");
+    f.applyLocal(f.ack(created, sequence++));
+    {
+        EnvelopeInput metadata; Command move{}; move.kind = Command::Kind::Move; move.section = c; move.oldParent = 2;
+        move.parent = 1; move.name = "C"; metadata.commands = {move};
+        const auto bytes = encodeEnvelope(metadata);
+        f.applyPeer(f.peer(bytes, sequence++), bytes);
+    }
+    f.applyLocal(f.ack(erased, sequence++));
+    f.applyLocal(f.ack(ballast, sequence++));
+    auto now = f.journal.snapshot();
+    check(now->pending.empty() && now->authoritative->pathForSection(c) == SdfPath("/C") &&
+          !now->authoritative->containsSection(2), "C did not outlive the Delete of P");
+    EnvelopeInput metadata; Command create{}; create.kind = Command::Kind::Create; create.section = 3000000;
+    create.parent = 1; create.name = "C"; create.sectionType = SdfSpecTypePrim; metadata.commands = {create};
+    const auto bytes = encodeEnvelope(metadata);
+    const auto submits = f.submits;
+    f.applyPeer(f.peer(bytes, sequence++), bytes);
+    now = f.journal.snapshot();
+    check(replaced.size() == 1 && replaced.back().section == c && replaced.back().restored,
+          "the peer's replacement of C was not reported as restored");
+    check(f.submits == submits + 1 && now->pending.size() == 1 &&
+          now->visible->data()->Get(SdfPath("/C/Box"), TfToken("marker")) == VtValue(7),
+          "C's content was not restored under the peer's C");
+}
+// After a sweep keeps the bookkeeping of a grown scene, a peer's deletion of
+// that content sweeps it away: the bookkeeping follows the scene down as
+// well as up, implicit containers included.
+void bookkeepingFollowsShrinkingScene() {
+    context = "the journal's section bookkeeping shrinks with the scene";
+    Fixture f;
+    f.applyLocal(f.ack(submitBallast(f, kBallast), 11));
+    const auto grown = f.journal.trackedForTest();
+    check(grown.created == kBallast + 1 && grown.containers == kBallast + 1 && grown.restored == 0,
+          "the sweep did not keep the bookkeeping of the sections the scene holds");
+    const auto ballast = f.journal.snapshot()->authoritative->sectionForPath(SdfPath("/Ballast"));
+    EnvelopeInput metadata; Command c{}; c.kind = Command::Kind::Delete; c.section = ballast; c.parent = 1;
+    metadata.commands = {c};
+    const auto erase = encodeEnvelope(metadata);
+    f.applyPeer(f.peer(erase, 12), erase);
+    const auto shrunk = f.journal.trackedForTest();
+    check(shrunk.created == 0 && shrunk.containers == 0 && shrunk.restored == 0,
+          "the bookkeeping kept the sections the peer deleted");
+}
+// A sweep while a restore waits keeps the rounds of the sections its source
+// scene holds: this writer's implicit /W/Mid, replaced by a peer and
+// restored in round 1, holds Box in round 1; when a peer then replaces /W
+// and that restore waits through a sweep, the restore once admitted copies
+// Box's round and so runs in round 2.
+void bookkeepingKeepsWaitingSources() {
+    context = "a sweep keeps the bookkeeping a waiting restore's source holds";
+    Fixture f;
+    size_t refusals = 0;
+    f.journal.restoreWith([&, submit = f.submitter()](std::string_view bytes,
+                              std::shared_ptr<const SceneJournal::Intent> intent, LayerProgress::Publication publication) {
+        if (refusals) {
+            --refusals;
+            throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+        }
+        return submit(bytes, std::move(intent), publication);
+    });
+    const auto base = f.journal.snapshot()->visible;
+    const auto created = f.journal.submitCaptured(base, capturedLog(base, [](SdfAbstractData& data) {
+        for (const char* path : {"/W", "/W/Mid"}) {
+            data.CreateSpec(SdfPath(path), SdfSpecTypePrim);
+            data.Set(SdfPath(path), SdfFieldKeys->Specifier, VtValue(SdfSpecifierOver));
+        }
+        data.CreateSpec(SdfPath("/W/Mid/Box"), SdfSpecTypePrim);
+        data.Set(SdfPath("/W/Mid/Box"), SdfFieldKeys->Specifier, VtValue(SdfSpecifierDef));
+        data.Set(SdfPath("/W/Mid/Box"), TfToken("marker"), VtValue(3));
+        data.Set(SdfPath("/W/Mid"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Box")}));
+        data.Set(SdfPath("/W"), SdfChildrenKeys->PrimChildren, VtValue(std::vector<TfToken>{TfToken("Mid")}));
+        data.Set(SdfPath::AbsoluteRootPath(), SdfChildrenKeys->PrimChildren,
+                 VtValue(std::vector<TfToken>{TfToken("P"), TfToken("W")}));
+    }), f.submitter());
+    uint64_t sequence = 11;
+    f.applyLocal(f.ack(created, sequence++));
+    const auto replace = [&](uint64_t section, const char* path) {
+        const auto now = f.journal.snapshot()->authoritative;
+        const SdfPath target(path);
+        EnvelopeInput metadata; Command c{}; c.kind = Command::Kind::Create; c.section = section;
+        c.parent = now->sectionForPath(target.GetParentPath()); c.name = target.GetName();
+        c.sectionType = SdfSpecTypePrim; metadata.commands = {c};
+        const auto bytes = encodeEnvelope(metadata);
+        f.applyPeer(f.peer(bytes, sequence++), bytes);
+    };
+    replace(900, "/W/Mid");
+    auto now = f.journal.snapshot();
+    check(now->pending.size() == 1 && now->pending.back().intent->round == 1 &&
+          now->visible->sectionForPath(SdfPath("/W/Mid")) == 900 &&
+          now->visible->sectionForPath(SdfPath("/W/Mid/Box")) != 0, "the peer's /W/Mid was not restored in round 1");
+    f.applyLocal(f.ack(now->pending.back().id, sequence++));
+    // The restore of /W waits through two applications, the second of which
+    // sweeps.
+    refusals = 2;
+    replace(950, "/W");
+    check(f.journal.snapshot()->pending.empty() && refusals == 1, "the restore of /W did not wait");
+    f.applyLocal(f.ack(submitBallast(f, kBallast), sequence++));
+    const auto swept = f.journal.trackedForTest();
+    check(refusals == 0 && f.journal.snapshot()->pending.empty() &&
+          swept.created + swept.containers + swept.restored >= SceneJournal::kMinSweep,
+          "the ballast's application did not sweep while the restore waited");
+    const auto stamp = edit(1, "stamp");
+    f.applyPeer(f.peer(stamp, sequence++), stamp);
+    now = f.journal.snapshot();
+    check(now->pending.size() == 1 && now->visible->data()->Get(SdfPath("/W/Mid/Box"), TfToken("marker")) == VtValue(3),
+          "the waiting restore of /W was not admitted");
+    check(now->pending.back().intent->round == 2, "the waiting restore lost the round of the content it copies");
+}
 void admissionHistory() {
     context = "local admission history and original dependency revisions";
     Fixture f;
@@ -229,7 +664,7 @@ void authoredAdmission() {
     const auto base = f.journal.snapshot()->visible;
     const auto log = capturedLog(base,[](SdfAbstractData& data) {
         data.Set(SdfPath("/P"),TfToken("value"),VtValue(1));
-        data.Set(SdfPath("/P"),TfToken("value"),VtValue(0));
+        data.Set(SdfPath("/P"),TfToken("value"),VtValue(2));
     });
     const Saved before(f.journal);
     bool failed = false;
@@ -246,7 +681,7 @@ void authoredAdmission() {
           "accepted captured log lost its original operations or base revision");
     check(now->pendingBytes == intent->retainedBytes && now->pendingBytes > intent->bytes.size(),
           "authoring retention charged only wire bytes");
-    check(number(now->visible) == 0 && now->applied == 10,"ABA authoring changed authoritative frontier");
+    check(number(now->visible) == 2 && now->applied == 10,"authoring changed the authoritative frontier");
     f.applyLocal(f.ack(id,11));
     check(f.journal.snapshot()->pending.empty() && !f.journal.snapshot()->pendingBytes,
           "authored confirmation did not retire complete retention charge");
@@ -2015,6 +2450,25 @@ void replayWorkIsReplaySteps() {
         check(state->replayWork == total,"the pending replay work differs from the replay's steps");
     }
 }
+// A host turn that edits a field and restores it before its flush changes
+// nothing relative to the scene it edited, so it admits nothing. A peer's
+// value committed meanwhile stands: the restore is not a write of the old value.
+void restoredEditLetsPeerValueStand() {
+    context = "a restored host edit and a peer's later value";
+    Fixture f;
+    const auto captureBase = f.journal.snapshot()->visible;
+    const auto log = capturedLog(captureBase,[](SdfAbstractData& data) {
+        data.Set(SdfPath("/P"),TfToken("value"),VtValue(5));
+        data.Set(SdfPath("/P"),TfToken("value"),VtValue(0));
+    });
+    const auto peer = edit(7);
+    f.applyPeer(f.peer(peer,11),peer);
+    const auto submits = f.submits;
+    check(f.journal.submitCaptured(captureBase,log,f.submitter()) == 0 && f.submits == submits &&
+          f.journal.snapshot()->pending.empty(),"a restored host edit admitted an update");
+    check(number(f.journal.snapshot()->visible) == 7 && number(f.journal.snapshot()->authoritative) == 7,
+          "the peer's value did not stand");
+}
 // The visible scene's identity graph, hidden rows included; inspect compares the Sdf data.
 std::string graphOf(const WireScenePtr& scene) {
     std::ostringstream text;
@@ -2048,6 +2502,64 @@ void visibleIsReplay(const SceneJournal& journal, const char* message) {
     for (const auto& entry : state->pending) { wire += entry.intent->bytes.size(); retained += entry.intent->retainedBytes; }
     check(state->pendingWireBytes == wire && state->pendingBytes == retained,"pending byte totals differ from the pending intents");
     if (state->pending.empty()) check(state->visible == state->authoritative,"no pending intent left a distinct visible scene");
+}
+// A captured log compiled against the visible scene admits with the compiler's verified scene as the
+// extended visible scene, which the host then holds as its baseline, so publication finds nothing to diff.
+// Every figure of the snapshot equals what replaying the intent onto the visible scene gives: the same
+// admissions into a journal whose visible scene is an equal but distinct scene replay instead, and the
+// pending replay work stays the sum of a full replay's steps. Only the transaction's own work is lower: a
+// replay materializes the scene it rebuilds, which the adopted admission does not.
+void adoptedCandidateIsTheReplayStep() {
+    context = "captured admission adopts the compiled scene";
+    const auto author = [](size_t index) {
+        return [index](SdfAbstractData& data) {
+            const SdfPath parent("/P");
+            if (index % 3 == 0) {
+                data.Set(parent,TfToken("value"),VtValue(int(index) + 1));
+                return;
+            }
+            // A child, then a grandchild under the previous child, so creates derive paths and child groups.
+            const SdfPath target = index % 3 == 1 ? parent.AppendChild(TfToken("c" + std::to_string(index))) :
+                parent.AppendChild(TfToken("c" + std::to_string(index - 1))).AppendChild(TfToken("g"));
+            const auto owner = target.GetParentPath();
+            const auto children = data.Get(owner,SdfChildrenKeys->PrimChildren);
+            auto names = children.IsEmpty() ? std::vector<TfToken>{} : children.Get<std::vector<TfToken>>();
+            names.push_back(target.GetNameToken());
+            data.CreateSpec(target,SdfSpecTypePrim);
+            data.Set(target,TfToken("marker"),VtValue(int(index)));
+            data.Set(owner,SdfChildrenKeys->PrimChildren,VtValue(names));
+        };
+    };
+    size_t first = 0, second = 0;
+    Fixture adopted({},128,{},std::make_shared<SectionIdAllocator>(4096,64,[&] { return uint64_t(1000) + first++; }));
+    Fixture replayed({},128,initialScene(),std::make_shared<SectionIdAllocator>(4096,64,[&] { return uint64_t(1000) + second++; }));
+    for (size_t index = 0; index != 9; ++index) {
+        const auto visible = adopted.journal.snapshot()->visible;
+        WireScenePtr applied;
+        check(adopted.journal.submitCaptured(visible,capturedLog(visible,author(index)),adopted.submitter(),&applied) != 0,
+              "an adopted admission admitted nothing");
+        const auto x = adopted.journal.snapshot();
+        check(applied && x->visible == applied,"an admission against the visible scene replayed the compiled intent");
+        // The other journal's visible scene is this one rebuilt: equal content, another scene.
+        const auto copy = replayed.journal.snapshot()->visible;
+        std::vector<std::string_view> intents;
+        for (const auto& entry : replayed.journal.snapshot()->pending) intents.push_back(entry.intent->bytes);
+        const auto equal = intents.empty() ? initialScene() : buildReplayedScene(replayed.initial,intents);
+        check(equal != copy && inspect(equal) == inspect(copy),"the rebuilt base is not a distinct equal scene");
+        WireScenePtr compiled;
+        check(replayed.journal.submitCaptured(equal,capturedLog(equal,author(index)),replayed.submitter(),&compiled) != 0,
+              "a replayed admission admitted nothing");
+        const auto y = replayed.journal.snapshot();
+        check(compiled && y->visible != compiled,"an admission against another scene adopted its compiled scene");
+        check(inspect(x->visible) == inspect(y->visible) && graphOf(x->visible) == graphOf(y->visible),
+              "the adopted scene differs from the replayed one");
+        check(x->derivation == SceneJournal::Derivation::Extended && y->derivation == x->derivation &&
+              x->work <= y->work && x->replayWork == y->replayWork && x->pending.back().replayWork == y->pending.back().replayWork &&
+              x->replayFields == y->replayFields && x->replayMetadataBytes == y->replayMetadataBytes &&
+              x->replayRederives == y->replayRederives && x->pending.back().replayed == y->pending.back().replayed,
+              "the adopted admission's figures differ from a replay's");
+        visibleIsReplay(adopted.journal,"the adopted visible scene is not the replay of the pending intents");
+    }
 }
 // Seeded histories interleave admissions of field, sample, whole-map and structural intents with peer updates
 // (field and sample records that pending intents do or do not also write, records of absent sections, explicit
@@ -2359,7 +2871,7 @@ void pendingChargeIsPerWrite() {
     std::vector<std::weak_ptr<const SdfOperationLog>> logs;
     for (int i = 0; i < writes; ++i) {
         const auto log = capturedLog(base,[i](SdfAbstractData& data) {
-            data.Set(SdfPath("/C" + std::to_string(i) + ".a"),SdfFieldKeys->Default,VtValue(float(i)));
+            data.Set(SdfPath("/C" + std::to_string(i) + ".a"),SdfFieldKeys->Default,VtValue(float(i) + 2.0f));
         });
         WireScenePtr applied;
         check(f.journal.submitCaptured(base,log,f.submitter(),&applied) != 0 && applied,"small write was not admitted");
@@ -2378,7 +2890,7 @@ void pendingChargeIsPerWrite() {
     for (size_t i = 1; i < bases.size(); ++i) check(bases[i].expired(),"a pending write pinned its base scene");
     for (const auto& log : logs) check(log.expired(),"a pending write pinned the host's sealed copy");
     check(number(f.journal.snapshot()->visible) == 0 &&
-          f.journal.snapshot()->visible->data()->Get(SdfPath("/C31.a"),SdfFieldKeys->Default) == VtValue(31.0f),
+          f.journal.snapshot()->visible->data()->Get(SdfPath("/C31.a"),SdfFieldKeys->Default) == VtValue(33.0f),
           "pending writes did not replay");
 
     context = "pending charge limit";
@@ -2478,17 +2990,23 @@ void usdPublicationTests();
 int measureUsdPublicationNotices();
 void sceneSeedTests();
 void footprintWorkTests(uint64_t seed);
+void workBudgetTests();
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "--measure-usd-notices") return measureUsdPublicationNotices();
+        if (argc > 1 && std::string(argv[1]) == "--work-budgets") {
+            context = "work budgets";
+            workBudgetTests();
+            return 0;
+        }
         const uint64_t seed = argc > 1 ? std::stoull(argv[1]) : 42;
         std::cout << "master_seed=" << seed << " scenario=scene-journal" << std::endl;
         // Every build checks its incremental derivation against a whole-scene
         // one, and every compilation its footprint against the whole scene.
         setWireSceneDerivationCheck(true);
         setFieldEditCompileCheck(true);
-        backlogScaling(); replayWorkIsReplaySteps(); ownEditsHidePeerUpdates(); incrementalReplay(seed);
-        admissionAndIds(); admissionHistory(); acknowledgementsAndABA(); peerReplayAndFailure(); aggregateRetiresAbsorbedIntents(); committedAndNettedRetirement(); batchedApplication(); onePassReplay(seed); operationPreservation(); ownershipRetirement();
+        backlogScaling(); replayWorkIsReplaySteps(); adoptedCandidateIsTheReplayStep(); restoredEditLetsPeerValueStand(); ownEditsHidePeerUpdates(); incrementalReplay(seed);
+        admissionAndIds(); admissionHistory(); bookkeepingStaysBounded(); bookkeepingKeepsHiddenPendingCreates(); bookkeepingFollowsShrinkingScene(); bookkeepingKeepsWaitingSources(); restoreWaitsForPendingReplayWork(); restoreMergesIntoEitherImplicitContainer(); acknowledgementsAndABA(); peerReplayAndFailure(); aggregateRetiresAbsorbedIntents(); committedAndNettedRetirement(); batchedApplication(); onePassReplay(seed); operationPreservation(); ownershipRetirement();
         initialSceneLimits(); quotasAndSharedWork(); brokenSubmitters(); concurrentSnapshots(); authoredAdmission(); authoredCreateAdmission(); staleReorderReplay(); liveIdentityCreateReplay(); authoredStructuralAdmission(); capturedShapesAndEmptyFlushes(); capturedRejectionClassification(); capturedFlushOrdering(); authoredPublication(); authoredSharedWork(); runFieldEditIntentTests(seed); runSceneNamespaceTests(seed);
         largeLayer();
         bulkCreateIntoLargerLayer();
@@ -2496,6 +3014,7 @@ int main(int argc, char** argv) {
         usdPublicationTests();
         context="creation seed compilation"; sceneSeedTests();
         context="footprint work"; footprintWorkTests(seed);
+        context="work budgets"; workBudgetTests();
         std::cout << "scene journal admission/ACK/replay/quota/retention contracts passed" << std::endl; return 0;
     } catch (OmniUsdLiveResult result) { std::cerr << "scene journal failed (" << context << "): result=" << result << std::endl; return 1;
     } catch (const std::exception& error) { std::cerr << "scene journal failed (" << context << "): " << error.what() << std::endl; return 1; }

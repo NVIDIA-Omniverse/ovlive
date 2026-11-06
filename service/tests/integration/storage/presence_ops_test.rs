@@ -2497,7 +2497,7 @@ async fn sweep_member_batch_timeout_counts_once_on_data_pool() {
 /// is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn presence_scripts_cluster_publish_joined_and_left_to_external_subscriber() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -2535,7 +2535,7 @@ async fn presence_scripts_cluster_publish_joined_and_left_to_external_subscriber
 /// `LIVE_EDIT_TEST_CLUSTER_URL` and prints a `SKIP:` line when it is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_member_infos_cluster_full_page_returns_every_entry_in_input_order() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -2635,7 +2635,7 @@ async fn open_tap_on_another_node(tv: &TestValkey, cluster_url: &str, sid: &str)
 /// is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sweep_member_batch_cluster_mixed_chunk_announces_each_removal_once_on_another_node() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

@@ -55,7 +55,8 @@
 //! # Round-trip contract with the assembler
 //!
 //! OMPF Part 0 is an OODF delta in `is_diff=true, base_version=0` (the reset
-//! delta shape `DiffEngine::plan` emits for `DiffPlan::FullContent`). Any
+//! delta shape the assembler builds from `DiffEngine::plan_full_content`'s
+//! `DiffPlan::FullContent`). Any
 //! other shape (`is_diff=false`, or `is_diff=true` with `base_version != 0`)
 //! is a wire-protocol violation and surfaces as
 //! [`CheckpointError::Permanent`] — re-reading the same bytes can never
@@ -83,9 +84,9 @@
 //! `apply_delta` already implements the reset-path logic the decoder
 //! needs: clear `sections` / `children` / `fields` / `time_samples`, set
 //! `source_format`, then run the struct commands / set fields / time
-//! samples. Re-implementing that here would duplicate the depth check, the
-//! name-conflict cascade, the `next_set_order` ceiling, and every other
-//! invariant `apply_delta` enforces — and would drift over time. We call
+//! samples. Re-implementing that here would duplicate the depth check,
+//! orphan adoption, the `next_set_order` ceiling, and every other invariant
+//! `apply_delta` enforces — and would drift over time. We call
 //! `apply_delta` directly, then reset `sequence_num` to 0 (`apply_restore`
 //! sets the canonical value per SR-2.5) and `first_version` to 0
 //! (likewise — the assembler stored it on `obj:hdr`, not in the delta).
@@ -94,14 +95,20 @@
 //! [`crate::domain::delta::apply_delta_into_mode`] with a
 //! [`crate::domain::delta::MutationSink::Discard`] sink (b.ot3), which is
 //! the same engine with nothing built rather than a list built and dropped,
-//! in [`crate::domain::delta::ApplyMode::RestoreBase`], which skips only the
-//! per-delta entry cap a whole-layer base can exceed.
+//! in [`crate::domain::delta::ApplyMode::RestoreBase`]. That mode differs from
+//! a commit in two steps: it skips the per-delta entry cap a whole-layer base
+//! can exceed, and a `DiffChangeSection` that creates a row does not
+//! cascade-delete the occupant of its collision slot (its parent, slot and
+//! name). A base is a stored state, so two rows in one slot in it existed
+//! live — an earlier build's same-parent rename stored such pairs (SDD §9.3)
+//! — and are rebuilt as stored, each with its subtree.
 
 #![allow(dead_code)]
 
 use bytes::Bytes;
 use fred::interfaces::{HashesInterface, KeysInterface};
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "test-checkpoint-fault-injection")]
 use crate::checkpoint::adapters::CheckpointFaultInjector;
@@ -145,7 +152,7 @@ use crate::storage::layer::{CheckpointCursorStamp, LayerStore, RestoreWriteOutco
 /// writer or a corrupted checkpoint, and the operator surface is the
 /// resulting `Permanent` error rather than a silent reject on the next
 /// write.
-const F64_SAFE_INT_MAX: u64 = 9_007_199_254_740_991; // 2^53 - 1
+pub(crate) const F64_SAFE_INT_MAX: u64 = 9_007_199_254_740_991; // 2^53 - 1
 
 /// Multiple of `LIVE_EDIT_CHECKPOINT_SEQ_SAFETY_MARGIN` above which a measured
 /// `observed_commit_span` earns an operator WARN at restore time (b.vnw).
@@ -164,7 +171,7 @@ const F64_SAFE_INT_MAX: u64 = 9_007_199_254_740_991; // 2^53 - 1
 /// exactly the commit range that was lost — and clamping it would re-open the
 /// silent sequence-reuse window (b.8y5 / b.dy5-class staleness) that the
 /// measured band exists to close. `F64_SAFE_INT_MAX` stays the only hard bound.
-const OUTSIZED_BAND_MARGIN_MULTIPLE: u64 = 8;
+pub(crate) const OUTSIZED_BAND_MARGIN_MULTIPLE: u64 = 8;
 
 /// The OODF parser's refusal of a plain OMPF base's delta, carried as the
 /// boxed source of [`decode_checkpoint_ompf`]'s [`CheckpointError::Permanent`].
@@ -243,8 +250,11 @@ pub(crate) fn is_over_entry_limit_base(err: &CheckpointError) -> bool {
 ///   - the delta (or any chunk) is not a reset delta (`is_diff != true` OR
 ///     `base_version != 0`), or a chunk after the first carries a
 ///     `source_format`
-///   - `apply_delta` rejects the delta (e.g. tree depth exceeded, name
-///     conflict left over from a previously-recovered torn state)
+///   - `apply_delta` rejects the delta (e.g. tree depth exceeded, or a
+///     corrupt base that repeats a section id onto a collision slot — the
+///     parent, the slot of its type, and the name — a sibling occupies:
+///     `DuplicateSiblingName`). Two distinct rows in one slot are not a
+///     rejection: both are rebuilt (`ApplyMode::RestoreBase`).
 pub(crate) fn decode_checkpoint_ompf(
     object_id: u64,
     ompf: &[u8],
@@ -309,17 +319,22 @@ fn apply_reset_base(object_id: u64, delta: OwnedDelta) -> Result<ObjectState, Ch
     //   - Bump `state.sequence_num` from 0 to 1 and `state.first_version`
     //     from 0 to 1. We reset both back to 0 below so the caller's SR-2.5
     //     `restore_floor + band` seed is the authoritative sequence value.
-    //   - Apply every struct command / set field / time sample exactly as
-    //     it would on the live write path — including depth-check and
-    //     name-conflict resolution. Any rejection here means the
-    //     checkpoint bytes encode an invalid state (corruption / cross-
-    //     version drift); surfacing as `Permanent` is correct because the
-    //     bytes can't be re-parsed into a valid state by retry.
+    //   - Apply every struct command / set field / time sample as it would
+    //     on the live write path — including the depth check — except for
+    //     the two `ApplyMode::RestoreBase` differences below. Any rejection
+    //     here means the checkpoint bytes encode an invalid state
+    //     (corruption / cross-version drift); surfacing as `Permanent` is
+    //     correct because the bytes can't be re-parsed into a valid state by
+    //     retry.
     //   - Run in `ApplyMode::RestoreBase`: every per-item rule and the depth
     //     check, but not the per-delta entry cap — a base describes a whole
     //     layer, and a chunked base merges into one delta over that cap. A
-    //     plain OMPF base is at or below the cap by construction, so the mode
-    //     changes nothing for it.
+    //     plain OMPF base is at or below the cap by construction, so the cap
+    //     skip changes nothing for it. And a `DiffChangeSection` that
+    //     creates a row does not cascade-delete its slot's occupant: every
+    //     row in a base existed live, two rows in one slot included (an
+    //     earlier build's same-parent rename stored such pairs, SDD §9.3),
+    //     so both siblings and their subtrees are rebuilt as stored.
     let mut state = ObjectState {
         object_id,
         ..ObjectState::default()
@@ -1054,7 +1069,9 @@ pub(crate) enum RestorePayload {
 ///   = 512 MiB of blobs into a `noeviction` Valkey for nothing.
 /// - **One `write_restored_object`.** Nothing but the seam may sit between the pre-store
 ///   and the write; persistence stays exactly one MULTI/EXEC, which is the whole
-///   of SR-3.3's atomicity argument.
+///   of SR-3.3's atomicity argument. (The pre-store itself is sent in chunks of
+///   `STORE_VALUES_MAX_INFLIGHT` values, so the hold write fence can stop it
+///   between chunks; see [`apply_restore`]'s `# The hold write fence`.)
 ///
 /// # Reference-count posture — ACCEPTED and documented, and leak-only
 ///
@@ -1066,9 +1083,11 @@ pub(crate) enum RestorePayload {
 /// three are accepted as-is**. All three leak; none loses data.
 ///
 /// - **Over-increment on retry.** A restore that is retried (a transient
-///   `write_restored_object` failure, a crash after the pre-store) re-stores the same
-///   hashes and over-counts their refs — leaked-but-never-GC'd blobs. This is
-///   *not new*: it is the pre-existing behaviour of any retried live upload.
+///   `write_restored_object` failure, a crash after the pre-store, a pre-store
+///   stopped partway by a store error or by the hold write fence between its
+///   chunks) re-stores the same hashes and over-counts their refs —
+///   leaked-but-never-GC'd blobs. This is *not new*: it is the pre-existing
+///   behaviour of any retried live upload.
 /// - **Over-increment on losing the b.h4m header fence.** Same leak, but a
 ///   *routine* outcome rather than a crash-or-retry one: step 5's
 ///   `write_restored_object` reports [`RestoreWriteOutcome::PeerLandedHeader`]
@@ -1483,6 +1502,41 @@ pub struct AppliedCheckpoint {
 /// `tests/integration/storage/checkpoint_apply_test.rs` — the regression fence
 /// for "existing base-only restore behaviour unchanged" — keeps compiling
 /// against an unchanged call shape.
+///
+/// # The hold write fence
+///
+/// `hold_fence` is the layer restore's hold write fence
+/// (`checkpoint::hold_fence`; `None` from [`apply_checkpoint`]). It is checked
+/// immediately before every store write this function's three write steps
+/// send:
+///
+/// - the residue wipe (3b) and the materialisation (5) check it inside, after
+///   their reads and queueing and immediately before their `EXEC`, which
+///   sends the whole `MULTI … EXEC` as one unit
+///   ([`ResidueWipeCtx::with_hold_fence`](crate::checkpoint::residue::ResidueWipeCtx::with_hold_fence),
+///   [`LayerStore::write_restored_object`]);
+/// - the external-value pre-store (4b) checks it before each chunk of
+///   `STORE_VALUES_MAX_INFLIGHT` values, each chunk one wave of concurrent
+///   single-command `EVALSHA`s, and the store checks it again before each
+///   value's script and before a `NOSCRIPT` reload's `SCRIPT LOAD` and
+///   re-send (`ExternalValueStore::store_values_unless_held`);
+/// - a materialisation whose `EXEC` committed checks it again in its release
+///   enqueue, before each attempt, immediately before the enqueue's script
+///   and before a `NOSCRIPT` reload: a closed fence skips the rest of the
+///   enqueue, the releases leaking their references, counted on
+///   `ext_ref_release_enqueue_failed_total`
+///   (`LayerStore::enqueue_ext_releases_unless_held`).
+///
+/// A closed fence refuses with [`CheckpointError::Transient`] carrying the
+/// fence's refusal message (a skipped release enqueue does not fail the
+/// restore, whose object has landed), and nothing more is sent. The fence
+/// does not stop a write already handed to fred — a pre-store value's
+/// script, the enqueue's script, or a residue wipe's or materialisation's
+/// `MULTI … EXEC`: fred writes it only while its caller still waits, so
+/// within the Valkey command timeout (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`,
+/// assumed > 0) or never, and discards a cut `MULTI`. A frame fred had
+/// already written is not recalled, a residual (`checkpoint::hold_fence`;
+/// SDD §15.3 *Vendored fred* change 9).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_restore(
     layer_store: &LayerStore,
@@ -1493,10 +1547,31 @@ pub(crate) async fn apply_restore(
     max_seq_observed: Option<u64>,
     config: &Config,
     ext: Option<ExtPrestore<'_>>,
+    hold_fence: Option<&CancellationToken>,
 ) -> Result<ApplyOutcome, CheckpointError> {
     let oid_str = object_id.to_string();
     let client = layer_store.client();
     let keys = layer_store.keys();
+    // The hold write fence's refusal, and its check before each pre-store
+    // chunk. The residue wipe and the materialisation check the same fence
+    // themselves, immediately before their `EXEC`s.
+    let held_refusal = || {
+        tracing::info!(
+            object_id,
+            "apply_restore stopped before its next write: this replica entered a \
+             disaster-recovery hold or lost contact with the store's hold state"
+        );
+        CheckpointError::Transient {
+            source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+        }
+    };
+    let refuse_if_held = || {
+        if crate::checkpoint::hold_fence::is_closed(hold_fence) {
+            Err(held_refusal())
+        } else {
+            Ok(())
+        }
+    };
 
     // Step 1: structural-presence short-circuit. If a sibling replica already
     // landed the recovery for this object, this round-trip is the cheapest way
@@ -1618,10 +1693,23 @@ pub(crate) async fn apply_restore(
     // `observed_commit_span` is that same quantity measured rather than
     // predicted: commits accumulated between the two newest generations, i.e.
     // over one checkpoint interval of this layer's real traffic.
-    let restore_floor = snap_seq.max(max_seq_observed.unwrap_or(0));
-    let band = config
-        .checkpoint_seq_safety_margin
-        .max(meta.observed_commit_span);
+    //
+    // The arithmetic is `checkpoint::seq_band`'s, shared with the restore
+    // Job's writer; the log lines and the refusal stay here.
+    let (banded, at_ceiling) = match crate::checkpoint::seq_band::seq_band(
+        snap_seq,
+        max_seq_observed.unwrap_or(0),
+        meta.observed_commit_span,
+        config.checkpoint_seq_safety_margin,
+    ) {
+        Ok(banded) => (banded, false),
+        Err(crate::checkpoint::seq_band::SeqCeiling(banded)) => (banded, true),
+    };
+    let crate::checkpoint::seq_band::SeqBand {
+        restore_floor,
+        band,
+        seeded_seq,
+    } = banded;
     // Outsized-band signal. The band is applied as measured — see
     // `OUTSIZED_BAND_MARGIN_MULTIPLE` for why it is not clamped — but a span
     // this far above the configured margin is worth an operator's attention,
@@ -1630,10 +1718,10 @@ pub(crate) async fn apply_restore(
     // subscriber synthesizes through client-side gap-fill before it can serve
     // live traffic again. A band of a few thousand is unremarkable; a band of
     // millions makes post-restore reconnects observably slow.
-    let outsized_threshold = config
-        .checkpoint_seq_safety_margin
-        .saturating_mul(OUTSIZED_BAND_MARGIN_MULTIPLE);
-    if meta.observed_commit_span > outsized_threshold {
+    if crate::checkpoint::seq_band::band_is_outsized(
+        meta.observed_commit_span,
+        config.checkpoint_seq_safety_margin,
+    ) {
         tracing::warn!(
             object_id,
             snap_seq,
@@ -1651,8 +1739,7 @@ pub(crate) async fn apply_restore(
              subscriber"
         );
     }
-    let seeded_seq = restore_floor.saturating_add(band);
-    if seeded_seq >= F64_SAFE_INT_MAX {
+    if at_ceiling {
         // The Lua fast path and slow path both reject writes once
         // `seq >= 2^53 - 1`, so seeding at or above the ceiling would
         // make every subsequent `UpdateLayer` against the restored
@@ -1687,7 +1774,7 @@ pub(crate) async fn apply_restore(
             .into(),
         });
     }
-    state.sequence_num = seeded_seq;
+    // `sequence_num` becomes `seeded_seq` in step 4a's flattening.
     // `first_version` was zeroed by the decoder (and by the `Composed` arm of
     // step 3); leave it at 0. The
     // assembler intentionally drops `first_version` from the OMPF payload
@@ -1697,121 +1784,15 @@ pub(crate) async fn apply_restore(
 
     // Step 4a: flatten the per-entry versions a diff builder FILTERS on —
     // `Section::last_version`, `Field::version`, `TimeSample::version` — onto
-    // `seeded_seq` (b.2ti). `Section::first_version` is deliberately exempt;
-    // see the last paragraph.
-    //
-    // A restore is ONE write of the WHOLE object at `seeded_seq`, so every
-    // entry it materializes must be visible as of that sequence. The restore
-    // preserves `object_id` (the SR-2.4 identity guard above), so a subscriber
-    // that survives it does NOT re-bootstrap — it reconnects and takes the
-    // incremental path, where `src/domain/diff.rs` (`plan_incremental` /
-    // `plan_faithful_coalesced`) emits only entries with `version >
-    // have_version` (the latter also restates the other children of a parent
-    // with such a child, and nothing else). Carrying the pre-restore stamps
-    // would therefore withhold the restored content from exactly the
-    // subscribers that need correcting:
-    // the base decode leaves everything at `version = 1`, and a composed
-    // lineage leaves base entries below its tail entries.
-    //
-    // What the guard band does and does not buy. `restore_floor` (step 4)
-    // provably dominates every sequence this server can PROVE the object
-    // issued — the checkpoint's `snap_seq`, and the surviving stream top when
-    // the probe returned one. The commits lost in the RPO window are by
-    // definition not provable; the band above the floor
-    // (`max(configured margin, measured commit span)`) is what COVERS them. So
-    // `seeded_seq` dominates a reconnector's `have_version` only insofar as
-    // that band is sized for the layer's real per-interval commit rate. If the
-    // band is undersized a subscriber can hold `have_version >= seeded_seq`,
-    // and for that subscriber this stamp does not help — its diff still
-    // filters the restored entries out. Closing that residual is the band's
-    // job, not this step's (SDD §22.6).
-    //
-    // Determinism, not order preservation. A constant `version` keeps
-    // `sort_fields_by_authoring`'s key `(version, authoring_set_order,
-    // section_id, key_name)` a TOTAL order, so the emit sequence stays
-    // deterministic — but it is a DIFFERENT sequence. With `version` constant
-    // the primary key collapses to `authoring_set_order`, which resets to 0
-    // per delta, so on the `Composed` arm base-era and tail-era fields
-    // interleave where composition had kept the eras separated. That
-    // reordering propagates into `dense_reindex_by_authoring`'s emitted
-    // indices and into the bytes of the re-base artifact named below.
-    //
-    // The time-sample comparator loses its primary key the same way, and in
-    // all three builders that use it: `plan_full_content`,
-    // `plan_faithful_snapshot` and `plan_faithful_coalesced` all sort on
-    // `(version, section_id, time)`, so with `version` constant the key
-    // collapses to `(section_id, time)` and samples authored in different eras
-    // interleave. For the re-base artifact that is not cosmetic — per
-    // `plan_full_content`'s rustdoc, `collect_external_value_hashes` scans
-    // `fields` THEN `time_samples` into ONE first-appearance pool, and
-    // `build_reset_ompf_from_state` forces that arm, so the artifact's ext-refs
-    // sidecar hash order (`ExternalValueScan::ordered_hashes`) moves with the
-    // time-sample order too. Still total, still deterministic — a different
-    // total order.
-    //
-    // Scope. `compose_lineage`'s own per-record stamping is left alone — it is
-    // the in-order-replay witness. But this flattening does not stop at what
-    // Valkey persists: `AppliedCheckpoint::state` is moved into
-    // `BaseBootstrap::spawn_restore_rebase` (`src/checkpoint/base_bootstrap.rs`;
-    // the recovery path calls it from `src/checkpoint/recovery.rs`) and
-    // rebuilt by `build_reset_ompf_from_state` (`src/checkpoint/assembler.rs`),
-    // so the SR-3.6 restore-minted re-base artifact is assembled from these
-    // flattened versions too.
-    //
-    // Why `Section::first_version` is exempt. `plan_faithful_coalesced`'s
-    // abandoned-prim retraction arm fires on `first_version <= have_version &&
-    // !live_prim_ids.contains(id)`. Raising `first_version` to `seeded_seq`
-    // would put it above every reconnector's `have_version`, so the orphan
-    // sections a restored base carries (`plan_full_content` emits unreachable
-    // sections into the base OMPF) could never be retracted. Left at the value
-    // the decoder produced (`1`) or the composition engine replayed (the real
-    // tail sequence, for a tail-created section), that arm keeps working, and
-    // new-vs-modified classification stays truthful for tail-created sections
-    // on the `Composed` arm — base-era sections read as pre-existing by
-    // construction, since the decoder stamps `first_version = 1` (on the
-    // `Ompf` arm that is EVERY section, so the retraction arm above matches
-    // every base-carried orphan for every reconnector, including orphans
-    // created after its `have_version` that it never held). The collapsed
-    // classification is harmless because `build_delta`
-    // (`src/storage/diff_read.rs`) emits the same `DiffChangeSection` upsert
-    // for both classes, so the wire shape is unchanged either way — the
-    // load-bearing reason to preserve `first_version` is the retraction arm,
-    // not the classification. `first_version <= last_version` still holds
-    // everywhere, and not by luck: `snap_seq` arrives here as the recovery
-    // path's `head_seq` (`src/checkpoint/recovery.rs`), which is cross-checked
-    // equal to `composed.composed_seq` — the terminal replay cursor — and so
-    // bounds every version composition stamped, while a base-only decode
-    // stamps `1`; with `restore_floor >= snap_seq` (step 4) and `band >= 1`
-    // (`checkpoint_seq_safety_margin` is zero-rejected in `Config::from_env`,
-    // and the band is a `max` over it), `seeded_seq = restore_floor + band` is
-    // strictly above the composed head and at least `1`, hence at or above
-    // every preserved `first_version`. SDD §22.6 (guard band), §12.10
-    // (catch-up / reconnect).
-    for section in state.sections.values_mut() {
-        section.last_version = seeded_seq;
-    }
-    for field in state.fields.values_mut() {
-        field.version = seeded_seq;
-    }
-    for sample in state.time_samples.values_mut() {
-        sample.version = seeded_seq;
-    }
-    // The exemption's ordering derivation above rests on step 4's floor/band
-    // arithmetic and on `snap_seq == composed_seq` upstream; pin it here so a
-    // change to either trips in-crate instead of shipping sections whose
-    // `first_version` outruns their `last_version`. `debug_assert!` rather than
-    // `assert!` because a restore runs on a request path — a release build must
-    // not abort a recovery it can still serve over an ordering invariant.
-    debug_assert!(
-        state
-            .sections
-            .values()
-            .all(|section| section.first_version <= section.last_version),
-        "restore must leave first_version <= last_version: seeded_seq is \
-         restore_floor + band, with restore_floor >= snap_seq (the composed \
-         head, which bounds every replayed version) and band >= 1, so it \
-         dominates every preserved first_version"
-    );
+    // `seeded_seq` (b.2ti), keeping `Section::first_version`, and set
+    // `sequence_num` to `seeded_seq`. `checkpoint::seq_band::flatten_to_seeded_seq`
+    // carries the whole rationale, the `first_version` exemption and the
+    // ordering pin; the restore Job's writer runs the same function. Here
+    // `snap_seq` arrives as the recovery path's `head_seq`
+    // (`src/checkpoint/recovery.rs`), cross-checked equal to
+    // `composed.composed_seq`, which is what that function's ordering pin
+    // rests on.
+    crate::checkpoint::seq_band::flatten_to_seeded_seq(&mut state, seeded_seq);
 
     // Step 3b: residue wipe (b.f4t). Restore is an authoritative REPLACE, and
     // `write_restored_object` — which queues the same body the CreateLayer
@@ -1847,6 +1828,9 @@ pub(crate) async fn apply_restore(
     // which is the production shape, where the whole field is compiled out.
     #[cfg(feature = "test-checkpoint-fault-injection")]
     let wipe_ctx = wipe_ctx.with_fault_injector(ext.as_ref().and_then(|e| e.fault_injector));
+    // The hold write fence rides the same context: the wipe checks it
+    // immediately before its `EXEC`, after every read it makes.
+    let wipe_ctx = wipe_ctx.with_hold_fence(hold_fence);
     // `Box::pin`, not a bare `.await`. An `async fn`'s state machine is inlined
     // into its caller's, and the wipe is a big one — a `WatchGuard`, a
     // `WatchedTxn`, five concurrent enumerations under `try_join!`, and the
@@ -1926,10 +1910,34 @@ pub(crate) async fn apply_restore(
             .iter()
             .map(|(hash, data)| (hash, data.as_ref()))
             .collect();
-        ext.store
-            .store_values(&pairs)
-            .await
-            .map_err(ext_prestore_err_to_checkpoint_err)?;
+        // One chunk of `STORE_VALUES_MAX_INFLIGHT` values at a time, with the
+        // hold write fence checked before each. `store_values` sends one
+        // single-command `EVALSHA` per value, at most that many at once, so a
+        // chunk is one wave of concurrent sends: once a hold or a stale-verdict
+        // entry closes the fence, the chunk already sent runs to its end and
+        // no further chunk is sent. A
+        // refusal partway through leaves the values of the chunks already
+        // stored with their pre-flight `+1` and no object referencing them —
+        // the leak-only shape `ExtPrestore` accepts for a pre-store that fails
+        // partway.
+        //
+        // The store checks the same fence again before each value's script
+        // and before a `NOSCRIPT` reload's `SCRIPT LOAD` and re-send
+        // (`ExternalValueStore::store_values_unless_held`); its refusal, which
+        // sent nothing more, answers the hold refusal too.
+        for chunk in pairs.chunks(crate::storage::external_values::STORE_VALUES_MAX_INFLIGHT) {
+            refuse_if_held()?;
+            ext.store
+                .store_values_unless_held(chunk, hold_fence)
+                .await
+                .map_err(|e| {
+                    if crate::storage::client::is_hold_fence_refusal(&e) {
+                        held_refusal()
+                    } else {
+                        ext_prestore_err_to_checkpoint_err(e)
+                    }
+                })?;
+        }
         tracing::debug!(
             object_id,
             ext_values = pairs.len(),
@@ -2021,6 +2029,10 @@ pub(crate) async fn apply_restore(
     // which lands in `RecoveryHook::try_restore_layer`'s, which lands in the
     // `SubscribeReadLayer` catch-up chain — the deepest caller of this path, on
     // a 2 MiB tokio worker thread.
+    //
+    // The hold write fence goes in with it: the materialisation checks it
+    // immediately before its `EXEC`, after every read it makes, and answers
+    // `RestoreWriteOutcome::HoldFenced` when it is closed.
     let write_outcome = Box::pin(layer_store.write_restored_object(
         &oid_str,
         &meta.session_id,
@@ -2042,9 +2054,16 @@ pub(crate) async fn apply_restore(
             // exactly on this path.
             restore_seq_bump: band,
         },
+        hold_fence,
     ))
     .await
     .map_err(write_object_err_to_checkpoint_err)?;
+
+    // The hold write fence was closed when the materialisation reached its
+    // `EXEC`, so nothing was sent and nothing written.
+    if write_outcome == RestoreWriteOutcome::HoldFenced {
+        return Err(held_refusal());
+    }
 
     // The fence answered "a peer replica already landed this object's rebuild",
     // so nothing was written (b.h4m). Same verdict step 1 and step 3b reach one
@@ -2143,6 +2162,7 @@ pub async fn apply_checkpoint(
         meta,
         max_seq_observed,
         config,
+        None,
         None,
     )
     .await
@@ -2512,6 +2532,17 @@ pub(crate) mod tests {
         // an in-process `apply_delta` against a fresh empty state would
         // produce. This is the "reconstructed state matches encoded delta
         // bit-for-bit" acceptance criterion.
+        //
+        // The equality holds for a delta with no two sections sharing a
+        // collision slot (one `(parent_id, name)` and kind), as this
+        // fixture's. For a delta that holds such a pair — a base of stored
+        // state an earlier build's rename wrote — the two paths differ by
+        // design: `apply_delta` (`Commit`) cascade-deletes the sibling the
+        // delta creates first (for a base, the one it lists first) when it
+        // creates the second, while the decode (`ApplyMode::RestoreBase`)
+        // rebuilds both. That case is pinned by
+        // `checkpoint::assembler::tests::same_name_siblings_survive_the_checkpoint_round_trip`
+        // and the `ApplyMode::RestoreBase` same-name tests in `domain::delta`.
         let delta = OwnedDelta {
             is_diff: true,
             base_version: 0,
@@ -2771,7 +2802,6 @@ pub(crate) mod tests {
     /// consumes `checkpoint_seq_safety_margin`; everything else is filler).
     pub(crate) fn test_config(safety_margin: u64) -> crate::config::Config {
         crate::config::Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -2853,6 +2883,10 @@ pub(crate) mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: false,
@@ -3574,6 +3608,7 @@ pub(crate) mod tests {
             &test_config(1000),
             // The wiring defect under test.
             None,
+            None,
         )
         .await;
 
@@ -3634,6 +3669,7 @@ pub(crate) mod tests {
             None,
             &config,
             Some(ExtPrestore::new(&ext_store)),
+            None,
         )
         .await
         .expect("a composed restore with its ext store wired must apply");
@@ -3877,6 +3913,7 @@ pub(crate) mod tests {
             None,
             &config,
             None,
+            None,
         )
         .await
         .expect("the Ompf arm must apply");
@@ -4028,6 +4065,7 @@ pub(crate) mod tests {
             None,
             &config,
             None,
+            None,
         )
         .await
         .expect("the Composed arm must apply");
@@ -4079,6 +4117,7 @@ pub(crate) mod tests {
             &composed_meta(),
             None,
             &test_config(1000),
+            None,
             None,
         )
         .await
@@ -4135,6 +4174,7 @@ pub(crate) mod tests {
             None,
             &test_config(1000),
             Some(ExtPrestore::new(&ext_store).with_fault_injector(&injector)),
+            None,
         )
         .await;
 

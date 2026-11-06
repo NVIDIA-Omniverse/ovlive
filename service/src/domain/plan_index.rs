@@ -21,11 +21,13 @@
 //!
 //! - **The name index**: for each parent id, the `(name hash, section id)` of
 //!   every row naming that parent, listed or not, sorted (one parent-keyed
-//!   map of sorted vectors). It answers the engine's `(parent_id, name)`
-//!   conflict lookup by the same rule as its per-delta index (the lowest
-//!   surviving id, re-verified against the row) and a birth's adoption (every
-//!   row naming the newborn). The engine's per-delta `NameIndex` and
-//!   `AdoptionIndex` builds, and their O(sections) passes, are skipped.
+//!   map of sorted vectors). It answers the engine's sibling-collision lookup
+//!   by the same rule as its per-delta index (the lowest surviving id of the
+//!   probed slot, each candidate re-verified against its row, the slot
+//!   included, so the index is keyed by name only and a row's type change
+//!   re-files nothing) and a birth's adoption (every row naming the
+//!   newborn). The engine's per-delta `NameIndex` and `AdoptionIndex` builds,
+//!   and their O(sections) passes, are skipped.
 //! - **External-hash counts** over the field and time-sample rows, and the
 //!   number of external rows of each kind, so the count of untouched rows
 //!   naming a hash is read in O(touched rows).
@@ -73,7 +75,9 @@ use std::mem::size_of;
 use crate::domain::alloc_model::{
     allocation_bytes, table_bytes, table_growth_bytes, table_growth_bytes_held,
 };
-use crate::domain::delta::{check_section_tree_depth_capped, DeltaError, RebuildProjector};
+use crate::domain::delta::{
+    check_section_tree_depth_capped, collision_slot, DeltaError, RebuildProjector, SiblingLookup,
+};
 use crate::domain::delta_write::{
     EngineHooks, HeaderImage, NameChange, RebuildTable, RemovedKey, ResetTables,
 };
@@ -827,36 +831,53 @@ impl PlanIndexes {
     }
 
     /// The lowest id among the rows of `sections` naming `(parent_id, name)`,
-    /// other than `except_id`: the engine's `find_child_by_name` rule, each
-    /// candidate re-verified against its row.
+    /// other than `except_id`, whose `collision_slot` is `slot`, and the
+    /// lowest of any slot ([`SiblingLookup`]): the engine's
+    /// `find_child_by_name` rule, each candidate re-verified against its row.
+    /// The vector is keyed by name only, so the slot is read off the row.
     pub(crate) fn child_by_name(
         &self,
         sections: &HashMap<u64, Section>,
         parent_id: u64,
+        slot: u8,
         name: &str,
         except_id: Option<u64>,
-    ) -> Option<u64> {
-        let entries = self.names.get(&parent_id)?;
+    ) -> SiblingLookup {
+        let mut lookup = SiblingLookup::default();
+        let Some(entries) = self.names.get(&parent_id) else {
+            return lookup;
+        };
         let hash = name_hash(name);
         let start = entries.partition_point(|&(h, _)| h < hash);
-        entries[start..]
-            .iter()
-            .take_while(|&&(h, _)| h == hash)
-            .map(|&(_, id)| id)
-            .find(|&id| {
-                except_id != Some(id)
-                    && sections
-                        .get(&id)
-                        .is_some_and(|row| row.parent_id == parent_id && row.name == name)
-            })
+        // Ascending ids within one hash: the first in the slot ends the walk,
+        // the lowest of any slot being at or below it, so already taken.
+        for &(_, id) in entries[start..].iter().take_while(|&&(h, _)| h == hash) {
+            if except_id == Some(id) {
+                continue;
+            }
+            let Some(row) = sections.get(&id) else {
+                continue;
+            };
+            if row.parent_id != parent_id || row.name != name {
+                continue;
+            }
+            let in_slot = collision_slot(row.section_type) == slot;
+            lookup.take(id, in_slot);
+            if in_slot {
+                break;
+            }
+        }
+        lookup
     }
 
     /// The ids of every row of `sections` at `(parent_id, name)`, each
     /// candidate re-verified against its row as [`Self::child_by_name`]'s
     /// are, in ascending order. O(log L + matches) for `parent_id`'s `L`
     /// rows; allocates nothing. The rows a command introducing
-    /// `(parent_id, name)` can cascade-delete as a same-name sibling
-    /// (`storage::structural_cache::estimate_replay_record_growth`).
+    /// `(parent_id, name)` can cascade-delete as its occupant
+    /// (`storage::structural_cache::estimate_replay_record_growth`): a
+    /// superset of them, of every slot, since its one consumer is an upper
+    /// bound that need not know the slot a command probes.
     pub(crate) fn rows_named<'a>(
         &'a self,
         sections: &'a HashMap<u64, Section>,
@@ -1664,12 +1685,13 @@ impl EngineHooks<CompactRows> for IndexedHooks<'_> {
         &self,
         sections: &HashMap<u64, Section>,
         parent_id: u64,
+        slot: u8,
         name: &str,
         except_id: Option<u64>,
-    ) -> Option<Option<u64>> {
+    ) -> Option<SiblingLookup> {
         Some(
             self.indexes
-                .child_by_name(sections, parent_id, name, except_id),
+                .child_by_name(sections, parent_id, slot, name, except_id),
         )
     }
 
@@ -1727,14 +1749,105 @@ mod tests {
         let state = state_of(&[(7, 0, "a"), (3, 0, "a"), (5, 0, "b")]);
         let indexes = PlanIndexes::build(&state);
         assert_eq!(
-            indexes.child_by_name(&state.sections, 0, "a", None),
+            indexes
+                .child_by_name(&state.sections, 0, 0, "a", None)
+                .occupant,
             Some(3)
         );
         assert_eq!(
-            indexes.child_by_name(&state.sections, 0, "a", Some(3)),
+            indexes
+                .child_by_name(&state.sections, 0, 0, "a", Some(3))
+                .occupant,
             Some(7)
         );
-        assert_eq!(indexes.child_by_name(&state.sections, 0, "c", None), None);
+        assert_eq!(
+            indexes
+                .child_by_name(&state.sections, 0, 0, "c", None)
+                .occupant,
+            None
+        );
+    }
+
+    /// Over rows of several kinds sharing one name, the persistent index
+    /// answers the engine's two lookups: the occupant, the lowest id whose
+    /// `collision_slot` is the probed slot (a relationship's is the
+    /// attribute's), and the lowest id of any slot, the earlier
+    /// `(parent_id, name)` rule's answer. A row's type change is read off the
+    /// row, with no rebuild.
+    #[test]
+    fn child_by_name_answers_the_lowest_id_of_the_probed_slot_and_of_any_slot() {
+        const ATTRIBUTE: u8 = 1;
+        const PRIM: u8 = 6;
+        const RELATIONSHIP: u8 = 8;
+        const VARIANT_SET: u8 = 11;
+        const CONNECTION: u8 = 2;
+        let mut state = state_of(&[
+            (1, 0, "p"),
+            (30, 1, "a"),
+            (20, 1, "a"),
+            (15, 1, "a"),
+            (5, 1, "a"),
+            (40, 1, "b"),
+        ]);
+        for (id, ty) in [
+            (1, PRIM),
+            (30, ATTRIBUTE),
+            (20, RELATIONSHIP),
+            (15, VARIANT_SET),
+            (5, PRIM),
+            (40, ATTRIBUTE),
+        ] {
+            state.sections.get_mut(&id).expect("built").section_type = ty;
+        }
+        let indexes = PlanIndexes::build(&state);
+        let lookup = |state: &CompactState, slot: u8, except: Option<u64>| {
+            let answer = indexes.child_by_name(&state.sections, 1, slot, "a", except);
+            (answer.occupant, answer.any_slot)
+        };
+
+        assert_eq!(lookup(&state, PRIM, None), (Some(5), Some(5)), "prim slot");
+        assert_eq!(
+            lookup(&state, ATTRIBUTE, None),
+            (Some(20), Some(5)),
+            "attribute slot: the relationship"
+        );
+        assert_eq!(
+            lookup(&state, collision_slot(RELATIONSHIP), None),
+            (Some(20), Some(5)),
+            "a relationship probes the attribute slot"
+        );
+        assert_eq!(
+            lookup(&state, ATTRIBUTE, Some(20)),
+            (Some(30), Some(5)),
+            "the relationship excepted"
+        );
+        assert_eq!(
+            lookup(&state, VARIANT_SET, None),
+            (Some(15), Some(5)),
+            "variant-set slot"
+        );
+        assert_eq!(
+            lookup(&state, CONNECTION, None),
+            (None, Some(5)),
+            "an empty slot"
+        );
+        assert_eq!(
+            lookup(&state, PRIM, Some(5)),
+            (None, Some(15)),
+            "the prim excepted"
+        );
+
+        state.sections.get_mut(&20).expect("built").section_type = PRIM;
+        assert_eq!(
+            lookup(&state, ATTRIBUTE, None),
+            (Some(30), Some(5)),
+            "the relationship retyped to a prim leaves the attribute slot"
+        );
+        assert_eq!(
+            lookup(&state, PRIM, Some(5)),
+            (Some(20), Some(15)),
+            "and joins the prim slot, with no rebuild"
+        );
     }
 
     #[test]

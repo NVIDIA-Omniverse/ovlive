@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Service readiness, scratch cleanup after interrupted and crashed runners, and the unsupported-platform refusal."""
+"""Service readiness, scratch cleanup after interrupted and crashed runners, Windows job cleanup and the unsupported-platform refusal."""
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 from tools.live import process_guard, test_support
@@ -204,6 +206,125 @@ class RunnerDeathTests(unittest.TestCase):
         # The guard's parent-death signal, or on Windows its wait on the runner's process handle, starts its cleanup.
         self.assertTrue(process_guard.wait_exit(record["guard"], 30), "guard did not exit after the runner died")
         self.assert_nothing_left(record)
+
+
+class FakeJobKernel:
+    """The kernel32 calls of the Windows guard's job cleanup, recorded in order. Handles are 100 + the process ID;
+    `unsignaled` handles stay unsignaled after the job stops counting their processes as active."""
+
+    def __init__(self, unsignaled=(), gone=(), outside=(), query_fails=False):
+        self.events, self.unsignaled, self.gone, self.outside = [], set(unsignaled), set(gone), set(outside)
+        self.query_fails, self.error = query_fails, 0
+
+    def TerminateJobObject(self, job, code):
+        self.events.append(("terminate", job))
+        return True
+
+    def OpenProcess(self, access, inherit, pid):
+        if pid in self.gone:
+            self.error = process_guard.ERROR_INVALID_PARAMETER
+            return None
+        return 100 + pid
+
+    def IsProcessInJob(self, handle, job, member):
+        if self.query_fails:
+            self.error = 5
+            return False
+        member._obj.value = handle - 100 not in self.outside
+        return True
+
+    def WaitForSingleObject(self, handle, timeout_ms):
+        self.events.append(("wait", handle))
+        return process_guard.WAIT_TIMEOUT if handle in self.unsignaled else process_guard.WAIT_OBJECT_0
+
+    def CloseHandle(self, handle):
+        self.events.append(("close", handle))
+        return True
+
+    def SetErrorMode(self, mode):
+        return 0
+
+    def AssignProcessToJobObject(self, job, handle):
+        self.events.append(("assign", handle))
+        return True
+
+
+class WindowsJobCleanupTests(unittest.TestCase):
+    """The guard's Windows job cleanup with the kernel faked. A terminated member stops counting as active, and
+    leaves the job's process list, before its handles close, so cleanup waits on the handle of every process the
+    job's completion port reported joining."""
+
+    def empty(self, kernel, joined=(11, 12, 13), count=None, total=None, active=(2, 0)):
+        counts = iter(active)
+        total = len(joined) if total is None else total
+        def accounting(job):
+            value = next(counts, None)  # The active counts the cleanup polls, then its query of the total.
+            if value is not None:
+                kernel.events.append(("active", value))
+            return SimpleNamespace(ActiveProcesses=value or 0, TotalProcesses=total)
+        def drain(port):
+            kernel.events.append(("drain", port))
+            return (len(joined) if count is None else count), set(joined)
+        with patch.object(process_guard, "_kernel32", kernel, create=True), \
+                patch.object(process_guard, "_accounting", accounting), \
+                patch.object(process_guard, "_joined", drain), \
+                patch.object(process_guard.ctypes, "get_last_error", lambda: kernel.error, create=True), \
+                patch.object(process_guard.ctypes, "WinError", lambda code=None: OSError(code), create=True), \
+                patch.object(process_guard.time, "sleep", lambda seconds: None):
+            return process_guard._empty("job", "port")
+
+    def test_cleanup_waits_on_every_member_the_port_reported(self):
+        kernel = FakeJobKernel(gone={13})
+        self.assertTrue(self.empty(kernel))
+        self.assertEqual(kernel.events, [
+            ("terminate", "job"), ("active", 2), ("active", 0), ("drain", "port"),
+            ("wait", 111), ("wait", 112), ("close", 111), ("close", 112)])
+
+    def test_a_member_whose_handle_is_unsignaled_leaves_cleanup_incomplete(self):
+        kernel = FakeJobKernel(unsignaled={112})
+        self.assertFalse(self.empty(kernel, joined=(11, 12)))
+        self.assertEqual(kernel.events[-3:], [("wait", 112), ("close", 111), ("close", 112)])
+
+    def test_a_member_terminated_before_cleanup_is_still_waited_on(self):
+        # An inner guard ended its nested job first: its member is neither active nor listed, but still tearing down.
+        for unsignaled, complete in (({112}, False), ((), True)):
+            with self.subTest(unsignaled=unsignaled):
+                kernel = FakeJobKernel(unsignaled=unsignaled)
+                self.assertIs(self.empty(kernel, joined=(12,), active=(0,)), complete)
+                self.assertIn(("wait", 112), kernel.events)
+
+    def test_an_id_reused_outside_the_job_is_not_waited_on(self):
+        kernel = FakeJobKernel(outside={12})
+        self.assertTrue(self.empty(kernel, joined=(11, 12)))
+        self.assertNotIn(("wait", 112), kernel.events)
+        self.assertIn(("close", 112), kernel.events)
+
+    def test_fewer_reported_joins_than_the_job_counted_is_incomplete(self):
+        kernel = FakeJobKernel()
+        self.assertFalse(self.empty(kernel, joined=(11,), total=2))
+        self.assertNotIn("wait", [event[0] for event in kernel.events])
+
+    def test_a_failed_membership_query_is_incomplete(self):
+        kernel = FakeJobKernel(query_fails=True)
+        self.assertFalse(self.empty(kernel, joined=(11,)))
+        self.assertEqual(kernel.events[-1], ("close", 111))
+        self.assertNotIn("wait", [event[0] for event in kernel.events])
+
+    def test_a_launch_error_leaves_the_job_to_cleanup_and_waits_on_the_workload(self):
+        kernel, child = FakeJobKernel(unsignaled={111}), unittest.mock.Mock(_handle=111)
+        child.kill.side_effect = lambda: kernel.events.append(("kill", 111))
+        child.wait.side_effect = lambda: kernel.events.append(("reaped", 111))
+        ntdll = SimpleNamespace(NtResumeProcess=lambda handle: 1)
+        with patch.object(process_guard, "_kernel32", kernel, create=True), \
+                patch.object(process_guard, "_ntdll", ntdll, create=True), \
+                patch.object(process_guard.subprocess, "Popen", return_value=child), \
+                self.assertRaises(OSError):
+            process_guard._run_in_job("job", ["workload"], {}, "stop", "runner")
+        self.assertEqual(kernel.events, [("assign", 111), ("kill", 111), ("reaped", 111)])
+        # The job's own cleanup still finds the workload through the port, after the launch error.
+        self.assertFalse(self.empty(kernel, joined=(11,), active=(0,)))
+        self.assertEqual(kernel.events[3:], [("terminate", "job"), ("active", 0), ("drain", "port"), ("wait", 111),
+                                             ("close", 111)])
 
 
 class UnsupportedPlatformTests(unittest.TestCase):

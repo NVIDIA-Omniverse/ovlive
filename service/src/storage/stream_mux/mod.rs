@@ -67,9 +67,11 @@
 //! armed then; both end when the reader retires it (`storage::router_supervisor`).
 
 pub mod core;
+pub mod delivery_ledger;
 mod reader;
 pub mod router;
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -90,6 +92,7 @@ use crate::storage::notifications::{
 };
 
 use self::core::{Failure, Offer, OverflowBound, StreamId, SubId, SubSink};
+use self::delivery_ledger::{DeliveryLedger, HoldShared, PipelineEntry, SubscriptionHold};
 use self::router::{RouterCore, Routing};
 
 /// The most entries requested per stream per XREAD: the ceiling of the
@@ -113,9 +116,8 @@ pub const DEFAULT_ENTRY_ESTIMATE: u64 = 16 * 1024;
 pub const PAGED_XRANGE_MAX_COUNT: u64 = 512;
 
 /// The `COUNT` for the next page of a paged `XRANGE` over one layer stream —
-/// the shared helper of the bounded stream reads outside the multiplexer
-/// (`SubscribeReadLayer`'s rollback-mode in-window replay,
-/// `storage::tail_slice::read_tail_slice`).
+/// the helper of the bounded stream read outside the multiplexer
+/// (`storage::tail_slice::read_tail_slice`).
 ///
 /// The multiplexer's soft [`core::ReadSizing`] rule for one key: one page aims
 /// at [`XREAD_REPLY_TARGET_BYTES`], sized from `largest_entry_bytes`, the
@@ -130,9 +132,8 @@ pub const PAGED_XRANGE_MAX_COUNT: u64 = 512;
 /// concurrent `XADD`, or the relay byte budget's `XTRIM MINID ~`) can remove
 /// entries past the cursor, and the next page then starts beyond a hole. More
 /// pages leave more such windows, so a caller that needs the whole range must
-/// detect the hole itself: the tail capture by its classifier's `+1`
-/// progression check, the in-window replay by re-checking that its first entry
-/// is still held after its last page.
+/// detect the hole itself, as the tail capture does by its classifier's `+1`
+/// progression check.
 pub fn paged_xrange_count(largest_entry_bytes: Option<u64>) -> u64 {
     core::ReadSizing {
         target_bytes: XREAD_REPLY_TARGET_BYTES,
@@ -184,8 +185,8 @@ pub const WAKE_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// reader with an XREAD in flight is never pinged: a reader sends its other
 /// commands — this `PING`, its probes, head checks and credential re-AUTH —
 /// only between reads, since a command queued behind a live read waits out its
-/// `BLOCK` (or, under `Blocking::Interrupt`, `CLIENT UNBLOCK`s it). A reader
-/// with no connection has nothing to keep alive and does not tick.
+/// `BLOCK` (the readers run fred's default `Blocking::Block`). A reader with
+/// no connection has nothing to keep alive and does not tick.
 pub const READER_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(200);
 /// Bound on the `PING` a reader sends before its first XREAD after it had
 /// nothing to read, and on a cluster before its first XREAD bound to a
@@ -457,13 +458,16 @@ type TerminalSlot = Arc<StdMutex<Option<ConsumerTerminalExit>>>;
 
 /// One item queued for a subscription.
 pub(crate) enum Delivery {
-    /// A stream entry: its stream id, its notification, and the size its sink
+    /// A stream entry: its stream id, its notification, the size its sink
     /// counted for it ([`core::Entry::bytes`]), which the consumer subtracts
-    /// when it receives the entry — exactly what was added.
+    /// when it receives the entry — exactly what was added — and its place in
+    /// the live-delivery ledger, from the offer until it is released
+    /// ([`PipelineEntry`]).
     Entry {
         id: String,
         notification: LayerNotification,
         bytes: u64,
+        pipeline: PipelineEntry,
     },
     /// A trim marker ([`SubSink::offer_trimmed`]) carrying `resumes_at`: the
     /// id of the key's first entry in the same reply, whether or not it can be
@@ -496,6 +500,11 @@ pub(crate) enum Delivery {
 /// Either ending is an [`Offer::Overflow`] whose [`OverflowBound`] is `Bytes`
 /// only when a byte limit was reached and the entry limit was not. Trim
 /// markers ([`Delivery::Trimmed`]) are outside both rules.
+///
+/// Every accepted entry is queued with its [`PipelineEntry`] on the
+/// live-delivery ledger, charged to `hold` when the registration carries one;
+/// a failure ending credits the hold's bytes as pending release
+/// ([`DeliveryLedger::credit_registration_ended`]).
 pub(crate) struct ChannelSink {
     tx: mpsc::UnboundedSender<Delivery>,
     backlog: Arc<AtomicUsize>,
@@ -508,13 +517,21 @@ pub(crate) struct ChannelSink {
     soft_bytes: u64,
     hard_bytes: u64,
     watchdog: Duration,
+    ledger: Arc<DeliveryLedger>,
+    hold: Option<Arc<HoldShared>>,
+    /// The hold's registration this sink belongs to (0 without a hold).
+    hold_generation: u64,
 }
 
 impl ChannelSink {
-    /// A sink sized by `knobs`, and the consumer's end of it: the channel's
-    /// receiver, the shared backlog counters and the terminal-exit slot.
+    /// A sink sized by `knobs`, charging `ledger` and, when it has one,
+    /// `hold` — the hold and the generation of the registration this sink
+    /// belongs to — and the consumer's end of it: the channel's receiver,
+    /// the shared backlog counters and the terminal-exit slot.
     fn new(
         knobs: &StreamMuxKnobs,
+        ledger: Arc<DeliveryLedger>,
+        hold: Option<(Arc<HoldShared>, u64)>,
     ) -> (
         Self,
         mpsc::UnboundedReceiver<Delivery>,
@@ -528,6 +545,10 @@ impl ChannelSink {
             draining: Arc::new(AtomicBool::new(false)),
         };
         let terminal: TerminalSlot = Arc::new(StdMutex::new(None));
+        let (hold, hold_generation) = match hold {
+            Some((hold, generation)) => (Some(hold), generation),
+            None => (None, 0),
+        };
         let sink = ChannelSink {
             tx,
             backlog: backlog.entries.clone(),
@@ -540,13 +561,22 @@ impl ChannelSink {
             soft_bytes: knobs.backlog_bytes,
             hard_bytes: knobs.backlog_hard_bytes,
             watchdog: knobs.send_watchdog,
+            ledger,
+            hold,
+            hold_generation,
         };
         (sink, rx, backlog, terminal)
     }
 }
 
 impl SubSink<LayerNotification> for ChannelSink {
-    fn offer(&mut self, id: &str, payload: &LayerNotification, bytes: u64) -> Offer {
+    fn offer(
+        &mut self,
+        id: &str,
+        payload: &LayerNotification,
+        bytes: u64,
+        relay_copy: Option<NonZeroU64>,
+    ) -> Offer {
         if self.tx.is_closed() {
             return Offer::Closed;
         }
@@ -577,12 +607,27 @@ impl SubSink<LayerNotification> for ChannelSink {
         }
         self.backlog.fetch_add(1, Ordering::AcqRel);
         self.backlog_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let relay_len = match payload {
+            LayerNotification::Update {
+                relay_ompf: Some(ompf),
+                ..
+            } => Some(ompf.len()),
+            _ => None,
+        };
+        // The reader offers only entries whose id parsed; an update's id is
+        // `{sequence_num}-0`.
+        let seq = StreamId::parse(id).map_or(0, |id| id.ms);
+        let pipeline =
+            PipelineEntry::offer(&self.ledger, self.hold.as_ref(), seq, relay_len, relay_copy);
         let delivery = Delivery::Entry {
             id: id.to_owned(),
             notification: payload.clone(),
             bytes,
+            pipeline,
         };
         if self.tx.send(delivery).is_err() {
+            // The returned delivery, and with it the pipeline entry, drops
+            // here, releasing what the offer charged.
             self.backlog.fetch_sub(1, Ordering::AcqRel);
             self.backlog_bytes.fetch_sub(bytes, Ordering::AcqRel);
             return Offer::Closed;
@@ -621,6 +666,14 @@ impl SubSink<LayerNotification> for ChannelSink {
                 reason: failure.reason,
                 error,
             });
+        }
+        // The subscription's stream ended: its queued entries go with it, so
+        // the live-delivery budget counts them as pending release rather than
+        // ending another subscription for them — unless the hold has already
+        // moved to a newer registration.
+        if let Some(hold) = &self.hold {
+            self.ledger
+                .credit_registration_ended(hold, self.hold_generation);
         }
         drop(self.tx);
     }
@@ -677,6 +730,9 @@ pub(crate) struct MuxShared {
     next_sub: AtomicU64,
     knobs: StdMutex<StreamMuxKnobs>,
     metrics: Arc<StdMutex<Option<SharedMetrics>>>,
+    /// The live-delivery budget's ledger: every relay copy the readers make
+    /// and every entry they queue is charged on it.
+    ledger: Arc<DeliveryLedger>,
     stats: Vec<ReaderStats>,
     /// One per reader: its connection, if it holds one.
     conns: Vec<StdMutex<ReaderSlot>>,
@@ -888,6 +944,9 @@ pub struct ReservedStream {
     registration: Registration,
     key: String,
     key_schema: KeySchema,
+    /// The subscription's live-delivery hold, when the caller gave one
+    /// ([`Self::with_hold`]).
+    hold: Option<Arc<HoldShared>>,
 }
 
 impl std::fmt::Debug for ReservedStream {
@@ -900,6 +959,16 @@ impl std::fmt::Debug for ReservedStream {
 }
 
 impl ReservedStream {
+    /// Charges this stream's queued entries to `hold`, the subscription's
+    /// live-delivery hold, from its registration on: the hold's pipeline
+    /// counts them until they are released, and the live-delivery budget can
+    /// end the subscription for them (`delivery_ledger`). Without a hold the
+    /// entries are charged to the ledger alone.
+    pub fn with_hold(mut self, hold: &SubscriptionHold) -> Self {
+        self.hold = Some(Arc::clone(hold.shared()));
+        self
+    }
+
     /// Registers the stream on the reserved reader, delivering entries
     /// strictly after `cursor`, and returns its consumer. In-memory: no Valkey
     /// round trip and no wait. The consumer's backlog limits are the
@@ -912,7 +981,12 @@ impl ReservedStream {
     pub fn register(self, cursor: &StreamCursor) -> Result<LayerStreamConsumer, ConsumeError> {
         let start = parse_cursor(cursor)?;
         let shared = self.registration.shared.clone();
-        let (sink, rx, backlog, terminal) = ChannelSink::new(&shared.knobs());
+        let hold = self.hold.map(|hold| {
+            let generation = hold.begin_registration(&self.key);
+            (hold, generation)
+        });
+        let (sink, rx, backlog, terminal) =
+            ChannelSink::new(&shared.knobs(), Arc::clone(&shared.ledger), hold);
         let sent = {
             let r = shared.router.lock().expect("router lock");
             !r.closed
@@ -1009,13 +1083,16 @@ impl StreamMux {
     /// through `connector` when it first serves a subscription, and the
     /// connector's routing view names slot owners. `data` carries the
     /// non-blocking commands (wake XADDs, key probes). `cluster` selects slot
-    /// affinity. Must be called inside a Tokio runtime.
+    /// affinity. `live_delivery_budget_bytes` is the live-delivery budget
+    /// `D_live` its ledger enforces (`delivery_ledger`). Must be called inside
+    /// a Tokio runtime.
     pub(crate) fn start(
         connector: Arc<ReaderConnector>,
         data: Pool,
         cluster: bool,
         readers: usize,
         knobs: StreamMuxKnobs,
+        live_delivery_budget_bytes: u64,
         metrics: Arc<StdMutex<Option<SharedMetrics>>>,
     ) -> Self {
         let n = readers;
@@ -1043,6 +1120,7 @@ impl StreamMux {
             freed: Notify::new(),
             next_sub: AtomicU64::new(1),
             knobs: StdMutex::new(knobs),
+            ledger: DeliveryLedger::new(live_delivery_budget_bytes, Arc::clone(&metrics)),
             metrics,
             stats: (0..n)
                 .map(|_| ReaderStats {
@@ -1103,9 +1181,11 @@ impl StreamMux {
     /// fred's cached `connection_ids()` identifies the connection without
     /// sending a command.
     ///
-    /// Never issue a command on it: a reader is parked in `XREAD BLOCK` with
-    /// `Blocking::Interrupt`, so any other command would `CLIENT UNBLOCK` the
-    /// reader's live read. An idle connected reader is not quiet either: its
+    /// Never issue a command on it: a reader is parked in `XREAD BLOCK` under
+    /// fred's default `Blocking::Block`, so any other command would queue
+    /// behind the reader's live read, wait out its `BLOCK`, and hold the
+    /// reader's next read behind it on the one connection. An idle
+    /// connected reader is not quiet either: its
     /// keepalive `PING`s the connection (`keepalive_interval`, from a random
     /// offset), so a test that borrows an idle reader's connection turns the
     /// keepalive off first. Under a credential provider (never in the static
@@ -1129,6 +1209,12 @@ impl StreamMux {
         (0..self.shared.conns.len())
             .filter_map(|reader| self.shared.conn(reader).map(|(client, _)| client))
             .collect()
+    }
+
+    /// The live-delivery budget's ledger (`delivery_ledger`): a
+    /// `SubscribeReadLayer` registers its hold on it.
+    pub fn delivery_ledger(&self) -> &Arc<DeliveryLedger> {
+        &self.shared.ledger
     }
 
     /// Readers holding a connection now.
@@ -1238,6 +1324,7 @@ impl StreamMux {
                         registration,
                         key,
                         key_schema: key_schema.clone(),
+                        hold: None,
                     });
                 }
             }
@@ -1489,7 +1576,10 @@ mod tests {
 
     impl Registered {
         fn offer(&mut self, bytes: u64) -> Got {
-            match self.sink.offer("1-0", &LayerNotification::Deleted, bytes) {
+            match self
+                .sink
+                .offer("1-0", &LayerNotification::Deleted, bytes, None)
+            {
                 Offer::Accepted => Got::Accepted,
                 Offer::Closed => Got::Closed,
                 Offer::Overflow(bound) => Got::Overflow(bound),
@@ -1537,6 +1627,7 @@ mod tests {
             next_sub: AtomicU64::new(2),
             knobs: StdMutex::new(knobs),
             metrics: Arc::new(StdMutex::new(None)),
+            ledger: DeliveryLedger::new(u64::MAX, Arc::new(StdMutex::new(None))),
             stats: Vec::new(),
             conns: vec![StdMutex::new(ReaderSlot::default())],
             faults: StdMutex::new(std::collections::HashMap::new()),
@@ -1551,6 +1642,7 @@ mod tests {
             },
             key: "k".to_owned(),
             key_schema: KeySchema::default(),
+            hold: None,
         };
         let consumer = reserved
             .register(&StreamCursor::From(cursor.to_owned()))
@@ -1778,7 +1870,9 @@ mod tests {
     impl Registered {
         /// Offers the update entry `{seq}-0` of `bytes` bytes.
         fn entry(&mut self, seq: u64, bytes: u64) -> Got {
-            got(self.sink.offer(&format!("{seq}-0"), &update(seq), bytes))
+            got(self
+                .sink
+                .offer(&format!("{seq}-0"), &update(seq), bytes, None))
         }
 
         /// Offers a trim marker resuming at `{ms}-0`.
@@ -2048,6 +2142,7 @@ mod tests {
                 id_str: format!("{seq}-0"),
                 payload: Some(update(seq)),
                 bytes: 1,
+                relay_copy: None,
             })
             .collect();
         let out = reader.on_read_ok(

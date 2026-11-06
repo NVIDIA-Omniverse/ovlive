@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Early gRPC listener bind for the bootstrap health server (b.rgs).
+//! Early gRPC listener bind for the bootstrap health server (b.rgs), and the
+//! process's shutdown signal and startup claim (below).
 //!
 //! The liveness probe targets the gRPC health service's overall (`""`)
 //! status, so a closed `:50001` socket is indistinguishable from a wedged
@@ -45,19 +46,213 @@
 //! The full-API server serves its stream through [`closable_incoming`], so
 //! graceful shutdown can close the socket when the readiness drain ends rather
 //! than when the server returns, and count the connections still open.
+//!
+//! # Shutdown signals from the first statement (SDD §5.5, §5.6)
+//!
+//! The binary runs as PID 1 in its container, and the kernel drops a signal
+//! sent to PID 1 that has no handler, so a handler installed only when the
+//! server starts serving would lose every `SIGTERM` that arrives while the
+//! replica boots. [`ShutdownSignal::install`] registers the `SIGTERM` and
+//! `SIGINT` handlers at once; `main.rs` calls it as the first statement of
+//! every mode but the scaler (which keeps its own, equally eager, listener),
+//! and it is the process's only listener.
+//!
+//! [`StartupClaim`] decides who acts on the first signal. Its watcher
+//! ([`StartupClaim::watch`]) turns the signal into the process shutdown
+//! request and, while the replica is still booting, runs the startup stop it
+//! is handed; once the serving path has claimed the startup parts
+//! ([`StartupClaim::claim_serving`]) the watcher only cancels the request,
+//! which the serving path drains on. The two outcomes are exclusive: the
+//! startup parts go to exactly one side.
 
+use std::future::Future;
 use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::signal::unix::{signal, Signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::server::{Connected, TcpConnectInfo, TcpIncoming};
+
+/// What [`ShutdownSignal::recv`] resolves to on a `SIGTERM`.
+pub const SIGTERM: &str = "SIGTERM";
+
+/// What [`ShutdownSignal::recv`] resolves to on a `SIGINT`.
+pub const SIGINT: &str = "SIGINT";
+
+/// The process's one `SIGTERM` and `SIGINT` listener.
+///
+/// Both handlers are registered by [`Self::install`], when it is called, not
+/// when [`Self::recv`] is first polled: a tokio signal listener sees every
+/// signal delivered after its creation, and its OS handler is never
+/// uninstalled, so no signal is lost from the install on, however long the
+/// process runs before anything waits on it.
+pub struct ShutdownSignal {
+    terminate: Signal,
+    interrupt: Signal,
+}
+
+impl ShutdownSignal {
+    /// Register the `SIGTERM` and `SIGINT` handlers now.
+    ///
+    /// Must be called from inside a tokio runtime context. An error is the
+    /// OS refusing a handler; `main.rs` reports it on stderr and exits 1.
+    pub fn install() -> io::Result<Self> {
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+
+    /// The next `SIGTERM` or `SIGINT`: [`SIGTERM`] or [`SIGINT`]. A signal
+    /// delivered before this is first polled resolves it at once.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.terminate.recv() => SIGTERM,
+            _ = self.interrupt.recv() => SIGINT,
+        }
+    }
+}
+
+/// Where startup stands, for [`StartupClaim`].
+enum StartupPhase<P> {
+    /// Booting: the startup parts are unclaimed.
+    Booting(P),
+    /// The serving path claimed the parts ([`StartupClaim::claim_serving`]).
+    Serving,
+    /// A signal arrived first, and the watcher took the parts to stop startup.
+    StoppingStartup,
+}
+
+struct ClaimState<P> {
+    phase: Mutex<StartupPhase<P>>,
+    /// The process shutdown request: cancelled by the watcher on the first
+    /// signal, after it records the cause, and by nothing else.
+    request: CancellationToken,
+    /// The first signal's name, set once, before `request` is cancelled.
+    cause: OnceLock<&'static str>,
+}
+
+/// Which side acts on the first shutdown signal: the startup stop while the
+/// replica boots, or the serving path once it has claimed the startup parts
+/// `P` (in `main.rs`, the bootstrap server, its shutdown token and the
+/// `/metrics` server).
+///
+/// Whichever side wins takes `P`; the other gets nothing, so a signal is
+/// never handled twice. Clones share one claim.
+///
+/// - [`Self::watch`] waits for the signal, records its name
+///   ([`Self::cause`]) and cancels the shutdown request; then, if the parts
+///   are still unclaimed, it takes them and runs the startup stop.
+/// - [`Self::claim_serving`] takes the parts for the serving path, or answers
+///   `None` when the startup stop already has them.
+/// - [`Self::request`] hands out children of the shutdown request, cancelled
+///   on the first signal in every phase.
+pub struct StartupClaim<P> {
+    state: Arc<ClaimState<P>>,
+}
+
+impl<P> Clone for StartupClaim<P> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<P> StartupClaim<P> {
+    /// A claim over `parts`, unclaimed, with no shutdown requested.
+    pub fn new(parts: P) -> Self {
+        Self {
+            state: Arc::new(ClaimState {
+                phase: Mutex::new(StartupPhase::Booting(parts)),
+                request: CancellationToken::new(),
+                cause: OnceLock::new(),
+            }),
+        }
+    }
+
+    fn phase(&self) -> MutexGuard<'_, StartupPhase<P>> {
+        // Every operation under the lock is a `mem::replace`; a panic in one
+        // leaves the phase consistent.
+        self.state.phase.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A child of the process shutdown request: cancelled on the first
+    /// signal, whether startup or the serving path acts on it. Cancelling the
+    /// child does not cancel the request.
+    pub fn request(&self) -> CancellationToken {
+        self.state.request.child_token()
+    }
+
+    /// The first signal's name ([`SIGTERM`] or [`SIGINT`]), once one has
+    /// arrived. Set before the shutdown request is cancelled, so it is `Some`
+    /// for anyone woken by the request.
+    pub fn cause(&self) -> Option<&'static str> {
+        self.state.cause.get().copied()
+    }
+
+    /// Claim the startup parts for the serving path: `Some` with the parts
+    /// and a child of the shutdown request ([`Self::request`]). The child is
+    /// already cancelled when a signal's watcher cancelled the request just
+    /// before this claim took the parts; the serving path then drains at
+    /// once.
+    ///
+    /// `None` when a signal claimed startup first: its startup stop owns the
+    /// parts and ends the process, so the caller waits for that and does not
+    /// serve. Called once; a second call finds no parts and also answers
+    /// `None`.
+    pub fn claim_serving(&self) -> Option<(P, CancellationToken)> {
+        let mut phase = self.phase();
+        match std::mem::replace(&mut *phase, StartupPhase::Serving) {
+            StartupPhase::Booting(parts) => Some((parts, self.request())),
+            other => {
+                *phase = other;
+                None
+            }
+        }
+    }
+
+    /// The watcher: wait for `signal`, record its name, cancel the shutdown
+    /// request, and, if the startup parts are unclaimed, take them and run
+    /// `stop` with the signal's name and the parts. Once the serving path
+    /// has claimed them, cancelling the request is all it does.
+    ///
+    /// A signal that arrives before this is first polled (`signal` resolves
+    /// at once) is acted on as soon as it is. `main.rs` spawns this with the
+    /// process's [`ShutdownSignal`] and its startup stop, which ends the
+    /// process; under a `stop` that returns, this returns after it.
+    pub async fn watch<S, F, Fut>(self, signal: S, stop: F)
+    where
+        S: Future<Output = &'static str>,
+        F: FnOnce(&'static str, P) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let name = signal.await;
+        let _ = self.state.cause.set(name);
+        self.state.request.cancel();
+        let parts = {
+            let mut phase = self.phase();
+            match std::mem::replace(&mut *phase, StartupPhase::StoppingStartup) {
+                StartupPhase::Booting(parts) => Some(parts),
+                other => {
+                    *phase = other;
+                    None
+                }
+            }
+        };
+        if let Some(parts) = parts {
+            stop(name, parts).await;
+        }
+    }
+}
 
 /// Bind the gRPC listening socket once and return two `TcpIncoming` streams
 /// over the same open file description, plus the address actually bound
@@ -260,5 +455,216 @@ impl AsyncWrite for CountedTcpStream {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! [`StartupClaim`]: which side acts on the first shutdown signal, the
+    //! startup stop or the serving path, with a fake signal future in place of
+    //! [`ShutdownSignal::recv`], so a test chooses when the signal "arrives".
+    //! The real handlers, and a signal to the binary while it is blocked in
+    //! startup, are `tests/misc/startup_signal_binary.rs`.
+
+    use std::sync::atomic::AtomicBool;
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// The startup parts every test claim carries, so a test can tell which
+    /// side took them.
+    const PARTS: &str = "the bootstrap and /metrics servers";
+
+    /// Bound on every wait here. A deadline, not a timing claim: each wait
+    /// ends on its own in microseconds.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// What a startup stop was handed: the signal's name and the parts.
+    type StopLog = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
+
+    /// A startup stop that records what it was handed and returns (the
+    /// production stop ends the process instead).
+    fn recording_stop(
+        log: &StopLog,
+    ) -> impl FnOnce(&'static str, &'static str) -> std::future::Ready<()> {
+        let log = Arc::clone(log);
+        move |signal, parts| {
+            log.lock().unwrap().push((signal, parts));
+            std::future::ready(())
+        }
+    }
+
+    /// A signal delivered before the watcher starts — between the listener's
+    /// install at the top of `main` and the watcher's spawn — is acted on
+    /// once the watcher runs: the claim does nothing on its own, and the
+    /// watcher then records the cause, cancels the request and runs the
+    /// startup stop exactly once, with the signal's name and the parts.
+    #[tokio::test]
+    async fn a_signal_delivered_before_the_watcher_starts_stops_startup_once_it_runs() {
+        let claim = StartupClaim::new(PARTS);
+        let request = claim.request();
+        let (delivered, recorded) = oneshot::channel::<&'static str>();
+        delivered
+            .send(SIGTERM)
+            .expect("the fake listener still holds its receiver");
+        assert!(
+            !request.is_cancelled() && claim.cause().is_none(),
+            "nothing acts on a signal before the watcher runs"
+        );
+
+        let stopped = StopLog::default();
+        let watcher = tokio::spawn(claim.clone().watch(
+            async move { recorded.await.expect("the signal was recorded") },
+            recording_stop(&stopped),
+        ));
+        tokio::time::timeout(WAIT, watcher)
+            .await
+            .expect("the watcher acts on the recorded signal at once")
+            .expect("the watcher does not panic");
+
+        assert_eq!(
+            *stopped.lock().unwrap(),
+            vec![(SIGTERM, PARTS)],
+            "the startup stop ran once, with the signal's name and the startup parts"
+        );
+        assert_eq!(claim.cause(), Some(SIGTERM));
+        assert!(request.is_cancelled(), "the shutdown request is cancelled");
+    }
+
+    /// Once a signal has started the startup stop, the serving path's claim
+    /// answers `None`, so it never takes the bootstrap server over, reaches the
+    /// serving point or opens readiness: the stop owns the parts, and ends the
+    /// process. Here the stop parks, as the production one does until its
+    /// `exit(0)`.
+    #[tokio::test]
+    async fn the_serving_claim_answers_none_once_a_signal_has_started_the_startup_stop() {
+        let claim = StartupClaim::new(PARTS);
+        let (started, stop_started) = oneshot::channel::<(&'static str, &'static str)>();
+        let _watcher = tokio::spawn(claim.clone().watch(
+            std::future::ready(SIGINT),
+            move |signal, parts| {
+                let _ = started.send((signal, parts));
+                std::future::pending::<()>()
+            },
+        ));
+        let handed = tokio::time::timeout(WAIT, stop_started)
+            .await
+            .expect("the startup stop starts")
+            .expect("the stop reports what it was handed");
+        assert_eq!(handed, (SIGINT, PARTS));
+
+        assert!(
+            claim.claim_serving().is_none(),
+            "the serving path gets nothing once the startup stop has the parts"
+        );
+        assert_eq!(claim.cause(), Some(SIGINT));
+        assert!(claim.request().is_cancelled());
+    }
+
+    /// Once the serving path has claimed the parts, a signal only records its
+    /// cause and cancels the request — the startup stop never runs — and the
+    /// serving path, woken by its request, reads the cause. A second claim
+    /// finds no parts.
+    #[tokio::test]
+    async fn a_signal_after_the_serving_claim_only_cancels_the_request() {
+        let claim = StartupClaim::new(PARTS);
+        let (deliver, delivered) = oneshot::channel::<&'static str>();
+        let stop_ran = Arc::new(AtomicBool::new(false));
+        let watcher = tokio::spawn(claim.clone().watch(
+            async move { delivered.await.expect("the test delivers a signal") },
+            {
+                let stop_ran = Arc::clone(&stop_ran);
+                move |_, _| {
+                    stop_ran.store(true, Ordering::SeqCst);
+                    std::future::ready(())
+                }
+            },
+        ));
+
+        let (parts, request) = claim
+            .claim_serving()
+            .expect("unclaimed parts go to the serving path");
+        assert_eq!(parts, PARTS);
+        assert!(
+            !request.is_cancelled() && claim.cause().is_none(),
+            "no signal yet"
+        );
+        let woken_with = tokio::spawn({
+            let claim = claim.clone();
+            let request = request.clone();
+            async move {
+                request.cancelled().await;
+                claim.cause()
+            }
+        });
+
+        deliver
+            .send(SIGINT)
+            .expect("the watcher still waits for its signal");
+        tokio::time::timeout(WAIT, watcher)
+            .await
+            .expect("the watcher returns once it has cancelled the request")
+            .expect("the watcher does not panic");
+
+        assert_eq!(
+            tokio::time::timeout(WAIT, woken_with)
+                .await
+                .expect("the serving path is woken by the request")
+                .expect("the reader does not panic"),
+            Some(SIGINT),
+            "the cause is recorded before the request is cancelled"
+        );
+        assert!(
+            !stop_ran.load(Ordering::SeqCst),
+            "the startup stop never runs once the serving path has the parts"
+        );
+        assert!(
+            claim.claim_serving().is_none(),
+            "a second claim finds no parts"
+        );
+    }
+
+    /// A child of the shutdown request — what `main.rs` stops the hold poll
+    /// and the hold reactor on — is cancelled by the first signal in both
+    /// phases: while booting, when the startup stop acts, and once serving,
+    /// when only the request is cancelled. Cancelling a child alone leaves the
+    /// request and its other children as they were.
+    #[tokio::test]
+    async fn a_child_of_the_request_is_cancelled_by_a_signal_while_booting_and_while_serving() {
+        for serving in [false, true] {
+            let phase = if serving { "serving" } else { "booting" };
+            let claim = StartupClaim::new(PARTS);
+            let child = claim.request();
+            let sibling = claim.request();
+            sibling.cancel();
+            assert!(
+                !child.is_cancelled() && !claim.request().is_cancelled(),
+                "{phase}: cancelling one child cancels neither the request nor another child"
+            );
+            if serving {
+                claim.claim_serving().expect("the parts are unclaimed");
+            }
+
+            let stopped = StopLog::default();
+            tokio::time::timeout(
+                WAIT,
+                claim
+                    .clone()
+                    .watch(std::future::ready(SIGTERM), recording_stop(&stopped)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{phase}: the watcher returns"));
+
+            assert!(
+                child.is_cancelled(),
+                "{phase}: the first signal cancels a child of the request"
+            );
+            assert_eq!(
+                stopped.lock().unwrap().len(),
+                usize::from(!serving),
+                "{phase}: the startup stop runs only while booting"
+            );
+        }
     }
 }

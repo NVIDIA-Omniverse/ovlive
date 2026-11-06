@@ -406,6 +406,9 @@ public:
     // Field and sample records the selector names apply nothing; they are
     // still decoded and charged.
     void skipRecords(const std::function<bool(const WireRecordKey&)>* skip) { skip_ = skip; }
+    // Every section a later applied update's Creates replace is appended to
+    // `replaced`; null records none.
+    void reportReplaced(std::vector<WireReplacedSection>* replaced) { replaced_ = replaced; }
 private:
     // A section's share of the scene's field count and metadata bytes.
     struct Contribution {
@@ -644,11 +647,20 @@ private:
         });
         return ids;
     }
-    // Each parent's children by name and its next free order, built on first
+    // A child's slot under its parent: its name within the child list its
+    // spec type belongs to, so a slot is one derived path, as Kit's applier
+    // keys children on the SdfPath. Attributes and relationships share the
+    // property list and every other spec type has a list of its own, so a
+    // prim and a property of one name hold distinct slots.
+    using Slot = std::pair<SdfSpecType, std::string>;
+    static Slot slotOf(SdfSpecType type, const std::string& name) {
+        return {type == SdfSpecTypeRelationship ? SdfSpecTypeAttribute : type, name};
+    }
+    // Each parent's children by slot and its next free order, built on first
     // use from its children and kept by Create; a Delete, Move or Reorder
     // drops them.
     struct Slots {
-        std::map<std::string, std::set<uint64_t>> occupants;
+        std::map<Slot, std::set<uint64_t>> occupants;
         uint64_t nextOrder = 0; // Past the largest child order; 2^32 means exhausted.
     };
     std::map<uint64_t, Slots> slots_;
@@ -658,16 +670,17 @@ private:
         for (const auto id : childrenOf(parent)) {
             const auto& child = section(id);
             work(1 + child.name.size());
-            built.occupants[child.name].insert(id);
+            built.occupants[slotOf(child.type, child.name)].insert(id);
             built.nextOrder = std::max<uint64_t>(built.nextOrder, uint64_t(child.order) + 1);
         }
         return slots_.emplace(parent, std::move(built)).first->second;
     }
-    // The service resolves a (parent, name) slot to its lowest live identity.
-    uint64_t occupant(uint64_t parent, const std::string& name, uint64_t except) {
+    // A slot resolves to its lowest live identity; this returns the lowest
+    // other than `except` in the parent's slot for a `type` child `name`.
+    uint64_t occupant(uint64_t parent, SdfSpecType type, const std::string& name, uint64_t except) {
         work(name.size() + 1);
         const auto& index = slots(parent).occupants;
-        const auto found = index.find(name);
+        const auto found = index.find(slotOf(type, name));
         if (found == index.end()) return 0;
         for (auto id : found->second) {
             work();
@@ -1184,7 +1197,15 @@ private:
                 break;
             }
             if (!lookup(c.parent)) break; // Create under a missing parent is skipped.
-            if (const auto replaced = occupant(c.parent, c.name, c.section)) cascade(replaced);
+            if (const auto replaced = occupant(c.parent, SdfSpecType(c.sectionType), c.name, c.section)) {
+                // The row's last derived path, empty for a hidden row as pathForSection reports it: an
+                // update derives paths and visibility at its end and before a Reorder.
+                if (replaced_) {
+                    const auto& row = section(replaced);
+                    replaced_->push_back({replaced, row.hidden ? SdfPath() : row.path, c.section});
+                }
+                cascade(replaced);
+            }
             if (state_->sections.size() >= limits_.maxSections) limited("wire scene section limit exceeded");
             Section child;
             child.parent = c.parent;
@@ -1192,7 +1213,7 @@ private:
             child.name = c.name;
             child.order = nextOrder(c.parent);
             auto& slot = slots(c.parent);
-            slot.occupants[child.name].insert(c.section);
+            slot.occupants[slotOf(child.type, child.name)].insert(c.section);
             slot.nextOrder = std::max<uint64_t>(slot.nextOrder, uint64_t(child.order) + 1);
             insert(c.section, std::move(child));
             mark(c.section);
@@ -1207,7 +1228,21 @@ private:
         case Command::Kind::Move: {
             if (c.section <= 1 || c.parent == c.section) malformed("invalid wire move identity");
             if (!lookup(c.section)) break; // A Move of a missing section is skipped.
-            if (c.oldParent == c.parent) { // Equal command parents rename under the stored parent.
+            if (c.oldParent == c.parent) {
+                // Equal command parents rename under the stored parent. A
+                // rename to the section's own name changes nothing; any other
+                // name deletes the lowest other live occupant of (stored
+                // parent, name) with its listed subtree first, as a Create
+                // does. An occupant is a sibling, so neither holds the other
+                // by stored parent, but the occupant's listed subtree holds
+                // the section when a stale listing below it names the
+                // section: the section then leaves with it.
+                const auto& row = section(c.section);
+                if (row.name == c.name) break;
+                if (const auto replaced = occupant(row.parent, row.type, c.name, c.section)) {
+                    cascade(replaced);
+                    if (!lookup(c.section)) break;
+                }
                 slots_.clear();
                 mark(c.section);
                 restructure(c.section, [&](Section& row) { row.name = c.name; });
@@ -1218,12 +1253,23 @@ private:
                 cascade(c.section);
                 break;
             }
-            const auto replaced = occupant(c.parent, c.name, c.section);
+            const auto replaced = occupant(c.parent, section(c.section).type, c.name, c.section);
             if (replaced && descends(c.section, replaced)) {
                 cascade(c.section);
                 break;
             }
-            if (replaced) cascade(replaced);
+            if (replaced) {
+                // The occupant is not an ancestor of the section, but its
+                // listed subtree holds the section, or the new parent, when a
+                // stale listing below it names one: the section then leaves
+                // with it, or is deleted as a Move to a missing parent is.
+                cascade(replaced);
+                if (!lookup(c.section)) break;
+                if (!lookup(c.parent)) {
+                    cascade(c.section);
+                    break;
+                }
+            }
             mark(c.section);
             const auto& current = section(c.section);
             // The service removes the section from its carried old parent's
@@ -1749,6 +1795,7 @@ private:
     }
     WireSceneWorkBudget* shared_ = nullptr;
     const std::function<bool(const WireRecordKey&)>* skip_ = nullptr;
+    std::vector<WireReplacedSection>* replaced_ = nullptr;
     bool pendingReplay_;
     const bool delivered_;
     std::unique_ptr<WireScene::State> state_;
@@ -1917,6 +1964,7 @@ bool sameProjectedFields(const std::map<TfToken, VtValue>& x, const std::map<TfT
 }
 } // namespace
 
+bool sameWireValue(const VtValue& a, const VtValue& b) { return sameProjectedValue(a, b); }
 void setWireSceneDerivationCheck(bool enabled) noexcept { derivationCheck.store(enabled, std::memory_order_relaxed); }
 WireSceneDifference diffProjectedScenes(const WireScene& before, const WireScene& after) {
     WireSceneDifference difference;
@@ -2009,17 +2057,27 @@ WireSceneDifference diffProjectedScenes(const WireScene& before, const WireScene
 }
 
 WireScenePtr buildSceneCandidate(const WireScenePtr& previous, std::string_view bytes, const WireSceneLimits& limits,
-    WireSceneWorkBudget* shared, WireSceneBatchPolicy policy) {
+    WireSceneWorkBudget* shared, WireSceneBatchPolicy policy, WireReplayStep* step) {
+    const auto before = shared ? shared->remaining : 0;
     const auto decoded = decodeUpdate(bytes, limits, shared, policy);
     const bool replay = policy == WireSceneBatchPolicy::PendingReplay && previous;
     WireSceneBuilder builder(previous, limits, replay, policy == WireSceneBatchPolicy::Delivered);
+    bool applied = true;
     try {
         builder.apply(decoded.envelope, decoded.values, shared);
-        return builder.finish();
     } catch (const PredictedRejection&) {
         if (!replay) throw;
+        applied = false;
+    }
+    const auto work = shared ? before - shared->remaining : 0;
+    if (!applied) {
+        if (step) *step = {false, work};
         return previous;
     }
+    if (step)
+        *step = {true, work, builder.derivedWork(), builder.derived(), builder.rederives(), builder.fieldCount(),
+            builder.metadataBytes()};
+    return builder.finish();
 }
 
 WireScenePtr buildDeliveredScene(const WireScenePtr& previous, const std::vector<WireSceneDelivery>& updates,
@@ -2028,6 +2086,7 @@ WireScenePtr buildDeliveredScene(const WireScenePtr& previous, const std::vector
     WireSceneBuilder builder(previous, limits, false, true);
     for (const auto& update : updates) {
         const auto decoded = decodeUpdate(update.bytes, limits, update.work, WireSceneBatchPolicy::Delivered);
+        builder.reportReplaced(update.replaced);
         builder.apply(decoded.envelope, decoded.values, update.work);
     }
     return builder.finish();

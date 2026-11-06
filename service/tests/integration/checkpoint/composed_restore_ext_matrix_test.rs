@@ -472,6 +472,10 @@ impl CheckpointStore for RecordingExtFetchStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.inner.delete_ext_blob(hash_hex).await
     }
@@ -701,7 +705,7 @@ async fn assert_ext_keys_absent(harness: &CheckpointHarness, hash_hex: &str, con
 /// `read_batch` for a single hash, flattened to "the bytes" or "the error".
 ///
 /// This is the production read surface the SR-3.2 fallback hangs off:
-/// `read_batch` is what `compute_diff_at_cut` calls, and `try_recover_via_checkpoint`
+/// `read_batch` is what a catch-up build's genuine-miss read calls, and `try_recover_via_checkpoint`
 /// runs inside its two miss arms (`external_values.rs:918-943`). Driving it
 /// per-hash rather than through `SubscribeReadLayer` is deliberate — a
 /// whole-layer diff batches every referenced hash into one call and fails on the

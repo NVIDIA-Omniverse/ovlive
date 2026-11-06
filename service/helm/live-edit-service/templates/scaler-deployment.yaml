@@ -91,23 +91,23 @@ spec:
             - name: LIVE_EDIT_SCALER_SERVICE
               value: {{ include "live-edit-service.servicename" . | quote }}
             - name: LIVE_EDIT_SCALER_MIN_REPLICAS
-              value: {{ .Values.autoscaling.minReplicas | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.minReplicas" "value" .Values.autoscaling.minReplicas "hint" "a replica count") | quote }}
             - name: LIVE_EDIT_SCALER_MAX_REPLICAS
-              value: {{ .Values.autoscaling.maxReplicas | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.maxReplicas" "value" .Values.autoscaling.maxReplicas "hint" "a replica count") | quote }}
             - name: LIVE_EDIT_SCALER_CPU_TARGET_PERCENT
-              value: {{ .Values.autoscaling.targetCPUUtilizationPercentage | default 0 | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.targetCPUUtilizationPercentage" "value" (.Values.autoscaling.targetCPUUtilizationPercentage | default 0) "hint" "a percentage of resources.requests.cpu, null turns the CPU signal off") | quote }}
             - name: LIVE_EDIT_SCALER_CPU_REQUEST
               value: {{ dig "requests" "cpu" "" (.Values.resources | default dict) | toString | quote }}
             - name: LIVE_EDIT_SCALER_POLL_INTERVAL_SECS
-              value: {{ $scaler.pollIntervalSeconds | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.scaler.pollIntervalSeconds" "value" $scaler.pollIntervalSeconds "hint" "seconds") | quote }}
             - name: LIVE_EDIT_SCALER_CATCHUP_TARGET_SECS
-              value: {{ $scaler.catchupTargetSeconds | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.scaler.catchupTargetSeconds" "value" $scaler.catchupTargetSeconds "hint" "seconds") | quote }}
             - name: LIVE_EDIT_SCALER_OCCUPANCY_HEADROOM_PERCENT
-              value: {{ $scaler.occupancyHeadroomPercent | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.scaler.occupancyHeadroomPercent" "value" $scaler.occupancyHeadroomPercent "hint" "a percentage") | quote }}
             - name: LIVE_EDIT_SCALER_SCALE_DOWN_WINDOW_SECS
-              value: {{ $scaler.scaleDown.windowSeconds | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.scaler.scaleDown.windowSeconds" "value" $scaler.scaleDown.windowSeconds "hint" "seconds") | quote }}
             - name: LIVE_EDIT_SCALER_SCALE_DOWN_INTERVAL_SECS
-              value: {{ $scaler.scaleDown.intervalSeconds | quote }}
+              value: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.scaler.scaleDown.intervalSeconds" "value" $scaler.scaleDown.intervalSeconds "hint" "seconds") | quote }}
             - name: LIVE_EDIT_SCALER_POD_DELETION_COST
               value: {{ $scaler.podDeletionCost | toString | quote }}
             - name: LIVE_EDIT_SCALER_HTTP_PORT

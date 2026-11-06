@@ -20,7 +20,9 @@
 // The `Drop` impl scans and deletes all keys matching the prefix.
 
 use std::env;
+use std::ffi::OsString;
 use std::sync::{Arc, Once, OnceLock};
+use std::time::Duration;
 
 use fred::interfaces::{ClientLike, KeysInterface};
 use fred::types::config::CredentialProvider;
@@ -176,6 +178,245 @@ pub async fn connect_test_client_with_credential_provider(
 ) -> Result<ValkeyClient, ConnectError> {
     crate::storage::client::with_credential_provider_for_test(provider, connect_test_client(config))
         .await
+}
+
+/// The variable naming the Valkey the store-backed tests run against. Set
+/// (CI always sets it), it makes the store required
+/// ([`TestValkeyRequirement::Required`]).
+pub const TEST_VALKEY_URL_VAR: &str = "TEST_VALKEY_URL";
+
+/// How long [`connect_test_client_or_skip`] waits for one connect when the
+/// store is required, before it fails the test. A hang guard, not a timing
+/// claim: a healthy connect takes well under a second, and a loaded shared
+/// store is waited for rather than skipped. It is the connect budget
+/// `TestValkey`'s fixtures already use under suite load, and sits 90 s below
+/// nextest's 120 s kill (`.config/nextest.toml`), so a connect that never
+/// completes fails with its own message before the kill.
+pub const TEST_VALKEY_CONNECT_HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// How long [`connect_test_client_or_skip`] tries an optional store
+/// ([`TestValkeyRequirement::Optional`]) before it skips. The caller's own
+/// connect budget applies inside it, unchanged.
+const UNSET_STORE_PROBE: Duration = Duration::from_secs(5);
+
+/// Whether a test that needs a Valkey must reach one, decided from the
+/// environment by [`from_env`](Self::from_env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestValkeyRequirement {
+    /// [`TEST_VALKEY_URL_VAR`] is set, even to an empty value: a store was
+    /// promised, so failing to reach it fails the test.
+    Required,
+    /// [`TEST_VALKEY_URL_VAR`] is unset outside CI: a local run that may have
+    /// no store, so failing to reach one skips the test.
+    Optional,
+}
+
+impl TestValkeyRequirement {
+    /// [`from_vars`](Self::from_vars) on this process's
+    /// [`TEST_VALKEY_URL_VAR`] and `GITLAB_CI`, read on every call.
+    ///
+    /// # Panics
+    ///
+    /// As [`from_vars`](Self::from_vars).
+    pub fn from_env() -> Self {
+        Self::from_vars(env::var_os(TEST_VALKEY_URL_VAR), env::var_os("GITLAB_CI"))
+    }
+
+    /// The requirement given the two variables' values: `Required` when
+    /// `test_valkey_url` is present, `Optional` when both are absent.
+    ///
+    /// # Panics
+    ///
+    /// When `test_valkey_url` is absent and `gitlab_ci` present: a CI job that
+    /// runs store-backed tests without naming its store is broken job wiring,
+    /// and skipping there would turn every such test into a pass nobody sees.
+    pub fn from_vars(test_valkey_url: Option<OsString>, gitlab_ci: Option<OsString>) -> Self {
+        if test_valkey_url.is_some() {
+            return Self::Required;
+        }
+        assert!(
+            gitlab_ci.is_none(),
+            "{TEST_VALKEY_URL_VAR} is unset in a CI job (GITLAB_CI is set) that runs Valkey-backed \
+             tests; the job must set {TEST_VALKEY_URL_VAR} to its Valkey service"
+        );
+        Self::Optional
+    }
+}
+
+/// Connect a bare `ValkeyClient` on `config` through [`connect_test_client`],
+/// for a test that needs a store: `Some` when it connects, `None` (after one
+/// `SKIP:` line) only when the store is optional and did not answer.
+///
+/// The requirement comes from [`TestValkeyRequirement::from_env`]:
+///
+/// - **Required** ([`TEST_VALKEY_URL_VAR`] set): the client is built from a
+///   clone of `config` whose `valkey_connect_timeout_secs` is the hang guard's
+///   ([`TEST_VALKEY_CONNECT_HANG_GUARD`]), and the connect runs inside that
+///   guard, so a slow store is waited for. A connect error or the guard
+///   expiring panics, naming the variable, the URL (credentials removed), the
+///   guard and the error. It never returns `None`.
+///
+///   The returned client keeps that raised budget for its whole lifetime, not
+///   only for this first connect: it is every connection's timeout on a
+///   reconnect, the stream readers' lazy connect and the member replacer's
+///   connect. The caller's own `valkey_connect_timeout_secs` is replaced
+///   without notice, so a test whose subject depends on its connect budget (a
+///   short budget to drive a reconnect path, say) calls
+///   [`connect_test_client`] directly.
+/// - **Optional** (unset outside CI): `config` as given, for at most 5 s; on
+///   failure it prints the `SKIP:` line and returns `None`.
+///
+/// A test that needs two clients joins two calls (`tokio::join!`), so its
+/// connect phase costs one guard, not two.
+///
+/// # Panics
+///
+/// When required and the connect fails, and as
+/// [`TestValkeyRequirement::from_vars`].
+pub async fn connect_test_client_or_skip(config: &Config) -> Option<ValkeyClient> {
+    connect_test_client_or_skip_with(
+        TestValkeyRequirement::from_env(),
+        config,
+        TEST_VALKEY_CONNECT_HANG_GUARD,
+    )
+    .await
+}
+
+/// [`connect_test_client_or_skip`] with the requirement and the required
+/// mode's hang guard given, so this module's tests drive both modes without
+/// touching the process environment. `hang_guard` bounds the required mode
+/// only; the optional mode is bounded by [`UNSET_STORE_PROBE`].
+async fn connect_test_client_or_skip_with(
+    requirement: TestValkeyRequirement,
+    config: &Config,
+    hang_guard: Duration,
+) -> Option<ValkeyClient> {
+    let url = crate::storage::client::redact_url_credentials(&config.valkey_url);
+    match requirement {
+        TestValkeyRequirement::Required => {
+            // `ValkeyClient::connect` enforces the connect budget on each of
+            // its phases, so the guard alone would still fail a slow connect
+            // at the caller's (shorter) budget: raise it to match. The client
+            // keeps the raised budget for its lifetime (reconnects, the stream
+            // readers' lazy connect, member replacement), replacing the
+            // caller's.
+            let mut config = config.clone();
+            config.valkey_connect_timeout_secs = hang_guard.as_secs().max(1);
+            match tokio::time::timeout(hang_guard, connect_test_client(&config)).await {
+                Ok(Ok(client)) => Some(client),
+                Ok(Err(e)) => panic!(
+                    "{TEST_VALKEY_URL_VAR} is set, so this test requires Valkey, but the \
+                     connect to {url} failed within the {hang_guard:?} hang guard: {e}"
+                ),
+                Err(_elapsed) => panic!(
+                    "{TEST_VALKEY_URL_VAR} is set, so this test requires Valkey, but the \
+                     connect to {url} did not complete within the {hang_guard:?} hang guard"
+                ),
+            }
+        }
+        TestValkeyRequirement::Optional => {
+            let failure =
+                match tokio::time::timeout(UNSET_STORE_PROBE, connect_test_client(config)).await {
+                    Ok(Ok(client)) => return Some(client),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_elapsed) => format!("no answer within {UNSET_STORE_PROBE:?}"),
+                };
+            eprintln!(
+                "SKIP: {TEST_VALKEY_URL_VAR} is unset and no Valkey answered at {url} \
+                 ({failure}); set {TEST_VALKEY_URL_VAR} to run this test"
+            );
+            None
+        }
+    }
+}
+
+/// The variable naming the multi-shard Valkey Cluster the cluster-gated tests
+/// run against. CI's `test-cluster:` and `test-cluster-disruptive:` jobs set
+/// it; read it only through [`test_cluster_url`].
+pub const TEST_CLUSTER_URL_VAR: &str = "LIVE_EDIT_TEST_CLUSTER_URL";
+
+/// The name rule for a test that reads [`TEST_CLUSTER_URL_VAR`]: its full
+/// nextest name (module path included) contains one of these. `cluster`
+/// selects it into CI's `test-cluster:` job; `disruptive` is the
+/// `#[ignore]`d family the `test-cluster-disruptive:` job runs by name.
+pub const CLUSTER_GATED_NAME_MARKS: [&str; 2] = ["cluster", "disruptive"];
+
+/// The filterset CI's `test-cluster:` job selects with: the name rule
+/// [`CLUSTER_GATED_NAME_MARKS`] states, as nextest regexes. Every other test
+/// runs in the `test:` job alone. The CI-wiring fence in
+/// `tests/integration/storage/b_289_tests.rs` holds the job to this string.
+pub const CLUSTER_GATED_FILTERSET: &str = "test(/cluster/) | test(/disruptive/)";
+
+/// [`TEST_CLUSTER_URL_VAR`], or `None` when it is unset.
+///
+/// Under nextest it first checks the calling test's name against
+/// [`CLUSTER_GATED_NAME_MARKS`] and panics on a miss, whether the variable is
+/// set or not. CI's `test:` job runs every test without a cluster, so a
+/// cluster-gated test named outside the rule fails there, rather than being
+/// left out of `test-cluster:`'s [`CLUSTER_GATED_FILTERSET`] and never
+/// reaching a cluster.
+pub fn test_cluster_url() -> Option<String> {
+    if let Err(problem) = cluster_gated_name_problem(
+        env::var("NEXTEST").ok().as_deref(),
+        env::var("NEXTEST_TEST_NAME").ok().as_deref(),
+    ) {
+        panic!("{problem}");
+    }
+    env::var(TEST_CLUSTER_URL_VAR).ok()
+}
+
+/// [`test_cluster_url`]'s name check, given the `NEXTEST` and
+/// `NEXTEST_TEST_NAME` variables. Outside nextest (`cargo test`) there is no
+/// test name to check. Under nextest the name must be there: nextest sets it
+/// from 0.9.116, and a run without it would pass the check vacuously.
+fn cluster_gated_name_problem(
+    nextest: Option<&str>,
+    test_name: Option<&str>,
+) -> Result<(), String> {
+    if nextest != Some("1") {
+        return Ok(());
+    }
+    let Some(name) = test_name else {
+        return Err(format!(
+            "{TEST_CLUSTER_URL_VAR} is read under nextest without NEXTEST_TEST_NAME (nextest \
+             sets it from 0.9.116), so the cluster-gated name rule cannot be checked; upgrade \
+             cargo-nextest"
+        ));
+    };
+    if CLUSTER_GATED_NAME_MARKS
+        .iter()
+        .any(|mark| name.contains(mark))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "`{name}` reads {TEST_CLUSTER_URL_VAR} but its name contains none of \
+         {CLUSTER_GATED_NAME_MARKS:?}, so CI's `test-cluster:` job (filterset \
+         `{CLUSTER_GATED_FILTERSET}`) would never run it against a cluster. Put `cluster` in \
+         the test's name or its module's"
+    ))
+}
+
+/// The logical database reserved for
+/// `storage::orphan_sweep::tests::scan_keyspace_yields_the_keys_before_a_failed_step_then_one_error_then_nothing`,
+/// whose assertions need a keyspace that holds its own keys alone (what a
+/// walk's first `SCAN` step returns must not depend on other tests' keys).
+/// No other test may select this database; a test that needs a keyspace of
+/// its own takes another number and documents it here beside this one.
+pub const SCAN_STEP_FAULT_TEST_DATABASE: u8 = 11;
+
+/// `TEST_VALKEY_URL` (default `redis://127.0.0.1:6379`, as `TestValkey`'s) on
+/// logical database `db`: any path or query the URL carries is replaced by
+/// `/<db>`. For [`TestValkey::setup_with_url`] on a database a test has
+/// reserved ([`SCAN_STEP_FAULT_TEST_DATABASE`]); standalone stores only.
+pub fn test_valkey_url_on_database(db: u8) -> String {
+    let url = env::var("TEST_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+    let authority = url.find("://").map_or(0, |scheme| scheme + 3);
+    let base = match url[authority..].find(['/', '?']) {
+        Some(end) => &url[..authority + end],
+        None => url.as_str(),
+    };
+    format!("{base}/{db}")
 }
 
 /// Per-test Valkey fixture with isolated key namespace.
@@ -366,10 +607,13 @@ impl TestValkey {
             update_layer_per_object_concurrency: 16,
             update_layer_backend: UpdateLayerBackend::Lua,
             ext_value_verify: crate::config::ExtValueVerifyMode::Enforce,
-            catchup_snapshot_enabled: false,
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: false,
@@ -473,21 +717,26 @@ pub(crate) fn scan_matching(
 /// path is preserved verbatim — the slot-grouping cost only materializes
 /// when `is_clustered()` is true.
 ///
-/// **Every round trip is bounded, not the whole walk.** `SCAN MATCH <prefix>*`
-/// walks the entire keyspace, which other tests and sessions share, so the
-/// number of round trips grows with the database and no total bound is right
-/// for all of them. What a broken client looks like is a single step that is
-/// never answered — `cleanup_keys` scans through `pool.next()`, and when that
-/// member's fred router task has ended, a cluster-wide `scan_cluster_buffered`
-/// is never answered and fred's command timeout does not bound it. So each
-/// step (each `stream.next()`, which waits for a `SCAN` page only when the
-/// buffer is empty, and each `UNLINK`) gets [`CLEANUP_STEP_BUDGET`]. A step
-/// that times out, or that fred itself fails with a `Timeout`, is reported as
-/// `Err` naming it; any other error ends the cleanup as best effort, as before.
+/// **Every step is bounded, not the whole walk.** `SCAN MATCH <prefix>*`
+/// walks the entire keyspace, which other tests and sessions share: about
+/// `DBSIZE / CLEANUP_SCAN_COUNT` pages ([`CLEANUP_SCAN_COUNT`]), plus one
+/// `UNLINK` per 100 of this test's keys. The number of round trips grows with
+/// the database, so no total bound is right for all of them. What a broken
+/// client looks like is a step that is never answered — `cleanup_keys` scans
+/// through `pool.next()`, and when that member's fred router task has ended, a
+/// cluster-wide `scan_cluster_buffered` is never answered and fred's command
+/// timeout does not bound it. So each step gets [`CLEANUP_STEP_BUDGET`]: each
+/// `UNLINK`, and each `stream.next()`, which waits for the walk's next
+/// matching key or its end. A page carries only the keys that match, and fred
+/// fetches the next page in the background, so one `stream.next()` spans every
+/// page with no match before the next one: on a large database, several round
+/// trips. A step that times out, or that fred itself fails with a `Timeout`,
+/// is reported as `Err` naming it; any other error ends the cleanup as best
+/// effort, as before.
 async fn cleanup_keys(pool: &fred::clients::Pool, pattern: &str) -> Result<(), String> {
     let client = pool.next();
     let is_clustered = client.is_clustered();
-    let mut stream = scan_matching(client, pattern, 100);
+    let mut stream = scan_matching(client, pattern, CLEANUP_SCAN_COUNT);
     let mut batch = Vec::with_capacity(100);
 
     loop {
@@ -570,11 +819,100 @@ async fn unlink_batch(
     Ok(())
 }
 
+/// Why [`block_on_spawned`] returned no value.
+#[derive(Debug)]
+pub enum SpawnedTaskEnded {
+    /// The future panicked; this is its panic payload.
+    Panicked(Box<dyn std::any::Any + Send + 'static>),
+    /// The task ended without reporting, so the future was dropped before it
+    /// finished: the runtime is shutting down, and either refused the task at
+    /// spawn (a closed runtime shuts a new task down at once) or cancelled it.
+    NeverReported,
+}
+
+/// Run `fut` to completion from synchronous code on a multi-thread runtime
+/// and return its output, without consuming a wake-up meant for another
+/// future on the calling thread.
+///
+/// `fut` is spawned on `handle`, and the calling thread waits for its outcome
+/// on a `std::sync::mpsc` channel inside `tokio::task::block_in_place`.
+///
+/// - **Why not a nested `Handle::block_on`.** A thread already inside a
+///   `block_on` (a `#[tokio::test]` body, say) parks on tokio's thread-local
+///   parker, which holds one pending wake at most. A second `block_on` on the
+///   same thread parks on that same parker, so a wake meant for the outer
+///   `block_on` — a sibling future's timer firing inside a `join_all` — is
+///   consumed by the inner park. The outer `block_on` then parks with nothing
+///   left to wake it. tokio's `blocking_recv` parks on the same parker, so it
+///   has the same flaw. A std channel's `recv` parks with std thread parking,
+///   which tokio's parker does not use, so a wake that arrives while this
+///   waits stays pending for the outer `block_on`.
+/// - **Why `block_in_place`.** On a runtime worker it hands the worker's core
+///   (its LIFO slot included) to another thread before blocking, so the
+///   spawned task, and every other task, still runs while this thread waits,
+///   even on a runtime with one worker. Off a worker, in a multi-thread
+///   runtime's `block_on`, it only leaves the runtime context.
+/// - **Outcome.** `Ok` with the output; [`SpawnedTaskEnded::Panicked`] when
+///   `fut` panicked (caught with `catch_unwind`, so the payload reaches the
+///   caller rather than ending the task silently);
+///   [`SpawnedTaskEnded::NeverReported`] when the task was dropped before it
+///   reported, which only a runtime shutting down does. The wait itself has
+///   no bound: it lasts as long as `fut` does, so bound the awaits in `fut`.
+///
+/// `fut` is spawned only once `block_in_place` has accepted the calling
+/// context, so nothing is left running when it refuses one.
+///
+/// # Panics
+///
+/// Where `block_in_place` panics: on a current-thread runtime, and inside a
+/// `LocalSet`.
+pub fn block_on_spawned<F>(
+    handle: &tokio::runtime::Handle,
+    fut: F,
+) -> Result<F::Output, SpawnedTaskEnded>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    use futures::FutureExt;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let received = tokio::task::block_in_place(|| {
+        // The task owns the only sender, so `recv` returns once the task has
+        // reported or has been dropped without reporting — and in each case
+        // only after `fut`, and whatever it owns, is gone: the awaited
+        // `catch_unwind` future is a temporary dropped at the end of its
+        // statement, before the send; a task cancelled mid-run drops its
+        // locals in reverse order, `fut` before `tx`; a task refused at spawn
+        // is dropped inside `spawn`, before `recv` starts. The `JoinHandle` is
+        // not needed: dropping it detaches the task.
+        drop(handle.spawn(async move {
+            let tx = tx;
+            let fut = std::panic::AssertUnwindSafe(fut);
+            let outcome = fut.catch_unwind().await;
+            let _ = tx.send(outcome);
+        }));
+        rx.recv()
+    });
+    match received {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(payload)) => Err(SpawnedTaskEnded::Panicked(payload)),
+        Err(std::sync::mpsc::RecvError) => Err(SpawnedTaskEnded::NeverReported),
+    }
+}
+
+/// The message of a panic payload, for reporting a caught panic.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s
+    } else {
+        "a panic with a non-string payload"
+    }
+}
+
 impl Drop for TestValkey {
     fn drop(&mut self) {
-        let pool = self.client.pool.clone();
-        let prefix = self.prefix.clone();
-
         // Guards:
         // - No current runtime: rare but possible (e.g. Drop from a synchronous
         //   teardown path). Skip the async cleanup — the test-prefix keys will
@@ -591,12 +929,13 @@ impl Drop for TestValkey {
             return;
         }
 
-        // Every round trip of the cleanup is bounded (see `cleanup_keys`), so a
-        // step that is never answered — a pooled client whose router task has
+        // Every step of the cleanup is bounded (see `cleanup_keys`), so a step
+        // that is never answered — a pooled client whose router task has
         // ended — gives up instead of hanging the test until nextest kills it,
         // which would also swallow the panic message of the test failure that
         // left the client broken. The walk as a whole is not bounded: it is as
-        // long as the shared keyspace is large.
+        // long as the shared keyspace is large, one `SCAN` page per
+        // `CLEANUP_SCAN_COUNT` keys.
         //
         // A test that is already failing (unwinding) only reports the stuck
         // step: a panic in `Drop` while panicking would abort the process and
@@ -604,53 +943,164 @@ impl Drop for TestValkey {
         // here: it left a pooled client unable to answer, and that must not
         // pass silently. Either way the keys left behind are only under this
         // test's unique prefix, which nothing else reads.
-        let pattern = format!("{prefix}*");
-        let cleaned = tokio::task::block_in_place(|| {
-            rt_handle.block_on(async { cleanup_keys(&pool, &pattern).await })
+        //
+        // The cleanup and the quit run as one task spawned on this runtime,
+        // and this thread waits for its outcome on a std channel
+        // ([`block_on_spawned`]), never in a nested `Handle::block_on`. A
+        // fixture is often dropped on a thread already inside a `block_on` —
+        // a `#[tokio::test]` body, beside sibling futures in a `join_all` — and
+        // a nested `block_on` parks on that thread's tokio parker, consuming
+        // a sibling's timer wake-up and leaving the outer `block_on` parked
+        // for good. The wait has no bound of its own: it lasts as long as the
+        // task, whose every await is bounded as above (and which a runtime
+        // shutdown cancels, ending the wait at once).
+        let pattern = format!("{}*", self.prefix);
+        let task_pattern = pattern.clone();
+        let pool = self.client.pool.clone();
+        let client = self.client.clone();
+        let outcome = block_on_spawned(&rt_handle, async move {
+            let cleaned = cleanup_keys(&pool, &task_pattern).await;
+            // Then quit the fixture's client, bounded, so its connections
+            // close with a `QUIT` while this test's runtime still runs their
+            // routers. Without it, the client's last owner dropping still
+            // stops its fan-out threads and the snapshot lane's routers on
+            // `snapshot-io` (`storage::fanout_thread`), and the other pools'
+            // routers end with this test's runtime.
+            let quit = tokio::time::timeout(FIXTURE_QUIT_BUDGET, client.quit()).await;
+            // Release the clones before reporting, so the fixture's own
+            // `client` field stays the client's last owner and is dropped on
+            // the dropping thread, after this `drop` returns.
+            drop(client);
+            drop(pool);
+            (cleaned, quit.is_ok())
         });
-        // Then quit the fixture's client, bounded, so its connections close
-        // with a `QUIT` while this test's runtime still runs their routers.
-        // Without it, the client's last owner dropping still stops its
-        // fan-out threads and the snapshot lane's routers on `snapshot-io`
-        // (`storage::fanout_thread`), and the other pools' routers end with
-        // this test's runtime.
-        let quit = tokio::task::block_in_place(|| {
-            rt_handle.block_on(tokio::time::timeout(
-                FIXTURE_QUIT_BUDGET,
-                self.client.quit(),
-            ))
-        });
-        if quit.is_err() {
-            eprintln!(
-                "TestValkey: the fixture client's quit for `{pattern}` did not finish within \
-                 {FIXTURE_QUIT_BUDGET:?}; its connections close without a `QUIT`"
-            );
-        }
-        if let Err(step) = cleaned {
-            let message = format!(
-                "TestValkey: key cleanup for `{pattern}` stopped — {step}; leaving those keys \
-                 behind — a pooled client can no longer answer"
-            );
-            if std::thread::panicking() {
-                eprintln!("{message}");
-            } else {
+        match fixture_drop_action(outcome, &pattern, std::thread::panicking()) {
+            FixtureDropAction::Report(lines) => {
+                for line in lines {
+                    eprintln!("{line}");
+                }
+            }
+            FixtureDropAction::Panic { report, message } => {
+                for line in report {
+                    eprintln!("{line}");
+                }
                 panic!("{message}");
             }
+            FixtureDropAction::ResumeUnwind(payload) => std::panic::resume_unwind(payload),
         }
     }
 }
 
-/// Bound on each round trip of [`TestValkey`]'s drop-time key cleanup: one
-/// `SCAN` page or one `UNLINK` (see [`cleanup_keys`]). The number of round
-/// trips grows with the shared keyspace, so the walk as a whole has no bound;
-/// one step that is not answered within this means a pooled client can no
-/// longer answer. A test that is otherwise passing then fails in `Drop` (a
+/// What [`TestValkey`]'s drop does once its cleanup task has ended: the pure
+/// decision [`fixture_drop_action`] makes, which `Drop` then carries out.
+#[derive(Debug)]
+pub enum FixtureDropAction {
+    /// Write each line to stderr, in order, and return. Empty when there is
+    /// nothing to report.
+    Report(Vec<String>),
+    /// Write each `report` line to stderr, in order, then panic with
+    /// `message` (failing the test).
+    Panic {
+        /// Lines written to stderr before the panic.
+        report: Vec<String>,
+        /// The panic's message.
+        message: String,
+    },
+    /// Re-raise the cleanup task's own panic with
+    /// `std::panic::resume_unwind`, so the test fails with that payload.
+    ResumeUnwind(Box<dyn std::any::Any + Send + 'static>),
+}
+
+/// Map the outcome of [`TestValkey`]'s drop-time task to what the drop does,
+/// with no I/O, so every leg is testable without a store.
+///
+/// `outcome` is [`block_on_spawned`]'s result for the task: on `Ok`, the
+/// cleanup's result (`Err` names the step that stopped) and whether the quit
+/// finished within its budget. `pattern` is the fixture's key pattern, named
+/// in every message. `panicking` is `std::thread::panicking()` on the dropping
+/// thread: a test that is already failing only reports, because a panic in
+/// `Drop` while unwinding would abort the process and lose the first failure.
+///
+/// - `Ok`: a quit that ran out of time is reported; a stopped cleanup panics,
+///   or is reported when `panicking`.
+/// - [`SpawnedTaskEnded::Panicked`]: re-raised, or reported when `panicking`.
+/// - [`SpawnedTaskEnded::NeverReported`]: only a runtime shutting down drops
+///   the task unreported (refused at spawn, or cancelled); nothing is wrong
+///   with the test, so this is reported and never fails it.
+pub fn fixture_drop_action(
+    outcome: Result<(Result<(), String>, bool), SpawnedTaskEnded>,
+    pattern: &str,
+    panicking: bool,
+) -> FixtureDropAction {
+    match outcome {
+        Ok((cleaned, quit_finished)) => {
+            let mut report = Vec::new();
+            if !quit_finished {
+                report.push(format!(
+                    "TestValkey: the fixture client's quit for `{pattern}` did not finish \
+                     within {FIXTURE_QUIT_BUDGET:?}; its connections close without a `QUIT`"
+                ));
+            }
+            let Err(step) = cleaned else {
+                return FixtureDropAction::Report(report);
+            };
+            let message = format!(
+                "TestValkey: key cleanup for `{pattern}` stopped — {step}; leaving those keys \
+                 behind — a pooled client can no longer answer"
+            );
+            if panicking {
+                report.push(message);
+                FixtureDropAction::Report(report)
+            } else {
+                FixtureDropAction::Panic { report, message }
+            }
+        }
+        Err(SpawnedTaskEnded::Panicked(payload)) => {
+            if panicking {
+                FixtureDropAction::Report(vec![format!(
+                    "TestValkey: the drop-time cleanup or quit for `{pattern}` panicked — {}; \
+                     keys under that prefix may be left behind",
+                    panic_message(&*payload)
+                )])
+            } else {
+                FixtureDropAction::ResumeUnwind(payload)
+            }
+        }
+        Err(SpawnedTaskEnded::NeverReported) => FixtureDropAction::Report(vec![format!(
+            "TestValkey: the drop-time cleanup or quit for `{pattern}` did not run to the end \
+             — the test's runtime is shutting down; keys under that prefix may be left behind"
+        )]),
+    }
+}
+
+/// Bound on each step of [`TestValkey`]'s drop-time key cleanup: one `UNLINK`,
+/// or one wait for the walk's next matching key or its end, which spans every
+/// `SCAN` page with no match in between (see [`cleanup_keys`]). The number of
+/// round trips grows with the shared keyspace, so the walk as a whole has no
+/// bound; one step that is not answered within this means a pooled client can
+/// no longer answer. A test that is otherwise passing then fails in `Drop` (a
 /// panic), and one that is already failing only reports it on stderr.
+///
+/// Because a step can span many pages, a slow but answering server can also
+/// run a step past this bound; the larger [`CLEANUP_SCAN_COUNT`] is, the
+/// fewer pages a step spans, and the less likely that is.
 ///
 /// Meant to equal the fixture's `valkey_command_timeout_ms: 5000` (both
 /// `Config` literals in this file): a step fred times out is reported the same
 /// way as one this bound times out. Changing one means changing the other.
 const CLEANUP_STEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The `SCAN` page hint of [`TestValkey`]'s drop-time key cleanup
+/// ([`cleanup_keys`]).
+///
+/// The cleanup walks the whole shared database for its own prefix, so a walk
+/// takes about `DBSIZE / CLEANUP_SCAN_COUNT` round trips, and the server
+/// visits every key once per walk whatever the page size. On a contended CI
+/// runner a cleanup's cost is its round trips, so a large page cuts that cost
+/// and the number of pages one [`CLEANUP_STEP_BUDGET`] step can span; it costs
+/// only a longer hold of the server per call. The `UNLINK` batch is 100: it
+/// counts this test's own keys, not the database's.
+const CLEANUP_SCAN_COUNT: u32 = 5_000;
 
 /// Bound on [`TestValkey`]'s drop-time `quit()` of its client. `quit()`
 /// bounds each of its own steps; this caps the whole, so a client a test left
@@ -947,22 +1397,33 @@ impl TestValkey {
 /// multi-thread runtime worker — a fan-out sink, say — blocking the caller
 /// until the store has it, so its next step cannot run before the push lands.
 ///
-/// It bridges into the runtime (`block_in_place` + `block_on`), which is why it
-/// lives here: this file is compiled only for tests, and is the one file under
-/// `src/` the blocking-bridge fence
+/// It bridges into the runtime through [`block_on_spawned`] (a spawned task
+/// and `block_in_place`, never a nested `block_on`, so no wake-up meant for
+/// another future on the calling thread is lost), which is why it lives here:
+/// this file is compiled only for tests, and is the one file under `src/` the
+/// blocking-bridge fence
 /// (`stream_consumer_test::no_production_code_under_src_blocks_a_runtime_worker`)
-/// exempts. Panics on a current-thread runtime.
+/// exempts. Panics when the push fails or does not run to the end (the
+/// runtime is shutting down), outside a runtime, and on a current-thread
+/// runtime.
 pub fn rpush_blocking(client: &ValkeyClient, key: &str, value: &str) {
     use fred::interfaces::ListInterface;
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let _: i64 = client
-                .pool
-                .rpush(key, value)
-                .await
-                .expect("RPUSH from a blocking test sink must succeed");
-        })
+    let pool = client.pool.clone();
+    let key = key.to_owned();
+    let value = value.to_owned();
+    let pushed = block_on_spawned(&tokio::runtime::Handle::current(), async move {
+        let _: i64 = pool
+            .rpush(key, value)
+            .await
+            .expect("RPUSH from a blocking test sink must succeed");
     });
+    match pushed {
+        Ok(()) => {}
+        Err(SpawnedTaskEnded::Panicked(payload)) => std::panic::resume_unwind(payload),
+        Err(SpawnedTaskEnded::NeverReported) => panic!(
+            "RPUSH from a blocking test sink did not run to the end: the runtime is shutting down"
+        ),
+    }
 }
 
 /// Release every stall, asserting each held until its release (a non-nil
@@ -975,6 +1436,257 @@ pub async fn release_all(stalls: Vec<ConnStall>) {
             matches!(&result, Ok(v) if !v.is_null()),
             "the stall on connection {id} must have held until its release; got {result:?}"
         );
+    }
+}
+
+// ── Fleet hold marker (SDD SR-4.1) ──────────────────────────────────────────
+
+/// The hold marker [`write_hold_marker`] writes: every one of its five fields
+/// (`storage::dr_hold::MARKER_FIELDS`), so every test seeds the same shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HoldMarkerSeed {
+    /// `incident`. Default: `test-<8 hex digits>`, unique per seed.
+    pub incident: String,
+    /// `reason`. Default: `test`.
+    pub reason: String,
+    /// `evidence`. Default: names this helper.
+    pub evidence: String,
+    /// `detected_by`. Default: `test-support`.
+    pub detected_by: String,
+    /// `detected_at_ms`. `None` (the default) writes the store's own clock,
+    /// `TIME` on the marker's node, at the write, never this process's clock;
+    /// `Some(ms)` writes `ms`, for a test that needs a hold detected in the
+    /// past.
+    pub detected_at_ms: Option<u64>,
+}
+
+impl Default for HoldMarkerSeed {
+    fn default() -> Self {
+        Self {
+            incident: format!("test-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            reason: "test".to_owned(),
+            evidence: "written by storage::test_support::write_hold_marker".to_owned(),
+            detected_by: "test-support".to_owned(),
+            detected_at_ms: None,
+        }
+    }
+}
+
+impl HoldMarkerSeed {
+    /// This seed with `incident`.
+    pub fn with_incident(mut self, incident: impl Into<String>) -> Self {
+        self.incident = incident.into();
+        self
+    }
+
+    /// This seed with `reason`.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = reason.into();
+        self
+    }
+
+    /// This seed with `detected_at_ms` fixed at `ms` instead of the store's
+    /// clock.
+    pub fn detected_at(mut self, ms: u64) -> Self {
+        self.detected_at_ms = Some(ms);
+        self
+    }
+}
+
+/// Write the fleet hold marker ([`KeySchema::dr_hold_marker`]) with all five
+/// fields of `seed`, overwriting any it already has, and return the
+/// `detected_at_ms` written. Panics if the store refuses either command.
+///
+/// The service itself never writes the marker in this release; this helper is
+/// how every test holds the fleet. With `seed.detected_at_ms` unset it reads
+/// `TIME` first, pinned to the marker's slot, so the value is the clock of the
+/// node that holds the marker.
+pub async fn write_hold_marker(
+    client: &ValkeyClient,
+    keys: &KeySchema,
+    seed: &HoldMarkerSeed,
+) -> u64 {
+    use crate::storage::dr_hold::{
+        MARKER_FIELD_DETECTED_AT_MS, MARKER_FIELD_DETECTED_BY, MARKER_FIELD_EVIDENCE,
+        MARKER_FIELD_INCIDENT, MARKER_FIELD_REASON,
+    };
+    use fred::interfaces::HashesInterface;
+    let marker = keys.dr_hold_marker();
+    let detected_at_ms = match seed.detected_at_ms {
+        Some(ms) => ms,
+        None => store_time_ms_at(client, &marker).await,
+    };
+    let _: i64 = client
+        .pool
+        .hset(
+            &marker,
+            vec![
+                (MARKER_FIELD_INCIDENT, seed.incident.clone()),
+                (MARKER_FIELD_REASON, seed.reason.clone()),
+                (MARKER_FIELD_EVIDENCE, seed.evidence.clone()),
+                (MARKER_FIELD_DETECTED_AT_MS, detected_at_ms.to_string()),
+                (MARKER_FIELD_DETECTED_BY, seed.detected_by.clone()),
+            ],
+        )
+        .await
+        .expect("HSET of the hold marker must succeed");
+    detected_at_ms
+}
+
+/// Delete the fleet hold marker, ending the hold; returns whether it existed.
+/// Panics if the store refuses the `DEL`.
+pub async fn remove_hold_marker(client: &ValkeyClient, keys: &KeySchema) -> bool {
+    let removed: i64 = client
+        .pool
+        .del(keys.dr_hold_marker())
+        .await
+        .expect("DEL of the hold marker must succeed");
+    removed == 1
+}
+
+/// The store's clock in milliseconds: `TIME`, pinned to `key`'s slot so it
+/// runs on the node that owns `key` (`TIME` is keyless, and fred would
+/// otherwise send it to an arbitrary primary).
+async fn store_time_ms_at(client: &ValkeyClient, key: &str) -> u64 {
+    use fred::types::config::Options;
+    use fred::types::{ClusterHash, CustomCommand, Value};
+    let pin = Options {
+        cluster_hash: Some(ClusterHash::from(key)),
+        ..Default::default()
+    };
+    let reply: Vec<String> = client
+        .pool
+        .next()
+        .with_options(&pin)
+        .custom(
+            CustomCommand::new_static("TIME", ClusterHash::FirstKey, false),
+            Vec::<Value>::new(),
+        )
+        .await
+        .expect("TIME must succeed");
+    match reply.as_slice() {
+        [secs, usecs] => {
+            let secs: u64 = secs.parse().expect("TIME seconds are an integer");
+            let usecs: u64 = usecs.parse().expect("TIME microseconds are an integer");
+            secs * 1000 + usecs / 1000
+        }
+        other => panic!("TIME must reply with two integers, got {other:?}"),
+    }
+}
+
+// ── Lengthened snapshot-fence leases ────────────────────────────────────────
+
+/// [`assert_fence_lease_lengthened`]'s read: the store's `TIME` in whole
+/// milliseconds, then `HGETALL KEYS[1]` (the fence key) as flat field/value
+/// pairs, in one atomic call on the key's slot. Reads only.
+static FENCE_FIELDS_AND_TIME_SCRIPT: std::sync::LazyLock<fred::types::scripts::Script> =
+    std::sync::LazyLock::new(|| {
+        fred::types::scripts::Script::from_lua(
+            "local t = redis.call('TIME') \
+             local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) \
+             local reply = {string.format('%d', now)} \
+             local fields = redis.call('HGETALL', KEYS[1]) \
+             for i = 1, #fields do reply[#reply + 1] = fields[i] end \
+             return reply",
+        )
+    });
+
+/// Assert that the fenced read holding `object_id`'s snapshot fence has a
+/// lengthened lease (`ObjectSnapshotReadFaultInjector::lengthen_fence_leases`):
+/// the fence key's latest live `r:*` deadline, less the store's `TIME`, is
+/// more than `ceil(lease(L))` of `reading`'s production coefficients
+/// ([`crate::storage::snapshot_fence::coefficients`]), with `L` the size the
+/// fence key stores. Panics with the fields read otherwise, or when the key
+/// stores no size or holds no live reader.
+///
+/// `store` issues the reads and `keys` names the key; `reading` is the client
+/// the read ran on. Call it once the read is parked in its held window. A
+/// production lease can never pass: every grant and renewal sets its deadline
+/// at most `ceil(lease(L))` past the store's clock at that moment. So it
+/// catches a lever set on an injector the client no longer has, as when a
+/// fixture installs a fresh injector after the test set it.
+///
+/// The fence key's fields and the store's clock are read in one script call
+/// on the key's slot ([`FENCE_FIELDS_AND_TIME_SCRIPT`]), so no round trip
+/// separates them: the remainder is exactly what the lease has at that
+/// instant, and a loaded runner or store cannot eat into the margin between
+/// the two reads.
+pub async fn assert_fence_lease_lengthened(
+    store: &ValkeyClient,
+    keys: &KeySchema,
+    object_id: u64,
+    reading: &ValkeyClient,
+) {
+    use crate::storage::snapshot_fence::{coefficients, LayerSize};
+    let fence_key = keys.obj_snapshot_fence(&object_id.to_string());
+    let reply: Vec<String> = FENCE_FIELDS_AND_TIME_SCRIPT
+        .evalsha_with_reload(
+            store.pool.next(),
+            vec![fence_key.clone()],
+            Vec::<String>::new(),
+        )
+        .await
+        .expect("reading the snapshot fence and the store's TIME must succeed");
+    let (now_ms, flat) = reply
+        .split_first()
+        .expect("the fence read replies with the store's TIME first");
+    let now_ms: u64 = now_ms
+        .parse()
+        .unwrap_or_else(|_| panic!("the store's TIME must be whole ms; got {now_ms:?}"));
+    assert!(
+        flat.len() % 2 == 0,
+        "HGETALL of the snapshot fence must reply in field/value pairs; got {flat:?}"
+    );
+    let fields: std::collections::HashMap<String, String> = flat
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect();
+    let stored = |field: &str| -> u64 {
+        fields
+            .get(field)
+            .unwrap_or_else(|| {
+                panic!("the fence key {fence_key} must store {field} once granted; {fields:?}")
+            })
+            .parse()
+            .unwrap_or_else(|_| panic!("the fence key's {field} must be an integer; {fields:?}"))
+    };
+    let size = LayerSize {
+        items: stored("size_e"),
+        bytes: stored("size_b"),
+    };
+    let latest_live = fields
+        .iter()
+        .filter(|(name, _)| name.starts_with("r:"))
+        .map(|(name, value)| {
+            value.parse::<u64>().unwrap_or_else(|_| {
+                panic!("fence reader field {name} must hold a deadline in ms; got {value:?}")
+            })
+        })
+        .filter(|deadline| *deadline > now_ms)
+        .max()
+        .unwrap_or_else(|| {
+            panic!("the fence key {fence_key} holds no live reader at {now_ms} ms; {fields:?}")
+        });
+    let remaining_ms = latest_live - now_ms;
+    let production_lease_ms = coefficients(reading).timing(size).lease_ms.ceil() as u64;
+    assert!(
+        remaining_ms > production_lease_ms,
+        "the held read's fence lease has {remaining_ms} ms left by the store's clock, no more \
+         than a production lease at its stored size ({size:?}: {production_lease_ms} ms): set \
+         lengthen_fence_leases(true) on the injector the reading client has now, before the read \
+         acquires; fields: {fields:?}"
+    );
+}
+
+impl TestValkey {
+    /// [`write_hold_marker`] with this fixture's client and prefix.
+    pub async fn write_hold_marker(&self, seed: &HoldMarkerSeed) -> u64 {
+        write_hold_marker(&self.client, &self.key_schema, seed).await
+    }
+
+    /// [`remove_hold_marker`] with this fixture's client and prefix.
+    pub async fn remove_hold_marker(&self) -> bool {
+        remove_hold_marker(&self.client, &self.key_schema).await
     }
 }
 
@@ -1252,8 +1964,12 @@ pub async fn write_commit_token_record(
 /// (`diff_read::read_object_snapshot_slim_charged`, the second
 /// `structural_update` entry point) under `charge`, as a structural WATCH
 /// attempt reads it: the snapshot, or `Ok(None)` when the read stopped
-/// because `charge` could not grow. For a test binary comparing it with
-/// `read_object_snapshot_slim` and the full read (b.26e Stage 2).
+/// because `charge` could not grow. A read whose round 1 came back short of
+/// an index's count (`ChargedSnapshotRead::Incomplete`, which the WATCH
+/// attempt weighs only after its `seq` proof) is `Err(Aborted)` naming the
+/// shortfall: this helper has no proof, and never returns such a state as a
+/// snapshot. For a test binary comparing it with `read_object_snapshot_slim`
+/// and the full read (b.26e Stage 2).
 pub async fn read_object_snapshot_slim_charged_for_test(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -1271,6 +1987,11 @@ pub async fn read_object_snapshot_slim_charged_for_test(
         match read_object_snapshot_slim_charged(client, keys, object_id, &mut allowance).await? {
             ChargedSnapshotRead::Snapshot(snapshot) => Some(*snapshot),
             ChargedSnapshotRead::Stopped { .. } => None,
+            ChargedSnapshotRead::Incomplete { shortfall, .. } => {
+                return Err(crate::error::ServiceError::Aborted(format!(
+                    "charged snapshot read of object {object_id}: {shortfall}"
+                )))
+            }
         },
     )
 }
@@ -1388,6 +2109,118 @@ pub async fn exec_watched_writes_for_test(
     }
 }
 
+/// `OBJECT ENCODING key`: how the store keeps `key` (`listpack`, `skiplist`,
+/// `hashtable`, …), for a test whose subject differs between a compact and a
+/// table-encoded collection, so it can assert the encoding it set up. Panics
+/// when the key is absent or the command fails.
+pub async fn object_encoding_for_test(client: &ValkeyClient, key: &str) -> String {
+    let reply: fred::types::Value = client
+        .pool
+        .next()
+        .custom(
+            fred::types::CustomCommand::new_static(
+                "OBJECT",
+                fred::types::ClusterHash::Offset(1),
+                false,
+            ),
+            vec![
+                fred::types::Value::from("ENCODING"),
+                fred::types::Value::from(key),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("OBJECT ENCODING {key} must succeed: {e}"));
+    reply
+        .as_string()
+        .unwrap_or_else(|| panic!("OBJECT ENCODING {key} answered no encoding: {reply:?}"))
+}
+
+/// The cursor pager (the crate-private `storage::retirement::page_by_cursor`)
+/// over the sorted set `key`, on one client of `client`'s data pool: a
+/// guarded walk (`storage::scan_guard::KeyedWalk`) of `ZSCAN key <cursor>
+/// COUNT count` steps from cursor `"0"` until the store answers `"0"`, each
+/// step sent with one attempt and, after a transient error, retried in place
+/// on an unchanged witness, its witness sent in one pipeline with it (the
+/// first step's start witness too) and checked against the walk's start, as
+/// the periodic reference-count reconcile pass walks its owed sets. Each
+/// step's members are handed to `after_step` and its future awaited before
+/// the next step is issued, so a test can change the set between two steps.
+/// `Ok` with every member the walk returned, in order, repeats included; the
+/// first error ends it: a store fault, a change of serving process
+/// ([`WalkError::Changed`](crate::storage::scan_guard::WalkError::Changed))
+/// or a missing witness.
+pub async fn zscan_members_by_cursor_for_test<F, Fut>(
+    client: &ValkeyClient,
+    key: &str,
+    count: u64,
+    after_step: F,
+) -> Result<Vec<String>, crate::storage::scan_guard::WalkError>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use crate::storage::retirement::{page_by_cursor, scan_step_firsts, CursorPageReader};
+    use crate::storage::scan_guard::{
+        GuardedStep, KeyedWalk, WalkError, Witness, WALK_STEP_ATTEMPTS,
+    };
+
+    struct Steps<'a, F> {
+        walk: KeyedWalk<'a>,
+        count: u64,
+        after_step: F,
+        returned: Vec<String>,
+    }
+
+    impl<F, Fut> CursorPageReader for Steps<'_, F>
+    where
+        F: FnMut(Vec<String>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        type Error = WalkError;
+        type Member = String;
+
+        async fn read_step(
+            &mut self,
+            cursor: &str,
+            start: Option<&Witness>,
+        ) -> Result<GuardedStep<String>, WalkError> {
+            let step = self
+                .walk
+                .step(cursor, self.count, start, WALK_STEP_ATTEMPTS)
+                .await?;
+            let key = self.walk.key();
+            step.try_map_members(|elements| {
+                let elements: Vec<String> = fred::types::Value::Array(elements).convert()?;
+                scan_step_firsts("ZSCAN", key, elements)
+            })
+            .map_err(|source| WalkError::Step {
+                walk: "ZSCAN",
+                target: std::sync::Arc::from(key),
+                source,
+            })
+        }
+
+        fn changed(&self, start: &Witness, later: &Witness) -> WalkError {
+            WalkError::changed(self.walk.change(start, later))
+        }
+
+        async fn take_page(&mut self, members: Vec<String>) -> Result<(), WalkError> {
+            (self.after_step)(members.clone()).await;
+            self.returned.extend(members);
+            Ok(())
+        }
+    }
+
+    let mut steps = Steps {
+        walk: KeyedWalk::new(client.pool.next(), "ZSCAN", key),
+        count,
+        after_step,
+        returned: Vec::new(),
+    };
+    page_by_cursor(&mut steps).await?;
+    Ok(steps.returned)
+}
+
 /// One `name=value` field of a `CLIENT LIST` line; empty when absent.
 fn client_list_field(line: &str, name: &str) -> String {
     line.split_whitespace()
@@ -1399,6 +2232,50 @@ fn client_list_field(line: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_gated_name_check_accepts_a_marked_name_and_refuses_an_unmarked_one() {
+        assert_eq!(
+            cluster_gated_name_problem(Some("1"), Some("storage::gc_test::cluster_gc_spreads")),
+            Ok(())
+        );
+        assert_eq!(
+            cluster_gated_name_problem(Some("1"), Some("storage::cluster_subscriber_test::a")),
+            Ok(()),
+            "a mark in the module path counts: nextest's name includes it"
+        );
+        assert_eq!(
+            cluster_gated_name_problem(Some("1"), Some("storage::x::stream_mux_disruptive_a")),
+            Ok(())
+        );
+        let refusal = cluster_gated_name_problem(Some("1"), Some("storage::b_ji8_tests::watch"))
+            .expect_err("a name with no mark is refused");
+        assert!(
+            refusal.contains("`storage::b_ji8_tests::watch`")
+                && refusal.contains(CLUSTER_GATED_FILTERSET),
+            "the refusal names the test and the filterset it misses: {refusal}"
+        );
+    }
+
+    #[test]
+    fn cluster_gated_name_check_needs_the_name_under_nextest_only() {
+        assert!(
+            cluster_gated_name_problem(Some("1"), None).is_err(),
+            "under nextest a missing name would pass vacuously"
+        );
+        assert_eq!(cluster_gated_name_problem(None, None), Ok(()));
+        assert_eq!(cluster_gated_name_problem(None, Some("anything")), Ok(()));
+    }
+
+    #[test]
+    fn cluster_gated_filterset_is_the_name_marks_as_nextest_regexes() {
+        let from_marks = CLUSTER_GATED_NAME_MARKS
+            .iter()
+            .map(|mark| format!("test(/{mark}/)"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(CLUSTER_GATED_FILTERSET, from_marks);
+    }
 
     // ── b.1kf TestValkey setup-semaphore contract ────────────────────────
     //
@@ -1479,10 +2356,10 @@ mod tests {
     // pool on return (so a long-running test process doesn't slowly leak
     // permits down to zero).
     //
-    // Follows the `maybe_connect` skip-on-unreachable pattern from
-    // `tests/integration/storage/client_test.rs` so the test runs cleanly
-    // in environments without a live Valkey (host shells without
-    // `dev-valkey.sh up`, CI stages that skip the storage suite, etc.).
+    // The happy-path test needs its store through
+    // `connect_test_client_or_skip`: with `TEST_VALKEY_URL` set an
+    // unreachable store fails it, and only an unset variable outside CI
+    // (a host shell without `dev-valkey.sh up`) skips it.
 
     fn minimal_test_config(valkey_url: String) -> Config {
         // Mirrors the `Config` `TestValkey::setup_with_url` builds, with
@@ -1569,10 +2446,13 @@ mod tests {
             update_layer_per_object_concurrency: 16,
             update_layer_backend: UpdateLayerBackend::Lua,
             ext_value_verify: crate::config::ExtValueVerifyMode::Enforce,
-            catchup_snapshot_enabled: false,
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: false,
@@ -1605,39 +2485,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_test_client_returns_ok_on_happy_path() {
         // Drive `connect_test_client` end-to-end: acquire a permit, run
-        // the connect handshake, release the permit, return an `Ok` client.
-        // Skips on environments without a reachable Valkey (matches the
-        // `maybe_connect` pattern from `tests/integration/storage/
-        // client_test.rs`) so the test does not flag host shells without
-        // `dev-valkey.sh up` running.
+        // the connect handshake, release the permit, return an `Ok` client,
+        // reached through `connect_test_client_or_skip`: with
+        // `TEST_VALKEY_URL` set a failed connect fails the test, and only an
+        // unset variable outside CI skips it.
         let valkey_url =
-            env::var("TEST_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            env::var(TEST_VALKEY_URL_VAR).unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let config = minimal_test_config(valkey_url);
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            connect_test_client(&config),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(_client)) => { /* happy path — helper drove a successful connect */ }
-            Ok(Err(_)) => {
-                // Valkey not reachable at the configured URL. Skip rather
-                // than fail — this test runs in environments with and
-                // without a live Valkey (sandbox vs. host-without-dev-valkey).
-                eprintln!(
-                    "connect_test_client_returns_ok_on_happy_path: \
-                     Valkey not reachable, skipping"
-                );
-            }
-            Err(_) => panic!(
-                "connect_test_client did not return within 10 s; the \
-                 helper must respect the configured \
-                 valkey_connect_timeout_secs (30 s) but our outer 10 s \
-                 budget should still complete fast on a reachable Valkey"
-            ),
-        }
+        let Some(_client) = connect_test_client_or_skip(&config).await else {
+            return;
+        };
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1653,7 +2511,7 @@ mod tests {
         // The semaphore is a *process-global* singleton shared with every
         // other `#[cfg(test)]` `--lib` test that routes through
         // `connect_test_client` (e.g. `observability::health`'s
-        // `maybe_connect`). A before/after gauge of `available_permits()`
+        // `real_valkey`). A before/after gauge of `available_permits()`
         // is therefore racy: a concurrent test may legitimately hold a
         // permit at the instant we sample, dipping the count without any
         // leak. We instead drive a real leak's *monotonic* signature — a
@@ -1663,9 +2521,17 @@ mod tests {
         // sequential acquire/connect/release cycles the pool is still
         // non-empty (and a permit is still acquirable) even with a few
         // transient concurrent holders, since pool size is 16.
+        //
+        // The subject is the permit, not the connect, so the connect's result
+        // is ignored and its budget is 1 s: against an unreachable store the
+        // cycles end in about 32 s, well inside nextest's 120 s kill, where
+        // the fixture's 30 s budget (cut at 10 s) would reach it.
         let valkey_url =
-            env::var("TEST_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
-        let config = minimal_test_config(valkey_url);
+            env::var(TEST_VALKEY_URL_VAR).unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let config = Config {
+            valkey_connect_timeout_secs: 1,
+            ..minimal_test_config(valkey_url)
+        };
 
         for _ in 0..(2 * TEST_VALKEY_SETUP_PERMITS) {
             let _ = tokio::time::timeout(
@@ -1697,5 +2563,273 @@ mod tests {
         // Drop the guard explicitly to release the permit we just took back
         // to the pool — this test must not itself leak a permit.
         drop(acquired);
+    }
+
+    // ── b.phh connect_test_client_or_skip: a required store fails, never skips ──
+    //
+    // The tests drive `connect_test_client_or_skip_with` with the requirement
+    // given, so they cover both modes without touching the process
+    // environment. Only the stall test needs a store, and it reaches it
+    // through `connect_test_client_or_skip` like any other caller.
+
+    /// How long the stall test's forwarder waits before its first accept:
+    /// above the old 5 s bounds (the outer timeout and the callers' 5 s
+    /// connect budget), and below fred's 10 s `internal_command_timeout`, so
+    /// the setup command written into the stalled connection is still
+    /// answered once the forwarder starts relaying it.
+    const ACCEPT_STALL: Duration = Duration::from_secs(7);
+
+    /// An address no store listens on, so a connect to it is refused at once.
+    const UNREACHABLE_STORE_URL: &str = "redis://127.0.0.1:1";
+
+    /// The store's `host:port`, and `url` with its host moved to loopback, when
+    /// `url` is a plain `redis://` URL a TCP forwarder can stand in for (not
+    /// TLS, not a cluster). The copy keeps the scheme, credentials and
+    /// database; the caller sets its port.
+    fn plain_redis_target(url: &str) -> Option<(String, url::Url)> {
+        let parsed = url::Url::parse(url)
+            .ok()
+            .filter(|u| u.scheme() == "redis")?;
+        let store_addr = format!("{}:{}", parsed.host_str()?, parsed.port().unwrap_or(6379));
+        let mut proxy = parsed;
+        proxy.set_host(Some("127.0.0.1")).ok()?;
+        Some((store_addr, proxy))
+    }
+
+    /// A required store whose connect cannot finish for [`ACCEPT_STALL`] (7 s,
+    /// past the old 5 s outer timeout and 5 s connect budget) is waited for,
+    /// and the helper returns its client. The stall is a TCP forwarder in
+    /// front of the store that sleeps before its first accept: the client's
+    /// TCP connect completes in the listen backlog, and its setup command
+    /// gets no reply until the forwarder starts relaying.
+    ///
+    /// The caller's config carries a 5 s connect budget, as
+    /// `common::test_config()` does, so the test also fails if the helper
+    /// stops raising the budget to its hang guard. Slow by design (about 7 s):
+    /// the only test in the suite that pays the stall.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_test_client_or_skip_when_required_waits_out_a_connect_stall_past_the_old_five_second_bound(
+    ) {
+        let store_url =
+            env::var(TEST_VALKEY_URL_VAR).unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        // The test's own need for a store: required when the variable is set,
+        // a skip only when it is unset outside CI.
+        let Some(probe) =
+            connect_test_client_or_skip(&minimal_test_config(store_url.clone())).await
+        else {
+            return;
+        };
+        probe.quit().await;
+        let Some((store_addr, mut proxy_url)) = plain_redis_target(&store_url) else {
+            eprintln!(
+                "SKIP: {TEST_VALKEY_URL_VAR} is not a plain redis://host:port URL, so this test \
+                 cannot put a TCP forwarder in front of the store"
+            );
+            return;
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the forwarder must bind a loopback port");
+        let proxy_port = listener
+            .local_addr()
+            .expect("the forwarder's listener must have an address")
+            .port();
+        proxy_url
+            .set_port(Some(proxy_port))
+            .expect("a redis:// URL with a host takes a port");
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // The clock starts before the forwarder's sleep does, so no connect
+        // through it can complete in less than the stall.
+        let started = tokio::time::Instant::now();
+        let forwarder = tokio::spawn({
+            let accepted = Arc::clone(&accepted);
+            async move {
+                // The injected stall itself, not a wait on another task.
+                tokio::time::sleep(ACCEPT_STALL).await;
+                // Held by this task, so aborting it ends every relay too.
+                let mut relays = tokio::task::JoinSet::new();
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let store_addr = store_addr.clone();
+                    relays.spawn(async move {
+                        if let Ok(mut outbound) = tokio::net::TcpStream::connect(&store_addr).await
+                        {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                    });
+                }
+            }
+        });
+
+        let config = Config {
+            valkey_connect_timeout_secs: 5,
+            ..minimal_test_config(proxy_url.to_string())
+        };
+        let client = connect_test_client_or_skip_with(
+            TestValkeyRequirement::Required,
+            &config,
+            TEST_VALKEY_CONNECT_HANG_GUARD,
+        )
+        .await
+        .expect("a required store returns its client or panics; it never returns None");
+        let elapsed = started.elapsed();
+
+        assert!(
+            accepted.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the client connected through the stalled forwarder"
+        );
+        assert!(
+            elapsed >= ACCEPT_STALL,
+            "the connect completed after {elapsed:?}, before the forwarder's {ACCEPT_STALL:?} \
+             stall ended, so it was never held up by it"
+        );
+        client.quit().await;
+        forwarder.abort();
+    }
+
+    /// The panic message of a required-mode connect on `config` under
+    /// `hang_guard`, failing the calling test if the helper returns instead
+    /// (a `None` is the silent skip every caller would take).
+    async fn required_connect_panic_message(config: &Config, hang_guard: Duration) -> String {
+        use futures::FutureExt;
+
+        let outcome = std::panic::AssertUnwindSafe(connect_test_client_or_skip_with(
+            TestValkeyRequirement::Required,
+            config,
+            hang_guard,
+        ))
+        .catch_unwind()
+        .await;
+        let payload = match outcome {
+            Ok(None) => panic!(
+                "a required store that could not be connected returned None, which every caller \
+                 turns into a silent skip"
+            ),
+            Ok(Some(_)) => panic!("{} unexpectedly accepted a connect", config.valkey_url),
+            Err(payload) => payload,
+        };
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .expect("the helper panics with a message")
+    }
+
+    /// A required connect that fails fails the test (the helper's connect-error
+    /// arm), naming the variable that made the store required. The URL is
+    /// empty, as an empty `TEST_VALKEY_URL` would make it: the variable still
+    /// counts as set, and fred rejects the URL while parsing it, before any
+    /// connect or retry, so the full hang guard cannot expire first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_test_client_or_skip_when_required_panics_naming_test_valkey_url_for_a_failed_connect(
+    ) {
+        let config = minimal_test_config(String::new());
+        let message = required_connect_panic_message(&config, TEST_VALKEY_CONNECT_HANG_GUARD).await;
+        assert!(
+            message.contains(TEST_VALKEY_URL_VAR),
+            "the panic names {TEST_VALKEY_URL_VAR}, the variable that made the store required: \
+             {message}"
+        );
+        assert!(
+            message.contains("failed within") && message.contains("invalid Valkey URL"),
+            "the panic comes from the connect-error arm and carries the connect's error: \
+             {message}"
+        );
+    }
+
+    /// A required connect still unfinished at the hang guard fails the test
+    /// (the helper's guard-expiry arm), naming the variable and the URL with
+    /// its credentials removed. The guard is under a second, so it expires
+    /// before the connect budget the helper raises to it (at least 1 s) can
+    /// end the refused connect's retries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_test_client_or_skip_when_required_panics_naming_the_redacted_url_when_the_hang_guard_expires(
+    ) {
+        let config = minimal_test_config("redis://user:hunter2@127.0.0.1:1".to_string());
+        let message = required_connect_panic_message(&config, Duration::from_millis(500)).await;
+        assert!(
+            message.contains(TEST_VALKEY_URL_VAR),
+            "the panic names {TEST_VALKEY_URL_VAR}, the variable that made the store required: \
+             {message}"
+        );
+        assert!(
+            message.contains("did not complete within"),
+            "the panic comes from the guard-expiry arm: {message}"
+        );
+        assert!(
+            message.contains("redis://127.0.0.1:1"),
+            "the panic names the address it could not reach: {message}"
+        );
+        assert!(
+            !message.contains("hunter2"),
+            "the panic leaves the URL's password out: {message}"
+        );
+    }
+
+    /// An optional store (the variable unset outside CI) that cannot be reached
+    /// still skips: the helper returns `None` rather than failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_test_client_or_skip_when_optional_returns_none_for_an_unreachable_store() {
+        // A 1 s connect budget: the refused connect is retried for that long,
+        // well inside the 5 s probe.
+        let config = Config {
+            valkey_connect_timeout_secs: 1,
+            ..minimal_test_config(UNREACHABLE_STORE_URL.to_string())
+        };
+        let client = connect_test_client_or_skip_with(
+            TestValkeyRequirement::Optional,
+            &config,
+            TEST_VALKEY_CONNECT_HANG_GUARD,
+        )
+        .await;
+        assert!(
+            client.is_none(),
+            "an optional store that refuses the connect is skipped (None)"
+        );
+    }
+
+    /// The URL variable present, even empty, makes the store required whatever
+    /// `GITLAB_CI` says; both absent make it optional.
+    #[test]
+    fn test_valkey_requirement_from_vars_is_required_with_the_url_present_and_optional_with_both_absent(
+    ) {
+        let present = |v: &str| Some(OsString::from(v));
+        let cases = [
+            (
+                present("redis://valkey:6379"),
+                None,
+                TestValkeyRequirement::Required,
+            ),
+            (present(""), None, TestValkeyRequirement::Required),
+            (
+                present("redis://valkey:6379"),
+                present("true"),
+                TestValkeyRequirement::Required,
+            ),
+            (
+                present(""),
+                present("true"),
+                TestValkeyRequirement::Required,
+            ),
+            (None, None, TestValkeyRequirement::Optional),
+        ];
+        for (url, gitlab_ci, expected) in cases {
+            assert_eq!(
+                TestValkeyRequirement::from_vars(url.clone(), gitlab_ci.clone()),
+                expected,
+                "{TEST_VALKEY_URL_VAR}={url:?}, GITLAB_CI={gitlab_ci:?}"
+            );
+        }
+    }
+
+    /// The URL variable absent in a CI job (`GITLAB_CI` present) is broken job
+    /// wiring, and fails rather than skipping every store-backed test.
+    #[test]
+    #[should_panic(expected = "TEST_VALKEY_URL is unset in a CI job (GITLAB_CI is set)")]
+    fn test_valkey_requirement_from_vars_with_the_url_absent_under_gitlab_ci_panics() {
+        TestValkeyRequirement::from_vars(None, Some(OsString::from("true")));
     }
 }

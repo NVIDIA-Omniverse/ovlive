@@ -14,10 +14,9 @@
 // limitations under the License.
 
 //! Criterion microbench for the **full-content diff plan** —
-//! `DiffEngine::plan(&state, &[], 0, 0, None)`, i.e. the `plan_full_content`
-//! branch — and, isolated beside it, the cost of the total-order field sort
-//! that branch acquired for SR-9.2 byte-deterministic base emission
-//! (b.gcb / b.vz7).
+//! `DiffEngine::plan_full_content(&state)`, the checkpoint base's plan — and,
+//! isolated beside it, the cost of the total-order field sort that plan
+//! acquired for SR-9.2 byte-deterministic base emission (b.gcb / b.vz7).
 //!
 //! ## Why this file exists
 //!
@@ -25,7 +24,7 @@
 //! the assembly path". When it was written there was **no instrument on
 //! that path at all**: `benches/` held only `ext_mirror_enqueue` and
 //! `ext_mirror_store_values`, both SR-3.1 ext-mirror, neither reaching
-//! `DiffEngine::plan`. "Run the existing bench" was not executable, so the
+//! the full-content plan. "Run the existing bench" was not executable, so the
 //! guard is discharged by creating the instrument.
 //!
 //! A true before/after criterion diff is also **not obtainable in-lane**:
@@ -42,11 +41,9 @@
 //! generated [`ObjectState`], built once per size outside every measured
 //! closure so allocation is never folded into the number:
 //!
-//! - `plan_full_content/<n>` — the whole `DiffEngine::plan(&state, &[], 0,
-//!   0, None)` call. `have_object_id = 0` never matches the generated
-//!   `object_id`, so this is unconditionally the `plan_full_content`
-//!   branch: DFS section walk + orphan-tail sort, field clone + field
-//!   sort, time-sample clone + sort.
+//! - `plan_full_content/<n>` — the whole
+//!   `DiffEngine::plan_full_content(&state)` call: DFS section walk +
+//!   orphan-tail sort, field clone + field sort, time-sample clone + sort.
 //! - `sort_only/<n>` — a pre-cloned field `Vec` in `HashMap` order, sorted
 //!   with the same comparator and nothing else. This is the delta the sort
 //!   introduced, isolated: everything else in `plan_full_content` (the
@@ -133,7 +130,7 @@
 //! cargo bench -j 4 -p live-edit --bench diff_plan_full_content -- --output-format bencher
 //! ```
 //!
-//! No `required-features` and no Valkey: `DiffEngine::plan`,
+//! No `required-features` and no Valkey: `DiffEngine::plan_full_content`,
 //! `DiffEngine::plan_faithful_snapshot` and `DiffPlan` are all `pub` and the
 //! measured code is pure `domain` logic. The target runs bare exactly as
 //! above.
@@ -217,9 +214,8 @@ const INLINE_VALUE_BYTES: usize = 48;
 /// bytes, matching the mixed shape a layer with large values has.
 const EXTERNAL_VALUE_STRIDE: usize = 8;
 
-/// `object_id` of the generated state. Any non-zero value works: the
-/// `plan_full_content` arm passes `have_object_id = 0`, which cannot match,
-/// so `DiffEngine::plan` takes the full-content branch unconditionally.
+/// `object_id` of the generated state. Any value works: neither measured plan
+/// reads it.
 const OBJECT_ID: u64 = 42;
 
 /// A deterministic field key name.
@@ -428,9 +424,9 @@ fn sort_fields_like_diff_engine(fields: &mut [Field]) {
 /// Without this the sweep would still produce confident numbers on a
 /// degenerate fixture, and every one of the four failure modes is silent:
 ///
-/// 1. **The plan really takes the full-content branch** and emits every
-///    generated field. A dispatch that fell through to `UpToDate` or
-///    `Incremental` would report a near-empty call as "the assembly path".
+/// 1. **The plan returns `FullContent` and emits every generated field.** A
+///    plan that dropped fields would report a smaller call as "the assembly
+///    path".
 /// 2. **`plan_faithful_snapshot` sorts the SAME field set.** It drops
 ///    fields on unreachable prims, so an orphan that accidentally acquired
 ///    fields would shrink the anchor arm's input and make the
@@ -448,15 +444,15 @@ fn sort_fields_like_diff_engine(fields: &mut [Field]) {
 /// Panicking here fails the bench run, which is the right outcome: the
 /// alternative is a plausible-looking number for the wrong input.
 fn assert_state_is_representative(state: &ObjectState, field_count: usize) {
-    let full = DiffEngine::plan(state, &[], 0, 0, None).expect("generated state must plan cleanly");
+    let full = DiffEngine::plan_full_content(state).expect("generated state must plan cleanly");
     let DiffPlan::FullContent {
         sections, fields, ..
     } = &full
     else {
         panic!(
-            "DiffEngine::plan did not take the full-content branch for the \
-             {field_count}-field state; the plan_full_content arm would be \
-             measuring some other branch entirely"
+            "DiffEngine::plan_full_content returned a plan other than full \
+             content for the {field_count}-field state; the plan_full_content \
+             arm would be measuring something else entirely"
         );
     };
 
@@ -539,14 +535,12 @@ fn bench_diff_plan_full_content(c: &mut Criterion) {
         group.throughput(Throughput::Elements(field_count as u64));
 
         // ── Arm 1: the whole full-content plan. ─────────────────────────
-        // `have_object_id = 0` never matches `OBJECT_ID`, so `plan`
-        // dispatches to `plan_full_content` on every iteration.
         group.bench_with_input(
             BenchmarkId::new("plan_full_content", field_count),
             &field_count,
             |b, _| {
                 b.iter(|| {
-                    let plan = DiffEngine::plan(black_box(&state), black_box(&[]), 0, 0, None)
+                    let plan = DiffEngine::plan_full_content(black_box(&state))
                         .expect("generated state must plan cleanly");
                     black_box(plan)
                 });

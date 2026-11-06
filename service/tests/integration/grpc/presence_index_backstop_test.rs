@@ -701,7 +701,7 @@ async fn backstop_gap_two_dead_joiner_after_a_failed_index_removal_is_reindexed_
 /// backstop's walk must cover every shard, and its re-add crosses slots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backstop_on_a_cluster_reindexes_member_sets_on_non_owner_shards_and_they_are_swept() {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

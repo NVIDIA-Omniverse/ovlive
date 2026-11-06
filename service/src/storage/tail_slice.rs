@@ -393,8 +393,8 @@ pub async fn read_tail_slice(
         // carries a binary `ompf` field alongside the UTF-8 `payload` field
         // (b.gze), and a `String` decode would fail the whole slice on the OMPF
         // bytes' invalid UTF-8 — poisoning every entry over one binary field.
-        // Same reason `subscribe.rs`'s rollback-mode in-window replay decodes
-        // as `Bytes`.
+        // Same reason `subscribe.rs`'s in-window point read decodes as
+        // `Bytes`.
         let page: Vec<(String, HashMap<String, Bytes>)> = client
             .pool
             .xrange_values(&stream_key, cursor.clone(), "+", Some(page_count))

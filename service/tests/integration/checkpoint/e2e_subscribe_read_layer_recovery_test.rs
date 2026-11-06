@@ -48,7 +48,7 @@
 //!    service=<label>}`, NOT the original Subtask's mis-spelled
 //!    `live_subscribe_regime_total{regime="regime3"}`.
 //! 6. A subsequent live `UpdateLayer` write surfaces to the subscriber via
-//!    the steady-state in-window per-commit path. This confirms the
+//!    the steady-state relay. This confirms the
 //!    open_consumer position is intact across the recovery boundary and
 //!    that the subscriber is NOT silently stuck on a stale stream cursor.
 //!
@@ -72,11 +72,11 @@
 //!   subscriber path runs through `read_object_header(object_id)`, sees
 //!   NotFound, and enters the recovery branch — the wired site for AC #7b.
 //! - The retry header read after recovery succeeds (apply re-wrote
-//!   `obj:hdr`), `have_version=0 < current_seq`, XRANGE on the freshly
-//!   wiped (now-empty) stream from `1-0` returns nothing → the catch-up
-//!   falls through to `catch_up_out_of_window` → ONE coalesced diff body
-//!   containing every restored section (FullContent plan triggered by
-//!   `have_version == 0`).
+//!   `obj:hdr`), `have_version=0 < current_seq`, and the in-window point
+//!   read for `1-0` misses on the freshly wiped (now-empty) stream → the
+//!   catch-up falls through to `catch_up_out_of_window` → ONE coalesced diff body
+//!   containing every restored section (at `have_version == 0` every
+//!   restored entry is newer than the reconnector's version).
 //!
 //! ## Sandbox env
 //!
@@ -103,7 +103,9 @@ use live_edit::grpc::subscribe::handle_subscribe_read_layer;
 use live_edit::grpc::BearerToken;
 use live_edit::storage::diff_read::snapshot_to_object_state;
 use live_edit::storage::session::SessionStore;
-use live_edit::storage::test_support::read_object_state_for_test;
+use live_edit::storage::test_support::{
+    read_object_state_for_test, rewrite_out_of_band, OutOfBandChange,
+};
 use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, SetField, StructCommand};
 
 use super::helpers::*;
@@ -115,12 +117,15 @@ const SESSION_NAME: &str = "subscribe-recovery-session";
 const SUBSCRIBER_CLIENT_ID: &str = "subscribe-recovery-subscriber";
 const WRITER_CLIENT_ID: &str = "subscribe-recovery-writer";
 const PRE_CHECKPOINT_UPDATE_COUNT: u64 = 3;
+/// The root section an empty `CreateLayer` leaves the layer holding (SDD
+/// §9.7): section 1 under 0.
+const SUPPLIED_ROOT_SECTION: u64 = 1;
 
 // ── OwnedDelta / streaming helpers ──────────────────────────────────────────
 //
 // Mirrors the sibling subscribe-regimes / subscribe-regime-metrics tests
 // shape — each UpdateLayer adds one new `DiffChangeSection` via a non-reset
-// delta so the per-commit diff is non-empty and the materialised state
+// delta so each commit is non-empty and the materialised state
 // genuinely diverges from the bootstrap `empty_delta`. The varying
 // `section_id` lets the bootstrap-body assertion below identify each
 // section unambiguously.
@@ -142,7 +147,7 @@ fn incremental_diff_change_section(section_id: u64) -> OwnedDelta {
 
 /// Issue a single UpdateLayer carrying a non-reset `DiffChangeSection` with
 /// the given `section_id`. The varying section_id guarantees each commit
-/// produces a non-empty, distinguishable per-commit diff so the bootstrap
+/// adds a distinguishable section so the bootstrap
 /// assertion can verify each pre-checkpoint section is preserved through
 /// recovery.
 async fn apply_section_update(
@@ -286,7 +291,8 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
         .await
         .expect("session creation must succeed");
 
-    // CreateLayer at seq=1 with an empty delta.
+    // CreateLayer at seq=1 with an empty delta: the layer holds only its root
+    // section.
     let create_ompf = delta_to_ompf_bytes(&empty_delta(), &[]);
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
@@ -299,7 +305,7 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 
     // Apply PRE_CHECKPOINT_UPDATE_COUNT UpdateLayers, each adding a unique
     // section. After this the layer is at seq=1 + N (== 4 by default) and
-    // the materialised ObjectState contains N distinct sections.
+    // the materialised ObjectState contains the root and N distinct sections.
     let expected_section_ids: Vec<u64> =
         (0..PRE_CHECKPOINT_UPDATE_COUNT).map(|i| 1000 + i).collect();
     for sid in &expected_section_ids {
@@ -321,8 +327,12 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     let pre_wipe_section_ids: HashSet<u64> = pre_wipe_state.sections.keys().copied().collect();
     assert_eq!(
         pre_wipe_section_ids,
-        expected_section_ids.iter().copied().collect::<HashSet<_>>(),
-        "pre-wipe state must contain exactly the sections we wrote"
+        expected_section_ids
+            .iter()
+            .copied()
+            .chain([SUPPLIED_ROOT_SECTION])
+            .collect::<HashSet<_>>(),
+        "pre-wipe state must contain exactly the layer's root and the sections we wrote"
     );
 
     // Wait for the periodic checkpoint loop to land a generation that captures
@@ -339,8 +349,8 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 
     // Wipe every `le:{oid}:obj:*` key — the production data-loss surface
     // a failover-to-fresh-replica or persistence-wipe would present. This
-    // ALSO wipes `le:{oid}:obj:stream`, so post-recovery XRANGE returns
-    // empty and the catch-up path falls through to `out_of_window`
+    // ALSO wipes `le:{oid}:obj:stream`, so the post-recovery in-window point
+    // read misses and the catch-up path falls through to `out_of_window`
     // (Regime 3) — the SDD §12.3 coalesced-diff path AC #7b requires.
     wipe_layer_state(&harness.tv, object_id).await;
 
@@ -377,12 +387,14 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     //   b) `read_object_header` returns NotFound (wipe took obj:hdr),
     //   c) the engineer's SR-2.4 recovery branch fires → Restored,
     //   d) the retry `read_object_header` succeeds (apply re-wrote obj:hdr),
-    //   e) `have_version=0 < current_seq` → XRANGE from `1-0` on the empty
-    //      stream returns nothing → fall through to `catch_up_out_of_window`.
+    //   e) `have_version=0 < current_seq` → the in-window point read for
+    //      `1-0` misses on the empty stream → fall through to
+    //      `catch_up_out_of_window`.
     // `have_version=0` is the cold-cache shape a client sends post-failover,
-    // and it is the one this test owns: `DiffEngine::plan` short-circuits
-    // `have_version == 0` to `FullContent`, so the whole restored state is
-    // emitted in DFS order and the assertions below can compare it whole.
+    // and it is the one this test owns: at `have_version == 0` every live
+    // section, field and sample is newer than the reconnector's version, so
+    // the coalesced diff carries the whole restored state, in DFS order, and
+    // the assertions below can compare it whole.
     //
     // The version-FILTERED shape — a reconnector at a version it really did
     // observe, which is the majority of post-failover subscribers — is a
@@ -468,7 +480,11 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     // annotations on the subscriber side are legitimately
     // apply_delta-bumped (coalesced-diff reset semantics; same caveat as
     // sibling `subscribe_regimes_test::out_of_window_reconnect_*`), so we
-    // compare the structural identity fields only.
+    // compare the structural identity fields only. The catch-up sends each
+    // section at its position among its parent's children (the walked
+    // position, SDD §12.9), not at the key the server stored for it, so the
+    // expected `section_order` is the section's index in the restored
+    // parent's children list.
     let restored_snapshot = read_object_state_for_test(
         &harness.svc.valkey,
         &harness.svc.key_schema,
@@ -482,6 +498,16 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
             .sections
             .get(sid)
             .unwrap_or_else(|| panic!("restored state missing section {sid}"));
+        let walked_position = restored_state
+            .children
+            .get(&restored.parent_id)
+            .and_then(|children| children.iter().position(|child| child == sid))
+            .unwrap_or_else(|| {
+                panic!(
+                    "restored section {sid} is listed under its parent {}",
+                    restored.parent_id
+                )
+            }) as u32;
         let subscriber = subscriber_state
             .sections
             .get(sid)
@@ -497,9 +523,10 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
                 restored.parent_id,
                 restored.name.as_str(),
                 restored.section_type,
-                restored.section_order,
+                walked_position,
             ),
-            "section {sid} structural identity must match the restored snapshot"
+            "section {sid} structural identity must match the restored snapshot, at its walked \
+             position"
         );
     }
 
@@ -508,7 +535,7 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     // carrying `tracked_version` (= current_seq = expected_seq for Regime 3).
     // It lands on the stream immediately after the coalesced diff and BEFORE
     // any live update, so it must be drained here or the live-update read
-    // below would mis-read this trailer as the per-commit diff. Before b.dy5
+    // below would mis-read this trailer as the live commit. Before b.dy5
     // the out_of_window path emitted no terminator and this drain was absent.
     let (caught_up_header, caught_up_body) = recv_message(&mut stream).await;
     assert_eq!(
@@ -570,7 +597,7 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     assert_eq!(
         subscribe_regime_count(&harness, "in_window"),
         0,
-        "no in_window observations: stream was wiped, XRANGE empty"
+        "no in_window observations: stream was wiped, so the in-window point read missed"
     );
     assert_eq!(
         subscribe_regime_count(&harness, "up_to_date"),
@@ -579,13 +606,13 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
     );
 
     // AC#7b final pin: a subsequent live UpdateLayer must surface to the
-    // subscriber via the steady-state in-window per-commit path. This
+    // subscriber via the steady-state relay. This
     // confirms (a) the open_consumer position survived the recovery
     // boundary, and (b) the writer half of the service can still XADD
     // against the just-restored object_id. The recovery hook does NOT
     // re-XADD an entry on the stream (see apply.rs step 5 comment), so
     // the next live write is the FIRST entry on the post-recovery
-    // stream — which is exactly what an in-window per-commit subscriber
+    // stream — which is exactly what the steady-state subscriber
     // expects.
     let post_recovery_section_id = 2000_u64;
     apply_section_update(&harness, &session_id, object_id, post_recovery_section_id).await;
@@ -616,7 +643,7 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
             .contains_key(&post_recovery_section_id),
         "subscriber's local mirror must contain the post-recovery \
          section (id={post_recovery_section_id}) after applying the \
-         live per-commit diff"
+         live commit"
     );
 
     // Tear the periodic loop down cleanly to avoid noisy panics if the
@@ -638,9 +665,8 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 //     needs `have_object_id == 0 && have_version == 0`
 //     (`src/grpc/subscribe.rs`);
 //   * both reconnect regimes therefore route through a filter on
-//     `version > have_version` — `plan_faithful_coalesced` under the shipped
-//     `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true`, `plan_incremental` (via
-//     `compute_diff_at_cut`) under the legacy `false` (`src/domain/diff.rs`);
+//     `version > have_version` — `plan_faithful_coalesced`
+//     (`src/domain/diff.rs`);
 //   * pre-b.2ti the restore left every entry at the version
 //     `decode_checkpoint_ompf` produced (`1`) while stamping the HEADER at
 //     `seeded_seq`, so no restored entry cleared the filter. The subscriber
@@ -648,7 +674,7 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 //     "a restored layer served an empty catch-up", indistinguishable at the
 //     client from a healthy no-op.
 //
-// The fix stamps the three versions those builders FILTER on —
+// The fix stamps the three versions that builder FILTERS on —
 // `Section::last_version`, `Field::version`, `TimeSample::version` — at
 // `seeded_seq`, which dominates every sequence number the object ever issued
 // (the guard band), so a reconnector at ANY version it could legitimately hold
@@ -671,8 +697,8 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 //
 // [`ReconnectPosition`] enumerates them, and each arm pins the catch-up REGIME
 // it lands in via `live_subscribe_regime_total` rather than leaving that to
-// prose — the regime is what selects the builder, so an arm that silently
-// changed regime would stop covering the builder it claims:
+// prose — an arm that silently changed regime would stop covering the regime
+// it claims and duplicate a sibling:
 //
 //   1. `AtCheckpointSequence` (`out_of_window`) — the plain shape.
 //   2. `AheadOfCheckpoint` (`out_of_window`) — the DISCRIMINATING position: it
@@ -683,32 +709,12 @@ async fn subscribe_read_layer_recovers_layer_state_after_valkey_wipe() {
 //      (`src/grpc/subscribe.rs`) picks `in_window` only when the stream holds
 //      an entry at EXACTLY `{have_version + 1}-0`, and both arms above sit at
 //      or above the stream's high-water mark (arm 1 wipes the stream outright;
-//      arm 2's `have_version` IS the mark). `catch_up_in_window_snapshot`
-//      reaches `compute_faithful_coalesced_at_cut` through a different call site with
-//      a different cursor pin, so the fix has to hold there on its own.
-//
-// ## Which positions run on which catch-up path
-//
-// Positions 1 and 2 each run TWICE — once on the shipped path
-// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true`, `plan_faithful_coalesced`) and
-// once on the legacy rollback path (`false`, `plan_incremental` via
-// `compute_diff_at_cut`); see the two `..._on_the_legacy_path` siblings. Both builders
-// filter on the same persisted `version` columns, so both were blind to a
-// restored layer pre-fix, and the legacy knob is a supported rollback.
-//
-// Position 3 runs on the SHIPPED path only, and that is a deliberate boundary
-// rather than a gap. `in_window` under the legacy path is not the same code at
-// all: `run_catch_up_inner` routes it to `catch_up_in_window`, which
-// RECONSTRUCTS each retained stream entry commit-by-commit
-// (`replay_commit_diff`, each commit's diff version-bounded to that commit)
-// instead of building one coalesced diff off persisted state. After a DR
-// restore the retained
-// entries are pre-loss commits against state that no longer exists, and nothing
-// in b.2ti's fix — which changes what `apply_restore` PERSISTS — reaches that
-// path. Adding a legacy `in_window` arm that expected the restored content
-// would therefore assert a claim this fix does not make and never intended to;
-// the honest coverage statement is that the legacy in-window replay after a
-// restore is its own unfixed subject.
+//      arm 2's `have_version` IS the mark). Both regimes register their
+//      stream at their proven read's cut and build through one site,
+//      `build_catch_up(CatchUpBuild::Coalesced)`; what this arm alone covers
+//      is the in-window regime's selection (the point-read hit), its up-front
+//      `deleted`-sentinel check, and the `version > have_version` filter
+//      reached through that regime's path.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Updates issued AFTER the checkpoint lands in the two arms that spare the
@@ -731,22 +737,21 @@ enum ReconnectPosition {
     /// hypothetical `snap_seq` stamp would sit BELOW `have_version` and be
     /// filtered out, while `seeded_seq` (= floor + band) sits above it.
     /// Regime `out_of_window`: `have_version` IS the stream's high-water mark,
-    /// so the XRANGE from `{have_version + 1}-0` comes back empty.
+    /// so the in-window point read for `{have_version + 1}-0` misses.
     AheadOfCheckpoint,
     /// The same partial loss as `AheadOfCheckpoint` — stream spared, floor at
     /// its high-water mark — but the subscriber's tracked version sits at
-    /// `snap_seq`, i.e. BELOW the surviving top. `run_catch_up_inner`'s XRANGE
-    /// from `{snap_seq + 1}-0` therefore hits the first post-checkpoint entry
-    /// exactly, and the catch-up routes through
-    /// `catch_up_in_window_snapshot` → `compute_faithful_coalesced_at_cut`.
+    /// `snap_seq`, i.e. BELOW the surviving top. `run_catch_up_inner`'s
+    /// in-window point read for `{snap_seq + 1}-0` therefore finds the first
+    /// post-checkpoint entry, and the catch-up routes through
+    /// `catch_up_in_window` → `compute_faithful_coalesced_at_cut`.
     ///
     /// Realistic as a shape: a Valkey data-key loss that spares the stream
     /// (the stream is a distinct key family) while a subscriber is only a
-    /// couple of commits behind. Distinct from the two arms above in the CALL
-    /// SITE it exercises, not in the subscriber's arithmetic: the in-window
-    /// arm opens its steady-state consumer at `{current_seq}-0` and computes
-    /// the coalesced diff from its own site, so the `version > have_version`
-    /// filter has to clear there independently.
+    /// couple of commits behind. Distinct from the two arms above in the
+    /// regime it selects, not in the subscriber's arithmetic: the restored
+    /// state's `version > have_version` filter has to clear on the in-window
+    /// regime's path too.
     InWindowAfterPartialLoss,
 }
 
@@ -788,7 +793,8 @@ async fn commit_past_the_checkpoint(
 /// Assert the surviving stream carries an entry at EXACTLY `{start_seq}-0`.
 ///
 /// The mechanical precondition for `run_catch_up_inner`'s in-window branch
-/// (`src/grpc/subscribe.rs`: `entries.first().id == start_id`). Asserted rather
+/// (`src/grpc/subscribe.rs` `read_in_window_point`: the stream holds
+/// `{have_version + 1}-0`). Asserted rather
 /// than assumed so that a change to how commits are XADDed shows up here as a
 /// fixture failure instead of silently demoting the in-window arm to
 /// `out_of_window` — where it would duplicate its two siblings and pin nothing
@@ -894,20 +900,9 @@ fn decode_catch_up_delta(body: &[u8]) -> OwnedDelta {
 }
 
 /// The shared body of the b.2ti reconnect tests — three
-/// [`ReconnectPosition`]s, the first two run on both catch-up builders.
-///
-/// `catchup_snapshot_enabled` selects the catch-up builder under test: `true`
-/// is the shipped production default (`plan_faithful_coalesced`), `false` the
-/// legacy rollback path (`plan_incremental` via `compute_diff_at_cut`). Both filter on
-/// `version > have_version`, so both were broken by the same stamp; the harness
-/// default is `false` (`tests/common/mod.rs::test_config`), which is why the
-/// production path has to be selected explicitly.
-async fn assert_post_restore_reconnector_receives_the_restored_state(
-    position: ReconnectPosition,
-    catchup_snapshot_enabled: bool,
-) {
+/// [`ReconnectPosition`]s.
+async fn assert_post_restore_reconnector_receives_the_restored_state(position: ReconnectPosition) {
     let mut harness = setup_checkpoint_harness(1).await;
-    harness.svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
 
     let session_store =
         SessionStore::new(harness.tv.client().clone(), harness.tv.key_schema().clone());
@@ -985,7 +980,7 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
             // `snap_seq` stamp land on opposite sides of `have_version`.
             wipe_layer_state_preserving_stream(&harness.tv, object_id).await;
             // `have_version` IS the surviving stream's top, so the in-window
-            // XRANGE from `{have_version + 1}-0` returns nothing: out-of-window.
+            // point read for `{have_version + 1}-0` misses: out-of-window.
             (post_checkpoint_seq, post_checkpoint_seq, "out_of_window")
         }
         ReconnectPosition::InWindowAfterPartialLoss => {
@@ -1037,7 +1032,11 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
     );
     assert_eq!(
         restored.sections.keys().copied().collect::<HashSet<_>>(),
-        checkpointed_section_ids.iter().copied().collect(),
+        checkpointed_section_ids
+            .iter()
+            .copied()
+            .chain([SUPPLIED_ROOT_SECTION])
+            .collect(),
         "fixture precondition: the restore must materialize exactly the checkpoint's content. \
          Anything else means a later generation landed and the arm is no longer testing the \
          position it claims"
@@ -1063,7 +1062,7 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
     //
     // Message #1 must carry the whole restored state. Pre-b.2ti it carried an
     // EMPTY delta: every restored entry sat at `version = 1`, below
-    // `have_version`, so `plan_faithful_coalesced` / `plan_incremental` emitted
+    // `have_version`, so `plan_faithful_coalesced` emitted
     // no section, no field and (the sections being live and reachable) not even
     // a retraction — and `deliver_catch_up_content` shipped the empty payload
     // and acked the subscriber caught-up.
@@ -1192,9 +1191,9 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
     // `section_order` is deliberately NOT compared: `plan_faithful_coalesced`
     // overrides it with each section's position among its parent's children
     // (the faithful walk's position, `src/domain/diff.rs`) rather than
-    // relaying the stored column, so on the
-    // shipped path the two legitimately differ for any fixture that authors
-    // several siblings at the same stored order. That override is its own
+    // relaying the stored column, so the two legitimately differ for any
+    // fixture that authors several siblings at the same stored order. That
+    // override is its own
     // contract with its own tests; nothing here turns on it.
     let mut subscriber_state = ObjectState::default();
     apply_ompf_to_state(&mut subscriber_state, &content_body);
@@ -1253,11 +1252,10 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
     );
 
     // And WHICH filtered regime it was, pinned per arm rather than asserted in
-    // prose. The regime selects the builder — `catch_up_out_of_window` vs
-    // `catch_up_in_window_snapshot`, two call sites into
-    // `compute_faithful_coalesced_at_cut` with different cursor pins — so an arm that
-    // drifted into the other regime would silently stop covering the one it
-    // names and duplicate a sibling. Exactly one subscribe RPC runs per test,
+    // prose. `catch_up_out_of_window` and `catch_up_in_window` share the
+    // coalesced builder but are selected differently (the in-window point
+    // read's miss or hit), so an arm that drifted into the other regime would
+    // silently stop covering the one it names and duplicate a sibling. Exactly one subscribe RPC runs per test,
     // and `harness.metrics` is freshly constructed per harness, so the cell is
     // exactly 1 / 0.
     assert_eq!(
@@ -1286,23 +1284,6 @@ async fn assert_post_restore_reconnector_receives_the_restored_state(
 async fn a_reconnector_at_the_checkpoint_sequence_receives_the_full_restored_state() {
     assert_post_restore_reconnector_receives_the_restored_state(
         ReconnectPosition::AtCheckpointSequence,
-        true,
-    )
-    .await;
-}
-
-/// The same claim on the legacy catch-up path
-/// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`), which filters through
-/// `plan_incremental` rather than `plan_faithful_coalesced`. Both builders read
-/// the same persisted `version` columns, so both were blind to a restored layer
-/// pre-fix; asserting only the shipped default would leave the rollback knob
-/// uncovered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reconnector_at_the_checkpoint_sequence_receives_the_full_restored_state_on_the_legacy_path(
-) {
-    assert_post_restore_reconnector_receives_the_restored_state(
-        ReconnectPosition::AtCheckpointSequence,
-        false,
     )
     .await;
 }
@@ -1321,36 +1302,6 @@ async fn a_reconnector_at_the_checkpoint_sequence_receives_the_full_restored_sta
 async fn a_reconnector_ahead_of_the_checkpoint_receives_the_full_restored_state() {
     assert_post_restore_reconnector_receives_the_restored_state(
         ReconnectPosition::AheadOfCheckpoint,
-        true,
-    )
-    .await;
-}
-
-/// The discriminating position on the legacy catch-up path
-/// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`).
-///
-/// Same shape as the arm above — stream spared, `have_version` at the surviving
-/// high-water mark, so the restore floor rises above `snap_seq` — but served by
-/// `catch_up_out_of_window`'s legacy branch: ONE coalesced `compute_diff_at_cut` /
-/// `plan_incremental` body rather than `compute_faithful_coalesced_at_cut`. The regime
-/// is still `out_of_window` (regime selection is the XRANGE probe's verdict and
-/// is independent of the builder knob), so this arm and its shipped-path sibling
-/// differ in exactly one variable.
-///
-/// Worth its own arm rather than folding into position 1's legacy sibling for
-/// the same reason position 2 exists at all on the shipped path: position 1
-/// wipes the stream, so `snap_seq` and the restore floor coincide there and a
-/// hypothetical `snap_seq` stamp would still clear `version > have_version`.
-/// Only here do the two candidate stamps land on opposite sides of the filter —
-/// and `plan_incremental` applies that filter at a different call site than
-/// `plan_faithful_coalesced`, so the rollback knob needs the discrimination
-/// proven on its own builder.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reconnector_ahead_of_the_checkpoint_receives_the_full_restored_state_on_the_legacy_path()
-{
-    assert_post_restore_reconnector_receives_the_restored_state(
-        ReconnectPosition::AheadOfCheckpoint,
-        false,
     )
     .await;
 }
@@ -1360,29 +1311,436 @@ async fn a_reconnector_ahead_of_the_checkpoint_receives_the_full_restored_state_
 ///
 /// The two arms above both land in `out_of_window` — one because the wipe took
 /// the stream with it, one because the subscriber sits AT the surviving stream's
-/// top. Neither can reach `catch_up_in_window_snapshot`, which is a separate
-/// call site into `compute_faithful_coalesced_at_cut` (its own consumer pin at
-/// `{current_seq}-0`, its own up-front `deleted`-sentinel scan) and applies the
-/// same `version > have_version` filter on its own. Sparing the stream while
-/// leaving `have_version` at `snap_seq` — one commit BELOW the first surviving
-/// post-checkpoint entry — is what selects it.
+/// top. Neither reaches `catch_up_in_window`. Both regimes build through the
+/// same coalesced builder (`build_catch_up(CatchUpBuild::Coalesced)`); what
+/// only this arm covers is the in-window regime's selection (the point read's
+/// hit), its up-front `deleted`-sentinel check, and the
+/// `version > have_version` filter reached through that regime's path. Sparing
+/// the stream while leaving `have_version` at `snap_seq` — one commit BELOW
+/// the first surviving post-checkpoint entry — is what selects it.
 ///
 /// No steady-state relay follows the catch-up here despite the surviving
-/// entries: the consumer is pinned at `{current_seq}-0` where `current_seq` is
-/// the restored header (`floor + band`), which dominates every retained entry
-/// id. Message #1 is the coalesced diff and message #2 the caught-up ack, both
-/// emitted by the catch-up phase before the steady-state loop starts, so the
-/// assertions in the shared body are ordered deterministically regardless.
-///
-/// Shipped path only, unlike positions 1 and 2 — under
-/// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false` the in-window regime is
-/// `catch_up_in_window`'s per-commit stream replay, not a persisted-state
-/// diff, so b.2ti's re-stamp does not reach it. See the block header.
+/// entries: the stream registers at the proven read's cut, which is at or
+/// above the restored header's sequence (`floor + band`) and so dominates
+/// every retained entry id. Message #1 is the coalesced diff and message #2
+/// the caught-up ack, both emitted by the catch-up phase before the
+/// steady-state loop starts, so the assertions in the shared body are ordered
+/// deterministically regardless.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_in_window_reconnector_after_a_partial_loss_receives_the_full_restored_state() {
     assert_post_restore_reconnector_receives_the_restored_state(
         ReconnectPosition::InWindowAfterPartialLoss,
-        true,
     )
     .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// b.vjg — a restored layer keeps both siblings of a same-name pair.
+//
+// An earlier build's same-parent `MoveSection` rename onto an occupied name
+// renamed without a collision check (SDD §9.3), so a stored layer can hold two
+// siblings of one kind sharing `(parent_id, name)`. This build's rename
+// cascades the occupant, so the test stores the rename's outcome directly,
+// out of band (`rewrite_out_of_band`), as that build stored it. The checkpoint
+// base carries each row as a `DiffChangeSection`, and the restore's base
+// decode must rebuild both, with the subtree and the fields under each. The
+// test drives that through the real service: live commits, the periodic
+// checkpoint loop, a wipe, the recovery hook on `SubscribeReadLayer`, and the
+// snapshots two subscribers are served.
+//
+// The snapshots are read as the commands they carry, never folded through
+// `apply_delta`: a fold resolves the collision as a commit does and would
+// itself drop one of the pair.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The pair's lower id, named `A` from creation, with [`PAIR_LEAF`] under it.
+const PAIR_LOWER: u64 = 10;
+/// The pair's higher id, created as `B` and stored renamed onto `A`.
+const PAIR_RENAMED: u64 = 11;
+/// The child under [`PAIR_LOWER`].
+const PAIR_LEAF: u64 = 20;
+/// `(section_id, parent_id, name)` of every row the pair's subtree holds.
+const PAIR_ROWS: [(u64, u64, &str); 3] = [
+    (PAIR_LOWER, SUPPLIED_ROOT_SECTION, "A"),
+    (PAIR_RENAMED, SUPPLIED_ROOT_SECTION, "A"),
+    (PAIR_LEAF, PAIR_LOWER, "leaf"),
+];
+
+fn pair_change_section(parent_id: u64, section_id: u64, name: &str, order: u32) -> StructCommand {
+    StructCommand::DiffChangeSection(CommandDiffChangeSection {
+        parent_id,
+        section_id,
+        section_name: name.to_owned(),
+        section_type: 0,
+        section_order: order,
+    })
+}
+
+/// Commit `delta` through `UpdateLayer`.
+async fn apply_pair_update(
+    harness: &CheckpointHarness,
+    session_id: &str,
+    object_id: u64,
+    delta: &OwnedDelta,
+    what: &str,
+) {
+    let stream = streaming_update(vec![
+        make_update_header(session_id, LAYER_NAME, object_id, 1000, WRITER_CLIENT_ID),
+        make_update_data(delta_to_ompf_bytes(delta, &[])),
+    ]);
+    handle_update_layer(&harness.svc, make_request(stream))
+        .await
+        .unwrap_or_else(|e| panic!("UpdateLayer ({what}) failed: {e}"));
+}
+
+/// Assert a catch-up snapshot carries every row of the pair's subtree under
+/// its stored parent and name, with each row's field, and retracts none.
+fn assert_snapshot_carries_the_pair(delta: &OwnedDelta, what: &str) {
+    let sections: HashMap<u64, (u64, String)> = delta
+        .struct_commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            StructCommand::DiffChangeSection(s) => {
+                Some((s.section_id, (s.parent_id, s.section_name.clone())))
+            }
+            _ => None,
+        })
+        .collect();
+    for (section_id, parent_id, name) in PAIR_ROWS {
+        assert_eq!(
+            sections.get(&section_id),
+            Some(&(parent_id, name.to_owned())),
+            "{what}: the snapshot must carry section {section_id} under {parent_id} named \
+             {name:?}; carried sections: {sections:?}"
+        );
+    }
+    let fields: BTreeMap<(u64, String), Vec<u8>> = delta
+        .set_fields
+        .iter()
+        .map(|f| {
+            (
+                (f.section_id, f.key_name.clone()),
+                f.value_or_ext_hash.clone(),
+            )
+        })
+        .collect();
+    for (section_id, _, _) in PAIR_ROWS {
+        assert_eq!(
+            fields.get(&(section_id, field_key(section_id))),
+            Some(&field_value(section_id)),
+            "{what}: the snapshot must carry section {section_id}'s field with its value"
+        );
+    }
+    let retracted: Vec<u64> = delta
+        .struct_commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            StructCommand::DiffDeleteSection(s)
+                if PAIR_ROWS.iter().any(|(id, _, _)| *id == s.section_id) =>
+            {
+                Some(s.section_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        retracted.is_empty(),
+        "{what}: the snapshot must not retract a row of the pair; retracted {retracted:?}"
+    );
+}
+
+/// A layer holding a same-name pair, restored by the recovery hook after a
+/// wipe, serves both siblings, the lower id's child and all three fields to a
+/// reconnector at version 0 and to a brand-new joiner after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_layer_serves_both_siblings_of_a_same_name_pair_to_new_subscribers() {
+    let mut harness = setup_checkpoint_harness(1).await;
+
+    let session_store =
+        SessionStore::new(harness.tv.client().clone(), harness.tv.key_schema().clone());
+    let session_id = session_store
+        .create(SESSION_NAME, "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+    let create_stream = streaming_create(vec![
+        make_create_header(&session_id, LAYER_NAME),
+        make_create_data(delta_to_ompf_bytes(&empty_delta(), &[])),
+    ]);
+    let object_id = handle_create_layer(&harness.svc, make_request(create_stream))
+        .await
+        .expect("CreateLayer must succeed")
+        .into_inner()
+        .object_id;
+
+    // `A`(10){leaf(20)} and `B`(11) under the root, a field on each, then 11
+    // stored renamed onto `A`.
+    let build = OwnedDelta {
+        is_diff: false,
+        base_version: 0,
+        struct_commands: vec![
+            pair_change_section(SUPPLIED_ROOT_SECTION, PAIR_LOWER, "A", 0),
+            pair_change_section(SUPPLIED_ROOT_SECTION, PAIR_RENAMED, "B", 1),
+            pair_change_section(PAIR_LOWER, PAIR_LEAF, "leaf", 0),
+        ],
+        set_fields: PAIR_ROWS
+            .iter()
+            .enumerate()
+            .map(|(rank, (section_id, _, _))| SetField {
+                section_id: *section_id,
+                key_name: field_key(*section_id),
+                value_or_ext_hash: field_value(*section_id),
+                ext_value_size: 0,
+                ext_value_index: 0,
+                set_order: rank as u64,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    apply_pair_update(&harness, &session_id, object_id, &build, "build").await;
+    // The earlier build's rename, as it stored it: 11's row renamed, nothing
+    // cascaded.
+    rewrite_out_of_band(
+        &harness.tv,
+        object_id,
+        OutOfBandChange::SectionName {
+            section_id: PAIR_RENAMED,
+            name: "A".to_owned(),
+        },
+    )
+    .await;
+    // A commit after it, rewriting the leaf's field with its value, so the
+    // newest base is taken at a seq after the stored rename.
+    let after = OwnedDelta {
+        set_fields: vec![SetField {
+            section_id: PAIR_LEAF,
+            key_name: field_key(PAIR_LEAF),
+            value_or_ext_hash: field_value(PAIR_LEAF),
+            ext_value_size: 0,
+            ext_value_index: 0,
+            set_order: PAIR_ROWS.len() as u64,
+        }],
+        ..Default::default()
+    };
+    apply_pair_update(&harness, &session_id, object_id, &after, "after the rename").await;
+
+    let live = snapshot_to_object_state(
+        &read_object_state_for_test(
+            &harness.svc.valkey,
+            &harness.svc.key_schema,
+            &object_id.to_string(),
+        )
+        .await
+        .expect("read_object_state_for_test must succeed before the checkpoint"),
+    );
+    for (section_id, parent_id, name) in PAIR_ROWS {
+        let row = live
+            .sections
+            .get(&section_id)
+            .unwrap_or_else(|| panic!("precondition: the live layer holds section {section_id}"));
+        assert_eq!(
+            (row.parent_id, row.name.as_str()),
+            (parent_id, name),
+            "precondition: live section {section_id}'s parent and name"
+        );
+    }
+    assert_eq!(
+        live.children.get(&SUPPLIED_ROOT_SECTION).map(Vec::as_slice),
+        Some([PAIR_LOWER, PAIR_RENAMED].as_slice()),
+        "precondition: the live root lists both siblings"
+    );
+
+    // The newest base is taken at or after the commit that followed the
+    // stored rename, so the restore decodes the pair from the base: no record
+    // of the stream carries the rename.
+    let _handle =
+        wait_for_checkpoint_at_least(&harness.store, object_id, live.sequence_num, 10).await;
+    harness.cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut harness.loop_handle).await;
+
+    wipe_layer_state(&harness.tv, object_id).await;
+    match read_object_state_for_test(
+        &harness.svc.valkey,
+        &harness.svc.key_schema,
+        &object_id.to_string(),
+    )
+    .await
+    {
+        Err(live_edit::error::ServiceError::NotFound(_)) => {}
+        Ok(_) => panic!("the wipe must leave the object header missing"),
+        Err(other) => panic!("the wipe must surface NotFound, got: {other}"),
+    }
+
+    // ── A reconnector at version 0 triggers the restore ──────────────────
+    let response =
+        handle_subscribe_read_layer(&harness.svc, subscribe_request(&session_id, object_id, 0))
+            .await
+            .expect("SubscribeReadLayer must return Ok after recovery");
+    let mut reconnector = response.into_inner();
+    let (_, reconnector_body) = recv_message(&mut reconnector).await;
+    assert_eq!(
+        recovery_attempts(&harness, "restored"),
+        1,
+        "exactly ONE Restored recovery attempt must have fired for this subscribe"
+    );
+
+    let restored = snapshot_to_object_state(
+        &read_object_state_for_test(
+            &harness.svc.valkey,
+            &harness.svc.key_schema,
+            &object_id.to_string(),
+        )
+        .await
+        .expect("post-recovery read_object_state_for_test must succeed"),
+    );
+    let missing: Vec<u64> = PAIR_ROWS
+        .iter()
+        .map(|(id, _, _)| *id)
+        .filter(|id| !restored.sections.contains_key(id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the restored layer lost sections {missing:?} that the live layer held"
+    );
+    assert_eq!(
+        restored.children.get(&SUPPLIED_ROOT_SECTION),
+        live.children.get(&SUPPLIED_ROOT_SECTION),
+        "the restored root lists both siblings, in the live order"
+    );
+    assert_eq!(
+        restored.children.get(&PAIR_LOWER),
+        live.children.get(&PAIR_LOWER),
+        "the restored lower id keeps its child"
+    );
+    for (section_id, _, _) in PAIR_ROWS {
+        let key = (section_id, field_key(section_id));
+        assert_eq!(
+            restored.fields.get(&key).map(|f| &f.value),
+            Some(&FieldValue::Inline(field_value(section_id))),
+            "the restored layer holds section {section_id}'s field with its value"
+        );
+    }
+
+    assert_snapshot_carries_the_pair(
+        &decode_catch_up_delta(&reconnector_body),
+        "the version-0 reconnector",
+    );
+    drop(reconnector);
+
+    // ── A brand-new joiner on the restored layer ─────────────────────────
+    let response = handle_subscribe_read_layer(&harness.svc, subscribe_request(&session_id, 0, 0))
+        .await
+        .expect("a brand-new SubscribeReadLayer must return Ok");
+    let mut joiner = response.into_inner();
+    let (_, joiner_body) = recv_message(&mut joiner).await;
+    assert_snapshot_carries_the_pair(&decode_catch_up_delta(&joiner_body), "the brand-new joiner");
+    assert_eq!(
+        subscribe_regime_count(&harness, "brand_new"),
+        1,
+        "the joiner must be served by the brand-new snapshot"
+    );
+}
+
+/// A layer whose stored state holds a same-kind pair, as an earlier build's
+/// rename stored it, is served whole on catch-up with no restore involved: a
+/// reconnector at the version before the pair's rows were created, and a
+/// brand-new joiner, each receive both rows of the pair, the lower id's
+/// child and every field, and a retraction of none of them. The catch-up
+/// reads rows by id (SDD §10.1); no collision rule runs on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stored_same_name_pair_is_served_whole_on_catch_up() {
+    let mut harness = setup_checkpoint_harness(1).await;
+
+    let session_store =
+        SessionStore::new(harness.tv.client().clone(), harness.tv.key_schema().clone());
+    let session_id = session_store
+        .create(SESSION_NAME, "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+    let create_stream = streaming_create(vec![
+        make_create_header(&session_id, LAYER_NAME),
+        make_create_data(delta_to_ompf_bytes(&empty_delta(), &[])),
+    ]);
+    let object_id = handle_create_layer(&harness.svc, make_request(create_stream))
+        .await
+        .expect("CreateLayer must succeed")
+        .into_inner()
+        .object_id;
+    let before_the_pair = read_pair_layer(&harness, object_id).await.sequence_num;
+
+    let build = OwnedDelta {
+        struct_commands: vec![
+            pair_change_section(SUPPLIED_ROOT_SECTION, PAIR_LOWER, "A", 0),
+            pair_change_section(SUPPLIED_ROOT_SECTION, PAIR_RENAMED, "B", 1),
+            pair_change_section(PAIR_LOWER, PAIR_LEAF, "leaf", 0),
+        ],
+        set_fields: PAIR_ROWS
+            .iter()
+            .enumerate()
+            .map(|(rank, (section_id, _, _))| SetField {
+                section_id: *section_id,
+                key_name: field_key(*section_id),
+                value_or_ext_hash: field_value(*section_id),
+                ext_value_size: 0,
+                ext_value_index: 0,
+                set_order: rank as u64,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    apply_pair_update(&harness, &session_id, object_id, &build, "build").await;
+    rewrite_out_of_band(
+        &harness.tv,
+        object_id,
+        OutOfBandChange::SectionName {
+            section_id: PAIR_RENAMED,
+            name: "A".to_owned(),
+        },
+    )
+    .await;
+    let live = read_pair_layer(&harness, object_id).await;
+    for (section_id, parent_id, name) in PAIR_ROWS {
+        let row = live
+            .sections
+            .get(&section_id)
+            .unwrap_or_else(|| panic!("precondition: the live layer holds section {section_id}"));
+        assert_eq!(
+            (row.parent_id, row.name.as_str()),
+            (parent_id, name),
+            "precondition: live section {section_id}'s parent and name"
+        );
+    }
+
+    for (what, subscribed_object, version) in [
+        (
+            "a reconnector from before the pair",
+            object_id,
+            before_the_pair,
+        ),
+        ("a brand-new joiner", 0, 0),
+    ] {
+        let response = handle_subscribe_read_layer(
+            &harness.svc,
+            subscribe_request(&session_id, subscribed_object, version),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{what}: SubscribeReadLayer must return Ok: {e}"));
+        let mut stream = response.into_inner();
+        let (_, body) = recv_message(&mut stream).await;
+        assert_snapshot_carries_the_pair(&decode_catch_up_delta(&body), what);
+    }
+    harness.cancel.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), &mut harness.loop_handle).await;
+}
+
+/// The layer's stored state, read by the reference reader.
+async fn read_pair_layer(harness: &CheckpointHarness, object_id: u64) -> ObjectState {
+    snapshot_to_object_state(
+        &read_object_state_for_test(
+            &harness.svc.valkey,
+            &harness.svc.key_schema,
+            &object_id.to_string(),
+        )
+        .await
+        .expect("read_object_state_for_test must succeed"),
+    )
 }

@@ -104,6 +104,20 @@ An RPC sample runs from the attempt's start to the completion-queue receipt of i
 
 Phases 2–7 name the first wait still incomplete at the shared deadline; later stages may also be blocked. Only TIMEOUT emits a `quiescence_failed` record, whose `reason` field is the phase. After a TIMEOUT the runtime keeps its final owner, so `CopyDiagnostics(0)` still works; after a successful final shutdown the runtime is gone and its last sample cannot be read.
 
+### Cleanup
+
+`cleanup_duration_ms_by_call_result` has sparse entries keyed by `call` and `result`. Each sample measures one whole public cleanup call on an initialized runtime, whatever its result; NOT_INITIALIZED adds no sample. A zero-timeout poll adds its own sample, so a host or binding that polls a handle until it is released adds one per poll; the Python package's own handle cleanup polls through these calls and is counted.
+
+| Call | Function |
+| --- | --- |
+| 1 | `UnregisterCallback`, of an auth, status or diagnostic callback |
+| 2 | `Cancel` |
+| 3 | `ReleaseRequest` |
+| 4 | `LeaveSession` |
+| 5 | `UnregisterEndpoint` |
+
+Result 14 (`BUSY`) counts refusals: a call on a callback worker that would wait for that worker's own work, a callback cancelling its own request, a `ReleaseRequest` before quiescence or a final `UnregisterEndpoint` while dependents remain. Result 9 (`TIMEOUT`) counts calls that returned before quiescence, polls included; only a `TIMEOUT` after a nonzero timeout emits a [`cleanup_timeout`](ovlive-diagnostic-catalog.md#cleanup-timeouts) record, whose `reason` field is the call. `ReleaseRequest` and `UnregisterEndpoint` never wait, so they have no `TIMEOUT` entries. Runtime shutdown's own cleanup of sessions, requests and observers is measured by the shutdown metric above, not here.
+
 ### Authentication
 
 `metrics.auth` describes endpoint credential waits.

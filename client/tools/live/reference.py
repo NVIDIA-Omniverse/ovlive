@@ -4,23 +4,36 @@
 """Build wire bindings and run the independent reference-service contract suite.
 
 The caller selects an already-provisioned interpreter. No implicit installation
-or network fetch. --identity works without socket permissions.
+or network fetch. --identity works without socket permissions. `serve` runs the
+reference service alone on loopback for trying the samples; it is a test
+fixture, not a deployable Live Services endpoint.
 """
-import argparse
-import asyncio
-import hashlib
-import importlib.metadata
-import json
-import os
 from pathlib import Path
-import socket
-import ssl
-import subprocess
 import sys
-import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-PINS = {"grpcio": "1.78.0", "grpcio-tools": "1.78.0", "protobuf": "6.33.6"}
+if __name__ == "__main__":
+    # The fault handler precedes the native imports below (OpenSSL through hashlib and ssl, asyncio, socket), so a
+    # fault while loading them leaves a dump too.
+    sys.path.insert(0, str(ROOT))
+    from tools.live import stack_dump
+    stack_dump.install()
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import hashlib  # noqa: E402
+import importlib.metadata  # noqa: E402
+import json  # noqa: E402
+import os  # noqa: E402
+import secrets  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import ssl  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+import unittest  # noqa: E402
+
+PINS = {"grpcio": "1.85.0", "grpcio-tools": "1.85.0", "protobuf": "7.36.2"}
 
 
 def identity(openssl):
@@ -71,8 +84,59 @@ async def serve_one_ping(seed):
         await server.stop()
 
 
+def serve_main(argv):
+    """Serves the reference service on loopback until Ctrl+C, SIGTERM or, with --stop-on-eof, the end of
+    standard input. It prints one JSON line with the authority and a token the service accepts. This is a test
+    fixture for trying the samples and the Python quick start, not a deployable Live Services endpoint: its
+    state is in memory and lasts only as long as the process."""
+    parser = argparse.ArgumentParser(prog="reference.py serve", description=serve_main.__doc__)
+    parser.add_argument("--port", type=int, default=0, help="loopback port; 0, the default, picks a free one")
+    parser.add_argument("--seed", type=int, default=42, help="seed of the service's generated identifiers")
+    parser.add_argument("--stop-on-eof", action="store_true", help="also stop when standard input ends")
+    args = parser.parse_args(argv)
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be 0 to 65535")
+    with tempfile.TemporaryDirectory() as generated:
+        proto_root = ROOT / "source/live/protos"
+        subprocess.run([sys.executable, "-m", "grpc_tools.protoc", f"--proto_path={proto_root}",
+                        f"--python_out={generated}", f"--grpc_python_out={generated}",
+                        str(proto_root / "nvidia/omniverse/live/v1alpha/live.proto")], check=True, timeout=30)
+        sys.path[:0] = [generated, str(ROOT / "tests/reference_service")]
+        return asyncio.run(serve(args.port, args.seed, args.stop_on_eof))
+
+
+async def serve(port, seed, stop_on_eof):
+    from service import Principal, ReferenceServer, State
+    token = secrets.token_urlsafe(24)
+    state = State(seed)
+    state.tokens = {token: Principal("reference-serve")}
+    # A fixed port that another process already holds fails to bind instead of sharing it.
+    server = ReferenceServer(state, reuse_port=False)
+    authority = await server.start(port)
+    stop, loop = asyncio.Event(), asyncio.get_running_loop()
+    for number in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(number, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows: asyncio.run cancels the wait on Ctrl+C, which stops the server below.
+    if stop_on_eof:
+        threading.Thread(target=lambda: (sys.stdin.read(), loop.call_soon_threadsafe(stop.set)), daemon=True).start()
+    print(json.dumps(dict(type="serving", authority=authority, token=token,
+                          note="reference service test fixture on loopback; not a deployable service")), flush=True)
+    try:
+        await stop.wait()
+    except asyncio.CancelledError:
+        pass  # Ctrl+C without a signal handler; asyncio.run then returns normally.
+    finally:
+        await server.stop()
+    print(json.dumps(dict(type="stopped")), flush=True)
+    return 0
+
+
 def main():
     """Runs the lane; a lane that ends before its service answered reports a failed start."""
+    if sys.argv[1:2] == ["serve"]:
+        return serve_main(sys.argv[2:])
     sys.path.insert(0, str(ROOT))
     from tools.live.test_support import report_ready
     try:
@@ -106,6 +170,11 @@ def lane_main():
     parser.add_argument("--diagnostics-sample", type=Path)
     parser.add_argument("--writer-plan", type=Path)
     parser.add_argument("--writer-case", type=Path)
+    parser.add_argument("--staged-package", type=Path,
+                        help="the <target-dir>/usd/omniverse/live stage a package writer case or a staged-samples "
+                             "reduced plan runs the samples of")
+    parser.add_argument("--reduced-plan", type=Path)
+    parser.add_argument("--without-test-defect", action="store_true")
     parser.add_argument("--resolver-runtime-plugin", type=Path)
     parser.add_argument("--resolver-runtime-plug-info", type=Path)
     parser.add_argument("--driver-mode", help="run only this native driver mode (requires --native-driver)")
@@ -125,6 +194,13 @@ def lane_main():
         parser.error('--writer-plan requires --plugin-driver')
     if args.writer_case and (args.writer_plan or not (args.plugin_driver or args.scene_transport_driver)):
         parser.error('--writer-case requires one plugin/scene driver and cannot combine with --writer-plan')
+    if args.reduced_plan and (args.writer_plan or args.writer_case or
+                              not (args.plugin_driver or args.scene_transport_driver)):
+        parser.error('--reduced-plan requires one plugin/scene driver and cannot combine with a writer plan or case')
+    if args.without_test_defect and not args.reduced_plan:
+        parser.error('--without-test-defect requires --reduced-plan')
+    if args.staged_package and not ((args.writer_case or args.reduced_plan) and args.plugin_driver):
+        parser.error('--staged-package requires a plugin --writer-case or --reduced-plan')
     resolver_options = (args.resolver_runtime_driver, args.resolver_runtime_plugin, args.resolver_runtime_plug_info)
     if any(resolver_options) and not all(resolver_options):
         parser.error("--resolver-runtime-driver, --resolver-runtime-plugin and --resolver-runtime-plug-info must be supplied together")
@@ -134,10 +210,13 @@ def lane_main():
     if args.driver_mode and not args.native_driver:
         parser.error("--driver-mode requires --native-driver")
     writer_case = None
+    reduced = None
     try:
         scenarios, shard = case_selection()
-        if (scenarios or shard or args.driver_mode) and (args.kit_executable or args.writer_plan or args.writer_case):
-            raise ValueError("case selection and driver modes are unavailable for Kit, writer plans and writer cases")
+        if (scenarios or shard or args.driver_mode) and (args.kit_executable or args.writer_plan or args.writer_case or
+                                                         args.reduced_plan):
+            raise ValueError("case selection and driver modes are unavailable for Kit, writer plans, writer cases "
+                             "and reduced plans")
         dependencies = identity(args.openssl)
         if args.identity:
             print(json.dumps(dependencies, sort_keys=True))
@@ -203,10 +282,37 @@ def lane_main():
                 raise ValueError('writer case requires a different driver boundary')
             if driver == 'scene':
                 candidate = native_identity(args.scene_transport_driver.resolve(), 'scene_transport')
+            package = None
+            if args.staged_package:
+                from tools.live import build, platforms
+                package = build.stage_identity(args.staged_package, platforms.host().name)
+                os.environ['LIVE_TEST_STAGED_PACKAGE'] = package['path']
+            else:
+                os.environ.pop('LIVE_TEST_STAGED_PACKAGE', None)
             verify_context(recipe['context'], source=fingerprint(), candidate=candidate, driver=driver,
                            reference=dependencies,
-                           sanitizer=sanitizer_record(os.environ))
+                           sanitizer=sanitizer_record(os.environ), package=package)
             os.environ['LIVE_TEST_SEED'] = str(writer_case['seed'])
+        if args.reduced_plan:
+            # The same checks as the common runner, before the reference service starts or any writer launches.
+            sys.path[:0] = [str(ROOT), str(ROOT / 'tests/reference_service')]
+            from tools.live.sanitizer import recorded as sanitizer_record
+            from tools.live.test import fingerprint, native_identity
+            import plan_replay
+            reduced = plan_replay.load(args.reduced_plan, without_defect=args.without_test_defect)
+            if reduced['lane'] != ('plugin-reference' if args.plugin_driver else 'scene-reference'):
+                raise ValueError(f"reduced {reduced['kind']} plan requires the {reduced['lane']} lane")
+            candidate = (native_identity(args.plugin_driver.resolve(), 'plugin') if args.plugin_driver else
+                         native_identity(args.scene_transport_driver.resolve(), 'scene_transport'))
+            staged = None
+            if args.staged_package:
+                staged = plan_replay.staged_identity(args.staged_package)
+                os.environ['LIVE_TEST_STAGED_PACKAGE'] = staged['path']
+            else:
+                os.environ.pop('LIVE_TEST_STAGED_PACKAGE', None)
+            plan_replay.verify(reduced, source=fingerprint(), candidate=candidate, reference=dependencies,
+                               sanitizer=sanitizer_record(os.environ), staged=staged)
+            os.environ['LIVE_TEST_SEED'] = str(reduced['plan']['master_seed'])
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
     except (OSError, ValueError, TypeError, KeyError, RuntimeError, importlib.metadata.PackageNotFoundError, subprocess.SubprocessError) as error:
@@ -260,8 +366,18 @@ def lane_main():
     sys.path[:0] = [str(generated), str(ROOT / "tests/reference_service")]
     asyncio.run(serve_one_ping(int(os.environ.get("LIVE_TEST_SEED", "0"))))
     report_ready(True, lane=lane)
+    if reduced is not None:
+        import plan_replay
+        from tools.live.test_support import write_json
+        result = asyncio.run(plan_replay.replay(reduced, artifact / 'reduced-plan-replay'))
+        evidence = plan_replay.evidence(reduced, result)
+        write_json(artifact / 'reduced-plan-result.json', evidence)
+        print(f"Reduced {reduced['kind']} plan {'reproduced' if evidence['reproduced'] else 'did NOT reproduce'} "
+              f"its recorded signature: {json.dumps(result, sort_keys=True)}", flush=True)
+        # A reproduced defect remains a failing check, never a green qualification.
+        return plan_replay.REPRODUCED if evidence['reproduced'] else plan_replay.NOT_REPRODUCED
     if writer_case is not None:
-        from tools.live.writer_campaign import PROFILES, case_passed, soak_scale
+        from tools.live.writer_campaign import PROFILES, case_passed, soak_scale, stream_age_scale
         from tools.live.test_support import write_json
         module, cls, method = writer_case['test_id'].rsplit('.', 2)
         case = getattr(importlib.import_module(module), cls)(method)
@@ -270,6 +386,8 @@ def lane_main():
         case.writer_process_limit = PROFILES[writer_case['profile']]['max_client_processes']
         if writer_case['scenario'] == 'soak':
             case.writer_soak = soak_scale()
+        if writer_case['scenario'] == 'stream-age':
+            case.writer_stream_age = stream_age_scale(writer_case['steps'])
         pending = dict(schema_version=1, case=writer_case, passed=False, tests_run=0, peak_clients=0,
                        skipped=0, errors=0, failures=0, unexpected_successes=0, expected_failures=0)
         destination = artifact / 'writer-case-result.json'

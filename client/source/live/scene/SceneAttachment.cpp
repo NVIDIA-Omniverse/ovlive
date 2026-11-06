@@ -4,6 +4,7 @@
 #include "LiveLayerAdmission.h"
 #include "LiveDeadline.h"
 #include "LiveExceptionResult.h"
+#include <pxr/base/tf/diagnostic.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -49,6 +50,9 @@ struct PublicationTask {
     }
     // Applies the ordered work to the journal as one transaction.
     SceneJournal::SnapshotPtr apply() const {
+        // A restore admitted in the transaction holds journal and actor
+        // locks while it unwinds; reservation releases report after them.
+        PendingBytes::DeferredReleaseNotices notices;
         std::vector<SceneJournal::Application> batch;
         batch.reserve(work.size());
         for (size_t i = 0; i < work.size(); ++i) batch.push_back({work[i], effect[i]->bytes(), effect[i]->intent});
@@ -312,17 +316,19 @@ std::shared_ptr<SceneAttachment> SceneAttachment::open(std::shared_ptr<Runtime> 
         };
     } else {
         callbacks.apply = [journal](const LayerProgress::Work& work, const LayerActor::Effect& effect) {
+            PendingBytes::DeferredReleaseNotices notices;
             journal->applyEmpty(work.first - 1);
             journal->apply(work, effect.bytes(), effect.intent);
         };
     }
     // After an issuance-only FAILED the journal keeps receiving; nothing
-    // installs into the host layer. A publication that failed after its own
+    // installs into the host layer, and nothing is restored, since the
+    // layer admits no intent. A publication that failed after its own
     // journal application already holds that work.
     callbacks.applyDetached = [journal](const LayerProgress::Work& work, const LayerActor::Effect& effect) {
         if (journal->snapshot()->applied >= work.last) return;
         journal->applyEmpty(work.first - 1);
-        journal->apply(work, effect.bytes(), effect.intent);
+        journal->apply(work, effect.bytes(), effect.intent, false);
     };
     callbacks.changed = [journal, publication = attachment->publication_, changed = std::move(changed)](
                             const auto& state) {
@@ -330,9 +336,88 @@ std::shared_ptr<SceneAttachment> SceneAttachment::open(std::shared_ptr<Runtime> 
         journal->applyEmpty(state.applied);
         if (changed) changed(state);
     };
+    // Only intents admitted through this attachment create sections, so no
+    // section the observer reports precedes the actor. A USD warning names the
+    // replaced section's path, and section_replaced records only its ID
+    // (design section 18 keeps names out of diagnostics). The observer and the
+    // restore admission are installed before the actor opens and learn the
+    // actor afterwards without allocating: once the actor is live nothing
+    // here may throw, since a dropped attachment's actor would hold the
+    // admission, not retiring, until it stops, and an immediate retry of the
+    // open would fail ALREADY_EXISTS.
+    struct ActorOwner {
+        std::mutex mutex;
+        std::weak_ptr<LayerActor> actor;
+    };
+    const auto actorOwner = std::make_shared<ActorOwner>();
+    journal->observeReplaced([actorOwner](const SceneJournal::ReplacedSection& replaced) {
+        std::shared_ptr<LayerActor> owner;
+        {
+            std::lock_guard<std::mutex> lock(actorOwner->mutex);
+            owner = actorOwner->actor.lock();
+        }
+        if (!owner) return;
+        try {
+            using namespace PXR_NS; // TF_WARN names Tf symbols unqualified.
+            TF_WARN("Live layer %s: the peer commit at sequence %llu replaced %s, which this client created, and "
+                    "%s (section %llu)",
+                owner->uri().c_str(), static_cast<unsigned long long>(replaced.sequence),
+                replaced.path.IsEmpty() ? "a hidden section" : replaced.path.GetText(),
+                replaced.restored ? "restored its content under the peer's section" : "removed its subtree",
+                static_cast<unsigned long long>(replaced.section));
+        } catch (...) {} // The record stands without its description.
+        owner->reportSectionReplaced(replaced.section, replaced.sequence);
+    });
+    // A restore is admitted as the attachment's captured intents are, from
+    // the journal transaction that applies the replacing peer update.
+    // A restore the endpoint refuses for capacity waits in the journal. Its
+    // own pending-byte watcher, which the actor registers when it is
+    // constructed, records the cause, and the endpoint's next release
+    // dispatches a retry through the publication dispatcher (a layer without
+    // one retries at its next application); a release during the refused
+    // admission retries at once.
+    const auto watcher = attachment->restoreWatcher_;
+    if (attachment->publication_)
+        watcher->setRetry([owner = std::weak_ptr<SceneAttachment>(attachment),
+                              state = std::weak_ptr<PublicationState>(attachment->publication_)] {
+            const auto publication = state.lock();
+            if (!publication) return;
+            DispatchExecutor::NonblockingScope scope;
+            publication->callbacks.dispatch([owner] {
+                if (const auto attached = owner.lock()) attached->retryRestore();
+            });
+        });
+    journal->restoreWith([actorOwner, restores = std::weak_ptr<BufferedEditCount>(watcher)](auto original, auto intent,
+                             auto publication) {
+        std::shared_ptr<LayerActor> owner;
+        {
+            std::lock_guard<std::mutex> lock(actorOwner->mutex);
+            owner = actorOwner->actor.lock();
+        }
+        if (!owner) throw OmniUsdLiveResult(OMNI_USD_LIVE_CANCELLED);
+        if (!owner->updateCanFit(original.size())) throw CapturedRejection{OMNI_USD_LIVE_RESOURCE_EXHAUSTED};
+        const auto retainedBytes = intent->retainedBytes;
+        const auto watching = restores.lock();
+        const auto releases = watching ? watching->releases() : 0;
+        try {
+            if (SceneJournal::takeRestoreRefusalForTest()) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+            return owner->submit(original, std::move(intent), publication, retainedBytes);
+        } catch (OmniUsdLiveResult result) {
+            if (result == OMNI_USD_LIVE_RESOURCE_EXHAUSTED && watching) {
+                watching->store(0, result);
+                if (watching->releases() != releases) watching->released();
+            }
+            throw;
+        }
+    });
+    actorOptions.releaseWatcher = watcher;
     // Captures own only the journal, never the attachment/actor: no owner cycle.
     // Callbacks may start before open returns and do not depend on actor_ assignment.
     attachment->actor_ = LayerActor::open(std::move(runtime), endpoint, std::move(actorOptions), std::move(callbacks));
+    {
+        std::lock_guard<std::mutex> lock(actorOwner->mutex);
+        actorOwner->actor = attachment->actor_;
+    }
     return attachment;
 }
 
@@ -536,6 +621,30 @@ SceneAttachment::PublicationProgress SceneAttachment::publicationProgress() cons
     std::lock_guard<std::mutex> lock(publication_->mutex);
     return {true, publication_->attempted, publication_->published, publication_->attemptedRevision,
         publication_->publishedRevision, publication_->result};
+}
+
+void SceneAttachment::retryRestore() noexcept {
+    PendingBytes::DeferredReleaseNotices notices;
+    // A refusal of this attempt records the cause again.
+    restoreWatcher_->store(0, OMNI_USD_LIVE_OK);
+    try {
+        const auto before = journal_->snapshot()->revision;
+        journal_->retryRestore();
+        // An admitted restore installs into the host content at once, as one
+        // admitted in an application's transaction does, so a later failure
+        // keeps it for export. This runs on the publication dispatcher.
+        const auto admitted = journal_->snapshot();
+        if (publication_ && admitted->revision != before) {
+            try {
+                publication_->publish(admitted);
+            } catch (OmniUsdLiveResult result) {
+                // A closing layer installs nothing; its local publication
+                // of the restore follows the actor as any admission's does.
+                if (result == OMNI_USD_LIVE_CANCELLED || result == OMNI_USD_LIVE_BUSY) return;
+                throw;
+            }
+        }
+    } catch (...) { failPublication(currentExceptionResult()); }
 }
 
 void SceneAttachment::requireAuthoring() const {

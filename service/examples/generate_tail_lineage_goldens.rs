@@ -857,6 +857,9 @@ async fn main() {
                 AssemblyDecision::ShuttingDown => {
                     panic!("the generator's keeper never reports a shutdown; got ShuttingDown")
                 }
+                AssemblyDecision::DeferredCleanup => {
+                    panic!("the generator runs no checkpoint clean-up; got DeferredCleanup")
+                }
             };
             assert_eq!(
                 outcome.snap_seq, sequence_num,

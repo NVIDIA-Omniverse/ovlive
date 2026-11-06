@@ -36,6 +36,10 @@ A replica reports `NOT_SERVING` on the readiness name until startup finishes, an
 When a service-identity token file is configured, readiness also waits for the first token.
 When backups are configured, readiness also waits for the startup check of the backup store's counters record.
 Readiness does not depend on the permissions or userinfo services, so an outage there does not take every replica out of rotation.
+Readiness and liveness stay `SERVING` while the service is held for disaster recovery ({ref}`Held for disaster recovery <live-edit-monitoring-held>`).
+Kubernetes therefore neither restarts held replicas nor takes them out of rotation, and clients get a refusal naming the hold rather than a load-balancer error.
+A replica, held or not, with no successful read of the hold state from the backing store for 30 seconds reports `NOT_SERVING` and sets `live_edit_dr_hold_verdict_stale` to `1`.
+It keeps reading with no time limit and does not exit while reads fail; once a read succeeds, a replica that is not held restarts, and a held one reports `SERVING` again ({ref}`Health probes and startup <live-edit-operations-probes>`).
 
 A ready replica or a successful `Ping` does not prove that users can open their base assets or that backups are being written.
 Use the alerts below for those.
@@ -52,12 +56,17 @@ Each failed RPC logs exactly one line:
 - `RPC failed` at `INFO` for client-caused failures, and at `WARN` for authorization denials and server-side failures: capacity refusals, backing-store failures, and `INTERNAL`, `UNKNOWN` or `DATA_LOSS` codes without a recorded cause.
 - `internal error` at `ERROR` for a server-side fault with a recorded cause, in its `error` field.
 - `RPC deadline exceeded` at `WARN` when the server deadline ran out, with `endpoint`, `deadline_ms` and `elapsed_ms`.
-- `RPC abandoned before completion` at `INFO` when the client cancelled or its own timeout expired first, with `elapsed_ms` and `client_timeout_ms`.
+- `RPC abandoned before completion` at `INFO` when the client cancelled, its own timeout expired or the connection closed first, with `elapsed_ms` and `client_timeout_ms`.
 
 The first two lines carry `endpoint`, `grpc_code`, `status_message` and `stage`, plus the `session_id`, `layer_name`, `client_id` and `base_path` the request named.
 The `grpc_code` and `endpoint` values match the labels of `live_endpoint_calls_total`, so a spike on a dashboard leads straight to its log lines.
 Clients receive only a generic message for a server-side fault, so these lines are the place to find its cause.
 The service never logs bearer tokens or other credentials.
+
+A `WARN` line containing `locally-reset streams reached limit` (too many malformed or cut-off requests over one connection's life) or `remotely-reset pending-accept streams reached limit` (many calls cancelled together as they started) means the service closed one client's or proxy's connection.
+Its clients reconnect; calls still waiting for a response log `RPC abandoned before completion`, and open `JoinSession` and `SubscribeReadLayer` streams end without a line.
+An occasional line on a proxy connection open for days can come from ordinary traffic; frequent lines mean a misbehaving client or proxy, or a deliberate flood.
+The line names no client, so find the source in your ingress or proxy connection logs for that time.
 
 (live-edit-monitoring-metrics)=
 ## Collecting metrics
@@ -67,6 +76,10 @@ Each replica serves Prometheus metrics at `/metrics` on port `9090` (`service.me
 - **Prometheus Operator.** Set `serviceMonitor.enabled: true` and add the labels your Prometheus selects on to `serviceMonitor.labels`.
   The ServiceMonitor scrapes every 30 s by default (`serviceMonitor.interval`).
   Install the Prometheus Operator's CRDs first, or the install fails.
+  The chart's ServiceMonitor keeps the service's `endpoint` and `service` labels, which the Prometheus Operator's scrape otherwise renames to `exported_endpoint` and `exported_service`.
+  Add your own metric relabeling rules as a list in `serviceMonitor.metricRelabelings` (default `[]`); they run after the chart's, so they see the restored labels.
+  Your own scrape that sets `endpoint` or `service`, such as a PodMonitor on server pods, needs the same rules: copy the `metricRelabelings` block that `helm template {RELEASE} {CHART} --set serviceMonitor.enabled=true` renders.
+  A Prometheus `scrape_config` uses `metric_relabel_configs`, `source_labels` and `target_label` instead.
 - **Replica autoscaler.** In the default `autoscaling.mode: scaler`, the scaler pod serves its own `live_edit_scaler_*` metrics on port `9090`.
   It has no Service, so the ServiceMonitor does not reach it: scrape the pod, for example with a PodMonitor or with annotations set through `autoscaling.scaler.podAnnotations`.
 - **OTLP push.** To push the same metrics to an OpenTelemetry collector as well, set `observability.metrics.enabled: true` and `observability.metrics.endpoint.grpc`, an `http://` or `https://` URL ({ref}`Configuration <live-edit-configuration-observability>`).
@@ -135,7 +148,7 @@ Calls to the health service, reflection and the capabilities service are counted
 | `ABORTED` | A chained `UpdateLayer` was refused because its previous write was not the client's latest. Nothing was applied. |
 | `CANCELLED` | The client cancelled, disconnected, or its own deadline expired first. |
 | `DEADLINE_EXCEEDED` | The server deadline ran out: `rpc.deadlineMs` (30 s) for most calls, `rpc.sessionListTimeoutMs` (2 s) for `ListSessions`. |
-| `UNAVAILABLE` | Retryable: a capacity refusal, a backing store or auth service that is unreachable or refusing, or a replica shutting down. Clients normally retry. |
+| `UNAVAILABLE` | Retryable: a capacity refusal, a backing store or auth service that is unreachable or refusing, a replica shutting down, or the service held offline for disaster recovery, when every call on every replica answers it. Clients normally retry. |
 | `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | A server-side fault. Each logs an `internal error` line at `ERROR`, or an `RPC failed` line at `WARN`. |
 
 ```promql
@@ -188,7 +201,7 @@ How the limits are sized and how the autoscaler responds is on {ref}`Scaling <li
 A replica refusing subscriptions at its ceiling shows flat CPU and memory, so do not judge subscription capacity from pod utilisation.
 
 Pod memory should return close to its post-start level within a few minutes of load ending, apart from the structural-edit cache.
-That cache keeps up to `live_edit_structural_cache_budget_bytes` (about 310 MiB at the `5Gi` limit, its indexes included) for 10 minutes after a layer's last structural edit; `live_edit_structural_cache_weight_bytes` shows its size.
+That cache keeps up to `live_edit_structural_cache_budget_bytes` (about 310 MiB at the `5Gi` limit, its own bookkeeping included) for 10 minutes after a layer's last structural edit; `live_edit_structural_cache_weight_bytes` shows its size.
 If `live_edit_jemalloc_allocated_bytes` keeps growing across load cycles beyond that, open a support case.
 
 (live-edit-monitoring-store-memory)=
@@ -215,6 +228,7 @@ If you set up only a few, start with these.
 | `LiveEditReplicasNotReady` | Fewer replicas are ready than requested (needs kube-state-metrics) | warning, 15m | {ref}`Probes <live-edit-operations-probes>` |
 | `LiveEditBackupsBehind` | Backups lag more than five backup intervals; only when backups are on | page, 5m | {ref}`Backups behind <live-edit-monitoring-backups>` |
 | `LiveEditCredentialExpired` | A cached service or backing-store token has expired; only with a token file | page, 1m | {ref}`Credential expired <live-edit-monitoring-credential>` |
+| `LiveEditHeldForRecovery` | The service is held for disaster recovery and refuses every call | page, 0m | {ref}`Held for disaster recovery <live-edit-monitoring-held>` |
 
 The rules are in Prometheus rule-file format; for the Prometheus Operator, put the `groups` list under `spec` of a `PrometheusRule`.
 The expressions group by `instance`; use `pod` if that is your scrape label.
@@ -266,6 +280,10 @@ groups:
     expr: min by (instance, role) (live_edit_service_token_expires_in_seconds) < 0
     for: 1m
     labels: {severity: page}
+  - alert: LiveEditHeldForRecovery
+    expr: max(live_edit_dr_held) == 1
+    for: 0m
+    labels: {severity: page}
 ```
 
 (live-edit-monitoring-runbooks-store)=
@@ -294,7 +312,7 @@ While the clean-up runs, uploads carrying large values pause, usually for under 
    - `freed`: the service freed memory; still grow the store.
    - `refused`: the store does not let the service free memory while it is full; only adding memory helps.
    - `nothing_to_collect`, or `freed_nothing` whose line shows `oom_skipped=0`, while writes stay refused: the store is full of data in use.
-   - `freed_nothing` whose line shows `oom_skipped` above 0: memory is still owed and will be freed; not a sizing signal.
+   - `freed_nothing` whose line shows `oom_skipped` above 0: some released values cannot be deleted yet and are freed once the store has room; not a sizing signal.
    - `failed`: the clean-up hit an error before it freed anything; its `error` field and a `GC pass failed` line say why. The next refused write starts another a second or more later; while it keeps failing, adding memory is still the fix.
 2. Raise `maxmemory` (and the store's memory limit with it), or free memory.
    On Azure Managed Redis, scale the cache to a larger SKU, then set `valkey.memoryBytes` to the new total.
@@ -326,14 +344,17 @@ Deleting layer keys does not help here.
 The backing store lost its data while the service kept running: a restart without persistence, a failover to a stale replica, or eviction.
 Every live session and layer in the store is gone; clients are disconnected and reconnect.
 
-With backups configured, one replica can also log this `WARN`, repeating about every minute: `checkpoint counters-sync: live le:counter:object_id is below the stored counters sidecar; not lowering the sidecar`.
+With backups configured, one replica can also log a `WARN` containing `is below the stored counters sidecar`, repeating about every minute.
 It means the backing store went back to older data, even when `LiveEditKeyspaceLost` did not fire, for example after a failover to a stale replica that still holds an older copy of the service's keys.
 Until a pod restarts, new layers can get ids that backups already hold, so restart the replicas: new layer ids then start above the backups' record.
 
 1. Confirm the event in your store's own logs and metrics.
 2. With backups configured, watch `live_edit_checkpoint_recovery_attempts_total{scope="layer"}` climb as layers are restored on access, then work through {ref}`After a restore <live-edit-monitoring-after-restore>`.
 3. If `outcome="failed_after_repair"` ticked, the store is dropping writes it already acknowledged: check that it runs `maxmemory-policy noeviction` and is not failing over repeatedly. Nothing the service writes is durable until that is fixed.
-4. If only `outcome="failed"` ticked, read the `ERROR` line for that repair: it names whether the backup store or the backing store failed.
+4. If only `outcome="failed"` ticked, read the line logged for that repair.
+   An `ERROR` names whether the backup store or the backing store failed.
+   An `INFO` saying the replica entered a disaster-recovery hold or lost contact with the store's hold state means one of those stopped the repair.
+   If `live_edit_dr_held` reads `1`, follow {ref}`Held for disaster recovery <live-edit-monitoring-held>`; otherwise the replica lost contact with the backing store and restarts by itself ({ref}`Health probes and startup <live-edit-operations-probes>`).
 
 (live-edit-monitoring-ext-integrity)=
 ### External-value integrity
@@ -356,7 +377,7 @@ A re-upload of the layer refused at the named key leaves the layer refusing edit
 The service then completes the re-upload by itself, with no further call, although it answered the client `INTERNAL`.
 If the named key is the layer's own entry, the service does not complete the re-upload; see step 3.
 If the named key is one of a deleted or replaced layer's indices, ending in `:obj:secs`, `:obj:dels`, `:obj:chs`, `:obj:flds` or `:obj:tss`, the layer's clean-up stopped partway; see step 4.
-The deleted layer, or a replaced layer's old content, is gone (a `DeleteLayer` that met the key answered `INTERNAL`), but its other keys stay in the store.
+The deleted layer, or a replaced layer's old content, is gone (a `DeleteLayer` that met the key answered `INTERNAL`), but its other keys stay in the store; its backups are still cleaned up.
 `LiveEditLayerKeysDamaged` fires for such a key; in rare cases the background clean-up stops at it without counting it, and only its `WARN`, `failed to clean up orphaned object`, names the key.
 
 1. Find the `ERROR` or `WARN` line from that time; it names the layer's object id and the exact key.
@@ -408,7 +429,7 @@ The deleted layer, or a replaced layer's old content, is gone (a `DeleteLayer` t
    If `obj:stream` is still listed after a minute, unlink it too.
 
 (live-edit-monitoring-runbooks-service)=
-## Runbooks: capacity, dependencies and delivery
+## Runbooks: capacity and dependencies
 
 (live-edit-monitoring-capacity-refusals)=
 ### Capacity refusals
@@ -417,8 +438,9 @@ Refusals reach clients as a retryable `UNAVAILABLE`; each one logs an `RPC faile
 
 1. Compare the replica's usage with its limit in {ref}`Capacity and saturation <live-edit-monitoring-capacity>`.
 2. **Subscriptions:** add replicas so new subscriptions land elsewhere. In `scaler` mode, raise `autoscaling.maxReplicas` if `live_edit_scaler_target_replicas` already equals it. To give each replica more subscriptions, raise `resources.limits.memory`; the ceiling follows it.
-3. **Catch-ups** (`reason="catchup_capacity"`): a join storm. Raise `valkey.subscriberMaxConcurrentCatchups` only together with the CPU limit; otherwise add replicas.
-4. **Uploads:** if `live_edit_upload_reserved_bytes / live_edit_upload_budget_bytes` is near 1, raise `resources.limits.memory`, which the upload memory follows, or add replicas. If it is low, one session has too many uploads in flight; the refusal lines name it.
+3. **Catch-ups** (`reason="catchup_capacity"`): a join storm. If `live_edit_catchup_payload_wait_seconds{outcome="refused_timeout"}` rises, raise `resources.limits.memory`; otherwise raise `valkey.subscriberMaxConcurrentCatchups` only with the CPU limit. Or add replicas.
+   Right after a disaster-recovery restore, that wait also covers first opens fetching large values from the backup store, and refusals from that cause stop by themselves once those values are fetched.
+4. **Uploads:** if `live_edit_upload_reserved_bytes / live_edit_upload_budget_bytes` is near 1, raise `resources.limits.memory` or add replicas. If it is low, one session has too many uploads in flight; the refusal lines name it.
 5. Verify: the refusal counters stop increasing.
 
 (live-edit-monitoring-backups)=
@@ -428,7 +450,7 @@ Layers that are not backed up are lost if the backing store loses its data.
 
 1. Check `live_edit_checkpoint_writes_total{result="error"}` by `kind`: errors mean the backup store is failing or unreachable, except as in step 2.
 2. If the errors are `kind="counters_sidecar"` only, and one replica logs a `WARN` containing `answered absent, but this process has already seen the counters sidecar` about every minute:
-   - Shortly after the first layer was created on a new backup prefix, this is expected when your Storage service caches "not found" answers, and it stops within that cache time.
+   - Shortly after the first layer was created on a new backup prefix, this is expected for up to about 15 minutes, or as long as your Storage service caches "not found" answers, then stops by itself.
    - If it continues past that, the service's layer-id record, `{BACKUP_PREFIX}/.live-edit/counters.json`, was deleted. Restart the replicas with `kubectl -n {NAMESPACE} rollout restart deployment/{DEPLOYMENT}`; a replica writes it again within about two minutes.
 3. If replicas log a `WARN` containing `the post-write checkpoint listing is empty`, backups are written but the service cannot list them: old backups are not deleted, and a restore finds no backup.
    Check that the pods reach the Storage service's list endpoint through any gateway or proxy in front of it, and that the list endpoint resolves `checkpoint.basePath`, in the form you set it, to the same prefix that writes use.
@@ -466,6 +488,9 @@ While this fires, the replica count is frozen.
 3. If decisions are all `reason="no_data"`, the scaler cannot reach the server pods' metrics port: check NetworkPolicies.
 4. Verify: `live_edit_scaler_decisions_total` increases about once per poll interval.
 
+(live-edit-monitoring-runbooks-delivery)=
+## Runbooks: delivery and self-checks
+
 (live-edit-monitoring-slow-propagation)=
 ### Edits propagate slowly
 
@@ -482,11 +507,52 @@ One of the service's internal consistency checks failed.
 The service has already protected the data, so no immediate action is needed.
 Collect the logs of every replica for the 15 minutes before the alert, note which metric increased, and open a support case.
 During or after an upgrade from, or a rollback to, a release that stores time samples at `-0.0` as written, first check whether the upgrade note expects the increase: {ref}`Upgrading from such a release <live-edit-operations-upgrade-time-zero>`.
+Do the same during or after an upgrade from, or a rollback to, 0.2.0 or earlier: {ref}`Upgrading from 0.2.0 or earlier <live-edit-operations-upgrade-from-0-2-0>`.
+
+(live-edit-monitoring-held)=
+## Held for disaster recovery
+
+While held for disaster recovery, the service is offline for every user until the lost data is restored or its loss accepted.
+Every replica then:
+
+- refuses every call `UNAVAILABLE`, with a message naming the incident and a hint to wait at least 30 seconds before retrying;
+- ends every open `JoinSession` and `SubscribeReadLayer` stream;
+- runs none of its background clean-up or backups;
+- keeps readiness and liveness `SERVING`, so its pod is neither restarted nor taken out of rotation.
+
+Each replica sets `live_edit_dr_held` to `1` and logs one `ERROR`, `the fleet is held for disaster recovery`, with the `incident`, `reason` and `evidence`; a replica serving when the hold began also counts it once on `live_edit_dr_hold_entered_total` with its `reason`.
+While held, it logs a `WARN`, `this replica is still held for disaster recovery`, every 5 minutes.
+A replica that starts during the hold, such as a rescheduled pod, starts held, logs that `ERROR` and reports `live_edit_dr_held` as `1` at once, so `LiveEditHeldForRecovery` keeps firing even after every pod restarts.
+In `scaler` autoscaling mode the replica count stays where it is while any replica is held, counted on `live_edit_scaler_decisions_total{reason="held"}`.
+`LiveEditReleasesNotRecorded` can also fire: a layer restore under way when the hold began leaves storage for the reconciler to reclaim.
+
+A disaster-recovery Job checks that each large value a restored or kept layer uses is in the backing store, a restored backup or the backup store.
+A value in none, or one the backup store could not confirm, keeps the service held.
+The accept-loss Job removes the attribute values that use such values, then ends the hold as its last step.
+If any value is unconfirmed, it removes nothing and the service stays held, unless it runs with a second `--confirm discard-unconfirmed-data`; a value of a session the Job removes goes with that session.
+For each layer that uses values in no store, the Job logs one `WARN`, `layer {LAYER} of session {SESSION_ID} references {N} values that are in no store`; values the backup store could not confirm get a separate `WARN` ending `whose presence the backup store could not confirm`.
+Each line lists up to 100 prims and attributes that use them, with a count and the start of each value's hash.
+The Job's metrics are readable only on its own pod while it runs ({ref}`Is the service held for disaster recovery? <live-edit-metrics-reference-dr-hold>`).
+Keep its log and add it to the support case.
+
+1. Find the `ERROR` line on any replica and note its `incident`, `reason` and `evidence`; {ref}`the reason values <live-edit-metrics-reference-dr-hold>` say what was lost.
+2. Do not restart or roll back the replicas to clear the hold: a restarted replica starts held.
+   Never delete the hold from the backing store by hand.
+   The restore or accept-loss Job removes it as its last step, after checking which large values are still in use; removed earlier, clean-up could delete the last backup copy of a large value.
+3. Run the restore Job, or accept the loss when nothing can restore it ({ref}`When the service is held <live-edit-durability-held>`).
+   If the Job cannot clear the hold, open a support case with its log, the `ERROR` line and the logs of every replica.
+4. Verify: within seconds of the hold clearing, each replica exits and Kubernetes restarts it, so expect one restart per pod.
+   `live_edit_dr_held` then reads `0` on every replica, and calls succeed again.
+   The first open of a layer whose large values only the backup store held is slower while it fetches them, up to 4 at a time (`live_edit_checkpoint_ext_recovery_total{result="recovered", meta="present"}`), and other first opens on that replica can be delayed.
+   While many such layers open at once, a first open can be refused with a retryable `catchup_capacity`; the client's retry does not fetch the values already fetched again.
+   `live_edit_checkpoint_ext_backup_owed` can read high until the backup repair has checked each such value.
+   If one replica still reads `1` and is not ready after the others restart, a fault inside that pod keeps it from reading the store.
+   Delete that pod: until then it keeps `LiveEditHeldForRecovery` firing and, in `scaler` mode, the replica count frozen.
 
 (live-edit-monitoring-after-restore)=
 ## After a disaster-recovery restore
 
-Restores happen automatically, when a client opens a layer or session the backing store has lost.
+A layer is restored when a client opens a layer or session the backing store has lost, or by a disaster-recovery Job ({ref}`Run the restore Job <live-edit-durability-run-restore>`).
 For a day afterwards, watch these signals; the `WARN` lines they come with name the layers involved.
 
 | Signal | What it means | What to do |
@@ -553,17 +619,57 @@ These optional rules watch backups. Add them only with `checkpoint.adapter` set:
 | `LiveEditBackupBlobEndpointUnreachable` | Large backups cannot upload to the backup store's blob storage | warning, 15m | {ref}`Durability <live-edit-durability-network>` |
 | `LiveEditBackupStoreDamaged` | Incremental backups were found with no full backup under them | warning, 0m | repair the backup store |
 | `LiveEditExternalValueMirrorDropping` | Copies of large values are skipped for lack of copy capacity; each is repaired minutes later | warning, 5m | the `reason` in {ref}`Are large values backed up? <live-edit-metrics-reference-large-value-backups>` |
-| `LiveEditLargeValueBackupsMissing` | Large values have gone an hour without a backup copy | warning, 0m | `live_edit_checkpoint_ext_backup_repair_total` by `outcome` in {ref}`Are large values backed up? <live-edit-metrics-reference-large-value-backups>`: `probe_failed`, and `resend_failed` with a `WARN` containing `could not upload` or `timed out`, mean the backup store is failing or slow, as in {ref}`Backups behind or stopped <live-edit-monitoring-backups>`; any other `resend_failed` is a backing-store read that failed for one value; `budget_busy` means copy capacity is short: act as for `budget_full`, checking the backup store's latency first; `oversized` names its value in a `WARN`. |
-| `LiveEditBackupCleanupBlocked` | Large-value clean-up stopped at a backup-store error, a malformed or vanished file, or its time limit | warning, 0m | A `WARN` containing `could not read the live ext-hash set` carries the reason. If it contains `was named by the layers listing but read as absent`, a file was listed and then not found: no action is needed, though the alert stays up for 6 hours; if `live_set_failed` keeps rising pass after pass, take the `WARN` lines to your Storage service's owner. A `permanent checkpoint-store error` ending in a line and column means one of the `.ext-refs.json` files under `{BACKUP_PREFIX}/.live-edit/layers/` is malformed; the line does not name the file. Open a support case, and do not delete the file: clean-up could then delete large values a backup still needs. Any other error means the backup store failed or refused the request: check that it is reachable and accepts the service's requests, as in {ref}`Backups behind or stopped <live-edit-monitoring-backups>`. A `WARN` containing `exceeded its collect-phase budget`, with `live_edit_checkpoint_adapter_ceiling_elapsed_total{phase="enumeration"}` rising, means the backup store answered too slowly for one pass: check its latency. |
-| `LiveEditBackupStorageGrowing` | Backup-store clean-up backlogs kept growing for 6 hours | warning, 1h | `LiveEditBackupCleanupBlocked` first. Then a `WARN` containing `exceeded its enumeration share` means the backup store listed too slowly for one pass: check its latency. A `WARN` containing `could not enumerate the layers namespace` means clean-up could not list the backup store: see {ref}`Backups behind or stopped <live-edit-monitoring-backups>`. An `INFO` line containing `listed no artifacts in the layers namespace` means clean-up listed no layer backups. On a store with none yet, deleted layers wait, and the backlog drains after the next layer backup. If replicas also log `the post-write checkpoint listing is empty`, the service cannot list its backups: see {ref}`Backups behind or stopped <live-edit-monitoring-backups>`. A `WARN` containing `two checkpoint listings in one reconciliation pass disagreed about a dead object` means the backup store answered two listings differently in one pass; that deleted layer's backups are kept, and their clean-up is retried next pass. One alone needs no action, but if it recurs, take it to your Storage service's owner. |
+| `LiveEditLargeValueBackupsMissing` | Large values have gone an hour without a backup copy | warning, 0m | `live_edit_checkpoint_ext_backup_repair_total` by `outcome` in {ref}`Are large values backed up? <live-edit-metrics-reference-large-value-backups>` |
+| `LiveEditBackupCleanupBlocked` | Large-value clean-up stopped at a backup-store error, a malformed file, a file that vanished unexplained, or its time limit | warning, 0m | {ref}`Backup clean-up alerts <live-edit-monitoring-backup-cleanup>` |
+| `LiveEditBackupStorageGrowing` | Backup-store clean-up backlogs kept growing for 6 hours, or deleted layers waited 6 hours with none cleaned up | warning, 1h | {ref}`Backup clean-up alerts <live-edit-monitoring-backup-cleanup>` |
 | `LiveEditRestoresRedirected` | Restores are redirected through blob storage | warning, 0m | the backup store's inline-read setting |
 
 `LiveEditExternalValueMirrorDropping` warns that copy capacity is short: the service repairs each skipped copy a few minutes later, except an `oversized` one, and until then the value has no backup ({ref}`Backups of large values <live-edit-durability-large-values>`).
 It leaves out `reason="shutdown"`: a replica that stops with large values still waiting for the backup store counts them there, so rollouts under upload load can fire it, and no setting prevents that.
+It also leaves out `reason="collect_fenced"`, values backup clean-up had just deleted, which say nothing about copy capacity.
 `LiveEditLargeValueBackupsMissing` reads the result of the last check that finished.
-A slow backup store does not silence it: each check gives up on existence requests and uploads after 4 minutes and still counts every value without a copy.
-Only a check that cannot finish counting within its 5-minute limit reports nothing, so the alert can stay silent while that repeats.
-Look for repeated `WARN` lines containing `backup repair pass did not complete its walk`, and check the backing store's latency.
+A slow backup store does not silence it.
+A check that cannot finish within its 5-minute limit, or that meets a backing-store error or a move of data between shards, reports nothing, so the alert can stay silent while that repeats.
+Look for repeated `WARN` lines containing `backup repair pass did not complete its walk`, and check the backing store's latency and whether it is {ref}`moving data between shards <live-edit-backing-store-moving-data>`.
+
+(live-edit-monitoring-backup-cleanup)=
+## Backup clean-up alerts
+
+See {ref}`Is backup clean-up keeping up? <live-edit-metrics-reference-backup-cleanup>` for what clean-up deletes and when.
+These alerts mean storage is kept longer than needed, not that backups are behind; a layer's backup waits for clean-up at most about 10 minutes at the default timeouts (`outcome="publish_deferred"`).
+Each pass logs one `INFO` line, `checkpoint clean-up pass complete`, with how long each step took and what it did.
+
+**`LiveEditBackupCleanupBlocked`:** clean-up deleted no large values in at least one pass.
+Find the `WARN` from that pass:
+
+- `could not read the live ext-hash set` carries the reason.
+  If it contains `ext-refs sidecar` and `is malformed`, it names a `.ext-refs.json` file under `{BACKUP_PREFIX}/.live-edit/layers/` that cannot be read.
+  Open a support case, and do not delete the file: clean-up could then delete large values a backup still needs.
+  Any other reason means the backup store failed or refused the request: check that it is reachable and accepts the service's requests, as in {ref}`Backups behind or stopped <live-edit-monitoring-backups>`.
+- `listed ext-refs sidecar(s) and then read them absent` names files the backup store listed and then answered "not found" for, with nothing to explain it.
+  One alone needs no action, though the alert stays up for 6 hours.
+  If it recurs pass after pass, take the `WARN` lines to your Storage service's owner: the store may be answering "not found" for files it holds.
+- `exceeded its collect-phase budget`, with `live_edit_checkpoint_adapter_ceiling_elapsed_total{phase="enumeration"}` rising, means the backup store answered too slowly for one pass: check its latency with `live_edit_checkpoint_adapter_call_duration_seconds`.
+
+**`LiveEditBackupStorageGrowing`:** check `LiveEditBackupCleanupBlocked` first, then these lines:
+
+- `INFO` containing `checkpoint clean-up skips the rest of this pass`: a replica of an older release, or none, leads backups, so clean-up waits.
+  Expected during an upgrade, and briefly after startup or while backup leadership moves.
+  If it lasts, see {ref}`Backups behind or stopped <live-edit-monitoring-backups>`.
+- `WARN` containing `storage-api refused a per-layer backup listing`: the Storage service refuses to list one layer's backups, so the service lists the whole backup folder, which is slower on a large store, and tries the layer's listing again every 5 minutes.
+  Check the service identity's listing permission under `{BACKUP_PREFIX}/.live-edit/layers/`.
+  Logged once per replica start.
+- `WARN` containing `exceeded its enumeration share`: the backup store listed too slowly for one pass; check its latency.
+- `WARN` containing `could not enumerate the layers namespace`: clean-up could not list the backup store; see {ref}`Backups behind or stopped <live-edit-monitoring-backups>`.
+- `INFO` containing `listed no artifacts in the layers namespace`: clean-up listed no layer backups.
+  On a store with none yet, deleted layers wait, and the backlog drains after the next layer backup.
+  If replicas also log `the post-write checkpoint listing is empty`, the service cannot list its backups; see {ref}`Backups behind or stopped <live-edit-monitoring-backups>`.
+- `INFO` containing `a deleted layer's store clean-up has not finished, so its backups are kept`: that layer's deletion is still finishing; its backups are deleted afterwards.
+  If the same layer repeats for hours, look for the background clean-up's `WARN` `failed to clean up orphaned object` ({ref}`Damaged layer keys <live-edit-monitoring-layer-keys>`).
+- `WARN` containing `two checkpoint listings in one reconciliation pass disagreed about a dead object`: the backup store answered two listings differently; that deleted layer's backups are kept and their clean-up retried next pass.
+  One alone needs no action; if it recurs, take it to your Storage service's owner.
+- `WARN` containing `could not withdraw the deletion announcements`: a backing-store error while clean-up kept a restored layer's backups.
+  If it recurs, open a support case.
 
 (live-edit-monitoring-internal-alerts)=
 ## Internal-check alerts
@@ -686,7 +792,7 @@ groups:
     for: 0m
     labels: {severity: warning}
   - alert: LiveEditExternalValueMirrorDropping
-    expr: sum by (instance, reason) (rate(live_edit_checkpoint_ext_mirror_dropped_total{reason!="shutdown"}[5m])) > 0
+    expr: sum by (instance, reason) (rate(live_edit_checkpoint_ext_mirror_dropped_total{reason!~"shutdown|collect_fenced"}[5m])) > 0
     for: 5m
     labels: {severity: warning}
   - alert: LiveEditLargeValueBackupsMissing
@@ -703,6 +809,8 @@ groups:
         and deriv((max(live_edit_checkpoint_ext_tombstone_backlog))[6h:]) > 0)
       or (min_over_time((max(live_edit_checkpoint_dead_object_backlog))[6h:]) > 0
         and deriv((max(live_edit_checkpoint_dead_object_backlog))[6h:]) > 0)
+      or (min_over_time((max(live_edit_checkpoint_dead_object_backlog))[6h:]) > 0
+        and sum(increase(live_edit_checkpoint_reconcile_total{outcome="dead_retired"}[6h])) == 0)
     for: 1h
     labels: {severity: warning}
   - alert: LiveEditRestoresRedirected

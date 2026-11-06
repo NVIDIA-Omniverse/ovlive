@@ -82,8 +82,10 @@ pub struct Section {
     pub last_version: u64,
 }
 
-/// The `(parent_id, name)` identity of a stored [`Section`] row — what a
-/// by-name child lookup keys on.
+/// The `(parent_id, name)` of a stored [`Section`] row. Not a collision key:
+/// siblings collide on their parent, their `section_type`'s collision slot
+/// and their name (`domain::delta::collision_slot`), so two rows of
+/// different slots can share one `SectionKey`.
 ///
 /// Carried by `StorageMutation::SetSection` (`previous`) and
 /// `StorageMutation::DeleteSection` to name the row each mutation replaces

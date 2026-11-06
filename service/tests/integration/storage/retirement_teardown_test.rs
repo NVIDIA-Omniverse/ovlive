@@ -39,22 +39,33 @@
 //! Every wait for a condition is bounded by `BUDGET` (20 s), as in
 //! `retirement_budget_test.rs`: a test's worst case is its number of such
 //! waits × `BUDGET`, [`Rig::sweep_until`] counting two (its condition and its
-//! join), and each stays inside nextest's 120 s hang-killer. The in-place
-//! retry's backoff (100 ms doubling to 1 s per retry) is not a wait for a
-//! condition and adds at most a few seconds.
+//! join), plus 15 s per [`Rig`] for its fixture's drop on a multi-thread
+//! runtime: 5 s for the first unanswered step of the `TestValkey` key purge,
+//! then 10 s for its client's quit. The purge's answered round trips come on
+//! top (one `SCAN` page per 5,000 keys of the whole shared database, one
+//! `UNLINK` per 100 of the test's own keys), so no total is fixed. On a
+//! current-thread runtime the fixture's drop skips its purge and quit and
+//! costs nothing. The in-place retry's backoff (100 ms doubling to 1 s per
+//! retry) is not a wait for a condition and adds at most a few seconds. The
+//! largest row, 80 s, stays inside nextest's 120 s hang-killer.
 //!
-//! | Test | Bounded waits | Worst case |
-//! |---|---|---|
-//! | `a_delete_whose_first_unlink_fails_…` | 0 | — |
-//! | `a_delete_whose_later_page_fails_once_…` | 0 | — |
-//! | `an_overwrite_body_retries_a_failed_later_page_…` | 2 | 40 s |
-//! | `a_sweep_retirement_retries_a_failed_later_page_…` | 2 | 40 s |
-//! | `an_overwrite_body_retries_a_later_page_retirement_page_retries_times_…` | 2 | 40 s |
-//! | `a_delete_whose_first_index_page_read_fails_once_…` | 0 | — |
-//! | `a_delete_whose_teardown_runs_out_of_retries_…` | 0 | — |
-//! | `a_teardown_failure_reads_the_same_on_every_route` | 4 | 80 s |
-//! | `a_delete_whose_teardown_is_refused_out_of_memory_…` | 0 | — |
-//! | `a_teardown_on_an_objects_page_widens_…` | 0 | — |
+//! | Test | Bounded waits | Rigs | Worst case |
+//! |---|---|---|---|
+//! | `a_delete_whose_first_unlink_fails_…` | 0 | 1 | 15 s |
+//! | `a_delete_whose_later_page_fails_once_…` | 0 | 1 | 15 s |
+//! | `an_overwrite_body_retries_a_failed_later_page_…` | 2 | 1 | 55 s |
+//! | `a_sweep_retirement_retries_a_failed_later_page_…` | 2 | 1 | 55 s |
+//! | `an_overwrite_body_retries_a_later_page_retirement_page_retries_times_…` | 2 (one per pass) | 2 (one per pass) | 40 s + 30 s = 70 s |
+//! | `a_delete_whose_first_index_page_read_fails_once_…` | 0 | 1 | 15 s |
+//! | `a_delete_whose_teardown_runs_out_of_retries_…` | 0 | 1 | 15 s |
+//! | `a_teardown_failure_reads_the_same_on_every_route` | 4 | 1 | 80 s (its drop costs 0 s: current-thread runtime) |
+//! | `a_delete_whose_teardown_is_refused_out_of_memory_…` | 0 | 1 | 15 s |
+//! | `a_teardown_on_an_objects_page_widens_…` | 0 | 1 | 15 s |
+//!
+//! `a_teardown_failure_reads_the_same_on_every_route` removes its keys itself
+//! at the end (`log_capture::purge_keys`), since its fixture's drop does not.
+//! That purge bounds none of its steps, so a hang there is the hang-killer's
+//! to report.
 //!
 //! Elsewhere: the first `UNLINK`'s contents and order, the last's, and that
 //! the pieces add up to `KeySchema::object_cleanup_keys` with no stream key —
@@ -279,6 +290,8 @@ async fn a_sweep_retirement_retries_a_failed_later_page_in_place_and_removes_eve
     let rig = Rig::new("teardown-sweep-retry").await;
     let ls = rig.store();
     let oid = populated_layer(&rig, &ls, "orphaned").await;
+    // Orphan it as a `DeleteLayer` stopped after its unmap leaves it: no
+    // mapping and no layers-index member.
     let keys = rig.tv.key_schema();
     let _: i64 = rig
         .tv
@@ -541,7 +554,9 @@ async fn a_teardown_failure_reads_the_same_on_every_route() {
     })
     .await;
 
-    // The orphan sweep's generic arm.
+    // The orphan sweep's generic arm, on an object left as a `DeleteLayer`
+    // stopped after its unmap leaves it: no mapping and no layers-index
+    // member.
     let orphan = populated_layer(&rig, &rig.store(), "foreign-orphan").await;
     let keys = rig.tv.key_schema();
     let _: i64 = rig

@@ -29,17 +29,21 @@
 //!
 //! | Test | What it pins |
 //! |---|---|
-//! | [`delete_session_whose_exec_is_redirected_answers_unavailable_and_keeps_the_session`] | (a) the `EXEC` answered `-ASK` (Valkey 9.x redirects the `EXEC`): `UNAVAILABLE`, the session's metadata kept, a retry deletes it |
+//! | [`delete_session_whose_exec_is_redirected_answers_unavailable_and_keeps_the_session`] | (a) the `EXEC` answered `-ASK` (Valkey 9.x redirects the `EXEC`): `UNAVAILABLE`, the session's metadata kept, a retry deletes it; the redirect reaches the `txn_pool`'s routing-stale mark (b.4q2), which on this standalone store advances no epoch and runs no sync |
 //! | [`delete_session_whose_queued_marker_set_is_redirected_answers_unavailable_and_keeps_the_session`] | (b) the deletion marker's queued `SET` answered `-ASK`, the `EXEC` `EXECABORT` (Valkey ≤ 8.x and Redis 7.x check each queued command): the same |
-//! | [`create_layer_whose_materialization_exec_is_redirected_answers_unavailable_and_writes_nothing`] | (c) the materialization's `EXEC` answered `-ASK`: plain `UNAVAILABLE`, no header, stream or mapping |
-//! | [`create_layer_whose_landed_materialization_replay_is_redirected_answers_unavailable_and_a_resend_creates_it`] and its two variants | (c2) the first `EXEC` lands and its reply is lost, fred's one replay is redirected: plain `UNAVAILABLE` with no refusal detail, an unmapped header and no record left behind; a re-send creates the layer (`APPLIED` with the `operation_id`, `UNSPECIFIED` without; an overwrite leaves the old object mapped and not superseded until then) |
-//! | [`create_layer_whose_landed_materialization_replay_reaches_the_store_answers_unavailable`] | (c3) the same lost reply, the replay reaching the store: its `XADD 1-0` is refused "equal or smaller" and the call answers `UNAVAILABLE` (decision 7), not `INTERNAL`; a re-send creates the layer |
+//! | [`create_layer_whose_materialization_exec_is_redirected_answers_unavailable_and_writes_nothing`] | (c) the materialization's `EXEC` answered `-ASK`: plain `Unavailable` from the store, no header, stream or mapping |
+//! | [`create_layer_whose_landed_materialization_replay_is_redirected_answers_unavailable_and_a_resend_creates_it`] and its two variants | (c2) the first `EXEC` lands and its reply is lost, fred's one replay is redirected: `UNAVAILABLE` carrying `UPSTREAM_UNAVAILABLE` (b.4q2: the materialization is before the store's commit marker), an unmapped header and no record left behind; a re-send creates the layer (`APPLIED` with the `operation_id`, `UNSPECIFIED` without; an overwrite leaves the old object mapped and not superseded until then) |
+//! | [`create_layer_whose_landed_materialization_replay_reaches_the_store_answers_unavailable`] | (c3) the same lost reply, the replay reaching the store: its `XADD 1-0` is refused "equal or smaller" and the call answers `UNAVAILABLE` (decision 7), not `INTERNAL`, carrying `UPSTREAM_UNAVAILABLE`; a re-send creates the layer |
+//! | [`hinted_pre_marker_refusal_after_a_landed_materialization_leaves_one_layer_and_balanced_ext_refcounts`] | (c2) with an external value and the real external-value store: the hinted refusal releases none of the call's pre-flight increments; the landed orphan holds one, a re-send creates the layer with its own, and the orphan sweep's retirement gives the orphan's back exactly once |
+//! | [`hinted_pre_marker_refusal_before_any_materialization_leaves_its_pre_flight_increment_to_the_reconciler`] | (c) with an external value and the real store: nothing materialized, so the refused call's pre-flight increment is held by no object; the sweep and the GC leave it (the reference-count reconciler's) |
 //! | [`the_session_checkpoint_applier_grades_a_redirected_exec_transient_as_the_classifier_does`] | the applier half of the classifier/applier agreement (`checkpoint::session`'s unit test holds the classifier half): session recovery whose Step A `EXEC` is redirected ends `Transient`, and the re-drive recovers |
 //!
 //! Before b.cyu, (a), (b), (c) and (c2) answer `INTERNAL` (the classifier did
 //! not match "Max redirections exceeded") and (c3) answers `INTERNAL` (the
 //! materialization mapped the refused `XADD 1-0` with the general mapper);
-//! the applier test fails on its classifier assertion.
+//! the applier test fails on its classifier assertion. Before b.4q2, (c2) and
+//! (c3) answered a plain `UNAVAILABLE` with no refusal detail: the handler
+//! set its commit marker before the store's call.
 //!
 //! What a proxy cannot show is that a real cluster answers these shapes, and
 //! the routing re-sync after a redirect, a no-op on a standalone store. Every
@@ -55,9 +59,13 @@
 //!
 //! Every call is a handful of round trips against a healthy store, plus, in
 //! (c2) / (c3), one fred reconnect (backoff from 100 ms); each is bounded by
-//! [`SETTLE`]. Healthy, every test takes well under a second.
+//! [`SETTLE`]. The two reference-count tests also run orphan-sweep passes
+//! (`b_ua9_tests::sweep_one_pass`, 20 s per pass plus its 5 s join; two
+//! passes in case A, one in case B) and GC passes under [`SETTLE`]: case A's
+//! worst case is about 90 s, inside nextest's 120 s. Healthy, every test
+//! takes well under a second.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -78,16 +86,24 @@ use live_edit::grpc::proto::{
 };
 use live_edit::grpc::service::LiveEditService;
 use live_edit::storage::client::is_transient_fred_error;
-use live_edit::storage::external_values::MockExternalValueStore;
+use live_edit::storage::external_values::{
+    ext_content_hash, ExternalValueStore, GcPassState, GcPolicy, MockExternalValueStore,
+    ValkeyExternalValueStore,
+};
+use live_edit::storage::keys::sha256_to_hex;
 use live_edit::storage::layer::LayerStore;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
 
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_inline};
-use crate::common::refusal_detail::assert_no_refusal_detail;
+use crate::common::owned_delta::{
+    delta_to_ompf_bytes, delta_with_set_field_external, delta_with_set_field_inline, with_root,
+};
+use crate::common::refusal_detail::assert_upstream_unavailable;
 use crate::grpc::helpers::{
     build_service, make_create_data, make_request, streaming_create, AllowAllPermissions,
 };
+use crate::storage::b_qpf_tests::{assert_blob_alive, pending_members, ref_count};
+use crate::storage::b_ua9_tests::sweep_one_pass;
 use crate::storage::snapshot_read_support::{
     test_valkey_addr, ConnProxyRule, ProxyAction, ScriptReplyProxy,
 };
@@ -248,6 +264,10 @@ async fn delete_session_whose_exec_is_redirected_answers_unavailable_and_keeps_t
         .await
         .expect("session creation must succeed");
     *meta_key.lock().unwrap() = Some(tv.key_schema().session_meta(&session_id));
+    let txn = &tv.client().txn_pool;
+    let triggers_before = txn.routing_stale_triggers_for_test();
+    #[cfg(feature = "test-fault-injection")]
+    let syncs_before = tv.client().txn_routing_syncs_for_test();
 
     let answer = tokio::time::timeout(SETTLE, sessions.delete(&session_id))
         .await
@@ -259,7 +279,24 @@ async fn delete_session_whose_exec_is_redirected_answers_unavailable_and_keeps_t
         "precondition: the DeleteSession EXEC was redirected once; the call answered {answer:?}"
     );
     assert_aborted_redirect(answer, "DeleteSession, EXEC redirected");
+    assert_eq!(
+        txn.routing_stale_triggers_for_test() - triggers_before,
+        1,
+        "the redirected transaction reaches the txn pool's routing-stale mark (b.4q2)"
+    );
+    assert_eq!(
+        txn.routing_epoch_for_test(),
+        0,
+        "a standalone store has no cluster routing to go stale: the mark advances no epoch"
+    );
     assert_kept_then_deleted_by_a_retry(&tv, &sessions, &session_id).await;
+    #[cfg(feature = "test-fault-injection")]
+    assert_eq!(
+        tv.client().txn_routing_syncs_for_test() - syncs_before,
+        0,
+        "a standalone store never re-syncs a txn-pool member: not after the redirect, not at \
+         the retry's checkout"
+    );
 }
 
 /// (b) The deletion marker's queued `SET` is answered `-ASK`, as Valkey ≤ 8.x
@@ -481,10 +518,22 @@ async fn create_through_handler(
     operation_id: &str,
     value: u8,
 ) -> Result<(u64, OperationOutcome), tonic::Status> {
+    // The layer's root section holding the field: content setting the field
+    // with no top-level section is refused (SDD §9.7).
     let payload = delta_to_ompf_bytes(
-        &delta_with_set_field_inline(1, "color", vec![value], 0),
+        &with_root(delta_with_set_field_inline(1, "color", vec![value], 0)),
         &[],
     );
+    create_payload_through_handler(svc, session_id, operation_id, payload).await
+}
+
+/// [`create_through_handler`] with the upload's OMPF `payload` given.
+async fn create_payload_through_handler(
+    svc: &LiveEditService,
+    session_id: &str,
+    operation_id: &str,
+    payload: Vec<u8>,
+) -> Result<(u64, OperationOutcome), tonic::Status> {
     let response = tokio::time::timeout(
         SETTLE,
         handle_create_layer(
@@ -641,9 +690,12 @@ async fn assert_orphan_left_then_a_resend_creates_the_layer(
 /// (c2), one case: the replay is redirected (the proxy discards it in the
 /// `EXEC`'s place and answers [`ASK_REPLY`]), so fred fails it "Max
 /// redirections exceeded" — a redirect past the zero budget ran nothing in
-/// that attempt, but the first send landed. The call answers a plain
-/// `UNAVAILABLE` with no refusal detail (the commit marker is set, so nothing
-/// claims "nothing applied").
+/// that attempt, but the first send landed. The call answers `UNAVAILABLE`
+/// carrying `UPSTREAM_UNAVAILABLE`: the materialization comes before the
+/// store's commit marker (b.4q2, `CreateCommitMarker`), and what it landed —
+/// an object no mapping names — is not client-visible, so the call applied
+/// nothing. Before b.4q2 the handler set its marker before the store's call,
+/// and this answered a plain `UNAVAILABLE` with no refusal detail.
 async fn lost_reply_then_redirected_replay(case: LostReplyCase, session_name: &str) {
     let (status, landed, old, session_id, svc, tv, proxy, seen) = lost_reply_then(
         case,
@@ -669,7 +721,7 @@ async fn lost_reply_then_redirected_replay(case: LostReplyCase, session_name: &s
         "{case:?}: the answer carries fred's {REDIRECTED:?}; got {:?}",
         status.message()
     );
-    assert_no_refusal_detail(&status);
+    assert_upstream_unavailable(&status);
     assert_orphan_left_then_a_resend_creates_the_layer(case, landed, old, &session_id, &svc, &tv)
         .await;
 }
@@ -702,9 +754,11 @@ async fn create_layer_overwrite_whose_landed_materialization_replay_is_redirecte
 /// (c3) The replay reaches the store: every queued write runs again, and its
 /// `XADD 1-0` is refused as equal or smaller than the entry the first send
 /// added. `write_object` recognises that refusal and answers a plain
-/// `UNAVAILABLE` (decision 7: an earlier send may have landed, and no layer
+/// `Unavailable` (decision 7: an earlier send may have landed, and no layer
 /// was made), before the general mapper, which called it `INTERNAL` before
-/// b.cyu. A re-send creates the layer.
+/// b.cyu. The materialization is before the store's commit marker, so the
+/// handler answers it carrying `UPSTREAM_UNAVAILABLE` (b.4q2; plain before).
+/// A re-send creates the layer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_layer_whose_landed_materialization_replay_reaches_the_store_answers_unavailable() {
     let case = LostReplyCase::NewLayer;
@@ -728,9 +782,376 @@ async fn create_layer_whose_landed_materialization_replay_reaches_the_store_answ
         "the answer is decision 7's; got {:?}",
         status.message()
     );
-    assert_no_refusal_detail(&status);
+    assert_upstream_unavailable(&status);
     assert_orphan_left_then_a_resend_creates_the_layer(case, landed, old, &session_id, &svc, &tv)
         .await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The hinted refusal and the call's external-value references (b.4q2)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A `CreateLayer` answered `UPSTREAM_UNAVAILABLE` before the store's commit
+// marker releases none of the pre-flight external-value increments its
+// handler took: the call cannot tell whether its materialization landed, so a
+// release on the error path would give a reference back twice when it had.
+// A landed orphan holds the increment, and the orphan sweep's retirement of it
+// gives it back once; an increment no materialization took up is the
+// reference-count reconciler's (SDD §11.1). These two tests drive both cases
+// through the handler with the real external-value store, the orphan sweep
+// (one pass at a time, its grace at zero) and the GC, and read the counts.
+
+/// The external value the reference-count tests' layer carries.
+const EXT_VALUE: &[u8] = b"b4q2 hinted refusal external value";
+
+/// The layer's root section holding one field whose value is [`EXT_VALUE`],
+/// carried in the container, and the value's content hash. Content setting
+/// the field with no top-level section is refused (SDD §9.7).
+fn external_payload() -> (Vec<u8>, [u8; 32]) {
+    let hash = ext_content_hash(EXT_VALUE);
+    let delta = with_root(delta_with_set_field_external(
+        1,
+        "b4q2-external",
+        hash.to_vec(),
+        EXT_VALUE.len() as u64,
+        1,
+        0,
+    ));
+    (delta_to_ompf_bytes(&delta, &[EXT_VALUE]), hash)
+}
+
+/// A proxied fixture whose service stores external values in the real
+/// external-value store, with the materialization rule
+/// ([`materialization_execs`]) staging `actions` once armed.
+struct ExtScenario {
+    // Declared before `proxy` so it drops (and cleans up through it) first.
+    tv: TestValkey,
+    proxy: ScriptReplyProxy,
+    armed: Arc<Mutex<Option<String>>>,
+    seen: Arc<AtomicUsize>,
+    ext: Arc<ValkeyExternalValueStore>,
+    svc: LiveEditService,
+    session_id: String,
+}
+
+impl ExtScenario {
+    async fn start(actions: Vec<Option<ProxyAction>>, session_name: &str) -> Self {
+        let armed: Arc<Mutex<Option<String>>> = Arc::default();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let proxy = ScriptReplyProxy::start_rewriting_replies(
+            test_valkey_addr(),
+            materialization_execs(Arc::clone(&armed), actions, Arc::clone(&seen)),
+        )
+        .await;
+        let tv = through(&proxy).await;
+        let ext = Arc::new(ValkeyExternalValueStore::new(
+            tv.client().clone(),
+            tv.key_schema().clone(),
+        ));
+        let svc = LiveEditService {
+            ext_value_store: ext.clone(),
+            ..build_service(&tv, Arc::new(AllowAllPermissions))
+        };
+        let session_id = new_session(&tv, session_name).await;
+        Self {
+            tv,
+            proxy,
+            armed,
+            seen,
+            ext,
+            svc,
+            session_id,
+        }
+    }
+
+    /// One `CreateLayer` of [`LAYER`] carrying [`OPERATION_ID`] and `payload`,
+    /// with the materialization rule armed; the rule is disarmed after it.
+    async fn armed_create(&self, payload: Vec<u8>) -> tonic::Status {
+        *self.armed.lock().unwrap() = Some(self.tv.prefix().to_owned());
+        let answer =
+            create_payload_through_handler(&self.svc, &self.session_id, OPERATION_ID, payload)
+                .await;
+        *self.armed.lock().unwrap() = None;
+        answer.expect_err("a create whose materialization was refused must fail")
+    }
+
+    /// The re-send: the same call, the rule disarmed. It creates the layer.
+    async fn resend(&self, payload: Vec<u8>) -> u64 {
+        let (created, outcome) =
+            create_payload_through_handler(&self.svc, &self.session_id, OPERATION_ID, payload)
+                .await
+                .unwrap_or_else(|e| panic!("the re-send must create the layer; got {e:?}"));
+        assert_eq!(
+            outcome,
+            OperationOutcome::Applied,
+            "the re-send finds no record and is applied as a fresh create"
+        );
+        assert_eq!(
+            mapping(&self.tv, &self.session_id).await,
+            Some(created),
+            "the layer maps to the re-send's object"
+        );
+        let record: Option<String> = self
+            .tv
+            .client()
+            .pool
+            .get(
+                self.tv
+                    .key_schema()
+                    .create_layer_operation(&self.session_id, OPERATION_ID),
+            )
+            .await
+            .expect("GET operation record must succeed");
+        assert!(
+            record
+                .as_deref()
+                .is_some_and(|r| r.starts_with(&format!("{created}:"))),
+            "the operation record names the re-send's object; got {record:?}"
+        );
+        created
+    }
+
+    /// One whole orphan-sweep pass, then one GC pass collecting everything
+    /// pending.
+    async fn sweep_then_collect(&self) {
+        sweep_one_pass(
+            self.tv.client(),
+            self.tv.key_schema(),
+            self.ext.clone(),
+            Arc::clone(&self.svc.layer_store),
+        )
+        .await;
+        tokio::time::timeout(
+            SETTLE,
+            self.ext
+                .process_pending(&GcPolicy::IMMEDIATE, &mut GcPassState::new()),
+        )
+        .await
+        .expect("the GC pass did not settle within its budget")
+        .expect("the GC pass must succeed");
+    }
+}
+
+/// `HGETALL le:{object_id}:obj:ext`: the object's external-value references.
+async fn obj_ext(tv: &TestValkey, object_id: u64) -> HashMap<String, String> {
+    tv.client()
+        .pool
+        .hgetall(tv.key_schema().obj_ext_index(&object_id.to_string()))
+        .await
+        .expect("HGETALL obj:ext must succeed")
+}
+
+/// Case A, (c2) with an external value: the first materialization `EXEC`
+/// lands and its reply is lost, fred's one replay is redirected, and the
+/// handler answers `UPSTREAM_UNAVAILABLE`. The landed orphan holds the call's
+/// one pre-flight increment (`ref_count` 1, its reference index naming the
+/// value once), nothing is mapped, recorded or claimed, and nothing is queued
+/// for release. The re-send creates the layer under a new object with its own
+/// increment (`ref_count` 2). The orphan sweep (grace zero) vetoes and retires
+/// the orphan, queueing exactly its one release; the GC gives it back
+/// (`ref_count` 1, the blob alive for the layer); a second sweep and GC change
+/// nothing. Fails if the error path hands the increment back (`ref_count` 0
+/// after the refusal), if retirement stops releasing (`ref_count` stays 2),
+/// or if the re-send is answered from a record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hinted_pre_marker_refusal_after_a_landed_materialization_leaves_one_layer_and_balanced_ext_refcounts(
+) {
+    let fx = ExtScenario::start(
+        vec![
+            Some(ProxyAction::CloseAfterReply),
+            Some(ProxyAction::DiscardReplying(ASK_REPLY.to_owned())),
+        ],
+        "b4q2-ext-landed",
+    )
+    .await;
+    let (payload, hash) = external_payload();
+    let hex = sha256_to_hex(&hash);
+    let ks = fx.tv.key_schema();
+
+    let refused = fx.armed_create(payload.clone()).await;
+    let landed = last_allocated(&fx.tv).await;
+
+    assert_eq!(
+        (fx.proxy.hits(), fx.seen.load(Ordering::SeqCst)),
+        (2, 2),
+        "precondition: the first EXEC's reply was lost and fred's one replay was redirected; \
+         the call answered {refused:?}"
+    );
+    assert!(
+        refused.message().contains(REDIRECTED),
+        "the answer carries fred's {REDIRECTED:?}; got {refused:?}"
+    );
+    assert_upstream_unavailable(&refused);
+    assert!(
+        exists(&fx.tv, &ks.obj_header(&landed.to_string())).await,
+        "precondition: the first send landed its object"
+    );
+    assert_eq!(
+        obj_ext(&fx.tv, landed).await,
+        HashMap::from([(hex.clone(), "1".to_owned())]),
+        "the landed orphan's reference index names the value once"
+    );
+    assert_eq!(
+        mapping(&fx.tv, &fx.session_id).await,
+        None,
+        "no layer was made"
+    );
+    assert!(
+        !exists(
+            &fx.tv,
+            &ks.create_layer_operation(&fx.session_id, OPERATION_ID)
+        )
+        .await,
+        "the operation was not recorded"
+    );
+    assert!(
+        !exists(&fx.tv, &ks.create_layer_claim(&fx.session_id, landed)).await,
+        "no run claimed the landed object"
+    );
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(1),
+        "the refused call released none of its pre-flight increments: the landed orphan holds \
+         the one it took"
+    );
+    assert_eq!(
+        pending_members(&fx.tv).await,
+        Vec::<String>::new(),
+        "nothing is queued for release"
+    );
+
+    let created = fx.resend(payload).await;
+    assert_ne!(created, landed, "the orphan is never mapped");
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(2),
+        "the re-send's object holds its own reference beside the orphan's"
+    );
+    assert_eq!(pending_members(&fx.tv).await, Vec::<String>::new());
+
+    fx.tv
+        .client()
+        .set_orphan_sweep_grace_for_test(Duration::ZERO);
+    sweep_one_pass(
+        fx.tv.client(),
+        ks,
+        fx.ext.clone(),
+        Arc::clone(&fx.svc.layer_store),
+    )
+    .await;
+    assert!(
+        !exists(&fx.tv, &ks.obj_header(&landed.to_string())).await,
+        "the sweep retired the orphan"
+    );
+    let claim: Option<String> = fx
+        .tv
+        .client()
+        .pool
+        .get(ks.create_layer_claim(&fx.session_id, landed))
+        .await
+        .expect("GET claim must succeed");
+    assert_eq!(
+        claim.as_deref(),
+        Some("vetoed"),
+        "the sweep vetoed the orphan's commit before retiring it"
+    );
+    assert_eq!(
+        mapping(&fx.tv, &fx.session_id).await,
+        Some(created),
+        "the layer is untouched"
+    );
+    assert_eq!(
+        pending_members(&fx.tv).await,
+        vec![format!("{hex}:{landed}:ret")],
+        "the retirement queued exactly the orphan's one release"
+    );
+    tokio::time::timeout(
+        SETTLE,
+        fx.ext
+            .process_pending(&GcPolicy::IMMEDIATE, &mut GcPassState::new()),
+    )
+    .await
+    .expect("the GC pass did not settle within its budget")
+    .expect("the GC pass must succeed");
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(1),
+        "the orphan's reference was given back once; the layer's remains"
+    );
+    assert_blob_alive(&fx.tv, hash, "after the orphan's release").await;
+
+    fx.sweep_then_collect().await;
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(1),
+        "a second sweep and GC release nothing more"
+    );
+    assert_eq!(pending_members(&fx.tv).await, Vec::<String>::new());
+}
+
+/// Case B, (c) with an external value: the materialization's `EXEC` is
+/// redirected, so nothing is materialized, and the handler answers
+/// `UPSTREAM_UNAVAILABLE`. The call's pre-flight increment is held by no
+/// object (`ref_count` 1, nothing queued), and the call does not release it.
+/// The re-send creates the layer (`ref_count` 2). A sweep at grace zero and a
+/// GC pass leave `ref_count` at 2: no object owns the surplus, so neither the
+/// sweep nor the GC can give it back. It is the reference-count reconciler's
+/// (SDD §11.1), which this test does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hinted_pre_marker_refusal_before_any_materialization_leaves_its_pre_flight_increment_to_the_reconciler(
+) {
+    let fx = ExtScenario::start(
+        vec![Some(ProxyAction::DiscardReplying(ASK_REPLY.to_owned()))],
+        "b4q2-ext-unheld",
+    )
+    .await;
+    let (payload, hash) = external_payload();
+
+    let refused = fx.armed_create(payload.clone()).await;
+    let refused_object = last_allocated(&fx.tv).await;
+
+    assert_eq!(
+        (fx.proxy.hits(), fx.seen.load(Ordering::SeqCst)),
+        (1, 1),
+        "precondition: the one materialization EXEC was redirected; the call answered \
+         {refused:?}"
+    );
+    assert!(
+        refused.message().contains(REDIRECTED),
+        "the answer carries fred's {REDIRECTED:?}; got {refused:?}"
+    );
+    assert_upstream_unavailable(&refused);
+    assert!(
+        !exists(
+            &fx.tv,
+            &fx.tv.key_schema().obj_header(&refused_object.to_string())
+        )
+        .await,
+        "the redirected EXEC materialized nothing"
+    );
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(1),
+        "the call released none of its pre-flight increment, though no object holds it"
+    );
+    assert_eq!(pending_members(&fx.tv).await, Vec::<String>::new());
+
+    let created = fx.resend(payload).await;
+    assert_ne!(created, refused_object);
+    assert_eq!(ref_count(&fx.tv, hash).await, Some(2));
+
+    fx.tv
+        .client()
+        .set_orphan_sweep_grace_for_test(Duration::ZERO);
+    fx.sweep_then_collect().await;
+    assert_eq!(
+        ref_count(&fx.tv, hash).await,
+        Some(2),
+        "surplus +1 is the reference-count reconciler's (SDD §11.1): no object holds it, so \
+         neither the sweep nor the GC gives it back"
+    );
+    assert_eq!(pending_members(&fx.tv).await, Vec::<String>::new());
+    assert_blob_alive(&fx.tv, hash, "the layer still references it").await;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

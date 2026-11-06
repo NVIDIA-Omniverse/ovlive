@@ -438,8 +438,9 @@ async fn shutdown_tracker_drain_waits_for_join_teardown_so_peer_left_lands() {
     // then ends the stream UNAVAILABLE.
     svc.shutdown.cancel();
 
-    // Step 2: drain the stream tasks as `main.rs` does, under a per-task
-    // budget standing in for `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`.
+    // Step 2: drain the stream tasks as the post-server shutdown sequence
+    // (`run_post_server_sequence`) does, under a per-task budget standing in
+    // for `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`.
     let shutdown_task_budget = Duration::from_secs(5);
     let wait_start = Instant::now();
     live_edit::grpc::transport::drain_stream_tasks(

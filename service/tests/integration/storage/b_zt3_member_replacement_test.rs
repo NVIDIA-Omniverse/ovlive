@@ -383,6 +383,10 @@ fn the_unresponsive_bounds_fit_the_command_timeout_and_clear_every_wait_they_jud
         UNRESPONSIVE_FAST_TIMEOUT + UNRESPONSIVE_CHECK_INTERVAL + Duration::from_secs(1)
             <= COMMAND_TIMEOUT
     );
+    // The 5 s is the reader's private `XREAD_CLIENT_TIMEOUT_MARGIN`, out of
+    // reach of this crate; `stream_mux::reader`'s
+    // `unresponsive_max_timeout_clears_the_xread_client_timeout` checks this
+    // against the named constant.
     assert!(UNRESPONSIVE_MAX_TIMEOUT > Duration::from_millis(XREAD_BLOCK_MS + 5_000));
     assert!(UNRESPONSIVE_CHECK_INTERVAL * 4 <= UNRESPONSIVE_FAST_TIMEOUT);
     assert!(UNRESPONSIVE_PEER_EVIDENCE_LAG < UNRESPONSIVE_FAST_TIMEOUT);

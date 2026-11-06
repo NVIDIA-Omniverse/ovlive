@@ -220,7 +220,7 @@ fn cluster_url(test: &str) -> Option<String> {
              `test-cluster-disruptive:` job run this"
         );
     };
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         skip("LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return None;
     };

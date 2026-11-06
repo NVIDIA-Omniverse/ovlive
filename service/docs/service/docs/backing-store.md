@@ -174,11 +174,9 @@ Keep a busy layer's update bytes per checkpoint interval well inside it, or incr
 
 **Headroom:** give the store about twice your expected peak memory.
 With `noeviction`, a full store refuses writes.
-On the first refused write, Live Edit deletes the released large values the store holds.
-A store they filled recovers within seconds; a store full of layer data stays full until you add memory or, on self-hosted Valkey or Azure Managed Redis, until clients delete layers.
-While it is full, Live Edit's own clean-up writes a little past `maxmemory`: about 1.5 MB at typical release rates, more during a large backlog, for about two minutes.
-If `maxmemory` sits right at the container or host memory limit, that overshoot can get the server killed for running out of memory.
-Keep `maxmemory` a few MB or more below that limit to absorb it.
+A store filled by large values awaiting clean-up recovers by itself within seconds; a store full of layer data stays full until you add memory or, on self-hosted Valkey or Azure Managed Redis, until clients delete layers.
+While the store is full, Live Edit can write a few MB past `maxmemory`, more during a large clean-up backlog.
+Keep `maxmemory` a few MB or more below the container or host memory limit, or the server can be killed for running out of memory.
 
 **Memory settings:** self-hosted Valkey, MemoryDB and ElastiCache report their memory limit to Live Edit, so leave `valkey.memoryBytes` unset on them.
 Azure Managed Redis does not: set `valkey.memoryBytes` to the cache's total memory, as {ref}`its size section <live-edit-backing-store-azure-size>` shows.
@@ -199,11 +197,30 @@ At the chart defaults:
 
 | Store | What to do |
 |---|---|
-| Self-hosted Valkey | set `maxclients 20000`, as {ref}`the self-hosted page <live-edit-backing-store-self-hosted-config>` does |
-| Azure Managed Redis | keep `autoscaling.maxReplicas` within {ref}`the size table <live-edit-backing-store-azure-size>` |
-| MemoryDB, ElastiCache for Valkey | nothing: the limit is 65,000 per node |
+| Self-hosted Valkey, standalone or cluster | set `maxclients 12000`, as {ref}`the self-hosted page <live-edit-backing-store-self-hosted-config>` does |
+| Azure Managed Redis `Balanced_B0` to `Balanced_B5` | keep `autoscaling.maxReplicas` at 9 or fewer |
+| Azure Managed Redis `Balanced_B10` and larger, MemoryDB, ElastiCache for Valkey | nothing |
 
 If the store runs out of connections, new pods cannot connect, the rollout stalls, and some subscriptions fail until it ends.
+The table covers one running disaster-recovery Job; changing `dr.restore.attempt` or `dr.acceptLoss.attempt` can briefly add a second Job's connections, for up to 30 seconds.
+
+**If you change a connection pool**, recheck the limit.
+At the chart defaults, one replica opens up to 392 connections on a single-primary store; on a cluster, up to 528 to one node and 800 in all with three primaries, plus 136 per further primary.
+A disaster-recovery Job opens up to 136 on a single-primary store; on a cluster, 272 to one node and 544 in all with three primaries, plus 136 per further primary.
+To count a cluster's primaries, count the `master` lines `CLUSTER NODES` returns.
+Each step up in a pool setting adds, per replica:
+
+| Setting raised by 1 | Single-primary store | One cluster node | Whole cluster, `n` primaries |
+|---|---|---|---|
+| `valkey.poolSize` | 2 | 4 | 2 × (`n` + 1) |
+| `valkey.maintenancePoolSize` or `valkey.snapshotPoolSize` | 1 | 2 | `n` + 1 |
+| `valkey.subscriberPoolSize` | 1 | 1 | 1 |
+
+A disaster-recovery Job adds the same, except for `valkey.subscriberPoolSize`.
+While `valkey.snapshotPoolSize` is unset, each step in `valkey.catchupSnapshotReadConcurrency` or `valkey.catchupFencedReadConcurrency` raises it by 1.
+Keep twice `autoscaling.maxReplicas` replicas plus one Job within each node's limit: `maxclients`, or 65,000 on MemoryDB and ElastiCache.
+On a self-hosted cluster, also leave room in `maxclients` for 2 connections per other node.
+An Azure Managed Redis limit covers the whole cache: 15,000 on `Balanced_B0` to `Balanced_B5`, 30,000 on `Balanced_B10` and 75,000 on `Balanced_B20`.
 
 (live-edit-backing-store-moving-data)=
 ## When the store moves data between shards
@@ -220,6 +237,12 @@ If a session's move lasts longer than about a minute, other participants can see
 
 During a move expect `live_endpoint_calls_total{grpc_code="UNAVAILABLE"}` to rise for the affected calls, a few `live_edit_valkey_reconnects_total`, and, in long moves, `live_edit_presence_lease_refresh_failures_total` and `live_edit_presence_rejoins_total`.
 They stop when the move ends.
+
+During a move, the backup gauges `live_edit_checkpoint_oldest_pending_age_seconds`, `live_edit_checkpoint_layers_never_written` and `live_edit_checkpoint_ext_backup_owed` can hold their last value.
+Background passes log `WARN` lines about the move, containing `migrating or importing` or `end-of-walk routing-table refresh failed`.
+Backups continue meanwhile; once the move ends, the gauges update again and the `WARN` lines stop.
+
+A restore or accept-loss Job that reads the store during a move can stop with exit code 1 and be retried ({ref}`Read a Job's log <live-edit-durability-job-log>`); start one only after the move ends.
 On a self-hosted cluster, move slots as {ref}`Adding shards <live-edit-backing-store-self-hosted-add-shards>` describes.
 
 (live-edit-backing-store-watch)=

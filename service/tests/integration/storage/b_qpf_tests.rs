@@ -110,6 +110,9 @@ use live_edit::storage::layer::LayerStore;
 use live_edit::storage::lua::is_fast_path;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::relay::RelayedUpdates;
+use live_edit::storage::test_support::structural_commit::{
+    dump_object_keyspace, CommitTokens, DumpedValue, ObjectKeyspaceDump,
+};
 use live_edit::storage::test_support::TestValkey;
 use oodf_ffi::{CommandDeleteSection, OwnedDelta, SetField, StructCommand, TimeSample};
 
@@ -1870,14 +1873,25 @@ async fn deleting_a_section_releases_the_external_values_its_rows_held() {
     let ext = ext_store(&tv);
     let session_id = create_session(&tv, "qpf-section-delete").await;
     let layer = "qpf-section-delete";
+    // A second top-level section the delete below leaves, so the delete keeps
+    // a top-level section: an update leaving none is refused (SDD §9.7).
+    const ANCHOR_ID: u64 = SECTION_ID + 1;
+    let mut state = state_with_section();
+    state.sections.insert(
+        ANCHOR_ID,
+        Section {
+            section_id: ANCHOR_ID,
+            parent_id: 0,
+            name: "Anchor".to_owned(),
+            section_type: 1,
+            section_order: 1,
+            first_version: 1,
+            last_version: 1,
+        },
+    );
+    state.children.entry(0).or_default().push(ANCHOR_ID);
     let oid = ls
-        .create_layer(
-            &session_id,
-            layer,
-            "b-qpf-user",
-            &state_with_section(),
-            ext.clone(),
-        )
+        .create_layer(&session_id, layer, "b-qpf-user", &state, ext.clone())
         .await
         .expect("create_layer must succeed");
 
@@ -2496,7 +2510,7 @@ async fn a_commit_on_an_object_retired_underneath_it_enqueues_no_release() {
 /// unset; CI's `test-cluster:` job is what runs the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_external_rewrite_release_crosses_the_object_hash_and_gc_slots() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -2564,7 +2578,7 @@ async fn cluster_external_rewrite_release_crosses_the_object_hash_and_gc_slots()
 /// Gated on `LIVE_EDIT_TEST_CLUSTER_URL`; CI-proven only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_two_objects_retiring_on_one_hash_owe_two_distinct_decrements() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -3287,4 +3301,237 @@ async fn an_intact_retirement_channel_counts_one_release_per_distinct_owed_hash(
         PendingSetState::Healthy,
     )
     .await;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 16. a same-parent rename's collision cascade (b.z16)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The occupant the rename cascades: `A` under the `World` section, with
+/// [`RENAME_OCCUPANT_CHILD`] under it.
+const RENAME_OCCUPANT: u64 = 10;
+const RENAME_OCCUPANT_CHILD: u64 = 11;
+/// The section renamed from `B` onto `A`.
+const RENAMED: u64 = 20;
+/// The external hashes: a field on the occupant's child, a time sample on the
+/// occupant, a field on the renamed section.
+const CHILD_FIELD_HASH: u8 = 0x81;
+const OCCUPANT_SAMPLE_HASH: u8 = 0x82;
+const RENAMED_FIELD_HASH: u8 = 0x83;
+
+/// [`state_with_section`] plus, under its `World` section, the attributes
+/// `A` (with a child) and `B`.
+fn state_for_the_rename_cascade() -> ObjectState {
+    let mut state = state_with_section();
+    for (id, parent, name, order) in [
+        (RENAME_OCCUPANT, SECTION_ID, "A", 0),
+        (RENAME_OCCUPANT_CHILD, RENAME_OCCUPANT, "child", 0),
+        (RENAMED, SECTION_ID, "B", 1),
+    ] {
+        state.sections.insert(
+            id,
+            Section {
+                section_id: id,
+                parent_id: parent,
+                name: name.to_owned(),
+                section_type: 1,
+                section_order: order,
+                first_version: 1,
+                last_version: 1,
+            },
+        );
+        state.children.entry(parent).or_default().push(id);
+    }
+    state
+}
+
+/// The three external rows, in one fast-path commit.
+fn delta_with_externals_in_and_beside_the_occupant() -> OwnedDelta {
+    let field = |section_id: u64, hash: u8, ext_value_index: u32| SetField {
+        section_id,
+        key_name: FIELD_A.to_owned(),
+        value_or_ext_hash: ext_hash_vec(hash),
+        ext_value_size: EXT_SIZE,
+        ext_value_index,
+        set_order: u64::from(ext_value_index),
+    };
+    OwnedDelta {
+        set_fields: vec![
+            field(RENAME_OCCUPANT_CHILD, CHILD_FIELD_HASH, 1),
+            field(RENAMED, RENAMED_FIELD_HASH, 3),
+        ],
+        time_samples: vec![TimeSample {
+            section_id: RENAME_OCCUPANT,
+            time: SAMPLE_TIME,
+            value_or_ext_hash: ext_hash_vec(OCCUPANT_SAMPLE_HASH),
+            ext_value_size: EXT_SIZE,
+            ext_value_index: 2,
+        }],
+        ..Default::default()
+    }
+}
+
+/// What one backend's run of the rename cascade leaves.
+struct RenameCascadeRun {
+    keyspace: ObjectKeyspaceDump,
+    obj_ext: Vec<(String, i64)>,
+    pending: Vec<String>,
+    /// The members the rename's commit owes: one per hash the occupant's
+    /// subtree held, naming the object and the commit.
+    owed: Vec<String>,
+    /// The `UpdateLayer` paths the rename's commit landed on.
+    paths: Vec<&'static str>,
+}
+
+async fn rename_cascade_on(backend: UpdateLayerBackend) -> RenameCascadeRun {
+    const PATHS: [&str; 5] = ["fast", "watch", "structural", "structural_full", "reset"];
+    let tv = TestValkey::setup().await;
+    let metrics = Arc::new(crate::common::metrics_scrape_only("test-qpf"));
+    let ls = layer_store(&tv, backend, &metrics);
+    let ext = ext_store(&tv);
+    let layer = "qpf-rename-cascade";
+    let session_id = create_session(&tv, layer).await;
+    let oid = ls
+        .create_layer(
+            &session_id,
+            layer,
+            "b-qpf-user",
+            &state_for_the_rename_cascade(),
+            ext.clone(),
+        )
+        .await
+        .expect("create_layer must succeed");
+    pre_store(
+        &ext,
+        &[
+            ext_hash(CHILD_FIELD_HASH),
+            ext_hash(OCCUPANT_SAMPLE_HASH),
+            ext_hash(RENAMED_FIELD_HASH),
+        ],
+    )
+    .await;
+    ls.update_layer_relayed(
+        &session_id,
+        layer,
+        oid,
+        Some(delta_with_externals_in_and_beside_the_occupant()),
+        "qpf-writer",
+        1,
+    )
+    .await
+    .expect("the external commit must land");
+    let mut held = vec![
+        (ext_hash_hex(CHILD_FIELD_HASH), 1),
+        (ext_hash_hex(OCCUPANT_SAMPLE_HASH), 1),
+        (ext_hash_hex(RENAMED_FIELD_HASH), 1),
+    ];
+    held.sort();
+    assert_eq!(
+        obj_ext_sorted(&tv, oid).await,
+        held,
+        "{backend:?}: fixture precondition: the object holds all three hashes"
+    );
+
+    let paths_before: Vec<u64> = PATHS
+        .iter()
+        .map(|path| update_attempts_on(&metrics, path))
+        .collect();
+    let rename = OwnedDelta {
+        struct_commands: vec![StructCommand::MoveSection(oodf_ffi::CommandMoveSection {
+            old_parent_id: SECTION_ID,
+            new_parent_id: SECTION_ID,
+            section_id: RENAMED,
+            new_name: "A".to_owned(),
+        })],
+        ..Default::default()
+    };
+    let (seq, _) = ls
+        .update_layer_relayed(&session_id, layer, oid, Some(rename), "qpf-writer", 2)
+        .await
+        .expect("the rename must land");
+    let paths = PATHS
+        .iter()
+        .zip(paths_before)
+        .filter(|(path, before)| update_attempts_on(&metrics, path) > *before)
+        .map(|(path, _)| *path)
+        .collect();
+    let mut owed = vec![
+        commit_member(ext_hash(CHILD_FIELD_HASH), oid, seq),
+        commit_member(ext_hash(OCCUPANT_SAMPLE_HASH), oid, seq),
+    ];
+    owed.sort();
+    let mut keyspace =
+        dump_object_keyspace(tv.client(), tv.key_schema(), oid, CommitTokens::Normalized).await;
+    // Each run's session is its own; the header names it.
+    if let Some(DumpedValue::Hash(header)) = keyspace.keys.get_mut("obj:hdr") {
+        header.remove("session_id");
+    }
+    RenameCascadeRun {
+        keyspace,
+        obj_ext: obj_ext_sorted(&tv, oid).await,
+        pending: pending_members(&tv).await,
+        owed,
+        paths,
+    }
+}
+
+/// `live_edit_update_layer_attempts_histogram_count{path}`: the commits
+/// landed on `path`.
+fn update_attempts_on(metrics: &Metrics, path: &str) -> u64 {
+    sample_value(
+        &render(metrics),
+        "live_edit_update_layer_attempts_histogram_count",
+        &[("path", path)],
+    )
+    .unwrap_or_default() as u64
+}
+
+/// A same-parent rename onto an occupied name cascades the occupant's
+/// subtree, with the external values its rows held, identically on the
+/// structural route (`lua`, planned on the structural cache) and the WATCH
+/// path (`txn`): the two objects' keyspaces are equal (each in its own
+/// session, so the header's `session_id` aside), `obj:ext` keeps only
+/// the renamed section's hash, and the commit owes one release per hash the
+/// occupant's subtree held — the field on its child and the time sample on
+/// the occupant itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_cascade_commits_one_keyspace_on_both_paths_and_releases_the_occupants_hashes() {
+    let structural = rename_cascade_on(UpdateLayerBackend::Lua).await;
+    let watch = rename_cascade_on(UpdateLayerBackend::Txn).await;
+
+    assert_eq!(
+        (structural.paths.as_slice(), watch.paths.as_slice()),
+        (["structural_full"].as_slice(), ["watch"].as_slice()),
+        "fixture precondition: the rename lands on the structural route and on the WATCH path"
+    );
+    assert_eq!(
+        structural.keyspace, watch.keyspace,
+        "the structural route and the WATCH path must leave one keyspace"
+    );
+    for (what, run) in [("structural", &structural), ("watch", &watch)] {
+        assert_eq!(
+            run.obj_ext,
+            vec![(ext_hash_hex(RENAMED_FIELD_HASH), 1)],
+            "{what}: obj:ext keeps only the renamed section's hash"
+        );
+        assert_eq!(
+            run.pending, run.owed,
+            "{what}: one owed release per hash the occupant's subtree held"
+        );
+        for key in [
+            format!("obj:sec:{RENAME_OCCUPANT}"),
+            format!("obj:sec:{RENAME_OCCUPANT_CHILD}"),
+        ] {
+            assert!(
+                !run.keyspace.keys.contains_key(&key),
+                "{what}: the occupant's subtree row {key} is gone"
+            );
+        }
+        assert!(
+            run.keyspace
+                .keys
+                .contains_key(&format!("obj:sec:{RENAMED}")),
+            "{what}: the renamed section's row stays"
+        );
+    }
 }

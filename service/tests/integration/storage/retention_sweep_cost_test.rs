@@ -164,7 +164,7 @@ struct Sample {
 /// `cluster_subscriber_test.rs`'s `cluster_fixture` follows). A set but
 /// unreachable cluster fails the test.
 fn cluster_url(test: &str) -> Option<String> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: {test}: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster \
              configured); run `bash scripts/dev-valkey.sh cluster-up` or let CI's \

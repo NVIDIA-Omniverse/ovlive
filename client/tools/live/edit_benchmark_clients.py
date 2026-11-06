@@ -10,7 +10,8 @@ Each process speaks JSON lines: it prints `{"type": "ready"}` once connected, wa
 - `ovlive-writer` drives ovlive through its Python bindings as a USD host: the main thread is the host and
   models a Kit frame per turn, authoring the turn in one `Sdf.ChangeBlock` and then running host jobs until
   the flush job that turn requested has run (bounded by `--frame-wait-ms`). With `--batch` every turn is
-  authored inside one frame. A refused USD call is recorded as a rejected turn.
+  authored inside one frame. A refused USD call is recorded as a rejected turn. `--diagnostics reduced`
+  initializes the runtime without diagnostic history and records nothing below ERROR.
 - `client-library-writer` models omni-spectree's default live layer format on Omniverse Client Library:
   edits since the last tick coalesce into one update, sent at the tick only while fewer than 16 updates
   are unacknowledged (omni-spectree `PENDING_UPDATES_STOP_COUNT`); otherwise they stay buffered.
@@ -24,12 +25,19 @@ import json
 from pathlib import Path
 import queue
 import sys
+try:
+    import resource
+except ImportError:  # Windows has no getrusage.
+    resource = None
 import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
 CLIENT_LIBRARY_WINDOW = 16
 REGISTRATIONS = []
+# The ovlive writer's runtime options per --diagnostics: the runtime defaults, or diagnostic history disabled
+# (OMNI_USD_LIVE_RUNTIME_DISABLE_DIAGNOSTIC_HISTORY) and the minimum severity at OMNI_USD_LIVE_SEVERITY_ERROR.
+DIAGNOSTICS = dict(default={}, reduced=dict(flags=1, diagnostic_min_severity=4))
 
 
 def turn_marker(data):
@@ -62,6 +70,16 @@ def wait_line(expected):
     raise SystemExit(f'stdin closed before {expected}')
 
 
+def process_usage():
+    """The writer process's peak resident set and CPU time so far, or None where getrusage is missing."""
+    if resource is None:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    # Linux reports ru_maxrss in KiB and macOS in bytes.
+    return dict(max_rss_kib=usage.ru_maxrss // (1024 if sys.platform == 'darwin' else 1),
+                cpu_s=usage.ru_utime + usage.ru_stime)
+
+
 def turn_schedule(args):
     """Yield (turn, due) pairs; due is None for a burst, whose turns are authored back to back."""
     period = 1.0 / args.rate_hz if args.rate_hz else None
@@ -75,7 +93,7 @@ def ovlive_writer(args):
     from omni.usd import live
 
     Plug.Registry().RegisterPlugins(str(Path(args.package) / 'resources/plugInfo.json'))
-    live.initialize()
+    live.initialize(**DIAGNOSTICS[args.diagnostics])
     endpoint = live.register_endpoint(args.authority, access_token=args.token)
     jobs = queue.SimpleQueue()
     arrivals = threading.Condition()
@@ -184,7 +202,8 @@ def ovlive_writer(args):
     drained = drained and status.state != live.State.FAILED
     diagnostics = live.copy_diagnostics(endpoint, max_records=64)
     result = dict(client='ovlive', edits=edits, rejected=rejected, frame_timeouts=frame_timeouts,
-                  samples=samples, drained=drained, blocked_turns=blocked_turns,
+                  samples=samples, drained=drained, blocked_turns=blocked_turns, diagnostics=args.diagnostics,
+                  usage=process_usage(),
                   peak=peak, final=dict(state=int(status.state), result=int(status.result),
                                         pending_write_count=status.pending_write_count,
                                         buffered_edit_count=status.buffered_edit_count),
@@ -314,7 +333,7 @@ def client_library_writer(args):
         result = dict(client='client-library', edits=edits, updates=updates, acks=state['acks'],
                       failures=state['failures'], drained=not state['in_flight'] and not buffered, peak=peak,
                       window=CLIENT_LIBRARY_WINDOW, version=client.get_version(), model=args.baseline_model,
-                      change_notices=notices[0])
+                      change_notices=notices[0], usage=process_usage())
     Path(args.output).write_text(json.dumps(result))
     emit('done')
     wait_line('exit')
@@ -382,6 +401,8 @@ def main():
                         help='client-library-writer host cost: USD authoring with a per-tick delta, or values only')
     parser.add_argument('--frame-wait-ms', type=float, default=2.0,
                         help='longest wait at a frame end for the flush job the turn requested (ovlive-writer)')
+    parser.add_argument('--diagnostics', choices=tuple(DIAGNOSTICS), default='default',
+                        help='runtime diagnostics: the defaults, or no history and ERROR minimum severity (ovlive-writer)')
     args = parser.parse_args()
     roles = {'ovlive-writer': ovlive_writer, 'client-library-writer': client_library_writer,
              'client-library-reader': client_library_reader}

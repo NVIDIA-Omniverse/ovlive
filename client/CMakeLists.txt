@@ -127,7 +127,8 @@ if(LIVE_BUILD_GRPC_RUNTIME)
         VERBATIM)
     add_library(live_proto STATIC "${live_generated}/${live_proto_name}.pb.cc"
                                   "${live_generated}/${live_proto_name}.grpc.pb.cc")
-    target_include_directories(live_proto PUBLIC "${live_generated}")
+    # Generated protobuf and gRPC code carries the generator's warnings (MSVC C4141 from protobuf's headers), not ours.
+    target_include_directories(live_proto SYSTEM PUBLIC "${live_generated}")
     target_link_libraries(live_proto PUBLIC live_grpc_dependencies)
     target_compile_features(live_proto PUBLIC cxx_std_17)
     set_target_properties(live_proto PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden
@@ -194,7 +195,8 @@ if(LIVE_BUILD_GRPC_RUNTIME)
                                               tests/native/runtime/status.cpp
                                               tests/native/runtime/diagnostics.cpp
                                               tests/native/runtime/diagnostics_api.cpp
-                                              tests/native/runtime/session_peers.cpp tests/native/runtime/session_api.cpp tests/native/runtime/layer_admission.cpp tests/native/runtime/layer_status.cpp)
+                                              tests/native/runtime/session_peers.cpp tests/native/runtime/session_api.cpp tests/native/runtime/layer_admission.cpp tests/native/runtime/layer_status.cpp
+                                              tests/native/runtime/grpc_dns.cpp)
         live_link_stack_dump(live_runtime_foundation)
         target_link_libraries(live_runtime_foundation PRIVATE live_runtime live_uri)
         set(live_diagnostic_catalog_header "${CMAKE_CURRENT_BINARY_DIR}/catalog-contract/LiveDiagnosticCatalogContract.h")
@@ -216,6 +218,17 @@ if(LIVE_BUILD_GRPC_RUNTIME)
         endif()
         add_test(NAME live_runtime_foundation COMMAND live_runtime_foundation)
         set_tests_properties(live_runtime_foundation PROPERTIES TIMEOUT 30)
+        if(UNIX)
+            # Exit ordering relative to a loaded library's static destructors is the POSIX atexit contract.
+            add_executable(live_runtime_exit tests/native/runtime/runtime_exit.cpp)
+            target_include_directories(live_runtime_exit PRIVATE include)
+            target_link_libraries(live_runtime_exit PRIVATE ${CMAKE_DL_LIBS})
+            target_compile_options(live_runtime_exit PRIVATE -Wall -Wextra -Werror -pedantic)
+            live_sanitize(live_runtime_exit PRIVATE)
+            add_dependencies(live_runtime_exit live_runtime_contract_probe)
+            add_test(NAME live_runtime_exit COMMAND live_runtime_exit $<TARGET_FILE:live_runtime_contract_probe>)
+            set_tests_properties(live_runtime_exit PROPERTIES TIMEOUT 30)
+        endif()
         get_property(live_dependency_files GLOBAL PROPERTY LIVE_DEPENDENCY_FILES)
         set(live_dependency_args)
         foreach(dependency IN LISTS live_dependency_files)
@@ -265,7 +278,7 @@ if(LIVE_BUILD_GRPC_RUNTIME)
                 --input tests/native/runtime/layer_write_lifecycle.cpp
                 --input tests/native/runtime/layer_read_lifecycle.cpp
                 --input tests/native/runtime/layer_progress.cpp --input tests/native/runtime/jitter.cpp --input tests/native/runtime/drain.cpp --input tests/native/runtime/status.cpp --input tests/native/runtime/diagnostics.cpp --input tests/native/runtime/diagnostics_api.cpp
-                --input tests/native/runtime/session_peers.cpp --input tests/native/runtime/session_api.cpp --input tests/native/runtime/layer_admission.cpp --input tests/native/runtime/layer_status.cpp ${LIVE_TEST_SUPPORT_MANIFEST_ARGS} ${live_dependency_args}
+                --input tests/native/runtime/session_peers.cpp --input tests/native/runtime/session_api.cpp --input tests/native/runtime/layer_admission.cpp --input tests/native/runtime/layer_status.cpp --input tests/native/runtime/grpc_dns.cpp ${LIVE_TEST_SUPPORT_MANIFEST_ARGS} ${live_dependency_args}
             VERBATIM)
         add_executable(live_unary_driver tests/native/runtime/unary_driver.cpp tests/native/runtime/layer_read_driver.cpp tests/native/runtime/layer_actor_driver.cpp tests/native/runtime/diagnostics_driver.cpp tests/native/runtime/session_driver.cpp)
         live_link_stack_dump(live_unary_driver)

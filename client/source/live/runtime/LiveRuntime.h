@@ -11,6 +11,8 @@
 #include <climits>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <map>
@@ -95,7 +97,8 @@ inline constexpr uint64_t kFixedResponseBytes = 1024;
     X(apply_lag_warning_threshold, 256) \
     X(reconnect_initial_ms, 1000) \
     X(reconnect_maximum_ms, 60000) \
-    X(reconnect_max_attempts, 10)
+    X(reconnect_max_attempts, 10) \
+    X(max_calls_per_endpoint, 1024)
 
 struct RuntimeOptions {
     OmniUsdLiveRuntimeOptions values{};
@@ -125,6 +128,134 @@ struct EndpointOptions {
     bool secure = true;
     static EndpointOptions copy(const OmniUsdLiveEndpointOptions* input, const RuntimeOptions& runtime);
     bool sameConfiguration(const EndpointOptions& other) const;
+};
+
+class CallBudget;
+class StreamReservation;
+// One open gRPC call on an endpoint, from before its preparation until its
+// completion is observed, or until the call is abandoned unissued. A call slot
+// also holds one unit of the budget's call share; a stream slot rides on its
+// owner's StreamReservation. Destruction releases it.
+class CallSlot {
+public:
+    CallSlot() = default;
+    CallSlot(const CallSlot&) = delete;
+    CallSlot& operator=(const CallSlot&) = delete;
+    CallSlot(CallSlot&& other) noexcept;
+    CallSlot& operator=(CallSlot&& other) noexcept;
+    ~CallSlot();
+    explicit operator bool() const noexcept { return bool(budget_); }
+    void reset() noexcept;
+private:
+    friend class CallBudget;
+    friend class StreamReservation;
+    std::shared_ptr<CallBudget> budget_;
+    bool call_ = false;
+};
+// One unit of the budget's stream share, which a layer holds until it closes
+// or fails with no call open and a session until it leaves, across every
+// reconnect, so that a reconnect never competes for a unit. Its owner opens
+// one stream call at a time on it.
+class StreamReservation {
+public:
+    StreamReservation(const StreamReservation&) = delete;
+    StreamReservation& operator=(const StreamReservation&) = delete;
+    ~StreamReservation();
+    CallSlot open() noexcept;
+private:
+    friend class CallBudget;
+    explicit StreamReservation(std::shared_ptr<CallBudget> budget) noexcept : budget_(std::move(budget)) {}
+    std::shared_ptr<CallBudget> budget_;
+};
+// A queue position for a call that waits for a free call unit. The budget
+// hands a released unit to the oldest waiter and runs its wake outside every
+// lock; destruction leaves the queue and returns a unit handed over but not taken.
+class CallWaiter : public std::enable_shared_from_this<CallWaiter> {
+public:
+    CallWaiter(const CallWaiter&) = delete;
+    CallWaiter& operator=(const CallWaiter&) = delete;
+    ~CallWaiter();
+private:
+    friend class CallBudget;
+    CallWaiter(std::shared_ptr<CallBudget> budget, std::function<void()> wake)
+        : budget_(std::move(budget)), wake_(std::move(wake)) {}
+    std::shared_ptr<CallBudget> budget_;
+    std::function<void()> wake_;
+    uint64_t granted_ = 0; // Units handed over, under the budget's mutex.
+    bool queued_ = false;  // Under the budget's mutex.
+};
+// An endpoint's concurrent gRPC calls, which its one channel carries on one
+// connection, bounded by max_calls_per_endpoint so that gRPC never queues a
+// call behind a server or proxy stream limit at or above the budget (design
+// section 4). The budget is split in two fixed shares, so neither kind of
+// call can starve the other.
+// The call share, max(2, limit / 8), serves short calls: layer writes,
+// finite requests and Pings, each holding a unit while it is open. Writes,
+// finite requests and the Ping that learns an endpoint's capabilities wait in
+// FIFO order for a unit (acquire), so issuance windows shrink under
+// contention; other calls are refused when none is free (tryAcquire). The
+// stream share, the rest, serves layer reads and session joins, each holding
+// a unit while its layer or session is live, across reconnects, with a
+// layer's creation riding on its layer's unit; one past it is refused at once
+// with RESOURCE_EXHAUSTED and never waits. Calls open on the endpoint
+// therefore never exceed the limit. The mutex is a leaf: nothing runs under it.
+class CallBudget final : public std::enable_shared_from_this<CallBudget> {
+public:
+    CallBudget(uint64_t limit, DiagnosticsRegistry& diagnostics, OmniUsdLiveEndpoint endpoint) noexcept;
+    CallBudget(const CallBudget&) = delete;
+    CallBudget& operator=(const CallBudget&) = delete;
+    static uint64_t callShare(uint64_t limit) noexcept { return std::max<uint64_t>(2, limit / 8); }
+    uint64_t limit() const noexcept { return limit_; }
+    // A unit of the stream share for a layer or session whose first call is
+    // `operation`; null, with a call_budget_exhausted record, when it is full.
+    // Allocation failure throws and reserves nothing.
+    std::shared_ptr<StreamReservation> reserveStream(uint32_t operation);
+    // Whether the stream share has a free unit, without reserving it; false,
+    // with the refusal's call_budget_exhausted record, when it is full. A
+    // layer open checks it before its first RPC, which precedes its reservation.
+    bool streamAvailable(uint32_t operation) noexcept;
+    // A queue position whose wake runs, outside every lock, when the budget
+    // hands it a unit.
+    std::shared_ptr<CallWaiter> waiter(std::function<void()> wake);
+    // A call unit for `waiter`: one handed to it, else a free one when no
+    // other waiter is ahead. An empty slot queues the waiter, if it is not
+    // queued, behind every other.
+    CallSlot acquire(CallWaiter& waiter, uint32_t operation) noexcept;
+    // A free call unit when no waiter is queued; empty otherwise, with a
+    // call_budget_exhausted record when `report`. Never queues.
+    CallSlot tryAcquire(uint32_t operation, bool report = true) noexcept;
+    // Units handed to `waiter` and not taken go to the next waiter or the share.
+    void returnGranted(CallWaiter& waiter) noexcept;
+    // A call_budget_exhausted record for `operation` with `reason`.
+    void report(uint32_t operation, uint32_t reason) noexcept;
+    // Reasons of call_budget_exhausted records.
+    static constexpr uint32_t kStreamRefused = 1, kCallQueued = 2, kCallRefused = 3, kWaitExpired = 4;
+    struct Counts {
+        uint64_t open = 0, peak = 0, streams = 0, calls = 0, waiting = 0;
+    };
+    // Calls open at the time of the call and at most so far, stream and call
+    // units held, and waiters queued.
+    Counts counts() const noexcept;
+private:
+    friend class CallSlot;
+    friend class StreamReservation;
+    friend class CallWaiter;
+    void opened() noexcept; // Mutex held.
+    void closed(bool call) noexcept;
+    void releaseStream() noexcept;
+    // Hands up to `units` call units to queued waiters, and returns the rest to the share.
+    void releaseCalls(uint64_t units) noexcept;
+    void pruneExpired() noexcept; // Mutex held.
+    void emit(uint32_t operation, uint32_t reason, const Counts& counts) noexcept;
+    const uint64_t limit_, calls_, streams_;
+    DiagnosticsRegistry& diagnostics_;
+    const OmniUsdLiveEndpoint endpoint_;
+    mutable std::mutex mutex_;
+    uint64_t open_ = 0, peak_ = 0, streamUnits_ = 0, callUnits_ = 0;
+    // Waiters, oldest first. A waiter that is gone prunes its own entry, so a
+    // free unit never stays behind an entry nobody waits on.
+    std::deque<std::weak_ptr<CallWaiter>> waiters_;
+    bool saturated_ = false; // A waiter queued since the call share last had a free unit.
 };
 
 class BufferedEditCount;
@@ -189,9 +320,11 @@ struct Endpoint {
     std::map<std::string, std::chrono::steady_clock::time_point> resendHolds;
     std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<nvidia::omniverse::live::v1alpha::LiveService::Stub> stub;
+    // Every call this endpoint's channel carries holds a slot of this budget.
+    const std::shared_ptr<CallBudget> calls;
 
     Endpoint(EndpointOptions options, OmniUsdLiveEndpoint handle, std::string writerId, OmniUsdLiveJitterParams jitter,
-        uint32_t maxUpdateBytes, DiagnosticsRegistry& diagnostics);
+        uint32_t maxUpdateBytes, uint64_t maxCalls, DiagnosticsRegistry& diagnostics);
 };
 
 // A layer/request/session/callback must acquire a dependency before starting

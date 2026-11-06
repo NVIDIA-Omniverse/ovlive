@@ -47,7 +47,8 @@ if(APPLE)
     set_property(TARGET omni_usd_live APPEND PROPERTY LINK_DEPENDS "${live_macho_exports}")
 elseif(NOT WIN32)
     # The ELF plugin exports only the symbols the version script lists and links with no undefined symbol; a Windows
-    # DLL exports the OMNI_USD_LIVE_API functions it defines.
+    # DLL exports the OMNI_USD_LIVE_API functions it defines and any symbol a linked object's own /EXPORT directive
+    # names, which MSVC's linker cannot drop (tests/native/plugin/package.py checks both).
     target_link_options(omni_usd_live PRIVATE "LINKER:--version-script=${live_plugin_exports}" "LINKER:-z,defs")
 endif()
 set_property(TARGET omni_usd_live APPEND PROPERTY LINK_DEPENDS "${live_plugin_exports}")
@@ -99,10 +100,8 @@ install(FILES "${live_repository_dir}/LICENSE" "${CMAKE_CURRENT_SOURCE_DIR}/NOTI
     "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md" "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.txt"
     "${CMAKE_CURRENT_SOURCE_DIR}/BOM.json"
     DESTINATION "${CMAKE_INSTALL_DATADIR}/omni_usd_live")
-install(FILES source/live/protos/PROVENANCE.md
+install(FILES source/live/protos/README.md
     DESTINATION "${CMAKE_INSTALL_DATADIR}/omni_usd_live/provenance" RENAME live-proto.md)
-install(FILES source/live/wire/schema/provenance.json
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/omni_usd_live/provenance/wire-schema")
 # The schema's Apache-2.0 notice retains its installed provenance path.
 install(FILES source/live/wire/schema/LICENSE.txt
     DESTINATION "${CMAKE_INSTALL_DATADIR}/omni_usd_live/provenance/wire-schema" RENAME UPSTREAM-NOTICE.txt)
@@ -192,7 +191,8 @@ if(BUILD_TESTING)
     set_tests_properties(live_diagnostic_log_json PROPERTIES TIMEOUT 30)
     add_test(NAME live_plugin_package COMMAND ${Python3_EXECUTABLE}
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/native/plugin/package.py"
-        "${live_plugin_package}" "$<TARGET_FILE:live_plugin_load_probe>" "${CMAKE_CURRENT_SOURCE_DIR}")
+        "${live_plugin_package}" "$<TARGET_FILE:live_plugin_load_probe>" "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${LIVE_DEPENDENCY_ROOT}")
     set_tests_properties(live_plugin_package PROPERTIES TIMEOUT 60)
     get_property(plugin_dependencies GLOBAL PROPERTY LIVE_DEPENDENCY_FILES)
     set(plugin_dependency_args)

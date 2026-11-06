@@ -240,7 +240,6 @@ async fn setup_counting_harness(tick_secs: u64) -> CountingHarness {
         SessionBasePathCache::new().with_recovery_hook(Arc::clone(&session_recovery));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store: Arc::new(MockExternalValueStore::new()),

@@ -51,8 +51,9 @@
 //!    recorded, the route WARNs and goes on, and the object's references
 //!    are left to the reference-count reconciler (`storage::ext_reconcile`).
 //!    Either way the teardown then stops at the foreign index after its first
-//!    `UNLINK` (step 5): on `DeleteLayer` that is an `INTERNAL` answer, with
-//!    the layers-index member left (b.yz5).
+//!    `UNLINK` (step 5): on `DeleteLayer` that is an `INTERNAL` answer, the
+//!    mapping and the layers-index member already removed by its unmap
+//!    (b.yz5).
 //! 2. **Reserves** from `R_ref` ([`RetirementReservation`]): a second
 //!    [`MemoryBudget`] the `LayerStore` holds, sized from the pod memory plan
 //!    (`PodMemoryPlan::retirement_budget_bytes`, `L / 500`, a margin term)
@@ -124,6 +125,7 @@ use crate::storage::external_values::hash_from_hex;
 use crate::storage::fanout_thread::{PassAnswer, PassLane};
 use crate::storage::keys::KeySchema;
 use crate::storage::memory_budget::{MemoryBudget, MemoryGrant, MemoryTopUp};
+use crate::storage::scan_guard::{GuardedStep, Witness};
 use crate::storage::subscriber_admission::CatchUpRefusal;
 
 /// `h`: the memory one distinct external reference holds through a
@@ -1340,6 +1342,137 @@ async fn page_by_rank<R: RankPageReader>(reader: &mut R, pages: Pages<'_>) -> Re
     }
 }
 
+/// The per-step side of the cursor pager ([`page_by_cursor`]): how one route
+/// issues one keyed-scan step of an index from a cursor, with the step's
+/// witnesses in its pipeline, through its
+/// [`KeyedWalk`](crate::storage::scan_guard::KeyedWalk) on the one client the
+/// walk holds, and what it does with the step's members. Each route keeps
+/// its own seams, error type and retry posture here: a route that retries a
+/// step re-issues it at the same cursor inside [`Self::read_step`]
+/// (`KeyedWalk::step`'s attempts, or the route's own write step); the pager
+/// never restarts a walk.
+pub(crate) trait CursorPageReader {
+    /// The route's error.
+    type Error;
+    /// One member as the route takes it: a `String`, or the reply's `Value`
+    /// where the route decodes members itself.
+    type Member;
+
+    /// One step from `cursor` (`"0"` for the first) through
+    /// `KeyedWalk::step`. `start` is the walk's start witness, which a
+    /// failed attempt's re-read is compared with before the step is sent
+    /// again; `None` on the first step, whose pipeline leads with the start
+    /// witness. The step's [`GuardedStep`]: the walk's start witness (the one
+    /// given, or the one the first step's pipeline led with), the next cursor
+    /// (`"0"` once the walk is complete), the step's members — for a `ZSCAN`
+    /// or an `HSCAN`, every second element of its reply
+    /// ([`scan_step_firsts`]) — and the step's after-step witness.
+    async fn read_step(
+        &mut self,
+        cursor: &str,
+        start: Option<&Witness>,
+    ) -> Result<GuardedStep<Self::Member>, Self::Error>;
+
+    /// The walk crossed a change of serving process: `start` and `later`
+    /// read different run_ids. The route's error for it (a forfeit in the
+    /// periodic reconcile pass).
+    fn changed(&self, start: &Witness, later: &Witness) -> Self::Error;
+
+    /// Take one step's members. The pager issues the next step only once
+    /// this returns, so each step is dropped before the next.
+    async fn take_page(&mut self, members: Vec<Self::Member>) -> Result<(), Self::Error>;
+}
+
+/// The cursor pager over one key's members: keyed-scan steps (`ZSCAN`,
+/// `HSCAN`, `SSCAN` through the reader's `KeyedWalk`) from cursor `"0"` until
+/// the server answers `"0"`, each step handed to `reader` before the next is
+/// issued. The first error ends it; it never restarts from `"0"`. Its route
+/// is the periodic reconcile pass's owed walks; the DR Jobs read a key with
+/// no witness, by rank pages or counted cursor walks
+/// (`storage::scan_guard`, *The DR Jobs' walks*).
+///
+/// **What it guarantees.** A full walk returns every member present in the
+/// key from the walk's start to its end at least once, whatever is added,
+/// removed or re-scored between two steps (SCAN's contract, Valkey
+/// `scan.md`). Past the compact encodings a step iterates the member table
+/// keyed by member (Valkey 9.0.3 `db.c` 1252–1254 and 1066–1068; 7.2 `db.c`
+/// 1032 and 1074), whose scan returns every entry present throughout however
+/// the table is modified between calls (9.0.3 `hashtable.c` 1768–1787): a
+/// removal or an addition of another member, or a shrink or a grow, can
+/// repeat an entry but never skip one. A re-score keeps the member's table
+/// entry and reorders only the skiplist (9.0.3 `t_zset.c` 1478, 1506–1511;
+/// 7.2 `t_zset.c` 1441, 1468–1474), which is what moves a rank or a score
+/// cursor and never a scan's. A member removed and re-added, or a key
+/// emptied and re-created, was not present throughout, so nothing is owed
+/// for it.
+///
+/// **What the caller absorbs.** A member may come back in more than one
+/// step (a rehash between steps), so a caller dedupes or counts into a set;
+/// a member removed after its step never comes back (9.0.3 `hashtable.c`
+/// 1836–1845). `COUNT` is a hint: a step answers up to `COUNT` members plus
+/// one bucket chain (9.0.3 `db.c` 1296–1304), and a key the store keeps in a
+/// compact encoding (a sorted set or hash of at most 128 entries of at most
+/// 64 B by default, 9.0.3 `config.c` 3395, 3399) answers whole in one step
+/// with cursor `"0"` (9.0.3 `db.c` 1324–1350; 7.2 `db.c` 1094–1118); a
+/// table never converts back to the compact form under `ZADD` / `ZREM`. So a
+/// caller chunks or tops up for a step larger than it asked for.
+///
+/// **Within one server process, checked.** The table's hash seed is random
+/// per server process (9.0.3 `server.c` 7168–7171), so a cursor continued on
+/// another process — after a failover, a slot migration or a restart between
+/// two steps — can skip members [inferred from source, untested]. So each
+/// step carries the walk's witness (`storage::scan_guard`: the run_id of the
+/// process serving the key, on the walk's own client and route) in its own
+/// pipeline, the first step its start witness before it too, and the pager
+/// hands a step's members to `take_page` only once that step's witness
+/// equals the walk's start; on a mismatch it returns the reader's
+/// [`CursorPageReader::changed`] error, and a missing witness is the
+/// reader's error from `read_step`. Each step is sent with one attempt, so
+/// fred cannot replay it on another connection or follow it to another node
+/// (`storage::scan_guard`, *Keyed walks*). The start witness is read once,
+/// with the first step, and never refreshed: a walk that crossed a change
+/// ends, and a later walk starts again from cursor `"0"`.
+pub(crate) async fn page_by_cursor<R: CursorPageReader>(reader: &mut R) -> Result<(), R::Error> {
+    let mut start: Option<Witness> = None;
+    let mut cursor = "0".to_owned();
+    loop {
+        let step = reader.read_step(&cursor, start.as_ref()).await?;
+        let first = start.get_or_insert(step.start);
+        if step.witness.run_id() != first.run_id() {
+            return Err(reader.changed(first, &step.witness));
+        }
+        reader.take_page(step.members).await?;
+        if step.next == "0" {
+            return Ok(());
+        }
+        cursor = step.next;
+    }
+}
+
+/// The first of every pair of a keyed-scan step's elements (`elements` from
+/// [`scan_step`] or `KeyedWalk::step`): a `ZSCAN` step's members (its scores
+/// dropped) or an `HSCAN` step's fields (its values dropped). The floor is
+/// Valkey 7.2, which has no `NOSCORES` / `NOVALUES`, so every step carries
+/// both. An odd count is a reply this cannot pair: a protocol error naming
+/// `command` and `key`, which every caller fails closed on.
+pub(crate) fn scan_step_firsts<T>(
+    command: &'static str,
+    key: &str,
+    elements: Vec<T>,
+) -> Result<Vec<T>, fred::error::Error> {
+    if !elements.len().is_multiple_of(2) {
+        return Err(fred::error::Error::new(
+            fred::error::ErrorKind::Protocol,
+            format!(
+                "{command} {key} answered {} elements, not member and score or field and value \
+                 pairs",
+                elements.len()
+            ),
+        ));
+    }
+    Ok(elements.into_iter().step_by(2).collect())
+}
+
 /// One page of a sorted index: `ZRANGE key start stop`, by rank.
 fn zrange_page<'p>(
     pool: &'p fred::clients::Pool,
@@ -1371,12 +1504,20 @@ where
     }
 }
 
-/// One `SSCAN` or `HSCAN` step (`command`) of `key` from `cursor`, asking for
-/// `count` elements: the next cursor (`"0"` when the scan is complete) and
-/// the step's elements — a set's members, or a hash's fields and values
-/// interleaved. A set the store keeps in a compact encoding answers whole,
-/// whatever `count`.
-async fn scan_step(
+/// One `SSCAN`, `HSCAN` or `ZSCAN` step (`command`) of `key` from `cursor`,
+/// asking for `count` elements: the next cursor (`"0"` when the scan is
+/// complete) and the step's elements — a set's members, a hash's fields and
+/// values interleaved, or a sorted set's members and scores interleaved
+/// ([`scan_step_firsts`] takes the first of each pair). `COUNT` is a hint: a
+/// key the store keeps in a compact encoding answers whole, whatever
+/// `count`, and a table-encoded one may answer a bucket chain past it
+/// ([`page_by_cursor`]). Keyed, so routed by `key` like any keyed command,
+/// on a fresh pool client per step and with fred's retries: unguarded. Its
+/// callers are the retirement routes' own `HSCAN` of `obj:ext` and the
+/// teardown's `SSCAN` set pages; the periodic reconcile pass's owed walks go
+/// through the cursor pager and `storage::scan_guard::KeyedWalk`, and the DR
+/// Jobs' counted walks through `storage::scan_guard::CountedScan`, instead.
+pub(crate) async fn scan_step(
     pool: &fred::clients::Pool,
     command: &'static str,
     key: &str,
@@ -1780,6 +1921,33 @@ mod tests {
             Arc::new(StdMutex::new(None)),
             &crate::storage::memory_budget::RETIREMENT_SERIES,
         ))
+    }
+
+    /// A keyed-scan step's elements are member and score (or field and
+    /// value) pairs: the cursor pager's callers keep the first of each pair,
+    /// in order, and an odd count, a reply that cannot be paired, is a
+    /// protocol error naming the command, the key and the count, which every
+    /// caller fails closed on. No elements is no members.
+    #[test]
+    fn scan_step_firsts_keeps_each_pairs_first_and_refuses_an_odd_count() {
+        let elements = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            scan_step_firsts("ZSCAN", "k", elements(&["a", "1", "b", "2.5"])).expect("pairs"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(
+            scan_step_firsts("HSCAN", "k", Vec::<String>::new()).expect("no pairs"),
+            Vec::<String>::new()
+        );
+        let err = scan_step_firsts("HSCAN", "le:{7}:obj:ext", elements(&["f", "1", "g"]))
+            .expect_err("an odd count cannot be paired");
+        assert_eq!(*err.kind(), fred::error::ErrorKind::Protocol);
+        assert!(
+            err.details()
+                .contains("HSCAN le:{7}:obj:ext answered 3 elements"),
+            "the error names the command, the key and the count: {}",
+            err.details()
+        );
     }
 
     /// `P = max(64, ⌊(R_ref / 4) ÷ RETIREMENT_ROW_BYTES⌋)`, `W = P ×

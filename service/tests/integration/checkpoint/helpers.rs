@@ -1160,7 +1160,6 @@ pub async fn setup_checkpoint_harness_with_options(
         .with_recovery_hook(Arc::clone(&session_recovery));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store: Arc::clone(&ext_value_store),
@@ -2354,7 +2353,6 @@ pub async fn setup_storage_api_checkpoint_harness(tick_secs: u64) -> StorageApiC
     //     is the load-bearing AC for this harness — the outbound auth
     //     path on the storage-api adapter is exercised end-to-end. ──────
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store,
@@ -2937,7 +2935,7 @@ pub const RECOVERY_STREAM_ADJUDICATION_BUDGET: Duration = Duration::from_secs(10
 ///
 /// Recovery may land between RPC completion and metric assertion on the
 /// asynchronous-landing surfaces — for instance, the AC #7 ghost-member
-/// SREM in `ListSessions`'s opportunistic-cleanup branch fires through the
+/// retirement in `ListSessions`'s clean-up branch fires through the
 /// session-recovery hook on its own schedule, decoupled from the RPC
 /// return. Per `docs-internal/test-writing-guide.md` `## Synchronization Patterns`,
 /// the test pattern is "bounded poll on the observable, not a fixed
@@ -3599,6 +3597,10 @@ impl CheckpointStore for CountingGetSessionCheckpointStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), live_edit::checkpoint::CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(
         &self,
         hash_hex: &str,
@@ -3825,6 +3827,10 @@ impl<T: CheckpointStore + ?Sized + Send + Sync> CheckpointStore for DelegatingCh
         hash_hex: &str,
     ) -> Result<bool, live_edit::checkpoint::CheckpointError> {
         self.inner.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), live_edit::checkpoint::CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn delete_ext_blob(
@@ -4429,13 +4435,13 @@ pub const EXT_RECOVERY_RESULTS: [&str; 5] = [
     "adapter_other",
 ];
 
-/// Read one `live_edit_checkpoint_ext_recovery_total{result}` cell. Returns the
-/// LIVE value, not a delta — callers snapshot pre/post (see
-/// [`ExtRecoveryCells`]).
+/// Read one `live_edit_checkpoint_ext_recovery_total{result}` cell, summed over
+/// its `meta` label (`present` | `absent`). Returns the LIVE value, not a delta
+/// — callers snapshot pre/post (see [`ExtRecoveryCells`]).
 ///
-/// `result` is the whole label set: the family carries no `service` label by
-/// design of SR-3.2's metric (operator alerts care about the aggregate rate, not
-/// the per-replica one) — read off the increment site,
+/// `result` and `meta` are the whole label set: the family carries no
+/// `service` label by design of SR-3.2's metric (operator alerts care about
+/// the aggregate rate, not the per-replica one) — read off the increment site,
 /// `Metrics::inc_ext_recovery`.
 ///
 /// **Panic-on-absent, deliberately** — this is the one behavioural change from
@@ -4450,7 +4456,7 @@ pub const EXT_RECOVERY_RESULTS: [&str; 5] = [
 /// deref-coerce, so one signature replaces both the `&SharedMetrics` copy and
 /// the `&ExtValueRecoveryHarness` copy.
 pub fn ext_recovery_count(metrics: &Metrics, result: &str) -> u64 {
-    live_edit::observability::metrics::test_util::sample_value(
+    live_edit::observability::metrics::test_util::sample_sum(
         &live_edit::observability::metrics::test_util::render(metrics),
         "live_edit_checkpoint_ext_recovery_total",
         &[("result", result)],

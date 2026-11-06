@@ -146,6 +146,12 @@ public:
     OmniUsdLiveResult observeHostFailure() noexcept { return actor_->observeHostFailure(); }
     // Thread-safe. The host edit buffer's count changed; status republishes it.
     void noteHostEdits() noexcept { actor_->noteHostEdits(); }
+    // Admits the journal's waiting restores that fit
+    // (SceneJournal::retryRestore) and installs the snapshot that holds them
+    // into the host layer; one that never fits fails the layer. Runs on the
+    // publication dispatcher, outside journal and actor callbacks; never
+    // throws.
+    void retryRestore() noexcept;
     // Thread-safe. Records flush_unsupported for a flush that failed the layer.
     void reportFlushUnsupported(UnsupportedOperation::Reason reason) noexcept {
         actor_->reportFlushUnsupported(static_cast<uint32_t>(reason));
@@ -187,5 +193,10 @@ private:
     const std::shared_ptr<SceneJournal> journal_;
     std::shared_ptr<LayerActor> actor_;
     std::shared_ptr<PublicationState> publication_;
+    // The pending-byte watcher of the journal's waiting restores, apart from
+    // the host edit buffer's: its cause is RESOURCE_EXHAUSTED while a restore
+    // the endpoint refused for capacity waits, and a release then retries it
+    // through the publication dispatcher. It changes no layer status.
+    const std::shared_ptr<BufferedEditCount> restoreWatcher_ = std::make_shared<BufferedEditCount>();
 };
 } // namespace omni::usd::live

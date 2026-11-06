@@ -26,6 +26,12 @@ public:
     size_t specCount() const;
     void CopyFrom(const PXR_NS::SdfAbstractDataConstPtr&) override;
     void CreateSpec(const PXR_NS::SdfPath&, PXR_NS::SdfSpecType) override;
+    // CreateSpec of `type` followed by Set of each of `fields` in order, as
+    // one record edit, so its work follows the record and `fields` rather
+    // than their product. An empty value erases its field; `fields` names
+    // each field at most once.
+    void OverlaySpec(const PXR_NS::SdfPath&, PXR_NS::SdfSpecType,
+        const std::vector<std::pair<PXR_NS::TfToken, PXR_NS::VtValue>>& fields);
     bool HasSpec(const PXR_NS::SdfPath&) const override;
     void EraseSpec(const PXR_NS::SdfPath&) override;
     void MoveSpec(const PXR_NS::SdfPath&, const PXR_NS::SdfPath&) override;

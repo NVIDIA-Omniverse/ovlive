@@ -7,7 +7,7 @@ NVIDIA-owned source and documentation use [Apache-2.0](LICENSE), subject to the 
 
 ## Client
 
-The client [NOTICE](client/NOTICE) records its license scope. The [client notices](client/THIRD_PARTY_NOTICES.md) describe copied code and external dependencies of the ovlive client. The [client BOM](client/BOM.json) and [license bundle](client/THIRD_PARTY_LICENSES.txt) cover the client's native package and host dependencies. The [client provenance record](client/PROVENANCE.json) preserves its original import snapshot.
+The client [NOTICE](client/NOTICE) records its license scope. The [client notices](client/THIRD_PARTY_NOTICES.md) describe copied code and external dependencies of the ovlive client. The [client BOM](client/BOM.json) and [license bundle](client/THIRD_PARTY_LICENSES.txt) cover the client's native package and host dependencies.
 
 ## Service
 

@@ -1281,6 +1281,12 @@ mod tests {
     ///
     /// A pass that sent its report and went on without the answer issues its
     /// next window while the hook is still watching.
+    ///
+    /// Each report blocks the read's task for [`QUIET`] beside its renewal
+    /// timer, and the parked window holds the read open: the read's lease is
+    /// lengthened (`lengthen_fence_leases`, checked once the window is
+    /// parked), so no renewal has to land in time meanwhile; the hook's
+    /// sizes stay production-sized.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fenced_pass_issues_no_window_before_its_caller_applied_the_report_b26e() {
         let tv = TestValkey::setup().await;
@@ -1288,6 +1294,7 @@ mod tests {
         let (client, injector, oid, answer) = rig(&tv, "fanout-progress-order").await;
         let total = client.catchup_build_budget.total_bytes();
         injector.record_window_threads();
+        injector.lengthen_fence_leases(true);
         let cache = StructuralCache::new(CACHE_BUDGET);
         let estimate = cold_start_estimate(&answer);
         let reports = Arc::new(StdMutex::new(Vec::new()));
@@ -1324,6 +1331,13 @@ mod tests {
             tokio::time::timeout_at(deadline, parked.parked())
                 .await
                 .expect("the window after the first top-up parks on the seam");
+            crate::storage::test_support::assert_fence_lease_lengthened(
+                tv.client(),
+                keys,
+                oid,
+                &client,
+            )
+            .await;
             let seen = (
                 reports.lock().expect("never poisoned").clone(),
                 injector.windows_recorded(),
@@ -1623,10 +1637,14 @@ mod tests {
     }
 
     /// The first field row's command of the fenced fan-out (round 2), held:
-    /// a point mid-read, after the lease was granted.
+    /// a point mid-read, after the lease was granted. The read's lease is
+    /// lengthened (`lengthen_fence_leases`), so a renewal landing late
+    /// cannot end the held attempt, and let its unheld retry finish the read,
+    /// before the test drops it.
     fn hold_mid_read(
         injector: &ObjectSnapshotReadFaultInjector,
     ) -> Arc<crate::storage::diff_read::SnapshotReadHold> {
+        injector.lengthen_fence_leases(true);
         injector.push_hold_at(ObjectSnapshotReadFaultTarget::nth_of_family(
             ObjectSnapshotReader::FencedFanout,
             "field",
@@ -1665,6 +1683,13 @@ mod tests {
             })
             .await
             .expect("the read parks mid-read on the seam");
+            crate::storage::test_support::assert_fence_lease_lengthened(
+                tv.client(),
+                keys,
+                oid,
+                &client,
+            )
+            .await;
             assert_eq!(
                 client.fanout_threads().live_passes(),
                 1,
@@ -1704,6 +1729,13 @@ mod tests {
         tokio::time::timeout(SIGNAL_BUDGET, hold.parked())
             .await
             .expect("the flight's read parks mid-read on the seam");
+        crate::storage::test_support::assert_fence_lease_lengthened(
+            tv.client(),
+            keys,
+            oid,
+            &client,
+        )
+        .await;
         assert_eq!(client.fanout_threads().live_passes(), 1, "precondition");
         for task in tasks {
             task.abort();

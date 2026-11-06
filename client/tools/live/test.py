@@ -55,6 +55,9 @@ CATALOG = json.loads((ROOT / "tests/contracts/suites.json").read_text(encoding="
 PLANNED = {name for name, entry in CATALOG["suites"].items() if entry.get("planned")}
 # A reference lane's workload reports readiness once its reference service answers.
 STARTUP_TIMEOUT_MS = 120000
+# The foundation suite's failure watchdog: every caller (presubmit, release candidate, public-source preview) gets the
+# same budget, sized for a slow hosted runner rather than a developer machine.
+FOUNDATION_TIMEOUT_MS = 300000
 
 
 def suite_platform_error(suite):
@@ -398,7 +401,7 @@ def native_identity(path, boundary="uri_component", *, source_root=None):
                      "source/live/protos/nvidia/omniverse/live/v1alpha/live.proto"}
         required |= ({"tests/native/runtime/runtime_foundation.cpp", "tests/native/runtime/request_lifecycle.cpp",
                       "tests/contracts/diagnostic-catalog.json", "tools/live/diagnostic_catalog.py",
-                      "tests/native/runtime/auth_controller.cpp", "tests/native/runtime/layer_write_lifecycle.cpp", "tests/native/runtime/layer_read_lifecycle.cpp", "tests/native/runtime/layer_progress.cpp", "tests/native/runtime/jitter.cpp", "tests/native/runtime/drain.cpp", "tests/native/runtime/status.cpp", "tests/native/runtime/diagnostics.cpp", "tests/native/runtime/diagnostics_api.cpp", "tests/native/runtime/session_peers.cpp", "tests/native/runtime/session_api.cpp", "tests/native/runtime/layer_admission.cpp", "tests/native/runtime/layer_status.cpp"}
+                      "tests/native/runtime/auth_controller.cpp", "tests/native/runtime/layer_write_lifecycle.cpp", "tests/native/runtime/layer_read_lifecycle.cpp", "tests/native/runtime/layer_progress.cpp", "tests/native/runtime/jitter.cpp", "tests/native/runtime/drain.cpp", "tests/native/runtime/status.cpp", "tests/native/runtime/diagnostics.cpp", "tests/native/runtime/diagnostics_api.cpp", "tests/native/runtime/session_peers.cpp", "tests/native/runtime/session_api.cpp", "tests/native/runtime/layer_admission.cpp", "tests/native/runtime/layer_status.cpp", "tests/native/runtime/grpc_dns.cpp"}
                      if boundary == "runtime_foundation" else {"tests/native/runtime/unary_driver.cpp", "tests/native/runtime/layer_read_driver.cpp", "tests/native/runtime/layer_actor_driver.cpp", "tests/native/runtime/diagnostics_driver.cpp", "tests/native/runtime/session_driver.cpp"})
         required |= test_support_inputs(root)
         if not manifest.get("dependencies"):
@@ -505,9 +508,33 @@ def clean_environment():
     return environment
 
 
+class Parser(argparse.ArgumentParser):
+    """The runner's argument parser. A reduced-plan replay reserves status 2 for a valid replay that does not
+    reproduce, so its usage errors exit with the refusal status instead."""
+    reduced_plan = False
+
+    def requests_reduced_plan(self, arguments):
+        """Whether `arguments` name --reduced-plan, in full or by an abbreviation argparse resolves to it alone."""
+        others = [option for option in self._option_string_actions if option != '--reduced-plan']
+        return any(len(option) > 2 and option.startswith('--') and '--reduced-plan'.startswith(option) and
+                   not any(other.startswith(option) for other in others)
+                   for option in (item.split('=', 1)[0] for item in arguments))
+
+    def error(self, message):
+        if self.reduced_plan or self.requests_reduced_plan(sys.argv[1:]):
+            self.print_usage(sys.stderr)
+            self.exit(REDUCED_PLAN_REFUSED, f"{self.prog}: error: {message}\n")
+        super().error(message)
+
+
+# Exit status of a reduced-plan replay (tests/reference_service/plan_replay.py): its recorded signature reproduced,
+# a valid replay that did not reproduce it, and a refused replay or one that produced no trial result.
+REDUCED_PLAN_REPRODUCED, REDUCED_PLAN_NOT_REPRODUCED, REDUCED_PLAN_REFUSED = 1, 2, 3
+
+
 def main():
     stack_dump.install()
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = Parser(description=__doc__)
     parser.add_argument("--suite", help="comma-separated suite names (default foundation)")
     parser.add_argument("--tag", help="comma-separated tags: select every implemented suite with one of them")
     parser.add_argument("--package", help="comma-separated packages: select every implemented suite of one of them")
@@ -524,7 +551,16 @@ def main():
     parser.add_argument("--replay", type=Path)
     parser.add_argument("--writer-plan", type=Path,
                         help="replay a retained root-field writer plan (plugin-reference only)")
-    parser.add_argument('--writer-fuzz-profile', choices=('ci', 'nightly', 'soak'), default='ci')
+    parser.add_argument("--reduced-plan", type=Path,
+                        help="replay a graph, rotation, period or staged-samples reduction's best.plan.json or "
+                             "original.plan.json once; exits 1 when it reproduces the recorded signature, 2 when it "
+                             "does not and 3 when refused")
+    parser.add_argument("--without-test-defect", action="store_true",
+                        help="replay the --reduced-plan without its named test-only defect")
+    parser.add_argument('--writer-fuzz-profile', choices=('ci', 'nightly', 'soak', 'package'), default='ci')
+    parser.add_argument('--staged-package', type=Path,
+                        help="the <target-dir>/usd/omniverse/live stage tools/live/build.py produced; the package "
+                             "writer campaign and a staged-samples --reduced-plan run its samples")
     parser.add_argument("--uri-library", type=Path, help="built URI contract probe; requires its build manifest")
     parser.add_argument("--wire-driver", type=Path, help="built OMPF envelope executable with pinned SDK manifest")
     parser.add_argument("--scene-transport-driver", type=Path, help="built scene transport executable with runtime/source/SDK manifest")
@@ -558,6 +594,10 @@ def main():
                   f"fixtures {fixture_fingerprint(name)[:12]}"
                   + (f", scenarios {scenario_fingerprint(name)[:12]}" if name in PLANNED else ""))
         return 0
+    if args.reduced_plan and (args.replay or args.writer_plan):
+        parser.error("--reduced-plan cannot combine with --replay or --writer-plan")
+    if args.without_test_defect and not args.reduced_plan:
+        parser.error("--without-test-defect requires --reduced-plan")
     if args.suite is not None and (args.tag or args.package):
         parser.error("--suite cannot combine with --tag or --package")
     tags = args.tag.split(",") if args.tag else []
@@ -630,12 +670,25 @@ def main():
             args.max_output_bytes = replay["max_output_bytes"]
             expected_fingerprint = replay["source_fingerprint"]
             writer_replay = replay.get("writer_plan")
+            if replay.get("reduced_plan") is not None:
+                # The run's own copy of the reduced plan, which the reduced-plan checks below verify again.
+                parser.reduced_plan = True
+                args.reduced_plan = Path(replay["reduced_plan"]["path"])
+                args.without_test_defect = replay["reduced_plan"]["without_test_defect"] is True
+                staged = replay.get('staged_package')
+                if staged is not None and (not isinstance(staged, str) or not Path(staged).is_absolute()):
+                    raise ValueError('invalid staged package replay path')
+                args.staged_package = Path(staged) if staged is not None else None
             if 'writer-fuzz' in selected:
                 from tools.live.writer_campaign import replay_context
                 expected_writer_context = replay_context(replay)
                 args.writer_fuzz_profile = replay['writer_fuzz_profile']
-                if args.writer_fuzz_profile not in ('ci', 'nightly', 'soak'):
+                if args.writer_fuzz_profile not in ('ci', 'nightly', 'soak', 'package'):
                     raise ValueError('invalid writer fuzz replay profile')
+                staged = replay['staged_package']
+                if staged is not None and (not isinstance(staged, str) or not Path(staged).is_absolute()):
+                    raise ValueError('invalid staged package replay path')
+                args.staged_package = Path(staged) if staged is not None else None
             if replay.get("uri_library"):
                 args.uri_library = Path(replay["uri_library"])
                 expected_native = replay.get("native_identity")
@@ -690,10 +743,15 @@ def main():
             parser.error(f"invalid replay: {error}")
     if any(getattr(args, name) is not None for name in KIT_INPUTS) and "kit-reference" not in selected:
         parser.error("Kit inputs require --suite kit-reference")
+    if (args.staged_package is not None and not args.reduced_plan and
+            ('writer-fuzz' not in selected or args.writer_fuzz_profile != 'package')):
+        parser.error("--staged-package requires --suite writer-fuzz with --writer-fuzz-profile package, or a "
+                     "staged-samples --reduced-plan")
     if args.timeout_ms is None:
         from tools.live.writer_campaign import PROFILES
         args.timeout_ms = max(PROFILES[args.writer_fuzz_profile]['campaign_timeout_ms'] if 'writer-fuzz' in selected else 60000,
-                              150000 if 'kit-reference' in selected else 0)
+                              150000 if 'kit-reference' in selected else 0,
+                              FOUNDATION_TIMEOUT_MS if 'foundation' in selected else 0)
     if (not selected or any(not isinstance(s, str) or not s for s in selected)
             or len(selected) != len(set(selected))):
         parser.error("select unique nonempty suite names")
@@ -738,6 +796,24 @@ def main():
         except (ValueError, TypeError) as error:
             parser.error(f"invalid writer replay: {error}")
         master_seed = writer_replay['master_seed']
+    reduced = None
+    if args.reduced_plan:
+        parser.reduced_plan = True
+        if scenarios or shard is not None or driver_mode is not None:
+            parser.error("--reduced-plan cannot combine with --scenario, --shard or --driver-mode")
+        sys.path.insert(0, str(ROOT / 'tests/reference_service'))
+        import plan_replay
+        try:
+            reduced = plan_replay.load(args.reduced_plan, without_defect=args.without_test_defect)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            parser.error(f"invalid reduced plan: {error}")
+        if args.suite is None and not tags and not packages:
+            selected = [reduced['lane']]
+        if selected != [reduced['lane']]:
+            parser.error(f"a reduced {reduced['kind']} plan requires only --suite {reduced['lane']}")
+        if (args.staged_package is not None) != (reduced['kind'] in plan_replay.STAGED_KINDS):
+            parser.error("--staged-package is required by, and only by, a reduced staged-samples plan")
+        master_seed = reduced['plan']['master_seed']
     args.artifact_dir.mkdir(parents=True, exist_ok=True)
     directory = Path(tempfile.mkdtemp(prefix="run-", dir=args.artifact_dir))
     source_hash = fingerprint()
@@ -887,6 +963,23 @@ def main():
                 raise ValueError("native shared plugin artifact differs from replay")
         except (OSError, ValueError, KeyError, TypeError) as error:
             plugin_error = str(error)
+    staged_package = None
+    if "writer-fuzz" in admitted and args.writer_fuzz_profile == 'package':
+        try:
+            if args.staged_package is None:
+                raise ValueError("--staged-package must identify the stage whose samples the package campaign runs")
+            from tools.live import build as package_build, platforms
+            staged_package = package_build.stage_identity(args.staged_package, platforms.host().name)
+            args.staged_package = Path(staged_package['path'])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            plugin_error = plugin_error or f"staged package unavailable: {error}"
+    if reduced is not None and reduced['kind'] in plan_replay.STAGED_KINDS:
+        # The stage, its SDK interpreter and its sample executables, which the reduction recorded.
+        try:
+            staged_package = plan_replay.staged_identity(args.staged_package)
+            args.staged_package = Path(staged_package['path'])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            plugin_error = plugin_error or f"staged package unavailable: {error}"
     if "resolver-reference" in admitted:
         try:
             if args.resolver_runtime_driver is None:
@@ -971,7 +1064,7 @@ def main():
     if expected_writer_context is not None:
         from tools.live.writer_campaign import canonical
         actual_writer_context = dict(source=source_hash, plugin=plugin_native, scene=scene_transport_native,
-                                     reference=reference, sanitizer=sanitizer_runtime)
+                                     reference=reference, sanitizer=sanitizer_runtime, package=staged_package)
         if canonical(actual_writer_context) != canonical(expected_writer_context):
             plugin_error = 'writer campaign replay source, candidate or dependency identity differs'
     if writer_replay is not None:
@@ -986,6 +1079,28 @@ def main():
         except ValueError as error:
             plugin_error = str(error)
         write_json(directory / 'writer.plan.json', writer_replay)
+    reduced_path = None
+    if reduced is not None:
+        # The lane replays the run's own copy of the plan and its reduction record, which must be the recipe
+        # verified here; stale identities are rejected before any native writer is launched.
+        copied = directory / 'reduced-plan'
+        copied.mkdir()
+        reduced_path = copied / reduced['name']
+        error = None
+        try:
+            shutil.copyfile(args.reduced_plan.parent / 'reduction.json', copied / 'reduction.json')
+            shutil.copyfile(args.reduced_plan, reduced_path)
+            if plan_replay.load(reduced_path, without_defect=args.without_test_defect) != reduced:
+                raise ValueError('reduced plan or its reduction record changed while the runner read it')
+            plan_replay.verify(reduced, source=source_hash, reference=reference, sanitizer=sanitizer_runtime,
+                               candidate=plugin_native if reduced['lane'] == 'plugin-reference' else
+                               scene_transport_native, staged=staged_package)
+        except (OSError, ValueError, TypeError, KeyError) as failure:
+            error = str(failure)
+        if error and reduced['lane'] == 'plugin-reference':
+            plugin_error = plugin_error or error
+        elif error:
+            scene_transport_error = scene_transport_error or error
     fixture_fingerprints = {suite: fixture_fingerprint(suite) for suite in selected if suite in CATALOG["suites"]}
     replay = {"schema_version": 1, "suites": selected, "master_seed": master_seed,
               "scenarios": scenarios, "shard": shard, "driver_mode": driver_mode,
@@ -1020,7 +1135,11 @@ def main():
               "reference_python": str(args.reference_python) if args.reference_python else None,
               "reference_openssl": str(args.reference_openssl) if args.reference_openssl else None,
               "reference_identity": reference, "writer_plan": writer_replay,
+              "reduced_plan": None if reduced_path is None else dict(
+                  path=str(reduced_path), without_test_defect=args.without_test_defect),
               "writer_fuzz_profile": args.writer_fuzz_profile,
+              "staged_package": staged_package['path'] if staged_package else None,
+              "staged_package_identity": staged_package,
               "diagnostic_schema_identity": diagnostic_schema,
               "diagnostic_python": str(args.diagnostic_python) if args.diagnostic_python else None}
     from tools.live.kit_reference import selection
@@ -1038,6 +1157,7 @@ def main():
                 "usd_values_identity": usd_values_native,
                 "sdf_identity": sdf_native,
                 "plugin_identity": plugin_native,
+                "staged_package_identity": staged_package,
                 "python_binding_identity": python_binding,
                 "kit_identity": kit_identity,
                 "resolver_runtime_identity": resolver_runtime_native,
@@ -1053,7 +1173,7 @@ def main():
     write_json(directory / "manifest.json", manifest)
     # Pruning follows input validation and the first manifest, so a rejected invocation deletes no evidence.
     manifest["pruned"] = prune_runs(args.artifact_dir, directory, args.keep_runs,
-                                    [path for path in (args.replay, args.writer_plan) if path])
+                                    [path for path in (args.replay, args.writer_plan, args.reduced_plan) if path])
     write_json(directory / "manifest.json", manifest)
     xml = ET.Element("testsuites", name="live")
     failures = errors = 0
@@ -1119,7 +1239,7 @@ def main():
                 if suite == 'writer-fuzz':
                     from tools.live.writer_campaign import generate as writer_campaign
                     campaign_context = dict(source=source_hash, plugin=plugin_native, scene=scene_transport_native,
-                                            reference=reference, sanitizer=sanitizer_runtime)
+                                            reference=reference, sanitizer=sanitizer_runtime, package=staged_package)
                     campaign_plan = writer_campaign(args.writer_fuzz_profile, master_seed)
                     campaign_plan['context'] = campaign_context
                     context_path = directory / 'writer-fuzz-context.json'
@@ -1128,6 +1248,8 @@ def main():
                                '--profile', args.writer_fuzz_profile, '--plugin-driver', str(args.plugin_driver),
                                '--scene-driver', str(args.scene_transport_driver), '--openssl', str(args.reference_openssl),
                                '--context', str(context_path)]
+                    if staged_package is not None:
+                        command += ['--staged-package', staged_package['path']]
                 if suite == "diagnostics-schema":
                     command = [str(args.diagnostic_python), "-B", str(ROOT / "tools/live/diagnostic_schema_suite.py"),
                                str(args.runtime_driver), str(args.timeout_ms), str(args.max_output_bytes)]
@@ -1201,6 +1323,11 @@ def main():
                         command += ["--native-driver", str(args.unary_driver)]
                         if driver_mode is not None:
                             command += ["--driver-mode", driver_mode]
+                    if reduced_path is not None:
+                        command += ["--reduced-plan", str(reduced_path),
+                                    *(["--without-test-defect"] if args.without_test_defect else [])]
+                        if staged_package is not None:
+                            command += ["--staged-package", staged_package['path']]
                 if sanitizer_kind == "thread":
                     suite_environment = dict(suite_environment,
                                              **sanitizer.runtime_options("thread", directory / f"{index}.tsan"))
@@ -1341,6 +1468,24 @@ def main():
                         result["tests_run"] = len(cases)
                     except (OSError, ValueError, KeyError, TypeError) as error:
                         result = {"outcome": "infrastructure_error", "reason": f"resolver trace missing or invalid: {error}"}
+                if reduced_path is not None and result['outcome'] == 'failed':
+                    # The lane exits 1 or 2 only with its record of one completed trial.
+                    try:
+                        from writer_history import read_json
+                        evidence = read_json(directory / 'reduced-plan-result.json')
+                        reproduced = plan_replay.reproduced(evidence['trial'], reduced['target'])
+                        if (evidence['reproduced'] is not reproduced or
+                                result['returncode'] != (REDUCED_PLAN_REPRODUCED if reproduced else
+                                                         REDUCED_PLAN_NOT_REPRODUCED) or
+                                evidence['plan_sha256'] != reduced['plan_sha256'] or
+                                plan_replay.canonical(evidence['target']) != plan_replay.canonical(reduced['target'])):
+                            raise ValueError('record differs from the replayed recipe or the lane status')
+                        result['reduced_plan'] = dict(
+                            kind=reduced['kind'], plan=reduced['name'], reproduced=reproduced,
+                            without_test_defect=args.without_test_defect, target=reduced['target'],
+                            trial_outcome=evidence['trial']['outcome'], signature=evidence['trial'].get('signature'))
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        result.update(outcome='infrastructure_error', reason=f'reduced plan replay record invalid: {error}')
                 apply_budget(result, suite, before, artifact_usage(directory))
         except KeyboardInterrupt:
             interrupted = True
@@ -1372,6 +1517,13 @@ def main():
     print(f"Artifacts: {directory}")
     # The hint names this script by its absolute path: it runs from any working directory, on any Windows drive.
     print(f"Replay: {sys.executable} {Path(__file__).resolve()} --replay {directory / 'replay.json'}")
+    if reduced is not None and not interrupted:
+        replayed = next((entry['reduced_plan'] for entry in manifest['results'] if 'reduced_plan' in entry), None)
+        if replayed is None:
+            print("Reduced plan replay refused or produced no trial result", file=sys.stderr)
+            return REDUCED_PLAN_REFUSED
+        print(f"Reduced plan {'reproduced' if replayed['reproduced'] else 'did NOT reproduce'} its recorded signature")
+        return REDUCED_PLAN_REPRODUCED if replayed['reproduced'] else REDUCED_PLAN_NOT_REPRODUCED
     return 130 if interrupted else 2 if errors else 1 if failures else 0
 
 

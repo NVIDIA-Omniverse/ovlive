@@ -28,7 +28,7 @@ class AbiDraftTests(unittest.TestCase):
                     command = [executable, "-x", language, f"-std={standard}", "-Wall", "-Wextra", "-Werror",
                                "-pedantic", "-I", str(ROOT / "include"), str(source), "-o", str(output)]
                 compiled = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                          timeout=30)
+                                          timeout=120)  # Failure-only; under CI's 300 s suite watchdog.
                 self.assertEqual(compiled.returncode, 0, compiled.stdout)
                 subprocess.run([str(output)], check=True, timeout=5)
 

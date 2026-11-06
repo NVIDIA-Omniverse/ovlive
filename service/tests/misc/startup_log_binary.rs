@@ -18,14 +18,18 @@
 //! step.
 //!
 //! Each test spawns the built binary (`CARGO_BIN_EXE_live-edit`) with a
-//! cleared environment, JSON logs, and `LIVE_EDIT_PORT` set to a port this
-//! test holds open with its own `TcpListener`. The child therefore exits 1 at
-//! the gRPC bind (`failed to bind gRPC listener`), the first dependency step,
-//! right after the startup preamble — no Valkey and no network are needed.
+//! cleared environment and JSON logs. Every child but the bound-line test's
+//! and the scaler tests' (which set no service variable at all) gets
+//! `LIVE_EDIT_PORT` set to a port the test holds open with its own
+//! `TcpListener`. Such a child therefore exits 1 at the gRPC bind (`failed to
+//! bind gRPC listener`), the first dependency step, right after the startup
+//! preamble — no Valkey and no network are needed.
 //! `LIVE_EDIT_VALKEY_URL` points at a closed local port with a 1 s connect
 //! timeout as a backstop, so a child that ever got past the bind would still
 //! fail fast instead of hanging. The service children read their pod memory
 //! limit from a 5 GiB cgroup fixture, not from the runner's own cgroup.
+//! `held_mode_binary.rs` runs the binary past the hold decision against the
+//! test store, with this module's binary path and cgroup fixture.
 //!
 //! - **Configuration WARNs reach the log.** `Config::from_env` logs startup
 //!   WARNs while it parses; they reach the log only if the subscriber is
@@ -42,6 +46,18 @@
 //!   an unlimited (`max`) cgroup, a WARN naming the reference size and the
 //!   reason (Linux only, where the WARN is raised); on a 1 GiB cgroup it exits
 //!   1 with a configuration error naming the smallest limit it needs.
+//! - **The gRPC bound line reports the HTTP/2 settings.** These children bind
+//!   a free port instead of the held one and stop at the next step, the
+//!   Valkey connect, against a closed local port: the bound line carries the
+//!   stream and connection windows, h2's small-frame budget, the
+//!   per-connection local-error-reset limit and the maximum frame size, at
+//!   the default waiter cap and at a non-default one. Uncovered: that
+//!   `main.rs`'s two `production_server_builder` calls pass that waiter cap,
+//!   so the servers advertise the logged windows. Only the child's HTTP/2
+//!   handshake frames would show that, and these tests read none: the child
+//!   exits at the Valkey connect. (What `production_server_builder` itself
+//!   advertises, and its reset limit, are pinned in the integration suite's
+//!   `h2_connection_limits_test`.)
 //! - **StorageApi without a token file is refused at configuration load.**
 //!   The child exits 1 with `configuration error:` on stderr naming
 //!   `LIVE_EDIT_SERVICE_TOKEN_FILE`, and its stdout shows it never reached
@@ -154,7 +170,7 @@ pub(crate) fn pod_memory_fixture() -> tempfile::TempDir {
 }
 
 /// [`pod_memory_fixture`] with `memory_max` as the cgroup's `memory.max`.
-fn pod_memory_fixture_with(memory_max: &str) -> tempfile::TempDir {
+pub(crate) fn pod_memory_fixture_with(memory_max: &str) -> tempfile::TempDir {
     let root = tempfile::tempdir().expect("create the cgroup fixture");
     let files = [
         ("proc/self/cgroup", "0::/\n"),
@@ -611,6 +627,99 @@ fn live_edit_binary_logs_its_pod_memory_plan_from_its_cgroup_before_grpc_bind() 
         "a readable limit raises no reference WARN; stdout: {}",
         run.stdout
     );
+}
+
+/// The environment of a child that binds its gRPC and metrics ports (port 0,
+/// any free one) and then stops at its first dependency step, the Valkey
+/// connect: the store URL is a closed local port with a 1 s connect timeout.
+fn bind_then_stop_env(
+    case: &[(&str, &str)],
+    cgroup_root: &std::path::Path,
+) -> Vec<(String, String)> {
+    let cgroup_root = cgroup_root
+        .to_str()
+        .expect("the fixture path is UTF-8")
+        .to_owned();
+    let fixed = [
+        ("LIVE_EDIT_LOG_FORMAT", "json"),
+        ("LIVE_EDIT_PORT", "0"),
+        ("LIVE_EDIT_METRICS_PORT", "0"),
+        ("LIVE_EDIT_VALKEY_URL", "redis://127.0.0.1:1"),
+        ("LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS", "1"),
+        ("MEASUREMENT_POD_MEMORY_CGROUP_ROOT", cgroup_root.as_str()),
+    ];
+    AUTH_ENV
+        .iter()
+        .chain(case)
+        .chain(fixed.iter())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The child's one "gRPC listener bound" record.
+fn bound_line(run: &ChildRun) -> serde_json::Value {
+    let records: Vec<serde_json::Value> = run
+        .stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a JSON log record"))
+        .collect();
+    record_starting(&records, BIND_SUCCESS_MESSAGE_PREFIX, run).clone()
+}
+
+/// The gRPC bound line reports the HTTP/2 settings both servers carry: the
+/// receive windows, the small-frame budget h2 derives from the connection
+/// window (a figure neither tonic nor hyper exposes), the per-connection
+/// limit on streams h2 resets for a protocol error, and the maximum frame
+/// size. At the default waiter cap of 64: a 1 MiB stream window, a (64 + 1) ×
+/// 1 MiB connection window and half of that as the budget; at a waiter cap of
+/// 7, a connection window of (7 + 1) × 1 MiB and its half. In both, a reset
+/// limit of 10,240 and a frame size of 16,384, which no setting moves. The
+/// child binds and then stops at the Valkey connect.
+#[test]
+fn live_edit_binary_logs_its_http2_settings_on_its_grpc_bound_line() {
+    for (case, connection_window, budget) in [
+        (&[][..], 68_157_440_u64, 34_078_720_u64),
+        (
+            &[("LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS", "7")][..],
+            8_388_608,
+            4_194_304,
+        ),
+    ] {
+        let cgroup = pod_memory_fixture();
+        let run = run_binary(&bind_then_stop_env(case, cgroup.path()));
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "{case:?}: the child exits at the Valkey connect, after the bind; stdout: {}\n\
+             stderr: {}",
+            run.stdout,
+            run.stderr
+        );
+        let line = bound_line(&run);
+        assert_eq!(line["level"], "INFO", "{line}");
+        let fields = &line["fields"];
+        assert_eq!(
+            fields["http2_stream_window_bytes"], 1_048_576,
+            "{case:?}: {line}"
+        );
+        assert_eq!(
+            fields["http2_connection_window_bytes"], connection_window,
+            "{case:?}: {line}"
+        );
+        assert_eq!(
+            fields["h2_small_frame_budget_bytes"], budget,
+            "{case:?}: {line}"
+        );
+        assert_eq!(
+            fields["http2_max_local_error_reset_streams"], 10_240,
+            "{case:?}: the bound line must report the local-error-reset limit; {line}"
+        );
+        assert_eq!(
+            fields["http2_max_frame_bytes"], 16_384,
+            "{case:?}: the bound line must report the maximum frame size; {line}"
+        );
+    }
 }
 
 /// W7 at the binary: a cgroup that sets no memory limit (`max`) sizes the

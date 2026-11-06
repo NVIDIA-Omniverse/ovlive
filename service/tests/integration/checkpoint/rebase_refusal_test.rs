@@ -529,6 +529,10 @@ impl CheckpointStore for RecordingRebaseRefusalStore {
         self.delegate.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.record(StoreWrite::DeleteExtBlob {
             hash_hex: hash_hex.to_string(),

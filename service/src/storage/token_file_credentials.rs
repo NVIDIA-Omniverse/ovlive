@@ -475,19 +475,26 @@ impl CredentialProvider for TokenFileCredentialProvider {
     /// replaces did.
     ///
     /// The two properties this cadence has to satisfy are coupled, and both are
-    /// mechanized as `const` assertions next to the constants in
-    /// `storage::client`:
+    /// mechanized as `const` assertions on the production constants:
     ///
     /// 1. `base_interval + jitter_bound` must not exceed
     ///    the provider's `auth_fanout_window`, or a client whose tick fired just
     ///    before a rotation was observed would not tick again inside the window
-    ///    and would never receive the new credential.
+    ///    and would never receive the new credential. Asserted next to the
+    ///    constants in `storage::client`.
     /// 2. The prolongation floor handed to the Redis-scoped
-    ///    `ServiceTokenProvider` must cover **two** such intervals — one for the
-    ///    first client to observe the rotation, one for the last client to take
-    ///    its next tick — since a rotation with less headroom than that before
-    ///    the outgoing token's expiry cannot be guaranteed to reach every live
-    ///    connection.
+    ///    `ServiceTokenProvider` is **two** such intervals: one in which every
+    ///    client takes its first tick after the pickup — inside the window,
+    ///    which opens no later than the first of those ticks — and one of
+    ///    slack. A stream reader's tick may also be late by the inline step it
+    ///    is waiting out, which the slack also covers. A busy stream reader
+    ///    spends part of the slack landing its `AUTH` after its in-flight read
+    ///    returns; the reader asserts, in `storage::stream_mux`, that one
+    ///    interval plus its landing bound stays within the floor (a late tick
+    ///    and a `-MOVED` routing sync are not asserted; see that bound's
+    ///    docs). A rotation picked up with less headroom than the
+    ///    floor may not reach every live connection before the outgoing token
+    ///    expires.
     ///
     /// Missing the window still costs a reconnect, not an auth outage.
     /// [`Self::fetch`] serves any unexpired cached token, and every pooled

@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -110,6 +111,12 @@ void json(const Fields& fields) {
     std::cout << '{'; bool first=true;
     for(const auto& item:fields) { if(!first) std::cout << ','; first=false; std::cout << '"' << item.first << "\":" << item.second; }
     std::cout << '}';
+}
+// `uri` with the first character of its final segment, the layer name, percent-encoded: an alias of the same layer.
+std::string percentAlias(const std::string& uri,const std::string& layerName) {
+    char encoded[4]; std::snprintf(encoded,sizeof(encoded),"%%%02X",static_cast<unsigned char>(layerName[0]));
+    auto alias=uri; alias.replace(alias.rfind(layerName),1,encoded);
+    return alias;
 }
 template<class F> std::string uriText(F action) {
     uint64_t size=0; check(action(nullptr,&size)==OMNI_USD_LIVE_OK && size,"public URI size query failed");
@@ -339,6 +346,18 @@ public:
         check(latest_.state==expected,"public status reached unexpected terminal failure");
         return latest_;
     }
+    // Waits until `predicate` holds for the latest status, starting from
+    // `current`, a status read after open so no change between them is missed.
+    template<class Predicate> OmniUsdLiveStatus waitFor(const OmniUsdLiveStatus& current,Predicate predicate) {
+        check(handle_ && current.subject_id==subject_,"invalid status predicate wait");
+        std::unique_lock<std::mutex> lock(mutex_);
+        if(current.revision>latest_.revision) latest_=current;
+        check(changed_.wait_for(lock,std::chrono::seconds(5),[&] {
+            return predicate(latest_) || latest_.state==OMNI_USD_LIVE_STATE_FAILED;
+        }),"public status callback wait timed out");
+        check(predicate(latest_),"public status reached unexpected terminal failure");
+        return latest_;
+    }
     void close() {
         if(!handle_) return;
         check(omniUsdLiveUnregisterCallback(handle_,5000)==OMNI_USD_LIVE_OK,
@@ -433,19 +452,87 @@ struct SoakAuth {
         std::cout << "]}" << std::endl;
     }
 };
+// One presence participant of the layer's session: its join survives every
+// stream end the runtime reconnects, and each report lists the events since
+// the previous one with the session's current state.
+struct Presence {
+    struct Event { uint32_t kind; OmniUsdLiveResult result; std::string connection, bytes; };
+    std::mutex mutex; std::condition_variable changed; std::vector<Event> events;
+    uint64_t connected=0, messages=0; OmniUsdLiveSession handle=0;
+    static void OMNI_USD_LIVE_CALL callback(void* user,const OmniUsdLiveSessionEvent* event) {
+        auto& self=*static_cast<Presence*>(user);
+        Event copy{event->kind,event->result,event->connection_id ? event->connection_id : "",{}};
+        if(event->size) copy.bytes.assign(static_cast<const char*>(event->bytes),event->size);
+        std::lock_guard<std::mutex> lock(self.mutex);
+        self.connected+=event->kind==OMNI_USD_LIVE_EVENT_CONNECTION && event->result==OMNI_USD_LIVE_OK;
+        self.messages+=event->kind==OMNI_USD_LIVE_EVENT_MESSAGE;
+        self.events.push_back(std::move(copy)); self.changed.notify_all();
+    }
+    static void OMNI_USD_LIVE_CALL ignored(void*,OmniUsdLiveResult) {}
+    void join(const std::string& uri,const std::string& app) {
+        check(!handle && identifier(app),"invalid presence join");
+        auto options=record<OmniUsdLiveJoinOptions>(); options.app_name=app.c_str();
+        const auto result=omniUsdLiveJoinSession(uri.c_str(),&options,this,callback,&handle);
+        std::cout << "{\"type\":\"session-joined\",\"result\":" << result << '}' << std::endl;
+    }
+    void send(const std::string& text) {
+        check(handle && identifier(text),"invalid presence message");
+        OmniUsdLiveRequest request=0;
+        auto result=omniUsdLiveSendMessage(handle,text.data(),text.size(),nullptr,ignored,&request);
+        if(result==OMNI_USD_LIVE_OK) {
+            // The receipt is local queue acceptance, never peer delivery.
+            check(omniUsdLiveWait(request,5000)==OMNI_USD_LIVE_OK && omniUsdLiveGetRequestStatus(request,&result)==OMNI_USD_LIVE_OK &&
+                  omniUsdLiveReleaseRequest(request)==OMNI_USD_LIVE_OK,"presence send receipt failed");
+        }
+        std::cout << "{\"type\":\"session-sent\",\"result\":" << result << '}' << std::endl;
+    }
+    // Waits, under a failure-only watchdog, until the join has connected and
+    // received messages at least the given total numbers of times.
+    void report(uint64_t connections,uint64_t received) {
+        check(handle,"presence report without a join");
+        std::vector<Event> taken;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            check(changed.wait_for(lock,std::chrono::seconds(10),[&] { return connected>=connections && messages>=received; }),
+                  "presence wait timed out");
+            taken.swap(events);
+        }
+        auto status=record<OmniUsdLiveStatus>();
+        check(omniUsdLiveGetSessionStatus(handle,&status)==OMNI_USD_LIVE_OK,"presence status query failed");
+        std::cout << "{\"type\":\"session-events\",\"state\":" << status.state << ",\"result\":" << status.result
+                  << ",\"events\":[";
+        for(size_t i=0;i<taken.size();++i) {
+            const auto& event=taken[i];
+            check(event.connection.find_first_of("\"\\")==std::string::npos && (event.bytes.empty() || identifier(event.bytes)),
+                  "presence event outside the fixture profile");
+            std::cout << (i ? ",[" : "[") << event.kind << ',' << event.result << ",\"" << event.connection << "\",\""
+                      << event.bytes << "\"]";
+        }
+        std::cout << "]}" << std::endl;
+    }
+    OmniUsdLiveResult leave() {
+        if(!handle) return OMNI_USD_LIVE_OK;
+        const auto result=omniUsdLiveLeaveSession(handle,3000);
+        if(result==OMNI_USD_LIVE_OK) handle=0;
+        return result;
+    }
+};
 int run(int argc,char** argv) {
-    check(argc==5,"public plugin driver expects authority session seed plugInfo");
+    check(argc==5 || argc==6,"public plugin driver expects authority session seed plugInfo [layer]");
+    // The attached layer, `root.live` unless the optional sixth argument names another layer of the session.
+    const std::string layerName=argc==6 ? argv[5] : "root.live";
+    check(!layerName.empty() && layerName.find('/')==std::string::npos,"invalid public layer name");
     std::cerr << "public shared-plugin consumer seed=" << argv[3] << '\n';
     check(std::filesystem::is_regular_file(argv[4]),"packaged plugin metadata missing");
     check(!PlugRegistry::GetInstance().RegisterPlugins(argv[4]).empty(),"packaged plugin metadata not registered");
     contextOwnershipChecks();
     Host host; Runtime runtime;
-    SoakAuth auth;
+    SoakAuth auth; Presence presence;
     struct Cleanup {
-        Host& host; Runtime& runtime; SoakAuth& auth;
-        ~Cleanup() { try { host.drop(); hostApi::setPublicationContext({},{}); auth.close(); runtime.close(); }
+        Host& host; Runtime& runtime; SoakAuth& auth; Presence& presence;
+        ~Cleanup() { try { presence.leave(); host.drop(); hostApi::setPublicationContext({},{}); auth.close(); runtime.close(); }
                      catch(...) { std::cerr << "public consumer cleanup failed\n"; std::_Exit(2); } }
-    } cleanup{host,runtime,auth};
+    } cleanup{host,runtime,auth,presence};
     auto options=record<OmniUsdLiveRuntimeOptions>(); options.initial_open_timeout_ms=kInitialOpenTimeoutMs;
     options.max_update_bytes=64*1024; // Also exercises seed compiler preallocation limits.
     // Rotations reconnect within a 100 ms first window; the production defaults would add about a second each.
@@ -470,7 +557,7 @@ int run(int argc,char** argv) {
     previous.reset(); // Its close/destructor must not clear the new context.
 
     const auto session=uriText([&](char* out,uint64_t* size) { return omniUsdLiveMakeSessionUri(argv[1],argv[2],out,size); });
-    const auto uri=uriText([&](char* out,uint64_t* size) { return omniUsdLiveMakeLayerUri(session.c_str(),"root.live",out,size); });
+    const auto uri=uriText([&](char* out,uint64_t* size) { return omniUsdLiveMakeLayerUri(session.c_str(),layerName.c_str(),out,size); });
     const auto creationUri=uriText([&](char* out,uint64_t* size) { return omniUsdLiveMakeLayerUri(session.c_str(),"created.live",out,size); });
     std::unique_ptr<hostApi::PublicationContext> creationContext;
     uint64_t retainedSubject=0;
@@ -478,7 +565,7 @@ int run(int argc,char** argv) {
         TfErrorMark errors; host.layer=SdfLayer::FindOrOpen(uri);
         check(host.layer && errors.IsClean() && host.layer->PermissionToEdit(),"packaged file format open failed or returned a read-only layer");
         check(host.layer->GetFileFormat()->GetFormatId()==TfToken("live"),"public consumer selected wrong file format");
-        auto alias=uri; alias.replace(alias.rfind("root.live"),9,"%72oot.live");
+        const auto alias=percentAlias(uri,layerName);
         check(SdfLayer::FindOrOpen(alias)==host.layer && errors.IsClean(),"public canonical alias created second layer");
     });
     check(context->close() == OMNI_USD_LIVE_BUSY, "attached layer failed to retain original context");
@@ -1166,6 +1253,16 @@ int run(int argc,char** argv) {
             std::cout << "{\"type\":\"diagnostics\",\"snapshot\":" << bytes << '}' << std::endl;
         }
         else if(command=="auth-events") auth.report(runtime.endpoint);
+        else if(command=="session-join") {
+            std::string app; check(bool(input>>app),"missing presence application"); presence.join(session,app);
+        } else if(command=="session-send") {
+            std::string text; check(bool(input>>text),"missing presence message"); presence.send(text);
+        } else if(command=="session-events") {
+            uint64_t connections=0,received=0; check(bool(input>>connections>>received),"missing presence counts");
+            presence.report(connections,received);
+        } else if(command=="session-leave") {
+            std::cout << "{\"type\":\"session-left\",\"result\":" << presence.leave() << '}' << std::endl;
+        }
         else if(command=="observe-status" || command=="await-status") {
             uint32_t expected=OMNI_USD_LIVE_STATE_READY;
             if(command=="observe-status") observer.open(runtime.endpoint,status().subject_id);
@@ -1180,7 +1277,7 @@ int run(int argc,char** argv) {
             // percent-encoded alias, returns the same layer.
             host.call([&] {
                 TfErrorMark errors;
-                auto alias=uri; alias.replace(alias.rfind("root.live"),9,"%72oot.live");
+                const auto alias=percentAlias(uri,layerName);
                 check(SdfLayer::FindOrOpen(uri)==host.layer && SdfLayer::FindOrOpen(alias)==host.layer && errors.IsClean(),
                       "cached open of the attached layer failed");
             });
@@ -1437,6 +1534,32 @@ int run(int argc,char** argv) {
             report("state");
         } else if(command=="reset-context") {
             check(hostApi::setPublicationContext({},{})==OMNI_USD_LIVE_OK,"public context reset failed"); report("context-reset");
+        } else if(command=="save-admitted") {
+            // An off-host save returns BUSY while host edits are buffered and
+            // schedules the flush that admits them (design section 11). Each status
+            // published after their record reports them buffered until a flush
+            // empties the buffer, so a status newer than the one read before that
+            // save, with none buffered outside BLOCKED, or a terminal status,
+            // follows their admission or the layer's failure; the save then runs
+            // again with the time left. The deadline only bounds failure.
+            uint32_t timeout=0; check(bool(input>>timeout),"missing public save deadline");
+            const auto protectedLayer=host.call([&] { return host.layer; });
+            const auto deadline=Clock::now()+std::chrono::milliseconds(timeout);
+            StatusObserver admission; admission.open(runtime.endpoint,status().subject_id);
+            OmniUsdLiveResult result;
+            for(;;) {
+                const auto seen=status().revision;
+                const auto left=std::chrono::duration_cast<std::chrono::milliseconds>(deadline-Clock::now()).count();
+                result=hostApi::save(*protectedLayer,static_cast<uint32_t>(std::max<int64_t>(0,left)));
+                if(result!=OMNI_USD_LIVE_BUSY) break;
+                admission.waitFor(status(),[seen](const OmniUsdLiveStatus& value) {
+                    return value.revision>seen && (value.state==OMNI_USD_LIVE_STATE_FAILED ||
+                        value.state==OMNI_USD_LIVE_STATE_CLOSING || value.state==OMNI_USD_LIVE_STATE_CLOSED ||
+                        (value.state!=OMNI_USD_LIVE_STATE_BLOCKED && value.buffered_edit_count==0));
+                });
+            }
+            admission.close();
+            std::cout << "{\"type\":\"saved\",\"result\":" << result << '}' << std::endl;
         } else if(command=="failed") {
             { StatusObserver terminal; terminal.open(runtime.endpoint,status().subject_id); terminal.wait(OMNI_USD_LIVE_STATE_FAILED); }
             report("state");
@@ -1460,6 +1583,7 @@ int run(int argc,char** argv) {
             std::cout << "{\"type\":\"exported\",\"result\":" << (exported ? 0 : 1) << ",\"fields\":";
             json(exported ? *exported : Fields{}); std::cout << '}' << std::endl;
         } else if(command=="close") {
+            check(presence.leave()==OMNI_USD_LIVE_OK,"public presence leave failed");
             observer.close();
             const auto values=host.read(); host.drop();
             check(hostApi::setPublicationContext({},{})==OMNI_USD_LIVE_OK,"public final context reset failed");

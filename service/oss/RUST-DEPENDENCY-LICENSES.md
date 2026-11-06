@@ -19,8 +19,9 @@ limitations under the License.
 
 This table is a snapshot of the root `Cargo.lock` whose SHA-256 is `ec9fb4c45ebe73fc7990ad3002c4c7e7dcb9aaef7201e713213a3f21f17559a6`.
 It lists all 395 packages that lockfile records, one row per name and version, sorted by name and then version.
-The conformance suite's native codec has its own lockfile, `conformance_tests/native-Cargo.lock`; every package in it is also in the root lockfile at the same version, so this table covers it.
-The fuzz harness's own lockfile, `oodf-ffi/fuzz/Cargo.lock`, is not covered: only `cargo-fuzz` builds the harness, and no release artifact ships it.
+The fuzz harness's own lockfile, `oodf-ffi/fuzz/Cargo.lock`, is not covered.
+It locks what `cargo-fuzz` builds the harness from, and no release binary contains the harness.
+The published source tree carries it, and CI audits it against the RustSec advisory database, as it does the root `Cargo.lock`.
 It was generated once, from `cargo metadata --locked --format-version 1`, and is not kept current: it is accurate as of the `Cargo.lock` whose SHA-256 it records, and after a dependency change, `Cargo.lock` and `ATTRIBUTIONS.md` are the current record.
 The inventory of what each release ships and how it is licensed is [SOURCE-INVENTORY.md](SOURCE-INVENTORY.md).
 
@@ -30,7 +31,8 @@ The inventory of what each release ships and how it is licensed is [SOURCE-INVEN
   The vendored `fred` row instead gives the split recorded in `vendor/fred-10.1.0.SOURCE.md`: upstream files and NVIDIA's modifications to them are MIT, and NVIDIA's added files are Apache-2.0.
   `ATTRIBUTIONS.md` normalises two declarations: `smartstring` (`MPL-2.0+`) is attributed as `MPL-2.0`, and `tikv-jemalloc-sys` (`MIT/Apache-2.0`) as `(MIT OR Apache-2.0) AND BSD-2-Clause`, because it compiles jemalloc's BSD-2-Clause C sources into the binary.
 - **Source** is `crates.io`, a workspace member's path, or the vendored tree the root `Cargo.toml` patches in with `[patch.crates-io]`.
-- **Scope** comes from the dependency kinds `cargo metadata` reports, walked from the four workspace members (`live-edit`, `oodf-ffi`, `live-edit-capabilities-proto`, `live-edit-scaler`):
+- **Scope** comes from the dependency kinds `cargo metadata` reports, walked from the four workspace members of that lockfile (`live-edit`, `oodf-ffi`, `live-edit-capabilities-proto`, `live-edit-scaler`).
+  The fifth member added since, `live-edit-conformance`, adds only its own source-less entry to `Cargo.lock`: every third-party package it reaches through normal or build edges is one `live-edit` reaches, at the same version (`conformance_tests/tests/dependency_fence.rs` fails otherwise).
   - `runtime`: reachable through normal dependency edges only. On a platform where it builds (the **Linux** column), such a crate is compiled into the binaries the workspace crates produce.
     `runtime (proc macro)` marks a procedural-macro crate in that set: it runs inside the compiler, and none of its code is linked into a binary.
   - `build`: not `runtime`, and reachable once build-dependency edges are followed too. These run only while compiling: build scripts and what they use.

@@ -72,12 +72,26 @@
 //!    the read, is `value_gone`.
 //! 5. A complete walk publishes `checkpoint_ext_backup_owed`: the values older
 //!    than `G` still without a copy, every one counted, including those a
-//!    spent time budget left unchecked. A pass whose walk failed, or that was
-//!    cancelled, publishes nothing, because its count would miss the metas it
-//!    never read; the next pass, or the next leader's, publishes. So does a
-//!    pass that runs past its deadline, the interval: a backstop that, with
-//!    checks and re-sends cut at the time budget, only a walk slower than the
-//!    rest of the interval or a stuck Valkey read reaches.
+//!    spent time budget left unchecked. A pass whose walk failed — a store
+//!    fault, a primary it did not walk on the node that serves it, an
+//!    unproven pin whose routing table was out of date, a slot map that
+//!    changed while it walked — or that was cancelled, publishes nothing,
+//!    because its count would miss the metas it never read; the next pass,
+//!    or the next leader's, publishes. A walk that walked every primary of
+//!    the store's slot map on its pin but could not prove each pin served
+//!    its primary — an open slot, or an unusable or unreadable
+//!    `CLUSTER NODES` with the routing table its pins came from dividing the
+//!    slots as the map does — counts as complete, with a WARN: withholding
+//!    the gauge would freeze it for as long as the store answers that way
+//!    (`orphan_sweep::KeyspaceWalkError::every_primary_walked`). That count
+//!    is not proof every meta was read: an open slot may skip keys, the
+//!    table comparison cannot see a change of primary that keeps every slot
+//!    set (`storage::scan_guard`, *The table check*), and with no
+//!    serving-process witness a failover or restart inside one walk can skip
+//!    metas for that walk only, undetected. A pass that runs past
+//!    its deadline, the interval, publishes nothing either: a backstop that,
+//!    with checks and re-sends cut at the time budget, only a walk slower
+//!    than the rest of the interval or a stuck Valkey read reaches.
 //!
 //! ## Why it is safe
 //!
@@ -89,7 +103,11 @@
 //! - **Absent is acted on, never trusted.** An `Ok(false)` from
 //!   `ext_blob_exists` may be a cached not-found (`CheckpointStore::
 //!   ext_blob_exists`); the worst a wrong one costs is an upload of bytes the
-//!   store already holds.
+//!   store already holds. An `Ok(true)` may be cached too, for bytes deleted
+//!   since (any by-address answer may be up to
+//!   `Config::checkpoint_storage_api_not_found_cache_secs` old); a wrong one
+//!   confirms a copy the store no longer holds, the residual SDD §22.16
+//!   states.
 //! - **Memory is constant.** One chunk of keys and its reply, at most
 //!   [`EXT_BACKUP_PROBE_CONCURRENCY`] existence checks (no bodies), the audit
 //!   list (at most [`ExtBackupRepairTiming::audit_per_pass`] hashes), and one
@@ -100,7 +118,8 @@
 //!   is the charge plus one range, which stays inside the data-pool
 //!   connection's counted read buffer.
 //! - **One replica sweeps.** It is a consumer of `le:gc:leader`, like the GC,
-//!   the orphan sweep and the reference-count reconciler, shaped like the
+//!   the orphan sweep, the reference-count reconciler and the checkpoint
+//!   clean-up (`checkpoint::cleanup`), shaped like the
 //!   reconciler (`storage::ext_reconcile::spawn_ext_ref_reconcile`): the lock
 //!   is taken before each pass, and a non-leader publishes 0. The pass does
 //!   not renew the lock; the GC task's refresh ticker does. Two leaders after
@@ -113,12 +132,20 @@
 //! What it does not cover: a value Valkey loses within `G` plus one interval
 //! of a skipped copy; a value larger than the mirror's whole byte budget
 //! (reachable only for one uploaded under a larger upload size limit);
-//! no clean-up fence yet guards its uploads against the checkpoint collect
-//! (see the upload's call site); and, until b.g65's fence, a confirmation
-//! from an upload or existence check that answered just before the collect
-//! deleted the copy, landing after the collect cleared the field: the value
-//! reads as backed up, with no copy, until the daily audit re-checks it
-//! (about 24 h).
+//! and a LocalDisk upload that lands after its ceiling, which the clean-up
+//! fence does not cover (an orphaned copy, a leak and never a loss).
+//!
+//! **The clean-up fence (b.g65).** Immediately before each re-send's upload,
+//! the repair runs the checkpoint clean-up's writer re-arm
+//! (`storage::recon_fence::recon_ext_rearm`) for the hash: a collect that
+//! commits afterwards refuses to delete it, and a delete the collect licensed
+//! within the re-send's reliance window — since the pass's Valkey read, plus
+//! the upload ceiling — skips the upload (`collect_fenced`), since uploading
+//! would resurrect a collected copy. A fence error skips it too
+//! (`resend_failed`). Every confirmation the pass writes carries that read as
+//! its reliance start, so one whose existence check or upload answered before
+//! the collect deleted the copy is declined rather than written after the
+//! collect cleared the field.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -128,12 +155,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::ext_mirror::{ExtMirrorSender, ReserveRefusal};
-use crate::checkpoint::store::CheckpointStore;
+use crate::checkpoint::store::{reconcile_grace, CheckpointStore};
 use crate::observability::metrics::{
     SharedMetrics, EXT_BACKUP_REPAIR_ALREADY_STORED, EXT_BACKUP_REPAIR_BUDGET_BUSY,
-    EXT_BACKUP_REPAIR_CONFIRMED_COPY_MISSING, EXT_BACKUP_REPAIR_OVERSIZED,
-    EXT_BACKUP_REPAIR_PROBE_FAILED, EXT_BACKUP_REPAIR_RESEND_FAILED, EXT_BACKUP_REPAIR_RESENT,
-    EXT_BACKUP_REPAIR_VALUE_GONE,
+    EXT_BACKUP_REPAIR_COLLECT_FENCED, EXT_BACKUP_REPAIR_CONFIRMED_COPY_MISSING,
+    EXT_BACKUP_REPAIR_OVERSIZED, EXT_BACKUP_REPAIR_PROBE_FAILED, EXT_BACKUP_REPAIR_RESEND_FAILED,
+    EXT_BACKUP_REPAIR_RESENT, EXT_BACKUP_REPAIR_VALUE_GONE,
 };
 use crate::storage::client::ValkeyClient;
 use crate::storage::ext_backup::{
@@ -144,6 +171,7 @@ use crate::storage::external_values::{hash_from_hex, try_acquire_gc_leader};
 use crate::storage::keys::KeySchema;
 use crate::storage::leader_lease::LeaderIdentity;
 use crate::storage::orphan_sweep::scan_keyspace;
+use crate::storage::recon_fence::recon_ext_rearm;
 
 /// How often the leader runs a pass, and each pass's deadline.
 pub const EXT_BACKUP_REPAIR_INTERVAL: Duration = Duration::from_secs(300);
@@ -316,6 +344,7 @@ pub struct PassSummary {
     pub budget_busy: u64,
     pub oversized: u64,
     pub confirmed_copy_missing: u64,
+    pub collect_fenced: u64,
     /// Values older than `G` still without a copy at the end of the pass: the
     /// owed gauge's reading.
     pub owed: u64,
@@ -336,6 +365,7 @@ impl PassSummary {
                 + self.budget_busy
                 + self.oversized
                 + self.confirmed_copy_missing
+                + self.collect_fenced
                 + self.owed
                 > 0
     }
@@ -344,8 +374,10 @@ impl PassSummary {
 /// Why a pass ended without a complete walk: it publishes nothing.
 #[derive(Debug)]
 pub enum PassError {
-    /// A Valkey read the walk depends on failed: the clock, the scan, or a
-    /// chunk's `HMGET`.
+    /// A Valkey read the walk depends on failed: the clock, the meta walk (a
+    /// store fault, or a walk that did not walk a primary on the node that
+    /// serves it, found an unproven pin's routing table out of date or saw
+    /// the slot map change), or a chunk's `HMGET`.
     Valkey {
         op: &'static str,
         source: fred::error::Error,
@@ -385,6 +417,10 @@ enum CandidateKind {
 enum ResendOutcome {
     /// Uploaded.
     Resent,
+    /// The clean-up fence refused the upload: the checkpoint collect deleted
+    /// the value's backup copy within the re-send's reliance window. Stays
+    /// owed; a later pass re-sends it once the window has passed.
+    CollectFenced,
     /// Larger than the whole budget; stays owed.
     Oversized,
     /// Valkey no longer holds it.
@@ -405,15 +441,27 @@ struct PassState {
     resending_stopped: bool,
     /// When the time budget for checks and re-sends runs out.
     work_deadline: tokio::time::Instant,
+    /// The pass's Valkey clock read, in ms: the reliance start of every
+    /// existence check and re-send of the pass. A confirmation is declined
+    /// when the checkpoint collect deleted the copy at or after it, and the
+    /// re-send's clean-up fence looks back to it (b.g65).
+    clock_ms: u64,
+    /// When that read was sent, on this process's monotonic clock, so the
+    /// re-send can measure the time since it. Sampled before the `TIME`
+    /// round trip rather than after it, so the lookback measured from it is
+    /// never shorter than the time since the Valkey clock read.
+    clock_read_at: Instant,
     summary: PassSummary,
 }
 
 impl PassState {
-    fn new(work_deadline: tokio::time::Instant) -> Self {
+    fn new(work_deadline: tokio::time::Instant, clock_ms: u64, clock_read_at: Instant) -> Self {
         Self {
             probing_stopped: false,
             resending_stopped: false,
             work_deadline,
+            clock_ms,
+            clock_read_at,
             summary: PassSummary::default(),
         }
     }
@@ -531,10 +579,11 @@ impl ExtBackupRepair {
         let work_deadline = started
             .checked_add(self.timing.work_budget)
             .unwrap_or_else(|| started + Duration::from_secs(u64::from(u32::MAX)));
-        let mut state = PassState::new(work_deadline);
+        let clock_read_at = Instant::now();
         let now_ms = valkey_time_ms(&self.client)
             .await
             .map_err(|source| PassError::Valkey { op: "TIME", source })?;
+        let mut state = PassState::new(work_deadline, now_ms, clock_read_at);
         let young_cutoff_ms = now_ms.saturating_sub(millis(self.timing.age_gate));
         let audit_cutoff_ms = now_ms.saturating_sub(millis(self.timing.audit_age));
 
@@ -551,17 +600,41 @@ impl ExtBackupRepair {
                 item = stream.next() => item,
             };
             let finished = next.is_none();
-            if let Some(item) = next {
-                let key = item.map_err(|source| PassError::Valkey {
-                    op: "SCAN ext:meta",
-                    source,
-                })?;
-                match key.as_str() {
+            match next {
+                None => {}
+                Some(Ok(key)) => match key.as_str() {
                     Some(key) => chunk.push(key.to_owned()),
                     None => tracing::debug!(
                         key = ?key,
                         "external-value backup repair skipped a meta key that is not UTF-8"
                     ),
+                },
+                // The walk walked every primary of the store's slot map on its
+                // pin but could not prove each pin served its primary — an
+                // open slot, or an unusable or unreadable `CLUSTER NODES`
+                // with the routing table its pins came from dividing the
+                // slots as the map does: the pass goes on to publish its
+                // count, because withholding it would freeze the owed gauge
+                // for as long as the store answers that way. The count can
+                // still be short (an open slot, a change of primary the table
+                // comparison cannot see, a change of serving process within
+                // the walk: module docs, step 5). The error is the walk's
+                // last item, so the next one ends the walk.
+                Some(Err(e)) if e.every_primary_walked() => tracing::warn!(
+                    error = %e,
+                    "external-value backup repair's meta walk walked every primary, but a node's \
+                     own slot check could not confirm it serves its primary; the owed count is \
+                     still published"
+                ),
+                // A primary not walked on the node that serves it, an
+                // unproven pin's routing table found out of date, a slot map
+                // that changed, or a store fault: metas may have been missed,
+                // so the pass publishes nothing.
+                Some(Err(e)) => {
+                    return Err(PassError::Valkey {
+                        op: "SCAN ext:meta",
+                        source: e.into_fred(),
+                    })
                 }
             }
             if chunk.len() >= META_CHUNK || (finished && !chunk.is_empty()) {
@@ -692,9 +765,10 @@ impl ExtBackupRepair {
                 continue;
             }
             let work_deadline = state.work_deadline;
+            let reliance = (state.clock_ms, state.clock_read_at);
             let outcome = tokio::select! {
                 biased;
-                outcome = self.resend(&candidate, cancel) => outcome?,
+                outcome = self.resend(&candidate, reliance, cancel) => outcome?,
                 () = tokio::time::sleep_until(work_deadline) => {
                     // Dropped mid-way, with its upload if one is in flight;
                     // the value stays owed.
@@ -707,6 +781,11 @@ impl ExtBackupRepair {
                 ResendOutcome::Resent => {
                     state.summary.resent += 1;
                     self.count(EXT_BACKUP_REPAIR_RESENT);
+                }
+                ResendOutcome::CollectFenced => {
+                    state.summary.collect_fenced += 1;
+                    state.summary.owed += 1;
+                    self.count(EXT_BACKUP_REPAIR_COLLECT_FENCED);
                 }
                 ResendOutcome::ValueGone => {
                     state.summary.value_gone += 1;
@@ -755,6 +834,7 @@ impl ExtBackupRepair {
         let total = candidates.len() as u64;
         let mut answered = 0u64;
         let mut absent = Vec::new();
+        let reliance_start_ms = state.clock_ms;
         let ceiling = self.call_ceiling;
         let store = &self.store;
         let mut checks = futures::stream::iter(candidates)
@@ -786,7 +866,11 @@ impl ExtBackupRepair {
                     state.summary.already_stored += 1;
                     self.count(EXT_BACKUP_REPAIR_ALREADY_STORED);
                     self.marks
-                        .confirm(&candidate.hash_hex, &candidate.last_store_ms)
+                        .confirm(
+                            &candidate.hash_hex,
+                            &candidate.last_store_ms,
+                            reliance_start_ms,
+                        )
                         .await;
                 }
                 Ok(Ok(false)) => {
@@ -826,11 +910,17 @@ impl ExtBackupRepair {
     /// Re-send one value from Valkey (module docs, step 4). The value is read
     /// only after its charge is reserved, into one buffer of the reserved
     /// length, so the charge covers all the re-send holds.
+    ///
+    /// `reliance` is the pass's Valkey clock read and when it returned: the
+    /// upload's clean-up fence looks back to it, and the confirmation is
+    /// declined when the collect deleted the copy at or after it.
     async fn resend(
         &self,
         candidate: &Candidate,
+        reliance: (u64, Instant),
         cancel: &CancellationToken,
     ) -> Result<ResendOutcome, PassError> {
+        let (reliance_start_ms, clock_read_at) = reliance;
         let hash_hex = candidate.hash_hex.as_str();
         // An absent key reads 0 here, like an empty value; the read below
         // tells them apart, at the cost of the smallest charge.
@@ -910,12 +1000,52 @@ impl ExtBackupRepair {
         };
         let bytes = reservation.wrap(bytes);
 
-        // No clean-up fence here yet: this upload can land after the
-        // checkpoint collect deleted the hash's copy, leaving an orphaned blob
-        // (a leak, never a loss). b.g65's fence lands after this change and
-        // adds its check here.
+        // The clean-up fence (b.g65), immediately before the upload: the
+        // re-arm records that this hash is referenced again, so a collect
+        // that commits afterwards refuses to delete it, and answers whether
+        // the collect deleted the copy within this re-send's reliance window —
+        // since the pass's Valkey read, plus the upload ceiling, the longest
+        // this upload can take to land. Then the upload would resurrect a
+        // collected copy, so it is skipped and the value stays owed. An error
+        // fails closed: no upload, `resend_failed`.
+        let lookback = clock_read_at.elapsed() + self.timing.upload_ceiling;
+        let grace = reconcile_grace(self.store.publish_worst_case());
+        match recon_ext_rearm(
+            &self.client,
+            &self.keys,
+            std::slice::from_ref(&candidate.hash_hex),
+            lookback,
+            grace,
+            None,
+        )
+        .await
+        {
+            Ok(reply) if reply.refuses() => {
+                tracing::info!(
+                    hash_prefix = prefix(hash_hex),
+                    "external-value backup repair did not re-send a value whose backup copy the \
+                     checkpoint clean-up deleted within the re-send's reliance window; it stays \
+                     owed and a later pass re-sends it"
+                );
+                return Ok(ResendOutcome::CollectFenced);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    hash_prefix = prefix(hash_hex),
+                    error = %e,
+                    "external-value backup repair could not check the checkpoint clean-up's \
+                     record before a re-send; it does not upload, and the value stays owed"
+                );
+                return Ok(ResendOutcome::Failed);
+            }
+        }
+
         // The upload ceiling, not the call ceiling: on the local adapters the
         // latter is a 5 s rename bound, too short for a large value's write.
+        // A LocalDisk write that lands after this ceiling (its write runs to
+        // completion in a blocking task) lands outside the fence's window: an
+        // orphaned copy in the backup store at worst, a leak and never a loss.
         let upload = tokio::time::timeout(
             self.timing.upload_ceiling,
             self.store.put_ext_blob(hash_hex, bytes),
@@ -927,7 +1057,9 @@ impl ExtBackupRepair {
         };
         match answer {
             Ok(Ok(())) => {
-                self.marks.confirm(hash_hex, &candidate.last_store_ms).await;
+                self.marks
+                    .confirm(hash_hex, &candidate.last_store_ms, reliance_start_ms)
+                    .await;
                 Ok(ResendOutcome::Resent)
             }
             Ok(Err(e)) => {
@@ -1002,6 +1134,7 @@ impl ExtBackupRepair {
                             budget_busy = summary.budget_busy,
                             oversized = summary.oversized,
                             confirmed_copy_missing = summary.confirmed_copy_missing,
+                            collect_fenced = summary.collect_fenced,
                             owed = summary.owed,
                             work_budget_spent = summary.work_budget_spent,
                             "external-value backup repair pass complete"
@@ -1031,10 +1164,13 @@ impl ExtBackupRepair {
 /// Spawn the backup repair as a periodic task: a pass every
 /// `repair.timing().interval`, the first at once, each run only while this
 /// replica holds `le:gc:leader` (taken with `leader`, the process-wide
-/// identity the GC, the orphan sweep and the reconciler share). A non-leader
+/// identity the GC, the orphan sweep, the reconciler and the checkpoint
+/// clean-up share). A non-leader
 /// publishes 0 on the owed gauge; a failed lock probe publishes nothing.
 /// Exits on `cancel`, abandoning a pass in progress; every step a pass
-/// completed stays done, and the next leader's pass resumes the work.
+/// completed stays done, and the next leader's pass resumes the work. The
+/// wait between passes is biased toward the cancel, so once it fires no
+/// elapsed interval starts another pass.
 pub fn spawn_ext_backup_repair(
     repair: ExtBackupRepair,
     leader: LeaderIdentity,
@@ -1080,12 +1216,15 @@ pub fn spawn_ext_backup_repair(
                     "external-value backup repair leader lock acquisition failed"
                 ),
             }
+            // Biased, the cancel first: once it fires, an interval that has
+            // also elapsed starts no further pass.
             tokio::select! {
-                () = tokio::time::sleep(repair.timing.interval) => {}
+                biased;
                 () = cancel.cancelled() => {
                     tracing::info!("external-value backup repair shutting down");
                     return;
                 }
+                () = tokio::time::sleep(repair.timing.interval) => {}
             }
         }
     })

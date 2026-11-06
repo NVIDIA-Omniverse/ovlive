@@ -4203,16 +4203,23 @@ pub struct ReplayRecordGrowth {
 ///
 /// - **Cascades** ([`cascade_scratch_bytes`]), when the record can cascade at
 ///   all: it carries a `DeleteSection` or a `MoveSection` (edges 2–4 delete
-///   the moved section, edge 5 the destination's same-name sibling), a
-///   pre-record row sits at a `(parent, name)` that a `CreateSection`, a
-///   `DiffChangeSection` or a `MoveSection` destination introduces (the
-///   same-name sibling a birth cascades), or two of those commands introduce
-///   the same `(parent, name)`. Otherwise it is 0. The pushes `P` are the
-///   births plus [`subtree_pushes`] summed over the roots the record can
-///   delete, on the state before it: each `DeleteSection` target with a row,
-///   each `MoveSection` id, each `DiffChangeSection` id with a row, each
-///   pre-record row at an introduced `(parent, name)` other than the
-///   introducing command's own id (with plan indexes found by
+///   the moved section; edge 5 and a same-parent rename the occupant of the
+///   name they move it to, and edge 5 the moved section too when the
+///   occupant's subtree took the destination), a pre-record row sits at a
+///   `(parent, name)` that a `CreateSection`, a `DiffChangeSection` or a
+///   `MoveSection` introduces (the occupant a birth cascades), or two of
+///   those commands introduce the same `(parent, name)`. A `MoveSection`
+///   introduces the name under the parent its occupant lookup reads: its
+///   destination, or for a same-parent rename the parent the section holds
+///   at that command — the one an earlier command of the record gave it,
+///   else its stored row's. Otherwise it is 0.
+///   The pushes `P` are the births plus [`subtree_pushes`] summed over the
+///   roots the record can delete, on the state before it: each
+///   `DeleteSection` target with a row, each `MoveSection` id, each
+///   `DiffChangeSection` id with a row, each pre-record row at an introduced
+///   `(parent, name)` other than the introducing command's own id, of any
+///   collision slot — a superset of the occupants, since the slot a command
+///   probes is not read here (with plan indexes found by
 ///   `PlanIndexes::rows_named`, without them by the one pass over the
 ///   sections that also counts the orphans), and each orphan a birth adopts.
 ///   That is every subtree a cascade can reach: a list gains entries only
@@ -4449,13 +4456,32 @@ fn replay_record_growth(
                 carries_subtree = true;
                 deletes_or_moves = true;
                 commanded.insert(c.section_id);
-                introduced.introduce(c.new_parent_id, &c.new_name, c.section_id);
+                // The parent the section has after this command, which is
+                // the parent its occupant lookup reads. A cross-parent move
+                // goes under its destination. A same-parent rename never
+                // moves the section: it stays under its parent as the
+                // record's earlier commands left it (`parent_after`), else
+                // its stored row's, and a carried parent naming another id
+                // is stale. Resolving it this way is required, not a
+                // widening: an earlier cross-parent move of the section
+                // puts a later rename's occupant under the moved-to parent,
+                // which neither the row nor the carried parent names.
+                let parent = if c.old_parent_id == c.new_parent_id {
+                    parent_after
+                        .get(&c.section_id)
+                        .copied()
+                        .or_else(|| row_parent(c.section_id))
+                        .unwrap_or(c.new_parent_id)
+                } else {
+                    c.new_parent_id
+                };
+                introduced.introduce(parent, &c.new_name, c.section_id);
                 tally.touched.insert(c.old_parent_id);
                 if let Some(old_parent) = row_parent(c.section_id) {
                     tally.touched.insert(old_parent);
                 }
                 tally.list_under(c.new_parent_id, c.section_id);
-                parent_after.insert(c.section_id, c.new_parent_id);
+                parent_after.insert(c.section_id, parent);
             }
             StructCommand::ReorderChildren(c) => {
                 tally.touched.insert(c.section_id);
@@ -4736,9 +4762,10 @@ fn replay_record_growth(
 }
 
 /// The `(parent, name)`s a record's `CreateSection`s, `DiffChangeSection`s
-/// and `MoveSection` destinations introduce ([`estimate_replay_record_growth`]):
-/// a row already there, other than the introducing command's own, is a
-/// same-name sibling the command can cascade-delete.
+/// and `MoveSection`s introduce ([`estimate_replay_record_growth`]): a row
+/// already there, other than the introducing command's own, can be the
+/// occupant the command cascade-deletes. Keyed by name alone, so the rows of
+/// every collision slot are counted: a superset of the occupants.
 #[derive(Default)]
 struct IntroducedNames<'d> {
     /// Each introduced `(parent, name)` → the id of the one command's section
@@ -10380,6 +10407,82 @@ mod tests {
             (0, 0),
             "an empty commit"
         );
+    }
+
+    /// A same-parent rename onto an occupied name cascades the occupant of
+    /// the name under the parent the section holds at that command, whatever
+    /// parent the command carries, so the estimate prices that occupant's
+    /// subtree at or above the engine's cascade of it: here the group, 1 + 50
+    /// pushes, against at least the one list the cascade unlinks it from.
+    ///
+    /// - **A stale carried parent:** the leaf, under the world, renamed onto
+    ///   the group's name with the second group carried as both parents.
+    /// - **An in-record chain:** one record moves a leaf of the second group
+    ///   under the world, renames it with the second group, now stale,
+    ///   carried as both parents, then renames it, carried the same way, onto
+    ///   the group's name. Neither the leaf's stored row nor the carried
+    ///   parent names the world; only the record's own earlier move does.
+    ///
+    /// The moved or renamed leaf is the only root a command names, one push,
+    /// so an estimate that looks the name up under the carried parent or the
+    /// stored row's misses the group and prices below the cascade.
+    #[test]
+    fn estimate_replay_record_growth_prices_a_stale_carried_renames_occupant_at_or_above_its_cascade(
+    ) {
+        let state = cascade_base();
+        let names = name_room(&state);
+        let group_name = format!("s{CASCADE_GROUP}");
+        let move_cmd = |carried: u64, destination: u64, section_id: u64, name: &str| {
+            StructCommand::MoveSection(oodf_ffi::CommandMoveSection {
+                old_parent_id: carried,
+                new_parent_id: destination,
+                section_id,
+                new_name: name.to_owned(),
+            })
+        };
+        let leaf_of_second = 200;
+        let cases = [
+            (
+                "a stale carried parent",
+                record_of(vec![move_cmd(
+                    CASCADE_SECOND,
+                    CASCADE_SECOND,
+                    CASCADE_LEAF,
+                    &group_name,
+                )]),
+            ),
+            (
+                "an in-record chain",
+                record_of(vec![
+                    move_cmd(
+                        CASCADE_SECOND,
+                        CASCADE_WORLD,
+                        leaf_of_second,
+                        &format!("s{leaf_of_second}"),
+                    ),
+                    move_cmd(CASCADE_SECOND, CASCADE_SECOND, leaf_of_second, "renamed"),
+                    move_cmd(CASCADE_SECOND, CASCADE_SECOND, leaf_of_second, &group_name),
+                ]),
+            ),
+        ];
+        let occupant_pushes = crate::domain::delta::subtree_pushes(&state, CASCADE_GROUP, u64::MAX)
+            .expect("the group is a finite tree");
+        assert_eq!(
+            occupant_pushes,
+            1 + CASCADE_GROUP_CHILDREN,
+            "fixture: the group's pushes"
+        );
+        for (what, delta) in cases {
+            let (indexed, copy) = scratch_on_both(&state, &delta);
+            assert!(
+                indexed >= cascade_scratch_bytes(occupant_pushes, 1, true, names),
+                "{what}, with plan indexes: {indexed} B is below the occupant's cascade"
+            );
+            assert!(
+                copy >= cascade_scratch_bytes(occupant_pushes, 1, false, names),
+                "{what}, without plan indexes: {copy} B is below the occupant's cascade"
+            );
+        }
     }
 
     /// When a cascade's walk cannot finish within the state's sections — a

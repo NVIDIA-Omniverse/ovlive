@@ -467,6 +467,12 @@ impl RestartStormHarness {
                      reply parse)."
                 );
             }
+            Err(SeedError::Held) => {
+                panic!(
+                    "respin: counter-seed routine returned Held, which the startup routine \
+                     cannot produce: it passes no hold write fence."
+                );
+            }
         }
 
         // Block until the receiver observes true. Bounded — a wiring
@@ -538,7 +544,6 @@ impl RestartStormHarness {
 
         // ── LiveEditService shell ──────────────────────────────────
         let svc = LiveEditService {
-            catchup_snapshot_enabled: false,
             session_store,
             layer_store: Arc::clone(&layer_store),
             ext_value_store,

@@ -29,9 +29,10 @@
 //                         subscribe), OR `have_object_id != current` (the
 //                         layer was overwritten on reconnect).
 //   2. `up_to_date`    — `have_version >= current_seq`.
-//   3. `in_window`     — XRANGE slice from `{have_version+1}-0` succeeds.
-//   4. `out_of_window` — falls through after the XRANGE slice misses the
-//                         expected start id (stream entry trimmed).
+//   3. `in_window`     — the in-window point read finds `{have_version+1}-0`
+//                         on the stream.
+//   4. `out_of_window` — falls through after the point read misses that
+//                         entry (stream entry trimmed).
 //
 // Error paths (e.g. layer-not-found from `get_layer_mapping`) return early
 // via `?` BEFORE the regime label is assigned, so no observation fires.
@@ -102,7 +103,6 @@ impl MetricsTestValkey {
         let key_schema = KeySchema::new(&prefix);
 
         let config = Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url,
@@ -196,6 +196,10 @@ impl MetricsTestValkey {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: live_edit::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs: 60,
             checkpoint_enabled: false,
             checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -277,16 +281,7 @@ impl Drop for MetricsTestValkey {
 /// `subscribe_regimes_test::build_pooled_service` because sibling test files
 /// can't directly import each other's module-private fixtures and the
 /// duplication is cheap.
-///
-/// `catchup_snapshot_enabled` selects the catch-up path wired onto the service.
-/// Metrics tests exercising the legacy per-commit reconstruction pass `false`;
-/// the snapshot-mode coverage passes `true` to exercise the corrected-snapshot
-/// path while asserting the regime observation still fires.
-fn build_metrics_service(
-    tv: &MetricsTestValkey,
-    maxlen: u64,
-    catchup_snapshot_enabled: bool,
-) -> LiveEditService {
+fn build_metrics_service(tv: &MetricsTestValkey, maxlen: u64) -> LiveEditService {
     let session_store = Arc::new(SessionStore::new(
         tv.client().clone(),
         tv.key_schema().clone(),
@@ -316,7 +311,6 @@ fn build_metrics_service(
     ));
 
     LiveEditService {
-        catchup_snapshot_enabled,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),
@@ -456,8 +450,7 @@ fn update_data(payload: Vec<u8>) -> UpdateLayerRequest {
 }
 
 /// Non-reset DiffChangeSection delta — mirrors the sibling test file so each
-/// update produces a per-commit diff that accumulates real state on the
-/// stream.
+/// update accumulates real state on the layer and an entry on its stream.
 fn incremental_diff_change_section(section_id: u64) -> OwnedDelta {
     OwnedDelta {
         is_diff: false,
@@ -730,7 +723,7 @@ fn assert_only_regime_observed(metrics: &Metrics, expected: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn brand_new_first_subscribe_increments_metrics_once() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, _object_id) =
         create_session_and_layer_metrics(&tv, &svc, "bn-fresh-session", "bn-fresh-layer").await;
@@ -765,74 +758,13 @@ async fn brand_new_first_subscribe_increments_metrics_once() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Regime 1a under snapshot catch-up: brand_new metrics still emit when
-// LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true reroutes `catch_up_brand_new` to the
-// corrected-snapshot builder (Existing-Behavior contract, t3.msb.35.f9.bs).
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// The snapshot rerouting changes HOW the brand_new full-state body is built,
-// not the regime the RPC is classified as: `subscribe.rs` keeps
-// `regime = "brand_new"` (only adding a `mode` log field), so the
-// `live_subscribe_regime_total{regime="brand_new"}` counter and the
-// `live_subscribe_catch_up_duration_seconds` observation must still fire on the
-// `brand_new` label and no other regime label may move. This mirrors
-// `brand_new_first_subscribe_increments_metrics_once` 1:1, the only difference
-// being the `Snapshot` catch-up mode threaded through `build_metrics_service`.
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn brand_new_first_subscribe_increments_metrics_once_snapshot_mode() {
-    let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
-
-    let (session_id, _object_id) =
-        create_session_and_layer_metrics(&tv, &svc, "bn-fresh-session-snap", "bn-fresh-layer-snap")
-            .await;
-
-    // First-time subscribe: have_object_id=0, have_version=0 → `is_brand_new`
-    // true, rerouted to the corrected-snapshot builder under `Snapshot` mode.
-    let sub_req = subscribe_request(
-        &session_id,
-        "bn-fresh-layer-snap",
-        0,
-        0,
-        "sub-bn-fresh-snap",
-    );
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    // Drain the full-state header (proves `run_catch_up` returned).
-    let header = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        header.sequence_num, 1,
-        "brand_new catch-up should land seq=1 for a freshly-created layer"
-    );
-    // The brand_new full-state delivery still terminates with a total_size==0
-    // caught-up ack carrying the same delivered version under snapshot mode.
-    let ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        ack.total_size, 0,
-        "brand_new trailer must be a total_size==0 ack under snapshot mode"
-    );
-    assert_eq!(
-        ack.sequence_num, header.sequence_num,
-        "caught-up ack must echo the delivered sequence_num"
-    );
-
-    // The regime observation must still fire on `brand_new` — and only there.
-    await_counter(&svc.metrics, "brand_new", 1).await;
-    assert_only_regime_observed(&svc.metrics, "brand_new");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Regime 1b: brand_new — overwrite-on-reconnect (have_object_id != current)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn brand_new_overwrite_reconnect_increments_metrics_once() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, old_object_id) =
         create_session_and_layer_metrics(&tv, &svc, "bn-overwrite-session", "bn-overwrite-layer")
@@ -908,7 +840,7 @@ async fn brand_new_overwrite_reconnect_increments_metrics_once() {
 // Distinct from `brand_new_overwrite_reconnect_increments_metrics_once` above,
 // which overwrites BEFORE the subscriber connects so the overwrite is observed
 // on the INITIAL subscribe through the `run_catch_up` brand_new-overwrite
-// branch. These two tests instead exercise the `run_steady_state` re-bootstrap
+// branch. This test instead exercises the `run_steady_state` re-bootstrap
 // site: the subscriber first completes an `up_to_date` initial catch-up (opening
 // the steady-state consumer at `$` on the OLD object's stream), THEN a
 // mid-session CreateLayer overwrite XADDs the `deleted` sentinel, and the
@@ -920,26 +852,23 @@ async fn brand_new_overwrite_reconnect_increments_metrics_once() {
 // `run_steady_state` Deleted arm); before it the re-bootstrap recorded NO
 // regime / mode / delivered-bytes metric at all.
 //
-// The two tests differ only in the `catchup_snapshot_enabled` mode threaded through
-// `build_metrics_service`, mirroring the file's brand_new snapshot/legacy
-// pairing: `Snapshot` → the re-bootstrap full-state lands on the
-// `catchup_mode="snapshot"` series; `Off` → on `catchup_mode="legacy"` (both
-// through `send_full_state`, whose Snapshot arm is the ONLY `"snapshot"`
-// emitter). The overwrite CreateLayer carries a NON-EMPTY DiffChangeSection
+// The re-bootstrap full-state lands on the `catchup_mode="snapshot"` series
+// (through `send_full_state`, the ONLY `"snapshot"` emitter). The overwrite
+// CreateLayer carries a NON-EMPTY DiffChangeSection
 // delta so the new generation's full-state snapshot delivers > 0 OMPF bytes,
 // keeping the delivered-bytes assertion non-vacuous. Without the f9 emission the
 // re-bootstrap records nothing, `brand_new` stays 0, and `await_counter_mode`
-// times out — so these are clean regression guards.
+// times out — so this is a clean regression guard.
 //
 // Note: `assert_only_regime_observed` is deliberately NOT reused — the initial
 // `up_to_date` catch-up legitimately fires its own regime observation, so the
-// all-other-regimes-zero helper does not apply; instead each test asserts the
+// all-other-regimes-zero helper does not apply; instead the test asserts the
 // brand_new mode series explicitly and that `in_window` / `out_of_window` stay 0.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric_snapshot_mode() {
+async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, old_object_id) = create_session_and_layer_metrics(
         &tv,
@@ -1033,7 +962,7 @@ async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric_snapshot_mode
     );
 
     // EXACTLY ONE brand_new observation on the `catchup_mode="snapshot"` series
-    // (the re-bootstrap routes through `send_full_state`'s Snapshot arm).
+    // (the re-bootstrap routes through `send_full_state`).
     await_counter_mode(&svc.metrics, "brand_new", "snapshot", 1).await;
     assert_eq!(
         read_regime_counter_mode(&svc.metrics, "brand_new", "snapshot"),
@@ -1059,152 +988,16 @@ async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric_snapshot_mode
         "re-bootstrap snapshot delivered-bytes sum must be > 0 (non-empty new gen)"
     );
 
-    // The opposite (legacy) brand_new series must stay 0 under Snapshot mode.
+    // A brand_new catch-up is never labelled `legacy`.
     assert_eq!(
         read_regime_counter_mode(&svc.metrics, "brand_new", "legacy"),
         0,
-        "the legacy brand_new series must NOT move under snapshot mode"
+        "the legacy brand_new series must NOT move"
     );
     assert_eq!(
         read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "legacy"),
         0,
-        "the legacy brand_new delivered-bytes series must NOT move under snapshot mode"
-    );
-
-    // The other regimes never fire for a steady-state overwrite re-bootstrap.
-    assert_eq!(
-        read_regime_counter(&svc.metrics, "in_window"),
-        0,
-        "in_window must stay 0 for a steady-state overwrite re-bootstrap"
-    );
-    assert_eq!(
-        read_regime_counter(&svc.metrics, "out_of_window"),
-        0,
-        "out_of_window must stay 0 for a steady-state overwrite re-bootstrap"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric_legacy_mode() {
-    let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
-
-    let (session_id, old_object_id) = create_session_and_layer_metrics(
-        &tv,
-        &svc,
-        "ss-rebootstrap-legacy-session",
-        "ss-rebootstrap-legacy-layer",
-    )
-    .await;
-
-    // have_version=1 == current_seq(=1) → up_to_date initial catch-up; opens the
-    // steady-state consumer at `$` on the OLD object's stream (see the snapshot
-    // sibling above for the full rationale).
-    let sub_req = subscribe_request(
-        &session_id,
-        "ss-rebootstrap-legacy-layer",
-        old_object_id,
-        1,
-        "sub-ss-rebootstrap-legacy",
-    );
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let init_ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        init_ack.total_size, 0,
-        "up_to_date initial catch-up must be a zero-body ack"
-    );
-    assert_eq!(
-        init_ack.sequence_num, 1,
-        "up_to_date ack must echo current server seq (=1)"
-    );
-    await_counter(&svc.metrics, "up_to_date", 1).await;
-
-    // Mid-session overwrite with non-empty new-generation content.
-    let overwrite_ompf = delta_to_ompf_bytes(&incremental_diff_change_section(7_801), &[]);
-    let create_stream = streaming_create(vec![
-        make_create_header(&session_id, "ss-rebootstrap-legacy-layer"),
-        make_create_data(overwrite_ompf),
-    ]);
-    let create_req = make_request(create_stream);
-    let new_object_id = handle_create_layer(&svc, create_req)
-        .await
-        .expect("mid-session CreateLayer overwrite must succeed")
-        .into_inner()
-        .object_id;
-    assert_ne!(
-        new_object_id, old_object_id,
-        "CreateLayer overwrite must allocate a new object_id generation"
-    );
-
-    let rebootstrap_header = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        rebootstrap_header.object_id, new_object_id,
-        "steady-state re-bootstrap full-state must surface the NEW object_id"
-    );
-    assert_eq!(
-        rebootstrap_header.sequence_num, 1,
-        "re-bootstrap full-state must land at seq=1 on the new generation"
-    );
-    assert!(
-        rebootstrap_header.total_size > 0,
-        "non-empty new-generation content must yield a non-empty re-bootstrap body"
-    );
-    let rebootstrap_ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        rebootstrap_ack.total_size, 0,
-        "re-bootstrap trailer must be a total_size==0 caught-up ack"
-    );
-    assert_eq!(
-        rebootstrap_ack.object_id, new_object_id,
-        "re-bootstrap caught-up ack must echo the NEW object_id"
-    );
-    assert_eq!(
-        rebootstrap_ack.sequence_num, 1,
-        "re-bootstrap caught-up ack must echo the delivered seq (1 on the new object)"
-    );
-
-    // EXACTLY ONE brand_new observation on the `catchup_mode="legacy"` series
-    // (under `Off`, `catch_up_brand_new` → `send_full_state`'s non-Snapshot arm
-    // emits catchup_mode="legacy").
-    await_counter_mode(&svc.metrics, "brand_new", "legacy", 1).await;
-    assert_eq!(
-        read_regime_counter_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "steady-state re-bootstrap must increment the brand_new/legacy counter exactly once"
-    );
-    assert_eq!(
-        read_regime_duration_count_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "re-bootstrap must record exactly one duration sample on the legacy series"
-    );
-    assert!(
-        read_regime_duration_sum_mode(&svc.metrics, "brand_new", "legacy") > 0.0,
-        "re-bootstrap legacy duration sum must be > 0"
-    );
-    assert_eq!(
-        read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "re-bootstrap must record exactly one delivered-bytes sample on the legacy series"
-    );
-    assert!(
-        read_delivered_bytes_sum_mode(&svc.metrics, "brand_new", "legacy") > 0.0,
-        "re-bootstrap legacy delivered-bytes sum must be > 0 (non-empty new gen)"
-    );
-
-    // The opposite (snapshot) brand_new series must stay 0 under Off mode.
-    assert_eq!(
-        read_regime_counter_mode(&svc.metrics, "brand_new", "snapshot"),
-        0,
-        "the snapshot brand_new series must NOT move under Off/legacy mode"
-    );
-    assert_eq!(
-        read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "snapshot"),
-        0,
-        "the snapshot brand_new delivered-bytes series must NOT move under Off/legacy mode"
+        "the legacy brand_new delivered-bytes series must NOT move"
     );
 
     // The other regimes never fire for a steady-state overwrite re-bootstrap.
@@ -1227,7 +1020,7 @@ async fn steady_state_overwrite_rebootstrap_emits_brand_new_metric_legacy_mode()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn up_to_date_reconnect_increments_metrics_once() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "utd-session", "utd-layer").await;
@@ -1257,186 +1050,20 @@ async fn up_to_date_reconnect_increments_metrics_once() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Regime 3: in_window — XRANGE slice from {have_version+1}-0 succeeds
+// Regime 4: out_of_window — the in-window point read misses the expected start id
 // ═══════════════════════════════════════════════════════════════════════════════
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_window_reconnect_increments_metrics_once() {
-    let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
-
-    let (session_id, object_id) =
-        create_session_and_layer_metrics(&tv, &svc, "iw-session", "iw-layer").await;
-
-    // Walk forward to seq=5 (4 updates after the seq=1 create).
-    for i in 0..4u64 {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "iw-layer",
-            object_id,
-            "writer-pre",
-            100 + i,
-        )
-        .await;
-    }
-
-    // 3 more updates while "disconnected" — server reaches seq=8. MAXLEN=4096
-    // keeps the entries on the stream so the XRANGE slice from 6-0 finds them.
-    for i in 0..3u64 {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "iw-layer",
-            object_id,
-            "writer-post",
-            200 + i,
-        )
-        .await;
-    }
-
-    // Reconnect with have_version=5 → XRANGE from 6-0 hits seq=6 → in_window.
-    let sub_req = subscribe_request(&session_id, "iw-layer", object_id, 5, "sub-iw");
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    // in_window replay delivers one header per replayed seq (6, 7, 8). Drain
-    // the first one — that's enough to prove `run_catch_up` returned (the
-    // observation fires on the same call boundary regardless of how many
-    // per-commit headers `catch_up_in_window` later sends).
-    let header = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        header.sequence_num, 6,
-        "in_window replay must start at have_version + 1 = 6"
-    );
-
-    await_counter(&svc.metrics, "in_window", 1).await;
-    assert_only_regime_observed(&svc.metrics, "in_window");
-
-    // b.dy5: drain the remaining replay headers (7, 8) and the exactly-once
-    // caught-up ack (`total_size==0`, seq=8 = last replayed `tracked_version`)
-    // that `run_catch_up` now emits centrally. The regime counter fired on
-    // `run_catch_up`'s return regardless of this trailer; this confirms the
-    // trailer does not disturb the metric path.
-    let replay7 = drain_catch_up(&mut stream).await;
-    assert_eq!(replay7.sequence_num, 7, "second in_window replay is seq=7");
-    let replay8 = drain_catch_up(&mut stream).await;
-    assert_eq!(replay8.sequence_num, 8, "third in_window replay is seq=8");
-    let ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        ack.total_size, 0,
-        "in_window catch-up trailer is a zero-body ack"
-    );
-    assert_eq!(
-        ack.sequence_num, 8,
-        "in_window caught-up ack carries the last replayed endpoint (tracked_version=8)"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Regime 4: out_of_window — XRANGE slice misses the expected start id
-// ═══════════════════════════════════════════════════════════════════════════════
+// The out-of-window coalesced body is built by the faithful-coalesced builder.
+// The regime CLASSIFICATION is chosen by the point-read-miss branch in
+// `run_catch_up` BEFORE the build, so the
+// `live_subscribe_regime_total{regime="out_of_window"}` counter and the
+// `live_subscribe_catch_up_duration_seconds` observation must fire on the
+// `out_of_window` label and no other regime label may move.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn out_of_window_reconnect_increments_metrics_once() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4, false); // small MAXLEN, will be force-trimmed below
-
-    let (session_id, object_id) =
-        create_session_and_layer_metrics(&tv, &svc, "oow-session", "oow-layer").await;
-
-    // Walk forward to seq=5 → then 10 more updates → server seq=15.
-    for i in 0..4u64 {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "oow-layer",
-            object_id,
-            "writer-pre",
-            100 + i,
-        )
-        .await;
-    }
-    for i in 0..10u64 {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "oow-layer",
-            object_id,
-            "writer-post",
-            200 + i,
-        )
-        .await;
-    }
-
-    // Force the stream past the subscriber's start_id deterministically.
-    // MAXLEN trimming is approximate ("~"), so we use XTRIM MINID = 15-0 to
-    // guarantee the seq=6 entry is gone.
-    let stream_key = tv.key_schema().layer_stream(object_id);
-    let cap: XCap = XCap::try_from(("MINID", "=", "15-0")).expect("build MINID xcap");
-    let _: () = tv
-        .client()
-        .pool
-        .xtrim(&stream_key, cap)
-        .await
-        .expect("XTRIM to force out-of-window must succeed");
-
-    // Reconnect with have_version=5 → XRANGE from 6-0 misses → out_of_window.
-    let sub_req = subscribe_request(&session_id, "oow-layer", object_id, 5, "sub-oow");
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let header = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        header.sequence_num, 15,
-        "out_of_window coalesced diff must carry the current server seq"
-    );
-
-    await_counter(&svc.metrics, "out_of_window", 1).await;
-    assert_only_regime_observed(&svc.metrics, "out_of_window");
-
-    // b.dy5: drain the exactly-once caught-up ack (`total_size==0`, seq=15 =
-    // current_seq = tracked_version for Regime 3) that `run_catch_up` now emits
-    // after the coalesced diff. The regime counter fired regardless; this
-    // confirms the trailer does not disturb the metric path.
-    let ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        ack.total_size, 0,
-        "out_of_window catch-up trailer is a zero-body ack"
-    );
-    assert_eq!(
-        ack.sequence_num, 15,
-        "out_of_window caught-up ack carries the coalesced endpoint (tracked_version=15)"
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Regime 4 under snapshot catch-up: out_of_window metrics still emit when
-// LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true reroutes the coalesced delivery through
-// the faithful-coalesced builder (Plan b.msb Task 2, t3.msb.js.qb.kz).
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Task 2 changes only the DELIVERY of the out-of-window regime under `Snapshot`
-// mode (the coalesced body is built by the DR-independent faithful-coalesced
-// entrypoint instead of the legacy `compute_diff_at_cut` path). The regime
-// CLASSIFICATION is chosen by the XRANGE-slice-miss branch in `run_catch_up`
-// BEFORE the delivery mode is selected, so the
-// `live_subscribe_regime_total{regime="out_of_window"}` counter and the
-// `live_subscribe_catch_up_duration_seconds` observation must still fire on the
-// `out_of_window` label and no other regime label may move. This mirrors
-// `out_of_window_reconnect_increments_metrics_once` 1:1, the only difference
-// being the `Snapshot` catch-up mode threaded through `build_metrics_service`.
-// (Sibling Task 4 additive `catchup_mode` label has NOT landed at authoring
-// time, so this test asserts only the regime dimension.)
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn out_of_window_reconnect_increments_metrics_once_snapshot_mode() {
-    let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4, true); // small MAXLEN, will be force-trimmed below
+    let svc = build_metrics_service(&tv, 4); // small MAXLEN, will be force-trimmed below
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "oow-session-snap", "oow-layer-snap").await;
@@ -1477,8 +1104,8 @@ async fn out_of_window_reconnect_increments_metrics_once_snapshot_mode() {
         .await
         .expect("XTRIM to force out-of-window must succeed");
 
-    // Reconnect with have_version=5 → XRANGE from 6-0 misses → out_of_window,
-    // delivered via the faithful-coalesced builder under `Snapshot` mode.
+    // Reconnect with have_version=5 → the point read for 6-0 misses → out_of_window,
+    // delivered via the faithful-coalesced builder.
     let sub_req = subscribe_request(&session_id, "oow-layer-snap", object_id, 5, "sub-oow-snap");
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
@@ -1488,21 +1115,21 @@ async fn out_of_window_reconnect_increments_metrics_once_snapshot_mode() {
     let header = drain_catch_up(&mut stream).await;
     assert_eq!(
         header.sequence_num, 15,
-        "out_of_window coalesced diff must carry the current server seq under snapshot mode"
+        "out_of_window coalesced diff must carry the current server seq"
     );
 
-    // The regime observation must still fire on `out_of_window` — and only there.
+    // The regime observation fires on `out_of_window` — and only there.
     await_counter(&svc.metrics, "out_of_window", 1).await;
     assert_only_regime_observed(&svc.metrics, "out_of_window");
 
     // Drain the exactly-once caught-up ack (`total_size==0`, seq=15 =
     // current_seq = tracked_version) that `run_catch_up` emits after the
     // coalesced diff. The regime counter fired regardless; this confirms the
-    // snapshot-mode delivery does not disturb the metric path.
+    // delivery does not disturb the metric path.
     let ack = drain_catch_up(&mut stream).await;
     assert_eq!(
         ack.total_size, 0,
-        "out_of_window catch-up trailer is a zero-body ack under snapshot mode"
+        "out_of_window catch-up trailer is a zero-body ack"
     );
     assert_eq!(
         ack.sequence_num, 15,
@@ -1511,30 +1138,21 @@ async fn out_of_window_reconnect_increments_metrics_once_snapshot_mode() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Regime 3 under snapshot catch-up: in_window metrics still emit when
-// LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true reroutes the in-window reconnect delivery
-// through the DR-independent faithful-coalesced builder (Plan b.msb Task 1,
-// t3.msb.xq.so.2e).
+// Regime 3: in_window — the in-window point read finds {have_version+1}-0
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Task 1 changes only the DELIVERY of the in-window regime under `Snapshot`
-// mode: instead of the legacy per-commit XRANGE-and-relay replay (seq 6/7/8),
-// the reconnector is caught up with a SINGLE corrected coalesced snapshot
-// (`compute_faithful_coalesced_at_cut`, `base_version = have_version`) at `current_seq`.
-// The regime CLASSIFICATION is chosen by the XRANGE-slice-HIT branch in
-// `run_catch_up` BEFORE the delivery mode is selected, so the
+// The reconnector is caught up with a SINGLE coalesced diff
+// (`compute_faithful_coalesced_at_cut`, `base_version = have_version`) at
+// `current_seq`. The regime CLASSIFICATION is chosen by the point-read-HIT
+// branch in `run_catch_up` BEFORE the build, so the
 // `live_subscribe_regime_total{regime="in_window"}` counter and the
-// `live_subscribe_catch_up_duration_seconds` observation must still fire on the
-// `in_window` label and no other regime label may move. This mirrors the Off-mode
-// `in_window_reconnect_increments_metrics_once` on the regime dimension, the
-// difference being the `Snapshot` catch-up mode threaded through
-// `build_metrics_service` (and the single-coalesced-header delivery shape it
-// produces, matching `out_of_window_reconnect_increments_metrics_once_snapshot_mode`).
+// `live_subscribe_catch_up_duration_seconds` observation must fire on the
+// `in_window` label and no other regime label may move.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_window_reconnect_increments_metrics_once_snapshot_mode() {
+async fn in_window_reconnect_increments_metrics_once() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "iw-session-snap", "iw-layer-snap").await;
@@ -1553,8 +1171,8 @@ async fn in_window_reconnect_increments_metrics_once_snapshot_mode() {
     }
 
     // 3 more updates while "disconnected" — server reaches seq=8. MAXLEN=4096
-    // keeps the entries on the stream so the XRANGE slice from 6-0 finds them →
-    // in_window classification (the branch Task 1 leaves in place).
+    // keeps the entries on the stream so the in-window point read finds 6-0 →
+    // in_window classification.
     for i in 0..3u64 {
         apply_unique_update(
             &svc,
@@ -1567,36 +1185,33 @@ async fn in_window_reconnect_increments_metrics_once_snapshot_mode() {
         .await;
     }
 
-    // Reconnect with have_version=5 → XRANGE from 6-0 hits seq=6 → in_window,
-    // delivered as a SINGLE corrected coalesced snapshot (base=have_version)
-    // under `Snapshot` mode instead of the legacy per-commit 6/7/8 replay.
+    // Reconnect with have_version=5 → the point read finds 6-0 → in_window,
+    // delivered as a SINGLE coalesced diff (base=have_version).
     let sub_req = subscribe_request(&session_id, "iw-layer-snap", object_id, 5, "sub-iw-snap");
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
         .expect("subscribe must succeed");
     let mut stream = response.into_inner();
 
-    // Snapshot-mode in-window delivers ONE coalesced header at current_seq (=8),
-    // not the per-commit 6/7/8 replay of the Off-mode legacy arm.
+    // In-window delivers ONE coalesced header at current_seq (=8).
     let header = drain_catch_up(&mut stream).await;
     assert_eq!(
         header.sequence_num, 8,
-        "snapshot-mode in_window coalesced snapshot carries current_seq (=8)"
+        "in_window coalesced diff carries current_seq (=8)"
     );
 
-    // The regime observation must still fire on `in_window` — and only there.
+    // The regime observation fires on `in_window` — and only there.
     await_counter(&svc.metrics, "in_window", 1).await;
     assert_only_regime_observed(&svc.metrics, "in_window");
 
     // Drain the exactly-once caught-up ack (`total_size==0`, seq=8 =
     // tracked_version = current_seq) that `run_catch_up` emits after the
-    // coalesced snapshot. The regime counter fired on `run_catch_up`'s return
-    // regardless; this confirms the snapshot-mode delivery does not disturb the
-    // metric path.
+    // coalesced diff. The regime counter fired on `run_catch_up`'s return
+    // regardless; this confirms the delivery does not disturb the metric path.
     let ack = drain_catch_up(&mut stream).await;
     assert_eq!(
         ack.total_size, 0,
-        "in_window catch-up trailer is a zero-body ack under snapshot mode"
+        "in_window catch-up trailer is a zero-body ack"
     );
     assert_eq!(
         ack.sequence_num, 8,
@@ -1605,35 +1220,32 @@ async fn in_window_reconnect_increments_metrics_once_snapshot_mode() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Regime 3 under snapshot catch-up, additive `catchup_mode` dimension: the
-// converged in-window reconnect delivery lands on catchup_mode="legacy".
+// Regime 3, `catchup_mode` dimension: the in-window reconnect lands on
+// catchup_mode="legacy".
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Task 1 makes the in-window reconnect converge on `compute_faithful_coalesced_at_cut`
-// (base=have_version) — the SAME primitive the out_of_window snapshot-mode
-// reconnect uses. Per the Plan b.msb `catchup_mode` taxonomy, a coalesced
+// The in-window reconnect builds with `compute_faithful_coalesced_at_cut`
+// (base=have_version) — the SAME primitive the out_of_window reconnect uses.
+// Per the Plan b.msb `catchup_mode` taxonomy, a coalesced
 // `base=have_version` delivery is `"legacy"`; `"snapshot"` is reserved for the
-// from-empty full-state (`send_full_state`) path only. Source of truth:
-// `catch_up_in_window_snapshot` returns `catchup_mode: "legacy"`
-// (src/grpc/subscribe.rs — the comment there pins it explicitly, "matching
-// `catch_up_out_of_window`"). So the in-window snapshot-mode observation must
-// land on the `catchup_mode="legacy"` series across ALL three catch-up
-// instruments and leave the `"snapshot"` series at zero — consistent with the
-// out_of_window reconnect precedent. Mirrors
-// `brand_new_snapshot_mode_lands_on_snapshot_catchup_mode_series` (but pinned to
-// the opposite mode value, because the regime is delivered by the coalesced
-// builder, not `send_full_state`'s Snapshot arm).
+// from-empty full-state (`send_full_state`) path only. So the in-window
+// observation must land on the `catchup_mode="legacy"` series across ALL three
+// catch-up instruments and leave the `"snapshot"` series at zero — consistent
+// with the out_of_window reconnect precedent. Mirrors
+// `brand_new_lands_on_snapshot_catchup_mode_series` (but pinned to the opposite
+// mode value, because the regime is delivered by the coalesced builder, not
+// `send_full_state`).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_window_snapshot_mode_lands_on_legacy_catchup_mode_series() {
+async fn in_window_reconnect_lands_on_legacy_catchup_mode_series() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "iw-cm-snap-session", "iw-cm-snap-layer").await;
 
-    // Seed 7 in-window updates (seq 2..8 → current_seq=8; MAXLEN=4096 keeps the
-    // XRANGE slice from 6-0 alive). Real DiffChangeSection state (sections at
+    // Seed 7 in-window updates (seq 2..8 → current_seq=8; MAXLEN=4096 keeps
+    // 6-0 on the stream for the in-window point read). Real DiffChangeSection state (sections at
     // seq 6/7/8 have version > have_version=5) so the base=have_version coalesced
     // snapshot delivers > 0 OMPF bytes → the delivered-bytes sum is non-vacuous.
     seed_sections(
@@ -1647,8 +1259,8 @@ async fn in_window_snapshot_mode_lands_on_legacy_catchup_mode_series() {
     )
     .await;
 
-    // Reconnect with have_version=5 → XRANGE from 6-0 hits → in_window,
-    // delivered via the faithful-coalesced primitive under `Snapshot` mode.
+    // Reconnect with have_version=5 → the point read finds 6-0 → in_window,
+    // delivered via the faithful-coalesced primitive.
     let sub_req = subscribe_request(
         &session_id,
         "iw-cm-snap-layer",
@@ -1679,25 +1291,25 @@ async fn in_window_snapshot_mode_lands_on_legacy_catchup_mode_series() {
     assert_eq!(
         read_regime_counter_mode(&svc.metrics, "in_window", "legacy"),
         1,
-        "snapshot-mode in_window must increment the catchup_mode=legacy counter"
+        "in_window must increment the catchup_mode=legacy counter"
     );
     assert_eq!(
         read_regime_duration_count_mode(&svc.metrics, "in_window", "legacy"),
         1,
-        "snapshot-mode in_window must record exactly one duration sample on the legacy series"
+        "in_window must record exactly one duration sample on the legacy series"
     );
     assert!(
         read_regime_duration_sum_mode(&svc.metrics, "in_window", "legacy") > 0.0,
-        "snapshot-mode in_window duration sum must be > 0"
+        "in_window duration sum must be > 0"
     );
     assert_eq!(
         read_delivered_bytes_count_mode(&svc.metrics, "in_window", "legacy"),
         1,
-        "snapshot-mode in_window must record exactly one delivered-bytes sample on the legacy series"
+        "in_window must record exactly one delivered-bytes sample on the legacy series"
     );
     assert!(
         read_delivered_bytes_sum_mode(&svc.metrics, "in_window", "legacy") > 0.0,
-        "snapshot-mode in_window delivered-bytes sum must be > 0 (seeded state)"
+        "in_window delivered-bytes sum must be > 0 (seeded state)"
     );
 
     // ...and the opposite `catchup_mode="snapshot"` series stays at zero across
@@ -1739,13 +1351,13 @@ async fn in_window_snapshot_mode_lands_on_legacy_catchup_mode_series() {
 // must not move any counter.
 //
 // This is the cleanest error-path probe available without a fault-injection
-// seam — `read_object_header` and `xrange_values` failures would require
+// seam — `read_object_header` and in-window point-read failures would require
 // reaching past `pub(crate)` boundaries that this test deliberately respects.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn error_path_layer_not_found_records_no_regime_metric() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
+    let svc = build_metrics_service(&tv, 4096);
 
     // Create a session but no layer; subscribing to a nonexistent layer name
     // hits the `get_layer_mapping(...) -> Ok(None)` branch in
@@ -1806,14 +1418,13 @@ async fn error_path_layer_not_found_records_no_regime_metric() {
 // three catch-up instruments (`live_subscribe_regime_total`,
 // `live_subscribe_catch_up_duration_seconds`, and the new
 // `live_subscribe_catch_up_delivered_bytes` histogram). `catchup_mode="snapshot"`
-// is emitted ONLY by `send_full_state`'s Snapshot arm (brand_new faithful
-// full-state under `catchup_snapshot_enabled = true`); every other catch-up —
-// including out_of_window even under snapshot mode — is `"legacy"`.
+// is emitted ONLY by `send_full_state` (the brand_new faithful full state);
+// every other catch-up — in_window and out_of_window — is `"legacy"`.
 //
-// The two tests below drive the SAME brand_new full-state path under the two
-// modes and assert each lands on its own `catchup_mode` series while leaving
-// the other's series at zero — proving the two modes emit distinct series
-// values on one metric NAME (additive, non-breaking).
+// The brand_new test below asserts the full state lands on the `"snapshot"`
+// series and leaves the `"legacy"` one at zero; the in_window test above pins
+// the opposite value, so the two values are distinct series on one metric NAME
+// (additive, non-breaking).
 
 /// Apply `n` distinct-section updates so the full-state snapshot carries real
 /// content (a from-empty full state can encode to zero OMPF bytes, which would
@@ -1841,12 +1452,12 @@ async fn seed_sections(
     }
 }
 
-// ── (a) snapshot-mode brand_new lands on catchup_mode="snapshot" ────────────
+// ── (a) brand_new lands on catchup_mode="snapshot" ──────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn brand_new_snapshot_mode_lands_on_snapshot_catchup_mode_series() {
+async fn brand_new_lands_on_snapshot_catchup_mode_series() {
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "cm-snap-session", "cm-snap-layer").await;
@@ -1863,7 +1474,7 @@ async fn brand_new_snapshot_mode_lands_on_snapshot_catchup_mode_series() {
     .await;
 
     // First-time subscribe (have_object_id=0, have_version=0) → brand_new,
-    // rerouted to the corrected-snapshot builder under `Snapshot` mode.
+    // built by the faithful full-state builder.
     let sub_req = subscribe_request(&session_id, "cm-snap-layer", 0, 0, "sub-cm-snap");
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
@@ -1907,108 +1518,26 @@ async fn brand_new_snapshot_mode_lands_on_snapshot_catchup_mode_series() {
         "snapshot brand_new delivered-bytes sum must be > 0"
     );
 
-    // ...and NOT on the legacy series.
+    // ...and NOT on the legacy series: a brand_new catch-up is never labelled
+    // `legacy`.
     assert_eq!(
         read_regime_counter_mode(&svc.metrics, "brand_new", "legacy"),
         0,
-        "the legacy series must NOT move when snapshot mode fires"
+        "the legacy series must NOT move for a brand_new catch-up"
     );
     assert_eq!(
         read_regime_duration_count_mode(&svc.metrics, "brand_new", "legacy"),
         0,
-        "the legacy duration series must NOT move when snapshot mode fires"
+        "the legacy duration series must NOT move for a brand_new catch-up"
     );
     assert_eq!(
         read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "legacy"),
         0,
-        "the legacy delivered-bytes series must NOT move when snapshot mode fires"
-    );
-}
-
-// ── (a) legacy/Off brand_new lands on catchup_mode="legacy" ─────────────────
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn brand_new_legacy_mode_lands_on_legacy_catchup_mode_series() {
-    let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, false);
-
-    let (session_id, object_id) =
-        create_session_and_layer_metrics(&tv, &svc, "cm-legacy-session", "cm-legacy-layer").await;
-    seed_sections(
-        &svc,
-        &session_id,
-        "cm-legacy-layer",
-        object_id,
-        "seed",
-        300,
-        3,
-    )
-    .await;
-
-    // First-time subscribe under `Off` → brand_new via the legacy full-content
-    // path → catchup_mode="legacy".
-    let sub_req = subscribe_request(&session_id, "cm-legacy-layer", 0, 0, "sub-cm-legacy");
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let header = drain_catch_up(&mut stream).await;
-    assert!(
-        header.total_size > 0,
-        "seeded legacy full-state must deliver a non-empty body"
-    );
-    let ack = drain_catch_up(&mut stream).await;
-    assert_eq!(
-        ack.total_size, 0,
-        "brand_new trailer must be a zero-body ack"
+        "the legacy delivered-bytes series must NOT move for a brand_new catch-up"
     );
 
-    // The observation lands on the `catchup_mode="legacy"` series...
-    await_counter_mode(&svc.metrics, "brand_new", "legacy", 1).await;
-    assert_eq!(
-        read_regime_counter_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "legacy brand_new must increment the catchup_mode=legacy counter"
-    );
-    assert_eq!(
-        read_regime_duration_count_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "legacy brand_new must record exactly one duration sample on the legacy series"
-    );
-    assert!(
-        read_regime_duration_sum_mode(&svc.metrics, "brand_new", "legacy") > 0.0,
-        "legacy brand_new duration sum must be > 0"
-    );
-    assert_eq!(
-        read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "legacy"),
-        1,
-        "legacy brand_new must record exactly one delivered-bytes sample on the legacy series"
-    );
-    assert!(
-        read_delivered_bytes_sum_mode(&svc.metrics, "brand_new", "legacy") > 0.0,
-        "legacy brand_new delivered-bytes sum must be > 0"
-    );
-
-    // ...and NOT on the snapshot series.
-    assert_eq!(
-        read_regime_counter_mode(&svc.metrics, "brand_new", "snapshot"),
-        0,
-        "the snapshot series must NOT move when legacy mode fires"
-    );
-    assert_eq!(
-        read_regime_duration_count_mode(&svc.metrics, "brand_new", "snapshot"),
-        0,
-        "the snapshot duration series must NOT move when legacy mode fires"
-    );
-    assert_eq!(
-        read_delivered_bytes_count_mode(&svc.metrics, "brand_new", "snapshot"),
-        0,
-        "the snapshot delivered-bytes series must NOT move when legacy mode fires"
-    );
-
-    // The mode-less subset-match reader (used by the pre-existing tests) still
-    // resolves the series — the additive label does not break the legacy read.
+    // The mode-less subset-match reader still resolves the series — the
+    // additive label does not break a mode-less read.
     assert_eq!(
         read_regime_counter(&svc.metrics, "brand_new"),
         1,
@@ -2032,7 +1561,7 @@ async fn regime_metric_names_and_labels_are_stable_guard() {
     );
 
     let tv = MetricsTestValkey::setup().await;
-    let svc = build_metrics_service(&tv, 4096, true);
+    let svc = build_metrics_service(&tv, 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "guard-session", "guard-layer").await;
@@ -2089,13 +1618,13 @@ async fn regime_metric_names_and_labels_are_stable_guard() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// (c) Long / trimmed snapshot-mode catch-up cost measurement.
+// (c) Long / trimmed full-state catch-up cost measurement.
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Builds a `Snapshot` service with a small stream MAXLEN, applies a
+// Builds a service with a small stream MAXLEN, applies a
 // representative LONG series of distinct-section commits, force-trims the stream
 // (XTRIM MINID) so no live-window history survives, then drives a brand_new
-// first-subscribe snapshot-mode catch-up. The full-state snapshot is
+// first-subscribe catch-up. The full-state snapshot is
 // reconstructed from materialized state (NOT the trimmed stream), so it still
 // delivers every section. We RECORD the observable catch-up duration and
 // delivered size, assert both positive+finite with exactly one histogram sample
@@ -2108,7 +1637,7 @@ async fn long_trimmed_snapshot_catch_up_records_positive_cost() {
 
     let tv = MetricsTestValkey::setup().await;
     // Small MAXLEN so the stream is aggressively bounded; then force-trim below.
-    let svc = build_metrics_service(&tv, 8, true);
+    let svc = build_metrics_service(&tv, 8);
 
     let (session_id, object_id) =
         create_session_and_layer_metrics(&tv, &svc, "long-snap-session", "long-snap-layer").await;
@@ -2156,7 +1685,7 @@ async fn long_trimmed_snapshot_catch_up_records_positive_cost() {
     let ack = drain_catch_up(&mut stream).await;
     assert_eq!(
         ack.total_size, 0,
-        "brand_new trailer must be a zero-body ack under snapshot mode"
+        "brand_new trailer must be a zero-body ack"
     );
 
     await_counter_mode(&svc.metrics, "brand_new", "snapshot", 1).await;

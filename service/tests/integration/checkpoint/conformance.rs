@@ -16,7 +16,7 @@
 //! SR-1.3 `CheckpointStore` conformance harness.
 //!
 //! This file is the parametrize-over-closure scaffold — every per-case body
-//! (`case_01_*` … `case_43_*`) is a fully populated `pub async fn` that the
+//! (`case_01_*` … `case_45_*`) is a fully populated `pub async fn` that the
 //! three per-adapter wrapper binaries drive against their adapter:
 //! `adapter_in_memory_test.rs`, `adapter_local_disk_test.rs`, and
 //! `adapter_storage_api_test.rs`, all alongside this file under
@@ -106,6 +106,13 @@
 //! the count's two answers across adapters — 0 for an empty store, every layer
 //! artifact the walk listed otherwise — and that `list_referenced_ext_hashes`
 //! answers the same set.
+//!
+//! ## Group O — the DR restore Job's one listing (#45)
+//!
+//! The restore Job lists `layers/` once and groups the enumeration per object
+//! (`checkpoint::lineage::group_layer_generations`). #45 pins that the grouped
+//! enumeration is each object's own `list_layer_checkpoints`, in order, on
+//! every adapter.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -7375,4 +7382,208 @@ pub async fn case_43_list_live_ext_set_counts_its_own_listing_and_projects_to_th
         projected, live.hashes,
         "case_43 [parity]: list_referenced_ext_hashes is list_live_ext_set's hash set"
     );
+}
+
+/// Case #44 — the list-route canary (`verify_list_route`, the DR Jobs'
+/// proof that the listing route works before they trust an empty or short
+/// listing) answers `Ok(())` on a working store: a fresh one, one that holds
+/// only its counters record (whose Job must complete), and one holding a base,
+/// a session backup and an external value. Run twice, it still passes, and
+/// it leaves nothing any listing or read shows: the artifact listing, the
+/// object and session listings and the counters record read the same before
+/// and after.
+///
+/// **Why on every adapter.** InMemory and LocalDisk answer with no I/O (their
+/// listing is the same map or directory read every by-key read uses);
+/// StorageApi writes a canary under `dr-canary/` and lists it back through
+/// both listing helpers. A shipped adapter that inherited the trait default
+/// answers `NotImplemented`, and one whose canary left its object behind would
+/// show it in no listing here, but in the backup store: StorageApi's own
+/// tests check its fake's contents.
+pub async fn case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed<F, Fut>(
+    factory: F,
+) where
+    F: Fn() -> Fut,
+    Fut: Future<Output = CheckpointStorePair>,
+{
+    async fn listed(
+        store: &Arc<dyn CheckpointStore>,
+    ) -> (Vec<u64>, Vec<String>, usize, Option<Bytes>) {
+        let mut objects = store
+            .list_all_object_ids()
+            .await
+            .expect("case_44: list_all_object_ids must succeed");
+        objects.sort_unstable();
+        let mut sessions = store
+            .list_session_checkpoint_ids()
+            .await
+            .expect("case_44: list_session_checkpoint_ids must succeed");
+        sessions.sort_unstable();
+        let artifacts = store
+            .list_layer_artifacts()
+            .await
+            .expect("case_44: list_layer_artifacts must succeed")
+            .len();
+        let counters = store
+            .get_counters_sidecar()
+            .await
+            .expect("case_44: get_counters_sidecar must succeed");
+        (objects, sessions, artifacts, counters)
+    }
+
+    async fn passes_twice_leaving_nothing(store: &Arc<dyn CheckpointStore>, shape: &str) {
+        let before = listed(store).await;
+        for run in 1..=2 {
+            if let Err(err) = store.verify_list_route().await {
+                panic!("case_44 [{shape}]: verify_list_route run {run} must pass; got {err:?}");
+            }
+        }
+        assert_eq!(
+            listed(store).await,
+            before,
+            "case_44 [{shape}]: the canary leaves nothing any listing or read shows"
+        );
+    }
+
+    let (store, _guard) = factory().await;
+    passes_twice_leaving_nothing(&store, "fresh store").await;
+
+    store
+        .put_counters_sidecar(sample_counters_body(0x4401))
+        .await
+        .expect("case_44: put_counters_sidecar must succeed");
+    passes_twice_leaving_nothing(&store, "counters record only").await;
+
+    store
+        .put_layer_checkpoint(44_044, 1, sample_layer_ompf(0x4402), sample_meta(1))
+        .await
+        .expect("case_44: put_layer_checkpoint must succeed");
+    store
+        .put_session_checkpoint(
+            "case-44-session",
+            sample_session_body(0x4403),
+            sample_meta(0),
+        )
+        .await
+        .expect("case_44: put_session_checkpoint must succeed");
+    store
+        .put_ext_blob(&sample_hash_hex(0x4404), sample_ext_bytes(0x4404))
+        .await
+        .expect("case_44: put_ext_blob must succeed");
+    passes_twice_leaving_nothing(&store, "a base, a session backup and a value").await;
+}
+
+// ----- Group O: the DR restore Job's one listing (#45) -----------------------
+
+/// Case #45 — one raw `list_layer_artifacts` enumeration, grouped by
+/// `checkpoint::lineage::group_layer_generations`, yields for every object
+/// exactly the generations `list_layer_checkpoints` reports for it, in the
+/// same order, compared by `(seq, kind)` (`adapter_key` is adapter-specific).
+///
+/// **Why on every adapter.** The DR restore Job lists `layers/` once and
+/// groups it (SR-9.2), where the on-access paths list once per object. The
+/// two listings come from different adapter code — an enumeration of every
+/// artifact kind, and a per-object listing driven by the generation
+/// artifacts — so each adapter must make them agree. The fixture mixes bases
+/// and tails, a base and a tail at one sequence, a base with an ext-refs
+/// sidecar and a tail-only object; and, where the adapter can hold them, an
+/// orphaned companion stem (no generation artifact) beside a live object and
+/// on an object of its own, and a write temp. Neither may become a
+/// generation.
+pub async fn case_45_grouped_layer_artifacts_equal_each_objects_listing<F, Fut>(factory: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = ArtifactFixture>,
+{
+    use std::collections::BTreeSet;
+
+    use live_edit::checkpoint::lineage::group_layer_generations;
+
+    let fixture = factory().await;
+    let store = Arc::clone(&fixture.store);
+    let (mixed, tail_only, orphan_only) = (451u64, 452u64, 453u64);
+
+    let mut base_1_meta = sample_meta(1);
+    base_1_meta.sidecar_bytes = Some(ext_refs_sidecar_for(&["h-451"]));
+    store
+        .put_layer_checkpoint(mixed, 1, sample_layer_ompf(0x4501), base_1_meta)
+        .await
+        .expect("case_45: put base@1 must succeed");
+    for (to_seq, base, from, tag) in [(3, 1, 1, 0x4503), (5, 1, 3, 0x4515), (7, 5, 5, 0x4507)] {
+        store
+            .put_layer_checkpoint(
+                mixed,
+                to_seq,
+                sample_tail_envelope(tag),
+                sample_tail_meta(base, from, to_seq),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("case_45: put tail@{to_seq} must succeed: {e:?}"));
+    }
+    store
+        .put_layer_checkpoint(mixed, 5, sample_layer_ompf(0x4505), sample_meta(5))
+        .await
+        .expect("case_45: put base@5 must succeed");
+    store
+        .put_layer_checkpoint(
+            tail_only,
+            4,
+            sample_tail_envelope(0x4524),
+            sample_tail_meta(2, 2, 4),
+        )
+        .await
+        .expect("case_45: put the tail-only object's tail@4 must succeed");
+    if let Some(plant_orphan) = fixture.plant_orphan.as_ref() {
+        plant_orphan(mixed, 11).await;
+        plant_orphan(orphan_only, 9).await;
+    }
+    if let Some(plant_temp) = fixture.plant_temp.as_ref() {
+        plant_temp(mixed, 5).await;
+    }
+
+    let artifacts = store
+        .list_layer_artifacts()
+        .await
+        .expect("case_45: list_layer_artifacts must succeed");
+    let grouped = group_layer_generations(&artifacts);
+
+    let mut objects: BTreeSet<u64> = grouped.keys().copied().collect();
+    objects.extend([mixed, tail_only, orphan_only]);
+    for object_id in objects {
+        let listed = store
+            .list_layer_checkpoints(object_id)
+            .await
+            .expect("case_45: list_layer_checkpoints must succeed");
+        let from_group = grouped
+            .get(&object_id)
+            .map(|handles| kind_seq_pairs(handles))
+            .unwrap_or_default();
+        assert_eq!(
+            from_group,
+            kind_seq_pairs(&listed),
+            "case_45 [object {object_id}]: the grouped enumeration must be the per-object \
+             listing; enumeration: {artifacts:?}"
+        );
+    }
+    assert_eq!(
+        kind_seq_pairs(&grouped[&mixed]),
+        vec![
+            (7, CheckpointKind::Tail),
+            (5, CheckpointKind::Base),
+            (5, CheckpointKind::Tail),
+            (3, CheckpointKind::Tail),
+            (1, CheckpointKind::Base),
+        ],
+        "case_45: newest first, a base before a tail at one sequence, no orphan or temp"
+    );
+    assert_eq!(
+        kind_seq_pairs(&grouped[&tail_only]),
+        vec![(4, CheckpointKind::Tail)]
+    );
+    assert!(
+        !grouped.contains_key(&orphan_only),
+        "case_45: an orphaned companion stem is no generation"
+    );
+
+    drop(fixture.guard);
 }

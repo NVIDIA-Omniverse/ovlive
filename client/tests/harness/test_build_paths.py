@@ -13,6 +13,48 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @unittest.skipUnless(shutil.which('cmake'), 'cmake is not on PATH')
 class BuildPathTests(unittest.TestCase):
+    def test_debug_binary_maps_source_paths_and_records_only_the_pdb_basename(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / 'checkout'
+            project.mkdir()
+            (project / 'probe.cpp').write_text('#include <cstdio>\nint main() { std::puts(__FILE__); }\n')
+            (project / 'CMakeLists.txt').write_text(
+                'cmake_minimum_required(VERSION 3.20)\nproject(paths LANGUAGES CXX)\n'
+                'if(MAP_BUILD_PATHS)\n'
+                f'include("{ROOT.as_posix()}/cmake/LiveBuildPaths.cmake")\nendif()\n'
+                'add_executable(path_probe probe.cpp)\n')
+            binaries = {}
+            outputs = {}
+            for mapped in (False, True):
+                build = base / ('mapped' if mapped else 'control')
+                configure = ['cmake', '-S', str(project), '-B', str(build), '-DCMAKE_BUILD_TYPE=Debug',
+                             '-DMAP_BUILD_PATHS=' + ('ON' if mapped else 'OFF')]
+                if shutil.which('ninja'):
+                    configure += ['-G', 'Ninja']
+                for command in (configure, ['cmake', '--build', str(build), '--config', 'Debug']):
+                    done = subprocess.run(command, capture_output=True, text=True, timeout=120)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                paths = list(build.rglob('path_probe.exe' if os.name == 'nt' else 'path_probe'))
+                self.assertEqual(len(paths), 1, paths)
+                binary = binaries[mapped] = paths[0].read_bytes()
+                done = subprocess.run([str(paths[0])], capture_output=True, timeout=15)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                outputs[mapped] = done.stdout
+                if os.name == 'nt':
+                    marker = binary.index(b'RSDS')
+                    pdb = binary[marker + 24:].split(b'\0', 1)[0]
+                    if mapped:
+                        self.assertEqual(pdb, b'path_probe.pdb')
+                    else:
+                        self.assertTrue(b'/' in pdb or b'\\' in pdb, pdb)
+            spellings = {str(base).encode().lower(), base.as_posix().encode().lower()}
+            self.assertTrue(any(root in outputs[False].lower() for root in spellings), 'control has no source path')
+            for root in spellings:
+                self.assertNotIn(root, outputs[True].lower())
+                if os.name == 'nt':
+                    self.assertFalse(root in binaries[True].lower(), 'Windows binary retains a build path')
+
     def test_linked_dependency_package_maps_to_its_symbolic_name(self):
         # GCC names a system header by its symlink-resolved path when that path is shorter, so a packman link
         # into a package cache needs a map of its own, not only the dependency root's. packman links a package

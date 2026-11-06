@@ -220,6 +220,10 @@ class OmniUsdLiveResolver final : public ArResolver {
                 if (attachedSubject(*runtime, uri.canonical)) return ArResolvedPath(uri.canonical);
                 times_.forget(*runtime, uri.canonical);
             }
+            // An open the endpoint's stream share cannot hold is refused before
+            // its existence stat, so it issues no RPC (design section 4).
+            if (!endpointFor(uri).endpoint->calls->streamAvailable(OMNI_USD_LIVE_OPERATION_OPEN))
+                throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
             (void)stat(uri, runtime, 0);
             return ArResolvedPath(uri.canonical);
         });

@@ -87,7 +87,7 @@ impl ProductionShapedServer {
 async fn spawn_production_shaped_server() -> ProductionShapedServer {
     let tv = TestValkey::setup().await;
     let service = build_service(&tv, Arc::new(AllowAllPermissions));
-    let live_service = live_service_server(service);
+    let live_service = live_service_server(service, live_edit::grpc::hold::HoldGate::always_open());
 
     // Health wiring mirrors `main.rs`: the capabilities service is marked
     // SERVING statically (never flipped by the health supervisor).

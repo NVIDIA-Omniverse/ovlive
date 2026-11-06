@@ -3323,8 +3323,9 @@ async fn update_layer_txn_wrongtype_stream_key_refuses_commit() {
 // anomaly, and must not be reported as one.
 //
 // Both retirement paths append a tombstone with an AUTO id: `delete_layer`
-// does `DEL mapping` → `XADD * payload deleted` → ext-GC → `cleanup_old_object`
-// (which UNLINKs the header), and the CreateLayer-overwrite path does
+// does its unmap (the mapping and its layers-index member) →
+// `XADD * payload deleted` → ext-GC → `cleanup_old_object` (which UNLINKs
+// the header), and the CreateLayer-overwrite path does
 // `HSET superseded=1` → flip mapping → `XADD * payload deleted` on the old
 // stream. An auto id is a wall-clock millisecond, so it sits astronomically
 // above any `{new_seq}-0` and refuses the in-flight writer's stream write on
@@ -3386,7 +3387,7 @@ enum RetirementEvidence {
     HeaderDeleted,
     /// A CreateLayer overwrite HSET `superseded=1` on the OLD header.
     Superseded,
-    /// `delete_layer` DELeted the session → object mapping.
+    /// `delete_layer`'s unmap deleted the session → object mapping.
     MappingDeleted,
     /// A CreateLayer overwrite flipped the mapping to the NEW object.
     MappingMoved,
@@ -3441,7 +3442,7 @@ impl CollisionHarness {
                 let _: () = pool
                     .del(self.mapping_key())
                     .await
-                    .expect("DEL layer mapping must succeed");
+                    .expect("DEL of the layer mapping must succeed");
             }
             RetirementEvidence::MappingMoved => {
                 let _: () = pool
@@ -7301,7 +7302,7 @@ async fn update_layer_lua_non_allowlisted_xadd_refusal_is_not_reported_as_a_coll
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_update_layer_lua_fast_path_field_only_commits() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -7365,7 +7366,7 @@ async fn cluster_update_layer_lua_structural_route_cold_hit_and_already_landed_c
     use std::sync::Mutex;
 
     const LAYER: &str = "cluster-lua-structural-layer";
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -7499,7 +7500,7 @@ async fn cluster_update_layer_lua_structural_route_cold_hit_and_already_landed_c
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_update_layer_lua_concurrent_writers_no_crossslot_no_aborts() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
         return;
     };

@@ -136,12 +136,12 @@ pub(crate) fn read_permanent_exits(metrics: &Metrics, phase: &str) -> u64 {
 }
 
 /// `live_edit_valkey_consumer_unblocked_retries_total`: live reader reads that
-/// ended in `-UNBLOCKED` and were re-planned. In production only an outside
-/// `CLIENT UNBLOCK` does that; in tests, a separate client's `CLIENT UNBLOCK`
-/// or a command sent at a blocked reader. The residual `Blocking::Interrupt`
-/// case never ticks it: that `-UNBLOCKED` goes to the abandoned read's
-/// dropped caller. Since b.19i no credential refresh produces one either — a
-/// reader re-AUTHs between its reads.
+/// ended in `-UNBLOCKED` and were re-planned. Only a `CLIENT UNBLOCK … ERROR`
+/// from another client does that — in production one from outside the
+/// service, in tests a separate client's (such as [`unblock_reader_read`]'s):
+/// every client runs fred's default `Blocking::Block` (b.9sh), so no command of
+/// the service's own interrupts a read, and since b.19i a reader re-AUTHs
+/// between its reads.
 pub(crate) fn read_unblocked_retries(metrics: &Metrics) -> u64 {
     read_counter(
         metrics,
@@ -384,20 +384,20 @@ pub(crate) async fn await_mux(
     }
 }
 
-/// Connects stream reader 0 of `client` and leaves it with no subscription
-/// and its read blocked on the server. Readers connect lazily, the first time
-/// they serve a subscription (b.azh), and standalone routing sends object 0 to
-/// reader 0 (`object_id % readers`).
+/// Connects stream reader 0 of `client` and leaves it idle: connected, with no
+/// subscription and no read in flight, so a command on its client is answered
+/// at once. Readers connect lazily, the first time they serve a subscription
+/// (b.azh), and standalone routing sends object 0 to reader 0
+/// (`object_id % readers`).
 ///
-/// The subscription is dropped only once the server shows the reader's
-/// connection blocked in its `XREAD` ([`await_reader_blocked_in_xread`]):
-/// before that the reader may not have issued its read, or fred may not yet
-/// have marked it blocked, and a command sent then would queue behind the
-/// 30 s BLOCK. A subscription leaving does not wake the read, so it stays
-/// blocked, and the next command on the reader's client interrupts it
-/// (`Blocking::Interrupt`); the reader, with nothing to read, then goes idle.
-/// The subscription names a fresh key prefix and writes nothing, so it leaves
-/// no key behind.
+/// The subscription is dropped once the server shows the reader's connection
+/// blocked in its `XREAD` ([`await_reader_blocked_in_xread`]). A subscription
+/// leaving does not wake the read, and under fred's default `Blocking::Block`
+/// a command on the reader's client would wait out the read's 30 s BLOCK, so
+/// [`unblock_reader_read`] then ends the read from the data pool; the reader,
+/// with nothing left to read, goes idle (its `-UNBLOCKED` re-plan ticks
+/// `valkey_consumer_unblocked_retries_total` once). The subscription names a
+/// fresh key prefix and writes nothing, so it leaves no key behind.
 pub(crate) async fn connect_reader_zero(client: &ValkeyClient) {
     let schema = KeySchema::new(&format!("test_{}:", uuid::Uuid::new_v4()));
     let subscription = consume_layer_stream(
@@ -421,39 +421,90 @@ pub(crate) async fn connect_reader_zero(client: &ValkeyClient) {
         .expect("reader 0 holds a connection");
     await_reader_blocked_in_xread(client.pool.next(), &reader).await;
     drop(subscription);
+    unblock_reader_read(client.pool.next(), &reader).await;
 }
 
-/// Polls (for one [`SETTLE`]) until the server shows `reader`'s one connection
-/// blocked in an `XREAD` (`CLIENT LIST`: `cmd=xread`, flag `b`), asked over
-/// `observer`. A reader's XREAD count rises before the command is sent, and
-/// fred marks the connection blocked only just after writing it, so neither
-/// the count nor a connected reader proves the read is parked: a command sent
-/// in that window queues behind the BLOCK instead of interrupting it. Once the
-/// server shows it blocked, fred has marked it too, and any command on the
-/// reader's client interrupts it (`Blocking::Interrupt`).
-pub(crate) async fn await_reader_blocked_in_xread(observer: &Client, reader: &Client) {
+/// The id of `reader`'s one connection, from fred's cached connection ids (no
+/// command sent).
+fn sole_reader_connection(reader: &Client) -> i64 {
     let ids = reader.connection_ids();
     assert_eq!(
         ids.len(),
         1,
         "a reader client holds one connection; got {ids:?}"
     );
-    let id = *ids.values().next().expect("checked above");
+    *ids.values().next().expect("checked above")
+}
+
+/// Whether the server shows connection `id` blocked in an `XREAD`
+/// (`CLIENT LIST`: `cmd=xread`, flag `b`), asked over `observer`, and the
+/// listing it read.
+async fn blocked_in_xread(observer: &Client, id: i64) -> (bool, String) {
     let field = |line: &str, name: &str| -> String {
         line.split_whitespace()
             .find_map(|kv| kv.strip_prefix(&format!("{name}=")[..]).map(str::to_owned))
             .unwrap_or_default()
     };
+    let listing: String = observer
+        .client_list::<String, String>(None, Some(vec![id.to_string()]))
+        .await
+        .expect("CLIENT LIST ID must succeed");
+    let blocked = listing
+        .lines()
+        .any(|l| field(l, "cmd") == "xread" && field(l, "flags").contains('b'));
+    (blocked, listing)
+}
+
+/// Ends `reader`'s blocked read with one `CLIENT UNBLOCK <id> ERROR` sent over
+/// `observer`, then polls (for one [`SETTLE`]) until the server no longer
+/// shows its connection blocked. The readers run fred's default
+/// `Blocking::Block` (b.9sh), so a command sent on a reader's own client
+/// while its read is blocked waits out the read's BLOCK; a fixture that needs
+/// the reader's client answered at once ends the read this way first. The
+/// read fails `-UNBLOCKED` and the reader re-plans it (one
+/// `valkey_consumer_unblocked_retries_total` tick); with no subscription left
+/// it issues no new read. Call it once the server shows the read blocked
+/// ([`await_reader_blocked_in_xread`]) and after dropping the reader's
+/// subscriptions, or the re-plan blocks again and the poll fails.
+pub(crate) async fn unblock_reader_read(observer: &Client, reader: &Client) {
+    let id = sole_reader_connection(reader);
+    let unblocked: i64 = observer
+        .client_unblock(id, Some(fred::types::ClientUnblockFlag::Error))
+        .await
+        .expect("CLIENT UNBLOCK must succeed");
+    assert_eq!(
+        unblocked, 1,
+        "precondition: reader connection {id} was blocked in its read"
+    );
     let deadline = tokio::time::Instant::now() + SETTLE;
     loop {
-        let listing: String = observer
-            .client_list::<String, String>(None, Some(vec![id.to_string()]))
-            .await
-            .expect("CLIENT LIST ID must succeed");
-        if listing
-            .lines()
-            .any(|l| field(l, "cmd") == "xread" && field(l, "flags").contains('b'))
-        {
+        let (blocked, listing) = blocked_in_xread(observer, id).await;
+        if !blocked {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reader connection {id} still blocked after its read was unblocked (did a \
+             subscription stay, so the reader re-issued its read?); last CLIENT LIST:\n{listing}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Polls (for one [`SETTLE`]) until the server shows `reader`'s one connection
+/// blocked in an `XREAD` (`CLIENT LIST`: `cmd=xread`, flag `b`), asked over
+/// `observer`. A reader's XREAD count rises before the command is sent, and
+/// fred marks the connection blocked only just after writing it, so neither
+/// the count nor a connected reader proves the read is parked. Once the
+/// server shows it blocked, a `CLIENT UNBLOCK` from another client
+/// ([`unblock_reader_read`]) ends it, and a command on the reader's own client
+/// waits behind it (fred's default `Blocking::Block`).
+pub(crate) async fn await_reader_blocked_in_xread(observer: &Client, reader: &Client) {
+    let id = sole_reader_connection(reader);
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    loop {
+        let (blocked, listing) = blocked_in_xread(observer, id).await;
+        if blocked {
             return;
         }
         assert!(

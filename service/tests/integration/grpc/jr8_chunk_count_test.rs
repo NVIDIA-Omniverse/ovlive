@@ -73,7 +73,6 @@ fn build_service_with_max_layer_size(tv: &TestValkey, max_layer_size: usize) -> 
     let session_recovery =
         super::helpers::build_disabled_session_recovery_hook(tv, Arc::clone(&metrics));
     LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),

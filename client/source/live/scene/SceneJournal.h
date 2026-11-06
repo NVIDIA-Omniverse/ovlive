@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <set>
 #include <tuple>
 
 namespace omni::usd::live {
@@ -50,6 +51,22 @@ public:
         // the edit was compiled against, which can include preceding optimistic
         // local edits; a cutoff is provenance, never permission to replay.
         const uint64_t localOrdinal, baseRevision, dependencyCutoff;
+        // The (parent, section) of each Create whose parent the intent does
+        // not create: where the subtrees it creates attach. Set before the
+        // intent is shared and never changed after.
+        std::vector<std::pair<uint64_t, uint64_t>> attachments;
+        // The sections the intent's Creates name. Set before the intent is
+        // shared and never changed after.
+        std::vector<uint64_t> creates;
+        // The sections a restore intent writes an authored copy's prim
+        // fields onto without creating them: implicit containers that hold
+        // the copy's path (restoreWith). Set before the intent is shared and
+        // never changed after.
+        std::vector<uint64_t> adopted;
+        // The highest restore round of the content the intent creates: zero
+        // for an authored intent. Each section's own round, which planning
+        // reads, is the journal's (design section 10).
+        uint32_t round = 0;
     private:
         static size_t charge(size_t bytes, size_t owned) {
             if (owned > SIZE_MAX - bytes) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
@@ -95,8 +112,10 @@ public:
         uint64_t localAdmitted = 0, localRetired = 0;
         // Logical work the transaction that published this snapshot did, as
         // its work budgets count it: compilation and the new intent's replay
-        // for an admission, each update's application and the visible
-        // scene's derivation for ordered work. An admission's budget also
+        // step for an admission, each update's application and the visible
+        // scene's derivation for ordered work. An admission compiled against
+        // the visible scene adopts the compiler's scene as the extended one
+        // and counts its build as that step. An admission's budget also
         // holds replayWork, which this excludes. Deterministic for a given
         // history; zero for an empty commit.
         size_t work = 0;
@@ -156,7 +175,10 @@ public:
     // applied bookkeeping only after this returns successfully.
     // Return the exact committed owner, rather than sampling a potentially
     // newer local admission after releasing the transaction guard.
-    SnapshotPtr apply(const LayerProgress::Work&, std::string_view bytes, std::shared_ptr<const void> localIntent = {});
+    // `restore` false applies without restoring (restoreWith), as a layer
+    // that admits no intent does.
+    SnapshotPtr apply(const LayerProgress::Work&, std::string_view bytes, std::shared_ptr<const void> localIntent = {},
+        bool restore = true);
     // One ordered work, its delivered or confirmed bytes and, for confirmed
     // local work, its retained intent.
     struct Application {
@@ -170,7 +192,23 @@ public:
     // between them are empty commits. Pending intents replay once, onto the
     // last authoritative scene, and one snapshot publishes. A failing work
     // publishes nothing.
-    SnapshotPtr apply(const std::vector<Application>&);
+    // When a peer update's Create replaces content this journal restores
+    // (restoreWith), the same transaction admits the restore intent through
+    // the restorer, so the published visible scene holds the restored
+    // content. A batch in which such a replacement occurs applies as its
+    // works applied one by one would, each its own transaction, so a later
+    // work's replacement copies an earlier work's pending restore. A restore
+    // the journal's pending limits or the restorer refuse for capacity
+    // waits (retryRestore) while the batch publishes; one that exceeds
+    // kMaxRestoreRounds, the service's entry limits or any limit by itself,
+    // or kMaxWaitingRestores waiting restores, throws RESOURCE_EXHAUSTED and
+    // publishes nothing.
+    SnapshotPtr apply(const std::vector<Application>&, bool restore = true);
+    // Admits the waiting restores (apply) whose destinations exist and that
+    // fit, publishing the snapshot that holds them; the rest wait. Throws
+    // as apply does for a restore that can never fit. Any thread outside the
+    // journal's callbacks.
+    void retryRestore();
     // Advances applied through empty commits the layer's progress applied
     // without work; every position at or below `through` holds applied work.
     // Callers advance through work.first - 1 before applying work, which the
@@ -183,6 +221,95 @@ public:
     // The configured limits. Of the authoring limits, only the work budget
     // grows with the scene (effectiveLimits).
     const Limits& limits() const noexcept { return limits_; }
+    // A section this journal created that a peer update's Create replaced:
+    // its identity, its last derived path (WireReplacedSection) and the
+    // sequence of the commit whose update replaced it. A section this journal
+    // created is one a Create of an intent it admitted names, pending or
+    // committed. `restored` tells whether it was an implicit container whose
+    // children the same transaction restored (restoreWith).
+    struct ReplacedSection {
+        uint64_t section = 0;
+        PXR_NS::SdfPath path;
+        uint64_t sequence = 0;
+        bool restored = false;
+    };
+    // Receives each replaced section this journal created once, when the
+    // peer update that replaces it applies to the authoritative scene and
+    // that application publishes; a visible-scene replay or overlay reports
+    // nothing. It runs after the publication, outside every journal guard,
+    // on the thread that applied the update; it must not throw.
+    // Replaces any earlier observer; an empty one reports nothing.
+    void observeReplaced(std::function<void(const ReplacedSection&)> observer);
+    // Admits the restore intents of apply, as a Submit admits a captured
+    // intent; an empty one restores nothing. A peer update's Create that
+    // replaces a section deletes its subtree (design section 20); the journal
+    // restores, with ordinary new writes under the replacing section:
+    // - every child of an implicit container this journal created
+    //   (FieldEditIntent::implicitContainers) and has not written a record
+    //   of since;
+    // - an authored prim this journal created that an implicit container
+    //   replaced: its prim fields onto the container and its children;
+    // - the subtrees a pending intent creates under the replaced section,
+    //   whose Creates the service skips once it is gone, and the prim
+    //   fields a pending restore writes of a section at or under it.
+    // Each restored child is a copy, with fresh section identities, of its
+    // subtree in the visible scene before the replacing update, restored to
+    // the path it held there, under the section that holds that path when
+    // it is admitted. A child a section already holds at that path stays.
+    // When either is an implicit container, the copy's children merge into
+    // it by the same rule, and an authored copy writes its own prim fields
+    // onto an implicit container there, so the authored prim's fields win
+    // whichever commits first; when both are authored, the copy is dropped.
+    // That is the only record written to a section the restore does not
+    // create. A missing implicit container above a restored subtree is
+    // created; a restore whose destination, or a missing authored section
+    // above it, is absent waits until a section holds that path, such as the
+    // one the absent section's creator restores.
+    void restoreWith(Submit restorer);
+    // The most rounds of restoring one subtree: content a restore created
+    // and that a peer update replaces again is restored in the next round.
+    static constexpr uint32_t kMaxRestoreRounds = 32;
+    // The most restores that wait for a destination or for capacity.
+    static constexpr size_t kMaxWaitingRestores = 64;
+    // Test seam: the round bound of every journal in the process; zero
+    // restores nothing, as a client without restore does. Production code
+    // never changes it.
+    static void setRestoreRoundsForTest(uint32_t rounds) noexcept;
+    // Test seam: the next `count` restore admissions in the process are
+    // refused for capacity, as a full endpoint refuses them. Production code
+    // never changes it.
+    static void refuseRestoresForTest(uint32_t count) noexcept;
+    // Test seam: whether the restorer refuses this admission for capacity,
+    // consuming one of refuseRestoresForTest's refusals.
+    static bool takeRestoreRefusalForTest() noexcept;
+    // The section bookkeeping an application sweeps (forgetAbsent): created
+    // sections, implicit containers and restore rounds.
+    struct Tracked {
+        size_t created = 0, containers = 0, restored = 0;
+    };
+    // Test seam: the entries the section bookkeeping holds.
+    Tracked trackedForTest();
+    // The fewest bookkeeping entries, all three sets together, at which an
+    // application sweeps.
+    static constexpr size_t kMinSweep = 4096;
+    // Content a restore copies: the subtree of `replaced`, at `path`, in
+    // `before`, the visible scene before the replacing update, restored to
+    // `path` in the current scene. `whole` restores every child; otherwise
+    // only `roots`, subtrees pending intents created, with the implicit
+    // containers above them, and sections a pending restore adopted, of
+    // which only the prim fields restore (`adopted`, a subset of `roots`).
+    // `authored` marks `replaced` as an authored prim this journal created,
+    // which adopts an implicit container that replaced it, merging its
+    // children, as a restored copy does. `round` is the replaced container's
+    // round.
+    struct RestoreSource {
+        WireScenePtr before;
+        uint64_t replaced = 0;
+        PXR_NS::SdfPath path;
+        bool whole = false, authored = false;
+        std::set<uint64_t> roots, adopted;
+        uint32_t round = 0;
+    };
 private:
     // The target of a field or sample record: a section's field, or the
     // section's time samples for a sample record, which names no field.
@@ -205,6 +332,10 @@ private:
     using FootprintIndex = std::map<Footprint, size_t, FootprintOrder>;
     // The distinct record targets of one intent's wire bytes.
     std::vector<Footprint> footprintOf(std::string_view bytes) const;
+    // The sections the Create commands of one intent's wire bytes name, and
+    // its attachments (Intent::attachments).
+    std::vector<uint64_t> createsOf(std::string_view bytes,
+        std::vector<std::pair<uint64_t, uint64_t>>* attachments = nullptr) const;
     // The index of the pending intents a visible scene applies.
     FootprintIndex index(const std::vector<Pending>&) const;
     static void retire(FootprintIndex&, const Footprint* begin, const Footprint* end) noexcept;
@@ -219,6 +350,57 @@ private:
         const WireSceneLimits& limits, WireSceneWorkBudget& work) const;
     uint64_t submit(std::string_view, const Submit&, const WireScenePtr& explicitBase,
         const std::shared_ptr<const SdfOperationLog>& captured, WireScenePtr* applied = nullptr);
+    // The sources of the content `replaced` removes from `previous`'s visible
+    // scene (restoreWith).
+    std::vector<RestoreSource> restoreSources(const Snapshot& previous,
+        const std::vector<WireReplacedSection>& replaced) const;
+    // A planned restore: its intent, or null when it creates nothing, the
+    // implicit containers and all the sections it creates with their
+    // rounds, the sources it
+    // restored content of, and the sources that wait.
+    struct Restoration {
+        std::shared_ptr<Intent> intent;
+        std::vector<std::pair<uint64_t, uint32_t>> containers, sections;
+        std::set<uint64_t> restored;
+        std::vector<RestoreSource> planned, waiting;
+    };
+    // Plans `sources` against the prepared visible scene; throws
+    // RESOURCE_EXHAUSTED for a source over the round bound.
+    Restoration planRestore(const Snapshot& previous, const Snapshot& prepared, std::vector<RestoreSource> sources,
+        uint32_t rounds) const;
+    // Appends the restore intent to the prepared snapshot's pending intents
+    // and visible scene, charged as an admission is; false, with `prepared`
+    // unchanged, when a pending limit that a retirement relieves refuses it.
+    bool admitRestore(Snapshot& prepared, const std::shared_ptr<Intent>& intent) const;
+    // Publishes `prepared` with the planned restore admitted through the
+    // restorer, or, when it is refused for capacity, without it and with
+    // its sources waiting; `index` is the footprint index of `prepared`'s
+    // pending intents before the restore. Under transactionMutex_. Throws,
+    // publishing nothing, for a restore that never fits or more than
+    // kMaxWaitingRestores waiting.
+    // True when the restore joined, and `prepared` is the published
+    // snapshot that holds it; otherwise `prepared` publishes alone when
+    // `publishAlone`.
+    bool publishRestore(SnapshotPtr& publication, std::shared_ptr<Snapshot>& prepared, Restoration& restoration,
+        FootprintIndex index, const std::shared_ptr<const Submit>& restorer, bool publishAlone);
+    // Forgets the created sections, implicit containers and restore rounds
+    // of sections that neither the published authoritative scene, nor a
+    // pending intent's Creates, nor a waiting restore's source scene holds.
+    // Every reader of an entry names a section one of those holds: a
+    // replaced section was in the authoritative scene, and a restore copies
+    // from the visible scene, which is the authoritative scene with the
+    // pending intents replayed and so holds no other section, or from a
+    // waiting source scene. A section none of them holds never returns: only
+    // a Create of its identity brings a section into the authoritative
+    // scene, this client never allocates an identity again, and every Create
+    // of one of its sections that has not retired is a pending intent's.
+    // It sweeps once the three hold sweepAt_ entries together, or, while no
+    // restore waits and they hold kMinSweep entries, once one of them holds
+    // more than twice the sections the authoritative scene and the pending
+    // intents' Creates name, so the sweep forgets more than half of that
+    // one; it then sets sweepAt_ to twice what remains, at least kMinSweep.
+    // Under transactionMutex_, after a publication.
+    void forgetAbsent() noexcept;
     const Limits limits_;
     const std::shared_ptr<SectionIdAllocator> ids_;
     mutable std::mutex mutex_;
@@ -228,5 +410,29 @@ private:
     // snapshot that its visible scene applies hold a record of it. Guarded
     // by transactionMutex_ and changed only with the publication it follows.
     FootprintIndex footprint_;
+    // The sections the Creates of admitted intents name, less those reported
+    // replaced or swept (forgetAbsent), and the observer of replaced ones.
+    // Guarded by transactionMutex_; created_ changes only with an
+    // admission's publication, a report or a sweep.
+    std::set<uint64_t> created_;
+    std::shared_ptr<const std::function<void(const ReplacedSection&)>> replaced_;
+    // The implicit containers this journal created, each with the restore
+    // round of its content, less those it has written a record of since,
+    // that were replaced or that were swept, and the restorer. Guarded by
+    // transactionMutex_; containers_ changes with an admission's
+    // publication, a report or a sweep.
+    std::map<uint64_t, uint32_t> containers_;
+    std::shared_ptr<const Submit> restorer_;
+    // Restores that wait for a destination or for capacity (apply).
+    // Guarded by transactionMutex_.
+    std::vector<RestoreSource> waiting_;
+    // The restore round of every section an admitted restore created,
+    // authored or implicit, less those reported replaced or swept, so a
+    // later restore that copies one counts its round after the restore
+    // intent retires. Guarded by transactionMutex_.
+    std::map<uint64_t, uint32_t> restored_;
+    // The bookkeeping size at which the next application sweeps
+    // (forgetAbsent). Guarded by transactionMutex_.
+    size_t sweepAt_ = kMinSweep;
 };
 } // namespace omni::usd::live

@@ -127,7 +127,7 @@ class PythonHostTests(unittest.IsolatedAsyncioTestCase):
         # edit stays buffered, coalescing.
         self.assertEqual(await driver.command('set startTimeCode -3.5'), {'type': 'authored', 'result': 0})
         both = {'framesPerSecond': 48.0, 'startTimeCode': -3.5}
-        queued = await driver.command('state')
+        queued = await driver.command('wait-buffered 1')
         self.assertEqual((queued['fields'], queued['pending'], queued['status']['buffered_edit_count']), (both, 1, 1))
         self.assertEqual(self.state.attempts['UpdateLayer'], 1)
         fault.release.set()
@@ -142,7 +142,7 @@ class PythonHostTests(unittest.IsolatedAsyncioTestCase):
         # A FAILED layer stays locally editable; the edit only buffers.
         self.assertEqual(await driver.command('set endTimeCode 7'), {'type': 'authored', 'result': 0})
         every = dict(both, endTimeCode=7.0)
-        edited = await driver.command('state')
+        edited = await driver.command('wait-buffered 2')
         self.assertEqual((edited['fields'], edited['status']['buffered_edit_count']), (every, 2))
         self.assertEqual(await driver.command('diagnostics'), {'type': 'diagnostics', 'records': []})
         self.assertEqual((await driver.command('save 1000'))['result'], 19)

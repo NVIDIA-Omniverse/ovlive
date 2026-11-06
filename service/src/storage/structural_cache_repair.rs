@@ -159,8 +159,12 @@
 //!    for one pending entry alone above [`STRUCTURAL_REPAIR_MAX_BYTES`];
 //!    within it, the next read grows instead, "The loop" above);
 //! 3. per record, during replay: `parse` (its OMPF or OODF bytes) or
-//!    `replay_err` (`apply_delta` refused it), and `dangling_adopted` (the
-//!    record created a section the entry holds a dangling parent for);
+//!    `replay_err` (`apply_delta` refused it), then `collision_rule` (its
+//!    replay counted a point where the earlier sibling-collision rule could
+//!    decide its outcome differently, so a replica of an earlier build may
+//!    have committed another state: `ApplyDeltaStats::collision_rule_divergences`,
+//!    [`ReloadReason::CollisionRule`]), and `dangling_adopted` (the record
+//!    created a section the entry holds a dangling parent for);
 //! 4. after the round: `too_far` once the budget is spent short of the header
 //!    — a backstop that cannot be reached, since step 2's `too_far` already
 //!    answers any round whose goal lies beyond the remaining budget.
@@ -176,8 +180,8 @@
 //!   reported as `too_far`. An entry 1,100 commits behind with a restore jump
 //!   400 entries in reloads `too_far` where SR-4.2's order alone would say
 //!   `gap`;
-//! - `dangling_adopted` ends the repair at the adopting record, so a later
-//!   record's error is not classified either.
+//! - `collision_rule` and `dangling_adopted` end the repair at the record
+//!   that raised them, so a later record's error is not classified either.
 //!
 //! Each is a reload all the same; only the label differs.
 //!
@@ -273,8 +277,9 @@ use crate::domain::replay::{
 use crate::domain::types::CompactState;
 use crate::error::ServiceError;
 use crate::observability::metrics::{
-    STRUCTURAL_CACHE_RELOAD_DANGLING_ADOPTED, STRUCTURAL_CACHE_RELOAD_DIVERGED,
-    STRUCTURAL_CACHE_RELOAD_GAP, STRUCTURAL_CACHE_RELOAD_IDENTITY, STRUCTURAL_CACHE_RELOAD_PARSE,
+    STRUCTURAL_CACHE_RELOAD_COLLISION_RULE, STRUCTURAL_CACHE_RELOAD_DANGLING_ADOPTED,
+    STRUCTURAL_CACHE_RELOAD_DIVERGED, STRUCTURAL_CACHE_RELOAD_GAP,
+    STRUCTURAL_CACHE_RELOAD_IDENTITY, STRUCTURAL_CACHE_RELOAD_PARSE,
     STRUCTURAL_CACHE_RELOAD_REGRESSED, STRUCTURAL_CACHE_RELOAD_REPLAY_ERR,
     STRUCTURAL_CACHE_RELOAD_TOMBSTONE, STRUCTURAL_CACHE_RELOAD_TOO_FAR,
     STRUCTURAL_CACHE_RELOAD_TOO_LARGE, STRUCTURAL_CACHE_RELOAD_UNCACHEABLE,
@@ -420,6 +425,18 @@ pub enum ReloadReason {
     Parse,
     /// A decoded stream entry did not replay onto the entry.
     ReplayErr,
+    /// A replayed stream entry's outcome can differ between the current
+    /// sibling-collision rule and the earlier one: its engine counters show a
+    /// non-zero `ApplyDeltaStats::collision_rule_divergences` (a collision
+    /// beside a same-named sibling of another collision slot, or a
+    /// same-parent rename onto an occupied name). A replica of an earlier
+    /// build commits such a record under the earlier rule, and the
+    /// `commit_chain` folds payloads, not outcomes, so a replay under this
+    /// build's rule could leave the entry holding rows the store lacks, or
+    /// lacking rows it holds; the entry is read again instead. Ticked for
+    /// every such record, whichever build committed it. Can be removed once
+    /// no supported upgrade or rollback path crosses 0.3.0.
+    CollisionRule,
     /// More than the repair's budget ([`STRUCTURAL_REPAIR_MAX_TOTAL`]) of
     /// entries separate the entry from the header.
     TooFar,
@@ -456,6 +473,7 @@ impl ReloadReason {
             Self::Tombstone => STRUCTURAL_CACHE_RELOAD_TOMBSTONE,
             Self::Parse => STRUCTURAL_CACHE_RELOAD_PARSE,
             Self::ReplayErr => STRUCTURAL_CACHE_RELOAD_REPLAY_ERR,
+            Self::CollisionRule => STRUCTURAL_CACHE_RELOAD_COLLISION_RULE,
             Self::TooFar => STRUCTURAL_CACHE_RELOAD_TOO_FAR,
             Self::TooLarge => STRUCTURAL_CACHE_RELOAD_TOO_LARGE,
             Self::DanglingAdopted => STRUCTURAL_CACHE_RELOAD_DANGLING_ADOPTED,
@@ -1603,6 +1621,11 @@ impl ChunkScan<'_> {
 /// bound is raised from the buckets the record's RP2 priced, read once the
 /// record and its children normalization have run.
 ///
+/// A record whose apply counts a collision-rule divergence
+/// (`ApplyDeltaStats::collision_rule_divergences`) ends the chunk with
+/// [`ReloadReason::CollisionRule`] once it has applied, on an entry with or
+/// without plan indexes.
+///
 /// On an error `held`'s state may be partly applied and must be discarded.
 fn replay_chunk(
     held: &mut CacheEntry,
@@ -1652,17 +1675,16 @@ fn replay_chunk(
             match plan.as_mut() {
                 Some(indexes) => {
                     apply_decoded_record_indexed(state, record, &mut sink, indexes, &mut touches)
-                        .map(drop)
                 }
                 None => apply_decoded_record_into(state, record, &mut sink),
             }
-            .map(|()| Ok((growth, priced)))
+            .map(|stats| Ok((growth, priced, stats)))
         })
         .map_err(|error| match error.class() {
             ReplayErrorClass::Parse => ReloadReason::Parse,
             ReplayErrorClass::Replay => ReloadReason::ReplayErr,
         })?;
-        let (growth, priced) = match step {
+        let (growth, priced, stats) = match step {
             Ok(step) => step,
             Err(target) => {
                 if held.plan.is_none() {
@@ -1674,6 +1696,13 @@ fn replay_chunk(
                 });
             }
         };
+        // A record whose outcome the earlier collision rule could decide
+        // differently: another build may have committed it under that rule,
+        // so the replayed state may not be the store's. Reload rather than
+        // trust it ([`ReloadReason::CollisionRule`]).
+        if stats.collision_rule_divergences != 0 {
+            return Err(ReloadReason::CollisionRule);
+        }
         // The ids the list-delete sink kept are exactly the
         // `StorageMutation::deleted_list` of each mutation a collecting sink
         // would have held, in the same order (`MutationSink::ListDeletes`

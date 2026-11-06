@@ -51,6 +51,11 @@
 # runtime set explicit stack sizes, so `RUST_MIN_STACK` does not reach them,
 # and its thread-bounds self-check fails if it ever did.
 
+# 0.9.116 is the first nextest that sets `NEXTEST_TEST_NAME`, which
+# `storage::test_support::test_cluster_url` needs to check a cluster-gated
+# test's name (it fails the test without it); `priority` below needs 0.9.91.
+nextest-version = { required = "0.9.116" }
+
 [profile.default]
 # Mark a test "slow" (emit a still-running line) at 40s, and hard-terminate it
 # after 3 such periods = 120s. The longest legitimate test in this suite is the
@@ -105,6 +110,78 @@ filter = 'test(=checkpoint::restart_storm_test::no_object_id_collision_under_res
 slow-timeout = { period = "60s", terminate-after = 5, grace-period = "5s" }
 retries = 0
 
+# Raise the kill deadline for the disaster-recovery hold's quiescence test
+# (`tests/integration/dr/hold_quiescence_test.rs`). Its window starts at hold
+# entry + `grpc::hold::hold_write_bound`, D + T + 45 s (51 s at the fixture's
+# settings), and runs 30 s, so a healthy run takes about 85 s and every wait at
+# its full budget sums to about 156 s — past the global 120s hard-kill, where a
+# killed test prints nothing. 60s × 3 = 180s. `retries = 0`: a failure here is
+# a writer left running, deterministic, not contention, and a retry would
+# double an 85 s run. Verify the match set (exactly one test) with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features test-support -E '<filter>'
+[[profile.default.overrides]]
+filter = 'test(=dr::hold_quiescence_test::from_the_hold_write_bound_on_nothing_writes_the_store_or_the_backup_store)'
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
+retries = 0
+
+# Raise the kill deadline for the disaster-recovery hold's stale-verdict test
+# (`tests/integration/dr/hold_entry_test.rs`). It waits out the production
+# 30 s stale threshold on a stalled hold-poll connection, so a healthy run
+# takes 30 to 40 s, and every wait at its full budget sums to about 220 s
+# (its module header's "Waits") — past the global 120s hard-kill, where a
+# killed test prints nothing. 60s × 4 = 240s. `retries = 0`: the threshold is
+# paid in every run, so a retry would double a 30–40 s run for a failure that is
+# a missed reaction, not contention. Verify the match set (exactly one test)
+# with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features test-support -E '<filter>'
+[[profile.default.overrides]]
+filter = 'test(=dr::hold_entry_test::a_dead_hold_poll_connection_fails_the_replica_closed_and_its_next_read_restarts_it)'
+slow-timeout = { period = "60s", terminate-after = 4, grace-period = "5s" }
+retries = 0
+
+# Raise the kill deadline for the restore writer's test of a layer over one
+# delta's entry limit (`tests/integration/dr/restore_write_test.rs`, W2). It
+# restores a layer of 100,001 entries from a chunked base: the planner and the
+# writer each decode it, and the writer sends 300,009 commands in batches of at
+# most 100,000, so at least four row batches and the header transaction. A
+# healthy debug-build run measured 47 s alone on the remote build host
+# (2026-10-20): the chunked base built in 0.2 s, the Job's run 30 s, the
+# read-back of every row 16 s, the store clean-up 0.8 s. A loaded CI runner
+# can take several times that, so the test bounds its run by `BIG_RUN_BUDGET`
+# (160 s) and its read-back by `BIG_READ_BACK_BUDGET` (80 s), about five times
+# each measurement; the two sum to 240 s, past the global 120s hard-kill, where
+# a killed test prints nothing, and the build and the clean-up come on top.
+# 60s × 5 = 300s leaves 60 s for those (about 1 s measured). `retries = 0`: a
+# failure here is a wrong batch or a wrong write, deterministic, and a retry
+# would double a long run. Verify the match set (exactly one test) with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features test-support -E '<filter>'
+[[profile.default.overrides]]
+filter = 'test(=dr::restore_write_test::restore_job_writes_a_layer_over_one_deltas_entry_limit_in_batches_each_with_its_timeout)'
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "5s" }
+retries = 0
+
+# Raise the kill deadline for held mode's dead-poll test
+# (`tests/integration/dr/held_mode_test.rs`). It waits out the production
+# 30 s stale threshold with the held client's hold reads failing, so a healthy
+# run takes 30 to 40 s, and every wait at its full budget sums to about 160 s
+# (its module header's "Clocks and waits") — past the global 120s hard-kill,
+# where a killed test prints nothing. 60s × 4 = 240s. `retries = 0`: the
+# threshold is paid in every run, and a failure is a missed reaction, not
+# contention. Verify the match set (exactly one test) with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features test-support -E '<filter>'
+[[profile.default.overrides]]
+filter = 'test(=dr::held_mode_test::held_mode_with_failing_hold_reads_reports_not_serving_stays_held_and_recovers)'
+slow-timeout = { period = "60s", terminate-after = 4, grace-period = "5s" }
+retries = 0
+
 # Raise the kill deadline for every b.azh stream-reader test
 # (`tests/integration/storage/stream_mux_reader_connect_test.rs`). Their WORST
 # cases — every wait at its full bound, not their runtime — sit near or past the
@@ -147,6 +224,36 @@ slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 filter = 'test(/^storage::stream_mux_reauth_test::/)'
 slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 
+# The same deadline, for the same reason, for every b.v6d router test
+# (`tests/integration/storage/b_v6d_router_test.rs`). The module header's
+# "Wait budget" section sums each test's worst case, every wait at its full
+# bound, plus fred's 5s one-shot commands: the largest are T33 (c), 110s
+# named, and T35's stream-reader variant, 100s named, which first end a
+# stream reader's blocked read (`unblock_reader_read`, b.9sh) — past the
+# global 120s hard-kill once those commands are added, and under 180s —
+# and the defer-9 back-to-back test reaches about 105s, within 15s of the global 120s hard-kill. On
+# the healthy path each runs in under a second, or up to about 8s where a
+# test waits out a held command by construction.
+#
+# The whole module, not a list of tests, for the reason given at the
+# stream-reader entry above: a per-test list had to be re-derived from
+# per-test arithmetic every time a wait was added, and missed tests that had
+# crossed 120s. A test added to the module is covered with no edit here.
+#
+# 60s × 3 = 180s. `retries` stays at the profile's 1. Verify the match set —
+# every test in the module — with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features test-support,test-fault-injection -E '<filter>'
+#
+# and compare it with the same command filtered on
+# `test(/b_v6d_router_test/)`. Pass `test-fault-injection`: the module's
+# fault-injection tests compile to nothing without it, so the list is
+# shorter, not wrong.
+[[profile.default.overrides]]
+filter = 'test(/^storage::b_v6d_router_test::/)'
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
+
 # The same deadline, for the same reason, for the b.zt3 dead-connection tests
 # (every `tests/integration/storage/b_zt3_*_test.rs` module): each module
 # header's "Wait budget" section sums each test's worst case, every wait at its
@@ -158,6 +265,28 @@ slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 # -E '<filter>'`.
 [[profile.default.overrides]]
 filter = 'test(/^storage::b_zt3_/)'
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
+
+# The same deadline, for the same reason, for every retirement-allowance test
+# (`tests/integration/storage/retirement_budget_test.rs`). The module header's
+# "Worst case per test" table sums each test's waits at their full bound plus
+# its fixtures' drops (15s each: 5s for the first unanswered purge step + 10s
+# quit). The largest rows are the six tests that run five cases at once in one
+# `join_all`: their cases, each cut off by its 60s case bound, plus five drops
+# one after another, 5 × 15s = 75s, so up to 60s + 75s = 135s, plus the purge's
+# answered round trips. That is past the global 120s hard-kill, and a killed
+# test prints nothing. 60s × 3 = 180s leaves 45s for those round trips.
+# `retries` stays at the profile's 1. Verify the match set — every test in the
+# module — with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features oodf-ffi/internal-bridge,test-fault-injection,test-checkpoint-fault-injection,test-support \
+#     -E '<filter>'
+#
+# The module is `#[cfg(feature = "test-fault-injection")]`: without that
+# feature the list is empty.
+[[profile.default.overrides]]
+filter = 'test(/^storage::retirement_budget_test::/)'
 slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 
 # Raise the kill deadline for b.tbw part one's multi-second whole-write tests:
@@ -176,7 +305,7 @@ slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 #   the at-limit create: 150s deadline + 5s + 10s (the fixture's drop)
 #     = 165s, plus the purge's answered round trips.
 #
-# The purge's round trips are one SCAN page per 100 keys of the whole shared
+# The purge's round trips are one SCAN page per 5,000 keys of the whole shared
 # database plus one UNLINK per 100 of the test's own keys (about 500 for the
 # largest txn_timeout object, about 1,000 for the at-limit one), so they have
 # no fixed bound. A stall a failed txn_timeout test leaves parked lasts until
@@ -198,6 +327,36 @@ slow-timeout = { period = "60s", terminate-after = 3, grace-period = "5s" }
 # that feature the list holds the create test alone.
 [[profile.default.overrides]]
 filter = 'test(=grpc::delta_size_refusal_test::create_layer_at_exactly_the_entry_limit_commits_and_its_catch_up_returns_every_entry) or test(/^storage::txn_timeout_test::/)'
+slow-timeout = { period = "60s", terminate-after = 4, grace-period = "5s" }
+
+# Raise the kill deadline for the fenced-layer double-apply test of
+# `tests/integration/grpc/subscribe_proven_read_test.rs`. Four joiners join
+# one after another under writers, each joiner's fenced read holding the
+# writers off for its epoch; each follower then applies every live commit up
+# to the sentinel. On CI's x86 runners it takes about 10–20s. A debug build
+# on an aarch64 development sandbox is 3–7× slower: at four test threads it
+# took 38–115s there (2026-10-16), the slowest 5s short of the global 120s
+# hard-kill, where a killed test prints nothing.
+#
+# The test's own bound is no help here: `FOLLOW_BUDGET` (60s) is a hang guard,
+# not a latency claim. It bounds a follower's catch-up and then each wait for
+# its next live commit, so a slow but progressing run is bounded by this
+# deadline alone, and a hung one fails at most one catch-up plus 60s after it
+# stops progressing. 60s × 4 = 240s, twice the slowest run measured.
+# `retries` stays at the profile's 1: the slow runs are load, the contention
+# class it exists for.
+#
+# Default profile, so CI's `--profile ci` picks it up too. Verify the match
+# set — exactly this one test — with:
+#
+#   cargo nextest list --profile ci -p live-edit --test integration \
+#     --features oodf-ffi/internal-bridge,test-fault-injection,test-checkpoint-fault-injection,test-support \
+#     -E '<filter>'
+#
+# It is `#[cfg(feature = "test-fault-injection")]`: without that feature the
+# list is empty.
+[[profile.default.overrides]]
+filter = 'test(=grpc::subscribe_proven_read_test::structural_writes_are_applied_exactly_once_by_every_brand_new_subscriber_of_a_fenced_layer)'
 slow-timeout = { period = "60s", terminate-after = 4, grace-period = "5s" }
 
 # Raise the kill deadline for the structural cache equivalence proptests
@@ -335,6 +494,16 @@ junit = { store-success-output = true }
 [[profile.default.overrides]]
 filter = 'test(=grpc::presence_sweep_relay_burst_test::sweep_burst_at_crash_scale_in_full_batch_sessions_reaches_every_observer_without_relay_lag)'
 retries = 0
+success-output = "immediate-final"
+junit = { store-success-output = true }
+
+# D1 T6 (b.cyy) prints the restore phase's durations at an injected 100 ms
+# backup-store latency, one value at a time and in batches, on tokio's paused
+# clock: model figures kept for the record when it passes, inline, in the final
+# summary and in the JUnit XML. Exactly this one; verify with
+# `cargo nextest list -p live-edit --test integration --features test-support -E '<filter>'`.
+[[profile.default.overrides]]
+filter = 'test(=grpc::b_yuo_catch_up_miss_test::restore_in_batches::backup_only_values_are_fetched_ext_restore_parallelism_at_a_time)'
 success-output = "immediate-final"
 junit = { store-success-output = true }
 
@@ -531,7 +700,8 @@ retries = 0
 # service, named by `LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL` — run one at a time.
 # `stream_mux_disruptive_*` sets `timeout 2`, which would close the idle
 # connections of the others; every `store_write_refusal_disruptive_*` test
-# (`store_write_refusal_test`, b.yvh, and `oom_collection_test`, b.pa1) sets
+# (`store_write_refusal_test`, b.yvh, `oom_collection_test`, b.pa1, and
+# `b_2tu_tests`, b.2tu) sets
 # `maxmemory` at or below what the store holds, which would refuse the
 # others' writes. Each restores its setting when it ends, but nextest runs
 # tests in parallel processes, and no in-process lock reaches across them:
@@ -543,8 +713,8 @@ retries = 0
 # Verify the filter matches exactly the stream-multiplexer test and every
 # `store_write_refusal_disruptive_` test with
 # `cargo nextest list --profile ci -p live-edit --test integration --features test-support,test-fault-injection --run-ignored all -E '<filter>'`
-# (`stream_mux_health_test` and the b.ua9 full-store test need
-# `test-fault-injection`). The group itself is declared under `[test-groups]`
+# (`stream_mux_health_test`, the b.ua9 full-store test and b.2tu's full-store
+# `CreateSession` test need `test-fault-injection`). The group itself is declared under `[test-groups]`
 # at the end of this file.
 [[profile.default.overrides]]
 filter = 'test(=storage::stream_mux_health_test::stream_mux_disruptive_idle_readers_outlive_the_idle_timeout_only_with_the_keepalive) or test(/store_write_refusal_disruptive_/)'
@@ -568,6 +738,22 @@ test-group = 'disruptive-valkey-config'
 # `cargo nextest list --profile ci -p live-edit --test integration --features test-support --run-ignored all -E '<filter>'`
 [[profile.default.overrides]]
 filter = 'test(/retention_sweep_cost_on_a_cluster_is_reported_b26e$/) or test(/write_check_cost_on_a_cluster_is_within_its_budget_bbo2$/)'
+success-output = "immediate-final"
+junit = { store-success-output = true }
+
+# The b.gns restart test (`scan_guard_serving_process_restart_disruptive_*`,
+# in the integration binary, `#[ignore]`d and run only by the
+# `test-cluster-disruptive:` job against its `valkey-restartable` service).
+# It asserts that a guarded walk fails across `DEBUG RESTART`, and reports,
+# without asserting, what an unguarded cursor continued on the new process
+# returned: its `B.GNS DATAPOINT:` lines are read from a passing run, so
+# `immediate-final` keeps them in the log and `store-success-output` in the
+# JUnit XML. In the default profile so it applies under `--profile ci` too.
+# It runs alone on its own server, so it needs no test group. Verify it
+# matches exactly this one test with
+# `cargo nextest list --profile ci -p live-edit --test integration --features test-support,test-fault-injection --run-ignored all -E '<filter>'`.
+[[profile.default.overrides]]
+filter = 'test(/serving_process_restart_disruptive/)'
 success-output = "immediate-final"
 junit = { store-success-output = true }
 
@@ -614,6 +800,151 @@ junit = { store-success-output = true }
 filter = 'test(/cluster_subscriber_disruptive/) or test(/retention_sweep_cost_on_a_cluster_is_reported_b26e$/) or test(/write_check_cost_on_a_cluster_is_within_its_budget_bbo2$/) or test(=storage::snapshot_read_cluster_test::snapshot_read_disruptive_structural_read_falls_back_to_plain_commands_during_a_slot_migration) or test(/slot_migration_disruptive/) or test(/fed_frame_flush_disruptive/)'
 test-group = 'disruptive-cluster'
 
+# Run order: three priority tiers, 100, 90 and 50. nextest starts tests in
+# priority order, highest first, across every binary, and otherwise in binary,
+# then name, order. A priority only reorders; it selects and skips nothing.
+# nextest accepts priorities from -100 to 100 only (a value outside fails the
+# config load, and with it every run), and it does not guarantee the order of
+# tests of equal priority, so each tier has its own value. All three entries
+# are in the default profile, so local runs order the same way as CI's.
+#
+# Priority 100, walk-first: the tests that drive a walk of the whole shared
+# Valkey keyspace, running one or waiting under a deadline on its result — a
+# checkpoint tick (its pass 1, `orphan_sweep::scan_keyspace`), the
+# external-value reconcile, an orphan-sweep pass, the backup repair, a
+# `scan_guard` walk, the presence-index backstop, the recovery tests' prefix
+# wipes, which walk the whole database, and the DR Job's guarded walks (its
+# planner's reads and its reference recount). Such a walk visits every key
+# the run's other tests hold at that moment, so its cost grows with them.
+# The database is reliably small only at the start of a run: fixtures
+# on a multi-thread runtime purge their keys on drop, but the keys of
+# fixtures on a current-thread runtime (the proptests among them) are never
+# purged, so the database's floor rises over a run. From CI job 501033955
+# (2026-10-21), the first run with the ≥60 s tests started first, b.bgp's
+# lease test slowed on the same runner from 4.06–4.08 s in all 14 earlier
+# jobs to 6.51 s and 5.47 s (jobs 501216688 and 501257224); that those tests
+# filled the database while the walkers ran is inferred, as no run logged
+# its size. The tier holds about 1,390 tests with CI's features (1,392 when
+# measured). In a 20-slot CI run its last test started at 22.7 s and all had
+# ended by 25.7 s; in the runs measured, every run outlasted its longest test
+# by 100–234 s, so the delay does not lengthen it.
+#
+# The rule: a test that drives a whole-keyspace walk — runs one, or waits
+# under a deadline on one's result — runs in this tier, so it lives in one of
+# the walkers' namespaces below. Its namespace joins whole, tests that drive
+# no walk included, unless a test in it holds 10,000 keys or more at once
+# (is key-heavy). The one exception is `dr::hold_quiescence_test`, named
+# below with its measurements. The filter names whole namespaces, not tests,
+# so a test added under one joins with no edit here.
+#
+# In the lib binary: `checkpoint::checkpointer::` (the tick driver,
+# `run_one_tick`, is private to that module, so every tick-driving test lives
+# there), `storage::ext_reconcile::` and `storage::orphan_sweep::`. In the
+# integration binary:
+#
+# - `checkpoint::` (the backup repair and the recovery and restore end-to-end
+#   tests, the users of the prefix-wipe helpers), `storage::checkpointer_*`,
+#   `storage::orphan_sweep*`, `storage::postcomp_orphan_sweep*`,
+#   `storage::scan_guard*` and `grpc::presence_index_backstop_test`;
+# - the DR Job's tests, whose planner and reference recount each walk the
+#   keyspace: `dr::accept_loss_test`, `dr::restore_finish_test`,
+#   `dr::restore_memory_test`, `dr::restore_plan_test` and
+#   `dr::restore_sessions_test`;
+# - the modules of the tests that wait under a deadline on an orphan-sweep
+#   pass, whose pass 1 walks the whole keyspace: `storage::b_j9j_tests`,
+#   `storage::b_kf1_tests`, `storage::b_muu_tests`, `storage::b_ua9_tests`,
+#   `storage::retirement_budget_test` and `grpc::b_ua9_subscriber_test`.
+#
+# To add a namespace, add it to this filter and to
+# `NextestWalkFirstTierTests`'s namespace list (`WALK_FIRST_NAMESPACES`). A
+# module that comes to hold a key-heavy test leaves this filter and joins the
+# guard's key-heavy list (`WALK_FIRST_KEY_HEAVY_NAMESPACES`).
+#
+# Kept out, at the default priority:
+#
+# - the key-heavy modules, which would fill the keyspace this tier keeps
+#   small: `dr::restore_write_test` (its over-limit test, W2, restores a layer
+#   of 100,001 entries; its other tests drive the Job's walks too, but naming
+#   them one by one, or naming W2 to leave it out, would fail open when a test
+#   is renamed), `grpc::delta_size_refusal_test` (the at-limit create, about
+#   100,000 keys) and `storage::txn_timeout_test` (about 50,000 keys);
+# - the rest of `dr::`: the hold, frame and lease tests (`held_mode`,
+#   `hold_*`, `job_frame`, `job_lease`; `dr::hold_quiescence_test` apart,
+#   next bullet) drive no planner and no recount. The wait-bound `dr::`
+#   tests take 25–86 s each, mostly waiting (the 86 s is
+#   `dr::hold_quiescence_test`'s). The run is throughput-bound, so a slot
+#   spent waiting costs the same wherever it runs, and in default order they
+#   start early enough to end well before the run does. In the tier they
+#   would only take its capacity;
+# - the rule's one exception, `dr::hold_quiescence_test`. It runs the
+#   background walkers (an orphan sweep and the external-value reconcile),
+#   and its setup waits under 10 s deadlines on walk results, the backup
+#   repair's first handled value among them, and on a checkpoint under a
+#   30 s deadline (its wait helper's floor), so by the rule it would join.
+#   It stays out because it is wait-bound on its hold window: its longer
+#   test's deliberate pauses are 81 s (the 51 s write bound and the 30 s
+#   quiet window), and it measured 85.73–85.81 s in three CI runs (jobs
+#   505922306, 505943755 and 509304275), so its setup, all those waits
+#   included, took under 5 s of each. Moving it would only take the tier's
+#   capacity. The exception is this module alone: a new test elsewhere whose
+#   setup waits under a deadline on a walk joins the tier.
+#
+# The entry sets only `filter` and `priority`, so every test it matches keeps
+# its other settings: the profile's 40s × 3 kill and retry, or those of an
+# entry above that sets them. The CI-wiring guard `NextestWalkFirstTierTests`
+# fails when this entry is missing, duplicated or outside the default
+# profile, when it sets anything else, drops a namespace or takes the whole
+# of one of the three key-heavy modules above (or a wider pattern), or a test
+# of one that it reads, and when any other override, in any profile, sets a
+# priority as high as this tier's. For the key-heavy modules
+# it checks the filter against a pattern wider than the module (`^dr::`, say)
+# and against every `fn` under `#[test]` or `#[tokio::test]` in the module's
+# source, and fails closed on a missing module, zero tests or a nested
+# `mod`; tests under other attribute macros, macro-generated tests and a
+# `#[path]` remap are not read. SDD §19.5 states the rule. Verify the match
+# set with:
+#
+#   cargo nextest list --profile ci -p live-edit --lib --test integration \
+#     --features oodf-ffi/internal-bridge,test-fault-injection,test-checkpoint-fault-injection,test-support \
+#     -E '<filter>'
+#
+# and compare its count with the sum of the same command's counts filtered on
+# each namespace. The same command with
+#
+#   -E '(<filter>) and (test(/^dr::restore_write_test::/) or test(/^grpc::delta_size_refusal_test::/) or test(/^storage::txn_timeout_test::/))'
+#
+# must list no test: nextest's own reading of the filter against the
+# key-heavy modules the guard checks.
+[[profile.default.overrides]]
+filter = '(binary_id(live-edit) and (test(/^checkpoint::checkpointer::/) or test(/^storage::(ext_reconcile|orphan_sweep)::/))) or (binary_id(live-edit::integration) and (test(/^checkpoint::/) or test(/^dr::(accept_loss|restore_finish|restore_memory|restore_plan|restore_sessions)_test::/) or test(/^storage::(checkpointer_|orphan_sweep|postcomp_orphan_sweep|scan_guard)/) or test(/^storage::(b_j9j_tests|b_kf1_tests|b_muu_tests|b_ua9_tests|retirement_budget_test)::/) or test(/^grpc::(presence_index_backstop_test|b_ua9_subscriber_test)::/)))'
+priority = 100
+
+# The longest tests start next. Without a priority they sort last: the
+# proptests binary and the upload memory envelope, whose large-base group runs
+# two at a time, sort after the thousands of short integration tests. A run
+# then ends on a tail of a few long tests on an otherwise idle runner (CI
+# pipeline 75590635: the `test:` run took 474 s, its tests 4,618 s in all, the
+# longest 148 s). Durations are from that run.
+#
+# Priority 90, the tests of 60 s and more: the structural cache and
+# structural WATCH equivalence proptests and the GC ledger state machine
+# (74–148 s), and the three longest large-base stream-repair rows (52–101 s),
+# which hold the large-base group's two slots longest. They start right after
+# the walk-first tier, not first. nextest takes each setting from the first
+# override that sets it, so this entry, above the next, wins for a test both
+# match; no test matches both it and the walk-first entry.
+[[profile.default.overrides]]
+filter = '(binary_id(live-edit::proptests) and (test(/^structural_cache_equivalence::/) or test(/^structural_watch_equivalence::/) or test(/^gc_ledger_state_machine::/))) or (binary(upload_memory_envelope) and (test(=cached_hit_repairing_256_prims_under_a_parent_of_4096_children_stays_within_its_charge_fsz) or test(=cached_hit_repairing_a_child_added_to_a_long_list_stays_within_its_charge_fsz) or test(=cached_hit_repairing_a_creation_into_a_full_sections_table_stays_within_its_charge_fsz)))'
+priority = 90
+
+# Priority 50: the rest of the upload memory envelope (908 s across 106 tests,
+# twenty of them over 15 s, and the large-base group's chain of two at a time
+# among them), the b.1jt GC-lock rollout tests (30–56 s each) and the fenced
+# snapshot-read proptest (40 s).
+[[profile.default.overrides]]
+filter = 'binary(upload_memory_envelope) or (binary_id(live-edit::integration) and test(/^storage::b_1jt_rollout_tests::/)) or (binary_id(live-edit::proptests) and test(/fenced_snapshot_read/))'
+priority = 50
+
 [profile.ci]
 # Same hang kill-switch as the default profile.
 slow-timeout = { period = "40s", terminate-after = 3, grace-period = "5s" }
@@ -641,7 +972,7 @@ path = "junit.xml"
 # Keep the output of a small set of PASSING tests (b.cv4).
 #
 # nextest's default — and the right default — is to print nothing for a test
-# that passed. The filter below reaches EIGHT tests. Two of them exist to REPORT
+# that passed. The filter below reaches NINE tests. Two of them exist to REPORT
 # a measurement rather than to assert one, and for those the default silently
 # discards the entire reason the test was run:
 #
@@ -666,7 +997,7 @@ path = "junit.xml"
 # B1's output from the same run is the context that says whether the cluster was
 # healthy while B2 measured. A few extra lines, one fewer re-run.
 #
-# The last five — `snapshot_read_cluster_test`'s
+# The next five — `snapshot_read_cluster_test`'s
 # `object_snapshot_read_answers_for_an_object_on_every_shard` and
 # `snapshot_read_self_test_passes_on_every_shard` (b.y3m Epic 2 Task 4),
 # `structural_read_window_scripts_answer_for_an_object_on_every_shard` and
@@ -683,7 +1014,14 @@ path = "junit.xml"
 # `test-cluster-disruptive:` job), and the six snapshot-fence scripts on every
 # shard.
 #
-# Beyond those eight, every test whose name contains `slot_migration_disruptive`
+# The ninth — `dr::hold_poll_test`'s
+# `hold_poll_script_runs_on_the_object_id_counters_primary_in_a_cluster`
+# (b.tv3 Epic 2 Task 1) — is the same shape: it returns early after `SKIP:`
+# without `LIVE_EDIT_TEST_CLUSTER_URL`, and its `CLUSTER-GATED RAN:` line is
+# the evidence that the cluster job ran the fleet-hold poll's script on the
+# primary serving the object-id counter.
+#
+# Beyond those nine, every test whose name contains `slot_migration_disruptive`
 # (b.vn4: multi-key commands under a slot staged `MIGRATING`, meeting the real
 # `-TRYAGAIN`, in the `test-cluster-disruptive:` job) or
 # `fed_frame_flush_disruptive` (b.gbt: a write fed behind a reconnect to a
@@ -691,26 +1029,83 @@ path = "junit.xml"
 # selects them, for the same reason: a cluster-gated pass is ambiguous without
 # its `CLUSTER-GATED RAN:` line.
 #
+# And the b.gns serving-process guard's cluster-gated tests, which print the
+# same line when they ran: the five `storage::scan_guard_test::cluster_*`
+# tests (integration binary) and, by the `serving_process_guard::…cluster…`
+# pattern, ext_reconcile's two (`a_cluster_pass_whose_object_walk_misses_its_primarys_slots_forfeits`,
+# `a_cluster_walk_with_no_myself_line_fails_the_recount_as_a_missing_witness`,
+# lib binary) and `dr::restore_plan_test`'s
+# `restore_plan_on_a_cluster_exits_3_when_a_pinned_node_answers_no_myself_line`
+# (integration binary); plus `storage::scan_guard::tests::a_keyed_step_pinned_to_a_cluster_non_owner_fails_instead_of_following_the_redirect`
+# (lib binary), by exact name.
+#
+# And the b.hyw coverage walk's cluster-gated tests, which print the same
+# line: the `storage::scan_guard_test::cluster_coverage_walk_*` tests (by the
+# `scan_guard_test::cluster_` pattern above), and, by exact name,
+# `checkpoint::ext_backup_repair_test::meta_walk_faults::cluster_meta_walk_counts_a_pass_whose_walk_walked_every_primary_and_fails_one_that_skipped_a_primary`
+# (integration binary),
+# `storage::orphan_sweep::tests::scan_keyspace_on_a_cluster_ends_a_forged_verdict_with_one_error_after_its_keys`
+# and
+# `checkpoint::checkpointer::lease_tests::cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes`
+# (lib binary).
+#
+# And b.87a's (the coverage walk's routing-table check, its end re-sync, the
+# check on a client denied `CLUSTER NODES` by ACL, and the end map check),
+# which print the same line: four more `storage::scan_guard_test::cluster_coverage_walk_*`
+# tests (by the `scan_guard_test::cluster_` pattern above), one more
+# `slot_migration_disruptive` test (by that pattern), and, by exact name,
+# `checkpoint::ext_backup_repair_test::meta_walk_faults::cluster_meta_walk_fails_a_pass_whose_walk_found_its_routing_table_stale`
+# (integration binary),
+# `checkpoint::checkpointer::lease_tests::cluster_tick_whose_pass_1_walk_found_a_stale_routing_table_forfeits_the_aggregates`
+# and b.hyw's
+# `storage::orphan_sweep::tests::scan_keyspace_on_a_cluster_walks_every_primary_of_a_fresh_map`,
+# which now prints the line too (lib binary).
+#
+# And b.xb7's (the store-memory read confirming its `INFO` targets against
+# its own `CLUSTER SLOTS` map), which print the same line: one more
+# `slot_migration_disruptive` test (by that pattern; integration binary, with
+# `test-fault-injection`) and, by exact name,
+# `storage::b_yuo_store_memory_tests::a_cluster_store_is_read_on_every_primary`
+# (integration binary, the `test-cluster:` job) and
+# `storage::store_memory::tests::a_cluster_slots_cut_off_at_the_deadline_leaves_a_cluster_read_with_no_map`
+# (lib binary, the `test-cluster:` job).
+#
+# And b.f3t's (a DR Job's keyspace walk, `KeyspaceWalk::start_job`, on a
+# cluster), which print the same line: five
+# `storage::scan_guard_test::cluster_job_walk_*` tests (integration binary,
+# with `test-fault-injection`), matched by the `scan_guard_test::cluster_`
+# pattern above.
+#
 # `immediate-final` prints the output inline AND repeats it in the final
 # summary, so it survives a long scrollback; `store-success-output` puts the
 # same text in the JUnit XML, which is the durable copy (job logs expire, and
 # the XML is an artifact).
 #
-# This is scoped to exactly these eight and those two patterns on purpose. Making
-# the whole ci profile verbose would bury them again.
+# This is scoped to exactly these nine, those two patterns and the b.gns,
+# b.hyw, b.87a, b.xb7 and b.f3t tests on purpose. Making the whole ci profile verbose
+# would bury them again.
 #
 # Note on `test(=…)`: nextest's exact-match operator matches the FULL
 # binary-relative test name, module path included — a bare function name matches
 # nothing and fails open (silently no override). Verify any edit here with
 # `cargo nextest list --profile ci -p live-edit --test integration --run-ignored all -E '<filter>'`
-# and count the results; the expected match set is exactly eight: the two
+# and count the results; the expected match set is exactly nine: the two
 # `cluster_subscriber_disruptive_*` tests, A6, the four
-# `snapshot_read_cluster_test` tests and the `snapshot_fence_cluster_test` test,
-# plus each `slot_migration_disruptive` and `fed_frame_flush_disruptive` test.
-# The b.gvf disruptive test is compiled only with `test-fault-injection`, so
-# list with that feature to count it.
+# `snapshot_read_cluster_test` tests, the `snapshot_fence_cluster_test` test and
+# the `dr::hold_poll_test` test, plus each `slot_migration_disruptive` and
+# `fed_frame_flush_disruptive` test, plus the b.gns, b.hyw, b.87a, b.xb7 and
+# b.f3t tests above: twenty-two in the integration binary (eighteen
+# `scan_guard_test::cluster_*` — five b.gns, four b.hyw, four b.87a, five
+# b.f3t — one
+# `restore_plan_test`, two `ext_backup_repair_test`, one
+# `b_yuo_store_memory_tests`), and eight in the lib binary (three b.gns, three
+# b.hyw, one b.87a, one b.xb7), counted with
+# `cargo nextest list --profile ci -p live-edit --lib --features test-support,test-fault-injection -E '<filter>'`.
+# The b.gvf disruptive test and the b.gns, b.hyw, b.87a and b.f3t integration
+# tests are compiled only with `test-fault-injection`, so list with that feature to
+# count them.
 [[profile.ci.overrides]]
-filter = 'test(/cluster_subscriber_disruptive/) or test(=storage::cluster_subscriber_test::cluster_subscriber_observed_errors_are_all_classified_transient) or test(=storage::snapshot_read_cluster_test::object_snapshot_read_answers_for_an_object_on_every_shard) or test(=storage::snapshot_read_cluster_test::snapshot_read_self_test_passes_on_every_shard) or test(=storage::snapshot_read_cluster_test::structural_read_window_scripts_answer_for_an_object_on_every_shard) or test(=storage::snapshot_read_cluster_test::snapshot_read_disruptive_structural_read_falls_back_to_plain_commands_during_a_slot_migration) or test(=storage::snapshot_fence_cluster_test::snapshot_fence_scripts_run_for_an_object_on_every_shard) or test(/slot_migration_disruptive/) or test(/fed_frame_flush_disruptive/)'
+filter = 'test(/cluster_subscriber_disruptive/) or test(=storage::cluster_subscriber_test::cluster_subscriber_observed_errors_are_all_classified_transient) or test(=storage::snapshot_read_cluster_test::object_snapshot_read_answers_for_an_object_on_every_shard) or test(=storage::snapshot_read_cluster_test::snapshot_read_self_test_passes_on_every_shard) or test(=storage::snapshot_read_cluster_test::structural_read_window_scripts_answer_for_an_object_on_every_shard) or test(=storage::snapshot_read_cluster_test::snapshot_read_disruptive_structural_read_falls_back_to_plain_commands_during_a_slot_migration) or test(=storage::snapshot_fence_cluster_test::snapshot_fence_scripts_run_for_an_object_on_every_shard) or test(=dr::hold_poll_test::hold_poll_script_runs_on_the_object_id_counters_primary_in_a_cluster) or test(/slot_migration_disruptive/) or test(/fed_frame_flush_disruptive/) or test(/^storage::scan_guard_test::cluster_/) or test(/serving_process_guard::.*cluster/) or test(=storage::scan_guard::tests::a_keyed_step_pinned_to_a_cluster_non_owner_fails_instead_of_following_the_redirect) or test(=storage::orphan_sweep::tests::scan_keyspace_on_a_cluster_ends_a_forged_verdict_with_one_error_after_its_keys) or test(=checkpoint::checkpointer::lease_tests::cluster_tick_whose_pass_1_walk_walked_every_primary_but_proved_no_owner_still_publishes) or test(=checkpoint::ext_backup_repair_test::meta_walk_faults::cluster_meta_walk_counts_a_pass_whose_walk_walked_every_primary_and_fails_one_that_skipped_a_primary) or test(=storage::orphan_sweep::tests::scan_keyspace_on_a_cluster_walks_every_primary_of_a_fresh_map) or test(=checkpoint::checkpointer::lease_tests::cluster_tick_whose_pass_1_walk_found_a_stale_routing_table_forfeits_the_aggregates) or test(=checkpoint::ext_backup_repair_test::meta_walk_faults::cluster_meta_walk_fails_a_pass_whose_walk_found_its_routing_table_stale) or test(=storage::b_yuo_store_memory_tests::a_cluster_store_is_read_on_every_primary) or test(=storage::store_memory::tests::a_cluster_slots_cut_off_at_the_deadline_leaves_a_cluster_read_with_no_map)'
 success-output = "immediate-final"
 junit = { store-success-output = true }
 

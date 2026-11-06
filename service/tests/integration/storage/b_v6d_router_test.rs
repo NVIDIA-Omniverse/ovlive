@@ -71,7 +71,14 @@
 //! | [`overwrite_commit_redirect::finisher_syncs_on_its_first_run_and_again_after_a_redirect_class_failure`] | b.ua9 finisher | an overwrite that gave up (both runs failed, injected `IO`) leaves its finisher; the finisher's first run fails `IO`, its second with the injected `-ASK` shape, its third commits: the routing-sync counter reads 3 (the call's repeated run, the finisher's first and third) |
 //! | [`overwrite_commit_redirect::finisher_resyncs_after_a_write_attempts_exhausted_failure`] | b.ua9 finisher | the same with the second run failing "Too many failed write attempts." (the shape a dropped connection or a `MOVED` gives a `txn_pool` command): the counter reads 3 — the extra sync after a dropped connection the finisher accepts |
 //! | [`overwrite_commit_redirect::finisher_does_not_resync_after_an_io_failure`] | b.ua9 finisher | the same with a plain `IO` second run, which the redirect-class classifier does not match: the counter reads 2 (the call's repeated run and the finisher's first) |
-//! | [`redirected_transaction_resync::redirected_session_checkpoint_step_b_resyncs_its_checkout_and_warns_on_a_slow_sync`] | b.cyu | session recovery whose Step B `EXEC` the facade answers `-ASK` (through the reply-rewriting proxy, `AskFacade::start_redirecting_exec`): `Transient` with "Max redirections exceeded", `exec_txn`'s re-sync counted once, and, its `CLUSTER SLOTS` held past the command timeout, one timed-out re-sync WARN naming the Step B transaction with the session-meta key as `key` |
+//! | [`redirected_transaction_resync::redirected_session_checkpoint_step_a_resyncs_its_checkout_and_warns_on_a_slow_sync`] | b.cyu | session recovery whose Step A `EXEC` the facade answers `-ASK` (through the reply-rewriting proxy, `AskFacade::start_redirecting_exec`): `Transient` with "Max redirections exceeded", `exec_txn`'s re-sync counted once, and, its `CLUSTER SLOTS` held past the command timeout, one timed-out re-sync WARN naming the Step A transaction with the path-index key as `key` (on-access recovery's record step is a script, not a transaction) |
+//! | [`txn_routing_stale::only_a_txn_redirect_refusal_marks_the_pool_stale_and_each_member_then_resyncs_once`] | b.4q2 I1 | the redirect refusal on the data pool, the other budget shapes on the `txn_pool`, and the refusal through an origin without the client mark nothing; the `txn_pool`'s `Routing` "Too many redirections." marks the pool (epoch 1), after which a checkout of every slot re-syncs each once and a second checkout re-syncs none |
+//! | [`txn_routing_stale::a_redirected_transaction_marks_the_pool_stale_and_records_its_own_member_synced`] | b.4q2 I1 | a redirected `DeleteSession` `EXEC`: `exec_txn` re-syncs its member once and marks the pool (epoch 1); its own mark, so that member is recorded at epoch 1 and a checkout of every slot re-syncs all but it |
+//! | [`txn_routing_stale::a_redirected_transaction_whose_resync_overlaps_another_mark_leaves_its_member_owing_a_resync`] | b.4q2 I1 | the same with another mark accepted while the re-sync's `CLUSTER SLOTS` is held: the transaction's own mark (epoch 2) is not the one after the epoch read before its sync, so the member is recorded at 0 and re-syncs at its next checkout |
+//! | [`txn_routing_stale::a_new_layers_repeated_commit_run_after_its_redirect_marked_the_pool_stale_syncs_once`] | b.4q2 I1 | a new layer's first commit `EVALSHA` answered a real `-ASK`: the receipt marks the pool (epoch 1), the second run issues exactly one routing sync, its own, the client's whole sync counter included, and its checkout still records the pool's epoch for its slot |
+//! | [`txn_routing_stale::a_checkout_whose_resync_times_out_returns_logs_once_and_records_the_pool_epoch`] | b.4q2 I1 | after a real `-ASK` marks the pool, a checkout's re-sync whose `CLUSTER SLOTS` is held past the command timeout: the checkout still returns, one timed-out re-sync WARN, and the slot recorded at the pool's epoch |
+//! | [`txn_routing_stale::a_slot_swapped_in_after_a_mark_made_while_its_fresh_client_connected_owes_a_resync`] | b.4q2 I1 | a slot replacement held after its epoch read (the `hold_txn_replacement_after_epoch_read_for_test` seam); the pool is marked and the old client's checkout records the new epoch; the swap overwrites the slot down to the epoch read before the mark, and the fresh client's next checkout re-syncs |
+//! | [`txn_redirect_refusal_shape::is_txn_redirect_refusal_matches_only_routing_too_many_redirections`] | b.4q2 | the classifier the mark and the commit marker share: kind-gated, prefix-anchored (needs no feature) |
 //!
 //! T37 (the storm guard's delay function) is a unit test beside
 //! `router_restart_delay` in `src/storage/router_supervisor.rs`; T39 (the six
@@ -95,11 +102,11 @@
 //! T38 and the defer-9 tests drive the txn checkout's `ProbeFaultInjector`,
 //! the R4-1 and finisher tests read `LayerStore`'s create-commit routing-sync
 //! counter (the finisher tests also its commit-fault queue and finisher
-//! timing), and
-//! the b.cyu Step B test reads `ValkeyClient::txn_routing_syncs_for_test`:
-//! all are `test-fault-injection` seams, and those tests are compiled out
-//! without that feature. Everything else needs only Valkey and `test-support`
-//! (for `ValkeyClient::end_router_for_test`).
+//! timing), and the b.cyu Step B test and the b.4q2 `txn_routing_stale` tests
+//! read `ValkeyClient::txn_routing_syncs_for_test`: all are
+//! `test-fault-injection` seams, and those tests are compiled out without that
+//! feature. Everything else needs only Valkey and `test-support` (for
+//! `ValkeyClient::end_router_for_test`).
 //!
 //! # Wait budget
 //!
@@ -120,10 +127,10 @@
 //! |---|---|---|
 //! | T33 (a) | connect, the commit, the `PING`s | 50 s |
 //! | T33 (b) | connect, the refused call, the `PING`s, the re-send | 60 s |
-//! | T33 (c) | connect, the subscription start, two `recv`s, the trap, the commit, the blocked-read wait, the `PING`s | 100 s |
+//! | T33 (c) | connect, the subscription start, two `recv`s, the trap, the commit, the blocked-read wait, the read's unblock (`unblock_reader_read`'s poll), the `PING`s | 110 s |
 //! | T33 control | connect, the `PING` | 40 s |
 //! | T34 | connect, the trap, the in-flight `GET` (the update's own `SETTLE` runs alongside) | 50 s |
-//! | T35 multiplexed | connect, the precondition `PING`, the restart phase, the reconnect; the stream reader's variant first connects its reader (the subscription start, the connected wait, the blocked-read wait) | 60 s; 90 s for the stream reader |
+//! | T35 multiplexed | connect, the precondition `PING`, the restart phase, the reconnect; the stream reader's variant first connects its reader (the subscription start, the connected wait, the blocked-read wait, the read's unblock) | 60 s; 100 s for the stream reader |
 //! | T35 pub/sub | connect, the restart phase, the `PUBLISH` loop, the reconnect | 60 s |
 //! | T35 txn | connect, the precondition phase, two restart phases, the reconnect | 70 s |
 //! | T35 txn permit / guard | connect, the opening checkout(s), the parked phase, the repaired phase | 60 s |
@@ -136,26 +143,42 @@
 //! | R4-1 slow sync | connect, the overwrite (`SLOW_SLOTS_DELAY` + `SETTLE`, 17.5 s), the update | 57.5 s |
 //! | finisher syncs (each of three) | connect, the overwrite, the poll for the finisher's landing, `wait_for_cleanup` | 60 s |
 //! | b.cyu Step B slow re-sync | connect, the recovery (`SLOW_SLOTS_DELAY` + `SETTLE`, 17.5 s) | 47.5 s |
+//! | b.4q2 marks only on the refusal | connect, three checkouts of every slot | 60 s |
+//! | b.4q2 own mark | connect, the delete, a checkout of every slot | 50 s |
+//! | b.4q2 overlapping mark | connect, the wait for the held sync, the delete (`SLOW_SLOTS_DELAY` + `SETTLE`), a checkout of every slot | 67.5 s |
+//! | b.4q2 repeated run syncs once | connect, the create, a checkout of every slot | 50 s |
+//! | b.4q2 checkout re-sync times out | connect, the trap checkout, the trap `GET`, the checkout (command timeout + `SETTLE`, 15 s) | 65 s |
+//! | b.4q2 swapped slot | connect, the two rendezvous, the old client's checkout, the swap's completion, the fresh client's checkout | 80 s |
 //!
 //! On top of that, some steps are bounded only by fred's 5 s command timeout:
 //! the setup commands of `layer()` (T33, T34, R4-1, the finisher tests), the
-//! R4-1 mapping `GET`, and the finisher tests' counter `GET` and the one
-//! mapping `GET` of their poll that may overrun its deadline; `SUBSCRIBE`,
+//! R4-1 mapping `GET`, the b.4q2 tests' session creates and mapping `GET`,
+//! and the finisher tests' counter `GET` and the one mapping `GET` of their
+//! poll that may overrun its deadline; `SUBSCRIBE`,
 //! `PUBLISH` (one may overrun the `PUBLISH` loop's deadline, plus its 200 ms
 //! receive window) and
 //! `UNSUBSCRIBE` in T35 pub/sub; `CLIENT ID` and `CLIENT KILL` in T35 (four
-//! `CLIENT ID`s in the guard test); the uncontended checkout and the `GET` in
-//! T33 control; the two `CLIENT ID`s in T38; the `CLIENT ID`s of the defer-9
-//! tests (three each, four back to back). T35 pub/sub reaches about 85 s, and
-//! defer-9 back to back, 85 s named plus four `CLIENT ID`s, about 105 s; T33
-//! (c), the longest named total, leaves 20 s of nextest's 120 s hang-killer
-//! for `layer()`'s setup commands. The closing `ValkeyClient::quit()` and
+//! `CLIENT ID`s in the guard test); the `CLIENT UNBLOCK` and the poll's last
+//! `CLIENT LIST` of each read unblock (`unblock_reader_read`, b.9sh) in T33
+//! (c) and T35's stream-reader variant; the uncontended checkout and the `GET`
+//! in T33 control; the two `CLIENT ID`s in T38; the `CLIENT ID`s of the
+//! defer-9 tests (three each, four back to back). T35 pub/sub reaches about
+//! 85 s, and defer-9 back to back, 85 s named plus four `CLIENT ID`s, about
+//! 105 s. T33 (c), 110 s named, and T35's stream-reader variant, 100 s, pass
+//! nextest's 120 s hang-killer once `layer()`'s setup commands and those
+//! 5 s commands are added, so `.config/nextest.toml` raises the deadline of
+//! every test in this module to 180 s, which every worst case here stays
+//! under; a test added to the module gets that deadline with no edit there,
+//! but its worst case must stay under 180 s too. The closing
+//! `ValkeyClient::quit()` and
 //! `TestValkey`'s drop-time cleanup carry their own bounds. The healthy path
 //! takes well under a second, except in the defer-9 tests, which wait out a
-//! held `DISCARD` by construction (about 3 s, 5 s and 8 s), and in the two
+//! held `DISCARD` by construction (about 3 s, 5 s and 8 s), and in the four
 //! slow-sync tests, which wait out a held `CLUSTER SLOTS` (about 7.5 s for
-//! the R4-1 overwrite; the b.cyu Step B recovery waits out the 5 s command
-//! timeout on it, about 7 s for the whole test).
+//! the R4-1 overwrite; the b.cyu Step B recovery, the b.4q2 redirected
+//! `DeleteSession` with an overlapping mark, and the b.4q2 checkout re-sync
+//! each wait out the 5 s command timeout on it, about 7 to 8 s for the whole
+//! test).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -183,7 +206,9 @@ use live_edit::storage::test_support::{connect_test_client, TestValkey};
 
 use crate::common::owned_delta::delta_with_set_field_inline;
 use crate::grpc::log_capture::{assert_field, Captured, ThreadCapture};
-use crate::storage::mux_test_helpers::{await_reader_blocked_in_xread, connect_reader_zero};
+use crate::storage::mux_test_helpers::{
+    await_reader_blocked_in_xread, connect_reader_zero, unblock_reader_read,
+};
 use crate::storage::snapshot_read_support::{
     error_reply_script, test_valkey_addr, ConnProxyRule, ProxyAction, ScriptReplyProxy,
 };
@@ -359,8 +384,11 @@ struct AskFacade {
     port: u16,
     trap: Trap,
     /// `CLUSTER SLOTS` frames the facade received after its trap fired: a
-    /// cluster routing sync that reached the wire. Read only by the
-    /// `test-fault-injection` R4-1 tests.
+    /// cluster routing sync that reached the wire. Read only by
+    /// `test-fault-injection` tests: the R4-1 tests, the b.4q2
+    /// overlapping-mark test, which waits for its held sync to arrive, and
+    /// the b.4q2 checkout re-sync timeout test, which checks its re-sync
+    /// reached the facade.
     #[cfg_attr(not(feature = "test-fault-injection"), allow(dead_code))]
     slots_after_trap: Arc<AtomicUsize>,
 }
@@ -372,9 +400,11 @@ enum SlotsAfterTrap {
     Answer,
     /// The same map, but the FIRST `CLUSTER SLOTS` after the trap is answered
     /// only after [`SLOW_SLOTS_DELAY`], past the client's 5 s command timeout:
-    /// the routing sync before an overwrite's second try, or `exec_txn`'s
-    /// re-sync after a redirected transaction, times out. Used only by the
-    /// `test-fault-injection` R4-1 and b.cyu Step B tests.
+    /// the routing sync before an overwrite's second try, `exec_txn`'s
+    /// re-sync after a redirected transaction, or a checkout's re-sync after
+    /// the pool was marked stale, times out. Used only by `test-fault-injection`
+    /// tests: R4-1, b.cyu Step B, and the b.4q2 overlapping-mark and checkout
+    /// re-sync tests.
     #[cfg_attr(not(feature = "test-fault-injection"), allow(dead_code))]
     Slow,
 }
@@ -392,18 +422,26 @@ enum SlotsAfterTrap {
 /// - **below 2T**: the second try's `EVALSHA` is queued behind the sync at
 ///   about T, under its own T deadline, so it must be served before 2T.
 /// - **below fred's 10 s `internal_command_timeout`**, which bounds the
-///   backchannel `CLUSTER SLOTS` the sync sends. Past it,
-///   `cluster_slots_backchannel` (`vendor/fred-10.1.0/src/router/clustered.rs:425-430`,
-///   `:469-477`) falls back to `connect_any` and sends a fresh `CLUSTER SLOTS`
-///   in the same sync attempt; the facade holds only the first one after the
-///   trap, so it answers that one at once and the sync completes at about
-///   10 s — too late for the queued `EVALSHA`'s 2T deadline.
+///   `CLUSTER SLOTS` the sync sends, on the connection `connect_any` opens for
+///   it (`cluster_slots_backchannel`,
+///   `vendor/fred-10.1.0/src/router/clustered.rs:469-478`; no client here
+///   stores a backchannel for a sync to reuse, since the vendored fred drops
+///   that connection when its sync ends, change 11). Past it the request
+///   fails, the sync attempt with it, and fred's sync retry opens another
+///   connection and sends a fresh `CLUSTER SLOTS`; the facade holds only the
+///   first one after the trap, so it answers that one at once and the sync
+///   completes at about 10 s — too late for the queued `EVALSHA`'s 2T
+///   deadline.
 ///
-/// (The last two limits serve the overwrite's second try; the b.cyu Step B
-/// recovery sends nothing behind its re-sync, so only the first binds it.)
+/// (The last two limits serve the overwrite's second try. The b.cyu Step B
+/// recovery and the b.4q2 redirected `DeleteSession` send nothing behind
+/// their re-sync, so only the first binds them. The b.4q2 checkout re-sync
+/// sends its hygiene probe behind it, whose 650 ms budget the held reply
+/// outlasts: that checkout may recycle its slot, a repair bounded at about
+/// 8.15 s, which its test's budget covers.)
 ///
-/// The overwrite, and the Step B recovery, carrying it are given [`SETTLE`]
-/// on top of this delay.
+/// The overwrite, the Step B recovery and the redirected `DeleteSession`
+/// carrying it are given [`SETTLE`] on top of this delay.
 #[cfg_attr(not(feature = "test-fault-injection"), allow(dead_code))]
 const SLOW_SLOTS_DELAY: Duration = Duration::from_millis(7_500);
 
@@ -462,6 +500,36 @@ impl AskFacade {
             true,
         )
         .await
+    }
+
+    /// [`Self::start_redirecting_exec`] answering `-ASK` to the `EXEC` of the
+    /// transaction whose connection queued `cmd` naming the key the test puts
+    /// in the returned slot (`None`, the default, arms nothing: a fixture's
+    /// own setup passes through).
+    #[cfg(feature = "test-fault-injection")]
+    async fn start_trapping_exec_after(
+        cmd: &'static [u8],
+        slots_after_trap: SlotsAfterTrap,
+    ) -> (Self, Arc<std::sync::Mutex<Option<String>>>) {
+        let key: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let queued_on = Arc::new(AtomicUsize::new(usize::MAX));
+        let facade = {
+            let (key, queued_on) = (Arc::clone(&key), Arc::clone(&queued_on));
+            Self::start_redirecting_exec("ASK", slots_after_trap, move |conn, args| {
+                let Some(key) = key.lock().unwrap().clone() else {
+                    return false;
+                };
+                if names(args, cmd, &key) {
+                    queued_on.store(conn, Ordering::SeqCst);
+                    return false;
+                }
+                args.first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(b"EXEC"))
+                    && queued_on.load(Ordering::SeqCst) == conn
+            })
+            .await
+        };
+        (facade, key)
     }
 
     async fn start_inner(
@@ -798,21 +866,22 @@ async fn ask_on_a_reader_xread_leaves_every_reader_serving() {
         "the delivery must be the commit made after the -ASK; got {delivered:?}"
     );
 
-    // Each reader is parked in its next XREAD BLOCK, and a `PING` on its
-    // client interrupts that read (`Blocking::Interrupt`) — but only if no
-    // read is in flight that fred has not yet marked blocked, and only if the
-    // reader does not re-issue its read ahead of the `PING`. So: wait until
-    // the server shows every reader blocked in its XREAD (fred marks a read
-    // blocked just after writing it), then drop the subscription before the
-    // `PING`s. A subscription leaving does not wake the read, and the reader
-    // applies the removal before it plans another, so once a `PING`
-    // interrupts the read the reader has nothing to re-issue and the `PING`
-    // is answered.
+    // Each reader is parked in its next XREAD BLOCK, and under fred's default
+    // `Blocking::Block` a `PING` on its client would wait out that read's
+    // BLOCK. So: wait until the server shows every reader blocked in its
+    // XREAD, drop the subscription, then end each read from the data pool
+    // (`unblock_reader_read`). A subscription leaving does not wake the read,
+    // and the reader applies the removal before it plans another, so once its
+    // read is unblocked the reader has nothing to re-issue and the `PING` is
+    // answered.
     let readers = tv.client().stream_mux.reader_clients_for_test();
     for reader in &readers {
         await_reader_blocked_in_xread(tv.client().pool.next(), reader).await;
     }
     drop(consumer);
+    for reader in &readers {
+        unblock_reader_read(tv.client().pool.next(), reader).await;
+    }
     assert_every_member_answers_ping(&readers, "subscriber_pool").await;
     drop(facade.proxy);
 }
@@ -1945,6 +2014,7 @@ mod overwrite_commit_redirect {
                 &state,
                 Arc::new(MockExternalValueStore::new()),
                 None,
+                &live_edit::storage::layer::CreateCommitMarker::new(),
             ),
         ))
         .await;
@@ -2152,6 +2222,7 @@ mod overwrite_commit_redirect {
                 },
                 Arc::new(MockExternalValueStore::new()),
                 None,
+                &live_edit::storage::layer::CreateCommitMarker::new(),
             ),
         )
         .await
@@ -2245,8 +2316,6 @@ mod overwrite_commit_redirect {
 
 #[cfg(feature = "test-fault-injection")]
 mod redirected_transaction_resync {
-    use std::sync::Mutex;
-
     use live_edit::checkpoint::adapters::InMemoryCheckpointStore;
     use live_edit::checkpoint::{
         CheckpointError, CheckpointMeta, CheckpointStore, SessionCheckpoint, SessionRecoveryHook,
@@ -2257,67 +2326,51 @@ mod redirected_transaction_resync {
     use crate::grpc::log_capture::capture;
 
     /// The WARN `ValkeyClient::exec_txn`'s re-sync logs when the routing sync
-    /// after Step B's redirected transaction outlives its bound.
-    const STEP_B_SYNC_TIMED_OUT: &str = "Cluster routing sync of a txn-pool connection after the \
-                                         session checkpoint apply Step B transaction was \
+    /// after Step A's redirected transaction outlives its bound.
+    const STEP_A_SYNC_TIMED_OUT: &str = "Cluster routing sync of a txn-pool connection after the \
+                                         session checkpoint apply Step A transaction was \
                                          redirected timed out";
 
     /// What fred's transaction router fails a redirected transaction with.
     const REDIRECTED: &str = "Max redirections exceeded";
 
-    /// Session recovery through the clustered facade, whose Step B `EXEC`
-    /// (the transaction that queued the session-meta `HSET`) is answered
+    /// Session recovery through the clustered facade, whose Step A `EXEC`
+    /// (the transaction that queued the path-index `SADD`) is answered
     /// `-ASK`. The `txn_pool` follows no redirect, so fred fails the
     /// transaction "Max redirections exceeded" and `exec_txn` re-syncs the
     /// checkout's cluster routing before the applier sees the error: the sync
     /// counter rises by exactly one. The facade holds that sync's
     /// `CLUSTER SLOTS` past the client's command timeout, so the re-sync logs
-    /// its timed-out WARN — once, naming the Step B transaction and carrying
-    /// the session-meta key the checkout was pinned to as `key` — and the
+    /// its timed-out WARN — once, naming the Step A transaction and carrying
+    /// the path-index key the checkout was pinned to as `key` — and the
     /// applier still answers `Transient` with the transaction's error.
     ///
-    /// Step B's first behavioural test of the re-sync: a standalone store
+    /// Step A is on-access recovery's one transaction: its record step
+    /// (Step B) is a script on the data pool, which follows redirects. The
+    /// restore Job's Step B, the applier's other transaction, sends its
+    /// `EXEC` through the same `exec_txn` call shape, which
+    /// `txn_exec_routing_guard_test` checks statically. A standalone store
     /// never syncs (the sync is skipped on a non-clustered client), and the
     /// cluster-gated `b_cyu_slot_migration_test` reaches only `DeleteSession`
     /// and `CreateLayer`. Without the re-sync the counter stays put and no
     /// WARN is logged. Slow by construction: the call waits out the client's
     /// 5 s command timeout on the held sync.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn redirected_session_checkpoint_step_b_resyncs_its_checkout_and_warns_on_a_slow_sync() {
-        // The session-meta key, once known: the trap fires on the `EXEC` of
-        // the connection that queued an `HSET` of it.
-        let meta_key: Arc<Mutex<Option<String>>> = Arc::default();
-        let queued_on = Arc::new(AtomicUsize::new(usize::MAX));
-        let facade = {
-            let (meta_key, queued_on) = (Arc::clone(&meta_key), Arc::clone(&queued_on));
-            AskFacade::start_redirecting_exec(
-                "ASK",
-                SlotsAfterTrap::Slow,
-                move |conn, args: &[Vec<u8>]| {
-                    let Some(key) = meta_key.lock().unwrap().clone() else {
-                        return false;
-                    };
-                    if names(args, b"HSET", &key) {
-                        queued_on.store(conn, Ordering::SeqCst);
-                        return false;
-                    }
-                    args.first()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(b"EXEC"))
-                        && queued_on.load(Ordering::SeqCst) == conn
-                },
-            )
-            .await
-        };
+    async fn redirected_session_checkpoint_step_a_resyncs_its_checkout_and_warns_on_a_slow_sync() {
+        // The path-index key, once known: the trap fires on the `EXEC` of the
+        // connection that queued an `SADD` of it.
+        let (facade, path_index_key) =
+            AskFacade::start_trapping_exec_after(b"SADD", SlotsAfterTrap::Slow).await;
         let tv = facade.test_valkey(4).await;
 
-        let session_id = format!("bcyu-step-b-{}", uuid::Uuid::new_v4());
-        let base_path = format!("/bcyu-step-b/{session_id}");
+        let session_id = format!("bcyu-step-a-{}", uuid::Uuid::new_v4());
+        let base_path = format!("/bcyu-step-a/{session_id}");
         let mut checkpoint = SessionCheckpoint {
             schema_version:
                 live_edit::checkpoint::session_payload::SESSION_CHECKPOINT_SCHEMA_VERSION,
             session_id: session_id.clone(),
-            name: "bcyu-step-b".to_owned(),
-            base_path,
+            name: "bcyu-step-a".to_owned(),
+            base_path: base_path.clone(),
             created_by: "bv6d-user".to_owned(),
             created_at: 1_700_000_000_000_000,
             layer_mappings: Default::default(),
@@ -2325,7 +2378,7 @@ mod redirected_transaction_resync {
             path_name_members: Default::default(),
             path_index_session_id_member: session_id.clone(),
         };
-        checkpoint.add_path_name_member("bcyu-step-b", &session_id);
+        checkpoint.add_path_name_member("bcyu-step-a", &session_id);
         let store = Arc::new(InMemoryCheckpointStore::new());
         store
             .put_session_checkpoint(
@@ -2342,10 +2395,10 @@ mod redirected_transaction_resync {
             tv.client().clone(),
             tv.key_schema().clone(),
             Arc::new(config),
-            Arc::new(crate::common::metrics_scrape_only("bcyu-step-b")),
+            Arc::new(crate::common::metrics_scrape_only("bcyu-step-a")),
         );
-        let session_meta_key = tv.key_schema().session_meta(&session_id);
-        *meta_key.lock().unwrap() = Some(session_meta_key.clone());
+        let pinned_key = tv.key_schema().path_index(&base_path);
+        *path_index_key.lock().unwrap() = Some(pinned_key.clone());
 
         let syncs_before = tv.client().txn_routing_syncs_for_test();
         let (outcome, captured) = capture(tokio::time::timeout(
@@ -2359,18 +2412,18 @@ mod redirected_transaction_resync {
         assert_eq!(
             facade.trap.fired(),
             1,
-            "precondition: Step B's EXEC was answered -ASK; recovery answered {outcome:?}"
+            "precondition: Step A's EXEC was answered -ASK; recovery answered {outcome:?}"
         );
         match &outcome {
             SessionRecoveryOutcome::Error(CheckpointError::Transient { source }) => {
                 let source = source.to_string();
                 assert!(
-                    source.contains("Step B") && source.contains(REDIRECTED),
-                    "Step B's redirected transaction answers Transient with fred's \
+                    source.contains("Step A") && source.contains(REDIRECTED),
+                    "Step A's redirected transaction answers Transient with fred's \
                      {REDIRECTED:?}; got {source}"
                 );
             }
-            other => panic!("a redirected Step B answers Transient; got {other:?}"),
+            other => panic!("a redirected Step A answers Transient; got {other:?}"),
         }
         assert_eq!(
             syncs, 1,
@@ -2383,19 +2436,19 @@ mod redirected_transaction_resync {
                 event["level"] == "WARN"
                     && event["fields"]["message"]
                         .as_str()
-                        .is_some_and(|m| m.starts_with(STEP_B_SYNC_TIMED_OUT))
+                        .is_some_and(|m| m.starts_with(STEP_A_SYNC_TIMED_OUT))
             })
             .collect();
         assert_eq!(
             warnings.len(),
             1,
-            "the re-sync that outlives its bound logs one WARN naming the Step B transaction. \
+            "the re-sync that outlives its bound logs one WARN naming the Step A transaction. \
              Full capture:\n{}",
             captured.text
         );
         assert_eq!(
             warnings[0]["fields"]["key"].as_str(),
-            Some(session_meta_key.as_str()),
+            Some(pinned_key.as_str()),
             "the re-sync WARN carries the key the checkout was pinned to as `key`: {}",
             warnings[0]
         );
@@ -2405,5 +2458,675 @@ mod redirected_transaction_resync {
             warnings[0]
         );
         drop(facade.proxy);
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// b.4q2 — a redirect on one txn-pool member marks the pool's routing stale
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "test-fault-injection")]
+mod txn_routing_stale {
+    //! The `txn_pool`'s routing epochs, driven through a real clustered client
+    //! (the facade): a redirect a member meets marks the pool's routing stale,
+    //! and every member re-syncs at its next checkout, once per mark
+    //! (`storage::checkout`, *Keeping every slot's cluster routing current*).
+    //! The facade is one node owning every slot, so each re-sync re-reads the
+    //! same routing: these tests count the syncs and read the epochs, and do
+    //! not reproduce a stale member rerouted (the cluster-gated
+    //! `b_cyu_slot_migration_test` does). The gate and epoch arithmetic are
+    //! unit tests beside `RoutingEpochs` in `src/storage/checkout.rs`.
+    //!
+    //! Every client here is the test's own, so its pool's epoch starts at zero
+    //! and its mark gate open. `txn_routing_syncs_for_test` counts every
+    //! `sync_txn_checkout_routing` the client issues, whatever its caller.
+
+    use std::collections::HashSet;
+
+    use fred::error::{Error as FredError, ErrorKind as FredErrorKind};
+
+    use live_edit::storage::client::{
+        is_txn_redirect_refusal, FredErrOrigin, BUDGET_EXHAUSTED_SHAPES, POOL_LABEL_DATA,
+        POOL_LABEL_TXN,
+    };
+    use live_edit::storage::layer::CreateCommitMarker;
+    use live_edit::storage::lua::CREATE_LAYER_COMMIT_SCRIPT;
+
+    use super::*;
+    use crate::grpc::log_capture::capture;
+
+    /// What fred's transaction router fails a redirected transaction with.
+    const REDIRECTED: &str = "Max redirections exceeded";
+
+    /// A fred error from row `index` of [`BUDGET_EXHAUSTED_SHAPES`]: row 0 is
+    /// `Unknown` "Too many failed write attempts.", row 1 `Routing` "Too many
+    /// redirections." (the `txn_pool`'s redirect refusal), row 2 `Routing`
+    /// "Max attempts reached.".
+    fn shape(index: usize) -> FredError {
+        let (kind, message) = BUDGET_EXHAUSTED_SHAPES[index].clone();
+        FredError::new(kind, message)
+    }
+
+    /// Check out every `txn_pool` slot at once — each checkout held while the
+    /// next is taken, so each takes a different slot — then release them all.
+    /// Answers how many routing syncs those checkouts issued.
+    async fn syncs_of_checking_out_every_slot(client: &ValkeyClient) -> usize {
+        let before = client.txn_routing_syncs_for_test();
+        let held = tokio::time::timeout(SETTLE, async {
+            let mut held = Vec::new();
+            for _ in 0..client.txn_pool.slots() {
+                held.push(client.acquire_txn().await);
+            }
+            held
+        })
+        .await
+        .expect("checking out every txn-pool slot did not settle within its budget");
+        let ids: HashSet<String> = held
+            .iter()
+            .map(|c| ClientLike::id(&**c).to_owned())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            client.txn_pool.slots(),
+            "precondition: each held checkout took a different slot"
+        );
+        drop(held);
+        client.txn_routing_syncs_for_test() - before
+    }
+
+    /// Only a `txn_pool` command's redirect refusal — `Routing` "Too many
+    /// redirections.", received through a `txn_pool` origin that carries the
+    /// client — marks the pool's routing stale. The same error received on
+    /// the data pool does not, nor do the other budget shapes on the
+    /// `txn_pool` ("Too many failed write attempts.", which does not prove a
+    /// redirect; "Max attempts reached."), nor the redirect shape through an
+    /// origin without the client. The negatives run first, while the mark
+    /// gate is open, so a wrong mark would advance the epoch rather than be
+    /// dropped by the gate.
+    ///
+    /// Then the mark's effect: every member re-syncs at its next checkout,
+    /// exactly once. A control run of checkouts before the mark syncs
+    /// nothing; one after it syncs each slot once; a second one syncs none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_txn_redirect_refusal_marks_the_pool_stale_and_each_member_then_resyncs_once() {
+        let facade = AskFacade::start(|_| false, Duration::ZERO, |_| None).await;
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client();
+        assert_eq!(
+            syncs_of_checking_out_every_slot(client).await,
+            0,
+            "control: before any mark no checkout re-syncs"
+        );
+
+        FredErrOrigin::client(client, POOL_LABEL_DATA).observe_error(&shape(1));
+        FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(&shape(0));
+        FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(&shape(2));
+        FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(&FredError::new(
+            FredErrorKind::Unknown,
+            "Too many redirections.",
+        ));
+        FredErrOrigin::metrics(None, POOL_LABEL_TXN, client.store_oom_signal())
+            .observe_error(&shape(1));
+        assert_eq!(
+            (
+                client.txn_pool.routing_stale_triggers_for_test(),
+                client.txn_pool.routing_epoch_for_test()
+            ),
+            (0, 0),
+            "none of those errors reaches the routing-stale mark"
+        );
+
+        FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(&shape(1));
+        assert_eq!(
+            (
+                client.txn_pool.routing_stale_triggers_for_test(),
+                client.txn_pool.routing_epoch_for_test()
+            ),
+            (1, 1),
+            "a txn-pool redirect refusal marks the pool's routing stale"
+        );
+
+        assert_eq!(
+            syncs_of_checking_out_every_slot(client).await,
+            client.txn_pool.slots(),
+            "after the mark every member re-syncs at its next checkout"
+        );
+        assert_eq!(
+            client.txn_pool.slot_routing_epochs_for_test(),
+            vec![1; client.txn_pool.slots()],
+            "each re-synced slot is recorded at the pool's epoch"
+        );
+        assert_eq!(
+            syncs_of_checking_out_every_slot(client).await,
+            0,
+            "once synced for a mark, no member re-syncs again for it"
+        );
+        drop(facade.proxy);
+    }
+
+    /// A fred `Transaction` the facade redirects (its `EXEC` answered `-ASK`;
+    /// `DeleteSession`): fred fails it "Max redirections exceeded",
+    /// `exec_txn` re-syncs the transaction's own member (one sync) and marks
+    /// the pool's routing stale (epoch 1). The mark is its own — the epoch it
+    /// produced is the one read before the sync plus one — so that member is
+    /// recorded synced at it, and its next checkout does not re-sync again:
+    /// a checkout of every slot afterwards re-syncs every member but that one.
+    /// Recording the epoch read before the sync instead would cost that member
+    /// one more sync here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirected_transaction_marks_the_pool_stale_and_records_its_own_member_synced() {
+        let (facade, meta_key) =
+            AskFacade::start_trapping_exec_after(b"DEL", SlotsAfterTrap::Answer).await;
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client();
+        let sessions = SessionStore::new(client.clone(), tv.key_schema().clone());
+        let session_id = sessions
+            .create("b4q2-own-mark", "/b4q2-own-mark", "bv6d-user")
+            .await
+            .expect("session creation must succeed");
+        *meta_key.lock().unwrap() = Some(tv.key_schema().session_meta(&session_id));
+
+        let syncs_before = client.txn_routing_syncs_for_test();
+        let answer = tokio::time::timeout(SETTLE, sessions.delete(&session_id))
+            .await
+            .expect("the delete did not settle within its budget");
+        let syncs = client.txn_routing_syncs_for_test() - syncs_before;
+
+        assert_eq!(
+            facade.trap.fired(),
+            1,
+            "precondition: the DeleteSession EXEC was answered -ASK; the call answered {answer:?}"
+        );
+        assert!(
+            matches!(&answer, Err(ServiceError::Aborted(msg)) if msg.contains(REDIRECTED)),
+            "precondition: the redirected transaction answers Aborted with fred's \
+             {REDIRECTED:?}; got {answer:?}"
+        );
+        assert_eq!(
+            syncs, 1,
+            "`exec_txn` re-syncs the redirected member once; no checkout had a mark to re-sync for"
+        );
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            1,
+            "the redirected transaction marks the pool's routing stale"
+        );
+        let mut epochs = client.txn_pool.slot_routing_epochs_for_test();
+        epochs.sort_unstable();
+        let mut expected = vec![0; client.txn_pool.slots() - 1];
+        expected.push(1);
+        assert_eq!(
+            epochs, expected,
+            "the redirected member, and only it, is recorded synced at its own mark's epoch"
+        );
+        assert_eq!(
+            syncs_of_checking_out_every_slot(client).await,
+            client.txn_pool.slots() - 1,
+            "every member but the redirected one re-syncs at its next checkout"
+        );
+        drop(facade.proxy);
+    }
+
+    /// The same redirected transaction, but another trigger's mark is accepted
+    /// while its re-sync is in flight (the facade holds that re-sync's
+    /// `CLUSTER SLOTS` past the client's command timeout, and the test marks
+    /// the pool meanwhile, epoch 1). The transaction's own mark, after the
+    /// re-sync timed out more than the gate's interval later, is accepted too
+    /// (epoch 2), but it is not the epoch read before the sync plus one, so
+    /// the member is recorded at the epoch read before its sync — zero — and
+    /// keeps the re-sync it owes for the mark its sync may not have seen.
+    /// Recording the mark's epoch instead would let a checkout of every slot
+    /// skip that member. Slow by construction: the call waits out the 5 s
+    /// command timeout on the held sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirected_transaction_whose_resync_overlaps_another_mark_leaves_its_member_owing_a_resync(
+    ) {
+        let (facade, meta_key) =
+            AskFacade::start_trapping_exec_after(b"DEL", SlotsAfterTrap::Slow).await;
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client().clone();
+        let session_id = SessionStore::new(client.clone(), tv.key_schema().clone())
+            .create("b4q2-overlap", "/b4q2-overlap", "bv6d-user")
+            .await
+            .expect("session creation must succeed");
+        *meta_key.lock().unwrap() = Some(tv.key_schema().session_meta(&session_id));
+
+        let delete = {
+            let (client, keys, session_id) =
+                (client.clone(), tv.key_schema().clone(), session_id.clone());
+            tokio::spawn(async move { SessionStore::new(client, keys).delete(&session_id).await })
+        };
+        // The re-sync's `CLUSTER SLOTS` reached the facade, which holds it: the
+        // epoch the re-sync covers was read before it was sent.
+        let deadline = settle_deadline();
+        while facade.slots_after_trap.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the redirected transaction's re-sync never reached the facade (trap fired {} \
+                 time(s))",
+                facade.trap.fired()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Another trigger's mark, accepted while the re-sync is in flight.
+        FredErrOrigin::client(&client, POOL_LABEL_TXN).observe_error(&shape(1));
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            1,
+            "precondition: the overlapping mark was accepted"
+        );
+        let answer = tokio::time::timeout(SLOW_SLOTS_DELAY + SETTLE, delete)
+            .await
+            .expect("the delete did not settle within its budget")
+            .expect("the delete task must not panic");
+
+        assert!(
+            matches!(&answer, Err(ServiceError::Aborted(msg)) if msg.contains(REDIRECTED)),
+            "precondition: the redirected transaction answers Aborted with fred's \
+             {REDIRECTED:?}; got {answer:?}"
+        );
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            2,
+            "precondition: the overlapping mark and the transaction's own were both accepted"
+        );
+        assert_eq!(
+            client.txn_pool.slot_routing_epochs_for_test(),
+            vec![0; client.txn_pool.slots()],
+            "the redirected member is recorded at the epoch read before its sync, not at its \
+             mark's"
+        );
+        assert_eq!(
+            syncs_of_checking_out_every_slot(&client).await,
+            client.txn_pool.slots(),
+            "every member re-syncs at its next checkout, the redirected one included"
+        );
+        drop(facade.proxy);
+    }
+
+    /// The `CreateLayer` commit's repeated run syncs its routing once, on the
+    /// wire: a new layer's first commit `EVALSHA` (`create_layer_commit.lua`,
+    /// on the `txn_pool`) is answered a real `-ASK` by the facade. fred fails
+    /// it `Routing` "Too many redirections." at the pool's zero redirection
+    /// budget — the shape the dispatch's receipt marks the pool's routing
+    /// stale on (the epoch reads 1). The call's second run then runs exactly
+    /// ONE routing sync: its own, before the run (`LayerStore`'s create-commit
+    /// sync counter reads 1). Its checkout, taken after the mark, leaves the
+    /// re-sync to the run (`acquire_txn_for_caller_synced`), so the client's
+    /// sync counter, which counts the checkout's re-syncs too, reads 1 as
+    /// well. A checkout that re-synced as well would read 2, and on a store
+    /// whose `CLUSTER SLOTS` hangs the second run would wait out two command
+    /// timeouts instead of one. That checkout still records the pool's epoch
+    /// for its slot: a checkout of every slot afterwards re-syncs every member
+    /// but that one. A checkout that skipped the record would leave that slot
+    /// owing one more re-sync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_layers_repeated_commit_run_after_its_redirect_marked_the_pool_stale_syncs_once()
+    {
+        let name = "b4q2-repeated-run";
+        let sha = CREATE_LAYER_COMMIT_SCRIPT.sha1().to_owned();
+        let armed = Arc::new(AtomicBool::new(false));
+        let facade = {
+            let armed = Arc::clone(&armed);
+            AskFacade::start_redirecting(
+                "ASK",
+                SlotsAfterTrap::Answer,
+                move |args| armed.load(Ordering::SeqCst) && names(args, b"EVALSHA", &sha),
+                Duration::ZERO,
+                |_| None,
+            )
+            .await
+        };
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client();
+        let session_id = SessionStore::new(client.clone(), tv.key_schema().clone())
+            .create(name, &format!("/{name}"), "bv6d-user")
+            .await
+            .expect("session creation must succeed");
+        let commit_syncs = Arc::new(AtomicUsize::new(0));
+        let store = LayerStore::new(client.clone(), tv.key_schema().clone(), 4096)
+            .with_create_layer_commit_cluster_sync_counter_for_test(Arc::clone(&commit_syncs));
+        let marker = CreateCommitMarker::new();
+
+        armed.store(true, Ordering::SeqCst);
+        let syncs_before = client.txn_routing_syncs_for_test();
+        let created = tokio::time::timeout(
+            SETTLE,
+            store.create_layer_with_operation(
+                &session_id,
+                name,
+                "bv6d-user",
+                &ObjectState {
+                    sequence_num: 1,
+                    first_version: 1,
+                    source_format: "usda".to_owned(),
+                    ..Default::default()
+                },
+                Arc::new(MockExternalValueStore::new()),
+                None,
+                &marker,
+            ),
+        )
+        .await
+        .expect("the create did not settle within its budget")
+        .expect("the new layer must commit on its second run after the -ASK");
+        let syncs = client.txn_routing_syncs_for_test() - syncs_before;
+
+        assert_eq!(
+            facade.trap.fired(),
+            1,
+            "precondition: the first commit EVALSHA was answered -ASK"
+        );
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            1,
+            "the txn-pool command's redirect refusal marks the pool's routing stale: the real \
+             -ASK reaches the dispatch as `Routing` \"Too many redirections.\""
+        );
+        assert_eq!(
+            commit_syncs.load(Ordering::SeqCst),
+            1,
+            "precondition: the second run synced its checkout's routing"
+        );
+        assert_eq!(
+            syncs, 1,
+            "the second run's routing sync is the only one: its checkout does not re-sync too"
+        );
+        assert!(marker.is_set(), "a committed run sets the commit marker");
+        let mapped: Option<String> = client
+            .pool
+            .get(tv.key_schema().layer_mapping(&session_id, name))
+            .await
+            .expect("GET of the layer mapping must succeed");
+        assert_eq!(mapped, Some(created.object_id.to_string()));
+        assert_eq!(
+            syncs_of_checking_out_every_slot(client).await,
+            client.txn_pool.slots() - 1,
+            "the second run's checkout recorded the pool's epoch for its slot though it left the \
+             re-sync to the run: every other member re-syncs at its next checkout, that one not"
+        );
+        drop(facade.proxy);
+    }
+
+    /// The opening words of the WARN a checkout logs when its re-sync after
+    /// a routing-stale mark outlives the command timeout.
+    const CHECKOUT_RESYNC_TIMED_OUT: &str = "Cluster routing re-sync of a txn-pool connection at \
+                                             checkout, after the pool's routing was marked stale, \
+                                             timed out";
+
+    /// A checkout whose re-sync hangs: a real `-ASK` to a `txn_pool` `GET`
+    /// (the facade's trap; no sync on an `-ASK`) fails `Routing` "Too many
+    /// redirections.", and its receipt marks the pool (epoch 1). The next
+    /// checkout re-syncs its slot, and the facade holds that sync's
+    /// `CLUSTER SLOTS` past the client's command timeout. The checkout still
+    /// returns — bounded by the command timeout, plus a recycle of its slot
+    /// if its hygiene probe, queued behind the held sync in the member's
+    /// router, times out (not under test) — logs one timed-out re-sync WARN,
+    /// and has recorded the pool's epoch for its slot before the sync, so the
+    /// failed sync is not retried for the same mark. Slow by construction:
+    /// the checkout waits out the 5 s command timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_checkout_whose_resync_times_out_returns_logs_once_and_records_the_pool_epoch() {
+        let marker = format!("b4q2-checkout-resync-{}", uuid::Uuid::new_v4());
+        let facade = {
+            let marker = marker.clone();
+            AskFacade::start_redirecting(
+                "ASK",
+                SlotsAfterTrap::Slow,
+                move |args| names(args, b"GET", &marker),
+                Duration::ZERO,
+                |_| None,
+            )
+            .await
+        };
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client();
+
+        let (refused, command_timeout) = {
+            let checkout = tokio::time::timeout(SETTLE, client.acquire_txn())
+                .await
+                .expect("the trap's checkout did not settle within its budget");
+            let refused = tokio::time::timeout(SETTLE, checkout.get::<Option<String>, _>(&marker))
+                .await
+                .expect("the trapped GET did not settle within its budget");
+            if let Err(e) = &refused {
+                FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(e);
+            }
+            (refused, checkout.perf_config().default_command_timeout)
+        };
+        assert_eq!(
+            facade.trap.fired(),
+            1,
+            "precondition: the GET was answered -ASK"
+        );
+        assert!(
+            matches!(&refused, Err(e) if is_txn_redirect_refusal(e)),
+            "precondition: the txn pool refuses the -ASK `Routing` \"Too many redirections.\"; got \
+             {refused:?}"
+        );
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            1,
+            "precondition: the refusal's receipt marked the pool"
+        );
+        assert_eq!(
+            client.txn_pool.slot_routing_epochs_for_test(),
+            vec![0; client.txn_pool.slots()],
+            "precondition: no slot has re-synced for the mark yet"
+        );
+
+        let syncs_before = client.txn_routing_syncs_for_test();
+        let (checkout, captured) = capture(tokio::time::timeout(
+            command_timeout + SETTLE,
+            client.acquire_txn(),
+        ))
+        .await;
+        let checkout = checkout.expect(
+            "a checkout whose re-sync hangs must still return, its sync bounded by the command \
+             timeout",
+        );
+        drop(checkout);
+
+        assert_eq!(
+            client.txn_routing_syncs_for_test() - syncs_before,
+            1,
+            "precondition: the checkout re-synced its slot"
+        );
+        assert!(
+            facade.slots_after_trap.load(Ordering::SeqCst) >= 1,
+            "precondition: the re-sync's CLUSTER SLOTS reached the facade, which held it"
+        );
+        let timed_out = captured
+            .events
+            .iter()
+            .filter(|event| {
+                event["level"] == "WARN"
+                    && event["fields"]["message"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with(CHECKOUT_RESYNC_TIMED_OUT))
+            })
+            .count();
+        assert_eq!(
+            timed_out, 1,
+            "the re-sync that outlives its bound logs one WARN and the checkout goes on. Full \
+             capture:\n{}",
+            captured.text
+        );
+        let mut epochs = client.txn_pool.slot_routing_epochs_for_test();
+        epochs.sort_unstable();
+        let mut expected = vec![0; client.txn_pool.slots() - 1];
+        expected.push(1);
+        assert_eq!(
+            epochs, expected,
+            "the checkout recorded the pool's epoch for its slot though its sync timed out"
+        );
+        drop(facade.proxy);
+    }
+
+    /// A slot replaced while a mark lands: the replacement reads the pool's
+    /// epoch (0) and is held there, before it builds its fresh client, by
+    /// `hold_txn_replacement_after_epoch_read_for_test`. The test then marks
+    /// the pool (epoch 1) and checks out the slot's old client, which
+    /// re-syncs and records the slot at 1 — a record that describes the
+    /// client about to leave the slot. Released, the replacement connects the
+    /// fresh client and swaps it in, setting the slot's record to the epoch it
+    /// read before the mark (0), overwriting the later one. The fresh client's
+    /// connect cannot be known to have seen the mark, so its next checkout
+    /// re-syncs. Fails if the swap records the epoch read after the fresh
+    /// client is built, keeps the larger record, or records nothing.
+    ///
+    /// The hold is a two-party barrier the replacement waits on twice
+    /// (arrival, then release); the test waits on it twice and never leaves
+    /// it armed without a replacement due, nor shuts the client down while
+    /// the replacement waits on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_slot_swapped_in_after_a_mark_made_while_its_fresh_client_connected_owes_a_resync() {
+        use live_edit::observability::metrics::VALKEY_POOL_TXN;
+        use live_edit::storage::member_replacement::{
+            ReplaceKnobs, MEMBER_REPLACE_AFTER_FAST_VERDICTS, MEMBER_REPLACE_COOLDOWN,
+            MEMBER_REPLACE_WINDOW,
+        };
+
+        /// The slot replaced: the first a scanning checkout takes, so the
+        /// test's checkout of the old client lands on it.
+        const SLOT: usize = 0;
+
+        let facade = AskFacade::start(|_| false, Duration::ZERO, |_| None).await;
+        let tv = facade.test_valkey(4).await;
+        let client = tv.client();
+        client
+            .install_observability_hooks(Arc::new(crate::common::metrics_scrape_only("b4q2-swap")))
+            .await;
+        client.set_member_replacement_knobs_for_test(ReplaceKnobs {
+            after_fast_verdicts: MEMBER_REPLACE_AFTER_FAST_VERDICTS,
+            window: MEMBER_REPLACE_WINDOW,
+            cooldown: MEMBER_REPLACE_COOLDOWN,
+            grace: Duration::from_secs(1),
+        });
+        let e0 = client.txn_pool.routing_epoch_for_test();
+        let old_id = client.txn_slot_client_ids_for_test()[SLOT].clone();
+
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        client.hold_txn_replacement_after_epoch_read_for_test(Arc::clone(&gate));
+        for _ in 0..MEMBER_REPLACE_AFTER_FAST_VERDICTS {
+            client.fast_verdict_for_test(VALKEY_POOL_TXN, SLOT);
+        }
+        tokio::time::timeout(SETTLE, gate.wait())
+            .await
+            .expect("the slot replacement did not reach its epoch read within its budget");
+
+        // The replacement has read e0 and built nothing.
+        assert_eq!(
+            client.mark_txn_routing_stale_for_test(),
+            Some(e0 + 1),
+            "precondition: the mark is accepted"
+        );
+        {
+            let old = tokio::time::timeout(SETTLE, client.acquire_txn())
+                .await
+                .expect("the old client's checkout did not settle within its budget");
+            assert_eq!(
+                ClientLike::id(&*old),
+                old_id,
+                "precondition: the checkout took the slot being replaced, its old client"
+            );
+        }
+        assert_eq!(
+            client.txn_pool.slot_routing_epochs_for_test()[SLOT],
+            e0 + 1,
+            "precondition: the old client's checkout re-synced and recorded the slot at the mark"
+        );
+        tokio::time::timeout(SETTLE, gate.wait())
+            .await
+            .expect("releasing the held replacement did not settle within its budget");
+
+        let deadline = settle_deadline();
+        while client.txn_slot_client_ids_for_test()[SLOT] == old_id
+            || client.member_replacement_tasks_for_test() > 0
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the slot replacement did not swap and finish within {SETTLE:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !client.member_replacement_in_flight_for_test(VALKEY_POOL_TXN),
+            "precondition: a finished replacement holds no slot"
+        );
+        assert_eq!(
+            client.txn_pool.routing_epoch_for_test(),
+            e0 + 1,
+            "precondition: nothing else marked the pool"
+        );
+        assert_eq!(
+            client.txn_pool.slot_routing_epochs_for_test()[SLOT],
+            e0,
+            "the swap set the slot to the epoch read before the fresh client connected, \
+             overwriting the old client's later record"
+        );
+
+        let fresh_id = client.txn_slot_client_ids_for_test()[SLOT].clone();
+        let syncs_before = client.txn_routing_syncs_for_test();
+        {
+            let fresh = tokio::time::timeout(SETTLE, client.acquire_txn())
+                .await
+                .expect("the fresh client's checkout did not settle within its budget");
+            assert_eq!(
+                ClientLike::id(&*fresh),
+                fresh_id,
+                "precondition: the checkout took the swapped slot"
+            );
+        }
+        assert_eq!(
+            client.txn_routing_syncs_for_test() - syncs_before,
+            1,
+            "the fresh client's first checkout re-syncs for the mark it may not have seen"
+        );
+        assert_eq!(client.txn_pool.slot_routing_epochs_for_test()[SLOT], e0 + 1);
+        drop(facade.proxy);
+    }
+}
+
+/// The classifier the routing-stale mark and the `CreateLayer` commit marker
+/// share. Outside `txn_routing_stale` because it needs no feature.
+mod txn_redirect_refusal_shape {
+    use fred::error::{Error as FredError, ErrorKind as FredErrorKind};
+
+    use live_edit::storage::client::{is_txn_redirect_refusal, BUDGET_EXHAUSTED_SHAPES};
+
+    /// Only `Routing` with a message starting "Too many redirections" — the
+    /// one shape that proves a `txn_pool` command never ran. Not the same
+    /// text under another kind, not the other budget shapes, not a timeout,
+    /// not fred's transaction redirect text, and not the text anywhere but at
+    /// the start.
+    #[test]
+    fn is_txn_redirect_refusal_matches_only_routing_too_many_redirections() {
+        let shape = |index: usize| {
+            let (kind, message) = BUDGET_EXHAUSTED_SHAPES[index].clone();
+            FredError::new(kind, message)
+        };
+        assert!(is_txn_redirect_refusal(&shape(1)));
+        assert!(is_txn_redirect_refusal(&FredError::new(
+            FredErrorKind::Routing,
+            "Too many redirections. (slot 1234)"
+        )));
+        for not_it in [
+            shape(0),
+            shape(2),
+            shape(3),
+            FredError::new(FredErrorKind::Unknown, "Too many redirections."),
+            FredError::new(FredErrorKind::Timeout, "Too many redirections."),
+            FredError::new(
+                FredErrorKind::Routing,
+                "Command failed: Too many redirections.",
+            ),
+            FredError::new(FredErrorKind::Unknown, "Max redirections exceeded"),
+        ] {
+            assert!(
+                !is_txn_redirect_refusal(&not_it),
+                "{not_it:?} does not prove the command never ran"
+            );
+        }
     }
 }

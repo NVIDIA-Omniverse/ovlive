@@ -34,6 +34,14 @@ public:
     const std::string& canonicalUri() const noexcept { return uri_; }
     const std::string& session() const noexcept { return session_; }
     const std::string& layer() const noexcept { return layer_; }
+    // The unit of the endpoint's stream share that the layer's calls ride on:
+    // its reads, one at a time, and before them its creation's CreateLayer.
+    // Null once returned.
+    std::shared_ptr<StreamReservation> stream() const noexcept;
+    // Returns the stream unit while this reservation lives on: the layer's
+    // actor has stopped or failed with no call open and opens none again, as
+    // for a closed or failed layer the host keeps for export. One-way.
+    void returnStream() noexcept;
 private:
     friend class LayerAdmissionRegistry;
     struct State;
@@ -42,6 +50,8 @@ private:
     std::shared_ptr<State> state_;
     size_t slot_ = 0; // Set before publication; the slot is this owner's until it expires.
     EndpointLease endpoint_;
+    mutable std::mutex streamMutex_;
+    std::shared_ptr<StreamReservation> stream_; // Set before publication; under streamMutex_ after.
     const std::string session_, layer_, uri_;
     std::atomic<bool> claimed_{false};
 };

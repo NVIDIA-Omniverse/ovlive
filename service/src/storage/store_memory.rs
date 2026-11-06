@@ -18,17 +18,24 @@
 //! the store is (`live_edit_store_memory_used_ratio`).
 //!
 //! **The reading.** [`read_store_memory`] reads the cluster map's slot ranges
-//! when `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set — one per entry of a
-//! `CLUSTER SLOTS` it sends on every pass, so a reshard is seen within one
-//! pass; one range covering every slot on a store that is not clustered —
-//! then sends `INFO memory` to every distinct primary endpoint and records
-//! each one's `maxmemory` and `used_memory`. A failed `INFO` keeps the map,
-//! and a failed or malformed `CLUSTER SLOTS` leaves the pass with no map
-//! while the `INFO`s go on. Only when no primary reports a `maxmemory` field at all and
-//! `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set does it also send `INFO
-//! commandstats`, for the store-wide count of replica acknowledgements
+//! — one per entry of a `CLUSTER SLOTS` it sends on every pass on a clustered
+//! store, whatever is configured, so a reshard or a scale-out is seen within
+//! one pass; one range covering every slot on a store that is not clustered —
+//! then, on a cluster, confirms its `INFO` targets against that map
+//! (*Routing* below), and sends `INFO memory` to every distinct primary
+//! endpoint, recording each one's `maxmemory` and `used_memory`. A failed
+//! `INFO` keeps the map. A pass that cannot confirm its targets — its
+//! `CLUSTER SLOTS` failed or was malformed, so it has no map, or its routing
+//! table still divides the slots otherwise than the map — sends no `INFO` at
+//! all and reads as a failed `INFO memory`
+//! ([`InfoUnread::Unconfirmed`]). Only when no primary reports a `maxmemory`
+//! field at all and `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set does it also send
+//! `INFO commandstats`, for the store-wide count of replica acknowledgements
 //! (`cmdstat_replconf`, [`store_copies`]). Startup reads once whatever is
-//! configured.
+//! configured, by the same code path, the whole read bounded by
+//! [`STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS`] command timeouts
+//! ([`startup_store_memory`]); a step that deadline cuts off reads as that
+//! step failing.
 //!
 //! **Budget precedence.**
 //!
@@ -42,8 +49,9 @@
 //!    as the provider states it — is set and the map is known, one shard's
 //!    share of it ÷ 8 ([`memory_bytes_budget`];
 //!    [`ExtReleaseBudgetSource::ValkeyMemory`], `source="override"`). It
-//!    needs only the map: a failed or refused `INFO` does not stop it, though
-//!    a failed `INFO` keeps a rule-2 budget already in force.
+//!    needs only the map: a failed or refused `INFO`, or one not sent because
+//!    the pass could not confirm its targets, does not stop it, though a
+//!    failed or unsent `INFO` keeps a rule-2 budget already in force.
 //! 4. Else the fallback, `min(8 × LIVE_EDIT_MAX_LAYER_SIZE, 100 MB)`
 //!    (`Config::ext_release_budget`), and startup logs why.
 //!
@@ -74,8 +82,9 @@
 //! when it did not move ([`store_copies`]) — so the figure is absent at a
 //! replica's first read and present from its second (later, when a count
 //! could not be read). Otherwise — and
-//! whenever the latest read failed or a primary reported no `used_memory` —
-//! no figure: the series is absent, never 0. A figure above 1 is kept as it
+//! whenever the latest read failed, could not confirm it reached every
+//! primary, or a primary reported no `used_memory` — no figure: the series
+//! is absent, never 0. A figure above 1 is kept as it
 //! is: the store is past its limit.
 //!
 //! **Logged by reason (b.1jt).** Why a reading's `maxmemory` was unusable is
@@ -85,12 +94,18 @@
 //! `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set (it answers both consumers), INFO
 //! otherwise. Every other reason — `maxmemory:0` (self-hosted Valkey with no
 //! limit), a malformed value, an unknown routing table, no primary, a failed
-//! or denied `INFO` — is a fault, logged at WARN. Two more faults are logged
-//! WARN once per kind, apart from those: a cluster map read that failed, a
-//! cluster map reply that was malformed, and an unreadable `INFO
-//! commandstats`. Startup logs one line at its reason's level, and the
+//! or denied `INFO`, primaries the pass could not confirm
+//! ([`UnusableReason::PrimariesUnconfirmed`]) — is a fault, logged at WARN
+//! with its cause's remedy (`problem_remedy`).
+//! Three more faults are logged WARN once per kind, apart from those: a
+//! cluster map read that failed, a cluster map reply that was malformed (each
+//! of which also leaves the pass's primaries unconfirmed, logged as that
+//! reason), and an unreadable `INFO commandstats`. Startup logs one line at
+//! its reason's level, and the
 //! refresh task is seeded with what startup logged, so the same kind is never
-//! logged twice in a row. A change of the gauge's arm or copies logs one INFO.
+//! logged twice in a row — except after a startup read cut off at its
+//! deadline, which seeds no problem, so the first pass that still fails logs
+//! its own cause. A change of the gauge's arm or copies logs one INFO.
 //!
 //! **Refresh.** A task ([`spawn_store_memory_refresh`]) reads again every
 //! [`STORE_MEMORY_REFRESH_INTERVAL`] whenever a consumer can use the read
@@ -103,26 +118,62 @@
 //! in place, or resharded, needs no redeploy. A reading of no map or no
 //! primary, or one neither rule answers, keeps the last good value: the
 //! budget a good read set stays, and a replica that never had one stays at
-//! the fallback. Each budget it sets is recorded on
+//! the fallback. A pass whose primaries are unconfirmed is a failed `INFO
+//! memory`: an `info` budget is held, an `override` budget is re-derived from
+//! the pass's map when it has one, and the gauge is absent until a confirmed
+//! pass. Each budget it sets is recorded on
 //! `live_edit_ext_release_budget_bytes{source}`.
 //!
 //! **Routing.** `INFO` is keyless and node-scoped (SDD §15.3's keyless-command
 //! inventory): on a cluster it is sent once per distinct primary endpoint the
 //! maintenance client's cached routing table lists, pinned with
-//! `with_cluster_node`; on standalone, once. The slot ranges come from a
-//! `CLUSTER SLOTS` sent on the same client as an ordinary keyless command,
-//! bounded by the command timeout like the `INFO`s — never fred's
-//! `sync_cluster`, which retries a failing `CLUSTER SLOTS` inside the shared
-//! maintenance client's router, stalling every other command on it. All of it
-//! runs on the maintenance pool, off the data pool's request traffic, writes
-//! nothing, and costs well under a millisecond per primary. Valkey classes
-//! `INFO` `@slow @dangerous`; an ACL user denied it gets an error. Managed
-//! stores restrict `CONFIG`, not `INFO`.
+//! `with_cluster_node`; on standalone, once. fred refreshes that table only on
+//! a connect or reconnect, a `-MOVED`, or an explicit sync, and a keyless
+//! `INFO` never draws a `-MOVED`, so after a scale-out the table can miss a
+//! new primary indefinitely. Each clustered pass therefore sends `CLUSTER
+//! SLOTS` on the same client as an ordinary keyless command, bounded by the
+//! command timeout like the `INFO`s — not as fred's sync, which retries a
+//! failing `CLUSTER SLOTS` inside the shared maintenance client's router,
+//! stalling every other command on it — and, before any `INFO`, compares a
+//! snapshot of the table taken after the reply with that map
+//! (`scan_guard::table_partition_matches`). A table that divides the slots
+//! among its nodes exactly as the map divides them among its primaries lists
+//! exactly the map's primaries, one each, in fred's own spelling: those are
+//! the targets. A table that differs is re-synced once
+//! (`scan_guard::refresh_routing`, fred's `sync_cluster`) — at most once per
+//! pass, and only on such a mismatch — and compared again only when the sync
+//! completed, so a new primary is read in the same pass. A sync that failed
+//! or timed out is never followed by a second comparison: fred writes the new
+//! table before it connects to the nodes it adds, so a matching table after
+//! an unfinished sync can list a node with no connection, and an `INFO`
+//! pinned to it makes fred reconnect the whole shared member. A pass with no
+//! map, whose sync did not complete, or whose synced table still differs, is
+//! unconfirmed: it sends no `INFO`.
+//!
+//! **Cost.** All of it runs on the maintenance pool, off the data pool's
+//! request traffic, and writes nothing. A pass whose table matches its map
+//! costs one `CLUSTER SLOTS` and well under a millisecond per primary. A pass
+//! whose table differs also runs the sync, normally milliseconds. The read
+//! waits for it at most the command timeout, but only its own wait is bounded:
+//! the sync keeps running inside that member's router, and while a node it
+//! adds refuses connections every other command on that maintenance-pool
+//! member waits until the sync connects — the GC and orphan sweeps, the
+//! reconciler, backup repair, the checkpoint loop's scans and clean-up, and
+//! every leader lock's acquire probe and refresh (SDD §15.3, maintenance-pool
+//! row). A lock holder whose member waits past its lease fails its refresh
+//! closed (`LeaderLease::ensure_held`) and a peer may lead meanwhile; nothing
+//! it queued is written once its caller gave up (vendored fred change 9, SDD
+//! §15.3 and *Why the inline-connect flush*), so the overlap is the one every
+//! leader-locked loop is already built to survive. Client RPCs and the DR
+//! hold poll run on the data pool and do not wait. Valkey classes `INFO`
+//! `@slow @dangerous`; an ACL user denied it gets an error. Managed stores
+//! restrict `CONFIG`, not `INFO`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use fred::interfaces::{ClientLike, ClusterInterface};
+use fred::types::cluster::ClusterRouting;
 use fred::types::config::Server;
 use fred::types::InfoKind;
 use tokio::task::JoinHandle;
@@ -134,13 +185,19 @@ use crate::storage::client::{
     map_transient_fred_err, FredErrOrigin, ValkeyClient, POOL_LABEL_MAINTENANCE,
 };
 use crate::storage::ext_release_gate::ExtReleaseGate;
+use crate::storage::scan_guard::{
+    refresh_routing, render_map, render_table, table_partition_matches, RoutingRefresh, SlotOwner,
+};
 
 /// How often the store's memory is read again: often enough that a resized
-/// store moves the budget, and the fullness gauge follows the store, within a
-/// minute; rarely enough that the read is noise — per replica per minute, one
-/// `INFO memory` per primary endpoint; with `LIVE_EDIT_VALKEY_MEMORY_BYTES`
-/// set, one `CLUSTER SLOTS` per pass on a clustered store, and, on a store
-/// with no `maxmemory` field, one `INFO commandstats` per primary endpoint.
+/// store moves the budget, the fullness gauge follows the store, and a new
+/// primary is read, within a minute; rarely enough that the read is noise —
+/// per replica per minute, one `INFO memory` per primary endpoint; on a
+/// clustered store, one `CLUSTER SLOTS` per pass whatever is configured,
+/// plus a routing-table sync on a pass whose table differs from that map;
+/// and, on a store with no `maxmemory` field with
+/// `LIVE_EDIT_VALKEY_MEMORY_BYTES` set, one `INFO commandstats` per primary
+/// endpoint.
 pub const STORE_MEMORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The percentage of `LIVE_EDIT_VALKEY_MEMORY_BYTES` treated as usable: a
@@ -251,13 +308,15 @@ pub struct PrimaryMemory {
 pub enum ReplconfCalls {
     /// `INFO commandstats` was not sent: the reading is not on the arm that
     /// needs it (no primary reports a `maxmemory` field, and
-    /// `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set).
+    /// `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set), or no `INFO memory` answered.
     NotRead,
     /// The highest `cmdstat_replconf` call count any endpoint reported
     /// ([`parse_info_replconf_calls`]).
     Calls(u64),
-    /// `INFO commandstats` failed on an endpoint, or a reply's
-    /// `cmdstat_replconf` line was malformed; why, as text.
+    /// `INFO commandstats` failed on an endpoint, a reply's
+    /// `cmdstat_replconf` line was malformed, or startup's read reached its
+    /// deadline before the count was read ([`startup_store_memory`]); why,
+    /// as text.
     Unreadable(String),
 }
 
@@ -270,17 +329,17 @@ pub enum StoreMemoryReading {
         /// entry of this pass's `CLUSTER SLOTS` reply — one per primary
         /// shard, however many shards share an endpoint;
         /// [`STANDALONE_SLOT_RANGE`] alone on a store that is not clustered.
-        /// Empty when there is no map: `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset
-        /// (nothing needs it, so `CLUSTER SLOTS` is not sent), or a reply that
-        /// failed or was malformed ([`StoreMemoryRead::map_problem`]).
+        /// Empty when there is no map: a `CLUSTER SLOTS` reply that failed or
+        /// was malformed ([`StoreMemoryRead::map_problem`]).
         slot_ranges: Vec<(u16, u16)>,
         /// The distinct primary endpoints: those of the `CLUSTER SLOTS` reply
-        /// when there is one, else those the `INFO`s were addressed to. A log
-        /// field only: one endpoint can front several shards, so it never
-        /// enters any arithmetic.
+        /// when there is one, else those the routing table lists. A log field
+        /// only: one endpoint can front several shards, so it never enters
+        /// any arithmetic.
         endpoints: usize,
-        /// Every endpoint's `INFO memory`, or why the read failed.
-        info: Result<Vec<PrimaryMemory>, String>,
+        /// Every endpoint's `INFO memory`, or why there is none: a failed
+        /// read, or a pass that could not confirm its targets and sent none.
+        info: Result<Vec<PrimaryMemory>, InfoUnread>,
         /// The replica acknowledgement count.
         replconf_calls: ReplconfCalls,
     },
@@ -290,9 +349,82 @@ pub enum StoreMemoryReading {
     NoPrimary,
 }
 
+/// Why a reading has no `INFO memory` answers ([`StoreMemoryReading::Read`]).
+/// Every consumer takes both the same way, as a failed `INFO memory`: the
+/// gauge is absent, a rule-2 (`info`) budget is held, rule 3 is derived from
+/// the map when there is one, and the refresh keeps running. Only the
+/// problem each is logged as differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InfoUnread {
+    /// An `INFO memory` failed (an error, or one an ACL denied), or startup's
+    /// read reached its deadline before every one answered
+    /// ([`startup_store_memory`]); the error, as text. Logged as
+    /// [`StoreMemoryProblem::ReadFailed`].
+    Failed(String),
+    /// No `INFO memory` was sent: the pass could not confirm its targets are
+    /// every primary of the store's current topology. Logged as
+    /// [`UnusableReason::PrimariesUnconfirmed`].
+    Unconfirmed(PrimariesUnconfirmed),
+}
+
+/// Why a pass could not confirm that its `INFO` targets — the distinct
+/// primaries of the maintenance client's routing table — are every primary
+/// of the cluster map it read ([`read_store_memory`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrimariesUnconfirmed {
+    /// The pass's `CLUSTER SLOTS` gave no map to confirm them against; why.
+    NoMap(ClusterMapProblem),
+    /// The routing table divides the slots among its nodes otherwise than
+    /// the map divides them among its primaries.
+    TableDiffers {
+        /// The map, `start-end@host:port` per range
+        /// (`scan_guard::render_map`).
+        map: String,
+        /// The table last compared with it, `start-end@host:port` per range,
+        /// or `no routing table` (`scan_guard::render_table`): after a
+        /// completed re-sync, the re-synced table; otherwise the table taken
+        /// after the map.
+        table: String,
+        /// How the pass's one routing-table re-sync went; `None` when none
+        /// has run — only `confirm_info_targets`'s answer before the re-sync,
+        /// which a read never reports.
+        refresh: Option<RoutingRefresh>,
+    },
+}
+
+impl std::fmt::Display for PrimariesUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrimariesUnconfirmed::NoMap(problem) => write!(
+                f,
+                "this pass has no cluster map to check this replica's routing table against \
+                 ({problem})"
+            ),
+            PrimariesUnconfirmed::TableDiffers {
+                map,
+                table,
+                refresh,
+            } => {
+                write!(
+                    f,
+                    "this replica's routing table divides the slots otherwise than the \
+                     cluster map (map {map}; table {table}), and "
+                )?;
+                match refresh {
+                    None => f.write_str("it has not refreshed its routing table"),
+                    Some(RoutingRefresh::Refreshed) => f.write_str(
+                        "it refreshed its routing table, which still divides them otherwise",
+                    ),
+                    Some(refresh) => refresh.fmt(f),
+                }
+            }
+        }
+    }
+}
+
 impl StoreMemoryReading {
-    /// The primaries' `INFO memory` answers, or `None` when none was read or
-    /// the read failed.
+    /// The primaries' `INFO memory` answers, or `None` when none was read,
+    /// the read failed, or the pass could not confirm its targets.
     pub fn primaries(&self) -> Option<&[PrimaryMemory]> {
         match self {
             StoreMemoryReading::Read { info: Ok(p), .. } => Some(p),
@@ -302,14 +434,23 @@ impl StoreMemoryReading {
 
     /// The smallest `maxmemory`, and how many primaries reported one, when
     /// every primary reports one above zero; otherwise why not — the failed
-    /// read, the reading's own reason, or the first primary, in routing-table
-    /// order, without a usable `maxmemory`.
+    /// read, the unconfirmed targets, the reading's own reason, or the first
+    /// primary, in routing-table order, without a usable `maxmemory`.
     pub fn maxmemory_limit(&self) -> Result<(u64, usize), StoreMemoryProblem> {
         let unusable = StoreMemoryProblem::Unusable;
         let primaries = match self {
             StoreMemoryReading::Read { info: Ok(p), .. } => p,
-            StoreMemoryReading::Read { info: Err(e), .. } => {
-                return Err(StoreMemoryProblem::ReadFailed(e.clone()))
+            StoreMemoryReading::Read {
+                info: Err(InfoUnread::Failed(e)),
+                ..
+            } => return Err(StoreMemoryProblem::ReadFailed(e.clone())),
+            StoreMemoryReading::Read {
+                info: Err(InfoUnread::Unconfirmed(cause)),
+                ..
+            } => {
+                return Err(unusable(UnusableReason::PrimariesUnconfirmed(
+                    cause.clone(),
+                )))
             }
             StoreMemoryReading::RoutingUnknown => {
                 return Err(unusable(UnusableReason::RoutingUnknown))
@@ -369,6 +510,10 @@ pub enum UnusableReason {
     RoutingUnknown,
     /// The cluster's routing table lists no primary. A fault, WARN.
     NoPrimary,
+    /// The pass could not confirm that its `INFO` targets are every primary
+    /// of the store's current topology, so it sent no `INFO`
+    /// ([`InfoUnread::Unconfirmed`]): why. A fault, WARN, naming its remedy.
+    PrimariesUnconfirmed(PrimariesUnconfirmed),
 }
 
 impl UnusableReason {
@@ -380,6 +525,7 @@ impl UnusableReason {
             UnusableReason::Malformed { .. } => StoreMemoryProblemKind::Malformed,
             UnusableReason::RoutingUnknown => StoreMemoryProblemKind::RoutingUnknown,
             UnusableReason::NoPrimary => StoreMemoryProblemKind::NoPrimary,
+            UnusableReason::PrimariesUnconfirmed(_) => StoreMemoryProblemKind::PrimariesUnconfirmed,
         }
     }
 }
@@ -406,6 +552,11 @@ impl std::fmt::Display for UnusableReason {
             UnusableReason::NoPrimary => {
                 f.write_str("the cluster's routing table lists no primary")
             }
+            UnusableReason::PrimariesUnconfirmed(cause) => write!(
+                f,
+                "the read could not confirm it reached every primary, so no INFO memory was \
+                 sent: {cause}"
+            ),
         }
     }
 }
@@ -415,7 +566,8 @@ impl std::fmt::Display for UnusableReason {
 /// denied it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreMemoryProblem {
-    /// The store answered, without a usable `maxmemory`.
+    /// No usable `maxmemory`: the store answered without one, or the read
+    /// had no primary to ask or could not confirm its primaries.
     Unusable(UnusableReason),
     /// The `INFO memory` read failed; the error, as text.
     ReadFailed(String),
@@ -462,6 +614,8 @@ pub enum StoreMemoryProblemKind {
     RoutingUnknown,
     /// [`UnusableReason::NoPrimary`].
     NoPrimary,
+    /// [`UnusableReason::PrimariesUnconfirmed`].
+    PrimariesUnconfirmed,
     /// [`StoreMemoryProblem::ReadFailed`].
     ReadFailed,
 }
@@ -482,10 +636,11 @@ pub struct StoreMemoryRead {
     /// What the read found.
     pub reading: StoreMemoryReading,
     /// Why this pass's `CLUSTER SLOTS` gave no map; `None` when it gave one
-    /// or was not sent (`LIVE_EDIT_VALKEY_MEMORY_BYTES` unset, a store that is
-    /// not clustered, or no routing table to address the read). With a
-    /// problem the reading's `slot_ranges` are empty: the pass behaves as one
-    /// with no map.
+    /// or was not sent (a store that is not clustered, or a cluster whose
+    /// routing table is not known or lists no primary). With a problem the
+    /// reading's `slot_ranges` are empty and its `INFO` is unconfirmed
+    /// ([`PrimariesUnconfirmed::NoMap`]): the pass has neither a map nor
+    /// `INFO` figures.
     pub map_problem: Option<ClusterMapProblem>,
 }
 
@@ -504,7 +659,8 @@ pub struct ClusterSlotsMap {
 /// Why a pass's `CLUSTER SLOTS` gave no map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClusterMapProblem {
-    /// The command failed; the error, as text.
+    /// The command failed, or startup's read reached its deadline before it
+    /// answered ([`startup_store_memory`]); the error, as text.
     ReadFailed(String),
     /// The reply was empty, or one of its entries was malformed
     /// ([`parse_cluster_slots_reply`]).
@@ -565,6 +721,31 @@ fn cluster_slot(value: &fred::types::Value) -> Option<u16> {
 /// with another on the same endpoint. `None` — no map — for an empty reply
 /// or any malformed entry: a partial map would undercount the shards.
 pub fn parse_cluster_slots_reply(reply: &fred::types::Value) -> Option<ClusterSlotsMap> {
+    parse_slot_entries(reply).map(|entries| cluster_slots_map(&entries))
+}
+
+/// The map [`parse_cluster_slots_reply`] gives from a reply's entries: their
+/// ranges in reply order, and the distinct primaries they name (a `host:port`
+/// string per primary, which is one per distinct `(host, port)`: the port
+/// has no `:`).
+fn cluster_slots_map(entries: &[SlotOwner]) -> ClusterSlotsMap {
+    ClusterSlotsMap {
+        slot_ranges: entries.iter().map(|e| (e.start, e.end)).collect(),
+        endpoints: entries
+            .iter()
+            .map(|e| e.primary.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+    }
+}
+
+/// The one strict reading of a `CLUSTER SLOTS` reply
+/// ([`parse_cluster_slots_reply`]'s rules): each entry's range and its
+/// primary, in reply order, the primary spelled as `scan_guard::SlotOwner`
+/// spells it, `"{host}:{port}"`, a NULL host as an empty host — so the map
+/// compares with a routing table by `scan_guard::table_partition_matches`.
+/// `None` for an empty reply or any malformed entry.
+fn parse_slot_entries(reply: &fred::types::Value) -> Option<Vec<SlotOwner>> {
     use fred::types::Value;
     let Value::Array(entries) = reply else {
         return None;
@@ -572,8 +753,7 @@ pub fn parse_cluster_slots_reply(reply: &fred::types::Value) -> Option<ClusterSl
     if entries.is_empty() {
         return None;
     }
-    let mut slot_ranges = Vec::with_capacity(entries.len());
-    let mut endpoints = std::collections::BTreeSet::new();
+    let mut owners = Vec::with_capacity(entries.len());
     for entry in entries {
         let Value::Array(fields) = entry else {
             return None;
@@ -589,7 +769,7 @@ pub fn parse_cluster_slots_reply(reply: &fred::types::Value) -> Option<ClusterSl
         let host = match primary.first()? {
             Value::String(host) => host.to_string(),
             Value::Bytes(host) => std::str::from_utf8(host).ok()?.to_owned(),
-            // "The node you asked": keyed as "" for the log-only endpoint set.
+            // "The node you asked": an empty host, as scan_guard spells it.
             Value::Null => String::new(),
             _ => return None,
         };
@@ -597,25 +777,27 @@ pub fn parse_cluster_slots_reply(reply: &fred::types::Value) -> Option<ClusterSl
             return None;
         };
         let port = u16::try_from(*port).ok()?;
-        slot_ranges.push((start, end));
-        endpoints.insert((host, port));
+        owners.push(SlotOwner {
+            start,
+            end,
+            primary: format!("{host}:{port}"),
+        });
     }
-    Some(ClusterSlotsMap {
-        slot_ranges,
-        endpoints: endpoints.len(),
-    })
+    Some(owners)
 }
 
 /// Send `CLUSTER SLOTS` as an ordinary command on `node_client` — bounded by
 /// that client's command timeout like the `INFO`s, its error classified by
-/// [`map_transient_fred_err`] — and read the reply
-/// ([`parse_cluster_slots_reply`]). Never fred's `sync_cluster`, which
-/// retries a failing `CLUSTER SLOTS` inside the shared client's router and
-/// stalls every other command on it meanwhile.
+/// [`map_transient_fred_err`] — and read the reply once
+/// ([`parse_cluster_slots_reply`]'s rules): the map, and each entry's range
+/// and primary for the comparison with the routing table. Not sent as fred's
+/// `sync_cluster`, which retries a failing `CLUSTER SLOTS` inside the shared
+/// client's router and stalls every other command on it meanwhile; a pass
+/// re-syncs the table only on a mismatch with this map ([`read_store_memory`]).
 async fn read_cluster_map(
     client: &ValkeyClient,
     node_client: &fred::clients::Client,
-) -> Result<ClusterSlotsMap, ClusterMapProblem> {
+) -> Result<(ClusterSlotsMap, Vec<SlotOwner>), ClusterMapProblem> {
     let reply: fred::types::Value = node_client.cluster_slots().await.map_err(|e| {
         ClusterMapProblem::ReadFailed(
             map_transient_fred_err(
@@ -626,7 +808,92 @@ async fn read_cluster_map(
             .to_string(),
         )
     })?;
-    parse_cluster_slots_reply(&reply).ok_or(ClusterMapProblem::Malformed)
+    let owners = parse_slot_entries(&reply).ok_or(ClusterMapProblem::Malformed)?;
+    Ok((cluster_slots_map(&owners), owners))
+}
+
+/// Which `INFO` targets a pass may use, given its `CLUSTER SLOTS` map
+/// (`map`), the maintenance client's routing table taken after that reply
+/// (`table`), and, once the pass has re-synced that table, how the re-sync
+/// went with the table taken after it (`sync`: the [`RoutingRefresh`], and
+/// the re-synced table — read only after [`RoutingRefresh::Refreshed`]).
+/// Pure.
+///
+/// - `table` divides the slots as `map` does
+///   (`scan_guard::table_partition_matches`): its distinct primaries, which
+///   equality proves are exactly the map's, one each, in fred's spelling.
+/// - Otherwise, before a re-sync (`sync` `None`): unconfirmed, with no
+///   refresh — the caller re-syncs once and asks again.
+/// - After a completed re-sync whose table divides the slots as `map` does:
+///   that table's distinct primaries, so a new primary is read in the same
+///   pass. One that still differs: unconfirmed, naming the re-synced table.
+/// - After a re-sync that failed or timed out: unconfirmed, naming `table`,
+///   and the table after it is never compared. fred writes a new table before
+///   it connects to the nodes it adds, so a table that matches after an
+///   unfinished sync can list a node with no connection, and an `INFO` pinned
+///   to it would make fred reconnect the whole shared maintenance member.
+pub(crate) fn confirm_info_targets(
+    map: &[SlotOwner],
+    table: Option<&ClusterRouting>,
+    sync: Option<(&RoutingRefresh, Option<&ClusterRouting>)>,
+) -> Result<Vec<Server>, PrimariesUnconfirmed> {
+    let primaries_if_matching = |routing: Option<&ClusterRouting>| {
+        routing
+            .filter(|routing| table_partition_matches(map, Some(routing)))
+            .map(ClusterRouting::unique_primary_nodes)
+    };
+    if let Some(targets) = primaries_if_matching(table) {
+        return Ok(targets);
+    }
+    let differs = |routing: Option<&ClusterRouting>, refresh: Option<RoutingRefresh>| {
+        PrimariesUnconfirmed::TableDiffers {
+            map: render_map(map),
+            table: render_table(routing),
+            refresh,
+        }
+    };
+    match sync {
+        None => Err(differs(table, None)),
+        Some((RoutingRefresh::Refreshed, after)) => primaries_if_matching(after)
+            .ok_or_else(|| differs(after, Some(RoutingRefresh::Refreshed))),
+        // Failed or TimedOut: never compared again (see above).
+        Some((refresh, _)) => Err(differs(table, Some(refresh.clone()))),
+    }
+}
+
+/// The confirmed `INFO` targets of one clustered pass, from its map's
+/// entries (`map`): a snapshot of `node_client`'s routing table taken now,
+/// after the map's reply, and, when it differs, one re-sync of that table
+/// (`scan_guard::refresh_routing`, which waits at most the command timeout;
+/// a sync it stops waiting for keeps running in the member's router, holding
+/// that member's other commands while it connects — module docs, *Cost*) and
+/// a second snapshot only if the re-sync completed
+/// ([`confirm_info_targets`]). At most one re-sync per pass. With a
+/// `deadline` (startup's read), the wait for the re-sync also ends at it:
+/// a re-sync cut off there reads as one that timed out
+/// ([`RoutingRefresh::TimedOut`], naming the time waited), the pass's
+/// targets unconfirmed; the sync keeps running in the router as above.
+async fn info_targets(
+    node_client: &fred::clients::Client,
+    map: &[SlotOwner],
+    deadline: Option<&ReadDeadline>,
+) -> Result<Vec<Server>, PrimariesUnconfirmed> {
+    let table = node_client.cached_cluster_state();
+    if let Ok(targets) = confirm_info_targets(map, table.as_ref(), None) {
+        return Ok(targets);
+    }
+    let waited_from = tokio::time::Instant::now();
+    let refresh = within(deadline, refresh_routing(node_client))
+        .await
+        .unwrap_or_else(|_cut_off| RoutingRefresh::TimedOut {
+            waited_ms: u64::try_from(waited_from.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+    let after = if refresh == RoutingRefresh::Refreshed {
+        node_client.cached_cluster_state()
+    } else {
+        None
+    };
+    confirm_info_targets(map, table.as_ref(), Some((&refresh, after.as_ref())))
 }
 
 /// Send `INFO <kind>` to `node` (a cluster primary, pinned) or to the store
@@ -657,78 +924,211 @@ async fn info_on(
     })
 }
 
-/// Read the store's memory on one maintenance-pool client.
+/// Read the store's memory on one maintenance-pool client. Startup and every
+/// refresh pass run this same path.
 ///
-/// 1. On a cluster, take the `INFO` addresses — the distinct primaries — from
-///    that client's cached routing table: fred keys its node connections by
-///    the routing table's own `host:port`, which can differ from the raw
-///    `CLUSTER SLOTS` host (fred prefers an announced hostname to the IP, and
-///    a missing host to the replying node's), and a node-pinned command to a
-///    server it holds no connection for makes it reconnect. No routing table
-///    yet, or one with no primary, ends the read.
-/// 2. When `memory_bytes` (`LIVE_EDIT_VALKEY_MEMORY_BYTES`) is set, the only
-///    consumer of the map, send `CLUSTER SLOTS` on that client as an
-///    ordinary command and read the map from its reply
-///    ([`parse_cluster_slots_reply`]): one slot range per entry, and the
-///    distinct primaries it names. A failed or malformed reply leaves the
-///    pass with no map ([`StoreMemoryRead::map_problem`]). A store that is
-///    not clustered is one range covering every slot, with no command sent.
-/// 3. `INFO memory` to every primary — via `with_cluster_node` on a
-///    cluster, once on standalone — recording each one's `maxmemory` and
-///    `used_memory`; a failed `INFO` ends this step, keeps the map, and is
-///    classified by [`map_transient_fred_err`] (its timeout counted).
-/// 4. When no primary reports a `maxmemory` field and `memory_bytes` is
-///    set, `INFO commandstats` to every primary, for the highest
-///    `cmdstat_replconf` call count.
+/// 1. On a cluster, no routing table yet on that client, or one with no
+///    primary, ends the read.
+/// 2. On a cluster, whatever is configured, send `CLUSTER SLOTS` on that
+///    client as an ordinary command and read the map from its reply
+///    ([`parse_cluster_slots_reply`]'s rules): one slot range per entry, the
+///    distinct primaries it names, and each entry's primary. A failed or
+///    malformed reply leaves the pass with no map
+///    ([`StoreMemoryRead::map_problem`]) and its targets unconfirmed
+///    ([`PrimariesUnconfirmed::NoMap`]). A store that is not clustered is one
+///    range covering every slot, with no command sent.
+/// 3. On a cluster with a map, confirm the `INFO` targets — the distinct
+///    primaries of that client's cached routing table — against the map,
+///    re-syncing the table at most once on a mismatch
+///    ([`confirm_info_targets`]; module docs, *Routing*). The targets come
+///    from fred's table, never the reply: fred keys its node connections by
+///    the table's own `host:port`, which can differ from the raw `CLUSTER
+///    SLOTS` host (fred prefers an announced hostname to the IP, and a
+///    missing host to the replying node's), and a node-pinned command to a
+///    server it holds no connection for makes it reconnect.
+/// 4. With confirmed targets, `INFO memory` to every one — via
+///    `with_cluster_node` on a cluster, once on standalone — recording each
+///    one's `maxmemory` and `used_memory`; a failed `INFO` ends this step,
+///    keeps the map, and is classified by [`map_transient_fred_err`] (its
+///    timeout counted). Unconfirmed targets get no `INFO` at all: the reading
+///    carries [`InfoUnread::Unconfirmed`], which every consumer takes as a
+///    failed `INFO memory`.
+/// 5. When no primary reports a `maxmemory` field and `memory_bytes`
+///    (`LIVE_EDIT_VALKEY_MEMORY_BYTES`) is set, `INFO commandstats` to every
+///    target, for the highest `cmdstat_replconf` call count.
+///
+/// Each command is bounded by the command timeout, but the read as a whole is
+/// not: a refresh pass waits for every step. Startup's read is bounded as a
+/// whole ([`startup_store_memory`]).
 pub async fn read_store_memory(
     client: &ValkeyClient,
     memory_bytes: Option<u64>,
 ) -> StoreMemoryRead {
+    read_store_memory_within(client, memory_bytes, None).await.0
+}
+
+/// How many command timeouts startup's whole store-memory read may take
+/// ([`startup_store_memory`]): with fred's sync and the `INFO`s on top of the
+/// `CLUSTER SLOTS`, a read with several primaries could otherwise take many
+/// command timeouts while the replica boots. 10 s at the default 5 s
+/// `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`.
+pub const STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS: u32 = 2;
+
+/// The instant a bounded store-memory read is cut off at, its bound in
+/// milliseconds for the error it is cut off with, and whether it cut a step
+/// off.
+struct ReadDeadline {
+    at: tokio::time::Instant,
+    ms: u64,
+    /// Set by [`within`] when the deadline cuts a step off. Atomic, not a
+    /// `Cell`, so the read's future stays `Send`.
+    reached: std::sync::atomic::AtomicBool,
+}
+
+impl ReadDeadline {
+    /// `command_timeouts` × `node_client`'s command timeout from now, or
+    /// `None` — unbounded — when that timeout is 0 (fred's "no timeout", as
+    /// `scan_guard::refresh_routing` treats it) or the instant overflows.
+    fn of(node_client: &fred::clients::Client, command_timeouts: u32) -> Option<Self> {
+        let timeout = node_client.perf_config().default_command_timeout;
+        if timeout.is_zero() {
+            return None;
+        }
+        let bound = timeout.saturating_mul(command_timeouts);
+        Some(Self {
+            at: tokio::time::Instant::now().checked_add(bound)?,
+            ms: u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            reached: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Why a step was cut off, as a failed read's error text; it starts with
+    /// [`DEADLINE_CUT_OFF`], which [`is_deadline_cut_off`] recognises.
+    fn cut_off(&self) -> String {
+        format!(
+            "{DEADLINE_CUT_OFF} after {} ms ({} x the command timeout)",
+            self.ms, STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS
+        )
+    }
+}
+
+/// How every error text a [`ReadDeadline`] cuts a step off with starts.
+const DEADLINE_CUT_OFF: &str = "the startup store-memory read reached its deadline";
+
+/// Whether a failed step's error text is a [`ReadDeadline`]'s cut-off rather
+/// than the store's own answer, so its remedy is the deadline's
+/// ([`problem_remedy`]). Every other failed step's text is a fred or service
+/// error's, which never starts with this one.
+fn is_deadline_cut_off(error: &str) -> bool {
+    error.starts_with(DEADLINE_CUT_OFF)
+}
+
+/// `step`, cut off at `deadline` when there is one: its output, or the
+/// cut-off's error text, the deadline marked reached. A cut-off step's
+/// commands are abandoned, not cancelled: fred still runs them, and a sync
+/// keeps running in the member's router.
+async fn within<F: std::future::Future>(
+    deadline: Option<&ReadDeadline>,
+    step: F,
+) -> Result<F::Output, String> {
+    match deadline {
+        None => Ok(step.await),
+        Some(deadline) => tokio::time::timeout_at(deadline.at, step)
+            .await
+            .map_err(|_elapsed| {
+                deadline
+                    .reached
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                deadline.cut_off()
+            }),
+    }
+}
+
+/// [`read_store_memory`], the whole read bounded, when `command_timeouts` is
+/// set, by that many command timeouts from its start ([`ReadDeadline`]), and
+/// whether that deadline cut a step off. A step the deadline cuts off reads
+/// as that step failing, so every consumer takes an existing failed-read
+/// path: a `CLUSTER SLOTS` as a failed map ([`ClusterMapProblem::ReadFailed`],
+/// the cut-off as its error, so no map and unconfirmed targets); the wait for
+/// the targets' re-sync as a re-sync that timed out
+/// ([`RoutingRefresh::TimedOut`], so unconfirmed targets, the map kept); the
+/// `INFO memory`s as a failed `INFO memory` ([`InfoUnread::Failed`], the map
+/// kept); `INFO commandstats` as an unreadable count
+/// ([`ReplconfCalls::Unreadable`]).
+async fn read_store_memory_within(
+    client: &ValkeyClient,
+    memory_bytes: Option<u64>,
+    command_timeouts: Option<u32>,
+) -> (StoreMemoryRead, bool) {
     let (pool, _maint_token) = client.acquire_maintenance();
     let node_client = pool.next();
-    let (nodes, slot_ranges, endpoints, map_problem) = if node_client.is_clustered() {
+    let deadline = command_timeouts.and_then(|n| ReadDeadline::of(node_client, n));
+    let read = read_bounded(client, node_client, memory_bytes, deadline.as_ref()).await;
+    let cut_off = deadline.is_some_and(|d| d.reached.load(std::sync::atomic::Ordering::Relaxed));
+    (read, cut_off)
+}
+
+/// The read itself, on `node_client`, each step bounded by `deadline` when
+/// there is one ([`read_store_memory_within`]).
+async fn read_bounded(
+    client: &ValkeyClient,
+    node_client: &fred::clients::Client,
+    memory_bytes: Option<u64>,
+    deadline: Option<&ReadDeadline>,
+) -> StoreMemoryRead {
+    let (targets, slot_ranges, endpoints, map_problem) = if node_client.is_clustered() {
         let Some(routing) = node_client.cached_cluster_state() else {
             return StoreMemoryRead {
                 reading: StoreMemoryReading::RoutingUnknown,
                 map_problem: None,
             };
         };
-        // INFO addresses come from fred's routing table, not CLUSTER SLOTS: a pinned
-        // send matches its connection by `Server` host:port, and fred's host can
-        // differ from the reply's (metadata hostname; replying node for NULL) — a
-        // miss fails "Failed to route command" and stalls the shared member in
-        // `defer_reconnection`. Ranges drive all arithmetic; endpoints only log.
-        let nodes: Vec<Option<Server>> = routing
-            .unique_primary_nodes()
-            .into_iter()
-            .map(Some)
-            .collect();
-        if nodes.is_empty() {
+        let listed = routing.unique_primary_nodes().len();
+        if listed == 0 {
             return StoreMemoryRead {
                 reading: StoreMemoryReading::NoPrimary,
                 map_problem: None,
             };
         }
-        let map = if memory_bytes.is_some() {
-            Some(read_cluster_map(client, node_client).await)
-        } else {
-            None
-        };
+        // INFO addresses come from fred's routing table, never from CLUSTER SLOTS: a
+        // pinned send matches its connection by `Server` host:port, and fred's host
+        // can differ from the reply's (metadata hostname; replying node for NULL) — a
+        // miss fails "Failed to route command" and stalls the shared member in
+        // `defer_reconnection`. The map only confirms that table lists every primary
+        // (`info_targets`). Ranges drive all arithmetic; endpoints only log.
+        let map = within(deadline, read_cluster_map(client, node_client))
+            .await
+            .unwrap_or_else(|why| Err(ClusterMapProblem::ReadFailed(why)));
         match map {
-            Some(Ok(map)) => (nodes, map.slot_ranges, map.endpoints, None),
-            Some(Err(problem)) => {
-                let endpoints = nodes.len();
-                (nodes, Vec::new(), endpoints, Some(problem))
+            Ok((map, owners)) => {
+                let targets = info_targets(node_client, &owners, deadline)
+                    .await
+                    .map(|nodes| nodes.into_iter().map(Some).collect::<Vec<_>>())
+                    .map_err(InfoUnread::Unconfirmed);
+                (targets, map.slot_ranges, map.endpoints, None)
             }
-            None => {
-                let endpoints = nodes.len();
-                (nodes, Vec::new(), endpoints, None)
-            }
+            Err(problem) => (
+                Err(InfoUnread::Unconfirmed(PrimariesUnconfirmed::NoMap(
+                    problem.clone(),
+                ))),
+                Vec::new(),
+                listed,
+                Some(problem),
+            ),
         }
     } else {
-        (vec![None], vec![STANDALONE_SLOT_RANGE], 1, None)
+        (Ok(vec![None]), vec![STANDALONE_SLOT_RANGE], 1, None)
     };
-    let info = read_info_memory(client, node_client, &nodes).await;
+    let (info, nodes) = match targets {
+        Ok(nodes) => (
+            within(deadline, read_info_memory(client, node_client, &nodes))
+                .await
+                .and_then(|answered| answered)
+                .map_err(InfoUnread::Failed),
+            nodes,
+        ),
+        Err(unread) => (Err(unread), Vec::new()),
+    };
     let mut reading = StoreMemoryReading::Read {
         slot_ranges,
         endpoints,
@@ -736,7 +1136,9 @@ pub async fn read_store_memory(
         replconf_calls: ReplconfCalls::NotRead,
     };
     if memory_bytes.is_some() && reading.reports_no_maxmemory_field() {
-        let calls = read_replconf_calls(client, node_client, &nodes).await;
+        let calls = within(deadline, read_replconf_calls(client, node_client, &nodes))
+            .await
+            .unwrap_or_else(ReplconfCalls::Unreadable);
         if let StoreMemoryReading::Read { replconf_calls, .. } = &mut reading {
             *replconf_calls = calls;
         }
@@ -882,8 +1284,9 @@ pub fn memory_bytes_budget(
 /// Rules 2 and 3 for one reading: the smallest `maxmemory` ÷ 8 when every
 /// primary reports one above zero (at least 1 byte); else, when
 /// `memory_bytes` is set and the map is known, [`memory_bytes_budget`] over
-/// its slot ranges — whatever `INFO` answered, a failure included; else
-/// `None` — no map, an empty map, or neither rule applies.
+/// its slot ranges — whatever `INFO` answered, a failure or an unconfirmed
+/// pass's unsent `INFO` included; else `None` — no map, an empty map, or
+/// neither rule applies.
 pub fn budget_from_reading(
     reading: &StoreMemoryReading,
     memory_bytes: Option<u64>,
@@ -947,8 +1350,8 @@ pub enum StoreMemoryGaugeArm {
 ///   ([`store_copies`]; `None` leaves the figure absent) ÷
 ///   [`store_usable_bytes`] of `memory_bytes`.
 /// - `None` for anything else: `maxmemory:0`, a malformed value or a mix, a
-///   primary that reported no `used_memory`, no primary read, or a failed
-///   read.
+///   primary that reported no `used_memory`, no primary read, a failed read,
+///   or a read that could not confirm it reached every primary.
 ///
 /// Not clamped: above 1 means the store is past its limit.
 #[allow(clippy::cast_precision_loss)] // byte counts as a ratio; f64 is ample
@@ -1005,7 +1408,8 @@ pub struct StoreMemoryResolution {
     /// The release budget to start with.
     pub budget: ExtReleaseBudget,
     /// Why the store's own `maxmemory` was not usable, if it was not: the
-    /// fallback line names it, and the refresh task is seeded with its kind.
+    /// fallback line names it, and the refresh task is seeded with its kind
+    /// unless the read was cut off at its deadline ([`Self::seed`]).
     pub problem: Option<StoreMemoryProblem>,
     /// The gauge's arm at startup ([`store_memory_gauge`]).
     pub gauge_arm: StoreMemoryGaugeArm,
@@ -1021,11 +1425,29 @@ pub struct StoreMemoryResolution {
     pub map_problem: Option<ClusterMapProblem>,
     /// Whether the refresh task should run ([`store_memory_refresh_needed`]).
     pub refresh_needed: bool,
+    /// Whether startup's read was cut off at its deadline
+    /// ([`startup_store_memory`]); `false` from [`resolve_startup`], which
+    /// does not read.
+    pub cut_off_at_deadline: bool,
 }
 
 impl StoreMemoryResolution {
-    /// What the refresh task starts from: what startup logged and read.
+    /// What the refresh task starts from: what startup logged and read. A
+    /// read cut off at its deadline seeds no problem — no maxmemory problem,
+    /// no cluster map problem, no unreadable `INFO commandstats` — since its
+    /// problems name the cut-off rather than the store: the first refresh pass
+    /// that still fails logs its own cause at its level, at the cost of at
+    /// most one more WARN.
     pub fn seed(&self) -> RefreshSeed {
+        if self.cut_off_at_deadline {
+            return RefreshSeed {
+                problem: None,
+                gauge_arm: Some(self.gauge_arm),
+                replconf_calls: self.replconf_calls,
+                map_problem: None,
+                commandstats_unreadable: false,
+            };
+        }
         RefreshSeed {
             problem: self.problem.as_ref().map(StoreMemoryProblem::kind),
             gauge_arm: Some(self.gauge_arm),
@@ -1042,8 +1464,8 @@ impl StoreMemoryResolution {
 /// may report its own limit. Only a store that answered with no `maxmemory`
 /// field on any primary — a managed store that does not expose it, which does
 /// not start exposing it while it runs — rules the gauge out; a failed read,
-/// a `maxmemory` of 0 (a limit can be set in place) or a malformed one leaves
-/// it open, so the refresh runs.
+/// one that could not confirm its primaries, a `maxmemory` of 0 (a limit can
+/// be set in place) or a malformed one leaves it open, so the refresh runs.
 pub fn store_memory_refresh_needed(
     configured: &ExtReleaseBudget,
     reading: &StoreMemoryReading,
@@ -1057,9 +1479,10 @@ pub fn store_memory_refresh_needed(
 /// Startup's resolution of `configured` (`Config::ext_release_budget`: the
 /// explicit budget, or the fallback) against one read: an explicit budget
 /// stands; otherwise [`budget_from_reading`] (rule 3 from the map alone when
-/// `INFO` failed), else the configured fallback (no map — `CLUSTER SLOTS`
-/// failed or malformed included — or nothing usable and `memory_bytes`
-/// unset). The problem, the gauge and whether the refresh
+/// `INFO` failed or the targets were unconfirmed), else the configured
+/// fallback (no map — `CLUSTER SLOTS` failed or malformed, which also leaves
+/// the targets unconfirmed — or nothing usable and `memory_bytes` unset).
+/// The problem, the gauge and whether the refresh
 /// runs are the read's, whatever the budget; the gauge's copies are unknown,
 /// so its store-total arm is pending.
 pub fn resolve_startup(
@@ -1094,24 +1517,48 @@ pub fn resolve_startup(
         commandstats_unreadable,
         map_problem: read.map_problem.clone(),
         refresh_needed: store_memory_refresh_needed(&configured, reading, memory_bytes),
+        cut_off_at_deadline: false,
     }
 }
 
 /// Startup's store read, for every configuration: one [`read_store_memory`],
-/// resolved by [`resolve_startup`].
+/// resolved by [`resolve_startup`]. The whole read, sync included, is bounded
+/// by [`STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS`] command timeouts from its
+/// start (unbounded when the command timeout is 0), so it adds at most that
+/// to the replica's boot. A read cut off at that deadline resolves as a
+/// failed read whose step names the cut-off (a failed `CLUSTER SLOTS` or
+/// `INFO`, or a re-sync that timed out, leaving the targets unconfirmed): an
+/// explicit budget stands; otherwise rule 3 from the map when one was read
+/// and `LIVE_EDIT_VALKEY_MEMORY_BYTES` is set, else the fallback; the gauge is
+/// absent; a WARN names the cause. Such a read is marked
+/// ([`StoreMemoryResolution::cut_off_at_deadline`]) and seeds the refresh
+/// with no problem, so a later pass that still fails logs its own cause. A
+/// sync it cuts off keeps running in the maintenance member's router, and the
+/// refresh, whose passes are not bounded as a whole, reads again within
+/// [`STORE_MEMORY_REFRESH_INTERVAL`].
 pub async fn startup_store_memory(
     client: &ValkeyClient,
     configured: ExtReleaseBudget,
     memory_bytes: Option<u64>,
 ) -> StoreMemoryResolution {
-    let read = read_store_memory(client, memory_bytes).await;
-    resolve_startup(configured, &read, memory_bytes)
+    let (read, cut_off_at_deadline) = read_store_memory_within(
+        client,
+        memory_bytes,
+        Some(STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS),
+    )
+    .await;
+    StoreMemoryResolution {
+        cut_off_at_deadline,
+        ..resolve_startup(configured, &read, memory_bytes)
+    }
 }
 
 /// The budget one refresh moves the gate to, or `None` to keep `current`
 /// (b.yuo, b.qhk): nothing for an explicit `current`; nothing when `INFO
-/// memory` failed while a rule-2 (`info`) budget is in force, which it keeps;
-/// else rule 2 or rule 3 ([`budget_from_reading`]) when it differs from
+/// memory` failed, or was not sent because the pass could not confirm its
+/// targets ([`InfoUnread`]), while a rule-2 (`info`) budget is in force,
+/// which it keeps — its minimum is not re-taken over primaries the pass did
+/// not read; else rule 2 or rule 3 ([`budget_from_reading`]) when it differs from
 /// `current` — in bytes or in source, so a switch between `info` and
 /// `override`, or a changed shard count, moves it; nothing for a reading of
 /// no map, no primary or an empty map, or one neither rule answers, which
@@ -1152,28 +1599,103 @@ fn budget_consequence(budget: &ExtReleaseBudget) -> &'static str {
 }
 
 /// What a reading leaves `live_edit_store_memory_used_ratio` as, for a log
-/// line.
-fn gauge_consequence(arm: StoreMemoryGaugeArm, memory_bytes_set: bool) -> &'static str {
-    match (arm, memory_bytes_set) {
-        (StoreMemoryGaugeArm::Maxmemory, _) => {
+/// line: by its arm and, for an absent figure, by the reading's problem kind
+/// (`problem`, [`StoreMemoryProblem::of_reading`]'s), so the line names why.
+fn gauge_consequence(
+    arm: StoreMemoryGaugeArm,
+    problem: Option<StoreMemoryProblemKind>,
+    memory_bytes_set: bool,
+) -> &'static str {
+    match arm {
+        StoreMemoryGaugeArm::Maxmemory => {
             "live_edit_store_memory_used_ratio is the highest used_memory / maxmemory across \
              primaries"
         }
-        (StoreMemoryGaugeArm::StoreTotal { .. }, _) => {
+        StoreMemoryGaugeArm::StoreTotal { .. } => {
             "live_edit_store_memory_used_ratio derives from LIVE_EDIT_VALKEY_MEMORY_BYTES"
         }
-        (StoreMemoryGaugeArm::StoreTotalPending, _) => {
+        StoreMemoryGaugeArm::StoreTotalPending => {
             "live_edit_store_memory_used_ratio derives from LIVE_EDIT_VALKEY_MEMORY_BYTES; its \
              value comes once two successive reads of the store's replica acknowledgement \
              count (cmdstat_replconf) can be compared, normally at the next read"
         }
-        (StoreMemoryGaugeArm::Absent, true) => {
-            "live_edit_store_memory_used_ratio is absent until a read gives one"
+        StoreMemoryGaugeArm::Absent => match problem {
+            Some(StoreMemoryProblemKind::ReadFailed) => {
+                "live_edit_store_memory_used_ratio is absent: the INFO memory read failed; it \
+                 returns at a read that succeeds"
+            }
+            Some(StoreMemoryProblemKind::PrimariesUnconfirmed) => {
+                "live_edit_store_memory_used_ratio is absent: the read could not confirm it \
+                 reached every primary; it returns at a read that does"
+            }
+            Some(StoreMemoryProblemKind::RoutingUnknown | StoreMemoryProblemKind::NoPrimary) => {
+                "live_edit_store_memory_used_ratio is absent: no primary was read; it returns \
+                 at a read that reaches the primaries"
+            }
+            _ if memory_bytes_set => {
+                "live_edit_store_memory_used_ratio is absent until a read gives one"
+            }
+            _ => {
+                "live_edit_store_memory_used_ratio is absent: the store reports no usable \
+                 maxmemory and LIVE_EDIT_VALKEY_MEMORY_BYTES is unset"
+            }
+        },
+    }
+}
+
+/// What an operator can do about `problem`, by its cause: the one place
+/// that text lives. Appended to the problem's WARN — the refresh task's and
+/// startup's ([`log_store_memory_problem`]) and the release budget's startup
+/// fallback line (`Config::log_ext_release_budget_startup`) — so it starts
+/// with `". "`; empty for a store that reports no `maxmemory` field, the
+/// expected case whose INFO line carries its own advice. A step startup's
+/// deadline cut off ([`is_deadline_cut_off`]: a failed `INFO memory`, or a
+/// `CLUSTER SLOTS` that left no map) gets the deadline's remedy, not the
+/// step's: the deadline, not the store, is its cause. A re-sync the deadline
+/// cut off is not told apart from one that timed out on its own and gets
+/// the differing table's remedy, which holds for both.
+///
+/// A failed `INFO memory` is not told apart by its error either — an ACL
+/// denial, a timeout or a lost connection — so its remedy names the ACL
+/// grant only for a denial, and, only while `LIVE_EDIT_VALKEY_MEMORY_BYTES`
+/// is unset (`memory_bytes_set` false), that setting it answers a store that
+/// does not report `maxmemory`. Every other cause's remedy holds whether the
+/// setting is set or not.
+pub(crate) fn problem_remedy(problem: &StoreMemoryProblem, memory_bytes_set: bool) -> &'static str {
+    const DEADLINE: &str = ". This normally clears at the next read; a later read that still \
+                            fails logs its own cause";
+    match problem {
+        StoreMemoryProblem::ReadFailed(error) if is_deadline_cut_off(error) => DEADLINE,
+        StoreMemoryProblem::Unusable(UnusableReason::PrimariesUnconfirmed(
+            PrimariesUnconfirmed::NoMap(ClusterMapProblem::ReadFailed(error)),
+        )) if is_deadline_cut_off(error) => DEADLINE,
+        StoreMemoryProblem::ReadFailed(_) if memory_bytes_set => {
+            ". If INFO was denied, let this service's user run it"
         }
-        (StoreMemoryGaugeArm::Absent, false) => {
-            "live_edit_store_memory_used_ratio is absent: the store reports no usable maxmemory \
-             and LIVE_EDIT_VALKEY_MEMORY_BYTES is unset"
+        StoreMemoryProblem::ReadFailed(_) => {
+            ". If INFO was denied, let this service's user run it; on a store that does not \
+             report maxmemory (Azure Managed Redis), set LIVE_EDIT_VALKEY_MEMORY_BYTES to the \
+             store's total memory, which needs only the cluster map"
         }
+        StoreMemoryProblem::Unusable(
+            UnusableReason::ZeroLimit { .. } | UnusableReason::Malformed { .. },
+        ) => ". Set maxmemory on every primary",
+        StoreMemoryProblem::Unusable(
+            UnusableReason::RoutingUnknown | UnusableReason::NoPrimary,
+        ) => ". Check the store's cluster state; it usually clears at a later read",
+        StoreMemoryProblem::Unusable(UnusableReason::PrimariesUnconfirmed(
+            PrimariesUnconfirmed::NoMap(_),
+        )) => {
+            ". This clears at a read whose CLUSTER SLOTS succeeds; if it persists, check that \
+             the store answers CLUSTER SLOTS (see the cluster map WARN)"
+        }
+        StoreMemoryProblem::Unusable(UnusableReason::PrimariesUnconfirmed(
+            PrimariesUnconfirmed::TableDiffers { .. },
+        )) => {
+            ". This normally clears at the next read; if it persists, check that the pods can \
+             reach every primary"
+        }
+        StoreMemoryProblem::Unusable(UnusableReason::FieldAbsent { .. }) => "",
     }
 }
 
@@ -1181,21 +1703,24 @@ fn gauge_consequence(arm: StoreMemoryGaugeArm, memory_bytes_set: bool) -> &'stat
 /// fault; for a store with no `maxmemory` field, INFO when
 /// `LIVE_EDIT_VALKEY_MEMORY_BYTES` is unset and nothing when it is set (it
 /// answers both consumers). Each line says what the budget in force
-/// (`budget`) and the fullness gauge now are.
+/// (`budget`) and the fullness gauge now are, and a WARN also the remedy for
+/// its cause ([`problem_remedy`]).
 fn log_store_memory_problem(
     problem: &StoreMemoryProblem,
     budget: &ExtReleaseBudget,
     arm: StoreMemoryGaugeArm,
     memory_bytes_set: bool,
 ) {
+    let kind = problem.kind();
     let budget_effect = budget_consequence(budget);
-    let gauge_effect = gauge_consequence(arm, memory_bytes_set);
-    if problem.kind().is_fault() {
+    let gauge_effect = gauge_consequence(arm, Some(kind), memory_bytes_set);
+    if kind.is_fault() {
+        let remedy = problem_remedy(problem, memory_bytes_set);
         tracing::warn!(
             problem = %problem,
             ext_release_max_bytes = budget.bytes,
             source = budget.source.label(),
-            "store memory read gave nothing usable: {budget_effect}; {gauge_effect}"
+            "store memory read gave nothing usable: {budget_effect}; {gauge_effect}{remedy}"
         );
     } else if !memory_bytes_set {
         tracing::info!(
@@ -1212,23 +1737,22 @@ fn log_store_memory_problem(
 }
 
 /// Log a pass's `CLUSTER SLOTS` that gave no map (WARN), by kind: the read
-/// failed, or the reply was malformed. Either way the pass has no map, so a
-/// budget derived from `LIVE_EDIT_VALKEY_MEMORY_BYTES` is not re-derived.
+/// failed, or the reply was malformed. Either way the pass has no map, and so
+/// no confirmed `INFO` targets ([`PrimariesUnconfirmed::NoMap`]): it sends no
+/// `INFO`, and neither rule re-derives the budget from it.
 fn log_cluster_map_problem(problem: &ClusterMapProblem) {
     match problem {
         ClusterMapProblem::ReadFailed(_) => tracing::warn!(
             problem = %problem,
-            "store memory read: the cluster map read failed; this pass has no map, so the \
-             release budget derived from LIVE_EDIT_VALKEY_MEMORY_BYTES is not re-derived (the \
-             last good budget stays; at startup, the fallback unless the store reports \
-             maxmemory)"
+            "store memory read: the cluster map read failed; this pass has no map, so it \
+             cannot confirm its INFO targets and sends no INFO: the release budget is not \
+             re-derived from the store, and no INFO figure is used"
         ),
         ClusterMapProblem::Malformed => tracing::warn!(
             problem = %problem,
-            "store memory read: the cluster map was malformed; this pass has no map, so the \
-             release budget derived from LIVE_EDIT_VALKEY_MEMORY_BYTES is not re-derived (the \
-             last good budget stays; at startup, the fallback unless the store reports \
-             maxmemory)"
+            "store memory read: the cluster map was malformed; this pass has no map, so it \
+             cannot confirm its INFO targets and sends no INFO: the release budget is not \
+             re-derived from the store, and no INFO figure is used"
         ),
     }
 }
@@ -1251,8 +1775,8 @@ fn log_commandstats_unreadable(why: &str) {
 /// budget is not the fallback (whose own startup line,
 /// `Config::log_ext_release_budget_startup`, names its reason), the
 /// maxmemory problem at the level the refresh task would log it first. The
-/// refresh task is seeded with what this logged
-/// ([`StoreMemoryResolution::seed`]).
+/// refresh task is seeded with what this logged, except after a read cut off
+/// at its deadline ([`StoreMemoryResolution::seed`]).
 pub fn log_store_memory_startup(resolution: &StoreMemoryResolution, memory_bytes: Option<u64>) {
     let memory_bytes_set = memory_bytes.is_some();
     tracing::info!(
@@ -1261,7 +1785,11 @@ pub fn log_store_memory_startup(resolution: &StoreMemoryResolution, memory_bytes
         valkey_memory_bytes = memory_bytes,
         refresh = resolution.refresh_needed,
         "store memory read at startup: {}",
-        gauge_consequence(resolution.gauge_arm, memory_bytes_set)
+        gauge_consequence(
+            resolution.gauge_arm,
+            resolution.problem.as_ref().map(StoreMemoryProblem::kind),
+            memory_bytes_set
+        )
     );
     if let Some(problem) = &resolution.map_problem {
         log_cluster_map_problem(problem);
@@ -1284,19 +1812,24 @@ pub fn log_store_memory_startup(resolution: &StoreMemoryResolution, memory_bytes
 
 /// What the refresh task remembers from startup's read
 /// ([`StoreMemoryResolution::seed`]), so it logs nothing startup already
-/// logged and its first copies compare against startup's count. The default
-/// remembers nothing.
+/// logged (a read cut off at its deadline seeds no problem, so its causes are
+/// logged again if they last) and its first copies compare against startup's
+/// count. The default remembers nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RefreshSeed {
-    /// The kind of the maxmemory problem startup logged, if any (b.1jt).
+    /// The kind of the maxmemory problem startup logged, if any (b.1jt);
+    /// `None` after a startup read cut off at its deadline, whatever it
+    /// logged.
     pub problem: Option<StoreMemoryProblemKind>,
     /// The gauge's arm at startup.
     pub gauge_arm: Option<StoreMemoryGaugeArm>,
     /// The replica acknowledgement count startup read.
     pub replconf_calls: Option<u64>,
-    /// The kind of `CLUSTER SLOTS` problem startup logged, if any.
+    /// The kind of `CLUSTER SLOTS` problem startup logged, if any; `None`
+    /// after a startup read cut off at its deadline, whatever it logged.
     pub map_problem: Option<ClusterMapProblemKind>,
-    /// Startup's `INFO commandstats` was unreadable (and was logged).
+    /// Startup's `INFO commandstats` was unreadable (and was logged); `false`
+    /// after a startup read cut off at its deadline, whatever it logged.
     pub commandstats_unreadable: bool,
 }
 
@@ -1309,7 +1842,9 @@ pub struct StoreMemoryRefresh {
     pub initial: ExtReleaseBudget,
     /// `LIVE_EDIT_VALKEY_MEMORY_BYTES`.
     pub memory_bytes: Option<u64>,
-    /// What startup logged and read.
+    /// What startup logged and read; after a startup read cut off at its
+    /// deadline, what it read but no problem it logged
+    /// ([`StoreMemoryResolution::seed`]).
     pub seed: RefreshSeed,
     /// Where the budget and the fullness gauge are recorded.
     pub metrics: Option<SharedMetrics>,
@@ -1478,6 +2013,7 @@ fn spawn_refresh_every(
                 _ => None,
             };
             let (arm, used_ratio) = store_memory_gauge(&reading, memory_bytes, copies);
+            let problem = StoreMemoryProblem::of_reading(&reading);
             if let Some(metrics) = &metrics {
                 metrics.record_store_memory_used_ratio(used_ratio);
             }
@@ -1487,7 +2023,11 @@ fn spawn_refresh_every(
                     previous_gauge_arm = ?last_arm,
                     store_memory_used_ratio = ?used_ratio,
                     "store memory re-read: {}",
-                    gauge_consequence(arm, memory_bytes.is_some())
+                    gauge_consequence(
+                        arm,
+                        problem.as_ref().map(StoreMemoryProblem::kind),
+                        memory_bytes.is_some()
+                    )
                 );
                 last_arm = Some(arm);
             }
@@ -1517,7 +2057,7 @@ fn spawn_refresh_every(
 
             // One kind per reason (and one for every failed read), so neither
             // a primary that changes nor a flapping error text logs again.
-            let Some(problem) = StoreMemoryProblem::of_reading(&reading) else {
+            let Some(problem) = problem else {
                 last_problem = None;
                 continue;
             };
@@ -1541,9 +2081,10 @@ fn spawn_refresh_every(
 #[cfg(test)]
 mod tests {
     //! The pure halves of the store reading — the `INFO` parses, the copies
-    //! rule, the budget a reading gives at startup and on a refresh, the
-    //! fullness gauge's arms, whether the refresh runs, the startup line —
-    //! and the refresh task itself, driven through its reader seam
+    //! rule, the confirmation of a pass's `INFO` targets against its cluster
+    //! map (b.xb7), the budget a reading gives at startup and on a refresh,
+    //! the fullness gauge's arms, whether the refresh runs, the startup line
+    //! — and the refresh task itself, driven through its reader seam
     //! ([`spawn_store_memory_refresh_with_reader_for_test`]) on a paused
     //! clock, so each pass is one scripted reading. The reads against a store
     //! (standalone, staged replies, a staged cluster map, a real cluster) are
@@ -1609,7 +2150,7 @@ mod tests {
         StoreMemoryReading::Read {
             slot_ranges: vec![STANDALONE_SLOT_RANGE],
             endpoints: 1,
-            info: Err(why.to_owned()),
+            info: Err(InfoUnread::Failed(why.to_owned())),
             replconf_calls: ReplconfCalls::NotRead,
         }
     }
@@ -1762,6 +2303,13 @@ mod tests {
                 true,
             ),
             (
+                StoreMemoryProblem::Unusable(UnusableReason::PrimariesUnconfirmed(
+                    PrimariesUnconfirmed::NoMap(ClusterMapProblem::Malformed),
+                )),
+                StoreMemoryProblemKind::PrimariesUnconfirmed,
+                true,
+            ),
+            (
                 StoreMemoryProblem::ReadFailed("NOPERM".to_owned()),
                 StoreMemoryProblemKind::ReadFailed,
                 true,
@@ -1775,6 +2323,12 @@ mod tests {
             StoreMemoryProblem::Unusable(zero("primary 10.0.0.3:6379")).kind(),
             StoreMemoryProblem::Unusable(zero("primary 10.0.0.2:6379")).kind(),
             "the kind does not name the primary"
+        );
+        assert_eq!(
+            StoreMemoryProblem::of_reading(&no_map_read(ClusterMapProblem::Malformed).reading)
+                .map(|p| p.kind()),
+            StoreMemoryProblem::of_reading(&table_differs(timed_out()).reading).map(|p| p.kind()),
+            "b.xb7: no map and a table that differs are one kind, whatever the cause"
         );
     }
 
@@ -1943,9 +2497,62 @@ mod tests {
         StoreMemoryReading::Read {
             slot_ranges,
             endpoints,
-            info: Err(why.to_owned()),
+            info: Err(InfoUnread::Failed(why.to_owned())),
             replconf_calls: ReplconfCalls::NotRead,
         }
+    }
+
+    /// A clustered pass whose `CLUSTER SLOTS` gave no map (`problem`), as
+    /// `read_store_memory` returns one (b.xb7): no ranges, and no `INFO` sent,
+    /// since there is no map to confirm the targets against — so no `INFO
+    /// commandstats` either.
+    fn no_map_read(problem: ClusterMapProblem) -> StoreMemoryRead {
+        StoreMemoryRead {
+            reading: StoreMemoryReading::Read {
+                slot_ranges: Vec::new(),
+                endpoints: X20_ENDPOINTS,
+                info: Err(InfoUnread::Unconfirmed(PrimariesUnconfirmed::NoMap(
+                    problem.clone(),
+                ))),
+                replconf_calls: ReplconfCalls::NotRead,
+            },
+            map_problem: Some(problem),
+        }
+    }
+
+    /// The map of a scale-out the routing table missed, as
+    /// [`PrimariesUnconfirmed::TableDiffers`] renders it: dev's two entries,
+    /// on two primaries.
+    const SCALED_OUT_MAP: &str = "0-8191@10.0.0.1:6379,8192-16383@10.0.0.2:6379";
+
+    /// The table that missed it: every slot on the first primary.
+    const MISSED_TABLE: &str = "0-16383@10.0.0.1:6379";
+
+    /// A clustered pass over dev's map ([`SCALED_OUT_MAP`]) whose routing table
+    /// still divided the slots otherwise ([`MISSED_TABLE`]) after its one
+    /// re-sync went as `refresh` says, as `read_store_memory` returns one
+    /// (b.xb7): the map is carried, and no `INFO` was sent.
+    fn table_differs(refresh: RoutingRefresh) -> StoreMemoryRead {
+        StoreMemoryRead {
+            reading: StoreMemoryReading::Read {
+                slot_ranges: dev_map(),
+                endpoints: 2,
+                info: Err(InfoUnread::Unconfirmed(
+                    PrimariesUnconfirmed::TableDiffers {
+                        map: SCALED_OUT_MAP.to_owned(),
+                        table: MISSED_TABLE.to_owned(),
+                        refresh: Some(refresh),
+                    },
+                )),
+                replconf_calls: ReplconfCalls::NotRead,
+            },
+            map_problem: None,
+        }
+    }
+
+    /// A re-sync cut off at the test client's command timeout.
+    fn timed_out() -> RoutingRefresh {
+        RoutingRefresh::TimedOut { waited_ms: 5_000 }
     }
 
     /// The rule-3 budget `total` gives over `slot_ranges` listed by
@@ -2262,6 +2869,238 @@ mod tests {
             .map(|(what, reply)| (*what, parse_cluster_slots_reply(reply)))
             .collect();
         let expected: Vec<_> = cases.iter().map(|(what, _)| (*what, None)).collect();
+        assert_eq!(got, expected);
+    }
+
+    // ── b.xb7 T1: confirm_info_targets ───────────────────────────────────────
+
+    /// A pass's `CLUSTER SLOTS` map: `(start, end, primary)` per entry, the
+    /// primary spelled `host:port` as `parse_slot_entries` spells it.
+    fn owners(entries: &[(u16, u16, &str)]) -> Vec<SlotOwner> {
+        entries
+            .iter()
+            .map(|&(start, end, primary)| SlotOwner {
+                start,
+                end,
+                primary: primary.to_owned(),
+            })
+            .collect()
+    }
+
+    /// A maintenance member's cached routing table, built as fred builds one
+    /// from a `CLUSTER SLOTS` reply naming each range's node by `(start, end,
+    /// host, port)`.
+    fn table(ranges: &[(i64, i64, &str, i64)]) -> ClusterRouting {
+        use fred::types::Value;
+        let reply = Value::Array(
+            ranges
+                .iter()
+                .map(|&(start, end, host, port)| {
+                    Value::Array(vec![
+                        Value::Integer(start),
+                        Value::Integer(end),
+                        Value::Array(vec![
+                            Value::from(host),
+                            Value::Integer(port),
+                            Value::from(format!("{host}-{port}")),
+                        ]),
+                    ])
+                })
+                .collect(),
+        );
+        ClusterRouting::from_cluster_slots(reply, "127.0.0.1").expect("the reply parses")
+    }
+
+    /// `table`'s ranges on `127.0.0.1`, one node per port.
+    fn local_table(ranges: &[(i64, i64, i64)]) -> ClusterRouting {
+        let on_localhost: Vec<(i64, i64, &str, i64)> = ranges
+            .iter()
+            .map(|&(start, end, port)| (start, end, "127.0.0.1", port))
+            .collect();
+        table(&on_localhost)
+    }
+
+    /// b.xb7 T1: the coverage decision, as the pure function of the pass's
+    /// map, the table taken after it, and — once the pass has re-synced — the
+    /// re-sync's outcome and the table taken after that. Confirmed only by a
+    /// table that divides the slots among its nodes exactly as the map divides
+    /// them among its primaries, and then its own primaries are the targets,
+    /// in its own spelling (Azure Managed Redis's 8 entries on 2 nodes are 2
+    /// targets); a completed re-sync is compared again, so a primary the table
+    /// missed is read in the same pass; a re-sync that failed or timed out is
+    /// never compared again, even when the table after it would match; an
+    /// unconfirmed answer names the table last compared and the re-sync's
+    /// outcome. With no map there is nothing to confirm against, whatever the
+    /// table (a pass whose `CLUSTER SLOTS` gave none never calls this:
+    /// [`PrimariesUnconfirmed::NoMap`], pinned at the read in
+    /// `tests/integration/storage/b_yuo_store_memory_tests.rs`). One collected
+    /// table, so a run that breaks several rows shows each.
+    ///
+    /// Fail-on-old, by in-place perturbations of `confirm_info_targets`:
+    /// comparing the counts of distinct primaries instead of
+    /// `table_partition_matches`, the moved-range row goes red (three primaries
+    /// on each side, every slot on each); re-comparing the table after a
+    /// re-sync that failed or timed out, the two rows that say "even with a
+    /// matching table after it" go red.
+    #[test]
+    fn confirm_info_targets_confirms_only_a_table_dividing_the_slots_as_the_map_does() {
+        let three = owners(&[
+            (0, 5460, "10.0.0.1:6379"),
+            (5461, 10922, "10.0.0.2:6379"),
+            (10923, 16383, "10.0.0.3:6379"),
+        ]);
+        let three_table =
+            local_table(&[(0, 5460, 7000), (5461, 10922, 7001), (10923, 16383, 7002)]);
+        // The map has moved slot 5461 from the first primary to the second;
+        // this table has not: the same three nodes and every slot, one range
+        // grouped otherwise.
+        let behind = local_table(&[(0, 5461, 7000), (5462, 10922, 7001), (10923, 16383, 7002)]);
+        // A scale-out: a fourth primary took part of the third's slots.
+        let four = owners(&[
+            (0, 5460, "10.0.0.1:6379"),
+            (5461, 10922, "10.0.0.2:6379"),
+            (10923, 13652, "10.0.0.3:6379"),
+            (13653, 16383, "10.0.0.4:6379"),
+        ]);
+        let four_table = local_table(&[
+            (0, 5460, 7000),
+            (5461, 10922, 7001),
+            (10923, 13652, 7002),
+            (13653, 16383, 7003),
+        ]);
+        let amr: Vec<(u16, u16, &str)> = (0..8u16)
+            .map(|i| {
+                let primary = if i % 2 == 0 {
+                    "10.0.0.4:8501"
+                } else {
+                    "10.0.0.4:8500"
+                };
+                (i * 2048, i * 2048 + 2047, primary)
+            })
+            .collect();
+        let amr_table: Vec<(i64, i64, &str, i64)> = (0..8i64)
+            .map(|i| (i * 2048, i * 2048 + 2047, "amr.example", 8501 - i % 2))
+            .collect();
+        let (amr, amr_table) = (owners(&amr), table(&amr_table));
+
+        let targets = |servers: &[&str]| -> Result<Vec<String>, PrimariesUnconfirmed> {
+            Ok(servers.iter().map(|s| (*s).to_owned()).collect())
+        };
+        let differs = |map: &[SlotOwner],
+                       table: Option<&ClusterRouting>,
+                       refresh: Option<RoutingRefresh>|
+         -> Result<Vec<String>, PrimariesUnconfirmed> {
+            Err(PrimariesUnconfirmed::TableDiffers {
+                map: render_map(map),
+                table: render_table(table),
+                refresh,
+            })
+        };
+        let refresh_failed =
+            || RoutingRefresh::Failed("Timeout Error: Request timed out.".to_owned());
+        let no_map: &[SlotOwner] = &[];
+        let (three, four, amr) = (three.as_slice(), four.as_slice(), amr.as_slice());
+        type Resync = Option<(RoutingRefresh, Option<ClusterRouting>)>;
+        let cases: Vec<(&str, &[SlotOwner], Option<&ClusterRouting>, Resync, _)> = vec![
+            (
+                "a table under other names that divides the slots as the map does",
+                three,
+                Some(&three_table),
+                None,
+                targets(&["127.0.0.1:7000", "127.0.0.1:7001", "127.0.0.1:7002"]),
+            ),
+            (
+                "AMR's 8 entries on 2 nodes: the table's 2 nodes",
+                amr,
+                Some(&amr_table),
+                None,
+                targets(&["amr.example:8500", "amr.example:8501"]),
+            ),
+            (
+                "a slot range moved between primaries, before a re-sync",
+                three,
+                Some(&behind),
+                None,
+                differs(three, Some(&behind), None),
+            ),
+            (
+                "a primary the table missed, re-synced to a table that lists it",
+                four,
+                Some(&three_table),
+                Some((RoutingRefresh::Refreshed, Some(four_table.clone()))),
+                targets(&[
+                    "127.0.0.1:7000",
+                    "127.0.0.1:7001",
+                    "127.0.0.1:7002",
+                    "127.0.0.1:7003",
+                ]),
+            ),
+            (
+                "no table before, re-synced to a matching one",
+                four,
+                None,
+                Some((RoutingRefresh::Refreshed, Some(four_table.clone()))),
+                targets(&[
+                    "127.0.0.1:7000",
+                    "127.0.0.1:7001",
+                    "127.0.0.1:7002",
+                    "127.0.0.1:7003",
+                ]),
+            ),
+            (
+                "re-synced to a table that still differs: the re-synced table is named",
+                four,
+                Some(&three_table),
+                Some((RoutingRefresh::Refreshed, Some(behind.clone()))),
+                differs(four, Some(&behind), Some(RoutingRefresh::Refreshed)),
+            ),
+            (
+                "re-synced, with no table after it",
+                four,
+                Some(&three_table),
+                Some((RoutingRefresh::Refreshed, None)),
+                differs(four, None, Some(RoutingRefresh::Refreshed)),
+            ),
+            (
+                "a re-sync that failed, even with a matching table after it",
+                four,
+                Some(&three_table),
+                Some((refresh_failed(), Some(four_table.clone()))),
+                differs(four, Some(&three_table), Some(refresh_failed())),
+            ),
+            (
+                "a re-sync that timed out, even with a matching table after it",
+                four,
+                Some(&three_table),
+                Some((timed_out(), Some(four_table.clone()))),
+                differs(four, Some(&three_table), Some(timed_out())),
+            ),
+            (
+                "no map: no table divides the slots as it does",
+                no_map,
+                Some(&three_table),
+                Some((RoutingRefresh::Refreshed, Some(three_table.clone()))),
+                differs(no_map, Some(&three_table), Some(RoutingRefresh::Refreshed)),
+            ),
+        ];
+        let got: Vec<_> = cases
+            .iter()
+            .map(|(what, map, before, sync, _)| {
+                let sync = sync
+                    .as_ref()
+                    .map(|(refresh, after)| (refresh, after.as_ref()));
+                let answer = confirm_info_targets(map, *before, sync).map(|servers| {
+                    let mut names: Vec<String> = servers.iter().map(Server::to_string).collect();
+                    names.sort_unstable();
+                    names
+                });
+                (*what, answer)
+            })
+            .collect();
+        let expected: Vec<_> = cases
+            .into_iter()
+            .map(|(what, _, _, _, expected)| (what, expected))
+            .collect();
         assert_eq!(got, expected);
     }
 
@@ -2732,31 +3571,29 @@ mod tests {
         );
     }
 
-    /// T4: no map — the routing table not known yet, no primary, or a map
-    /// with no entry — leaves the setting nothing to divide: startup stays on
-    /// the fallback and names why, and a refresh keeps the last good budget,
-    /// whatever it is.
+    /// T4: no map — the routing table not known yet, no primary, or a
+    /// clustered pass whose `CLUSTER SLOTS` failed or was malformed, which
+    /// (b.xb7) also cannot confirm its `INFO` targets and so sends no `INFO` —
+    /// leaves the setting nothing to divide: startup stays on the fallback and
+    /// names why, and a refresh keeps the last good budget, whatever it is.
     #[test]
     fn no_map_starts_on_the_fallback_and_a_refresh_keeps_the_last_good_budget() {
-        let empty_map = StoreMemoryReading::Read {
-            slot_ranges: vec![],
-            endpoints: 1,
-            info: Ok(vec![primary(
-                "primary 10.0.0.1:8500",
-                MaxmemoryField::Absent,
-            )]),
-            replconf_calls: ReplconfCalls::NotRead,
-        };
-        for (what, reading) in [
-            ("routing unknown", StoreMemoryReading::RoutingUnknown),
-            ("no primary", StoreMemoryReading::NoPrimary),
-            ("a map with no entry", empty_map),
+        for (what, read) in [
+            (
+                "routing unknown",
+                no_map_problem(StoreMemoryReading::RoutingUnknown),
+            ),
+            ("no primary", no_map_problem(StoreMemoryReading::NoPrimary)),
+            (
+                "a CLUSTER SLOTS that failed",
+                no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned())),
+            ),
+            (
+                "a malformed CLUSTER SLOTS",
+                no_map_read(ClusterMapProblem::Malformed),
+            ),
         ] {
-            let resolution = resolve_startup(
-                fallback(),
-                &no_map_problem(reading.clone()),
-                Some(X20_TOTAL),
-            );
+            let resolution = resolve_startup(fallback(), &read, Some(X20_TOTAL));
             assert_eq!(resolution.budget, fallback(), "{what}");
             assert!(
                 resolution.problem.is_some(),
@@ -2768,10 +3605,230 @@ mod tests {
                 fallback(),
             ] {
                 assert_eq!(
-                    refreshed_budget(&current, &reading, Some(X20_TOTAL)),
+                    refreshed_budget(&current, &read.reading, Some(X20_TOTAL)),
                     None,
                     "{what}: {current:?} stands"
                 );
+            }
+        }
+    }
+
+    // ── b.xb7 T2: an unconfirmed reading through every consumer ──────────────
+
+    /// b.xb7 T2: startup takes a pass whose primaries are unconfirmed as it
+    /// takes a failed `INFO memory`. With the setting unset, the fallback; with
+    /// it set, rule 3 from the pass's map when the table differed (the map
+    /// was read), and the fallback when there was no map. Either way the
+    /// problem is the unconfirmed primaries, the gauge is absent, and the
+    /// refresh runs.
+    #[test]
+    fn startup_takes_an_unconfirmed_read_as_a_failed_info_memory() {
+        let dev = from_total(&dev_map(), DEV_TOTAL, 2);
+        assert_eq!(dev.bytes, 600_000_000, "precondition: 12 GB over 2 shards");
+        let no_map = no_map_read(ClusterMapProblem::Malformed);
+        let cases = [
+            (
+                "the table differs, the setting unset",
+                table_differs(timed_out()),
+                None,
+                fallback(),
+            ),
+            (
+                "the table differs, the setting set",
+                table_differs(timed_out()),
+                Some(DEV_TOTAL),
+                dev,
+            ),
+            (
+                "no map, the setting set",
+                no_map.clone(),
+                Some(DEV_TOTAL),
+                fallback(),
+            ),
+            ("no map, the setting unset", no_map, None, fallback()),
+        ];
+        for (what, read, memory_bytes, budget) in cases {
+            let resolution = resolve_startup(fallback(), &read, memory_bytes);
+            assert_eq!(
+                (
+                    resolution.budget,
+                    resolution.problem.as_ref().map(StoreMemoryProblem::kind),
+                    resolution.gauge_arm,
+                    resolution.used_ratio,
+                    resolution.refresh_needed,
+                ),
+                (
+                    budget,
+                    Some(StoreMemoryProblemKind::PrimariesUnconfirmed),
+                    StoreMemoryGaugeArm::Absent,
+                    None,
+                    true,
+                ),
+                "{what}: (budget, problem, gauge arm, gauge, refresh)"
+            );
+        }
+    }
+
+    /// b.xb7 T2: a refresh takes an unconfirmed pass as a failed `INFO
+    /// memory`: an `info` budget in force is kept — its minimum is never
+    /// re-taken over primaries the pass did not read — while an `override`
+    /// budget is re-derived from the pass's fresh map, and a fallback stays
+    /// unless rule 3 answers (the setting set and a map).
+    #[test]
+    fn a_refresh_keeps_an_info_budget_over_an_unconfirmed_pass_and_rederives_an_override() {
+        let differs = table_differs(timed_out()).reading;
+        let no_map = no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned())).reading;
+        let dev = from_total(&dev_map(), DEV_TOTAL, 2);
+        let rows = [
+            (
+                "info, the table differs, the setting set",
+                from_store(THREE_GIB, 1),
+                &differs,
+                Some(DEV_TOTAL),
+                None,
+            ),
+            (
+                "info, the table differs, the setting unset",
+                from_store(THREE_GIB, 1),
+                &differs,
+                None,
+                None,
+            ),
+            (
+                "info, no map",
+                from_store(THREE_GIB, 1),
+                &no_map,
+                Some(DEV_TOTAL),
+                None,
+            ),
+            (
+                "override from an older map, re-derived from the fresh one",
+                from_total(&x20_map(), DEV_TOTAL, X20_ENDPOINTS),
+                &differs,
+                Some(DEV_TOTAL),
+                Some(dev),
+            ),
+            (
+                "override, the same map",
+                dev,
+                &differs,
+                Some(DEV_TOTAL),
+                None,
+            ),
+            ("override, no map", dev, &no_map, Some(DEV_TOTAL), None),
+            (
+                "fallback, the setting unset",
+                fallback(),
+                &differs,
+                None,
+                None,
+            ),
+            (
+                "fallback, no map",
+                fallback(),
+                &no_map,
+                Some(DEV_TOTAL),
+                None,
+            ),
+            (
+                "fallback, the setting set and a map: rule 3",
+                fallback(),
+                &differs,
+                Some(DEV_TOTAL),
+                Some(dev),
+            ),
+        ];
+        for (what, current, reading, memory_bytes, next) in rows {
+            assert_eq!(
+                refreshed_budget(&current, reading, memory_bytes),
+                next,
+                "{what}"
+            );
+        }
+    }
+
+    /// b.xb7 T2: an unconfirmed pass has no gauge figure on either arm — the
+    /// one a store reporting its limit takes (the setting unset) and the one a
+    /// store with no `maxmemory` field takes with the setting set, the copies
+    /// known — and never rules the refresh out, even beside an explicit
+    /// budget with the setting unset.
+    #[test]
+    fn an_unconfirmed_read_has_no_gauge_on_either_arm_and_keeps_the_refresh_running() {
+        for (what, reading) in [
+            ("the table differs", table_differs(timed_out()).reading),
+            ("no map", no_map_read(ClusterMapProblem::Malformed).reading),
+        ] {
+            assert_eq!(
+                (
+                    store_memory_gauge(&reading, None, Some(2)),
+                    store_memory_gauge(&reading, Some(DEV_TOTAL), Some(2)),
+                ),
+                (
+                    (StoreMemoryGaugeArm::Absent, None),
+                    (StoreMemoryGaugeArm::Absent, None)
+                ),
+                "{what}: (the limit's arm, the store total's arm)"
+            );
+            assert!(
+                store_memory_refresh_needed(&explicit(1), &reading, None),
+                "{what}: the refresh runs"
+            );
+        }
+    }
+
+    /// b.xb7 T2: the problem of an unconfirmed pass is a fault of its own kind
+    /// whose text names the cause: the map problem when there was no map; the
+    /// map, the table last compared and how the one re-sync went when the
+    /// table differed.
+    #[test]
+    fn an_unconfirmed_reads_problem_is_a_fault_naming_its_cause() {
+        let cases = [
+            (
+                no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned())),
+                vec!["the CLUSTER SLOTS read failed: timed out"],
+            ),
+            (
+                no_map_read(ClusterMapProblem::Malformed),
+                vec!["the CLUSTER SLOTS reply was empty or had a malformed entry"],
+            ),
+            (
+                table_differs(timed_out()),
+                vec![
+                    SCALED_OUT_MAP,
+                    MISSED_TABLE,
+                    "the refresh did not finish within 5000 ms",
+                ],
+            ),
+            (
+                table_differs(RoutingRefresh::Failed("connection refused".to_owned())),
+                vec![
+                    SCALED_OUT_MAP,
+                    "it could not refresh its routing table: connection refused",
+                ],
+            ),
+            (
+                table_differs(RoutingRefresh::Refreshed),
+                vec![
+                    SCALED_OUT_MAP,
+                    "it refreshed its routing table, which still divides them otherwise",
+                ],
+            ),
+        ];
+        for (read, causes) in cases {
+            let problem = StoreMemoryProblem::of_reading(&read.reading)
+                .expect("an unconfirmed pass carries a problem");
+            let text = problem.to_string();
+            assert_eq!(
+                (problem.kind(), problem.kind().is_fault()),
+                (StoreMemoryProblemKind::PrimariesUnconfirmed, true),
+                "{text}"
+            );
+            assert!(
+                text.starts_with("the read could not confirm it reached every primary"),
+                "{text}"
+            );
+            for cause in causes {
+                assert!(text.contains(cause), "{cause:?} in {text:?}");
             }
         }
     }
@@ -3035,7 +4092,8 @@ mod tests {
     /// pending and its value absent (its copies need a second read), and the
     /// refresh is seeded with startup's acknowledgement count, its arm, its
     /// problem and its cluster map problem. A `CLUSTER SLOTS` that gave no map
-    /// leaves startup on the fallback, the kind carried to the refresh. An
+    /// sends no `INFO` (b.xb7) and leaves startup on the fallback, both kinds —
+    /// the map's, and the unconfirmed primaries' — carried to the refresh. An
     /// unreadable count is carried as such, with no count to compare against.
     #[test]
     fn startup_on_a_store_without_maxmemory_seeds_the_refresh_with_what_it_read() {
@@ -3057,15 +4115,15 @@ mod tests {
             }
         );
 
-        let no_map = StoreMemoryRead {
-            reading: amr(Vec::new(), 2, DEV_USED, ReplconfCalls::Calls(651)),
-            map_problem: Some(ClusterMapProblem::ReadFailed("timed out".to_owned())),
-        };
+        let no_map = no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned()));
         let resolution = resolve_startup(fallback(), &no_map, Some(DEV_TOTAL));
         assert_eq!(resolution.budget, fallback(), "no map: the fallback");
         assert_eq!(
-            resolution.seed().map_problem,
-            Some(ClusterMapProblemKind::ReadFailed)
+            (resolution.seed().problem, resolution.seed().map_problem),
+            (
+                Some(StoreMemoryProblemKind::PrimariesUnconfirmed),
+                Some(ClusterMapProblemKind::ReadFailed)
+            )
         );
 
         let unreadable = no_map_problem(amr(
@@ -3166,7 +4224,10 @@ mod tests {
     /// the next read, and no "does not report its size" line (the setting
     /// answers both consumers); with the setting unset, that it is absent for
     /// that reason. A failed cluster map read and an unreadable count each
-    /// WARN once.
+    /// WARN once. They cannot meet in one pass: a pass with no map sends no
+    /// `INFO` at all (b.xb7), so its startup line names the unconfirmed
+    /// primaries as why the gauge is absent, and only the map WARNs (its
+    /// budget is the fallback, whose own line names the problem).
     #[test]
     fn the_startup_line_names_the_gauges_arm_or_why_it_is_absent() {
         let pending = resolve_startup(
@@ -3205,32 +4266,86 @@ mod tests {
             lines[0]
         );
 
-        let faults = resolve_startup(
+        let no_map = resolve_startup(
             fallback(),
-            &StoreMemoryRead {
-                reading: amr(
-                    Vec::new(),
-                    X20_ENDPOINTS,
-                    DEV_USED,
-                    ReplconfCalls::Unreadable("INFO commandstats failed: NOPERM".to_owned()),
-                ),
-                map_problem: Some(ClusterMapProblem::ReadFailed(
-                    "Timeout Error: Request timed out.".to_owned(),
-                )),
-            },
+            &no_map_read(ClusterMapProblem::ReadFailed(
+                "Timeout Error: Request timed out.".to_owned(),
+            )),
             Some(X20_TOTAL),
         );
-        let capture = LogCapture::of(|| log_store_memory_startup(&faults, Some(X20_TOTAL)));
+        let capture = LogCapture::of(|| log_store_memory_startup(&no_map, Some(X20_TOTAL)));
+        let lines = capture.lines("INFO", STARTUP_LINE);
+        assert_eq!(lines.len(), 1, "{}", capture.text());
+        assert!(
+            lines[0].contains("gauge_arm=Absent")
+                && lines[0].contains("could not confirm it reached every primary"),
+            "{}",
+            lines[0]
+        );
         assert_eq!(
             (
                 capture.lines("WARN", "the cluster map read failed").len(),
+                capture.lines("WARN", "").len(),
+            ),
+            (1, 1),
+            "one WARN, the map's; got {}",
+            capture.text()
+        );
+
+        let unreadable = resolve_startup(
+            fallback(),
+            &no_map_problem(amr(
+                x20_map(),
+                X20_ENDPOINTS,
+                DEV_USED,
+                ReplconfCalls::Unreadable("INFO commandstats failed: NOPERM".to_owned()),
+            )),
+            Some(X20_TOTAL),
+        );
+        let capture = LogCapture::of(|| log_store_memory_startup(&unreadable, Some(X20_TOTAL)));
+        assert_eq!(
+            (
                 capture.lines("WARN", "could not be read").len(),
                 capture.lines("WARN", "").len(),
             ),
-            (1, 1, 2),
-            "one WARN each; got {}",
+            (1, 1),
+            "one WARN, the count's; got {}",
             capture.text()
         );
+
+        // b.xb7: with the setting unset, a read that reached no usable figure
+        // for a reason other than the store's own answer names that reason —
+        // never "the store reports no usable maxmemory", which is the line for
+        // a store that answered.
+        for (what, reading, cause) in [
+            (
+                "a failed INFO memory",
+                failed("connection refused"),
+                "the INFO memory read failed",
+            ),
+            (
+                "routing unknown",
+                StoreMemoryReading::RoutingUnknown,
+                "no primary was read",
+            ),
+            (
+                "no primary",
+                StoreMemoryReading::NoPrimary,
+                "no primary was read",
+            ),
+        ] {
+            let resolution = resolve_startup(fallback(), &no_map_problem(reading), None);
+            let capture = LogCapture::of(|| log_store_memory_startup(&resolution, None));
+            let lines = capture.lines("INFO", STARTUP_LINE);
+            assert_eq!(lines.len(), 1, "{what}: {}", capture.text());
+            assert!(
+                lines[0].contains("gauge_arm=Absent")
+                    && lines[0].contains(cause)
+                    && !lines[0].contains("reports no usable maxmemory"),
+                "{what}: {}",
+                lines[0]
+            );
+        }
     }
 
     // ── T5, T6: the refresh task through its reader seam ─────────────────────
@@ -3554,25 +4669,17 @@ mod tests {
     }
 
     /// T5 (PD4) at the task: a pass whose `CLUSTER SLOTS` failed or was
-    /// malformed has no map, so the budget derived from the setting keeps its
-    /// last good value; the next pass with a map moves it. Each kind WARNs
-    /// once until a pass gets a map, then again at its next occurrence.
+    /// malformed has no map — and so (b.xb7) sends no `INFO` — so the budget
+    /// derived from the setting keeps its last good value; the next pass with
+    /// a map moves it. Each kind WARNs once until a pass gets a map, then
+    /// again at its next occurrence.
     #[tokio::test(start_paused = true)]
     async fn a_pass_without_a_map_keeps_the_budget_and_each_kind_warns_once() {
         let capture = LogCapture::default();
         let _guard = capture.install();
-        let pass = |problem: Option<ClusterMapProblem>| StoreMemoryRead {
-            reading: amr(
-                if problem.is_some() {
-                    Vec::new()
-                } else {
-                    x20_map()
-                },
-                X20_ENDPOINTS,
-                1,
-                ReplconfCalls::Calls(5),
-            ),
-            map_problem: problem,
+        let pass = |problem: Option<ClusterMapProblem>| match problem {
+            Some(problem) => no_map_read(problem),
+            None => no_map_problem(amr(x20_map(), X20_ENDPOINTS, 1, ReplconfCalls::Calls(5))),
         };
         let failed = || Some(ClusterMapProblem::ReadFailed("timed out".to_owned()));
         // The second read-failed WARN follows a pass with a map: without the
@@ -3616,58 +4723,72 @@ mod tests {
 
     /// The refresh task inherits startup's WARN-once state
     /// ([`StoreMemoryResolution::seed`]): when startup's cluster map read
-    /// failed and its `INFO commandstats` was unreadable — each logged once by
-    /// [`log_store_memory_startup`] — re-reads that fail the same way log no
-    /// WARN for either.
+    /// failed — logged by [`log_store_memory_startup`], its unconfirmed
+    /// primaries by the fallback's own startup line — or its `INFO
+    /// commandstats` was unreadable, re-reads that fail the same way log no
+    /// WARN at all. The two are separate startups: a pass with no map sends
+    /// no `INFO` (b.xb7), so it never reads the count.
     #[tokio::test(start_paused = true)]
     async fn the_refresh_does_not_warn_again_for_failures_startup_logged() {
-        let failing = || StoreMemoryRead {
-            reading: amr(
-                Vec::new(),
+        let no_map = || no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned()));
+        let unreadable = || {
+            no_map_problem(amr(
+                x20_map(),
                 X20_ENDPOINTS,
                 1,
                 ReplconfCalls::Unreadable("INFO commandstats failed: NOPERM".to_owned()),
-            ),
-            map_problem: Some(ClusterMapProblem::ReadFailed("timed out".to_owned())),
+            ))
         };
-        let startup = resolve_startup(fallback(), &failing(), Some(X20_TOTAL));
-        assert!(
-            startup.seed().map_problem == Some(ClusterMapProblemKind::ReadFailed)
-                && startup.seed().commandstats_unreadable,
-            "precondition: startup saw both failures"
-        );
-        let capture = LogCapture::default();
-        let _guard = capture.install();
-
-        let passes = run_refresh(
-            vec![failing(), failing()],
-            None,
-            startup.budget,
-            Some(X20_TOTAL),
-            startup.seed(),
-        )
-        .await;
-
-        assert_eq!(passes.len(), 2, "precondition: both passes ran");
-        assert_eq!(
+        for (what, failing, seen) in [
             (
-                capture.lines("WARN", "the cluster map read failed").len(),
-                capture
-                    .lines(
-                        "WARN",
-                        "(cmdstat_replconf in INFO commandstats) could not be read"
-                    )
-                    .len(),
+                "the cluster map read failed",
+                &no_map as &dyn Fn() -> StoreMemoryRead,
+                RefreshSeed {
+                    problem: Some(StoreMemoryProblemKind::PrimariesUnconfirmed),
+                    gauge_arm: Some(StoreMemoryGaugeArm::Absent),
+                    replconf_calls: None,
+                    map_problem: Some(ClusterMapProblemKind::ReadFailed),
+                    commandstats_unreadable: false,
+                },
             ),
-            (0, 0),
-            "(cluster map WARNs, commandstats WARNs); got {}",
-            capture.text()
-        );
-        assert!(
-            capture.lines("WARN", "").is_empty(),
-            "no WARN at all; got {}",
-            capture.text()
-        );
+            (
+                "the count was unreadable",
+                &unreadable as &dyn Fn() -> StoreMemoryRead,
+                RefreshSeed {
+                    problem: Some(StoreMemoryProblemKind::FieldAbsent),
+                    gauge_arm: Some(StoreMemoryGaugeArm::StoreTotalPending),
+                    replconf_calls: None,
+                    map_problem: None,
+                    commandstats_unreadable: true,
+                },
+            ),
+        ] {
+            let startup = resolve_startup(fallback(), &failing(), Some(X20_TOTAL));
+            assert_eq!(
+                startup.seed(),
+                seen,
+                "{what}: precondition: what startup saw"
+            );
+            let capture = LogCapture::default();
+            let guard = capture.install();
+
+            let passes = run_refresh(
+                vec![failing(), failing()],
+                None,
+                startup.budget,
+                Some(X20_TOTAL),
+                startup.seed(),
+            )
+            .await;
+
+            drop(guard);
+            assert_eq!(passes.len(), 2, "{what}: precondition: both passes ran");
+            assert!(
+                capture.lines("WARN", "").is_empty(),
+                "{what}: no WARN at all; got {}",
+                capture.text()
+            );
+        }
     }
 
     /// The refresh task inherits startup's gauge arm
@@ -3701,5 +4822,625 @@ mod tests {
             "the arm did not change; got {}",
             capture.text()
         );
+    }
+
+    /// b.xb7 T3 through the task, the setting unset: passes confirmed,
+    /// unconfirmed (no map), unconfirmed (the table still differed after a
+    /// re-sync that timed out), confirmed at half the limit, unconfirmed again
+    /// (the table still differed after a completed re-sync). The gate's
+    /// budget stands across the unconfirmed passes and follows the confirmed
+    /// ones; the gauge is absent on every unconfirmed pass and back on the
+    /// confirmed one. The unconfirmed primaries WARN once for the first run
+    /// of passes — its second pass is a repeat of the kind, logged at DEBUG,
+    /// whatever its cause — and the confirmed pass resets the kind, so the
+    /// last pass WARNs again (without the reset it would be a second DEBUG).
+    /// Each WARN says why the gauge is absent, never that the store reports
+    /// no usable maxmemory (the line for a store that answered), and names
+    /// the remedy for its own cause: the no-map pass's points at `CLUSTER
+    /// SLOTS`, the differing table's at reaching every primary, neither at the
+    /// other's. No line names the maintenance client, an internal name.
+    #[tokio::test(start_paused = true)]
+    async fn unconfirmed_passes_hold_the_budget_hide_the_gauge_and_warn_once_per_run() {
+        const UNCONFIRMED: &str = "could not confirm it reached every primary";
+        const NO_MAP_REMEDY: &str = "check that the store answers CLUSTER SLOTS";
+        const DIFFERS_REMEDY: &str = "check that the pods can reach every primary";
+        let capture = LogCapture::default();
+        let _guard = capture.install();
+        let initial = from_store(THREE_GIB, 2);
+        let reads = vec![
+            no_map_problem(limit(THREE_GIB, 2)),
+            no_map_read(ClusterMapProblem::ReadFailed("timed out".to_owned())),
+            table_differs(timed_out()),
+            no_map_problem(limit(THREE_GIB / 2, 2)),
+            table_differs(RoutingRefresh::Refreshed),
+        ];
+
+        let passes = run_refresh(
+            reads,
+            Some(test_gate(initial.bytes)),
+            initial,
+            None,
+            RefreshSeed::default(),
+        )
+        .await;
+
+        let half = from_store(THREE_GIB / 2, 2).bytes;
+        assert_eq!(
+            (
+                passes.iter().map(|p| p.budget).collect::<Vec<_>>(),
+                passes
+                    .iter()
+                    .map(|p| p.ratio().is_some())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                vec![
+                    Some(initial.bytes),
+                    Some(initial.bytes),
+                    Some(initial.bytes),
+                    Some(half),
+                    Some(half),
+                ],
+                vec![true, false, false, true, false],
+            ),
+            "(the gate's budget, the gauge present) after each pass"
+        );
+        let warns = capture.lines("WARN", UNCONFIRMED);
+        assert_eq!(
+            (
+                warns.len(),
+                capture.lines("DEBUG", "gave nothing usable again").len(),
+            ),
+            (2, 1),
+            "(WARNs, DEBUG repeats) for the unconfirmed primaries; got {}",
+            capture.text()
+        );
+        for warn in &warns {
+            assert!(
+                warn.contains("store memory read gave nothing usable: ")
+                    && warn.contains(
+                        "live_edit_store_memory_used_ratio is absent: the read could not confirm \
+                         it reached every primary"
+                    )
+                    && !warn.contains("the store reports no usable maxmemory"),
+                "{warn}"
+            );
+        }
+        assert_eq!(
+            warns
+                .iter()
+                .map(|w| (w.contains(NO_MAP_REMEDY), w.contains(DIFFERS_REMEDY)))
+                .collect::<Vec<_>>(),
+            [(true, false), (false, true)],
+            "(the no-map remedy, the differing table's remedy) in each WARN, in order; got {warns:#?}"
+        );
+        assert!(
+            !capture.text().contains("maintenance client"),
+            "no line names the maintenance client; got {}",
+            capture.text()
+        );
+    }
+
+    // ── b.xb7: startup's read bounded as a whole ─────────────────────────────
+    //
+    // The deadline is 2 command timeouts (2T) from the read's start, and each
+    // command is bounded by T on its own, as is the routing sync
+    // (`refresh_routing`). So a store can cut off only a step made of several
+    // commands — the `INFO memory`s, the `INFO commandstats` — which the
+    // staged integration tests drive (`b_yuo_store_memory_tests.rs`). The
+    // `CLUSTER SLOTS`, the first step, ends by T, and the sync, which starts
+    // after it and waits at most T from its own start, ends by 2T: the
+    // deadline could cut either off only within timer slack at that boundary,
+    // never reliably, so their cut-offs are driven here with a deadline set by
+    // hand.
+
+    /// A fred client that never connects, whose command timeout is `timeout`:
+    /// a routing sync sent on it waits forever (its router never runs), so
+    /// only a bound ends the wait. No I/O.
+    fn unconnected_client(timeout: Duration) -> fred::clients::Client {
+        fred::clients::Client::new(
+            fred::types::config::Config::default(),
+            Some(fred::types::config::PerformanceConfig {
+                default_command_timeout: timeout,
+                ..Default::default()
+            }),
+            None,
+            None,
+        )
+    }
+
+    /// A read deadline at `at`, named as 10 s in its cut-off text.
+    fn deadline_at(at: tokio::time::Instant) -> ReadDeadline {
+        ReadDeadline {
+            at,
+            ms: 10_000,
+            reached: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A deadline an hour gone: any step bounded by it is cut off at its first
+    /// poll, once it has sent its command.
+    fn passed_deadline() -> ReadDeadline {
+        let now = tokio::time::Instant::now();
+        deadline_at(now.checked_sub(Duration::from_secs(3600)).unwrap_or(now))
+    }
+
+    fn reached(deadline: &ReadDeadline) -> bool {
+        deadline.reached.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// b.xb7 2(b): startup's deadline is [`STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS`]
+    /// command timeouts from now — 10 s at a 5 s timeout — and there is none
+    /// when the command timeout is 0, fred's "no timeout".
+    #[tokio::test(start_paused = true)]
+    async fn the_startup_reads_deadline_is_two_command_timeouts_and_none_without_one() {
+        assert!(
+            ReadDeadline::of(
+                &unconnected_client(Duration::ZERO),
+                STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS
+            )
+            .is_none(),
+            "a zero command timeout: no deadline"
+        );
+        let deadline = ReadDeadline::of(
+            &unconnected_client(Duration::from_secs(5)),
+            STARTUP_STORE_MEMORY_READ_COMMAND_TIMEOUTS,
+        )
+        .expect("a 5 s command timeout gives a deadline");
+        assert_eq!(
+            (
+                deadline.at,
+                deadline.ms,
+                reached(&deadline),
+                deadline
+                    .cut_off()
+                    .contains("reached its deadline after 10000 ms"),
+            ),
+            (
+                tokio::time::Instant::now() + Duration::from_secs(10),
+                10_000,
+                false,
+                true
+            ),
+            "(at, ms, reached, cut-off text) on a paused clock"
+        );
+    }
+
+    /// b.xb7 2(a): a routing sync the deadline cuts off reads as a re-sync
+    /// that timed out after the time actually waited — here 3 s, the deadline,
+    /// not the 5 s command timeout the sync's own bound would have waited —
+    /// the targets unconfirmed (`TableDiffers`, which the read carries as
+    /// [`InfoUnread::Unconfirmed`], never [`InfoUnread::Failed`]), and the
+    /// deadline marked reached, which `startup_store_memory` reports as
+    /// `cut_off_at_deadline`. Without a deadline the same sync ends at its own
+    /// bound, 5 s, and nothing is marked. A paused clock and a client that
+    /// never connects: no I/O.
+    ///
+    /// Fail-on-old, by in-place perturbation: with the cut-off mapped to a
+    /// failed re-sync (`RoutingRefresh::Failed` with the cut-off text) instead
+    /// of one that timed out, this goes red. `info_targets` cannot return
+    /// [`InfoUnread::Failed`] — its error is a [`PrimariesUnconfirmed`] — and
+    /// the read maps that error only to [`InfoUnread::Unconfirmed`].
+    #[tokio::test(start_paused = true)]
+    async fn a_routing_sync_cut_off_at_the_deadline_reads_as_a_re_sync_that_timed_out_for_the_time_waited(
+    ) {
+        let client = unconnected_client(Duration::from_secs(5));
+        let map = owners(&[(0, 16383, "10.0.0.1:6379")]);
+        let differs = |waited_ms| -> Result<Vec<Server>, PrimariesUnconfirmed> {
+            Err(PrimariesUnconfirmed::TableDiffers {
+                map: render_map(&map),
+                table: "no routing table".to_owned(),
+                refresh: Some(RoutingRefresh::TimedOut { waited_ms }),
+            })
+        };
+
+        let deadline = deadline_at(tokio::time::Instant::now() + Duration::from_secs(3));
+        let cut_off = info_targets(&client, &map, Some(&deadline)).await;
+        let unbounded = info_targets(&client, &map, None).await;
+
+        assert_eq!(
+            (cut_off, reached(&deadline), unbounded),
+            (differs(3_000), true, differs(5_000)),
+            "(the cut-off's targets, the deadline reached, the targets with no deadline)"
+        );
+    }
+
+    /// b.xb7 2(b), on the standalone test store: an `INFO memory` the deadline
+    /// cuts off reads as a failed `INFO memory` naming the cut-off, the map —
+    /// one range over every slot — kept, and the deadline marked reached.
+    /// The deadline is long gone, so the step is cut off at its first poll,
+    /// once it has sent its command, whatever the store's speed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_info_memory_cut_off_at_the_deadline_is_a_failed_info_memory_that_keeps_the_map() {
+        let tv = crate::storage::test_support::TestValkey::setup().await;
+        let (pool, _token) = tv.client().acquire_maintenance();
+        let deadline = passed_deadline();
+
+        let read = read_bounded(tv.client(), pool.next(), None, Some(&deadline)).await;
+
+        let StoreMemoryReading::Read {
+            info: Err(InfoUnread::Failed(why)),
+            slot_ranges,
+            ..
+        } = &read.reading
+        else {
+            panic!("a failed INFO memory; got {read:?}");
+        };
+        assert_eq!(
+            (
+                why.contains("reached its deadline"),
+                slot_ranges.clone(),
+                read.map_problem.clone(),
+                reached(&deadline),
+            ),
+            (true, vec![STANDALONE_SLOT_RANGE], None, true),
+            "(the cut-off named, the map, map problem, deadline reached); got {why}"
+        );
+    }
+
+    /// b.xb7 2(b), on a real cluster (`LIVE_EDIT_TEST_CLUSTER_URL`; skipped
+    /// otherwise — CI's `test-cluster:` job runs it): a `CLUSTER SLOTS` the
+    /// deadline cuts off reads as a failed map read naming the cut-off — no
+    /// map, so the targets are unconfirmed and no `INFO` is sent — and the
+    /// deadline is marked reached. The deadline is long gone, so the command
+    /// is cut off at its first poll. Prints `CLUSTER-GATED RAN:` when it ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cluster_slots_cut_off_at_the_deadline_leaves_a_cluster_read_with_no_map() {
+        let Some(cluster_url) = crate::storage::test_support::test_cluster_url() else {
+            eprintln!(
+                "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)"
+            );
+            return;
+        };
+        let tv = crate::storage::test_support::TestValkey::setup_with_url(cluster_url, 1).await;
+        let (pool, _token) = tv.client().acquire_maintenance();
+        let node_client = pool.next();
+        assert!(node_client.is_clustered(), "a cluster URL is required");
+        let deadline = passed_deadline();
+
+        let read = read_bounded(tv.client(), node_client, None, Some(&deadline)).await;
+
+        let Some(ClusterMapProblem::ReadFailed(why)) = &read.map_problem else {
+            panic!("a failed map read; got {read:?}");
+        };
+        assert!(why.contains("reached its deadline"), "{why}");
+        assert!(
+            matches!(
+                &read.reading,
+                StoreMemoryReading::Read {
+                    info: Err(InfoUnread::Unconfirmed(PrimariesUnconfirmed::NoMap(
+                        ClusterMapProblem::ReadFailed(_)
+                    ))),
+                    slot_ranges,
+                    ..
+                } if slot_ranges.is_empty()
+            ),
+            "no map, the targets unconfirmed: {read:?}"
+        );
+        assert!(reached(&deadline), "the deadline is marked reached");
+        println!(
+            "CLUSTER-GATED RAN: a_cluster_slots_cut_off_at_the_deadline_leaves_a_cluster_read_with_no_map"
+        );
+    }
+
+    /// b.xb7 2(c): a startup read cut off at its deadline seeds the refresh
+    /// with no problem — no maxmemory problem, no map problem, no unreadable
+    /// count, since those name the cut-off rather than the store — but with
+    /// the gauge's arm and the acknowledgement count it read; one that was not
+    /// cut off seeds every field as before. (All three problems at once is
+    /// not one read's shape; the seed maps each field on its own.)
+    ///
+    /// Fail-on-old, by in-place perturbation: with `seed` ignoring the flag,
+    /// the cut-off row seeds the three problems and goes red.
+    #[test]
+    fn a_startup_read_cut_off_at_its_deadline_seeds_no_problem_but_keeps_what_it_read() {
+        let read = StoreMemoryResolution {
+            budget: fallback(),
+            problem: Some(StoreMemoryProblem::ReadFailed("deadline".to_owned())),
+            gauge_arm: StoreMemoryGaugeArm::StoreTotalPending,
+            used_ratio: None,
+            replconf_calls: Some(651),
+            commandstats_unreadable: Some("deadline".to_owned()),
+            map_problem: Some(ClusterMapProblem::ReadFailed("deadline".to_owned())),
+            refresh_needed: true,
+            cut_off_at_deadline: false,
+        };
+        let cut_off = StoreMemoryResolution {
+            cut_off_at_deadline: true,
+            ..read.clone()
+        };
+        assert_eq!(
+            (read.seed(), cut_off.seed()),
+            (
+                RefreshSeed {
+                    problem: Some(StoreMemoryProblemKind::ReadFailed),
+                    gauge_arm: Some(StoreMemoryGaugeArm::StoreTotalPending),
+                    replconf_calls: Some(651),
+                    map_problem: Some(ClusterMapProblemKind::ReadFailed),
+                    commandstats_unreadable: true,
+                },
+                RefreshSeed {
+                    problem: None,
+                    gauge_arm: Some(StoreMemoryGaugeArm::StoreTotalPending),
+                    replconf_calls: Some(651),
+                    map_problem: None,
+                    commandstats_unreadable: false,
+                },
+            ),
+            "(the seed of a read not cut off, of one cut off)"
+        );
+    }
+
+    /// b.xb7 2(c) through the task: startup's `INFO memory` cut off at the
+    /// deadline (a failed `INFO memory` naming the cut-off), then a first
+    /// refresh pass whose `INFO memory` fails too, the same kind. When
+    /// startup was cut off, that pass WARNs its own cause, with its own
+    /// cause's remedy — a failed `INFO memory`'s, the setting unset, not the
+    /// deadline's, since this pass's failure is not a cut-off; when the same
+    /// startup was not cut off, startup already logged the kind, and the pass
+    /// is a DEBUG repeat.
+    ///
+    /// Fail-on-old, by in-place perturbation: with `seed` ignoring the flag,
+    /// the cut-off row is a DEBUG repeat with no WARN and goes red.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_refresh_after_a_cut_off_startup_warns_for_a_failure_of_the_same_kind() {
+        const FAILED: &str = "the INFO memory read failed";
+        let resolution = resolve_startup(
+            fallback(),
+            &no_map_problem(failed_over(
+                dev_map(),
+                2,
+                "the startup store-memory read reached its deadline after 10000 ms (2 x the \
+                 command timeout)",
+            )),
+            None,
+        );
+        let mut logged = Vec::new();
+        for cut_off_at_deadline in [false, true] {
+            let startup = StoreMemoryResolution {
+                cut_off_at_deadline,
+                ..resolution.clone()
+            };
+            let capture = LogCapture::default();
+            let guard = capture.install();
+            let passes = run_refresh(
+                vec![no_map_problem(failed_over(dev_map(), 2, "Timeout Error"))],
+                None,
+                startup.budget,
+                None,
+                startup.seed(),
+            )
+            .await;
+            drop(guard);
+            assert_eq!(passes.len(), 1, "precondition: the pass ran");
+            logged.push((
+                cut_off_at_deadline,
+                capture
+                    .lines("WARN", FAILED)
+                    .iter()
+                    .map(|warn| remedies_in(warn))
+                    .collect::<Vec<_>>(),
+                capture.lines("DEBUG", "gave nothing usable again").len(),
+            ));
+        }
+        assert_eq!(
+            logged,
+            [
+                (false, vec![], 1),
+                (true, vec![vec!["acl", "store total"]], 0)
+            ],
+            "(startup cut off, each WARN's remedies, DEBUG repeats) for the first pass's failed \
+             INFO memory"
+        );
+    }
+
+    // ── b.xb7: each cause's remedy (`problem_remedy`) ────────────────────────
+
+    /// The distinctive phrase of each remedy clause [`problem_remedy`] gives,
+    /// by name. `config.rs`'s tests pin the same phrases on the release
+    /// budget's startup fallback WARN, which appends the same text.
+    const REMEDIES: [(&str, &str); 7] = [
+        (
+            "deadline",
+            "a later read that still fails logs its own cause",
+        ),
+        ("acl", "If INFO was denied"),
+        ("store total", "set LIVE_EDIT_VALKEY_MEMORY_BYTES"),
+        ("maxmemory", "Set maxmemory on every primary"),
+        ("cluster state", "Check the store's cluster state"),
+        ("no map", "the store answers CLUSTER SLOTS"),
+        ("table differs", "the pods can reach every primary"),
+    ];
+
+    /// The names of the [`REMEDIES`] whose phrase `text` carries, in
+    /// [`REMEDIES`] order.
+    fn remedies_in(text: &str) -> Vec<&'static str> {
+        REMEDIES
+            .iter()
+            .filter(|(_, phrase)| text.contains(phrase))
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
+    /// An ACL denial of `INFO`, as Valkey words it.
+    const INFO_DENIED: &str = "NOPERM this user has no permissions to run the 'info' command";
+
+    /// Each problem's remedy is its own cause's clause and no other's, with
+    /// `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset and set: a failed `INFO memory`
+    /// names the ACL grant, and the setting only while it is unset; a step
+    /// startup's deadline cut off — a failed `INFO memory`, or a `CLUSTER
+    /// SLOTS` that left no map — gets the deadline's clause instead of its
+    /// step's whatever the setting, the cut-off recognised in the text
+    /// [`ReadDeadline::cut_off`] gives; a store with no `maxmemory` field gets
+    /// none. Every non-empty remedy starts with `". "`, since it is appended
+    /// to a sentence.
+    ///
+    /// Fail-on-old, by in-place perturbation: with the deadline arm giving
+    /// `""`, or the failed `INFO`'s store-total clause given whatever the
+    /// setting, this goes red.
+    #[test]
+    fn each_problems_remedy_is_its_own_causes_with_the_store_total_set_or_not() {
+        let cut_off = passed_deadline().cut_off();
+        let unusable = StoreMemoryProblem::Unusable;
+        let unconfirmed = |cause| unusable(UnusableReason::PrimariesUnconfirmed(cause));
+        let no_map = |problem| unconfirmed(PrimariesUnconfirmed::NoMap(problem));
+        let primary = || "primary 10.0.0.1:6379".to_owned();
+        // (the problem, its remedies with the setting unset, with it set)
+        let cases: Vec<(StoreMemoryProblem, &[&str], &[&str])> = vec![
+            (
+                StoreMemoryProblem::ReadFailed(INFO_DENIED.to_owned()),
+                &["acl", "store total"],
+                &["acl"],
+            ),
+            (
+                StoreMemoryProblem::ReadFailed("Timeout Error: Request timed out.".to_owned()),
+                &["acl", "store total"],
+                &["acl"],
+            ),
+            (
+                StoreMemoryProblem::ReadFailed(cut_off.clone()),
+                &["deadline"],
+                &["deadline"],
+            ),
+            (
+                no_map(ClusterMapProblem::ReadFailed(cut_off.clone())),
+                &["deadline"],
+                &["deadline"],
+            ),
+            (
+                no_map(ClusterMapProblem::ReadFailed(
+                    "Timeout Error: Request timed out.".to_owned(),
+                )),
+                &["no map"],
+                &["no map"],
+            ),
+            (
+                no_map(ClusterMapProblem::Malformed),
+                &["no map"],
+                &["no map"],
+            ),
+            (
+                unconfirmed(PrimariesUnconfirmed::TableDiffers {
+                    map: SCALED_OUT_MAP.to_owned(),
+                    table: MISSED_TABLE.to_owned(),
+                    refresh: Some(timed_out()),
+                }),
+                &["table differs"],
+                &["table differs"],
+            ),
+            (
+                unusable(UnusableReason::ZeroLimit { primary: primary() }),
+                &["maxmemory"],
+                &["maxmemory"],
+            ),
+            (
+                unusable(UnusableReason::Malformed { primary: primary() }),
+                &["maxmemory"],
+                &["maxmemory"],
+            ),
+            (
+                unusable(UnusableReason::RoutingUnknown),
+                &["cluster state"],
+                &["cluster state"],
+            ),
+            (
+                unusable(UnusableReason::NoPrimary),
+                &["cluster state"],
+                &["cluster state"],
+            ),
+            (
+                unusable(UnusableReason::FieldAbsent { primary: primary() }),
+                &[],
+                &[],
+            ),
+        ];
+        for (problem, unset, set) in &cases {
+            for (memory_bytes_set, expected) in [(false, unset), (true, set)] {
+                let remedy = problem_remedy(problem, memory_bytes_set);
+                assert_eq!(
+                    remedies_in(remedy),
+                    *expected,
+                    "{problem} (setting set: {memory_bytes_set}): got {remedy:?}"
+                );
+                assert!(
+                    if expected.is_empty() {
+                        remedy.is_empty()
+                    } else {
+                        remedy.starts_with(". ")
+                    },
+                    "{problem} (setting set: {memory_bytes_set}): empty only with no clause, \
+                     else appended as a sentence; got {remedy:?}"
+                );
+            }
+        }
+    }
+
+    /// Startup's WARN for a problem whose budget is not the fallback (which
+    /// has its own line, `Config::log_ext_release_budget_startup`) carries its
+    /// own cause's remedy and no other's: a denied `INFO` with the store total
+    /// set (the budget is rule 3's) names the ACL grant only; with it unset
+    /// (the budget explicit) the setting too; an `INFO memory` startup's
+    /// deadline cut off names the deadline's; `maxmemory 0` names setting
+    /// `maxmemory`.
+    ///
+    /// Fail-on-old, by in-place perturbation: with `log_store_memory_problem`
+    /// appending no remedy, or the failed `INFO`'s store-total clause given
+    /// whatever the setting, this goes red.
+    #[test]
+    fn a_startup_warn_off_the_fallback_carries_its_own_causes_remedy() {
+        const WARN_LINE: &str = "store memory read gave nothing usable";
+        let cut_off = passed_deadline().cut_off();
+        let denied = || no_map_problem(failed_over(x20_map(), X20_ENDPOINTS, INFO_DENIED));
+        /// (what, the configured budget, startup's read, the store total,
+        /// the WARN's remedies)
+        type Case = (
+            &'static str,
+            ExtReleaseBudget,
+            StoreMemoryRead,
+            Option<u64>,
+            &'static [&'static str],
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a denied INFO, the store total set",
+                fallback(),
+                denied(),
+                Some(X20_TOTAL),
+                &["acl"],
+            ),
+            (
+                "a denied INFO, the store total unset",
+                explicit(123_456_789),
+                denied(),
+                None,
+                &["acl", "store total"],
+            ),
+            (
+                "an INFO memory cut off at the deadline",
+                explicit(123_456_789),
+                no_map_problem(failed_over(x20_map(), X20_ENDPOINTS, &cut_off)),
+                None,
+                &["deadline"],
+            ),
+            (
+                "maxmemory 0",
+                explicit(123_456_789),
+                no_map_problem(one(MaxmemoryField::Value(0))),
+                None,
+                &["maxmemory"],
+            ),
+        ];
+        for (what, configured, read, memory_bytes, expected) in cases {
+            let resolution = resolve_startup(configured, &read, memory_bytes);
+            assert!(
+                !matches!(resolution.budget.source, ExtReleaseBudgetSource::Fallback),
+                "{what}: precondition: the budget is not the fallback; got {:?}",
+                resolution.budget
+            );
+            let capture = LogCapture::of(|| log_store_memory_startup(&resolution, memory_bytes));
+            let warns = capture.lines("WARN", WARN_LINE);
+            assert_eq!(warns.len(), 1, "{what}: one WARN; got {}", capture.text());
+            assert_eq!(remedies_in(&warns[0]), expected, "{what}: {}", warns[0]);
+        }
     }
 }

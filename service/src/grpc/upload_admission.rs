@@ -27,16 +27,17 @@
 //!
 //! **No upload under `LIVE_EDIT_MAX_LAYER_SIZE` is refused for its size.** The
 //! budget bounds how many uploads run at once; an upload whose processing does
-//! not fit runs in the **overflow slot**, one at a time, beside the in-budget
-//! uploads. So the in-budget reservations never exceed `B`, at most one upload
-//! is charged beyond `B`, and total upload memory is at most `B` plus that one
-//! upload's charge. A structural `UpdateLayer` also holds memory for the
-//! object it edits; its commit charges that too, before it allocates it (the
-//! object-state charge, below), with three residuals on the WATCH path, all
-//! charged after they arrive: names longer than any its read has seen yet, a
-//! small set index's whole membership answering one index page, and a
-//! hashtable-encoded set index's scan step overshooting its share by a few
-//! members (below).
+//! not fit — or, unless it is a chained `UpdateLayer`, whose content does not
+//! fit while it is received and finds the slot free — runs in the **overflow
+//! slot**, one at a time, beside the in-budget uploads. So the in-budget
+//! reservations never exceed `B`, at most one upload is charged beyond `B`, and
+//! total upload memory is at most `B` plus that one upload's charge. A
+//! structural `UpdateLayer` also holds memory for the object it edits; its
+//! commit charges that too, before it allocates it (the object-state charge,
+//! below), with three residuals on the WATCH path, all charged after they
+//! arrive: names longer than any its read has seen yet, a small set index's
+//! whole membership answering one index page, and a hashtable-encoded set
+//! index's scan step overshooting its share by a few members (below).
 //!
 //! **Charges.** Admission reserves `F + A`:
 //!
@@ -47,12 +48,16 @@
 //!
 //! While the body is read the reservation grows by
 //! [`RECEIVE_CHARGE_FACTOR`] × each chunk's length (the chunks as received
-//! plus their one concatenation), accepted or refused at once
-//! ([`UploadReservation::try_grow_in_budget`]). `B` is floored at
+//! plus their one concatenation), granted or refused at once, never waiting
+//! ([`UploadReservation::try_grow_receive`]): in budget when it fits; else,
+//! for an upload that is not a chained `UpdateLayer`, in the overflow slot
+//! when the slot is free and no processing step is queued, its in-budget bytes
+//! moving onto the slot; else refused `UNAVAILABLE`. `B` is floored at
 //! `F + A + 2 × LIVE_EDIT_MAX_LAYER_SIZE` ([`upload_budget_floor_bytes`]), so
-//! the receive phase of any upload under the size cap fits an empty budget. At
-//! the end of the body [`UploadReservation::end_receive`] releases `A` and the
-//! session slot, and the reservation shrinks to `F` + body length.
+//! the receive phase of any upload under the size cap fits an empty budget,
+//! and so fits the free slot too. At the end of the body
+//! [`UploadReservation::end_receive`] releases `A` and the session slot, and
+//! the reservation shrinks to `F` + body length, in budget or on the slot.
 //!
 //! Then two processing steps, each through
 //! [`UploadReservation::reserve_processing`]:
@@ -145,7 +150,8 @@
 //!   set's own size × 20 B, but no constant in the code bounds it.
 //!
 //! **Waiting.** Only two calls wait, and neither waits on anything that is
-//! itself waiting on the gate:
+//! itself waiting on the gate, except across the HTTP/2 connection window, an
+//! edge the admission wait bounds (below):
 //!
 //! - [`UploadAdmissionGate::admit`] waits holding nothing from the gate, for at
 //!   most the admission wait. The queue is first-come-first-served: a waiter
@@ -154,14 +160,17 @@
 //!   need the same `F + A`).
 //! - [`UploadReservation::reserve_processing`] keeps the in-budget bytes it
 //!   already holds while it waits, and waits only for room in `B` or for the
-//!   overflow slot, whose holder never waits on the gate (it may wait outside
-//!   it, at the external-value release budget: SDD §5.4, and the chained
-//!   `UpdateLayer` paragraph below). It grows in budget when the target fits;
-//!   otherwise it takes the free overflow slot if no processing waiter is
-//!   queued; otherwise it queues for whichever comes first — room in `B`, or
-//!   reaching the head of the processing queue with the slot free. It
-//!   is bounded by the RPC deadline (the handler future is dropped) and races
-//!   the token its caller passes: the handlers, a commit's recharge through
+//!   overflow slot, whose holder never waits on the gate. The holder may wait
+//!   outside it: on its own client while it is still receiving its content,
+//!   at the external-value release budget (SDD §5.4), and on per-object
+//!   permits or the txn checkout, whose holders never await the gate (the
+//!   lock order below; and the chained `UpdateLayer` paragraph below). The
+//!   step grows in budget when the target fits; otherwise it takes the free
+//!   overflow slot if no processing waiter is queued; otherwise it queues for
+//!   whichever comes first — room in `B`, or reaching the head of the
+//!   processing queue with the slot free. It is bounded by the RPC deadline
+//!   (the handler future is dropped) and races the token its caller passes:
+//!   the handlers, a commit's recharge through
 //!   [`UploadCommitCharge`]'s [`CommitCharge::hold`], and the `UpdateLayer`
 //!   handler's hold of one extra copy of the external values before the
 //!   checkpoint-recovery re-issue's second pre-store (through the same
@@ -170,39 +179,68 @@
 //!   `begun` token, cancelled when the paced stream ending starts.
 //!
 //! Every other charge is accepted or refused at once —
-//! [`UploadReservation::try_hold_processing`] included: it takes
+//! [`UploadReservation::try_hold_processing`] and the receive growth
+//! ([`UploadReservation::try_grow_receive`]) included: each takes
 //! [`UploadReservation::reserve_processing`]'s steps that need no wait and is
-//! refused, with nothing changed, where that would queue. The slot holder never
-//! waits on the gate — it grows in place — so the slot always frees, and the
-//! slot goes to processing waiters in FIFO order, so every processing waiter
-//! is granted after at most the processing of the slot holders ahead of it.
+//! refused, with nothing changed, where that would queue (a chained
+//! `UpdateLayer`'s receive growth stays in budget: below). The slot holder
+//! never waits on the gate — it grows in place — and what it waits on outside
+//! the gate does not wait on the gate either, with one exception, the HTTP/2
+//! connection-window edge. A holder still receiving its content waits for its
+//! client's DATA, and that DATA flows through a connection window that
+//! admission waiters share (`grpc::transport::http2_connection_window_bytes`).
+//! When the waiters and one other unread stream fill that window, a cycle is
+//! reachable: the holder waits for its DATA, the DATA for room in the window,
+//! held by the admission waiters, the waiters for room in `B`, `B` held by
+//! processing steps waiting for the slot, and the slot held by the holder.
+//! In-budget receivers have the same edge, holding bytes in `B` while they
+//! wait for their DATA. The admission wait (`LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS`,
+//! 2 s by default) breaks the cycle: each waiter is granted or refused by
+//! then, and a refused waiter's stream gives its window back, so the cycle
+//! cannot hold beyond the admission wait, and a slot waiter can also wait up
+//! to that. So the slot always frees: when its call ends, at the latest when
+//! the RPC deadline drops it. The slot goes to processing waiters in FIFO
+//! order, and a receive growth takes it only when no processing step is
+//! queued, so it never overtakes one: every processing waiter is granted after
+//! at most the processing of the slot holders ahead of it.
 //! On every release the gate first grants each processing waiter that now fits
 //! in `B`, then gives a free slot to the processing-queue head (whose bytes
 //! leave `B` with it, so the in-budget grants run again), then serves
 //! admissions: work in progress goes before new work. That is why the gate
-//! cannot deadlock even though processing waiters hold bytes in `B`, and why a
+//! cannot deadlock even though processing waiters hold bytes in `B` (the
+//! connection-window edge aside, which the admission wait bounds), and why a
 //! small arrival cannot overtake a slot waiter.
 //!
 //! A chained `UpdateLayer` (`UpdateLayerRequest.chained_header`) also waits,
 //! outside the gate: in the chain gate (`storage::chain_gate`), between the
 //! end of its body and its first processing step, for its predecessor's
 //! commit. It holds its reservation there — `F` plus its content — and
-//! nothing else of the gate: no processing charge, no overflow slot. It waits
-//! on no permit the gate grants, only on a commit, so it adds no edge to the
-//! gate's waits. Its bytes do stay in `B` while it waits: if waiting chained
-//! calls fill `B`, a predecessor's admission waits at most the admission wait
-//! and is then refused `UPLOAD_CAPACITY` with nothing applied (a receive-growth
-//! charge that does not fit is refused at once), and a client cancel of the
-//! waiters frees their bytes at once. Past admission, a predecessor's
-//! processing step, and its commit's recharge between attempts
-//! ([`CommitCharge::hold`]), are never refused for capacity: each waits for
-//! room in `B` (which waiting successors hold) or for the overflow slot. The
-//! slot's holder may itself be waiting at the external-value release budget
-//! (SDD §5.4): the `CreateLayer` and `UpdateLayer` handlers await it after
-//! both processing steps, holding their processing charge, and so the slot if
-//! they run in it. So the predecessor, and the chain waiting behind it, can
-//! wait up to that holder's release-budget wait. It is still deadlock-free,
-//! because there the slot's holder waits only on GC, never on a chained call.
+//! nothing else of the gate: no processing charge, no overflow slot. Its
+//! receive growth never takes the slot (the handler passes
+//! `may_enter_overflow = false` to [`UploadReservation::try_grow_receive`]),
+//! because a chained call holding the slot at the chain gate would make a
+//! predecessor whose processing waits for the slot wait on a successor that
+//! waits on that predecessor's commit. It waits on no permit the gate grants,
+//! only on a commit, so it adds no edge to the gate's waits. Its bytes do stay
+//! in `B` while it waits: if waiting chained calls fill `B`, a predecessor's
+//! admission waits at most the admission wait and is then refused
+//! `UPLOAD_CAPACITY` with nothing applied (a receive growth that fits neither
+//! `B` nor, for an unchained predecessor, the free slot is refused at once),
+//! and a client cancel of the waiters frees their bytes at once. Past
+//! admission, a predecessor's processing step, and its commit's recharge
+//! between attempts ([`CommitCharge::hold`]), are never refused for capacity:
+//! each waits for room in `B` (which waiting successors hold) or for the
+//! overflow slot. The slot's holder may itself be waiting outside the gate: at
+//! the external-value release budget (SDD §5.4) — the `CreateLayer` and
+//! `UpdateLayer` handlers await it after both processing steps, holding their
+//! processing charge, and so the slot if they run in it — or, when it took the
+//! slot while receiving, on its own client, up to its RPC deadline. So the
+//! predecessor, and the chain waiting behind it, can wait up to that holder's
+//! release-budget wait or its client's pace. It is still deadlock-free,
+//! because there the slot's holder waits only on GC or on its own client,
+//! never on a chained call; its client's DATA can wait on the connection
+//! window that admission waiters share, an edge the admission wait (2 s by
+//! default) bounds (above).
 //!
 //! **Fairness.** Each session may have at most
 //! [`UploadAdmissionGate::per_session_cap`] uploads still receiving their
@@ -270,9 +308,15 @@ pub const UPLOAD_MEMORY_BUDGET_MIB_DEFAULT: u64 = 384;
 pub const MAX_LAYER_SIZE_DEFAULT_BYTES: u64 = 104_857_600;
 
 /// The ceiling of the derived `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS` default:
-/// 2000 ([`upload_admission_wait_ms_default`]). A waiting upload leaves its
-/// unread content in the connection's flow-control window, so the wait bounds
-/// how long it can stall other streams sharing that connection.
+/// 2000 ([`upload_admission_wait_ms_default`]). A waiting upload leaves up to
+/// one stream window (1 MiB) of its content unread in h2, and its client's
+/// deadline runs while it waits, so the wait is kept short. Waiting uploads
+/// cannot fill their connection's window on their own: the connection window
+/// holds one stream window per upload that can wait, plus one
+/// (`grpc::transport::http2_connection_window_bytes`). That spare window is
+/// shared with the connection's other unread streams (uploads not yet
+/// admitted, `JoinSession`s that are not reading), so together with them a
+/// waiting upload can still stall the connection while it waits.
 pub const UPLOAD_ADMISSION_WAIT_MS_DEFAULT: u64 = 2_000;
 
 /// The `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS` default for a given
@@ -290,7 +334,11 @@ pub const fn upload_admission_wait_ms_default(rpc_deadline_ms: u64) -> u64 {
 }
 
 /// Default `LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS`: 64, which holds the queued
-/// uploads' unread content to about 64 MiB.
+/// uploads' unread content to about 64 MiB (one 1 MiB stream window each). The
+/// cap also sizes every inbound connection's HTTP/2 receive window, (cap + 1)
+/// × 1 MiB, 65 MiB at this default
+/// (`grpc::transport::http2_connection_window_bytes`); configuration accepts
+/// 1 to 2,046.
 pub const UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT: usize = 64;
 
 /// tonic's decode limit for one request message. Nothing in this crate calls
@@ -1691,11 +1739,13 @@ pub enum UploadRefusal {
     /// The service is shutting down: refused at admission or while waiting
     /// for processing room.
     ShuttingDown,
-    /// The budget cannot hold an in-budget growth of an admitted reservation
-    /// right now ([`UploadReservation::try_grow_in_budget`]): a receive-phase
-    /// growth, which refuses the upload, or a best-effort growth after the
-    /// body, such as a `CreateLayer` re-send's re-spawn charges, which only
-    /// skips that work.
+    /// A growth of an admitted reservation that never waits cannot be held
+    /// right now: a receive-phase growth that fits neither the budget nor —
+    /// for an upload allowed to take it — the free overflow slot
+    /// ([`UploadReservation::try_grow_receive`]), which refuses the upload, or
+    /// a best-effort growth after the body that the budget cannot hold
+    /// ([`UploadReservation::try_grow_in_budget`]), such as a `CreateLayer`
+    /// re-send's re-spawn charges, which only skips that work.
     Growth,
 }
 
@@ -2213,7 +2263,9 @@ impl UploadAdmissionGate {
 
     /// Count one upload that took the overflow slot and goes on to run beyond
     /// the budget: one `live_edit_upload_overflow_runs_total{rpc}`, paired
-    /// with the [`ProcessingGrant::entered_overflow`] the caller logs.
+    /// with the slot entry the caller logs — a processing step's
+    /// [`ProcessingGrant::entered_overflow`], or a receive growth's
+    /// ([`UploadReservation::try_grow_receive`]).
     fn count_overflow_run(&self, rpc: UploadRpc) {
         if let Some(m) = &self.metrics {
             m.inc_upload_overflow_runs(rpc.label());
@@ -2482,7 +2534,8 @@ impl Drop for PendingAdmission<'_> {
 }
 
 /// One admitted upload's reservation. Grows and shrinks with the upload, in
-/// budget or — once a processing step moved it there — in the overflow slot.
+/// budget or — once a receive growth or a processing step moved it there — in
+/// the overflow slot.
 /// Its `Drop` releases every byte it holds, the slot if it holds it, and the
 /// session slot if the upload was still receiving.
 pub struct UploadReservation {
@@ -2538,8 +2591,9 @@ impl UploadReservation {
     /// growth now. A refusal changes nothing. While the upload is still
     /// receiving, a refusal counts one `live_edit_upload_admission_total{rpc,
     /// result="refused_growth"}`: that is the receive growth the client is
-    /// refused for. A refusal after [`Self::end_receive`] — a best-effort
-    /// growth no client is refused for — counts nothing.
+    /// refused for ([`Self::try_grow_receive`], which comes here for an upload
+    /// not allowed to take the slot). A refusal after [`Self::end_receive`] —
+    /// a best-effort growth no client is refused for — counts nothing.
     pub fn try_grow_in_budget(&mut self, target: u64) -> Result<(), UploadRefusal> {
         if target <= self.reserved {
             return Ok(());
@@ -2562,6 +2616,67 @@ impl UploadReservation {
         gate.grow_locked(&mut st, target - self.reserved);
         self.reserved = target;
         Ok(())
+    }
+
+    /// A receive-phase growth: grow the reservation to `target` bytes while
+    /// the body is read (`grpc::streaming::read_upload_body`), at once or not
+    /// at all. It never waits and never queues.
+    ///
+    /// In order:
+    ///
+    /// 1. a target at or below what the reservation holds changes nothing;
+    /// 2. the overflow holder books the target on its slot in place;
+    /// 3. a target that fits the budget grows the reservation in budget;
+    /// 4. otherwise, when `may_enter_overflow` is set, the slot is free and no
+    ///    processing step is queued, the reservation takes the slot at once,
+    ///    its in-budget bytes moving out of the budget onto it, and counts one
+    ///    `live_edit_upload_overflow_runs_total{rpc}`;
+    /// 5. otherwise it is refused [`UploadRefusal::Growth`], with nothing
+    ///    changed, counting one `live_edit_upload_admission_total{rpc,
+    ///    result="refused_growth"}` while the upload is still receiving.
+    ///
+    /// Steps 2–4 are [`Self::reserve_processing`]'s steps that need no wait;
+    /// without `may_enter_overflow` it is [`Self::try_grow_in_budget`]. The
+    /// handlers clear `may_enter_overflow` for a chained `UpdateLayer`, which
+    /// waits in the chain gate after its body and must hold no slot there
+    /// (module docs). A receive growth takes the slot only when no processing
+    /// step is queued, so it never goes ahead of a processing step waiting for
+    /// it. It is not refused once graceful shutdown has begun: like any growth
+    /// that never waits, it does not race the shutdown token.
+    ///
+    /// Returns whether this growth moved the upload into the overflow slot:
+    /// the caller logs that entry once ([`log_upload_runs_beyond_budget`],
+    /// phase `receiving`). False when it was already there, or stayed in
+    /// budget.
+    pub fn try_grow_receive(
+        &mut self,
+        target: u64,
+        may_enter_overflow: bool,
+    ) -> Result<bool, UploadRefusal> {
+        if !may_enter_overflow {
+            return self.try_grow_in_budget(target).map(|()| false);
+        }
+        if target <= self.reserved {
+            return Ok(false);
+        }
+        let gate = Arc::clone(&self.gate);
+        let mut st = gate.lock();
+        let granted = self.grant_processing_at_once_locked(&mut st, target);
+        drop(st);
+        match granted {
+            Some(entered_overflow) => {
+                if entered_overflow {
+                    gate.count_overflow_run(self.rpc);
+                }
+                Ok(entered_overflow)
+            }
+            None => {
+                if self.receiving {
+                    gate.count_refusal(self.rpc, ADMISSION_RESULT_REFUSED_GROWTH);
+                }
+                Err(UploadRefusal::Growth)
+            }
+        }
     }
 
     /// One processing step: hold at least `target` bytes, in budget or in the
@@ -2711,8 +2826,9 @@ impl UploadReservation {
     /// caller drops the lock and then records the grant's metrics:
     /// [`Self::reserve_processing`] through [`Self::granted_at_once`] (the
     /// overflow run and a ~0 processing wait), and
-    /// [`Self::try_hold_processing`] the overflow run alone, with no
-    /// processing-wait observation, since it never waits.
+    /// [`Self::try_hold_processing`] and the receive growth
+    /// ([`Self::try_grow_receive`]) the overflow run alone, with no
+    /// processing-wait observation, since they never wait.
     fn grant_processing_at_once_locked(&mut self, st: &mut GateState, target: u64) -> Option<bool> {
         let gate = &self.gate;
         if self.in_overflow {
@@ -2893,11 +3009,16 @@ impl Drop for PendingProcessing<'_> {
 }
 
 /// The INFO line "upload runs beyond the upload budget", logged once per
-/// upload, by the caller of the processing step that returned
-/// [`ProcessingGrant::entered_overflow`]: the RPC, the session and layer, the
-/// step's charge (`charge_bytes`), `B` and how long the step waited.
+/// upload, by the caller of the step that moved it into the overflow slot: a
+/// receive growth ([`UploadReservation::try_grow_receive`] returned `true`;
+/// `phase` = [`UPLOAD_PHASE_RECEIVING`], never waited) or a processing step
+/// that returned [`ProcessingGrant::entered_overflow`] (`phase` =
+/// [`UPLOAD_PHASE_PROCESSING`]). Carries the RPC, the phase, the session and
+/// layer, the step's charge (`charge_bytes`), `B` and how long the step
+/// waited.
 pub(crate) fn log_upload_runs_beyond_budget(
     reservation: &UploadReservation,
+    phase: &'static str,
     session_id: &str,
     layer_name: &str,
     charge_bytes: u64,
@@ -2905,6 +3026,7 @@ pub(crate) fn log_upload_runs_beyond_budget(
 ) {
     tracing::info!(
         rpc = reservation.rpc().label(),
+        phase,
         session_id = %session_id,
         layer_name = %layer_name,
         charge_bytes,
@@ -2998,6 +3120,7 @@ impl<'a> UploadCommitCharge<'a> {
         if grant.entered_overflow {
             log_upload_runs_beyond_budget(
                 self.reservation,
+                UPLOAD_PHASE_PROCESSING,
                 self.session_id,
                 self.layer_name,
                 charge_bytes,
@@ -4796,6 +4919,237 @@ mod tests {
             "an equal target changes nothing the gate holds"
         );
         assert_eq!(render(&metrics), before, "and records nothing");
+    }
+
+    // ── Receive growth: the budget, or the free overflow slot (b.vna) ──────
+
+    fn overflow_bytes_gauge(metrics: &Metrics) -> f64 {
+        metric(metrics, "live_edit_upload_overflow_bytes", &[])
+    }
+
+    fn reserved_bytes_gauge(metrics: &Metrics) -> f64 {
+        metric(metrics, "live_edit_upload_reserved_bytes", &[])
+    }
+
+    /// A receive growth to a target at or below what the reservation holds
+    /// changes nothing, and one that fits the budget grows there, with or
+    /// without leave to take the slot; neither enters the slot or counts
+    /// anything.
+    #[tokio::test]
+    async fn try_grow_receive_fitting_target_grows_in_budget() {
+        let token = CancellationToken::new();
+        let (g, metrics) = gate_with_metrics(SMALL_BUDGET, LONG_WAIT, 8);
+        let mut r = admit_now(&g, "r", &token).await;
+
+        assert_eq!(r.try_grow_receive(C, true), Ok(false));
+        assert_eq!(r.try_grow_receive(C - 1, true), Ok(false));
+        assert_eq!(r.reserved(), C);
+        for (target, may_enter_overflow) in [(C + 10, true), (C + 20, false)] {
+            assert_eq!(r.try_grow_receive(target, may_enter_overflow), Ok(false));
+            assert_eq!(r.reserved(), target);
+            assert!(!r.in_overflow());
+            assert_eq!(g.reserved_bytes(), target);
+        }
+        assert_eq!(g.overflow_bytes(), 0);
+        assert_eq!(overflow_runs(&metrics), 0.0);
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            0.0
+        );
+    }
+
+    /// With the slot free and no processing step queued, a receive growth
+    /// the budget cannot hold, of an upload allowed to take the slot, takes it
+    /// at once (`Ok(true)`): the reservation's in-budget bytes leave the
+    /// budget with it, both gauges follow, one overflow run is counted, no
+    /// `refused_growth`, and the room that frees serves a queued admission at
+    /// once. A further growth books on the slot in place (`Ok(false)`, no
+    /// second run). The upload keeps its session slot while it receives;
+    /// `end_receive` gives that back and the receive allowance off the slot,
+    /// and the reservation's drop vacates the slot, which goes to the
+    /// processing step queued for it.
+    #[tokio::test]
+    async fn try_grow_receive_past_the_budget_takes_the_free_slot_and_drop_vacates_it() {
+        let token = CancellationToken::new();
+        let (g, metrics) = gate_with_metrics(SMALL_BUDGET, LONG_WAIT, 8);
+        let mut r = admit_now(&g, "r", &token).await;
+        let _b = admit_now(&g, "b", &token).await;
+        let c = admit_now(&g, "c", &token).await;
+        let mut admission = std::pin::pin!(g.admit(UploadRpc::UpdateLayer, "d", &token));
+        assert!(
+            poll_once(admission.as_mut()).await.is_pending(),
+            "fixture self-check: the budget is too full for a fourth admission"
+        );
+        assert_eq!(g.processing_waiters(), 0, "precondition: no step queued");
+
+        assert_eq!(r.try_grow_receive(OVER, true), Ok(true));
+
+        assert!(r.in_overflow());
+        assert!(r.is_receiving());
+        assert_eq!(r.reserved(), OVER);
+        assert_eq!(g.overflow_bytes(), OVER);
+        assert_eq!(overflow_bytes_gauge(&metrics), OVER as f64);
+        assert_eq!(overflow_runs(&metrics), 1.0);
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            0.0
+        );
+        let Poll::Ready(Ok(_d)) = poll_once(admission.as_mut()).await else {
+            panic!("the admission r's bytes leaving the budget made room for must be served");
+        };
+        assert_eq!(
+            g.reserved_bytes(),
+            3 * C,
+            "b's, c's and d's admissions; r's left with it"
+        );
+        assert_eq!(reserved_bytes_gauge(&metrics), (3 * C) as f64);
+        assert_eq!(
+            g.receiving_uploads("r"),
+            1,
+            "r keeps its session slot while it receives"
+        );
+
+        assert_eq!(r.try_grow_receive(OVER + 1, true), Ok(false));
+        assert_eq!(g.overflow_bytes(), OVER + 1);
+        assert_eq!(overflow_runs(&metrics), 1.0, "one entry, one run");
+        assert_eq!(
+            g.reserved_bytes(),
+            3 * C,
+            "a growth in place leaves B alone"
+        );
+
+        r.end_receive();
+        assert_eq!(g.overflow_bytes(), OVER + 1 - RECEIVE_ALLOWANCE_BYTES);
+        assert_eq!(g.receiving_uploads("r"), 0);
+        assert!(r.in_overflow());
+
+        // Room for the processing step's own admission.
+        drop(c);
+        let mut waiter = received(&g, "waiter", &token).await;
+        let mut waiting = Box::pin(waiter.reserve_processing(OVER, &token));
+        assert!(poll_once(waiting.as_mut()).await.is_pending());
+        drop(r);
+        let Poll::Ready(Ok(grant)) = poll_once(waiting.as_mut()).await else {
+            panic!("r's drop must vacate the slot and hand it to the queued step");
+        };
+        assert!(grant.entered_overflow);
+        assert_eq!(g.overflow_bytes(), OVER);
+        assert_eq!(overflow_runs(&metrics), 2.0, "r's and the waiter's");
+    }
+
+    /// A receive growth that fits neither the budget nor the slot — another
+    /// upload holds it, and then a processing step is queued for it too — is
+    /// refused `Growth` at once with nothing changed: not the reservation, the
+    /// gate, the queue or the gauges. Each refusal counts one
+    /// `refused_growth` and no overflow run, and it never queues: the holder's
+    /// drop hands the slot to the queued step, not to the refused upload.
+    #[tokio::test]
+    async fn try_grow_receive_with_the_slot_held_is_refused_changes_nothing_and_never_queues() {
+        let token = CancellationToken::new();
+        let (g, metrics) = gate_with_metrics(SMALL_BUDGET, LONG_WAIT, 8);
+        let mut holder = received(&g, "holder", &token).await;
+        assert!(
+            process_now(&mut holder, OVER, &token)
+                .await
+                .entered_overflow
+        );
+        let mut r = admit_now(&g, "r", &token).await;
+        let state = |g: &UploadAdmissionGate, metrics: &Metrics| {
+            (
+                g.reserved_bytes(),
+                g.overflow_bytes(),
+                reserved_bytes_gauge(metrics),
+                overflow_bytes_gauge(metrics),
+            )
+        };
+        let before = state(&g, &metrics);
+
+        assert_eq!(
+            r.try_grow_receive(OVER, true),
+            Err(UploadRefusal::Growth),
+            "the slot is held: refused"
+        );
+        assert_eq!(r.reserved(), C);
+        assert!(!r.in_overflow());
+        assert_eq!(state(&g, &metrics), before);
+        assert_eq!(g.processing_waiters(), 0, "a refusal never queues");
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            1.0
+        );
+        assert_eq!(overflow_runs(&metrics), 1.0, "only the holder's entry");
+
+        let mut waiter = received(&g, "waiter", &token).await;
+        let mut waiting = Box::pin(waiter.reserve_processing(OVER, &token));
+        assert!(poll_once(waiting.as_mut()).await.is_pending());
+        let before = state(&g, &metrics);
+        assert_eq!(
+            r.try_grow_receive(OVER, true),
+            Err(UploadRefusal::Growth),
+            "the slot is held and a step is queued for it: refused"
+        );
+        assert_eq!(state(&g, &metrics), before);
+        assert_eq!(g.processing_waiters(), 1, "still only the queued step");
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            2.0
+        );
+
+        drop(holder);
+        let Poll::Ready(Ok(grant)) = poll_once(waiting.as_mut()).await else {
+            panic!("the holder's drop must hand the slot to the queued step");
+        };
+        assert!(grant.entered_overflow);
+        assert!(!r.in_overflow(), "the refused upload never queued");
+        assert_eq!(r.reserved(), C);
+        assert_eq!(
+            r.try_grow_receive(OVER, true),
+            Err(UploadRefusal::Growth),
+            "the slot went to the queued step"
+        );
+        assert_eq!(
+            overflow_runs(&metrics),
+            2.0,
+            "the holder's and the waiter's"
+        );
+    }
+
+    /// Without leave to take the slot — a chained `UpdateLayer` — a receive
+    /// growth the budget cannot hold is refused `Growth` with the slot free,
+    /// counting one `refused_growth`; the slot stays free and nothing else
+    /// changes.
+    #[tokio::test]
+    async fn try_grow_receive_without_leave_for_the_slot_is_refused_with_the_slot_free() {
+        let token = CancellationToken::new();
+        let (g, metrics) = gate_with_metrics(SMALL_BUDGET, LONG_WAIT, 8);
+        let mut r = admit_now(&g, "r", &token).await;
+        assert_eq!(g.processing_waiters(), 0, "precondition: no step queued");
+
+        assert_eq!(r.try_grow_receive(OVER, false), Err(UploadRefusal::Growth));
+
+        assert_eq!(r.reserved(), C);
+        assert!(!r.in_overflow());
+        assert_eq!(g.reserved_bytes(), C);
+        assert_eq!(g.overflow_bytes(), 0, "the free slot was not taken");
+        assert_eq!(overflow_bytes_gauge(&metrics), 0.0);
+        assert_eq!(overflow_runs(&metrics), 0.0);
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            1.0
+        );
+
+        r.end_receive();
+        assert_eq!(r.try_grow_receive(OVER, false), Err(UploadRefusal::Growth));
+        assert_eq!(
+            r.try_grow_receive(OVER, true),
+            Ok(true),
+            "fixture self-check: with leave, the same growth takes the free slot"
+        );
+        assert_eq!(
+            admission_count(&metrics, ADMISSION_RESULT_REFUSED_GROWTH),
+            1.0,
+            "a refusal after the content is received refuses no client"
+        );
     }
 
     // ── The test-only charge observer (b.26e T7) ────────────────────────────

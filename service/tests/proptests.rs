@@ -36,6 +36,7 @@ use live_edit::checkpoint::{
     TailRecordKind, TAIL_FORMAT_VERSION, TAIL_HEADER_SIZE, TAIL_MAX_SEQUENCE,
 };
 use live_edit::domain::delta::{apply_delta, DeltaError, StorageMutation};
+use live_edit::domain::layer_root::{check_keeps_top_level_section, has_top_level_section};
 use live_edit::domain::ompf::OmpfContainer;
 use live_edit::domain::types::ObjectState;
 use live_edit::storage::diff_read::snapshot_to_object_state;
@@ -93,6 +94,23 @@ fn proptest_config_with_cap(default_cases: u32, max_override: u32) -> ProptestCo
 }
 
 // ── Shared test helpers ──────────────────────────────────────────────────────
+
+/// [`apply_delta`] as `LayerStore::update_layer` applies a delta: the engine,
+/// then the layer-root rule both structural commit routes check after the
+/// plan (SDD §9.7), which refuses an update taking the layer from at least one
+/// top-level section to none. The model a property checks a store's commits
+/// against goes through this, so a delta the store refuses for the rule is a
+/// refusal on both sides. On `Err` the state is left as the engine left it,
+/// for the caller to discard.
+fn apply_update(
+    state: &mut ObjectState,
+    delta: Option<oodf_ffi::OwnedDelta>,
+) -> Result<Vec<StorageMutation>, DeltaError> {
+    let had_top_level = has_top_level_section(state);
+    let mutations = apply_delta(state, delta)?;
+    check_keeps_top_level_section(had_top_level, state)?;
+    Ok(mutations)
+}
 
 fn make_state() -> ObjectState {
     ObjectState {
@@ -687,8 +705,9 @@ proptest! {
 //
 // 1. `apply_diff_change_section` rename-onto-occupied-slot — pin
 //    `DuplicateSiblingName` as the deterministic rejection on any state
-//    where two sections legitimately share a `(parent_id, name)` slot after
-//    a rename would commit.
+//    where two sections would share a collision slot (the same
+//    `(parent_id, name)` and kind) after the rename committed, and the
+//    rename's acceptance beside a sibling of another kind.
 //
 // 2. Self-parenting (CreateSection / DiffChangeSection / MoveSection's
 //    new_parent_id and old_parent_id branches) — pin that every
@@ -817,6 +836,91 @@ proptest! {
             pre_seq,
             "sequence_num must not advance on DuplicateSiblingName"
         );
+    }
+
+    /// The other half of b.dmu item 2's refusal: it is keyed on the
+    /// collision slot, not the name alone. Two siblings A and B of arbitrary
+    /// `SdfSpecType`s; B's `DiffChangeSection` renames it onto A's name,
+    /// keeping its type. It is refused with `DuplicateSiblingName` exactly
+    /// when the two types share a slot (equal, or an attribute and a
+    /// relationship); otherwise it commits, both rows live under the one
+    /// name, and `sequence_num` advances.
+    #[test]
+    fn proptest_dmu_diff_change_section_rename_beside_a_sibling_refuses_only_the_same_slot(
+        name_a in arb_section_name_dmu(),
+        name_b in arb_section_name_dmu(),
+        type_a in prop::sample::select(vec![0u8, 1, 2, 6, 8, 10, 11]),
+        type_b in prop::sample::select(vec![0u8, 1, 2, 6, 8, 10, 11]),
+    ) {
+        if name_a == name_b {
+            return Ok(());
+        }
+        let section = |id: u64, parent_id: u64, name: &str, section_type: u8| {
+            live_edit::domain::types::Section {
+                section_id: id,
+                parent_id,
+                name: name.to_string(),
+                section_type,
+                section_order: 0,
+                first_version: 1,
+                last_version: 1,
+            }
+        };
+        let mut state = make_state();
+        state.sections.insert(50, section(50, 0, "ParentForTest", 6));
+        state.sections.insert(100, section(100, 50, &name_a, type_a));
+        state.sections.insert(101, section(101, 50, &name_b, type_b));
+        state.children.insert(0, vec![50]);
+        state.children.insert(50, vec![100, 101]);
+
+        let pre_seq = state.sequence_num;
+        let result = apply_delta(
+            &mut state,
+            Some(OwnedDelta {
+                struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+                    parent_id: 50,
+                    section_id: 101,
+                    section_name: name_a.clone(),
+                    section_type: type_b,
+                    section_order: 1,
+                })],
+                ..Default::default()
+            }),
+        );
+
+        let same_slot = common::sibling_model::collision_slot(type_a)
+            == common::sibling_model::collision_slot(type_b);
+        if same_slot {
+            prop_assert!(
+                matches!(
+                    result,
+                    Err(DeltaError::DuplicateSiblingName {
+                        section_id: 101,
+                        conflicting_id: 100,
+                        ..
+                    })
+                ),
+                "types {} and {} share a slot: expected DuplicateSiblingName, got {:?}",
+                type_a,
+                type_b,
+                result
+            );
+            prop_assert_eq!(state.sequence_num, pre_seq);
+        } else {
+            prop_assert!(
+                result.is_ok(),
+                "types {} and {} hold distinct slots: the rename commits, got {:?}",
+                type_a,
+                type_b,
+                result
+            );
+            prop_assert_eq!(
+                (state.sections[&100].name.as_str(), state.sections[&101].name.as_str()),
+                (name_a.as_str(), name_a.as_str()),
+                "both rows live under the one name"
+            );
+            prop_assert_eq!(state.sequence_num, pre_seq + 1);
+        }
     }
 }
 
@@ -2714,10 +2818,12 @@ proptest! {
 
 #[derive(Debug, Clone)]
 enum CheckpointWriteOp {
+    /// A `CreateSection` of `SdfSpecType` `section_type`.
     CreateSection {
         parent_id: u64,
         section_id: u64,
         name: String,
+        section_type: u8,
     },
     DeleteSection {
         section_id: u64,
@@ -2735,6 +2841,45 @@ enum CheckpointWriteOp {
         time_ticks: i16,
         value: u8,
     },
+    /// A same-parent `MoveSection` (`old_parent_id == new_parent_id`): a
+    /// rename in place under the section's stored parent (SDD §9.3). A rename
+    /// onto a name a sibling of the same collision slot holds cascades it;
+    /// onto one a sibling of another slot holds (a prim beside an
+    /// attribute), it leaves two siblings sharing `(parent_id, name)`. Edge 1
+    /// renames under the stored parent whatever parent the command carries,
+    /// so the op carries the root.
+    RenameSection {
+        section_id: u64,
+        new_name: String,
+    },
+}
+
+/// The section a [`CheckpointWriteOp::RenameSection`] renames, drawn mostly
+/// from the AC-4 seed sections, which exist from the first commit, so most
+/// renames land on a live row; otherwise any id.
+fn arb_rename_section_id() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        3 => prop::sample::select(AC4_INTERACTIVE_SECTIONS.to_vec()),
+        1 => arb_section_id(),
+    ]
+}
+
+/// A name for [`CheckpointWriteOp::RenameSection`] and, half the time, for a
+/// [`CheckpointWriteOp::CreateSection`], drawn mostly from the names the AC-4
+/// seed sections hold (`ac4_seed_state`'s `seed-{id}` under the root), so a
+/// rename or a create lands on a held sibling name often; otherwise any
+/// section name. Beside a seed (an attribute), a prim keeps both rows: a
+/// same-name pair of different kinds.
+fn arb_rename_name() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => prop::sample::select(
+            AC4_INTERACTIVE_SECTIONS
+                .iter()
+                .map(|id| format!("seed-{id}"))
+                .collect::<Vec<_>>()
+        ),
+        1 => arb_section_name(),
+    ]
 }
 
 fn arb_checkpoint_write_op() -> impl Strategy<Value = CheckpointWriteOp> {
@@ -2742,29 +2887,60 @@ fn arb_checkpoint_write_op() -> impl Strategy<Value = CheckpointWriteOp> {
         // CreateSection — bound section IDs to 1..=20 so writes collide
         // meaningfully under the constrained address space. Filter out
         // self-parenting which `apply_delta` rejects.
-        (0u64..=5u64, arb_section_id(), arb_section_name())
+        //
+        // Its type is mostly a prim, which keeps a seed (an attribute) of
+        // the same name beside it; otherwise an attribute or a relationship,
+        // which share the seeds' collision slot and cascade such a seed.
+        1 => (
+            0u64..=5u64,
+            arb_section_id(),
+            prop_oneof![arb_section_name(), arb_rename_name()],
+            prop_oneof![2 => Just(6u8), 1 => Just(1u8), 1 => Just(8u8)],
+        )
             .prop_filter(
                 "self-parenting CreateSection rejected by validator",
-                |(parent, sid, _)| *parent == 0 || parent != sid,
+                |(parent, sid, _, _)| *parent == 0 || parent != sid,
             )
-            .prop_map(|(parent, sid, name)| CheckpointWriteOp::CreateSection {
+            .prop_map(|(parent, sid, name, section_type)| CheckpointWriteOp::CreateSection {
                 parent_id: parent,
                 section_id: sid,
                 name,
+                section_type,
             }),
-        arb_section_id().prop_map(|sid| CheckpointWriteOp::DeleteSection { section_id: sid }),
-        (arb_section_id(), "[a-z]{1,3}", any::<u8>()).prop_map(|(sid, key, val)| {
+        // A prim under the root named as a seed (an attribute), aimed at a
+        // same-name pair of different kinds: both rows stay
+        // (`ac4_generator_takes_bases_while_a_same_name_pair_holds_content`).
+        2 => (arb_section_id(), arb_rename_name()).prop_map(|(sid, name)| {
+            CheckpointWriteOp::CreateSection {
+                parent_id: 0,
+                section_id: sid,
+                name,
+                section_type: 6,
+            }
+        }),
+        1 => arb_section_id().prop_map(|sid| CheckpointWriteOp::DeleteSection { section_id: sid }),
+        1 => (arb_section_id(), "[a-z]{1,3}", any::<u8>()).prop_map(|(sid, key, val)| {
             CheckpointWriteOp::SetField {
                 section_id: sid,
                 key,
                 value: val,
             }
         }),
-        (arb_section_id(), -64i16..=64, any::<u8>()).prop_map(|(sid, t, v)| {
+        1 => (arb_section_id(), -64i16..=64, any::<u8>()).prop_map(|(sid, t, v)| {
             CheckpointWriteOp::SetTimeSample {
                 section_id: sid,
                 time_ticks: t,
                 value: v,
+            }
+        }),
+        // A same-parent rename, weighted up so renames often land on a held
+        // name: a prim's beside a seed makes a same-name pair of different
+        // kinds (`ac4_generator_takes_bases_while_a_same_name_pair_holds_content`),
+        // and a seed's onto another seed cascades it.
+        2 => (arb_rename_section_id(), arb_rename_name()).prop_map(|(sid, new_name)| {
+            CheckpointWriteOp::RenameSection {
+                section_id: sid,
+                new_name,
             }
         }),
     ]
@@ -2776,13 +2952,14 @@ fn checkpoint_op_to_delta(op: &CheckpointWriteOp) -> OwnedDelta {
             parent_id,
             section_id,
             name,
+            section_type,
         } => OwnedDelta {
             is_diff: false,
             struct_commands: vec![StructCommand::CreateSection(CommandCreateSection {
                 parent_id: *parent_id,
                 section_id: *section_id,
                 section_name: name.clone(),
-                section_type: 0,
+                section_type: *section_type,
             })],
             ..Default::default()
         },
@@ -2830,6 +3007,19 @@ fn checkpoint_op_to_delta(op: &CheckpointWriteOp) -> OwnedDelta {
             }],
             ..Default::default()
         },
+        CheckpointWriteOp::RenameSection {
+            section_id,
+            new_name,
+        } => OwnedDelta {
+            is_diff: false,
+            struct_commands: vec![StructCommand::MoveSection(CommandMoveSection {
+                old_parent_id: 0,
+                new_parent_id: 0,
+                section_id: *section_id,
+                new_name: new_name.clone(),
+            })],
+            ..Default::default()
+        },
     }
 }
 
@@ -2840,7 +3030,8 @@ fn op_section_id(op: &CheckpointWriteOp) -> u64 {
         CheckpointWriteOp::CreateSection { section_id, .. }
         | CheckpointWriteOp::DeleteSection { section_id }
         | CheckpointWriteOp::SetField { section_id, .. }
-        | CheckpointWriteOp::SetTimeSample { section_id, .. } => *section_id,
+        | CheckpointWriteOp::SetTimeSample { section_id, .. }
+        | CheckpointWriteOp::RenameSection { section_id, .. } => *section_id,
     }
 }
 
@@ -3133,7 +3324,7 @@ async fn atomic_read_case(
         }
         let delta = atomic_read_op_delta(&model, op);
         let mut next = model.clone();
-        let domain = apply_delta(&mut next, Some(delta.clone()));
+        let domain = apply_update(&mut next, Some(delta.clone()));
         let store = ls
             .update_layer_relayed(
                 session_id,
@@ -3504,7 +3695,7 @@ async fn fenced_read_case(
         }
         let delta = atomic_read_op_delta(&model, op);
         let mut next = model.clone();
-        let domain = apply_delta(&mut next, Some(delta.clone()));
+        let domain = apply_update(&mut next, Some(delta.clone()));
         let store = ls
             .update_layer_relayed(
                 session_id,
@@ -4110,9 +4301,8 @@ proptest! {
 // ---- (4) b.gcb / b.vz7: plan_full_content total-order determinism -----------
 //
 // Randomized coverage for the OTHER full-content emitter: `plan_full_content`,
-// the shared path behind the checkpoint base assembly
-// (`build_reset_ompf_from_state`) and the legacy catch-up cold-start branch
-// (`DiffEngine::plan` with `have_version == 0`). All three of its emitted
+// the path behind the checkpoint base assembly
+// (`build_reset_ompf_from_state`). All three of its emitted
 // vectors used to inherit `HashMap` iteration order, so the same logical
 // snapshot produced byte-divergent base OMPF blobs and a byte-divergent
 // ext-refs sidecar across replicas — SR-9.2's duplicate-leader re-base could
@@ -4403,10 +4593,8 @@ proptest! {
             "the forward and reversed builds must be the same logical state"
         );
 
-        // `have_object_id = 0` mismatches `object_id = 1` AND `have_version = 0`
-        // — the cold-start route into `plan_full_content`.
-        let plan_fwd = DiffEngine::plan(&state_fwd, &[], 0, 0, None).unwrap();
-        let plan_rev = DiffEngine::plan(&state_rev, &[], 0, 0, None).unwrap();
+        let plan_fwd = DiffEngine::plan_full_content(&state_fwd).unwrap();
+        let plan_rev = DiffEngine::plan_full_content(&state_rev).unwrap();
         prop_assert_eq!(
             &plan_fwd,
             &plan_rev,
@@ -4419,14 +4607,14 @@ proptest! {
             fields: out_fields,
             time_samples: out_samples,
         } = &plan_fwd else {
-            panic!("have_version == 0 must route to FullContent");
+            panic!("plan_full_content must plan FullContent");
         };
         let DiffPlan::FullContent {
             fields: rev_fields,
             time_samples: rev_samples,
             ..
         } = &plan_rev else {
-            panic!("have_version == 0 must route to FullContent");
+            panic!("plan_full_content must plan FullContent");
         };
 
         // (b) The ext-refs sidecar's first-appearance order, compared as a
@@ -4640,6 +4828,10 @@ proptest! {
 
 /// Root-level seed sections whose ids fall inside `arb_section_id`'s `1..=20`
 /// range, so generated ops can re-parent, rename, delete and overwrite them.
+/// Their names (`seed-{id}`) are also what `arb_rename_name` mostly draws, so
+/// a rename or a create lands on a held sibling name: beside a seed (an
+/// attribute), a prim makes a same-name pair of different kinds, and an
+/// attribute or a relationship cascades the seed.
 const AC4_INTERACTIVE_SECTIONS: [u64; 3] = [1, 2, 3];
 
 /// A root-level seed section OUTSIDE `arb_section_id`'s range, so no generated
@@ -4761,7 +4953,11 @@ fn ac4_seed_state() -> ObjectState {
 /// condition C4): when this block was written that enum was also the drawn
 /// distribution of the b.pw6 read-interleaving model (since retired), so
 /// widening it would have reshaped tests this block did not own. The wrapper
-/// keeps this block's own ops separate from the shared vocabulary.
+/// keeps this block's own ops separate from the shared vocabulary. With that
+/// model retired, the shared enum is now this block's alone
+/// (`arb_ac4_op` is the only consumer of `arb_checkpoint_write_op`), which is
+/// why `CheckpointWriteOp::RenameSection`, aimed at this block's seed names,
+/// was added there rather than here.
 #[derive(Debug, Clone)]
 enum Ac4Op {
     /// The shared op vocabulary, drawn through `arb_checkpoint_write_op`.
@@ -4893,6 +5089,7 @@ fn arb_ac4_history() -> impl Strategy<Value = (Vec<Ac4Op>, usize)> {
                             parent_id: 0,
                             section_id,
                             name: format!("anchor{section_id}"),
+                            section_type: 0,
                         });
                         // One anchor + `echoes` guaranteed-rejected repeats.
                         for _ in 0..=echoes {
@@ -5277,6 +5474,13 @@ async fn drive_ac4_case(ops: &[Ac4Op], split: usize) -> Result<Ac4Outcome, Strin
                             .to_owned(),
                     );
                 }
+                AssemblyDecision::DeferredCleanup => {
+                    return Err(
+                        "assembler's clean-up fence deferred the PUT, but this fixture runs no \
+                         clean-up"
+                            .to_owned(),
+                    );
+                }
                 AssemblyDecision::ShuttingDown => {
                     return Err(
                         "assembler was handed a keeper that never shuts down, yet reported \
@@ -5486,7 +5690,9 @@ proptest! {
     /// composing `base@S0 + tail(S0, S]` reproduces the state the layer
     /// actually materialized at S — on the faithful-column basis, including
     /// the per-entry versions the tail range stamped, and including histories
-    /// that contain §8.4 empty-delta commits and external-value writes.
+    /// that contain §8.4 empty-delta commits and external-value writes, and
+    /// bases taken while two sections of different kinds share a
+    /// `(parent_id, name)` (b.vjg, b.z16).
     ///
     /// See the block header above for the amendment-1 rationale (why the
     /// reference is live Valkey state and never `apply_delta`), the
@@ -5705,9 +5911,9 @@ fn ac4_generator_produces_non_empty_tails_with_empty_and_ext_commits() {
     use proptest::test_runner::TestRunner;
 
     // Fixed-seed sampling runner, so these counts are reproducible rather than
-    // statistical. Measured on the strategy as written: 484/500 (96.8%) leave a
-    // non-empty tail range, 293/500 (58.6%) carry an empty-delta commit inside
-    // it, 287/500 (57.4%) carry an external-value SetField inside it. The
+    // statistical. Measured on the strategy as written: 471/500 (94.2%) leave a
+    // non-empty tail range, 261/500 (52.2%) carry an empty-delta commit inside
+    // it, 262/500 (52.4%) carry an external-value SetField inside it. The
     // floors sit well below all three, so ordinary re-weighting of `arb_ac4_op`
     // / `arb_ac4_rejection_run` does not trip them, but a change that stopped
     // emitting empty commits / ext writes, or that pushed the split to the end
@@ -5801,6 +6007,112 @@ fn ac4_generator_produces_non_empty_tails_with_empty_and_ext_commits() {
          external-value-referencing SetField INSIDE the tail range, or the ext-parts \
          collection and the `ext_value_index` exclusion are never exercised; got \
          {tail_has_ext_field}/{SAMPLES}"
+    );
+}
+
+/// Whether `state` holds two sections of different collision slots sharing
+/// a `(parent_id, name)` (a prim beside an attribute) whose lower id has a
+/// child or a field — the shape a checkpoint base must rebuild whole, and the
+/// one a tail record's collision must resolve by slot. A base decode or a
+/// replay that keyed collisions on `(parent_id, name)` alone would drop one
+/// row of the pair. The lower id is a fixed choice for the floor, not the row
+/// such a decode loses. It serves because every AC-4 seed section carries
+/// fields and the generator mostly makes a pair by creating or renaming a
+/// prim onto a seed's name, so the seed's row holds content, and because any
+/// lost row, with content or without, fails the property's section-set
+/// check. Same-slot pairs are left out: no commit of this build makes one.
+fn holds_a_same_name_pair_with_content_under_its_lower_id(state: &ObjectState) -> bool {
+    let mut by_name: std::collections::HashMap<(u64, &str), Vec<(u64, u8)>> =
+        std::collections::HashMap::new();
+    for section in state.sections.values() {
+        by_name
+            .entry((section.parent_id, section.name.as_str()))
+            .or_default()
+            .push((
+                section.section_id,
+                common::sibling_model::collision_slot(section.section_type),
+            ));
+    }
+    by_name
+        .values()
+        .filter(|rows| rows.iter().any(|&(_, slot)| slot != rows[0].1))
+        .any(|rows| {
+            let lower = rows
+                .iter()
+                .map(|&(id, _)| id)
+                .min()
+                .expect("a pair has ids");
+            state.children.get(&lower).is_some_and(|c| !c.is_empty())
+                || state
+                    .fields
+                    .keys()
+                    .any(|(section_id, _)| *section_id == lower)
+        })
+}
+
+/// Anti-vacuity guard for the same-name pair (b.vjg, b.z16): the AC-4
+/// property is the one test that takes a base over live commits and composes
+/// it against live history, and it says nothing about a same-name pair unless
+/// the generator takes bases while one exists. This floors the share of drawn
+/// histories whose base-era state (the ops before the split) holds a pair of
+/// different kinds whose lower id has a child or a field, made by a prim's
+/// `CheckpointWriteOp::CreateSection` or `CheckpointWriteOp::RenameSection`
+/// landing on a seed's name.
+///
+/// The acceptance model is the same PURE `apply_delta` proxy as
+/// `ac4_generator_produces_non_empty_tails_with_empty_and_ext_commits`, for
+/// counting only, never as a reference state.
+#[test]
+fn ac4_generator_takes_bases_while_a_same_name_pair_holds_content() {
+    use proptest::strategy::{Strategy as _, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    // Fixed-seed sampling runner, so the count is reproducible. Measured on
+    // the strategy as written: 131/500 (26.2%) bases hold such a pair, so the
+    // property's 16 cases miss one in about 1% of runs. The floor sits well
+    // below the measured share, so ordinary re-weighting does not trip it,
+    // but a generator that stopped mixing kinds onto held names does (before
+    // the arm creating a prim under a seed's name, it measured 4/500).
+    const SAMPLES: usize = 500;
+    const PAIR_BASE_FLOOR_PERCENT: usize = 10;
+
+    let strategy = arb_ac4_history();
+    let mut runner = TestRunner::deterministic();
+    let mut pair_bases = 0usize;
+
+    for _ in 0..SAMPLES {
+        let (ops, split) = strategy
+            .new_tree(&mut runner)
+            .expect("strategy must produce a value")
+            .current();
+
+        let mut state = ac4_seed_state();
+        for op in &ops[..split] {
+            match ac4_op_payload(op) {
+                None => {
+                    apply_delta(&mut state, None).expect("empty commit must apply");
+                }
+                Some((delta, _)) => {
+                    let snapshot = state.clone();
+                    if apply_delta(&mut state, Some(delta)).is_err() {
+                        // Rejected: state untouched, as the live engine leaves it.
+                        state = snapshot;
+                    }
+                }
+            }
+        }
+        if holds_a_same_name_pair_with_content_under_its_lower_id(&state) {
+            pair_bases += 1;
+        }
+    }
+
+    assert!(
+        pair_bases * 100 >= SAMPLES * PAIR_BASE_FLOOR_PERCENT,
+        "at least {PAIR_BASE_FLOOR_PERCENT}% of generated histories must take their base while \
+         two sections of different kinds share a (parent_id, name) and the lower id has a child \
+         or a field, or `proptest_ac4_composed_lineage_matches_live_lua_backend_history` never \
+         checks that a base rebuilds a same-name pair; got {pair_bases}/{SAMPLES}. If \
+         `arb_rename_name` or `arb_checkpoint_write_op` changed, that is the first place to look."
     );
 }
 
@@ -6304,9 +6616,11 @@ proptest! {
 
 // ── b.ot3 P2 — duplicate-name conflict resolution is deterministic ───────────
 
-/// Build an `ObjectState` in which every id in `holders` is a section named
-/// `DUP_NAME` under parent `PARENT`, inserted into `state.sections` in the
-/// order given, plus one differently-named section `MOVER`.
+/// Build an `ObjectState` in which every id in `holders` is an attribute
+/// named `DUP_NAME` under parent `PARENT`, inserted into `state.sections` in
+/// the order given, plus one differently-named attribute `MOVER`: holders in
+/// one collision slot, a state only an earlier build's same-parent rename
+/// stored.
 ///
 /// The insertion order is the point: pre-b.ot3 the conflict target came from
 /// `HashMap::values().find()`, i.e. from the table's layout, which depends on
@@ -6359,9 +6673,11 @@ const MOVER: u64 = 10_000;
 proptest! {
     #![proptest_config(proptest_config(256))]
 
-    /// b.ot3 P2: when several siblings share `(parent_id, name)`, the conflict
-    /// target is the LOWEST `section_id` — regardless of the order the rows
-    /// were inserted into `state.sections`.
+    /// b.ot3 P2: when several siblings share one collision slot — the same
+    /// `(parent_id, name)` and kind, which only stored state an earlier
+    /// build's rename wrote can hold — the conflict target is the LOWEST
+    /// `section_id`, regardless of the order the rows were inserted into
+    /// `state.sections`. Every row here is an attribute.
     ///
     /// Observed through `DiffChangeSection`'s existing-row rename, whose
     /// `DuplicateSiblingName::conflicting_id` carries the pick as a value.
@@ -6677,14 +6993,21 @@ fn prop_materialize(spec: &StructSpec, state: &ObjectState) -> Option<StructComm
                 return None;
             }
             let name = prop_sel_name(*name);
-            // An *existing* row renamed onto an occupied `(parent_id, name)`
-            // slot is a `DuplicateSiblingName` rejection. The new-row branch
-            // cascade-deletes the holder instead of rejecting, so it is
-            // generated freely — which is what keeps the conflict cascade in
-            // the covered set.
+            let section_type = prop_sel_type(*ty);
+            // An *existing* row changed into an occupied collision slot — the
+            // same parent and name, and the slot of its (possibly new) type
+            // (`collision_slot`) — is a `DuplicateSiblingName` rejection. A
+            // sibling of another slot is no conflict, so that change is
+            // generated. The new-row branch cascade-deletes the occupant
+            // instead of rejecting, so it is generated freely — which is what
+            // keeps the conflict cascade in the covered set.
+            let slot = common::sibling_model::collision_slot(section_type);
             if state.sections.contains_key(&section_id)
                 && state.sections.values().any(|s| {
-                    s.section_id != section_id && s.parent_id == parent_id && s.name == name
+                    s.section_id != section_id
+                        && s.parent_id == parent_id
+                        && s.name == name
+                        && common::sibling_model::collision_slot(s.section_type) == slot
                 })
             {
                 return None;
@@ -6693,7 +7016,7 @@ fn prop_materialize(spec: &StructSpec, state: &ObjectState) -> Option<StructComm
                 parent_id,
                 section_id,
                 section_name: name.to_string(),
-                section_type: prop_sel_type(*ty),
+                section_type,
                 section_order: *order,
             }))
         }
@@ -8047,6 +8370,353 @@ fn sibling_order_generator_reaches_partial_and_ignored_reorders() {
     ]);
 }
 
+// ── b.z16: the collision-rule divergence counter never misses ───────────────
+//
+// The structural cache's cross-build replay guard reloads, rather than
+// replays, a stream record whose outcome the server's earlier collision rule
+// could decide differently: another build may have committed the record under
+// that rule. It reads `ApplyDeltaStats::collision_rule_divergences`, which may
+// over-count but must never miss. `structural_cache_equivalence` predicts
+// each reload from that same counter, so it cannot catch a miss; this block
+// checks the counter against an oracle independent of it: the C++ client
+// library's reader model (`tests/common/sibling_model.rs`) switched to the
+// earlier rule (`CollisionRule::NameOnly`) — siblings colliding on the name
+// alone, a same-parent rename that never looks for an occupant, and a move
+// whose occupant took the destination storing the section as an orphan.
+//
+// Histories of deltas of one or two commands — the b.xje generator's
+// creates, `DiffChangeSection`s, deletes and moves (`arb_spec`): mixed kinds,
+// three names over twelve ids, stale carried parents, changes of new and of
+// existing rows, type changes included — run from the b.xje typed seed plus a
+// stored same-slot pair (`seed_state`). A multi-command delta's second lookup
+// answers from the per-delta name index, its first from a scan. Before each
+// delta, one model under each rule is seeded from the server's state; both
+// apply a `DiffChangeSection` by the server's rule for a client upload, not
+// by a reader's catch-up rule (`SiblingModel::applying_changes_as_the_server`).
+// The engine and both models apply the delta. Then:
+//
+// (i)  every delta, all of which the engine accepts, the slot-rule model
+//      accepts too (it never sets `refused`), and after it holds the
+//      engine's sections — ids, parents and names — so whatever the
+//      name-only model holds differently comes from the rule alone;
+// (ii) whenever the name-only model holds other sections than the engine,
+//      the delta counted at least one divergence.
+//
+// Check (ii) skips a delta the name-only rule's server refused
+// (`SiblingModel::refused`: a move whose occupant took the section, or a
+// change of an existing row onto a name a sibling of any kind holds): no
+// build of that rule committed it. Check (i) still runs on it. Reorders, which
+// move no section, are not generated. Edge 5's destination check needs a cycle
+// in the lists; a generated change that reparents a row under its own child
+// can make one, but no floor holds the shape, and the inline tests in
+// `src/domain/delta.rs` pin it.
+//
+// `collision_rule_generator_reaches_divergent_deltas` holds the generator to a
+// floor of each divergent and each `DiffChangeSection` shape, so the property
+// cannot pass vacuously. Measured fail-on-old, each tick removed in turn: the
+// rename cascade's (shrunk to a same-parent rename with a stale carried parent
+// onto a same-kind sibling's name); every lookup's (shrunk to a create beside
+// a same-named prim of another kind, which the earlier rule cascaded); and
+// that of `apply_diff_change_section`'s lookup alone (shrunk to a new-row
+// change, a relationship, beside a same-named prim, which the earlier rule
+// cascaded).
+mod collision_rule_divergences {
+    use super::*;
+
+    use common::sibling_model::CollisionRule;
+    use live_edit::domain::delta::{apply_delta_with_stats, ApplyDeltaStats};
+
+    /// A section's parent and name, by id.
+    type Sections = BTreeMap<u64, (u64, String)>;
+
+    /// The b.xje seed plus a same-slot pair, the shape an earlier build's
+    /// rename could store: attribute 10 named `b` beside attribute 9 under
+    /// parent 2. Cross-map consistent and sorted by key.
+    fn seed_state() -> ObjectState {
+        const ATTRIBUTE: u8 = 1;
+        let mut state = sibling_seed_state();
+        prop_seed_section(&mut state, 10, 2, "b", 6);
+        state.sections.get_mut(&10).expect("seeded").section_type = ATTRIBUTE;
+        state.children.get_mut(&2).expect("seeded").push(10);
+        state
+    }
+
+    fn one_command(cmd: StructCommand) -> OwnedDelta {
+        OwnedDelta {
+            is_diff: false,
+            struct_commands: vec![cmd],
+            ..Default::default()
+        }
+    }
+
+    /// Materialize `specs` into one delta, each against the state the
+    /// commands before it leave (the b.ot3 block pins a batch to its
+    /// one-command-per-delta replay); `None` when none materializes.
+    fn materialize_delta(specs: &[StructSpec], state: &ObjectState) -> Option<OwnedDelta> {
+        let mut scratch = state.clone();
+        let mut cmds = Vec::new();
+        for spec in specs {
+            let Some(cmd) = prop_materialize(spec, &scratch) else {
+                continue;
+            };
+            apply_delta(&mut scratch, Some(one_command(cmd.clone())))
+                .expect("a materialized command must apply");
+            cmds.push(cmd);
+        }
+        (!cmds.is_empty()).then(|| OwnedDelta {
+            is_diff: false,
+            struct_commands: cmds,
+            ..Default::default()
+        })
+    }
+
+    fn sections_of(state: &ObjectState) -> Sections {
+        state
+            .sections
+            .values()
+            .map(|s| (s.section_id, (s.parent_id, s.name.clone())))
+            .collect()
+    }
+
+    /// One delta applied by the engine and by a model under each rule seeded
+    /// from the state before it.
+    struct Applied {
+        /// The engine's `collision_rule_divergences` for the delta.
+        divergences: u64,
+        /// The engine's sections after the delta.
+        engine: Sections,
+        /// Whether the slot-rule model refused the delta, which the engine
+        /// accepted: always a model bug.
+        slot_refused: bool,
+        /// The slot-rule model's sections after it.
+        slot: Sections,
+        /// The name-only model's sections after it; `None` when the
+        /// name-only rule's server refused the delta (block doc).
+        name_only: Option<Sections>,
+    }
+
+    impl Applied {
+        /// Whether the name-only rule left other sections than the engine.
+        fn earlier_rule_differs(&self) -> bool {
+            self.name_only
+                .as_ref()
+                .is_some_and(|name_only| *name_only != self.engine)
+        }
+    }
+
+    fn apply_under_both_rules(state: &mut ObjectState, delta: &OwnedDelta) -> Applied {
+        let mut slot =
+            sibling_model_holding(Reader::Ovlive, state).applying_changes_as_the_server();
+        let mut name_only = sibling_model_holding(Reader::Ovlive, state)
+            .applying_changes_as_the_server()
+            .with_collision_rule(CollisionRule::NameOnly);
+        let mut stats = ApplyDeltaStats::default();
+        apply_delta_with_stats(state, Some(delta.clone()), &mut stats)
+            .expect("a materialized delta must apply");
+        slot.apply(delta);
+        name_only.apply(delta);
+        Applied {
+            divergences: stats.collision_rule_divergences,
+            engine: sections_of(state),
+            slot_refused: slot.refused(),
+            slot: slot.parents_and_names(),
+            name_only: (!name_only.refused()).then(|| name_only.parents_and_names()),
+        }
+    }
+
+    /// The b.xje generator's creates, `DiffChangeSection`s, deletes and moves,
+    /// with its selectors (`arb_struct_spec`), weighted toward the commands
+    /// that look an occupant up; the deletes free ids for the creates and the
+    /// new-row changes. A change names a new or an existing id, and its type
+    /// is drawn afresh, so an existing row's change often retypes it. Half
+    /// the creates and changes name the root or parent 1 or 2, where the
+    /// seed's siblings are, so that most land beside a same-named sibling.
+    fn arb_spec() -> impl Strategy<Value = StructSpec> {
+        let parent = || prop_oneof![0u8..=2, 0u8..=12];
+        prop_oneof![
+            4 => (parent(), 0u8..12, 0u8..3, 0u8..5).prop_map(|(parent, id, name, ty)| {
+                StructSpec::Create {
+                    parent,
+                    id,
+                    name,
+                    ty,
+                }
+            }),
+            3 => (parent(), 0u8..12, 0u8..3, 0u8..5, 0u32..4).prop_map(
+                |(parent, id, name, ty, order)| StructSpec::Change {
+                    parent,
+                    id,
+                    name,
+                    ty,
+                    order,
+                }
+            ),
+            4 => (0u8..12).prop_map(|id| StructSpec::Delete { id }),
+            4 => (0u8..12, 0u8..=19, 0u8..3, 0u8..39).prop_map(
+                |(id, new_parent, name, carried)| StructSpec::Move {
+                    id,
+                    new_parent,
+                    name,
+                    carried,
+                }
+            ),
+        ]
+    }
+
+    fn arb_deltas() -> impl Strategy<Value = Vec<Vec<StructSpec>>> {
+        prop::collection::vec(prop::collection::vec(arb_spec(), 1..=2), 1..=24)
+    }
+
+    proptest! {
+        #![proptest_config(proptest_config(256))]
+
+        /// After every delta of a generated history: the slot-rule model
+        /// accepted it and holds the engine's sections, and a delta the
+        /// name-only rule did not refuse, after which the name-only model
+        /// holds other sections, counted a collision-rule divergence (block
+        /// doc).
+        #[test]
+        fn proptest_collision_rule_divergences_count_every_delta_the_earlier_rule_decides_differently(
+            deltas in arb_deltas(),
+        ) {
+            let mut state = seed_state();
+            let mut history: Vec<Vec<StructCommand>> = Vec::new();
+            for specs in &deltas {
+                let Some(delta) = materialize_delta(specs, &state) else {
+                    continue;
+                };
+                let applied = apply_under_both_rules(&mut state, &delta);
+                history.push(delta.struct_commands);
+                prop_assert!(
+                    !applied.slot_refused,
+                    "(i) the slot-rule model must accept the delta the engine accepted, after {:?}",
+                    history
+                );
+                prop_assert_eq!(
+                    &applied.slot,
+                    &applied.engine,
+                    "(i) the slot-rule model must hold the engine's sections after {:?}",
+                    history
+                );
+                let Some(name_only) = &applied.name_only else {
+                    continue;
+                };
+                prop_assert!(
+                    !applied.earlier_rule_differs() || applied.divergences > 0,
+                    "(ii) the earlier rule leaves {:?} where the engine leaves {:?}, but the \
+                     delta counted no divergence, after {:?}",
+                    name_only,
+                    applied.engine,
+                    history
+                );
+            }
+        }
+    }
+
+    /// The property above is only as strong as the divergent deltas its
+    /// generator reaches. Over a deterministic sample of
+    /// [`SIBLING_REACH_SAMPLES`] histories, count the histories holding each
+    /// shape of one-command delta (one command, so it is the one that
+    /// diverged):
+    ///
+    /// * the earlier rule decides differently: a create (beside a same-named
+    ///   sibling of another kind), a same-parent rename (whose occupant is
+    ///   cascaded), a cross-parent move (its carried parent other than its
+    ///   destination; beside, or onto an ancestor of, a same-named sibling of
+    ///   another kind), and a `DiffChangeSection` of a new row (beside a
+    ///   same-named sibling of another kind, which the earlier rule cascaded);
+    /// * a `DiffChangeSection` of an existing row that the earlier rule
+    ///   refused (a sibling of another kind holds the name) and the engine
+    ///   accepted, so the model's refusal is driven;
+    /// * a `DiffChangeSection` that retypes an existing row, compared.
+    ///
+    /// Each must be reached in at least one history in twenty (13); measured:
+    /// 47 creates, 29 renames, 24 cross-parent moves, 44 new-row changes, 54
+    /// refused existing-row changes and 105 retyping changes.
+    #[test]
+    fn collision_rule_generator_reaches_divergent_deltas() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+
+        let (mut creates, mut renames, mut moves) =
+            (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        let (mut new_rows, mut refused_rows, mut retyped_rows) =
+            (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        let mut runner = TestRunner::deterministic();
+        let strategy = arb_deltas();
+        for sample in 0..SIBLING_REACH_SAMPLES {
+            let deltas = strategy.new_tree(&mut runner).expect("generator").current();
+            let mut state = seed_state();
+            for specs in &deltas {
+                let Some(delta) = materialize_delta(specs, &state) else {
+                    continue;
+                };
+                // A change's row as it stood before the delta: its type.
+                let held_type = match &delta.struct_commands[..] {
+                    [StructCommand::DiffChangeSection(c)] => {
+                        state.sections.get(&c.section_id).map(|s| s.section_type)
+                    }
+                    _ => None,
+                };
+                let applied = apply_under_both_rules(&mut state, &delta);
+                let [cmd] = &delta.struct_commands[..] else {
+                    continue;
+                };
+                let differs = applied.earlier_rule_differs();
+                match cmd {
+                    StructCommand::CreateSection(_) if differs => {
+                        creates.insert(sample);
+                    }
+                    StructCommand::MoveSection(m)
+                        if differs && m.old_parent_id == m.new_parent_id =>
+                    {
+                        renames.insert(sample);
+                    }
+                    StructCommand::MoveSection(_) if differs => {
+                        moves.insert(sample);
+                    }
+                    StructCommand::DiffChangeSection(c) => match held_type {
+                        None if differs => {
+                            new_rows.insert(sample);
+                        }
+                        Some(_) if applied.name_only.is_none() => {
+                            refused_rows.insert(sample);
+                        }
+                        Some(ty) if ty != c.section_type => {
+                            retyped_rows.insert(sample);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        assert_each_shape_reached(&[
+            ("a create the earlier rule decides differently", creates),
+            (
+                "a same-parent rename the earlier rule decides differently",
+                renames,
+            ),
+            (
+                "a cross-parent move the earlier rule decides differently",
+                moves,
+            ),
+            (
+                "a new-row change the earlier rule decides differently",
+                new_rows,
+            ),
+            (
+                "an existing-row change the earlier rule refused",
+                refused_rows,
+            ),
+            (
+                "an existing-row change that retypes the row, compared",
+                retyped_rows,
+            ),
+        ]);
+    }
+}
+
 // ── b.ze1: reconnectors of either reader fold the coalesced catch-up ────────
 //
 // The b.xje block's generator, from its typed seed widened by two prims under
@@ -8055,7 +8725,7 @@ fn sibling_order_generator_reaches_partial_and_ignored_reorders() {
 // partial reorders re-key only part of a list. For every `have_version` in
 // it, a reconnector of each client reader (`tests/common/sibling_model.rs`:
 // the Kit client's key-with-displacement reading and the C++ client
-// library's index-and-renumber reading) folds the snapshot-mode coalesced
+// library's index-and-renumber reading) folds the coalesced
 // catch-up (`plan_faithful_coalesced`, in `build_delta`'s wire order: new
 // sections, existing ones, retractions) and must end with the server's order
 // in every child list, from two baselines:
@@ -8116,6 +8786,19 @@ fn sibling_order_generator_reaches_partial_and_ignored_reorders() {
 // history already used, whose re-created row the coalesced diff both emits and
 // retracts (SDD §9.2 Known gap).
 //
+// One generated shape is committed changed: a `DiffChangeSection` naming a
+// held section with another `section_type` is committed at the held type. No
+// known client sends one (a spec's type is fixed for its path), and the Kit
+// client keeps the held node's type where the models take the new one
+// (`docs-internal/cross-repo-debugging.md` § Sibling order and move rules).
+// Retyping a parent can move its children into another child list; when two
+// lists merge, the interleaving between them, which USD never shows and which
+// the readers may hold differently, reads as a misorder (b.if6). Keeping the
+// step, rather than dropping it, keeps the change's re-parent, rename and
+// order, which open the re-entering-subtree gap below.
+// `reconnector_fold_property_reaches_both_kit_live_branches` counts these
+// steps.
+//
 // Part of one check is left out where a separate gap makes it
 // unsatisfiable: the **re-entering subtree**. A `DiffChangeSection` that
 // re-parents a section under a missing parent, or into its own subtree,
@@ -8157,7 +8840,7 @@ fn sibling_order_generator_reaches_partial_and_ignored_reorders() {
 // the snapshot's sections and has the same gap as the snapshot baseline; the
 // live checks here do not cover its fold.
 
-/// The snapshot-mode catch-up for a reconnector at `have_version`, in
+/// The coalesced catch-up for a reconnector at `have_version`, in
 /// `build_delta`'s wire order: new sections, then existing ones, then
 /// retractions.
 fn prop_coalesced_catch_up(
@@ -8242,6 +8925,9 @@ struct ReconnectorFoldReach {
     /// Commands the history committed, one delta each: a command is dropped
     /// when it does not materialize or re-uses an id (block doc).
     committed: usize,
+    /// Committed `DiffChangeSection`s that named a held section with another
+    /// `section_type` and were committed at the held one (block doc; b.if6).
+    retypes_held: usize,
     /// A Kit live baseline that held the server's order, folded in full.
     kit_live_full: usize,
     /// A Kit live baseline that had diverged after a reorder, folded, with at
@@ -8541,10 +9227,34 @@ fn check_reconnector_history<F: Fn(&ObjectState) -> Option<StructCommand>>(
     let mut states = vec![state.clone()];
     let mut deltas: Vec<OwnedDelta> = Vec::new();
     let mut tombstones: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    let mut retypes_held = 0usize;
     for step in steps {
-        let Some(cmd) = step(&state) else {
+        let Some(mut cmd) = step(&state) else {
             continue;
         };
+        // A held section retyped in place keeps its type (block doc; b.if6).
+        if let StructCommand::DiffChangeSection(c) = &mut cmd {
+            if let Some(held_type) = state.sections.get(&c.section_id).map(|s| s.section_type) {
+                // Kept at its held type, a change `prop_materialize` drew
+                // beside a sibling of another kind can land in that sibling's
+                // collision slot: the engine refuses it
+                // (`DuplicateSiblingName`), so it is skipped, as
+                // `prop_materialize` skips every refusal.
+                let slot = common::sibling_model::collision_slot;
+                if state.sections.values().any(|s| {
+                    s.section_id != c.section_id
+                        && s.parent_id == c.parent_id
+                        && s.name == c.section_name
+                        && slot(s.section_type) == slot(held_type)
+                }) {
+                    continue;
+                }
+                if held_type != c.section_type {
+                    c.section_type = held_type;
+                    retypes_held += 1;
+                }
+            }
+        }
         let born = match &cmd {
             StructCommand::CreateSection(c) => Some(c.section_id),
             StructCommand::DiffChangeSection(c) if !state.sections.contains_key(&c.section_id) => {
@@ -8585,6 +9295,7 @@ fn check_reconnector_history<F: Fn(&ObjectState) -> Option<StructCommand>>(
     let reachable_now = prop_snapshot_ids(&state);
     let mut reach = ReconnectorFoldReach {
         committed: deltas.len(),
+        retypes_held,
         resynced: deltas
             .iter()
             .any(|d| matches!(d.struct_commands[0], StructCommand::DiffChangeSection(_))),
@@ -8891,10 +9602,13 @@ fn reconnector_fold_property_reaches_both_kit_live_branches() {
     let (mut full_points, mut diverged_points, mut resynced_points) = (0usize, 0usize, 0usize);
     let (mut gap_folds, mut gap_fold_points) = (BTreeSet::new(), 0usize);
     let (mut gapped_lists, mut drift_rekeys, mut collision_rekeys) = (0usize, 0usize, 0usize);
+    let (mut committed, mut retypes_held) = (0usize, 0usize);
     for sample in 0..SIBLING_REACH_SAMPLES {
         let specs = strategy.new_tree(&mut runner).expect("generator").current();
         let reach = check_reconnector_fold(&specs)
             .unwrap_or_else(|e| panic!("the property fails on sampled sequence {sample}: {e}"));
+        committed += reach.committed;
+        retypes_held += reach.retypes_held;
         full_points += reach.kit_live_full;
         diverged_points += reach.kit_live_diverged;
         resynced_points += reach.resynced_points;
@@ -8922,7 +9636,8 @@ fn reconnector_fold_property_reaches_both_kit_live_branches() {
          ({resynced_points} Kit have_versions checked from a re-synced baseline), Kit fold \
          restating a parent with a kept gap in {} ({gap_fold_points} have_versions; re-syncs \
          kept {gapped_lists} gapped lists, re-keyed {drift_rekeys} by position for drift and \
-         {collision_rekeys} for a collision)",
+         {collision_rekeys} for a collision); {committed} steps committed, {retypes_held} \
+         of them retypes committed at the held type",
         full.len(),
         diverged.len(),
         resynced.len(),
@@ -8957,12 +9672,12 @@ const RECONNECTOR_EXCLUSION_SAMPLES: usize = 2048;
 /// The reconnector property's snapshot baseline may leave out at most one
 /// child list in this many for the re-entering-subtree gap (b.jdv), over the
 /// [`RECONNECTOR_EXCLUSION_SAMPLES`] sequences the test checks. There it
-/// leaves out 27 of 67,976 lists (about one in 2,500). Leaving out every
+/// leaves out 39 of 68,225 lists (about one in 1,750). Leaving out every
 /// list at the `have_version`s the gap reaches, as the comparison once did,
-/// leaves out 88 (about one in 770), which this bound fails; one in 1,000
-/// leaves 2.5 times the measured count. The bound is set for this sample,
+/// leaves out 103 (about one in 660), which this bound fails; one in 1,000
+/// leaves 1.7 times the measured count. The bound is set for this sample,
 /// not for the generator at large: over the first 8192 sequences the
-/// exclusion leaves out 287 of 272,796 (about one in 950).
+/// exclusion leaves out 365 of 274,359 (about one in 750).
 const RECONNECTOR_SKIP_RATE_DIVISOR: usize = 1000;
 
 /// The lists the reconnector property's snapshot baseline leaves out for the
@@ -9095,7 +9810,9 @@ fn expected_reentry_exclusions(
 /// The re-entering-subtree exclusion (T5 block doc; b.jdv) for a subtree
 /// that re-enters when a move reattaches a cycle: draw 3497 (counting from
 /// 0) of `TestRunner::deterministic()` over [`arb_reconnector_specs`], as it
-/// materializes from [`reconnector_seed_state`] (parent 1 lists
+/// materialized and committed under the earlier sibling-name rule, with
+/// version 10's rename of 8 given a free name (see the history), from
+/// [`reconnector_seed_state`] (parent 1 lists
 /// `[3, 4, 6, 7, 20, 21]`, of which 4 and 7 are attributes; parent 2 lists
 /// `[5, 8, 9]`). Version 4
 /// re-parents 2 under its own child 5, so 2, 5, 8 and 9 leave the scene;
@@ -9114,12 +9831,13 @@ fn reconnector_fold_reentry_exclusion_after_a_cycle_reattach_covers_only_the_sub
     let history = [
         reentry_reorder(1, vec![6, 4]),
         reentry_reorder(1, vec![6, 7, 6]),
-        // Version 4: 2 goes under its own child 5.
+        // Version 4: 2 goes under its own child 5. The draw's type, Unknown
+        // (0), is committed at 2's held type, Prim (block doc; b.if6).
         StructCommand::DiffChangeSection(CommandDiffChangeSection {
             parent_id: 5,
             section_id: 2,
             section_name: "b".to_string(),
-            section_type: 0,
+            section_type: 6,
             section_order: 3,
         }),
         StructCommand::DeleteSection(CommandDeleteSection {
@@ -9134,7 +9852,10 @@ fn reconnector_fold_reentry_exclusion_after_a_cycle_reattach_covers_only_the_sub
             parent_id: 0,
             section_id: 7,
         }),
-        reentry_move(8, 2, 2, "b"),
+        // Version 10: the draw renamed 8 `b`, the attribute 9's name, which
+        // a relationship's rename now cascades (taking 9, and version 11's
+        // destination, with it); a free name keeps the shape.
+        reentry_move(8, 2, 2, "f"),
         // Version 11: the attribute 4 leaves parent 1 for 9.
         reentry_move(4, 1, 9, "c"),
         reentry_reorder(1, vec![3, 21]),
@@ -9208,6 +9929,43 @@ fn reconnector_fold_reentry_exclusion_after_a_parent_birth_covers_only_the_subtr
             ]
         )
     );
+}
+
+/// The b.if6 counterexample, shrunk by the reconnector property, as wire
+/// commands from [`reconnector_seed_state`]. Two partial reorders of parent
+/// 1, with a move of 3 into parent 1 between them (3 already sits there, so
+/// it is renamed `c`, which removes its sibling 6), leave a live Kit client
+/// holding
+/// parent 1's prims `[20, 21, 3]` and attributes `[4, 7]` in the server's
+/// order but interleaved as `[20, 4, 7, 21, 3]` where the server stores
+/// `[20, 4, 21, 7, 3]`. Version 6 re-parents the prim 1 with type Unknown
+/// (0), under which all five fall into one fallback list. Committed as sent,
+/// that change merged the lists and the property reported Kit's interleaving
+/// as a misorder; committed at 1's held type, as the Kit client keeps it
+/// (block doc), every list must hold the server's order. Sending the held
+/// type itself folds the same way and holds nothing.
+#[test]
+fn reconnector_fold_holds_a_retyped_sections_type() {
+    let history = |section_type| {
+        [
+            reentry_change(8, 10, "a", 0),
+            reentry_reorder(1, vec![20, 3]),
+            reentry_move(3, 10, 1, "c"),
+            reentry_reorder(1, vec![21, 3]),
+            reentry_change(5, 1, "a", section_type),
+        ]
+    };
+    for (section_type, held) in [(0, 1), (6, 0)] {
+        let history = history(section_type);
+        let reach = check_reconnector_commands(&history).unwrap_or_else(|e| {
+            panic!("the property fails with version 6 at type {section_type}: {e}")
+        });
+        assert_eq!(
+            (reach.committed, reach.retypes_held),
+            (history.len(), held),
+            "version 6 at type {section_type}: every command commits, and a retype is held"
+        );
+    }
 }
 
 /// The Kit re-sync's keying ([`key_between_carried_neighbours`]): a child to
@@ -9817,6 +10575,13 @@ mod structural_watch_equivalence {
         /// The b.ot3 create and change draw their names blind and reach the
         /// conflict cascade rarely.
         OnName { pick: u8, id: u8, change: bool },
+        /// The other-kind twin of [`CmdSpec::OnName`]: a row named as the
+        /// live section `pick` selects, under its parent, of a kind whose
+        /// collision slot differs from that section's — a create, or, when
+        /// `change`, a `DiffChangeSection` renaming one of that section's
+        /// live siblings onto its name (see [`resolve_beside_other_kind`]).
+        /// Both stay beside it; blind names and types reach that rarely.
+        BesideOtherKind { pick: u8, id: u8, change: bool },
         /// A create (or, `change`, a `DiffChangeSection`) of
         /// [`DANGLING_PARENT`] under the root, while it has no row.
         CreateDangling { change: bool },
@@ -9858,6 +10623,9 @@ mod structural_watch_equivalence {
             2 => (any::<u8>(), any::<u8>(), any::<bool>()).prop_map(|(pick, id, change)| {
                 CmdSpec::OnName { pick, id, change }
             }),
+            1 => (any::<u8>(), any::<u8>(), any::<bool>()).prop_map(|(pick, id, change)| {
+                CmdSpec::BesideOtherKind { pick, id, change }
+            }),
             1 => any::<bool>().prop_map(|change| CmdSpec::CreateDangling { change }),
         ]
     }
@@ -9873,8 +10641,9 @@ mod structural_watch_equivalence {
         /// Create a section as its own parent.
         SelfParent(u8),
         /// Rename a live section, through a `DiffChangeSection`, onto the
-        /// `(parent_id, name)` another live section holds (both picked among
-        /// the live ones).
+        /// `(parent_id, name)` another live section holds, with that
+        /// section's type, so into its collision slot (both picked among the
+        /// live ones).
         RenameOntoSibling(u8),
         /// Set an external field whose hash is not 32 bytes.
         BadExtHash,
@@ -9984,6 +10753,9 @@ mod structural_watch_equivalence {
             }
             CmdSpec::MoveTo { shape, pick, other } => resolve_move(*shape, *pick, *other, state),
             CmdSpec::OnName { pick, id, change } => resolve_on_name(*pick, *id, *change, state),
+            CmdSpec::BesideOtherKind { pick, id, change } => {
+                resolve_beside_other_kind(*pick, *id, *change, state)
+            }
             CmdSpec::CreateDangling { change } => {
                 let adopts = state
                     .sections
@@ -10015,7 +10787,7 @@ mod structural_watch_equivalence {
 
     /// Resolve a [`CmdSpec::OnName`] against `state`: a create (or a
     /// `DiffChangeSection`, when `change`), under the stored parent of the
-    /// live section `pick` selects and with its name, of the first id from
+    /// live section `pick` selects and with its name and type, of the first id from
     /// `prop_sel_id(id)` on (wrapping within the generated id space) that is
     /// neither live nor that parent; `None` when no section is live or no id
     /// is free.
@@ -10033,12 +10805,13 @@ mod structural_watch_equivalence {
             .find(|candidate| {
                 !state.sections.contains_key(candidate) && *candidate != held.parent_id
             })?;
+        // Of the held section's type, so the new row takes its collision slot.
         Some(if change {
             StructCommand::DiffChangeSection(CommandDiffChangeSection {
                 parent_id: held.parent_id,
                 section_id,
                 section_name: held.name.clone(),
-                section_type: 0,
+                section_type: held.section_type,
                 section_order: 0,
             })
         } else {
@@ -10046,9 +10819,64 @@ mod structural_watch_equivalence {
                 parent_id: held.parent_id,
                 section_id,
                 section_name: held.name.clone(),
-                section_type: 0,
+                section_type: held.section_type,
             })
         })
+    }
+
+    /// Resolve a [`CmdSpec::BesideOtherKind`] against `state`: under the
+    /// stored parent of the live section `pick` selects, with its name, a row
+    /// of a kind in another collision slot — a prim beside a non-prim, an
+    /// attribute beside a prim. A create of the first free id from
+    /// `prop_sel_id(id)` on (as [`resolve_on_name`]'s), or, when `change`, a
+    /// `DiffChangeSection` of the live sibling `id` selects among the held
+    /// section's other siblings, keeping its order, so it is a rename in
+    /// place. `None` when no section is live, no id is free or no sibling
+    /// is, or a row of the chosen kind already holds the name there.
+    fn resolve_beside_other_kind(
+        pick: u8,
+        id: u8,
+        change: bool,
+        state: &ObjectState,
+    ) -> Option<StructCommand> {
+        let slot = common::sibling_model::collision_slot;
+        let mut live: Vec<&Section> = state.sections.values().collect();
+        live.sort_unstable_by_key(|s| s.section_id);
+        let held = *live.get(pick as usize % live.len().max(1))?;
+        let section_type = if slot(held.section_type) == 6 { 1 } else { 6 };
+        if state.sections.values().any(|s| {
+            s.parent_id == held.parent_id
+                && s.name == held.name
+                && slot(s.section_type) == slot(section_type)
+        }) {
+            return None;
+        }
+        if change {
+            let siblings: Vec<&Section> = live
+                .iter()
+                .copied()
+                .filter(|s| s.parent_id == held.parent_id && s.section_id != held.section_id)
+                .collect();
+            let renamed = *siblings.get(id as usize % siblings.len().max(1))?;
+            return Some(StructCommand::DiffChangeSection(CommandDiffChangeSection {
+                parent_id: held.parent_id,
+                section_id: renamed.section_id,
+                section_name: held.name.clone(),
+                section_type,
+                section_order: renamed.section_order,
+            }));
+        }
+        let section_id = (0..PROP_ID_SPACE)
+            .map(|step| (u64::from(id) + step) % PROP_ID_SPACE + 1)
+            .find(|candidate| {
+                !state.sections.contains_key(candidate) && *candidate != held.parent_id
+            })?;
+        Some(StructCommand::CreateSection(CommandCreateSection {
+            parent_id: held.parent_id,
+            section_id,
+            section_name: held.name.clone(),
+            section_type,
+        }))
     }
 
     /// Resolve a [`CmdSpec::MoveTo`] against `state`: the live section `pick`
@@ -10088,7 +10916,14 @@ mod structural_watch_equivalence {
             }
             false
         };
+        // A holder of the moved section's collision slot, so the move meets
+        // it as its occupant (edges 4 and 5).
+        let slot = common::sibling_model::collision_slot;
         let pick_other = |candidates: Vec<&Section>| -> Option<(u64, String)> {
+            let candidates: Vec<&Section> = candidates
+                .into_iter()
+                .filter(|s| slot(s.section_type) == slot(moved.section_type))
+                .collect();
             let held = *candidates.get(other as usize % candidates.len().max(1))?;
             Some((held.parent_id, held.name.clone()))
         };
@@ -10180,11 +11015,13 @@ mod structural_watch_equivalence {
                     .position(|id| *id == held.section_id)
                     .expect("a listed section is live");
                 let renamed = live[(at + 1) % live.len()];
+                // Of the held section's type, so the renamed row's new slot
+                // is the held one's.
                 Some(StructCommand::DiffChangeSection(CommandDiffChangeSection {
                     parent_id: held.parent_id,
                     section_id: renamed,
                     section_name: held.name.clone(),
-                    section_type: 0,
+                    section_type: held.section_type,
                     section_order: 0,
                 }))
             }
@@ -10213,15 +11050,31 @@ mod structural_watch_equivalence {
                 }
             }
         };
-        // The lowest other section holding `(parent_id, name)`
-        // (`delta.rs`'s `find_child_by_name`).
-        let conflict = |parent_id: u64, name: &str, except: u64| {
+        // The lowest other section holding `(parent_id, name)` in the
+        // collision slot of a `ty` child (`delta.rs`'s `find_child_by_name`).
+        let slot = common::sibling_model::collision_slot;
+        let conflict = |parent_id: u64, ty: u8, name: &str, except: u64| {
             state
                 .sections
                 .values()
-                .filter(|s| s.section_id != except && s.parent_id == parent_id && s.name == name)
+                .filter(|s| {
+                    s.section_id != except
+                        && s.parent_id == parent_id
+                        && s.name == name
+                        && slot(s.section_type) == slot(ty)
+                })
                 .map(|s| s.section_id)
                 .min()
+        };
+        // Whether another section holds `(parent_id, name)` in a slot other
+        // than a `ty` child's: a sibling the command leaves in place.
+        let other_kind = |parent_id: u64, ty: u8, name: &str, except: u64| {
+            state.sections.values().any(|s| {
+                s.section_id != except
+                    && s.parent_id == parent_id
+                    && s.name == name
+                    && slot(s.section_type) != slot(ty)
+            })
         };
         let created = match cmd {
             StructCommand::CreateSection(c) => Some(c.section_id),
@@ -10245,8 +11098,12 @@ mod structural_watch_equivalence {
                     "create: existing id (refused)"
                 } else if c.parent_id != 0 && !live(c.parent_id) {
                     "create: missing parent (skipped)"
-                } else if conflict(c.parent_id, &c.section_name, c.section_id).is_some() {
+                } else if conflict(c.parent_id, c.section_type, &c.section_name, c.section_id)
+                    .is_some()
+                {
                     "create: name conflict cascade"
+                } else if other_kind(c.parent_id, c.section_type, &c.section_name, c.section_id) {
+                    "create: beside another kind (no cascade)"
                 } else {
                     "create"
                 }
@@ -10261,16 +11118,26 @@ mod structural_watch_equivalence {
                 }
             }
             StructCommand::MoveSection(c) => {
-                if !live(c.section_id) {
-                    "move: absent section"
-                } else if c.old_parent_id == c.new_parent_id {
-                    "move edge 1: same-parent rename"
+                let Some(row) = state.sections.get(&c.section_id) else {
+                    return "move: absent section";
+                };
+                if c.old_parent_id == c.new_parent_id {
+                    // Under the stored parent, whatever parent is carried.
+                    if row.name == c.new_name {
+                        "move edge 1: own-name rename (no-op)"
+                    } else if conflict(row.parent_id, row.section_type, &c.new_name, c.section_id)
+                        .is_some()
+                    {
+                        "move edge 1: rename cascade"
+                    } else {
+                        "move edge 1: same-parent rename"
+                    }
                 } else if c.new_parent_id != 0 && !live(c.new_parent_id) {
                     "move edge 2: missing new parent"
                 } else if descends(c.new_parent_id, c.section_id) {
                     "move edge 3: cycle"
                 } else {
-                    match conflict(c.new_parent_id, &c.new_name, c.section_id) {
+                    match conflict(c.new_parent_id, row.section_type, &c.new_name, c.section_id) {
                         Some(holder) if descends(c.section_id, holder) => {
                             "move edge 4: conflict is an ancestor"
                         }
@@ -10281,11 +11148,21 @@ mod structural_watch_equivalence {
             }
             StructCommand::ReorderChildren(_) => "reorder",
             StructCommand::DiffChangeSection(c) => {
+                let occupied =
+                    conflict(c.parent_id, c.section_type, &c.section_name, c.section_id).is_some();
                 if live(c.section_id) {
-                    "change: existing section"
+                    // Into an occupied slot it is refused; beside a sibling
+                    // of another kind it is accepted.
+                    if !occupied
+                        && other_kind(c.parent_id, c.section_type, &c.section_name, c.section_id)
+                    {
+                        "change: existing section beside another kind (accepted)"
+                    } else {
+                        "change: existing section"
+                    }
                 } else if c.parent_id != 0 && !live(c.parent_id) {
                     "change: orphan (missing parent)"
-                } else if conflict(c.parent_id, &c.section_name, c.section_id).is_some() {
+                } else if occupied {
                     "change: name conflict cascade"
                 } else {
                     "change: new section"
@@ -10880,6 +11757,21 @@ mod structural_watch_equivalence {
         // post-state the `obj:ext` model reads.
         let mut post = pre.clone();
         let modelled = apply_delta(&mut post, Some(delta.clone())).ok();
+        // A delta the layer-root rule refuses (SDD §9.7), taking the seed from
+        // at least one top-level section to none, is outside this property:
+        // the WATCH path refuses it after its plan, while the structural side
+        // here commits a test-support plan (`plan_structural_commit`) that
+        // models the engine's plan alone. Both production routes' refusal of
+        // it is `storage::layer_root_update_test`'s subject, and the dispatch
+        // property below compares the two routes on it, writing nothing
+        // (required coverage `DISPATCH_REFUSED_LAYER_ROOT`).
+        if modelled.is_some()
+            && check_keeps_top_level_section(has_top_level_section(&pre), &post).is_err()
+        {
+            return Err(TestCaseError::reject(
+                "the layer-root rule refuses the delta on the WATCH path only",
+            ));
+        }
         let refused = modelled.is_none();
         let planted = planted_index(&pre, drift);
         let drifted = planted != ext_row_counts(&pre);
@@ -11378,17 +12270,21 @@ mod structural_watch_equivalence {
             "create",
             "create: missing parent (skipped)",
             "create: name conflict cascade",
+            "create: beside another kind (no cascade)",
             "delete: cascading",
             "delete: leaf",
             "delete: absent section",
             "reorder",
             "change: existing section",
+            "change: existing section beside another kind (accepted)",
             "change: new section",
             "change: orphan (missing parent)",
             "change: name conflict cascade",
             "diff delete (ignored)",
             "move: absent section",
             "move edge 1: same-parent rename",
+            "move edge 1: rename cascade",
+            "move edge 1: own-name rename (no-op)",
             "move edge 2: missing new parent",
             "move edge 3: cycle",
             "move edge 4: conflict is an ancestor",
@@ -11642,11 +12538,12 @@ mod structural_watch_equivalence {
     );
 
     /// Resolve `spec` against `pre` (both sides scrub, see [`resolve_cmd`])
-    /// and model it.
+    /// and model it as both stores commit it ([`apply_update`]: the engine,
+    /// then the layer-root rule).
     fn resolve_step(pre: &ObjectState, spec: &DeltaSpec) -> Resolved {
         let (delta, command_notes) = materialize(pre, spec, true);
         let mut post = pre.clone();
-        let plan = apply_delta(&mut post, Some(delta.clone())).map_err(ServiceError::from);
+        let plan = apply_update(&mut post, Some(delta.clone())).map_err(ServiceError::from);
         (delta, plan, post, command_notes)
     }
 
@@ -11659,7 +12556,15 @@ mod structural_watch_equivalence {
     const DISPATCH_LUA_RESET: &str = "lua: committed on reset";
     const DISPATCH_LUA_FAST: &str = "lua: committed on fast";
     const DISPATCH_LUA_UNCACHEABLE: &str = "lua: committed on watch (unmarked, uncacheable)";
-    const DISPATCH_REFUSED: &str = "step refused by both";
+    /// A step both stores refuse with an engine refusal (an `apply_delta`
+    /// error); a layer-root refusal counts as [`DISPATCH_REFUSED_LAYER_ROOT`]
+    /// instead, so each is required on its own.
+    const DISPATCH_REFUSED: &str = "step refused by both: an engine refusal";
+    /// A step both stores refuse under the layer-root rule (SDD §9.7): the
+    /// cases [`equivalence_case`] rejects are covered here, so this note shows
+    /// the property reaches them.
+    const DISPATCH_REFUSED_LAYER_ROOT: &str =
+        "step refused by both: removes the last top-level section";
     const DISPATCH_DRIFT_FREE_STRUCTURAL: &str =
         "drift-free case: structural-mode step compared whole";
     const DISPATCH_DRIFTED_STRUCTURAL: &str = "drifted case: structural-mode step modelled";
@@ -11670,13 +12575,14 @@ mod structural_watch_equivalence {
         "committed: creation of the dangling parent over its stored list, adopting";
     const DISPATCH_DANGLING_ALONE: &str =
         "committed: creation of the dangling parent over its stored list, adopting nothing";
-    const DISPATCH_REQUIRED: [&str; 10] = [
+    const DISPATCH_REQUIRED: [&str; 11] = [
         DISPATCH_LUA_STRUCTURAL_FULL,
         DISPATCH_LUA_STRUCTURAL,
         DISPATCH_LUA_RESET,
         DISPATCH_LUA_FAST,
         DISPATCH_LUA_UNCACHEABLE,
         DISPATCH_REFUSED,
+        DISPATCH_REFUSED_LAYER_ROOT,
         DISPATCH_DRIFT_FREE_STRUCTURAL,
         DISPATCH_DRIFTED_STRUCTURAL,
         DISPATCH_DANGLING_ADOPTING,
@@ -11930,14 +12836,15 @@ mod structural_watch_equivalence {
                             ),
                         ));
                     };
-                    // The refusal is the domain's own, as `update_layer` maps
-                    // it, not merely the same on both sides: a refusal both
-                    // stores share for another reason (a broken relay or
-                    // dispatch) fails here.
+                    // The refusal is the domain's own (the engine's, or the
+                    // layer-root rule's), as `update_layer` maps it, not
+                    // merely the same on both sides: a refusal both stores
+                    // share for another reason (a broken relay or dispatch)
+                    // fails here.
                     prop_assert_eq!(
                         normalise_rejection(lua_err),
                         normalise_rejection(model_err),
-                        "{}: the stores must refuse with the error apply_delta refuses with on \
+                        "{}: the stores must refuse with the error apply_update refuses with on \
                          the step's state ({:?}); got {:?}",
                         context,
                         model_err,
@@ -11962,7 +12869,15 @@ mod structural_watch_equivalence {
                         lua_released,
                         watch_released
                     );
-                    notes.insert(DISPATCH_REFUSED);
+                    if normalise_rejection(model_err)
+                        == normalise_rejection(&ServiceError::from(
+                            DeltaError::RemovesLastTopLevelSection,
+                        ))
+                    {
+                        notes.insert(DISPATCH_REFUSED_LAYER_ROOT);
+                    } else {
+                        notes.insert(DISPATCH_REFUSED);
+                    }
                 }
                 _ => prop_assert!(
                     false,
@@ -11992,8 +12907,9 @@ mod structural_watch_equivalence {
     /// keyspace and release the same external values after every step on a
     /// drift-free index; on a drifted one every key but `obj:ext` is equal and
     /// the `lua` side's `obj:ext` and releases follow [`ext_model`]; a delta
-    /// `apply_delta` refuses is refused by both with its error class,
-    /// writing nothing. See the block comment above. Default case count (256,
+    /// [`apply_update`] refuses (an engine refusal or the layer-root rule) is
+    /// refused by both with its error class, writing nothing. See the block
+    /// comment above. Default case count (256,
     /// `PROPTEST_CASES` overrides); the notes it reached print at the end, and
     /// after at least the default case count each of [`DISPATCH_REQUIRED`],
     /// every drift shape and a committed operation id is required.
@@ -13772,7 +14688,13 @@ mod stream_mux_core {
     }
 
     impl SubSink<u64> for Sink {
-        fn offer(&mut self, id: &str, _payload: &u64, bytes: u64) -> Offer {
+        fn offer(
+            &mut self,
+            id: &str,
+            _payload: &u64,
+            bytes: u64,
+            _relay_copy: Option<std::num::NonZeroU64>,
+        ) -> Offer {
             let mut log = self.log.borrow_mut();
             if log.closed[self.sub] {
                 return Offer::Closed;
@@ -13995,6 +14917,7 @@ mod stream_mux_core {
                             id_str: format!("{ms}-0"),
                             payload: ok.then_some(ms),
                             bytes: size,
+                            relay_copy: None,
                         })
                         .collect();
                     (key.clone(), entries)
@@ -14503,7 +15426,13 @@ mod stream_mux_gaps {
     }
 
     impl SubSink<u64> for GapSink {
-        fn offer(&mut self, id: &str, payload: &u64, _bytes: u64) -> Offer {
+        fn offer(
+            &mut self,
+            id: &str,
+            payload: &u64,
+            _bytes: u64,
+            _relay_copy: Option<std::num::NonZeroU64>,
+        ) -> Offer {
             let mut log = self.log.borrow_mut();
             let s = &mut log.subs[self.sub];
             // An ended consumer is never polled again.
@@ -14757,6 +15686,7 @@ mod stream_mux_gaps {
                                 Kind::Sentinel => Some(SENTINEL),
                             },
                             bytes: 0,
+                            relay_copy: None,
                         })
                         .collect();
                     (key.clone(), entries)
@@ -14967,15 +15897,21 @@ mod stream_mux_gaps {
 //
 // * no entry → a cold start (`structural_full`, no reload);
 // * an entry, and no replayed commit made one of the store's dangling parents
-//   a live section → a repair that replays exactly the commits since the
-//   entry's cut (`structural`, no reload);
-// * otherwise → exactly one `dangling_adopted` reload. The prediction reads
-//   the store around each commit: the dangling ids before it against the
-//   sections after it, which is the repair's own rule (SR-3.2).
+//   a live section or counts a collision-rule divergence → a repair that
+//   replays exactly the commits since the entry's cut (`structural`, no
+//   reload);
+// * otherwise → exactly one reload, for the first such commit: `collision_rule`
+//   when its replay counts a divergence (checked first), else
+//   `dangling_adopted`. The adoption is predicted from the store around each
+//   commit: the dangling ids before it against the sections after it, which is
+//   the repair's own rule (SR-3.2). The divergence is read off the engine's
+//   `ApplyDeltaStats::collision_rule_divergences` for the commit applied to
+//   the cut before it; the shapes that count are pinned in `domain::delta`'s
+//   tests.
 //
 // A `lua` replica's own structural commits and resets move its entry: the
-// commit's read brings it current (and reloads `dangling_adopted` there when
-// an adoption was pending), and the commit puts the successor back at its own
+// commit's read brings it current (and reloads there when a reload was
+// pending), and the commit puts the successor back at its own
 // cut, so the replica's next sync replays none of its own commits. Such a
 // commit that makes one of the entry's dangling parents live is the replica's
 // own adoption (SR-3.2's own planned creation of an id in `dangling_parents`):
@@ -15851,6 +16787,21 @@ mod structural_cache_equivalence {
     /// delta), its relay OMPF's external-value parts, and its coverage tags.
     type Materialized = (Option<OwnedDelta>, Vec<Vec<u8>>, Vec<&'static str>);
 
+    /// Whether every commit route refuses `delta` on `state` for the layer-root
+    /// rule (SDD §9.7): it would take the layer from at least one top-level
+    /// section to none ([`apply_update`]).
+    fn removes_last_top_level_section(state: &ObjectState, delta: Option<&OwnedDelta>) -> bool {
+        let mut post = state.clone();
+        matches!(
+            apply_update(&mut post, delta.cloned()),
+            Err(DeltaError::RemovesLastTopLevelSection)
+        )
+    }
+
+    /// The top-level section a [`CommitOp::Reset`] restates when its own
+    /// commands would leave the layer none: an id the generator never draws.
+    const RESET_RESTATED_TOP: u64 = 9_000;
+
     // ── Coverage ─────────────────────────────────────────────────────────────
 
     /// Occurrences over the run, keyed by what occurred.
@@ -15895,7 +16846,7 @@ mod structural_cache_equivalence {
         RESET_WITH_ORPHAN,
         "multi-command delta",
         "C++ client create-plus-reorder",
-        "reset with no content",
+        "reset with no generated content",
         "reset with content",
         "empty commit with relay bytes",
         "empty commit with no delta",
@@ -15911,6 +16862,8 @@ mod structural_cache_equivalence {
         CACHED_ON_RESET,
         "sync: cold start",
         "sync: repair of more than one entry",
+        COLLISION_RULE_RECORD,
+        COLLISION_RULE_RELOAD,
         "variant: trim → gap",
         "variant: rematerialize → identity",
         "variant: two restores → gap, identity, then a structural edit with no reload",
@@ -15952,6 +16905,12 @@ mod structural_cache_equivalence {
     const CACHED_ON_STRUCTURAL: &str = "commit planned on a cache: path structural";
     const CACHED_ON_STRUCTURAL_FULL: &str = "commit planned on a cache: path structural_full";
     const CACHED_ON_RESET: &str = "commit planned on a cache: path reset";
+
+    /// The coverage tags of a commit whose replay counts a collision-rule
+    /// divergence ([`Run::commit`]), and of a sync whose repair reloaded
+    /// `collision_rule` at such a commit ([`Run::read`]).
+    const COLLISION_RULE_RECORD: &str = "commit counting a collision-rule divergence";
+    const COLLISION_RULE_RELOAD: &str = "sync: collision_rule reload";
 
     /// The coverage tag of a sync whose cold start or reload took the fenced
     /// read ([`Ceilings::Lowered`]).
@@ -16155,9 +17114,13 @@ mod structural_cache_equivalence {
         /// The `seq` the replica's entry stood at after its last sync; `None`
         /// when it holds none.
         entry_seq: Option<u64>,
-        /// A commit since the last sync made one of the store's dangling
-        /// parents live: the next sync reloads `dangling_adopted`.
-        adoption_pending: bool,
+        /// The reason the replica's next repair reloads with, set by the
+        /// first commit since its last sync that the repair stops at: one
+        /// whose replay counts a collision-rule divergence
+        /// (`collision_rule`, checked first), or one that made a store's
+        /// dangling parent live (`dangling_adopted`). `None` when the next
+        /// repair replays through.
+        pending_reload: Option<&'static str>,
     }
 
     struct Run<'a> {
@@ -16219,7 +17182,6 @@ mod structural_cache_equivalence {
         let checkpoints =
             || -> Arc<dyn CheckpointStore> { Arc::new(InMemoryCheckpointStore::new()) };
         LiveEditService {
-            catchup_snapshot_enabled: false,
             session_store: Arc::new(SessionStore::new(client.clone(), keys.clone())),
             recovery: Arc::new(RecoveryHook::new(
                 checkpoints(),
@@ -16358,7 +17320,7 @@ mod structural_cache_equivalence {
                     writer_id,
                     reader_id,
                     entry_seq: None,
-                    adoption_pending: false,
+                    pending_reload: None,
                 }
             };
             let [backend_a, backend_b] = sh.front.backends();
@@ -16443,8 +17405,8 @@ mod structural_cache_equivalence {
         /// The `path` a commit of `delta` by `w` lands on (SR-7.3): on a
         /// `lua` replica, `fast` for a fast delta, `reset` for a reset, and
         /// otherwise `structural_full` when the replica's read is a cold
-        /// start or a pending `dangling_adopted` reload and `structural` when
-        /// it is a repair of a held entry; `watch` for every commit on a
+        /// start or a pending reload (`collision_rule`, `dangling_adopted`)
+        /// and `structural` when it is a repair of a held entry; `watch` for every commit on a
         /// `txn` replica; none for the third writer, whose store reports to
         /// no registry.
         fn predicted_path(&self, w: Writer, delta: &Option<OwnedDelta>) -> Option<&'static str> {
@@ -16461,7 +17423,7 @@ mod structural_cache_equivalence {
                 .is_some_and(|d| d.is_diff && d.base_version == 0)
             {
                 "reset"
-            } else if rep.entry_seq.is_none() || rep.adoption_pending {
+            } else if rep.entry_seq.is_none() || rep.pending_reload.is_some() {
                 "structural_full"
             } else {
                 "structural"
@@ -16543,7 +17505,7 @@ mod structural_cache_equivalence {
         /// A `lua` replica plans a non-fast commit (a structural delta or a
         /// reset) on its own cache ([`Self::plans_on_cache`]): the commit's
         /// read brings the replica's entry current — a cold start, a repair,
-        /// or a `dangling_adopted` reload when an adoption was pending — and
+        /// or the pending reload ([`ReplicaState::pending_reload`]) — and
         /// the commit then puts the successor back at the commit's cut
         /// (`entry_seq` moves there, nothing left to replay), or, when the
         /// commit adopts one of the entry's dangling parents (an own
@@ -16552,9 +17514,12 @@ mod structural_cache_equivalence {
         /// The reloads the commit ticks are asserted here and drained (with
         /// the entries its repair replayed), so each sync observes only its
         /// own. Every other commit — a fast one, any commit on a `txn`
-        /// replica, the third writer's — plans on no cache: a commit that
-        /// makes a dangling parent live leaves an adoption pending for each
-        /// other replica holding an entry.
+        /// replica, the third writer's — plans on no cache. For each replica
+        /// holding an entry other than a writer that planned on its cache, a
+        /// commit whose replay counts a collision-rule divergence leaves a
+        /// `collision_rule` reload pending, and one that makes a dangling
+        /// parent live a `dangling_adopted` one, unless an earlier commit's
+        /// reload is pending already ([`ReplicaState::pending_reload`]).
         async fn commit(
             &mut self,
             w: Writer,
@@ -16566,10 +17531,11 @@ mod structural_cache_equivalence {
                 Writer::Replica(r) if self.plans_on_cache(r, &delta) => Some(r),
                 _ => None,
             };
-            let reload_pending = on_cache.is_some_and(|r| {
+            let reload_pending = on_cache.and_then(|r| {
                 let rep = self.rep(r);
-                rep.entry_seq.is_some() && rep.adoption_pending
+                rep.entry_seq.and(rep.pending_reload)
             });
+            let diverges = Self::counts_a_collision_rule_divergence(&self.cut.state, &delta);
             let path = self.predicted_path(w, &delta);
             let paths_before = self.sh.commits_by_path();
             self.commit_unread(w, delta, external, context).await?;
@@ -16608,29 +17574,39 @@ mod structural_cache_equivalence {
                 .iter()
                 .any(|p| next.state.sections.contains_key(p));
             let (commit_reloads, _replayed) = self.sh.observe();
-            let ticks = u64::from(reload_pending) + u64::from(on_cache.is_some() && adopted);
-            let expected_reloads: BTreeMap<String, u64> = if ticks == 0 {
-                BTreeMap::new()
-            } else {
-                BTreeMap::from([("dangling_adopted".to_owned(), ticks)])
-            };
+            let mut expected_reloads: BTreeMap<String, u64> = BTreeMap::new();
+            for reason in reload_pending
+                .into_iter()
+                .chain((on_cache.is_some() && adopted).then_some("dangling_adopted"))
+            {
+                *expected_reloads.entry(reason.to_owned()).or_default() += 1;
+            }
             prop_assert_eq!(
                 &commit_reloads,
                 &expected_reloads,
-                "{}: the reloads the commit ticked (the writer's pending adoption at its read, \
+                "{}: the reloads the commit ticked (the writer's pending reload at its read, \
                  its own adoption at its commit)",
                 context
             );
+            if diverges {
+                self.cov.borrow_mut().bump(COLLISION_RULE_RECORD);
+            }
             for r in [Replica::A, Replica::B] {
                 let rep = &mut self.replicas[r.index()];
                 if on_cache == Some(r) {
                     rep.entry_seq = (!adopted).then_some(next.seq);
-                    rep.adoption_pending = false;
+                    rep.pending_reload = None;
                     if adopted {
                         self.cov.borrow_mut().bump(own_adoption_tag(r));
                     }
-                } else {
-                    rep.adoption_pending |= adopted && rep.entry_seq.is_some();
+                } else if rep.entry_seq.is_some() && rep.pending_reload.is_none() {
+                    // The repair applies the record, then stops on its
+                    // collision-rule count before its adoption check.
+                    rep.pending_reload = if diverges {
+                        Some("collision_rule")
+                    } else {
+                        adopted.then_some("dangling_adopted")
+                    };
                 }
             }
             self.cut = next;
@@ -16687,13 +17663,37 @@ mod structural_cache_equivalence {
             Ok(())
         }
 
+        /// Whether a replay of `delta` on `state`, the cut it commits on,
+        /// counts a collision-rule divergence
+        /// (`ApplyDeltaStats::collision_rule_divergences`): a record the
+        /// repair ends at with a `collision_rule` reload. Read off the engine,
+        /// whose count `domain::delta`'s tests pin shape by shape; here it
+        /// only predicts the route.
+        fn counts_a_collision_rule_divergence(
+            state: &ObjectState,
+            delta: &Option<OwnedDelta>,
+        ) -> bool {
+            let Some(delta) = delta else {
+                return false;
+            };
+            let mut replayed = state.clone();
+            let mut stats = live_edit::domain::delta::ApplyDeltaStats::default();
+            live_edit::domain::delta::apply_delta_with_stats(
+                &mut replayed,
+                Some(delta.clone()),
+                &mut stats,
+            )
+            .is_ok()
+                && stats.collision_rule_divergences != 0
+        }
+
         /// The route a sync of `r` takes with no anomaly injected (block doc).
         fn plain(&self, r: Replica) -> Expect {
             let rep = self.rep(r);
-            match rep.entry_seq {
-                None => Expect::Cold,
-                Some(_) if rep.adoption_pending => Expect::Reload("dangling_adopted"),
-                Some(_) => Expect::Repair,
+            match (rep.entry_seq, rep.pending_reload) {
+                (None, _) => Expect::Cold,
+                (Some(_), Some(reason)) => Expect::Reload(reason),
+                (Some(_), None) => Expect::Repair,
             }
         }
 
@@ -16729,6 +17729,9 @@ mod structural_cache_equivalence {
                 "{}: the reloads ticked",
                 context
             );
+            if expect == Expect::Reload("collision_rule") {
+                self.cov.borrow_mut().bump(COLLISION_RULE_RELOAD);
+            }
 
             if expect == Expect::NotFound {
                 match &answer {
@@ -16816,7 +17819,7 @@ mod structural_cache_equivalence {
             self.assert_is_cut(ready.entry.entry(), &context)?;
             let rep = self.rep_mut(r);
             rep.entry_seq = Some(ready.entry.entry().seq);
-            rep.adoption_pending = false;
+            rep.pending_reload = None;
             Ok((Some(ready), replayed))
         }
 
@@ -16970,15 +17973,29 @@ mod structural_cache_equivalence {
                     Some((Some(delta), vec![], tags))
                 }
                 CommitOp::Reset(specs) => {
-                    let (delta, mut tags) = structural_delta(pre, specs, true, &mut cov)?;
+                    let (mut delta, mut tags) = structural_delta(pre, specs, true, &mut cov)?;
                     if !orphan_pairs(pre).is_empty() {
                         tags.push(RESET_WITH_ORPHAN);
                     }
                     tags.push(if delta.struct_commands.is_empty() {
-                        "reset with no content"
+                        "reset with no generated content"
                     } else {
                         "reset with content"
                     });
+                    // A reset leaving the layer no top-level section is refused
+                    // (SDD §9.7), so one whose commands leave none restates a
+                    // fresh top-level section after them.
+                    if removes_last_top_level_section(pre, Some(&delta)) {
+                        delta.struct_commands.push(StructCommand::DiffChangeSection(
+                            CommandDiffChangeSection {
+                                parent_id: 0,
+                                section_id: RESET_RESTATED_TOP,
+                                section_name: "restated".to_owned(),
+                                section_type: 7,
+                                section_order: 0,
+                            },
+                        ));
+                    }
                     Some((Some(delta), vec![], tags))
                 }
                 CommitOp::LiveMove {
@@ -17238,6 +18255,17 @@ mod structural_cache_equivalence {
                         .bump("generator: op resolved to nothing");
                     continue;
                 };
+                // Every commit route refuses a delta that would take the layer
+                // from at least one top-level section to none (the layer-root
+                // rule, SDD §9.7), so the generator skips one, as it skips an
+                // op that resolves to nothing: this property is about the
+                // commits that land.
+                if removes_last_top_level_section(&self.cut.state, delta.as_ref()) {
+                    self.cov
+                        .borrow_mut()
+                        .bump("generator: op refused by the layer-root rule");
+                    continue;
+                }
                 let context = format!("step {step} commit {i} by {by:?}: {delta:?}");
                 self.commit(Writer::Replica(*by), delta, &parts, &context)
                     .await?;
@@ -17638,7 +18666,7 @@ mod structural_cache_equivalence {
                 self.rep(r).ls.structural_cache().invalidate(self.oid);
                 let rep = self.rep_mut(r);
                 rep.entry_seq = None;
-                rep.adoption_pending = false;
+                rep.pending_reload = None;
             }
             self.cut = self.read_cut().await?;
             prop_assert!(
@@ -20649,7 +21677,6 @@ mod chained_writes {
         let checkpoints =
             || -> Arc<dyn CheckpointStore> { Arc::new(InMemoryCheckpointStore::new()) };
         LiveEditService {
-            catchup_snapshot_enabled: false,
             session_store: Arc::new(SessionStore::new(client.clone(), keys.clone())),
             recovery: Arc::new(RecoveryHook::new(
                 checkpoints(),
@@ -25290,6 +26317,259 @@ mod structural_cache_resident_bound {
                 "the generator reaches {arm:?} in {count} of {SAMPLES} cases, under its floor of \
                  {floor}: {reached:?}"
             );
+        }
+    }
+}
+
+// ── b.r7q: the cursor pager over a sorted index (`storage::retirement`) ─────
+//
+// The periodic reference-count reconcile pass walks its owed sets (`pending`
+// by `SSCAN`, `inflight` by `ZSCAN`) through one pager (`page_by_cursor`,
+// driven here by `ZSCAN` steps through
+// `test_support::zscan_members_by_cursor_for_test`). Its guarantee is SCAN's:
+// a full walk returns every member present from its start to its end at
+// least once, whatever is added, removed or re-scored between two steps. The index is kept past the compact encoding (more than
+// 128 members, asserted `skiplist`), where a step iterates the member table
+// and a rank or score cursor is what a re-score or a removal moves.
+//
+// Between every two steps the case removes members the walk already returned
+// and members it has not, adds new members, and re-scores present members up
+// and down. The property: every member present throughout (an initial member
+// never removed) is among those the walk returned. The same property over a
+// rank pager (`ZRANGE i i+n-1`) fails: a removal of a returned member shifts
+// the later ranks down and the next page starts past one of them (proven by
+// an in-place perturbation of the test-support walk to rank pages). The DR
+// Jobs still read value indices by rank pages because no other writer runs
+// on the held store, and the value removal pages descending ranks so its own
+// deletes never shift a rank still to be read (SDD §11.3.2 *The DR Jobs'
+// completeness proofs*).
+mod cursor_pager {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::rc::Rc;
+
+    use fred::interfaces::{KeysInterface, SortedSetsInterface};
+    use live_edit::storage::test_support::{
+        object_encoding_for_test, zscan_members_by_cursor_for_test, TestValkey,
+    };
+    use proptest::test_runner::TestRunner;
+
+    /// One change between two steps, resolved against the set as it stands
+    /// when the step ends (an index selects among the eligible members).
+    #[derive(Clone, Debug)]
+    enum Move {
+        /// `ZREM` a member the walk has already returned.
+        RemoveReturned(u16),
+        /// `ZREM` a present member the walk has not returned yet.
+        RemoveUnreturned(u16),
+        /// `ZADD` a member never in the set before, at this score.
+        AddNew(i32),
+        /// `ZADD` a present member at its score plus this (nonzero) delta.
+        Rescore(u16, i32),
+    }
+
+    fn arb_move() -> impl Strategy<Value = Move> {
+        prop_oneof![
+            any::<u16>().prop_map(Move::RemoveReturned),
+            any::<u16>().prop_map(Move::RemoveUnreturned),
+            (-1_000i32..1_000).prop_map(Move::AddNew),
+            (any::<u16>(), prop_oneof![-5_000i32..=-1, 1i32..=5_000])
+                .prop_map(|(i, d)| Move::Rescore(i, d)),
+        ]
+    }
+
+    /// A case: the initial members (past the compact encoding's 128), the
+    /// `COUNT` hint, and the moves after each step (a step past the list
+    /// moves nothing).
+    fn arb_case() -> impl Strategy<Value = (usize, u64, Vec<Vec<Move>>)> {
+        (
+            129usize..=260,
+            1u64..=24,
+            prop::collection::vec(prop::collection::vec(arb_move(), 0..6), 0..48),
+        )
+    }
+
+    /// The test's model of the set while the walk runs.
+    #[derive(Default)]
+    struct Model {
+        present: BTreeMap<String, f64>,
+        returned: BTreeSet<String>,
+        ever_removed: BTreeSet<String>,
+        added: u64,
+        steps: usize,
+    }
+
+    impl Model {
+        /// `moves` resolved against the model, applied to it, and returned as
+        /// the commands that apply them to the store: `(member, Some(score))`
+        /// for a `ZADD`, `(member, None)` for a `ZREM`.
+        fn resolve(&mut self, moves: &[Move]) -> Vec<(String, Option<f64>)> {
+            let mut commands = Vec::new();
+            for m in moves {
+                let pick = |set: Vec<String>, i: u16| -> Option<String> {
+                    (!set.is_empty()).then(|| set[usize::from(i) % set.len()].clone())
+                };
+                match m {
+                    Move::RemoveReturned(i) | Move::RemoveUnreturned(i) => {
+                        let returned = matches!(m, Move::RemoveReturned(_));
+                        let eligible: Vec<String> = self
+                            .present
+                            .keys()
+                            .filter(|k| self.returned.contains(*k) == returned)
+                            .cloned()
+                            .collect();
+                        if let Some(member) = pick(eligible, *i) {
+                            self.present.remove(&member);
+                            self.ever_removed.insert(member.clone());
+                            commands.push((member, None));
+                        }
+                    }
+                    Move::AddNew(score) => {
+                        let member = format!("new{:05}", self.added);
+                        self.added += 1;
+                        let score = f64::from(*score);
+                        self.present.insert(member.clone(), score);
+                        commands.push((member, Some(score)));
+                    }
+                    Move::Rescore(i, delta) => {
+                        let eligible: Vec<String> = self.present.keys().cloned().collect();
+                        if let Some(member) = pick(eligible, *i) {
+                            let score = self.present[&member] + f64::from(*delta);
+                            self.present.insert(member.clone(), score);
+                            commands.push((member, Some(score)));
+                        }
+                    }
+                }
+            }
+            commands
+        }
+    }
+
+    async fn pager_case(
+        tv: &TestValkey,
+        case: usize,
+        initial: usize,
+        count: u64,
+        moves: &[Vec<Move>],
+    ) -> Result<(), TestCaseError> {
+        let key = format!("{}pager-prop:{case}", tv.prefix());
+        let members: Vec<(f64, String)> = (0..initial)
+            .map(|i| (i as f64, format!("m{i:05}")))
+            .collect();
+        let _: i64 = tv
+            .client()
+            .pool
+            .zadd(&key, None, None, false, false, members.clone())
+            .await
+            .expect("seeding the index must succeed");
+        prop_assert_eq!(
+            object_encoding_for_test(tv.client(), &key).await,
+            "skiplist",
+            "fixture: the index is past the compact encoding"
+        );
+
+        let model = Rc::new(RefCell::new(Model {
+            present: members.iter().map(|(s, m)| (m.clone(), *s)).collect(),
+            ..Model::default()
+        }));
+        let walked = {
+            let model = Rc::clone(&model);
+            let client = tv.client().clone();
+            let index = key.clone();
+            zscan_members_by_cursor_for_test(tv.client(), &key, count, move |step| {
+                let commands = {
+                    let mut model = model.borrow_mut();
+                    model.returned.extend(step);
+                    let at = model.steps;
+                    model.steps += 1;
+                    model.resolve(moves.get(at).map_or(&[][..], Vec::as_slice))
+                };
+                let (client, key) = (client.clone(), index.clone());
+                async move {
+                    for (member, score) in commands {
+                        match score {
+                            Some(score) => {
+                                let _: i64 = client
+                                    .pool
+                                    .zadd(&key, None, None, false, false, (score, member.as_str()))
+                                    .await
+                                    .expect("ZADD between steps must succeed");
+                            }
+                            None => {
+                                let _: i64 = client
+                                    .pool
+                                    .zrem(&key, member.as_str())
+                                    .await
+                                    .expect("ZREM between steps must succeed");
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the walk must succeed")
+        };
+        let _: i64 = tv.client().pool.del(&key).await.expect("DEL the index");
+
+        let walked: BTreeSet<String> = walked.into_iter().collect();
+        let model = model.borrow();
+        let missed: Vec<&String> = members
+            .iter()
+            .map(|(_, m)| m)
+            .filter(|m| !model.ever_removed.contains(*m) && !walked.contains(*m))
+            .collect();
+        prop_assert!(
+            missed.is_empty(),
+            "a member present throughout was never returned: {:?} (COUNT {}, {} initial \
+             members, {} steps)",
+            missed,
+            count,
+            initial,
+            model.steps
+        );
+        Ok(())
+    }
+
+    /// **b.r7q (pager).** A full cursor walk of a table-encoded sorted index
+    /// returns every member present throughout, whatever is removed (returned
+    /// or not), added or re-scored up and down between its steps. Default
+    /// case count (256, `PROPTEST_CASES` overrides). Fails over a rank pager
+    /// (module comment).
+    #[test]
+    fn proptest_cursor_pager_returns_every_member_present_throughout_a_walk() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime build must succeed");
+        let tv = rt.block_on(TestValkey::setup());
+
+        let mut runner = TestRunner::new(proptest_config(256));
+        let case = std::cell::Cell::new(0usize);
+        let result = runner.run(&arb_case(), |(initial, count, moves)| {
+            case.set(case.get() + 1);
+            rt.block_on(pager_case(&tv, case.get(), initial, count, &moves))
+        });
+
+        rt.block_on(async {
+            use futures::StreamExt;
+            let node = tv.client().pool.next();
+            let keys: Vec<fred::types::Key> = node
+                .scan_buffered(
+                    format!("{}*", tv.prefix()),
+                    Some(500),
+                    None::<fred::types::scan::ScanType>,
+                )
+                .filter_map(|k| async move { k.ok() })
+                .collect()
+                .await;
+            for chunk in keys.chunks(500) {
+                let _: Result<i64, _> = tv.client().pool.unlink(chunk.to_vec()).await;
+            }
+        });
+
+        if let Err(e) = result {
+            panic!("{e}\n{runner}");
         }
     }
 }

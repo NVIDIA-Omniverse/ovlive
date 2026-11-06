@@ -86,13 +86,19 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(failures)
         self.assertTrue(all(driver.error is None for driver in self.drivers))
 
-    async def prepare(self, address=None, host=False, target=False, diagnostics=False):
+    def reads(self):
+        """The service's read records without their writer, the client's writer ID, which every read carries."""
+        self.assertTrue(all(read['writer'] for read in self.state.reads), self.state.reads)
+        return [{key: value for key, value in read.items() if key != 'writer'} for read in self.state.reads]
+
+    async def prepare(self, address=None, host=False, target=False, diagnostics=False, environment=None):
         attempts = dict(self.state.attempts)
         process = await asyncio.create_subprocess_exec(
             os.environ['LIVE_TEST_SCENE_DRIVER'], '--create-target' if target else ('--create-host' if host else '--create'),
             address or self.address,
             self.session, self.layer, str(self.seed_path), *(['--diagnostics'] if diagnostics else []), stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=None if environment is None else dict(os.environ, **environment))
         driver = Driver(process, self.artifact / (self.id().split('.')[-1] + '.creation-native.log'))
         self.drivers.append(driver)
         prepared = await driver.receive()
@@ -350,7 +356,7 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attached['authoritative'], self.expected)
         self.assertEqual(attached['visible'], self.expected)
         self.retained(attached, ready['request'])
-        self.assertEqual(self.state.reads, [dict(backend='A', attempt=1, object=ready['object'], cursor=0)])
+        self.assertEqual(self.reads(), [dict(backend='A', attempt=1, object=ready['object'], cursor=0)])
         self.assertEqual((await driver.command('attach'))['result'], 0)
         self.assertEqual(self.state.attempts.get('SubscribeReadLayer'), 1)
         await self.observed_status(driver, 2, 0)
@@ -359,6 +365,29 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(closed_creation['closing'])
         self.assertEqual((closed_creation['status_state'], closed_creation['status_result']), (2, 0))
         self.retained(closed_creation, ready['request'])
+        self.committed_once(ready['object'])
+        await self.quit(driver)
+
+    async def test_creation_and_its_read_ride_on_the_layers_stream_unit(self):
+        # A budget of 3 has a stream share of one unit, which the creation reserves, so the share is full. Its
+        # CreateLayer and then the attached layer's read open on that unit; the CreateLayer takes no call unit.
+        driver, _ = await self.prepare(environment={'LIVE_TEST_MAX_CALLS_PER_ENDPOINT': '3'})
+        fault = self.state.plan('CreateLayer', 'before', pause=True)
+        started = await driver.command('start')
+        self.assertEqual(started['result'], 0, started)
+        await asyncio.wait_for(fault.reached.wait(), 3)
+        creating = await driver.command('wait 0')
+        self.assertEqual(creating['calls'], dict(open=1, streams=1, calls=0), creating)
+        fault.release.set()
+        ready = await driver.command('wait 5000')
+        self.assertEqual((ready['result'], ready['phase']), (0, 'confirmed'), ready)
+        attached = await driver.command('attach')
+        self.assertEqual((attached['result'], attached['attach_result']), (0, 0), attached)
+        # The read is the one stream call open; a capability Ping may hold a call unit beside it.
+        self.assertEqual(attached['calls']['streams'], 1)
+        self.assertEqual(attached['calls']['open'] - attached['calls']['calls'], 1, attached['calls'])
+        self.assertEqual(attached['authoritative'], self.expected)
+        self.assertEqual(self.state.attempts.get('SubscribeReadLayer'), 1)
         self.committed_once(ready['object'])
         await self.quit(driver)
 
@@ -785,7 +814,7 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         await self.observed_status(driver, 9, 13)
         await self.quit(driver)
         self.committed_once(receipt['object'])
-        self.assertEqual(self.state.reads, [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
+        self.assertEqual(self.reads(), [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
 
     async def test_creation_wait_timeout_does_not_cancel_or_replace_receipt(self):
         driver, _ = await self.prepare()
@@ -841,7 +870,7 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.attempts.get('CreateLayer'), 1)
 
     async def test_creation_replacement_before_attach_keeps_confirmed_object(self):
-        driver, _ = await self.prepare()
+        driver, _ = await self.prepare(diagnostics=True)
         ready = await self.confirmed(driver)
         replacement = encode(Delta(commands=(C(1, 77, 1, 'Replacement', 6),), fields=(F(77, 'counter', 999),)))
         frames = [pb.CreateLayerRequest(header=pb.CreateLayerHeader(session_id=self.session, layer_name=self.layer)),
@@ -853,7 +882,14 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((failed['phase'], failed['create_result'], failed['object']), ('confirmed', 0, ready['object']))
         self.assertEqual(failed['applied'], 0)
         self.retained(failed, ready['request'])
-        self.assertEqual(self.state.reads, [dict(backend='A', attempt=1, object=ready['object'], cursor=0)])
+        # The layer's result changes to OBJECT_REPLACED once, at ERROR, with
+        # the incident of its FAILED status.
+        diagnostics = (await driver.command('diagnostics'))['diagnostics']
+        replaced = [r for r in diagnostics['recent_records'] if r['event_name'] == 'object_replaced']
+        self.assertEqual([(r['event_code'], r['severity'], r['subject_id']) for r in replaced], [(11, 4, self.subject)])
+        self.assertGreater(replaced[0]['incident_id'], 0)
+        self.assertEqual((replaced[0]['fields']['result'], replaced[0]['fields']['state']), (16, 7))
+        self.assertEqual(self.reads(), [dict(backend='A', attempt=1, object=ready['object'], cursor=0)])
         self.assertEqual(self.state.attempts.get('CreateLayer'), 2)
         self.assertEqual([entry.payload for entry in self.commits()], [self.seed, replacement])
         await self.quit(driver)
@@ -950,7 +986,7 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         await self.host_staged(driver, receipt)
         self.assertEqual(self.state.attempts.get('SubscribeReadLayer'), 1)
         await self.host_activated(driver, receipt)
-        self.assertEqual(self.state.reads, [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
+        self.assertEqual(self.reads(), [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
         closed_creation = await driver.command('close 5000')
         self.assertEqual(closed_creation['result'], 0, closed_creation)
         self.assertEqual((closed_creation['status_state'], closed_creation['status_result']), (2, 0))
@@ -1032,7 +1068,7 @@ class SceneCreationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed['host'], [])
         self.assertEqual(failed['applied'], 0)
         self.retained(failed, receipt['request'])
-        self.assertEqual(self.state.reads, [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
+        self.assertEqual(self.reads(), [dict(backend='A', attempt=1, object=receipt['object'], cursor=0)])
         self.assertEqual([entry.payload for entry in self.commits()], [self.seed, replacement])
         self.assertEqual(self.state.attempts.get('CreateLayer'), 2)
         current = await driver.command('report')

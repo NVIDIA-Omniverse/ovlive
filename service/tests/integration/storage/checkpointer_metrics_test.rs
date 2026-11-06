@@ -245,6 +245,10 @@ impl CheckpointStore for ErroringCheckpointStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.inner.delete_ext_blob(hash_hex).await
     }
@@ -1032,6 +1036,9 @@ async fn case_c_label_cardinality_is_bounded() {
     // adjudication (`t2.dfh.be.s8`): the checkpoint-store-damage arms split out
     // of `refused_no_base`. Restated here by the deliberate human edit this
     // literal exists to force — the whole point of not importing the const.
+    //
+    // `refused_cleanup_in_flight` is the ELEVENTH, added by b.g65: the pre-PUT
+    // backup clean-up fence refused the tail, which waits for a later tick.
     let tail_outcomes = [
         "captured",
         "captured_capped",
@@ -1043,6 +1050,7 @@ async fn case_c_label_cardinality_is_bounded() {
         "refused_no_base",
         "refused_chain_full",
         "refused_lineage_unrootable",
+        "refused_cleanup_in_flight",
     ];
     let tail_cells = gather_tail_outcome_cells(&metrics);
     let observed_outcomes: HashSet<String> = tail_cells.keys().cloned().collect();
@@ -1053,7 +1061,7 @@ async fn case_c_label_cardinality_is_bounded() {
         "pre-init outcome set on live_edit_checkpoint_tail_total must be exactly \
          {{captured, captured_capped, rebased, refused_trimmed, refused_missing_bytes, \
          refused_sentinel, refused_seq_gap, refused_no_base, refused_chain_full, \
-         refused_lineage_unrootable}}; got {observed_outcomes:?}"
+         refused_lineage_unrootable, refused_cleanup_in_flight}}; got {observed_outcomes:?}"
     );
     for outcome in tail_outcomes {
         let value = tail_cells

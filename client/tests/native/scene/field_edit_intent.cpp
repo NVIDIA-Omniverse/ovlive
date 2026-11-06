@@ -16,6 +16,7 @@
 #include <pxr/usd/sdf/primSpec.h>
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
 #include <random>
 #include <set>
@@ -118,17 +119,16 @@ void ordinary(const Envelope& envelope) {
 }
 void orderedFields() {
     Fixture f;
-    for (int value : {1,0,0}) f.both([&](auto& data) { data.Set(SdfPath("/P.a"),SdfFieldKeys->Default,VtValue(value)); });
+    for (int value : {1,0,2}) f.both([&](auto& data) { data.Set(SdfPath("/P.a"),SdfFieldKeys->Default,VtValue(value)); });
     f.both([](auto& data) { data.Set(SdfPath("/P.b"),SdfFieldKeys->Default,VtValue(-7)); });
     const auto intent = f.compile(); const auto envelope = decodeEnvelope(intent->bytes()); ordinary(envelope);
-    // /P.a's writes collapse to one record of its last value, which equals
-    // the base's and is still emitted.
+    // /P.a's writes collapse to one record of its last value.
     checkIntent(envelope.fields.size() == 2 && envelope.samples.empty(),"repeated field writes did not collapse");
     for (size_t i = 0; i < 2; ++i) {
         const auto& field = envelope.fields[i];
         checkIntent(field.section == (i == 1 ? 203 : 91) && field.name == "default" && field.setOrder == i+3,
                     "field IDs/order differ from the last write of each field");
-        const int expected = i == 0 ? 0 : -7;
+        const int expected = i == 0 ? 2 : -7;
         const auto raw = field.value.bytes();
         checkIntent(raw.size() == 6 && uint8_t(raw[0]) == 3 && raw[1] == 0,"int32 type bytes differ");
         for (unsigned byte = 0; byte < 4; ++byte)
@@ -157,7 +157,9 @@ void interleavedSamples() {
                 original[3].kind == SdfOperationKind::SetSample && original[3].time == 3 && original[3].value == VtValue(33),
                 "suppressed samples were erased or rewritten in retained original log");
     checkIntent(envelope.fields.empty(),"time samples emitted as ordinary fields");
-    checkIntent(envelope.samples.size() == 8,"expanded sample records differ");
+    // The erasure of the base's key 0, /P.a's keys 5 and 6 and /P.b's key 9; keys 1 to 4, which the base lacks
+    // and the log erases again, emit nothing.
+    checkIntent(envelope.samples.size() == 4,"expanded sample records differ");
     const auto values = decodeValues(envelope);
     checkIntent(values.samples.back() == VtValue(SdfValueBlock{}),"sample block collapsed into deletion");
 }
@@ -192,8 +194,9 @@ void emptyMapsAndErasure() {
             continue;
         }
         const auto intent = f.compile(); const auto envelope = decodeEnvelope(intent->bytes());
-        checkIntent(envelope.fields.empty() && envelope.samples.size() == 3 &&
-                    envelope.samples.back().time == 999 && envelope.samples.back().value.empty(),"erased map normalization differs");
+        // Only the base's key 0 is erased; keys 1 and 999, which the base lacks, emit nothing.
+        checkIntent(envelope.fields.empty() && envelope.samples.size() == 1 &&
+                    envelope.samples.back().time == 0 && envelope.samples.back().value.empty(),"erased map normalization differs");
         const auto actual = buildSceneCandidate(f.base,intent->bytes());
         checkIntent(!actual->data()->Has(SdfPath("/P.a"),SdfFieldKeys->TimeSamples),"map erasure changed presence");
     }
@@ -255,11 +258,13 @@ void emptyDictionaryKeySemantics() {
                     "compiled empty-key semantics differ from stock or changed retained base");
         const auto envelope = decodeEnvelope(intent->bytes()); const auto values = decodeValues(envelope);
         // The set and the erase are whole-field replacements of one field,
-        // which collapse to the erase's.
-        const VtValue afterErase = mode == 2 ? VtValue(keep) : VtValue();
-        checkIntent(values.fields == std::vector<VtValue>{afterErase} && envelope.fields.size() == 1 &&
-                    envelope.fields[0].section == 17 && envelope.fields[0].setOrder == 2,
-                    "empty-key operations did not compile to the field's last whole-field value");
+        // which collapse to the erase's. Only mode 1 ends on a value other
+        // than the base's; the others change nothing and emit no record.
+        if (mode == 1)
+            checkIntent(values.fields == std::vector<VtValue>{VtValue()} && envelope.fields.size() == 1 &&
+                        envelope.fields[0].section == 17 && envelope.fields[0].setOrder == 2,
+                        "empty-key operations did not compile to the field's last whole-field value");
+        else checkIntent(envelope.fields.empty() && intent->empty(),"empty-key operations that restore the base emitted a record");
         checkIntent(intent->operations() == original->operations && original->operations->size() == 2 &&
                     original->operations->at(0).kind == SdfOperationKind::SetDictKey &&
                     original->operations->at(1).kind == SdfOperationKind::EraseDictKey &&
@@ -625,7 +630,8 @@ void rewrittenFieldsKeepTheirReads() {
     f.both([&](auto& data) { data.Set(attribute,SdfFieldKeys->Default,VtValue(3)); });
     const auto envelope = decodeEnvelope(f.compile()->bytes());
     ordinary(envelope);
-    checkIntent(envelope.fields.size() == 3,"rewritten fields did not collapse to one record each");
+    // Documentation, written and then erased where the base has none, changes nothing and emits no record.
+    checkIntent(envelope.fields.size() == 2,"rewritten fields did not collapse to one record each");
 }
 // One field written many times emits one record carrying its last value, and
 // the operation and entry limits count emitted records, not buffered writes.
@@ -733,6 +739,74 @@ void repeatedWholeSampleMapsCollapse() {
     try { (void)compileFieldEdits(f.base,extended,limits); }
     catch (const DecodeError& error) { limited = error.kind == ErrorKind::ResourceLimit; }
     checkIntent(limited,"a whole-map write adding a sample key did not count as another operation");
+}
+// A record whose final value is the base's is not emitted: a log that edits
+// fields and samples and then restores them compiles to nothing, and a
+// whole-map rewrite emits only the keys it changes or removes.
+void unchangedValuesCompileToNothing() {
+    {
+        Fixture f;
+        VtDictionary edited; edited["base"] = VtValue(2);
+        VtDictionary original; original["base"] = VtValue(1);
+        f.both([&](auto& data) {
+            data.Set(SdfPath("/P.a"),SdfFieldKeys->Default,VtValue(5));
+            data.SetTimeSample(SdfPath("/P.a"),1,VtValue(11));
+            data.EraseTimeSample(SdfPath("/P.a"),0);
+            data.SetTimeSample(SdfPath("/P.b"),0,VtValue(21));
+            data.Set(SdfPath("/P"),SdfFieldKeys->CustomData,VtValue(edited));
+        });
+        f.both([&](auto& data) {
+            data.Set(SdfPath("/P.a"),SdfFieldKeys->Default,VtValue(0));
+            data.Set(SdfPath("/P.a"),SdfDataTokens->TimeSamples,VtValue(SdfTimeSampleMap{{0,VtValue(10)}}));
+            data.SetTimeSample(SdfPath("/P.b"),0,VtValue(20));
+            data.Set(SdfPath("/P"),SdfFieldKeys->CustomData,VtValue(original));
+        });
+        const auto intent = compileFieldEdits(f.base,recordedLog(*f.backing));
+        const auto envelope = decodeEnvelope(intent->bytes());
+        checkIntent(intent->empty() && envelope.fields.empty() && envelope.samples.empty() && envelope.commands.empty(),
+                    "a log that restores every value it edited emitted records");
+        checkIntent(inspect(*buildSceneCandidate(f.base,intent->bytes())->data()) == inspect(*f.oracle),
+                    "the restoring log's candidate differs from stock USD");
+    }
+    {
+        Fixture f;
+        f.both([](auto& data) {
+            data.Set(SdfPath("/P.a"),SdfDataTokens->TimeSamples,VtValue(SdfTimeSampleMap{{0,VtValue(10)},{1,VtValue(11)}}));
+            data.Set(SdfPath("/P.b"),SdfDataTokens->TimeSamples,VtValue(SdfTimeSampleMap{{0,VtValue(21)}}));
+            data.Set(SdfPath("/P.b"),SdfFieldKeys->Default,VtValue(0));
+        });
+        const auto intent = compileFieldEdits(f.base,recordedLog(*f.backing));
+        const auto envelope = decodeEnvelope(intent->bytes());
+        checkIntent(envelope.fields.empty() && envelope.samples.size() == 2 &&
+                    envelope.samples[0].section == 91 && envelope.samples[0].time == 1 &&
+                    envelope.samples[1].section == 203 && envelope.samples[1].time == 0,
+                    "a whole-map rewrite emitted a key it did not change, or an unchanged field");
+        checkIntent(inspect(*buildSceneCandidate(f.base,intent->bytes())->data()) == inspect(*f.oracle),
+                    "the whole-map rewrite's candidate differs from stock USD");
+    }
+    // The base's key is +0. A set at -0 keeps the key's bits, so the same value changes nothing; an erase at -0
+    // removes the +0 key; an erase and a set at -0 author the key's bits and change it.
+    const auto signedZero = [](auto author, size_t records, const char* message) {
+        Fixture f;
+        f.both(author);
+        const auto intent = compileFieldEdits(f.base,recordedLog(*f.backing));
+        const auto candidate = buildSceneCandidate(f.base,intent->bytes());
+        checkIntent(decodeEnvelope(intent->bytes()).samples.size() == records && inspect(*candidate->data()) == inspect(*f.oracle),
+                    message);
+        const auto map = candidate->data()->Get(SdfPath("/P.a"),SdfDataTokens->TimeSamples);
+        const auto expected = f.oracle->Get(SdfPath("/P.a"),SdfDataTokens->TimeSamples);
+        checkIntent(map.IsEmpty() == expected.IsEmpty() &&
+                    (map.IsEmpty() || std::signbit(map.UncheckedGet<SdfTimeSampleMap>().begin()->first) ==
+                                          std::signbit(expected.UncheckedGet<SdfTimeSampleMap>().begin()->first)),
+                    message);
+    };
+    signedZero([](auto& data) { data.SetTimeSample(SdfPath("/P.a"),-0.0,VtValue(10)); },0,
+               "a set at -0 of the +0 key's value emitted a record");
+    signedZero([](auto& data) { data.EraseTimeSample(SdfPath("/P.a"),-0.0); },1,"an erase at -0 kept the +0 key");
+    signedZero([](auto& data) {
+        data.EraseTimeSample(SdfPath("/P.a"),0.0);
+        data.SetTimeSample(SdfPath("/P.a"),-0.0,VtValue(10));
+    },2,"an erase and a set at -0 did not author the key's bits");
 }
 // Writes to one field collapse across moves of the identity they address.
 // Writes to an erased identity are dropped, and writes to the identity
@@ -879,6 +953,40 @@ void capturedFreshIdentityRemoval() {
     checkIntent(dropped.commands.size() == 1 && dropped.commands[0].kind == Command::Kind::Delete &&
                 dropped.commands[0].section == 203 && dropped.fields.empty() && dropped.samples.empty(),
                 "captured records addressing a removed identity were emitted");
+}
+// SdfCreatePrimInLayer creates each missing ancestor as an `over` with no
+// other field: an implicit container. A defined, typed or otherwise authored
+// prim is not one, and neither is a prim the base already holds.
+void implicitContainersAreMarked() {
+    const auto base = initialScene();
+    const auto compile = [&](const std::function<void(const SdfLayerRefPtr&)>& author) {
+        auto backing = recordingBacking(base);
+        const SdfFileFormatRefPtr format = TfCreateRefPtr(new IntentLayerFormat(backing));
+        auto layer = SdfLayer::CreateAnonymous("containers.intenttest",format);
+        author(layer);
+        const auto intent = compileFieldEdits(base,recordedLog(*backing),{},sequentialIds());
+        const auto candidate = buildSceneCandidate(base,intent->bytes());
+        std::set<SdfPath> paths;
+        for (const auto id : intent->implicitContainers()) paths.insert(candidate->pathForSection(id));
+        return paths;
+    };
+    checkIntent(compile([](const SdfLayerRefPtr& layer) {
+        const auto rack = SdfCreatePrimInLayer(layer,SdfPath("/World/Racks/Rack"));
+        rack->SetSpecifier(SdfSpecifierDef);
+        rack->SetTypeName("Cube");
+    }) == std::set<SdfPath>{SdfPath("/World"),SdfPath("/World/Racks")},"ancestors of a defined prim are not marked");
+    // An override's prim carries only its specifier, with a property child.
+    checkIntent(compile([](const SdfLayerRefPtr& layer) {
+        const auto rack = SdfCreatePrimInLayer(layer,SdfPath("/World/Rack"));
+        SdfAttributeSpec::New(rack,"marker",SdfValueTypeNames->Int)->SetDefaultValue(VtValue(1));
+    }) == std::set<SdfPath>{SdfPath("/World"),SdfPath("/World/Rack")},"an override's prims are not marked");
+    checkIntent(compile([](const SdfLayerRefPtr& layer) {
+        SdfCreatePrimInLayer(layer,SdfPath("/World/Rack"))->SetSpecifier(SdfSpecifierDef);
+        layer->GetPrimAtPath(SdfPath("/World"))->SetTypeName("Xform");
+    }).empty(),"an authored prim was marked");
+    checkIntent(compile([](const SdfLayerRefPtr& layer) {
+        SdfCreatePrimInLayer(layer,SdfPath("/P/Inner"))->SetSpecifier(SdfSpecifierDef);
+    }).empty(),"a prim the base holds, or a defined one, was marked");
 }
 // Captured logs drop records inside a subtree they delete, but move-cycle
 // scratch Creates and child-membership overrides stay unsupported.
@@ -1182,6 +1290,43 @@ void structuralAllocatorAndLimits() {
                 std::find(burned.begin(),burned.end(),second)==burned.end(),"independent preparations reused new or burned section identity");
 }
 
+// A long session's history: 400,000 IDs, each allocation first drawing an ID
+// the history already holds, sorted or staged, and every tenth also observing
+// one again. No ID is issued twice, the history holds each ID once, and its
+// storage stays within the bound the allocator states.
+void allocatorHistoryBound() {
+    constexpr size_t count = 400000;
+    using Allocator = SectionIdAllocator;
+    std::mt19937_64 random(360);
+    std::vector<uint64_t> issued;
+    uint64_t next = 1000;
+    bool repeat = false;
+    const auto ids = std::make_shared<Allocator>(count, 4, [&] {
+        repeat = !repeat;
+        if (repeat && !issued.empty()) return issued[random() % issued.size()];
+        return uint64_t(next++ * 0x9E3779B97F4A7C15ull);
+    });
+    size_t peakStaged = 0;
+    for (size_t i = 0; i < count; ++i) {
+        issued.push_back(ids->allocate());
+        if (i % 10 == 9) ids->observe(issued[random() % issued.size()]);
+        const auto storage = ids->storageForTest();
+        checkIntent(storage.staged < std::max(Allocator::kMinStaged, storage.sorted / Allocator::kStagedDivisor) &&
+                    storage.capacity == storage.sorted && storage.sorted + storage.staged == issued.size(),
+                    "the section ID history outgrew its stated storage");
+        peakStaged = std::max(peakStaged, storage.staged);
+    }
+    auto sorted = issued;
+    std::sort(sorted.begin(), sorted.end());
+    checkIntent(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end() && ids->observedCount() == count,
+                "the section ID history issued an ID twice");
+    checkIntent(peakStaged > Allocator::kMinStaged, "the history never staged past its floor");
+    bool exhausted = false;
+    try { (void)ids->allocate(); }
+    catch (const DecodeError& error) { exhausted = error.kind == ErrorKind::ResourceLimit; }
+    checkIntent(exhausted, "a full section ID history allocated");
+}
+
 // Seeded public namespace edits of nested prims (create, subtree delete,
 // rename, reparent, reorder, sibling swap and attribute values), authored
 // through SdfLayer on a recording backing and on an independent stock layer.
@@ -1391,11 +1536,14 @@ void parentWideReorderEmission() {
     const auto appended = decodeEnvelope(compileFieldEdits(base,recordedLog(*append),{},sequentialIds())->bytes());
     checkIntent(appended.commands.size() == 1 && appended.commands[0].kind == Command::Kind::Create,
                 "structural append emitted a reorder");
-    // A peer rename leaves 304 as a shadowed duplicate of A; it owns no spec but stays listed.
-    EnvelopeInput peer; Command rename{}; rename.kind = Command::Kind::Move; rename.section = 304;
-    rename.oldParent = 17; rename.parent = 17; rename.name = "A";
-    peer.commands = {rename,create(305,17,"C",SdfSpecTypePrim)};
-    const auto shadowed = buildSceneCandidate(base,encodeEnvelope(peer));
+    // A resume diff from a store that keeps both siblings of a rename onto an occupied name restates 304 as A at
+    // its sibling index, which leaves it a shadowed duplicate of A; it owns no spec but stays listed.
+    EnvelopeInput restate; restate.isDiff = true; restate.baseVersion = 1;
+    Command renamed{}; renamed.kind = Command::Kind::DiffChange; renamed.section = 304; renamed.parent = 17;
+    renamed.name = "A"; renamed.sectionType = uint8_t(SdfSpecTypePrim); renamed.sectionOrder = 3;
+    restate.commands = {renamed};
+    EnvelopeInput peer; peer.commands = {create(305,17,"C",SdfSpecTypePrim)};
+    const auto shadowed = buildSceneCandidate(buildSceneCandidate(base,encodeEnvelope(restate)),encodeEnvelope(peer));
     checkIntent(shadowed->pathForSection(304).IsEmpty(),"fixture did not shadow the duplicate sibling");
     auto swap = recordingBacking(shadowed);
     swap->Set(SdfPath("/P"),SdfChildrenKeys->PrimChildren,VtValue(std::vector<TfToken>{TfToken("C"),TfToken("A")}));
@@ -1663,6 +1811,7 @@ void runFieldEditIntentTests(uint64_t seed) {
     intentContext = "field writes across structure"; fieldWritesAcrossStructure();
     intentContext = "interleaved samples/maps"; interleavedSamples();
     intentContext = "signed zero sample keys"; signedZeroSampleKeys();
+    intentContext = "unchanged values compile to nothing"; unchangedValuesCompileToNothing();
     intentContext = "empty maps and erasure"; emptyMapsAndErasure();
     intentContext = "dictionary semantics"; dictionarySemantics();
     intentContext = "empty dictionary keys"; emptyDictionaryKeySemantics();
@@ -1675,6 +1824,7 @@ void runFieldEditIntentTests(uint64_t seed) {
     intentContext = "public structural Sdf operations"; publicStructuralDraft();
     intentContext = "captured fresh identity removal"; capturedFreshIdentityRemoval();
     intentContext = "captured structural veto"; capturedStructuralVeto();
+    intentContext = "implicit containers"; implicitContainersAreMarked();
     intentContext = "parent-wide reorder emission"; parentWideReorderEmission();
     intentContext = "complete reorder emission"; completeReorderEmission();
     intentContext = "replacement parent with surviving children"; replacementPreservesSurvivingChildren();
@@ -1686,6 +1836,7 @@ void runFieldEditIntentTests(uint64_t seed) {
     structuralChildPolicies();
     structuralLatestSubtreeReplay();
     intentContext = "structural allocator and limits"; structuralAllocatorAndLimits();
+    intentContext = "section ID history bound"; allocatorHistoryBound();
     intentContext = "log operation limit"; logOperationLimit();
     structuralSeedHistory(seed);
     nestedStructuralSeeds(seed);

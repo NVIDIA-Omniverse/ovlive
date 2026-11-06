@@ -40,7 +40,9 @@ does not name is byte-identical to the archive. The copy in the GitHub source
 release lacks two of them, `Cargo.lock` and `.vscode/settings.json`, which git
 ignore rules drop when the release is committed; neither is read by any build,
 and `scripts/check-vendored-fred.sh` accepts their absence there, never a
-change. In this repository both must be present.
+change. In this repository both must be present. The copy in the container
+images' OSS source archive (`/vendor.tar.gz`) lacks `Cargo.lock`, which the
+packaging drops with every other upstream lockfile.
 
 `vendor/fred-10.1.0.SHA256SUMS` records every file of that archive as
 published, before the patch: 171 lines in GNU `sha256sum` format (the digest,
@@ -55,10 +57,11 @@ find . -type f -printf '%P\0' | LC_ALL=C sort -z | xargs -0 sha256sum > ../fred-
 
 So it tells, without the network, which files of the tree are upstream's as
 published: every listed file the patch does not edit has its listed digest in
-the tree, the 23 files the patch edits do not, and the six files the patch
+the tree, the 23 files the patch edits do not, and the seven files the patch
 adds under `src/live_edit/` are not listed. `Cargo.lock` and
 `.vscode/settings.json` stay listed for the GitHub source release, where they
-are absent. `tools/tests/test_vendored_fred_scripts.py` holds the manifest to
+are absent, and `Cargo.lock` for the OSS source archive, which lacks it.
+`tools/tests/test_vendored_fred_scripts.py` holds the manifest to
 these facts against the tree and the patch.
 
 ## License
@@ -75,9 +78,9 @@ these facts against the tree and the patch.
   on at least one of its added lines. Those
   modifications are Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES and are
   licensed under the MIT license, so each modified file stays under MIT alone.
-- **NVIDIA's new files.** The six files the patch adds under `src/live_edit/`
-  (`abandon.rs`, `ask.rs`, `liveness.rs`, `mod.rs`, `pool.rs` and
-  `retention.rs`) are
+- **NVIDIA's new files.** The seven files the patch adds under `src/live_edit/`
+  (`abandon.rs`, `ask.rs`, `liveness.rs`, `mod.rs`, `pool.rs`, `redirect.rs`
+  and `retention.rs`) are
   Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES and licensed under the
   Apache License 2.0. Each carries NVIDIA's SPDX Apache-2.0 header, and the
   repository's `LICENSE.txt` holds the license text.
@@ -2845,7 +2848,7 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +}
 --- a/src/live_edit/mod.rs
 +++ b/src/live_edit/mod.rs
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,344 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +//
@@ -2885,12 +2888,18 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +//!   flushing fed frames before the router waits, connects inline or writes where the write can reach a socket, all
 +//!   connections at once, the command-queue counter's resync, pubsub classification and the state a verdict records.
 +//! - [`pool`]: a `Pool`'s logical members, each re-pointable to a fresh client.
++//! - [`redirect`]: a reply is a cluster redirect only when it is an error frame (`clustered::process_response_frame`
++//!   calls [`redirect::is_redirection`] directly).
 +//! - [`retention`]: what a connection keeps once its traffic drains (connection buffer limits).
++//!
++//! One hook has no submodule: [`end_sync_backchannel`] drops the connection a cluster sync opened for its
++//! `CLUSTER SLOTS` when the sync ends, instead of keeping it as the client's backchannel.
 +
 +pub mod abandon;
 +pub mod ask;
 +pub mod liveness;
 +pub mod pool;
++pub mod redirect;
 +pub mod retention;
 +
 +pub use retention::CodecState;
@@ -2948,6 +2957,23 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +  let mut conn = transport.into_pipelined(replica);
 +  liveness::attach(inner, &mut conn);
 +  conn
++}
++
++/// The end of a cluster sync's `CLUSTER SLOTS` exchange on a connection the sync opened (`connect_any`, in
++/// `clustered::cluster_slots_backchannel`): drop that connection instead of storing it as the client's backchannel,
++/// as stock fred does. Dropping closes the socket at once and waits on nothing — the sync runs inside the router
++/// task, which must not wait on a peer — as a connection judged dead is closed ([`liveness`]'s bounded waits). Every
++/// other exit of the sync drops the connection with the sync's own scope: a failed or timed-out `CLUSTER SLOTS`, and
++/// the router task's future dropped on a cancel or an abort. So the connection a sync opens never outlives the sync,
++/// and a sync holds one more connection only while it runs. The router's connection-id map
++/// (`Backchannel::connection_ids`) is the router's, not the stored connection's, and is unchanged.
++pub(crate) fn end_sync_backchannel(inner: &RefCount<ClientInner>, transport: ExclusiveConnection) {
++  _debug!(
++    inner,
++    "Dropping the CLUSTER SLOTS connection to {} at the end of its sync.",
++    transport.server
++  );
++  drop(transport);
 +}
 +
 +/// `Connection::push_command`: record the command; returns whether it has no responses.
@@ -3169,7 +3195,7 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +}
 --- a/src/live_edit/pool.rs
 +++ b/src/live_edit/pool.rs
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,273 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +//
@@ -3327,18 +3353,20 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +
 +/// How long [`retire`] gives the backchannel's close (`Backchannel::clear_router_state`) before it drops it.
 +///
-+/// The close is one socket's: take the backchannel's async write lock, take the connection out, flush whatever is
-+/// buffered on it, then shut it down — and fred puts no timeout on any of it (`ExclusiveConnection::disconnect`). On a
-+/// healthy socket it takes well under a millisecond. It waits in two places:
++/// The close is one socket's, when the backchannel holds one: take the backchannel's async write lock, take the
++/// connection out, flush whatever is buffered on it, then shut it down — and fred puts no timeout on any of it
++/// (`ExclusiveConnection::disconnect`). On a healthy socket it takes well under a millisecond. It waits in two places:
 +///
 +/// - **for the lock**, while another holder has it: the client's router (its cluster-state sync in
-+///   `router/clustered.rs`, and the unblock of a blocked connection), or a backchannel command sent on the client
-+///   (`CLIENT UNBLOCK`, `FUNCTION KILL`, and the like), which first `PING`s an existing backchannel connection with no
-+///   timeout (`check_and_create_transport`).
-+///   The live-edit service sends no backchannel command on a pool member's client, so in a retirement this wait is
-+///   reachable only when the old router is still running as the release starts: [`retire`] got no `router`, or the
-+///   router did not finish within [`RETIRE_ROUTER_WAIT`];
-+/// - **in the flush**, when the peer stopped reading.
++///   `router/clustered.rs` looks for a stored connection, and the unblock of a blocked connection), or a backchannel
++///   command sent on the client (`CLIENT UNBLOCK`, `FUNCTION KILL`, and the like), which first `PING`s an existing
++///   backchannel connection with no timeout (`check_and_create_transport`).
++///   The live-edit service sends no backchannel command, and a cluster sync no longer stores the connection it opens
++///   for `CLUSTER SLOTS` ([`super::end_sync_backchannel`]), so a service client's backchannel holds no connection and
++///   a sync holds the lock only to find that out, doing no I/O under it. In a retirement the wait is therefore
++///   reachable only when the old router is still running as the release starts ([`retire`] got no `router`, or the
++///   router did not finish within [`RETIRE_ROUTER_WAIT`]), and is then that brief look;
++/// - **in the flush**, when the peer stopped reading. With no stored connection there is nothing to flush.
 +///
 +/// A longer wait helps neither: a holder or a peer that is stuck stays stuck. So 1 s bounds a single socket close with
 +/// ample margin, and the release task as a whole ends within [`RETIRE_ROUTER_WAIT`] plus this. What a close cut short
@@ -3361,9 +3389,13 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +///   or when the client's `ClientInner` drops — and a retired client's never drops, because its spare cell keeps it
 +///   (and the task holds a clone of it). Left running it would fetch credentials, and log failed refreshes, for the
 +///   life of the process;
-+/// - its **backchannel connection**, which fred closes after a completed `QUIT` (`check_and_disconnect`) or when the
-+///   next router starts (`clear_router_state`) — neither happens to a client whose `QUIT` did not complete and whose
-+///   router was aborted, so the husk would keep a socket to a node, with its buffers, until the process exits.
++/// - its **backchannel connection**, when it holds one, which fred closes after a completed `QUIT`
++///   (`check_and_disconnect`) or when the next router starts (`clear_router_state`) — neither happens to a client
++///   whose `QUIT` did not complete and whose router was aborted, so the husk would keep a socket to a node, with its
++///   buffers, until the process exits. A live-edit service client holds none (a cluster sync drops the connection it
++///   opens, [`super::end_sync_backchannel`], and the service sends no backchannel command), so for it this step only
++///   clears the router-dependent state (the connection-id map and the blocked flag); it stays for any client that
++///   does hold one.
 +///
 +/// `router` is the abort handle of the router the caller ended or aborted, when it has one. An abort takes effect
 +/// only at the router's next await, and a router that has just connected re-arms the credential task with no await
@@ -3382,12 +3414,12 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +///   drop releases the lock with the backchannel holding no connection and drops the taken `ExclusiveConnection`,
 +///   whose socket the OS then closes; only the unflushed bytes of a socket nobody reads again are lost;
 +/// - **cut short while waiting for the lock** (see [`RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`] for the holders and when that
-+///   can happen in a retirement): the drop just leaves the lock's queue and nothing is taken, so the backchannel
-+///   connection stays on the client until the client is dropped. A client kept in a spare cell (a pool member's
-+///   retired client) is never dropped before its `Pool`, so that one socket to a node, with its buffers, stays open
-+///   until the pool's last clone drops — the leak this release exists to close, left as a known residual for the rare
-+///   retirement whose old router outlived the wait. A client kept in no cell (a discarded fresh client, a `txn` slot's
-+///   swapped-out client) keeps the socket only until its last clone drops, normally soon after its router ends.
++///   can happen in a retirement): the drop just leaves the lock's queue and nothing is taken, so a backchannel
++///   connection, if the client held one, stays on the client until the client is dropped. A client kept in a spare
++///   cell (a pool member's retired client) is never dropped before its `Pool`, so that one socket to a node, with its
++///   buffers, would stay open until the pool's last clone drops; a client kept in no cell (a discarded fresh client,
++///   a `txn` slot's swapped-out client) keeps it only until its last clone drops, normally soon after its router
++///   ends. A live-edit service client holds no backchannel connection, so for it this cut leaves no socket behind.
 +pub fn retire(client: &Client, router: Option<AbortHandle>) {
 +  let inner = client.inner.clone();
 +  match tokio::runtime::Handle::try_current() {
@@ -3437,6 +3469,66 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +pub fn spare_cells(pool: &Pool) -> usize {
 +  pool.inner.live_edit.spares.len()
 +}
+--- a/src/live_edit/redirect.rs
++++ b/src/live_edit/redirect.rs
+@@ -0,0 +1,57 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++//! A reply is a cluster redirect only when it is an error frame.
++//!
++//! Part of the live-edit patch to fred 10.1.0; the record of every change, with the reason for each, is
++//! `vendor/fred-10.1.0.SOURCE.md` in the live-edit repository.
++//!
++//! A cluster node refuses a command it does not serve with an error reply, `-MOVED <slot> <host:port>` or
++//! `-ASK <slot> <host:port>`. Stock `clustered::process_response_frame` (`src/router/clustered.rs:322`) asked
++//! redis-protocol 6.0.0's `Resp3Frame::is_redirection` (`src/resp3/types.rs:894-897`). That reads the frame's text
++//! through `as_str` (`:1878-1889`) and accepts any text that starts `MOVED` or `ASK` and has exactly three
++//! space-separated tokens (`src/utils.rs:66-73`). `as_str` answers for data frames too (`SimpleString`, `BlobString`,
++//! `BigNumber`, `VerbatimString`, `ChunkedString`), so a data reply whose value reads `ASK 1234 10.0.0.9:6379` was
++//! routed as a redirect and never reached its caller. Stock fred then re-synced the cluster and re-sent the command
++//! (`MOVED`), or sent `ASKING` to the named node when connected to it and otherwise slept and failed (`ASK`). With
++//! this patch's [`super::ask::follow`], a command with write attempts left opens a connection to the named host, with
++//! the client's store credentials, when the client has none.
++//!
++//! The RESP type, not the text, is the protocol's signal that a frame is a server refusal and not data. So
++//! [`is_redirection`] requires an error frame and then applies stock's text rule to it unchanged (a case-sensitive
++//! `MOVED` or `ASK` prefix and exactly three tokens): every real `-MOVED` and `-ASK` is handled exactly as before,
++//! and a data reply reaches its caller as data, whatever it reads.
++//!
++//! The types cover both protocols. Under RESP2 a server error (`-…`) arrives as `SimpleError`, a status reply (`+…`)
++//! as `SimpleString` and a bulk string (`$…`) as `BlobString`, both through this patch's conversion for a connection
++//! that never subscribed (`liveness::resp2_as_data`) and through redis-protocol's `into_resp3`
++//! (`src/resp2/types.rs:679-682`). Under RESP3 a server error arrives as `SimpleError` or `BlobError`.
++//!
++//! fred's other redirect paths already decided by type and are unchanged. The transaction router converts a reply
++//! with `protocol::utils::frame_to_error` (`src/protocol/utils.rs:493-502`, error frames only) and then asks
++//! `Error::is_moved` / `Error::is_ask` (`src/error.rs:418-426`; `src/router/transactions.rs:77-79`, `:203`, `:222`).
++//! The cluster-wide reply parser uses `frame_to_error` too (`src/router/clustered.rs:85`). The centralized and
++//! sentinel routers handle no redirects.
++//!
++//! To revert: put `frame.is_redirection()` back in `clustered.rs:322`'s condition, then delete this module, its
++//! `pub mod` line and its bullet in `live_edit/mod.rs`.
++
++use redis_protocol::resp3::types::{BytesFrame as Resp3Frame, Resp3Frame as _};
++
++/// Whether `frame`, a reply read from a cluster node, is a `MOVED` or `ASK` redirect: an error frame (`SimpleError` or
++/// `BlobError`) whose text redis-protocol's redirect rule accepts. Any other frame is data, whatever its text.
++pub fn is_redirection(frame: &Resp3Frame) -> bool {
++  matches!(frame, Resp3Frame::SimpleError { .. } | Resp3Frame::BlobError { .. }) && frame.is_redirection()
++}
 --- a/src/live_edit/retention.rs
 +++ b/src/live_edit/retention.rs
 @@ -0,0 +1,1090 @@
@@ -3477,10 +3569,10 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +//! Draining a byte buffer does not free its allocation: a flush advances the buffer and a decode splits the frame
 +//! off, and the next `reserve` reclaims the whole allocation for reuse.
 +//!
-+//! A client also holds a backchannel connection (`Backchannel::transport`), opened lazily beside its pipelined
-+//! connections: for `CLIENT UNBLOCK` under `Blocking::Interrupt` (from a reader's first interrupt), and for
-+//! `CLUSTER SLOTS` at a cluster client's topology sync (re-created at every sync of a healthy client). Its buffers
-+//! grow like any other connection's, and nothing in stock fred cuts them back.
++//! A client can also hold a backchannel connection (`Backchannel::transport`), opened lazily beside its pipelined
++//! connections by fred's backchannel commands (`CLIENT UNBLOCK`, `FUNCTION KILL`, `FUNCTION STATS`); stock fred also
++//! kept there the connection a cluster sync opens for `CLUSTER SLOTS`, which `super::end_sync_backchannel` drops. Its
++//! buffers grow like any other connection's, and nothing in stock fred cuts them back. The live-edit service has none.
 +//!
 +//! # The rule
 +//!
@@ -3563,25 +3655,25 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
 +//!   each read, so an unallocated read buffer would grow by doubling from a few bytes and take several reads for
 +//!   even a 1 KiB reply. At 8 KiB, a connection used again reads a reply of up to 8 KiB in one read.
 +//! - **The backchannel is taken with `try_write`.** Its lock is a tokio `RwLock` that a caller task holds while it
-+//!   uses the backchannel (to interrupt a blocked command, or for a topology sync). The router task must never wait
++//!   uses the backchannel (a backchannel command, or a topology sync's look for one). The router task must never wait
 +//!   on a caller, so the sweep takes the lock only when it is free; a busy lock skips the backchannel for that pass,
 +//!   and a later pass tries again.
 +//! - **The backchannel is cut after any traffic**, not after traffic above a size. That makes "8 KiB read + 8 KiB
 +//!   write" exact by construction: a size threshold would have to prove, from bytes' growth rules, that no frame
 +//!   under it can grow the buffer (one from 4 to 8 KiB can double it to 16 KiB behind a setup reply's prefix), and
 +//!   that a credential in its HELLO never grows the write buffer. The cost is two 8 KiB allocations per use, and use
-+//!   is rare: one per cluster sync, which already opens a new connection, and one per reader interrupt.
++//!   is rare: one per backchannel command, none of which the live-edit service sends.
 +//!
 +//! # Why the cluster routing table and the sentinel primary own their strings
 +//!
 +//! fred parses `CLUSTER SLOTS` without copying: every string in the reply frame, and so each `SlotRange`'s `id`,
 +//! primary `host` and TLS server name, is a view into the read-buffer allocation the reply was read into. Those
 +//! strings outlive the sync that read them. They are kept by the routing state (in `ClientInner` and in the
-+//! router's cache), by every connection-map key and `Connection::server` added at that sync, by the next
-+//! backchannel's `server` (`connect_any` takes it from the old routing), and by each `Server` a caller clones from
-+//! the routing, such as the live-edit service's stream readers, whose client config keeps their owner's `Server`
-+//! for life. Each one would pin a whole read-buffer allocation, however the backchannel's buffer is cut, and the
-+//! pins would grow with the primary count and the sync history. [`own_slot_ranges`], called at the end of
++//! router's cache), by every connection-map key and `Connection::server` added at that sync, by the next sync's
++//! `CLUSTER SLOTS` connection's `server` (`connect_any` takes it from the old routing), and by each `Server` a caller
++//! clones from the routing, such as the live-edit service's stream readers, whose client config keeps their owner's
++//! `Server` for life. Each one would pin a whole read-buffer allocation, however a connection's buffer is cut, and
++//! the pins would grow with the primary count and the sync history. [`own_slot_ranges`], called at the end of
 +//! `ClusterRouting::rebuild`, copies them out, so the reply's allocation is freed when the sync ends and every
 +//! `Server` cloned later shares the small owned strings.
 +//!
@@ -4750,6 +4842,35 @@ The vendored crate as a whole is therefore `MIT AND Apache-2.0`.
      None => {
        _debug!(
          inner,
+@@ -319,7 +319,7 @@
+   #[cfg(feature = "partial-tracing")]
+   let _ = command.traces.network.take();
+ 
+-  if frame.is_redirection() {
++  if crate::live_edit::redirect::is_redirection(&frame) { // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
+     redirect_command(inner, &conn.server, command, frame);
+     return Ok(());
+   }
+@@ -459,8 +459,8 @@
+         )
+         .await?;
+         let host = transport.default_host.clone();
+-        inner.update_backchannel(transport).await;
+-
++        crate::live_edit::end_sync_backchannel(inner, transport); // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
++
+         (frame, host)
+       } else {
+         // use the response from the backchannel command
+@@ -476,6 +476,6 @@
+       .await?;
+       let host = transport.default_host.clone();
+-      inner.update_backchannel(transport).await;
+-
++      crate::live_edit::end_sync_backchannel(inner, transport); // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
++
+       (frame, host)
+     };
 @@ -570,7 +570,7 @@
        _debug!(inner, "Connecting to cluster node {}", server);
        let mut transport = connection::create(&_inner, &server, None).await?;
@@ -5220,6 +5341,12 @@ The patch carries these changes:
    was dropped), and a pipeline cut during the router step that writes it, or a
    fred `Transaction` cut partway, never leaves a `MULTI` open
    (`src/live_edit/abandon.rs`).
+10. A reply is a cluster redirect only when it is an error frame: a data reply
+    that reads like `ASK <slot> <host:port>` or `MOVED <slot> <host:port>` is
+    returned to its command as data (`src/live_edit/redirect.rs`).
+11. A cluster sync drops the connection it opened for `CLUSTER SLOTS` when
+    the sync ends, instead of keeping it as the client's backchannel
+    (`src/live_edit/mod.rs`, `end_sync_backchannel`).
 
 ### 1. `process_ask` no longer ends the router task
 
@@ -5710,7 +5837,8 @@ otherwise leave behind, once that router has finished: it takes, closes
 (`Receiver::close`, `src/runtime/_tokio.rs:104`) and drains the command
 receiver, cancelling every queued command, so a later send through a borrowed
 `&Client` fails at once instead of waiting forever; it stops the
-credential-refresh task; and it closes the backchannel connection. It does
+credential-refresh task; and it clears the backchannel's router-dependent
+state, closing the backchannel connection when the client holds one. It does
 so on a detached task spawned on the current runtime, bounded: it waits at
 most `RETIRE_ROUTER_WAIT` (5 s) for the router, and gives the backchannel's
 close, one socket's, at most `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT` (1 s), since
@@ -5718,19 +5846,21 @@ fred puts no timeout on that close, and logs one WARN, naming the client, when
 that expires. What a close cut short leaves depends on where it was cut. Cut
 after it took the backchannel's async lock, it has already taken the
 connection out of the backchannel, and dropping it closes the socket. Cut
-while still waiting for that lock, it has taken nothing: the connection stays
-on the client until the client is dropped. For a client kept in a spare cell
-(a pool member's retired client), which is never dropped before its `Pool`,
-that one socket stays open until the pool's last clone drops; that is a known
-residual. A client kept in no cell (a discarded fresh client, a `txn` slot's
-swapped-out client) keeps it only until its last clone drops, normally soon
-after its router ends. The WARN says "until the client is dropped (for a pool
-member, with its pool)". The lock's other holders are the client's router
-(its cluster-state sync, the unblock of a blocked connection) and backchannel
-commands sent on the client, which `PING` first with no timeout; the service
-sends none on a pool member, so the wait is reachable only when the old
-router is still running as the release starts (no router handle was given,
-or the router did not finish within `RETIRE_ROUTER_WAIT`).
+while still waiting for that lock, it has taken nothing: a connection the
+client held stays on it until the client is dropped, which for a client kept
+in a spare cell (a pool member's retired client) is with its `Pool`, and for a
+client kept in no cell (a discarded fresh client, a `txn` slot's swapped-out
+client) normally soon after its router ends. The WARN says "until the client
+is dropped (for a pool member, with its pool)". The service's clients hold no
+backchannel connection: change 11 drops the one a cluster sync opens, and the
+service sends no backchannel command. So for them the step only clears state
+and a cut leaves no socket behind. The lock's other holders are the client's
+router (its cluster-state sync, which looks for a stored connection, and the
+unblock of a blocked connection) and backchannel commands sent on the client,
+which `PING` first with no timeout; the service sends none, so the wait is
+reachable only when the old router is still running as the release starts (no
+router handle was given, or the router did not finish within
+`RETIRE_ROUTER_WAIT`), and is then a sync's brief look.
 
 ### 7. Connection buffer limits
 
@@ -5845,9 +5975,11 @@ a fresh 8 KiB read buffer.
   8 KiB write" exact without a growth derivation: a 4–8 KiB reply behind a
   setup reply's consumed prefix can double an 8 KiB buffer to 16 KiB, and a
   large credential in HELLO would grow the write buffer. The cost is two 8 KiB
-  allocations per use, and use is rare: one per cluster sync of a healthy
-  client, which fred re-opens the backchannel for (`src/router/clustered.rs:410-411`,
-  `:470-478`), and one per reader interrupt.
+  allocations per use, and use is rare: one per backchannel command
+  (`CLIENT UNBLOCK`, `FUNCTION KILL`, `FUNCTION STATS`), none of which the
+  service sends. A cluster sync's `CLUSTER SLOTS` connection is never stored
+  there (change 11), so the sweep never sees it; it is dropped when its sync
+  ends, with whatever its reply grew.
 - **The cluster routing table owns its strings**
   (`src/protocol/types.rs:559`, the end of `ClusterRouting::rebuild`, the only
   place a running client builds it; `from_cluster_slots` is unchanged). fred
@@ -5856,10 +5988,10 @@ a fresh 8 KiB read buffer.
   `host` and TLS server name is a view into the read-buffer allocation the
   reply was read into, kept past the sync by the routing state, every
   connection-map key and `Connection::server` added at that sync, the next
-  backchannel's `server` (`connect_any`), and any `Server` a caller clones
-  from the routing (the service's stream readers keep their owner's `Server`
-  in their client config for life). Each would pin a whole allocation however
-  the backchannel's buffer is cut. `retention::own_slot_ranges` replaces each
+  sync's `CLUSTER SLOTS` connection's `server` (`connect_any`), and any
+  `Server` a caller clones from the routing (the service's stream readers keep
+  their owner's `Server` in their client config for life). Each would pin a
+  whole allocation however a connection's buffer is cut. `retention::own_slot_ranges` replaces each
   of those strings, and the replicas' under the `replicas` feature, with an
   owned copy, so the reply's allocation is freed when the sync ends.
 - **A sentinel-named primary owns its strings**
@@ -6039,7 +6171,8 @@ command with a write attempt left, `live_edit::ask::follow`:
   node that owns no slot yet, as in a scale-out (`Connections::add_connection`,
   `src/router/connections.rs:375`), announced on the client's reconnect events
   as a cluster sync announces a connection it adds (`src/router/clustered.rs:574`).
-  A target the routing table lists as a primary gets that entry's TLS server
+  Only a server's `-ASK` error reply reaches it, never a data reply that reads
+  like one (change 10). A target the routing table lists as a primary gets that entry's TLS server
   name; one it does not gets the client's TLS host mapping applied with the
   slot owner's TLS server name as the default host. The connect runs inline on
   the client's single router task, so every other command on the client waits
@@ -6382,6 +6515,155 @@ probe for an `UNWATCH` fred had not yet written.
 Then `src/live_edit/abandon.rs` and its `pub mod abandon;` line, with
 `ConnectionState::abandon`, go.
 
+### 10. A reply is a cluster redirect only when it is an error frame
+
+A cluster node refuses a command it does not serve with an error reply,
+`-MOVED <slot> <host:port>` or `-ASK <slot> <host:port>`. Stock fred decides
+whether a reply on a clustered connection is one in
+`clustered::process_response_frame` (`src/router/clustered.rs:322`), with
+redis-protocol 6.0.0's `Resp3Frame::is_redirection`
+(`src/resp3/types.rs:894-897`). That reads the frame's text through `as_str`
+(`:1878-1889`), which answers for data frames too (`SimpleString`,
+`BlobString`, `BigNumber`, `VerbatimString`, `ChunkedString`), and accepts any
+text that starts `MOVED` or `ASK` (case-sensitive) and has exactly three
+space-separated tokens (`src/utils.rs:66-73`). So a data reply whose value
+reads `ASK 1234 10.0.0.9:6379` — a `GET` of a stored string, or a status
+reply — is taken for a redirect and never reaches its caller. Under RESP2 the
+same holds: a server error (`-…`) becomes `SimpleError`, a status reply (`+…`)
+`SimpleString` and a bulk string (`$…`) `BlobString`, both through change 4's
+conversion (`live_edit::liveness::resp2_as_data`) and through redis-protocol's
+`into_resp3` (`src/resp2/types.rs:679-682`).
+
+In stock fred the effect is a lost reply and a wrong action: a `MOVED`-shaped
+value re-syncs the cluster and re-sends the command; an `ASK`-shaped one sends
+`ASKING` to the named node when the client is connected to it, and otherwise
+sleeps and fails (`send_asking_with_policy`; `Router::route` finds no
+connection for an unknown node, `src/router/mod.rs:181-182`). With change 8 it
+is worse: a command with a write attempt left follows the `-ASK` by opening a
+connection to the named host when the client has none, authenticated with the
+client's store credentials. A data value shaped like a redirect would then
+steer a credentialed connection to a host named by data. No read the service
+makes returns such a value today: its single-string reads return values it
+wrote itself, and a client-supplied base path is canonicalized so it cannot
+carry the shape. The change keeps that from depending on what future reads
+return.
+
+The patch (`src/live_edit/redirect.rs`, called from the one existing line,
+`src/router/clustered.rs:322`) makes the RESP type the test, as the protocol
+intends: `live_edit::redirect::is_redirection` requires a `SimpleError` or
+`BlobError` frame and then applies redis-protocol's text rule to it unchanged.
+Every real `-MOVED` and `-ASK` is handled exactly as before (the same
+case-sensitive prefix, the same three-token count), and any other frame is
+returned to its command as data, whatever it reads, with no sync, re-send,
+`ASKING` or connection. Nothing is logged or counted for such a data reply.
+fred's other redirect paths already decided by type and are unchanged: the
+transaction router converts a reply with `protocol::utils::frame_to_error`
+(`src/protocol/utils.rs:493-502`, error frames only) and asks
+`Error::is_moved` / `Error::is_ask` (`src/error.rs:418-426`;
+`src/router/transactions.rs:77-79`, `:203`, `:222`); the cluster-wide reply
+parser uses `frame_to_error` too (`src/router/clustered.rs:85`); and the
+centralized and sentinel routers handle no redirects.
+
+After the change, the redirect handlers are reached only for an error reply on
+a connection the client opened: to the configured endpoint, to a node a
+`CLUSTER SLOTS` reply named (`src/router/clustered.rs:518-592`), or to an
+earlier followed `-ASK` target. Error texts there come from the store itself,
+or from the service's scripts' `redis.error_reply`, whose texts are literals,
+code-prefixed strings or a store error relayed from `redis.pcall`. Steering a
+connection now takes control of a store node or of the script text the service
+ships; writing data is not enough.
+
+The service's integration suite pins the behaviour in
+`tests/integration/storage/b_myh_redirect_frame_test.rs`: a table of
+`is_redirection` over every string-carrying RESP3 frame type, and, through a
+mock cluster, an `ASK`-shaped stored value and status reply returned as data
+with no connection to the named host, and a `MOVED`-shaped stored value
+returned as data and sent once, beside `-ASK` and `-MOVED` error-frame
+controls that are still followed. Restoring the stock test on line 322 fails
+the data cases.
+
+**Reverting the change**: restore `src/router/clustered.rs:322` to
+`if frame.is_redirection() {`, then delete `src/live_edit/redirect.rs` and its
+`pub mod redirect;` line and module-docs bullet in `src/live_edit/mod.rs`.
+
+### 11. A cluster sync drops its `CLUSTER SLOTS` connection when it ends
+
+Every cluster sync (`clustered::sync`, from a connect, a reconnect, a
+`-MOVED`, or a caller's `sync_cluster()`) reads the topology with one
+`CLUSTER SLOTS` in `cluster_slots_backchannel`
+(`src/router/clustered.rs:405-498`). Stock fred sends it on the client's
+stored backchannel connection when there is one, and otherwise, or when that
+fails, opens a fresh connection to the first configured or cached node that
+connects and completes its setup (`connect_any`, `:359-397`), sends it there,
+and stores that connection as the client's backchannel
+(`inner.update_backchannel`, `:462` and `:478`). `sync` asks for the stored
+connection to be dropped first unless some connection has a pending read
+error, but its test is inverted (`force_disconnect`, `:527-533`: it is true
+when *no* connection has one), so a healthy client's sync drops the stored
+connection and opens a new one anyway. The stored connection therefore saves
+almost no handshakes; its one lasting effect is a socket per clustered client
+that carries nothing between syncs. For the live-edit service that is one per
+pooled client, and `connect_any` takes the first node of a sorted set, so
+every client's lands on the same node: P₀ = 136 idle sockets on one node per
+replica at the chart's pool sizes, counted against the store's connection
+limit.
+
+The patch (two existing lines, `src/router/clustered.rs:462` and `:478`,
+calling `live_edit::end_sync_backchannel` in `src/live_edit/mod.rs`) drops
+the connection the sync opened once its `CLUSTER SLOTS` reply is read, instead
+of storing it. Its two `clustered.rs` hunks are hand-shaped: each lists the
+unchanged blank line after the call, `:463` and `:479`, as removed and
+re-added, with symmetric context so it applies with no fuzz. The next
+regeneration by the procedure under *Re-vendoring* (`diff -u --label …`)
+replaces them with canonical context; the patched tree is the same either
+way. Dropping an `ExclusiveConnection` closes its socket at once and
+waits on nothing (no flush, no `close_notify`, no shutdown), as change 3's
+close of a connection judged dead does; the sync runs inside the router task,
+which must not wait on a peer, and the reply has been read in full, so nothing
+is pending on the socket. Its lifecycle:
+
+- **Created** by `connect_any`, in every sync that has no stored connection
+  to use, which after this change is every sync of a client that sends no
+  backchannel command.
+- **Used** for one `CLUSTER SLOTS`, under fred's `internal_command_timeout`.
+- **Dropped** when `cluster_slots_backchannel` is done with it, on every path:
+  after the reply on success, and by scope on the `?` returns (a failed or
+  timed-out request), before the null-response return and a `rebuild` error,
+  which both come after the drop. On a cancel or a shutdown the router task's
+  future is dropped, and the connection with it.
+- **Never stored**, so `Backchannel::clear_router_state` (a new router's
+  start, `pool::retire`) and `check_and_disconnect` find nothing to close for
+  it, and the retention sweep never sees it.
+- **Observable** only in the store's `CLIENT LIST`; nothing counts it.
+
+What stays: the router's connection-id map, `Backchannel::connection_ids`,
+which `Router` refreshes from its own connections (`src/router/mod.rs:322`,
+`src/router/connections.rs:168`) and the service's `storage::watched_txn`
+reads, is not the stored connection's and is unchanged. The backchannel's
+other users — `CLIENT UNBLOCK` (under `Blocking::Interrupt`, or called
+directly), `FUNCTION KILL` and `FUNCTION STATS` — still open and store a
+connection through `Backchannel::request_response`; the service sends none of
+them (its stream readers run `Blocking::Block`), so none of its clients holds
+a backchannel connection. A sync still looks for a stored one first, and uses
+it when a backchannel command left one.
+
+The cost: one connect, TLS handshake and `AUTH` per sync, which stock fred
+already paid on every sync of a healthy client (the inverted test above); only
+a sync that found a connection with a pending error, which stock reused the
+stored connection for, now opens one. A sync holds the extra connection only
+while it runs, so at most one per clustered client exists at once, all of them
+during a cluster-wide resync; the service counts that peak in its memory
+bound and its connection requirement (`src/storage/connection_buffers.rs`;
+its SDD §15.3). Over-`maxclients`, a Valkey node accepts the connection, sends
+`-ERR max number of clients reached` (nothing under TLS) and closes it; the
+setup's `HELLO` / `AUTH` then fails, and `connect_any` skips to the next node,
+as it skips a node that does not connect.
+
+**Reverting the change**: restore `src/router/clustered.rs:462` and `:478` to
+`inner.update_backchannel(transport).await;` (with their indentation), then
+delete `end_sync_backchannel` and its module-docs sentence in
+`src/live_edit/mod.rs`.
+
 ## How the copy is wired in
 
 - `Cargo.toml`: `[patch.crates-io] fred = { path = "vendor/fred-10.1.0" }`,
@@ -6433,7 +6715,8 @@ Then `src/live_edit/abandon.rs` and its `pub mod abandon;` line, with
   with `supply-chain:audit`. The job gates release.
 - `tools/package_oss.py` ships the tree, the patch, this file and the
   upstream-file manifest in the OSS source archive under
-  `sources/patched-crates/`, because `cargo vendor` skips path packages.
+  `sources/patched-crates/`, because `cargo vendor` skips path packages. The
+  tree goes in without its `Cargo.lock`, which the manifest still lists.
 - `tools/generate_attributions.py` (`VENDORED_CRATES`) attributes fred's
   license from the tree, because `dd-rust-license-tool` lists only packages
   with a source. It fails on a source-less package that is neither a workspace
@@ -6503,14 +6786,15 @@ that cannot be followed fails only its command, a silent connection is detected
 by its oldest outstanding command with peer evidence and its verdict says which
 rule fired, no wait on one connection's I/O is unbounded, a connection judged
 dead is closed without waiting on it, a data reply is never
-taken for a pubsub frame, a fed command is never left unsent while the client
+taken for a pubsub frame or a cluster redirect, a fed command is never left unsent while the client
 waits, connects inline or writes to another connection, a pool member can be swapped for a fresh client, a command, pipeline or
 transaction is never written after its caller gave up on it (its timeout
 fired, the client answered it with an error, or its call was dropped), a
 pipeline cut during the step that writes it and a transaction cut partway never
 leave a `MULTI` open (a pipeline replayed after a lost connection is not
 covered; the service sends every `MULTI` pipeline at one write attempt, so it
-never replays one), and what a client
+never replays one), a cluster topology sync keeps no connection open once it
+ends, and what a client
 keeps once its traffic drains is bounded with one warm connection per client
 at its class limits and every other connection, and the backchannel, at a
 small idle shape, so the service's memory bound for its connections
@@ -6551,8 +6835,8 @@ router-ending paths the patch does not touch.
 Upstream `main` still has the stock `process_ask` (both its router exit and
 its `-ASK` follow), unresponsive check, router
 waits, pubsub classification, flush gate, command-queue counter, `Pool`,
-connection buffers and give-up handling of pipelines, transactions and dropped
-calls (identical to 10.1.0 as of 2026-10-15: `main` is still the 10.1.0
+connection buffers, redirect recognition, give-up handling of pipelines, transactions and dropped
+calls, and the stored `CLUSTER SLOTS` connection (identical to 10.1.0 as of 2026-10-15: `main` is still the 10.1.0
 release commit `f222ad7b`). The project is dormant: no commit since the 10.1.0 release on
 2025-02-27, issue #377 ("is this repo dead?", August 2026) is unanswered, and
 the open pull requests from September 2026 (#380, #381) have no review. No

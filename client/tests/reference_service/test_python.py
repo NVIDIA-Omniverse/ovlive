@@ -365,6 +365,8 @@ finally:
             "reconnect_initial_ms", "reconnect_maximum_ms", "reconnect_max_attempts")},
             dict(retry_initial_ms=100, retry_maximum_ms=10000, retry_max_attempts=8,
                  reconnect_initial_ms=1000, reconnect_maximum_ms=60000, reconnect_max_attempts=10))
+        # Each endpoint's call budget defaults to 1,024, a client-side choice.
+        self.assertEqual(configuration["max_calls_per_endpoint"], 1024)
         state = live.get_auth_state(self.endpoint)
         result, generation = live.set_access_token(self.endpoint, state.generation, "synthetic-writer")
         self.assertEqual(result, live.Result.OK)
@@ -385,10 +387,11 @@ finally:
         env = dict(os.environ, PYTHONPATH=str(path.parents[3]) + os.pathsep + os.environ["PYTHONPATH"],
                    PYTHONDONTWRITEBYTECODE="1")
         program = ("from omni.usd import live; r=live.initialize(apply_lag_warning_threshold=8, "
-                   "reconnect_initial_ms=7, reconnect_maximum_ms=70, reconnect_max_attempts=3); "
+                   "reconnect_initial_ms=7, reconnect_maximum_ms=70, reconnect_max_attempts=3, "
+                   "max_calls_per_endpoint=8); "
                    "c=live.copy_diagnostics(max_records=0)['effective_configuration']; "
                    "print(c['apply_lag_warning_threshold'], c['reconnect_initial_ms'], c['reconnect_maximum_ms'], "
-                   "c['reconnect_max_attempts']); r.close(5000)")
+                   "c['reconnect_max_attempts'], c['max_calls_per_endpoint']); r.close(5000)")
         result = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", program], env=env,
                                          capture_output=True, text=True, timeout=10)
-        self.assertEqual((result.returncode, result.stdout.strip()), (0, "8 7 70 3"), result.stderr)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "8 7 70 3 8"), result.stderr)

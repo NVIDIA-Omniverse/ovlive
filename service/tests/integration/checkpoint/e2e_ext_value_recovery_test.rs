@@ -23,7 +23,7 @@
 //! ext-value field, pre-seed the bytes into the checkpoint adapter,
 //! wipe ONLY the `le:ext:meta:{hash}` + `le:ext:data:{hash}` keys for
 //! those hashes (leaving the object's `le:{oid}:obj:*` keys intact),
-//! issue `SubscribeReadLayer` → `compute_diff_at_cut` → `read_batch` →
+//! issue `SubscribeReadLayer` → `compute_faithful_coalesced_at_cut` → `read_batch` →
 //! `try_recover_via_checkpoint` falls back to
 //! `CheckpointStore::get_ext_blob`, the bytes are refilled into Valkey
 //! via `store_recovered_values` — `ExternalValueStore::store_values`'
@@ -151,7 +151,7 @@ use live_edit::storage::keys::sha256_to_hex;
 use live_edit::storage::layer::LayerStore;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
-use oodf_ffi::{OwnedDelta, SetField};
+use oodf_ffi::{CommandCreateSection, OwnedDelta, SetField, StructCommand};
 use tonic::{Request, Status};
 
 // The one `live_edit_checkpoint_ext_recovery_total{result}` reader. Named
@@ -162,7 +162,7 @@ use tonic::{Request, Status};
 // `composed_restore_ext_matrix_test.rs`. The shared one takes `&Metrics`, so
 // `&harness.metrics` (a `SharedMetrics`) deref-coerces at each call site.
 use super::helpers::ext_recovery_count;
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external};
+use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external, with_root};
 use crate::grpc::helpers::{
     make_create_data, make_create_header, make_request, streaming_create, AllowAllPermissions,
     StubUserinfo,
@@ -175,7 +175,7 @@ use crate::grpc::helpers::{
 const SERVICE_LABEL: &str = "test";
 
 /// Bundle returned by [`setup_ext_value_recovery_harness`]. Owns every
-/// handle a `compute_diff_at_cut`-misses → adapter-fallback → Valkey-rewrite
+/// handle a catch-up-build-misses → adapter-fallback → Valkey-rewrite
 /// E2E flow needs end-to-end.
 ///
 /// The `LiveEditService::ext_value_store` field is wired with a REAL
@@ -315,7 +315,6 @@ pub(super) async fn setup_ext_value_recovery_harness(tick_secs: u64) -> ExtValue
     ));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store,
@@ -492,12 +491,35 @@ where
     (header, buf)
 }
 
+/// `delta` with each of `section_ids` created as a child of the layer's root
+/// section 1, ahead of its fields. Wrap the result in `with_root`, which puts
+/// the root's own `CreateSection` first, so section 1 exists before its
+/// children; never pass 1 here (the root would be created twice, which
+/// CreateLayer refuses as a duplicate section id).
+///
+/// A catch-up sends only the fields of sections reachable from the root
+/// (`plan_faithful_coalesced`'s net-live filter), so a field on a section
+/// never created is never sent: the build never reads its external value,
+/// and the recovery path these tests exist for would never run.
+fn with_sections_under_root(mut delta: OwnedDelta, section_ids: &[u64]) -> OwnedDelta {
+    let created = section_ids.iter().map(|&section_id| {
+        StructCommand::CreateSection(CommandCreateSection {
+            parent_id: 1,
+            section_id,
+            section_name: format!("ext-section-{section_id}"),
+            section_type: 0,
+        })
+    });
+    delta.struct_commands.splice(0..0, created);
+    delta
+}
+
 /// Build a `Request<SubscribeReadLayerRequest>` carrying a stub
 /// `BearerToken` extension so the auth interceptor accepts it.
 /// `client_id` is fixed because the happy-path test doesn't care
 /// about self-echo suppression — the writer and subscriber are the
 /// same task in this test and the bootstrap-message path is not
-/// `client_id`-filtered (only the live per-commit path is).
+/// `client_id`-filtered (only the live relay is).
 pub(super) fn subscribe_request(
     session_id: &str,
     layer_name: &str,
@@ -593,7 +615,8 @@ async fn subscribe_read_layer_recovers_ext_value_field_after_ext_namespace_wipe(
         /*ext_value_index=*/ 1,
         /*set_order=*/ 1,
     );
-    let create_ompf = delta_to_ompf_bytes(&delta, &[payload]);
+    // The content creates the layer's root section, holding the fields (SDD §9.7).
+    let create_ompf = delta_to_ompf_bytes(&with_root(delta), &[payload]);
 
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
@@ -679,13 +702,13 @@ async fn subscribe_read_layer_recovers_ext_value_field_after_ext_namespace_wipe(
     // ── 6. SubscribeReadLayer with have_object_id=oid, sequence_num=0 ─────
     //
     // `sequence_num=0` with a non-zero `have_object_id` is the
-    // "subscriber wants a full reset from a stale-cache cold start"
-    // shape — `DiffEngine::plan` short-circuits to `FullContent`,
-    // which emits every section + field. The ext-value field is in
-    // section 1, so the diff-build calls `read_batch` for our hash,
-    // misses (both ext keys wiped), falls back to
-    // `try_recover_via_checkpoint`, which fetches the bytes from the
-    // adapter and rewrites them into Valkey via `store_recovered_values`
+    // "subscriber holds nothing of this object" shape: every live section
+    // and field is newer than version 0, so the coalesced diff carries them
+    // all. The ext-value field is in section 1, so the build probes our
+    // hash, misses (both ext keys wiped), re-reads under the read hold,
+    // misses again, and reads it with `read_batch`, which falls back to
+    // `try_recover_via_checkpoint`: it fetches the bytes from the adapter
+    // and rewrites them into Valkey via `store_recovered_values`
     // (`store_values`' write, without the ext-mirror copy).
     let sub_req = subscribe_request(&session_id, LAYER_NAME, object_id, 0);
     let response = handle_subscribe_read_layer(&harness.svc, sub_req)
@@ -704,7 +727,7 @@ async fn subscribe_read_layer_recovers_ext_value_field_after_ext_namespace_wipe(
     );
     assert!(
         !bootstrap_body.is_empty(),
-        "bootstrap body must be non-empty — FullContent diff covers section 1's SetField"
+        "bootstrap body must be non-empty — the coalesced diff covers section 1's SetField"
     );
 
     // ── 7. Decode the bootstrap body, resolve ext-value, assert bytes ─────
@@ -716,13 +739,13 @@ async fn subscribe_read_layer_recovers_ext_value_field_after_ext_namespace_wipe(
         .expect("bootstrap OMPF must parse");
     assert!(
         !container.delta_bytes.is_empty(),
-        "bootstrap OMPF delta part must be non-empty (FullContent reset delta)"
+        "bootstrap OMPF delta part must be non-empty"
     );
     let decoded_delta =
         oodf_ffi::parse_delta(container.delta_bytes).expect("OODF delta must parse");
 
-    // Find the SetField referencing our hash. The FullContent plan
-    // emits every field; for this one-field layer there is exactly one.
+    // Find the SetField referencing our hash. At version 0 the coalesced
+    // diff emits every field; for this one-field layer there is exactly one.
     let set_field = decoded_delta
         .set_fields
         .iter()
@@ -855,7 +878,7 @@ async fn subscribe_read_layer_recovers_ext_value_field_after_ext_namespace_wipe(
 //   - Pre-seed the adapter directly for every hash (same `put_ext_blob`
 //     pattern the happy-path test uses, mirrored 4×).
 //   - Wipe the ext namespace for ALL 4 hashes.
-//   - SubscribeReadLayer with `sequence_num=0` → FullContent diff plan
+//   - SubscribeReadLayer with `sequence_num=0` → coalesced diff of everything
 //     → `read_batch` for all 4 hashes misses → SR-3.2 fallback fires for
 //     every hash → adapter returns the bytes → Valkey rehydrated →
 //     bootstrap body carries every payload byte-identical.
@@ -960,9 +983,11 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
     // ── 4. CreateLayer with N SetField entries across 2 sections ──────────
     //
     // Field-to-section distribution: even-index payloads (0, 2) → section
-    // 1; odd-index payloads (1, 3) → section 2. Interleaving by parity
-    // guarantees both sections carry multiple fields so the FullContent
-    // diff-build's per-section emit-loop is exercised end-to-end. The
+    // 1, the layer's root (`with_root`); odd-index payloads (1, 3) →
+    // section 2, created under the root (`with_sections_under_root`), so
+    // the catch-up reaches every field. Interleaving by parity
+    // guarantees both sections carry multiple fields so the catch-up
+    // build's per-section emit is exercised end-to-end. The
     // `ext_value_index` is 1-based per the OMPF contract — field `i`
     // references external blob `i + 1`, which in the OMPF's
     // `external_values: &[&[u8]]` argument is `external_values[i]`.
@@ -979,12 +1004,17 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
             set_order: (i as u64) + 1,
         })
         .collect();
-    let delta = OwnedDelta {
-        set_fields,
-        ..Default::default()
-    };
+    let delta = with_sections_under_root(
+        OwnedDelta {
+            set_fields,
+            ..Default::default()
+        },
+        &[2],
+    );
     let external_values: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
-    let create_ompf = delta_to_ompf_bytes(&delta, &external_values);
+    // The content creates the layer's root section, holding section 2 and the
+    // fields (SDD §9.7).
+    let create_ompf = delta_to_ompf_bytes(&with_root(delta), &external_values);
 
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
@@ -1076,13 +1106,13 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
         );
     }
 
-    // ── 8. SubscribeReadLayer (FullContent diff plan) ─────────────────────
+    // ── 8. SubscribeReadLayer (coalesced diff at version 0) ───────────────
     //
-    // `sequence_num=0` with `have_object_id=object_id` short-circuits
-    // `DiffEngine::plan` to `FullContent`, which emits every section's
-    // every field. With 4 ext-value-referencing fields across 2 sections,
-    // the bootstrap body's OODF delta carries all 4 SetField entries and
-    // the OMPF carries all 4 ext blobs. The diff-build's `read_batch`
+    // `sequence_num=0` with `have_object_id=object_id`: every live section
+    // and field is newer than version 0, so the coalesced diff emits every
+    // section's every field. With 4 ext-value-referencing fields across 2
+    // sections, the bootstrap body's OODF delta carries all 4 SetField
+    // entries and the OMPF carries all 4 ext blobs. The build's `read_batch`
     // hits 4 distinct misses, fires the SR-3.2 fallback for each, and
     // populates the bootstrap body's external_values from the adapter
     // bytes.
@@ -1099,12 +1129,12 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
     );
     assert!(
         !bootstrap_body.is_empty(),
-        "bootstrap body must be non-empty — FullContent diff covers all N fields"
+        "bootstrap body must be non-empty — the coalesced diff covers all N fields"
     );
 
     // ── 9. Decode OMPF, resolve each SetField, assert byte-identical ──────
     //
-    // The bootstrap OMPF carries the FullContent reset delta (part 0) +
+    // The bootstrap OMPF carries the coalesced delta (part 0) +
     // every ext blob (parts 1..N). For each SetField in the decoded
     // delta, locate its source-side payload by hash (the SetField's
     // `value_or_ext_hash` carries the content hash), then resolve its
@@ -1112,15 +1142,14 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
     // the bytes equal the source payload byte-for-byte.
     //
     // The order of SetField entries in the bootstrap delta is NOT
-    // guaranteed to match the source-side order (the FullContent
-    // diff-build walks sections in section-id order and fields in
-    // canonical order within each section). Mapping by hash content
+    // guaranteed to match the source-side order (the build emits fields
+    // in its own canonical order). Mapping by hash content
     // rather than by index defeats that ordering assumption.
     let container = live_edit::domain::ompf::OmpfContainer::parse(&bootstrap_body)
         .expect("bootstrap OMPF must parse");
     assert!(
         !container.delta_bytes.is_empty(),
-        "bootstrap OMPF delta part must be non-empty (FullContent reset delta)"
+        "bootstrap OMPF delta part must be non-empty"
     );
     let decoded_delta =
         oodf_ffi::parse_delta(container.delta_bytes).expect("OODF delta must parse");
@@ -1316,7 +1345,7 @@ async fn ext_value_heavy_layer_recovers_byte_identical_after_full_ext_namespace_
 /// `Err(Status)` and return it. The bootstrap path of
 /// `handle_subscribe_read_layer` returns `Ok(Response::new(stream))`
 /// immediately (it only allocates the bridge channel); any
-/// `compute_diff_at_cut` failure surfaces inside the spawned `run_subscription`
+/// catch-up build failure surfaces inside the spawned `run_subscription`
 /// task and arrives on the stream as `Err(Status)`. A subscribe that
 /// hits the SR-3.2 miss-path on a layer whose ext-value bytes are
 /// gone from BOTH Valkey and the adapter never delivers a bootstrap
@@ -1405,7 +1434,8 @@ async fn subscribe_read_layer_surfaces_meta_not_found_when_adapter_lacks_ext_val
         /*ext_value_index=*/ 1,
         /*set_order=*/ 1,
     );
-    let create_ompf = delta_to_ompf_bytes(&delta, &[payload]);
+    // The content creates the layer's root section, holding the fields (SDD §9.7).
+    let create_ompf = delta_to_ompf_bytes(&with_root(delta), &[payload]);
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
         make_create_data(create_ompf),
@@ -1448,7 +1478,7 @@ async fn subscribe_read_layer_surfaces_meta_not_found_when_adapter_lacks_ext_val
 
     // ── 4. SubscribeReadLayer must surface Code::Internal ─────────────────
     //
-    // The bootstrap path runs `compute_diff_at_cut` → `read_batch` →
+    // The bootstrap path runs the catch-up build → `read_batch` →
     // `try_recover_via_checkpoint`; the adapter returns `Ok(None)`
     // because the blob was never put. The recovery path ticks
     // `adapter_miss` and re-surfaces the original
@@ -1715,7 +1745,6 @@ async fn setup_ext_value_recovery_harness_in_memory(
     ));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store,
@@ -1872,7 +1901,8 @@ async fn subscribe_read_layer_surfaces_unavailable_when_adapter_get_ext_blob_ret
         /*ext_value_index=*/ 1,
         /*set_order=*/ 1,
     );
-    let create_ompf = delta_to_ompf_bytes(&delta, &[payload]);
+    // The content creates the layer's root section, holding the fields (SDD §9.7).
+    let create_ompf = delta_to_ompf_bytes(&with_root(delta), &[payload]);
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
         make_create_data(create_ompf),
@@ -2018,7 +2048,8 @@ async fn subscribe_read_layer_surfaces_meta_not_found_when_adapter_get_ext_blob_
         /*ext_value_index=*/ 1,
         /*set_order=*/ 1,
     );
-    let create_ompf = delta_to_ompf_bytes(&delta, &[payload]);
+    // The content creates the layer's root section, holding the fields (SDD §9.7).
+    let create_ompf = delta_to_ompf_bytes(&with_root(delta), &[payload]);
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
         make_create_data(create_ompf),

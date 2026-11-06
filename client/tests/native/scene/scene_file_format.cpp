@@ -286,6 +286,7 @@ class Host final {
     bool stop_=false, holdNext_=false, rejectNext_=false;
     bool rejectContext_=false; // Access only on worker; forces one production callback rejection.
     bool failAllocationNext_=false; // The next dispatched job fails its first allocation once.
+    bool failAllocations_=false; // Under mutex_: every dispatched job fails its first allocation until cleared.
     bool refuseDispatch_=false; // Under mutex_: every dispatch is refused for capacity.
     bool allocationFaulted_=false; // Host thread only: whether that job's allocation failed.
     std::thread worker_;
@@ -367,9 +368,14 @@ public:
                 rejectContext_=false;
             };
         }
-        if(failAllocationNext_) {
-            failAllocationNext_=false;
-            job=[this,original=std::move(job)]() mutable {
+        const bool once=std::exchange(failAllocationNext_,false);
+        if(once || failAllocations_) {
+            job=[this,once,original=std::move(job)]() mutable {
+                // A held fault is decided when the job runs, so a job queued
+                // before directSetTryCleared clears it runs without one.
+                bool fault=once;
+                if(!fault) { std::lock_guard<std::mutex> lock(mutex_); fault=failAllocations_; }
+                if(!fault) { original(); return; }
                 allocationFailed=false; allocationCountdown=0;
                 try { original(); } catch(...) { allocationCountdown=-1; throw; }
                 allocationCountdown=-1; allocationFaulted_=std::exchange(allocationFailed,false);
@@ -549,6 +555,15 @@ public:
     // the layer reports dirty afterwards.
     struct TryOutcome { OmniUsdLiveResult refused=OMNI_USD_LIVE_OK; unsigned notices=0; bool dirty=false; };
     TryOutcome directSetTry(const std::string& key,int value) { return call([&] { return authorTry(key,value); }); }
+    // Clears a held allocation fault and authors one root field in the same
+    // host job, so no flush job runs between them: the flush this turn's
+    // refusal requests is the first that can admit.
+    TryOutcome directSetTryCleared(const std::string& key,int value) {
+        return call([&] {
+            { std::lock_guard<std::mutex> lock(mutex_); check(failAllocations_,"no held allocation fault"); failAllocations_=false; }
+            return authorTry(key,value);
+        });
+    }
     // Author `frames` one-field turns in one host job, each followed by the
     // flush its flush job runs, as a host frame does. The job holds the host,
     // so no local publication, which issuance waits for, runs before it
@@ -725,10 +740,14 @@ public:
     // Author root fields in one host job whose first record dispatches the
     // flush job; that job's first allocation fails once. Returns whether it
     // failed, read in a host job queued after the flush job.
-    bool directSetAllocationFault(const std::shared_ptr<SceneAttachment>& attachment,const Fields& values) {
+    // With `held`, every job that runs before directSetTryCleared also fails
+    // its first allocation, so a flush that any pending-byte release requests
+    // meanwhile defers the same way.
+    bool directSetAllocationFault(const std::shared_ptr<SceneAttachment>& attachment,const Fields& values,bool held=false) {
         call([&] {
             check(attachedLiveScene(*layer_)==attachment && layer_->PermissionToEdit(),"allocation fault fixture is not editable");
-            { std::lock_guard<std::mutex> lock(mutex_); check(!failAllocationNext_,"allocation fault already armed"); failAllocationNext_=true; }
+            { std::lock_guard<std::mutex> lock(mutex_); check(!failAllocationNext_ && !failAllocations_,"allocation fault already armed");
+              failAllocationNext_=true; failAllocations_=held; }
             {
                 SdfChangeBlock changes;
                 for(const auto& field:values) layer_->SetField(SdfPath::AbsoluteRootPath(),TfToken(field.first),VtValue(field.second));
@@ -1360,11 +1379,11 @@ int fileFormatMain(int argc,char** argv) {
             const auto current=host.read(); // Queued last: every job above has run.
             std::cout << "{\"type\":\"direct\",\"result\":" << owner.attachment->progress().result << ",\"fields\":";
             jsonFields(current); std::cout << ",\"installed\":"; jsonFields(*installed); std::cout << '}' << std::endl;
-        } else if (command=="direct-set-alloc-fault") {
+        } else if (command=="direct-set-alloc-fault" || command=="direct-set-alloc-fault-held") {
             Fields values; std::string key; int value;
             while(input>>key>>value) { check(identifier(key),"invalid direct field name"); values[key]=value; }
             check(!values.empty() && input.eof(),"invalid direct field edits");
-            const bool faulted=host.directSetAllocationFault(owner.attachment,values);
+            const bool faulted=host.directSetAllocationFault(owner.attachment,values,command=="direct-set-alloc-fault-held");
             last=host.read();
             std::cout << "{\"type\":\"alloc-fault\",\"result\":" << owner.attachment->progress().result
                       << ",\"injection\":" << (LIVE_TEST_ALLOCATOR?"true":"false")
@@ -1375,11 +1394,11 @@ int fileFormatMain(int argc,char** argv) {
             check(!parkedTry.valid(),"a parked edit is already pending");
             parkedTry=host.parkTryOnFailure(key,value,owner.attachment);
             std::cout << "{\"type\":\"parked\"}" << std::endl;
-        } else if (command=="direct-set-try" || command=="parked-try") {
+        } else if (command=="direct-set-try" || command=="direct-set-try-cleared" || command=="parked-try") {
             Host::TryOutcome outcome;
-            if(command=="direct-set-try") {
+            if(command!="parked-try") {
                 std::string key; int value=0; check(bool(input>>key>>value) && identifier(key),"invalid direct field edit");
-                outcome=host.directSetTry(key,value);
+                outcome=command=="direct-set-try" ? host.directSetTry(key,value) : host.directSetTryCleared(key,value);
             } else {
                 check(parkedTry.valid() && parkedTry.wait_for(std::chrono::seconds(10))==std::future_status::ready,
                       "parked edit did not run");
@@ -1495,6 +1514,40 @@ int fileFormatMain(int argc,char** argv) {
             const auto unopened=[](const Outcome& outcome) {
                 check(!outcome.opened,"a Read failed by an earlier allocation failure still opened the layer");
             };
+            // While the hold is closed, every closing actor waits at its
+            // quiescence gate, so an actor a failed open dropped still holds
+            // its admission when `vacant` looks. Off host: such a failure
+            // leaves the admission free at once, so an immediate retry of the
+            // open never meets ALREADY_EXISTS.
+            struct ClosingHold {
+                std::mutex mutex; std::condition_variable changed; bool closed=false;
+                static void hook(void* context) noexcept {
+                    if(!context) return; // A worker racing the disarm may load a cleared context.
+                    auto& hold=*static_cast<ClosingHold*>(context);
+                    std::unique_lock<std::mutex> lock(hold.mutex);
+                    if(!hold.changed.wait_for(lock,std::chrono::seconds(10),[&] { return !hold.closed; })) std::abort();
+                }
+                void set(bool value) { std::lock_guard<std::mutex> lock(mutex); closed=value; changed.notify_all(); }
+            };
+            // Static: a worker that loaded the hook before disarming may still read it.
+            static ClosingHold closingHold;
+            closingHold.set(false);
+            // Disarms the hook and opens the hold on every exit, so a failed
+            // check never leaves a closing actor parked or the hook installed.
+            struct DisarmClosingHold { ~DisarmClosingHold() {
+                LayerActor::setBeforeCloseQuiescentForTest(nullptr,nullptr);
+                closingHold.set(false);
+            } } disarmClosingHold;
+            LayerActor::setBeforeCloseQuiescentForTest(ClosingHold::hook,&closingHold);
+            const auto vacant=[&](const std::string& uri) {
+                const auto parsed=parseUri(uri);
+                try { (void)getRuntime()->layerAdmissions->reserve(owner.endpoint,parsed.sessionId,parsed.layerName); }
+                catch(OmniUsdLiveResult result) {
+                    closingHold.set(false);
+                    check(result!=OMNI_USD_LIVE_ALREADY_EXISTS,"an open that failed before its bootstrap wait left its admission held");
+                    throw;
+                }
+            };
             std::map<long,unsigned> newCodes, readCodes;
             std::map<long,unsigned> absorbedCodes; // The resolver's reported cause per absorbed New; -1 for none.
             unsigned control=0, newSites=0, threw=0, refused=0, setup=0, newAbsorbed=0, unbacked=0, readSites=0, readFailed=0, readAbsorbed=0;
@@ -1506,6 +1559,7 @@ int fileFormatMain(int argc,char** argv) {
             SceneAttachment::setBeforeOpenWaitForTest(disarmAtOpenWait,nullptr);
             for(long index=0;index<=max && !readComplete;++index) {
                 Outcome outcome; outcome.uri=makeLayerUri(sessionUri,layerName);
+                closingHold.set(true);
                 host.call([&] {
                     outcome.layer=SdfLayer::New(format,outcome.uri);
                     check(bool(outcome.layer),"live SdfLayer::New returned no layer");
@@ -1515,6 +1569,8 @@ int fileFormatMain(int argc,char** argv) {
                     read(outcome,errors,codeOf);
                     if(!outcome.fired) check(outcome.ok && outcome.opened,"uninjected Read did not reach its bootstrap wait");
                 });
+                if(outcome.fired && !outcome.ok && !outcome.opened) vacant(outcome.uri);
+                closingHold.set(false);
                 if(!outcome.fired) {
                     ready(outcome); release(outcome); ++control; readComplete=true; readMap+='C'; break;
                 }
@@ -1526,6 +1582,7 @@ int fileFormatMain(int argc,char** argv) {
             std::string current=layerName; // A service layer until the first throw.
             for(long index=0;index<=max && readComplete && !newComplete;++index) {
                 Outcome outcome; outcome.uri=makeLayerUri(sessionUri,current);
+                closingHold.set(true);
                 host.call([&] {
                     TfErrorMark errors;
                     allocationFailed=false; allocationCountdown=LIVE_TEST_ALLOCATOR ? index : -1;
@@ -1548,6 +1605,8 @@ int fileFormatMain(int argc,char** argv) {
                     read(outcome,errors,codeOf);
                     outcome.fired=fired;
                 });
+                if(outcome.fired && !outcome.opened && (outcome.threw || !outcome.layer || !outcome.ok)) vacant(outcome.uri);
+                closingHold.set(false);
                 if(!outcome.fired) {
                     if(current!=layerName) {
                         // The fresh identifier names no service layer.

@@ -45,6 +45,7 @@ Terminate client TLS at an HTTP/2-capable ingress, and restrict direct access to
 Have these ready before you install:
 
 - A Kubernetes cluster that supports gRPC probes (1.24 or later), Helm 3, `kubectl`, and an NGC API key that can pull the Live Edit chart and images.
+  Recovering from a disaster-recovery hold needs Kubernetes 1.29 or later: on an older cluster the service has no supported way out of a hold ({ref}`When the service is held <live-edit-durability-held>`).
 - A Valkey-compatible backing store that meets the {ref}`backing-store requirements <live-edit-backing-store>`, set up for your provider: {ref}`self-hosted <live-edit-backing-store-self-hosted>`, {ref}`Azure Managed Redis <live-edit-backing-store-azure>` or {ref}`Amazon MemoryDB <live-edit-backing-store-aws>`.
   Give each Live Edit deployment its own store.
 - An authenticated Storage Service that holds the base assets your clients collaborate on and validates callers' bearer tokens.
@@ -164,7 +165,7 @@ Where each value comes from:
 - `authorization`: your Storage Service REST endpoint, with its `https://` scheme ({ref}`Request authorization <live-edit-authentication-user-token-authorization>`).
 - `valkey`: {ref}`Connect Live Edit <live-edit-backing-store-azure-connect>`, including `memoryBytes`, the cache's total memory for your size from {ref}`Choose a size <live-edit-backing-store-azure-size>`.
 - `checkpoint`: {ref}`Configure checkpoints <live-edit-deployment-checkpoints>`.
-- `autoscaling.maxReplicas`: keep it at 10 or fewer, and at 7 or fewer on Azure Managed Redis `Balanced_B0` to `Balanced_B5` ({ref}`Choose a size <live-edit-backing-store-azure-size>`).
+- `autoscaling.maxReplicas`: keep it at 10 or fewer ({ref}`Keep fleet-wide layer reads at 10 or fewer <live-edit-scaling-read-concurrency>`), and at 9 or fewer on Azure Managed Redis `Balanced_B0` to `Balanced_B5` ({ref}`Choose a size <live-edit-backing-store-azure-size>`).
   The chart's defaults also run an autoscaler and a disruption budget ({ref}`Scaling <live-edit-scaling>`).
 
 For another backing store, replace the `valkey` block and the provisioner's backing-store token:
@@ -230,6 +231,17 @@ The ingress must route HTTP/2 to port 50001.
 Any ingress or proxy in front of the service must balance per request, not per connection: HTTP/2 carries all of a client's calls on one connection, so connection-level balancing pins each client to one replica.
 Contour, Envoy and Istio balance per request; no session affinity is needed.
 
+Raise the proxy's connection and request limits for Live Edit, because each connected user holds long-lived calls open.
+Set each limit, on every proxy instance, to at least the sum over your expected concurrent users of 2 × open layers + 1 for each session they have joined; for 1,000 users in one session with 5 open layers each, that is 11,000.
+At Envoy's default of 1,024, new calls fail with `UNAVAILABLE` from roughly 100 users with 5 open layers each.
+
+| Proxy | Default | Where to raise it |
+|---|---|---|
+| Contour | 1,024 | For every service, under `cluster.circuit-breakers` in the Contour configuration file: `max-connections`, `max-pending-requests` and `max-requests`. For Live Edit only, through `service.annotations`: `projectcontour.io/max-connections`, `projectcontour.io/max-pending-requests` and `projectcontour.io/max-requests`, as quoted strings. |
+| Istio | No limit | If a `DestinationRule` for the service sets `trafficPolicy.connectionPool`, keep `tcp.maxConnections`, `http.http1MaxPendingRequests` and `http.http2MaxRequests` at or above the figure. |
+| Envoy Gateway | 1,024 | A `BackendTrafficPolicy`'s `circuitBreaker`: `maxConnections`, `maxPendingRequests` and `maxParallelRequests`. |
+| Envoy | 1,024 | The cluster's `circuit_breakers.thresholds`: `max_connections`, `max_pending_requests` and `max_requests`. |
+
 What to expect from the ingress:
 
 - `JoinSession` and `SubscribeReadLayer` routes have 240-minute timeouts: the ingress ends a subscription at most 240 minutes after it opens, and a join after 240 minutes without traffic.
@@ -273,6 +285,7 @@ spec:
 ```
 
 For Amazon MemoryDB, allow port 6379 to the cluster's subnets instead of the Azure ports.
+The chart's policy and this example select server pods only; a disaster-recovery Job's pod carries `app.kubernetes.io/component: dr-job`, so in a namespace that denies egress by default, give it the same egress.
 Verify with `kubectl get networkpolicy -n storage-apis`, then confirm the pods become ready.
 
 (live-edit-deployment-install)=
@@ -293,7 +306,7 @@ kubectl rollout status deployment/live-edit-service -n storage-apis --timeout=10
 
 `helm template` fails with a message naming the value when a required setting is missing or two settings conflict.
 A replica becomes ready once it can reach the backing store, the backup store when checkpoints are on, and an unexpired service token when the token sidecar is on ({ref}`Health checks <live-edit-monitoring-health>`).
-The startup probe allows it up to 285 seconds.
+The startup probe allows it up to 310 seconds.
 
 (live-edit-deployment-verify)=
 ## Verify
@@ -360,6 +373,7 @@ tests:
 With the ingress enabled, the tests connect through its host name, which needs in-cluster DNS and a valid certificate; until then, add `tests.grpcEndpoint: "http://live-edit-service.storage-apis.svc.cluster.local:50001"`.
 
 With `tests.enabled: true` the tests also run after every install and upgrade, and a failing test fails that `helm upgrade` and marks the release failed.
+They do not run while a disaster-recovery action is set, since the service is then held.
 Run them now:
 
 ```bash

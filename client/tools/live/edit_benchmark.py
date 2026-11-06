@@ -505,7 +505,7 @@ async def run_case(args, scenario, rtt_ms, client, directory):
             writer = await Child.start('writer', [
                 *wrapper, python, str(CLIENTS), 'ovlive-writer', *connection, *workload,
                 '--package', str(args.python_extension.parents[4]), '--attributes', ','.join(paths),
-                '--frame-wait-ms', str(args.frame_wait_ms)],
+                '--frame-wait-ms', str(args.frame_wait_ms), '--diagnostics', args.diagnostics],
                 directory / 'writer.log', extension_environment(args.python_extension))
         else:
             # client-library authors USD as omni-spectree's host does; client-library-record only records values.
@@ -609,7 +609,7 @@ def writer_metrics(writer):
         # A failed write fails the layer, which ends its drain; a drain that ends otherwise timed out.
         final = writer['final']
         failures = [f"layer FAILED, result {final['result']}"] if final['state'] == OVLIVE_FAILED_STATE else []
-        return dict(**accepted, frame_timeouts=writer.get('frame_timeouts'), failures=failures,
+        return dict(**accepted, frame_timeouts=writer.get('frame_timeouts'), failures=failures, usage=writer.get('usage'),
                     drained=writer['drained'], drain_timed_out=not writer['drained'] and not failures,
                     peak_pending_write_count=writer['peak']['pending_write_count'],
                     peak_buffered_edit_count=writer['peak']['buffered_edit_count'],
@@ -617,7 +617,7 @@ def writer_metrics(writer):
                     delivery_status=writer['delivery_status'], metrics=writer['metrics'])
     # Every baseline write settles in its callback, failed or not, so an undrained baseline timed out.
     return dict(**accepted, drained=writer['drained'], drain_timed_out=not writer['drained'],
-                window=writer['window'],
+                window=writer['window'], usage=writer.get('usage'),
                 peak_in_flight=writer['peak']['in_flight'],
                 peak_buffered_turns=writer['peak']['buffered_turns'], updates_sent=len(writer['updates']),
                 failures=writer['failures'], version=writer['version'])
@@ -686,7 +686,8 @@ def identity_line(measured):
 
 def summary(report):
     lines = ['# Interactive edit benchmark', '',
-             f"Seed {report['seed']}, {report['service']} reference service, proxy jitter {report['jitter_ms']} ms, labels: "
+             f"Seed {report['seed']}, {report['service']} reference service, proxy jitter {report['jitter_ms']} ms, "
+             f"ovlive diagnostics {report.get('diagnostics', 'default')}, labels: "
              + ', '.join(f'{k}={v}' for k, v in report['labels'].items()) + '.', '',
              identity_line(report['identities']), '',
              'Latency is host edit to peer visibility at a raw SubscribeReadLayer reader; the jitter column is the '
@@ -711,6 +712,9 @@ def summary(report):
         peak = (f"pending {writer['peak_pending_write_count']}, buffered {writer['peak_buffered_edit_count']}, "
                 f"blocked turns {writer['blocked_turns']}{window}" if case['client'] == 'ovlive' else
                 f"in flight {writer['peak_in_flight']}/{writer['window']}, buffered turns {writer['peak_buffered_turns']}")
+        usage = writer.get('usage')
+        if usage:
+            peak += f", max RSS {usage['max_rss_kib'] / 1024:.0f} MiB, CPU {usage['cpu_s']:.1f} s"
         if writer.get('rejected_turns'):
             peak += (f", accepted {writer['accepted_turns']} turns, refused {writer['rejected_turns']} "
                      f"from turn {writer['first_rejected_turn']}")
@@ -825,7 +829,8 @@ async def run(args):
                           args.python_extension and extension_manifest(args.python_extension), args.client_library,
                           args.client_library and client_library_version(args.client_library))
     report = dict(schema_version=SCHEMA_VERSION, qualification='characterization_only', seed=args.seed,
-                  service=args.service, service_options=args.service_option, jitter_ms=args.jitter_ms, labels=labels,
+                  service=args.service, service_options=args.service_option, jitter_ms=args.jitter_ms,
+                  diagnostics=args.diagnostics, labels=labels,
                   identities=measured, scenarios={n: selected[n].description for n in names},
                   scene_prims=args.scene_prims, cases=[])
     for name in names:
@@ -874,6 +879,8 @@ def main():
                        help='opaque relays payloads verbatim; graph validates every commit at much higher cost')
         p.add_argument('--service-option', action='append', default=[],
                        help='NAME=VALUE set on the reference service state, such as chained_writes=false')
+        p.add_argument('--diagnostics', choices=('default', 'reduced'), default='default',
+                       help='ovlive runtime diagnostics: the defaults, or no history and ERROR minimum severity')
         p.add_argument('--drain-timeout-s', type=float, default=120.0)
         p.add_argument('--client-library-log-level', help='Omniverse Client Library log level, such as debug')
         p.add_argument('--no-client-library-reader', action='store_true',

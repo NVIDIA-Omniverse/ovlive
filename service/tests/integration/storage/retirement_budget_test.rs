@@ -38,7 +38,7 @@
 //!
 //! | Test | Design row | What it pins |
 //! |---|---|---|
-//! | [`the_test_allowances_are_the_pod_memory_plans_at_the_smallest_and_the_reference_pod`] | F3 | [`R_REF`] and [`R_REF_5_GIB`] are the plan's allowances at the 2,709 MiB minimum and the 5 GiB reference pod |
+//! | [`the_test_allowances_are_the_pod_memory_plans_at_the_smallest_and_the_reference_pod`] | F3 | [`R_REF`] and [`R_REF_5_GIB`] are the plan's allowances at the 2,687 MiB minimum and the 5 GiB reference pod |
 //! | [`concurrent_retirements_on_every_route_hold_at_most_the_allowance_and_give_it_all_back`] | D4-T3 | `DeleteLayer`s, call bodies, sweep tail arms and generic-arm orphans at once: reserved plus over-commit never above the allowance, every object gone, and the allowance, its over-commit and its waiters back to zero |
 //! | [`retirements_are_granted_in_arrival_order`] | D4-T3 | FIFO: a small reservation queued behind an oversized `DeleteLayer` is granted only once that delete has finished, though it would have fitted beside the one before it |
 //! | [`a_retirement_whose_teardown_page_fails_gives_its_reservation_back`] | D4-T3 | an injected page error ending a `DeleteLayer` |
@@ -47,13 +47,18 @@
 //! | [`a_body_reaching_the_allowance_after_shutdown_began_that_fits_completes_within_the_drain`] | D4-T3 | a body parked in its size read when shutdown begins and that fits is granted `immediate` and runs within the drain |
 //! | [`a_body_reaching_the_allowance_after_shutdown_began_that_would_wait_ends_at_once`] | D4-T3 | the same body with the allowance full ends at once, never queued: the drain returns within `BUDGET / 2`, the header kept |
 //! | [`an_overwrite_body_whose_wake_up_never_lands_reserves_nothing`] | D4-T3 | a wake that never lands reserves nothing, checked once the body has ended |
+//! | [`a_delete_dropped_mid_walk_leaves_its_object_registered_dead_through_the_sweep`] | b.g65 (D) T1 | a `DeleteLayer` dropped mid-walk: unmapped, header standing, registered dead, and still registered after the sweep retires it |
+//! | [`a_delete_whose_teardown_fails_after_the_header_leaves_its_object_registered_dead`] | b.g65 (D) T2 | a teardown page failing after the header's `UNLINK`: `Aborted`, header gone, registered dead |
+//! | [`an_overwrite_body_whose_size_read_fails_has_registered_the_replaced_object_dead`] | b.g65 (D) T3 | the body's size-read failure: header kept and unbegun, registered dead before any sweep |
+//! | [`an_overwrite_body_ended_by_shutdown_has_registered_the_replaced_object_dead`] | b.g65 (D) T4 | the body ended `Closed` at shutdown: header kept, registered dead |
+//! | [`an_overwrite_body_whose_wake_up_never_lands_has_registered_the_replaced_object_dead`] | b.g65 (D) T5 | no wake-up landed: header standing, registered dead |
 //! | [`a_delete_whose_deadline_passes_while_it_waits_changes_nothing_and_a_retry_works`] | D4-T4 | nothing written; this replica's admission entry and structural-cache entry kept (premise-check amendment); the wait counted `cancelled`; a retry deletes |
 //! | [`a_delete_at_shutdown_that_would_wait_answers_unavailable_and_retires_nothing`] | I-D4e | shutdown's exit for a delete that would wait: `UNAVAILABLE` with `SERVER_SHUTTING_DOWN`, never queued, nothing written, both entries kept |
 //! | [`a_delete_at_shutdown_that_fits_deletes_the_layer`] | I-D4e | a delete at shutdown whose reservation fits deletes the layer |
 //! | [`an_oversized_retirement_is_clamped_to_the_allowance_and_runs_alone`] | D4-T5 | the clamped reservation holds the whole allowance, with no over-commit, and a second retirement waits for it |
 //! | [`a_retirement_with_no_obj_ext_tops_up_for_the_references_its_walk_finds`] | D4-T6 | `H` = 0, so the walk's references are covered by a forced top-up, repaid at the shrink |
 //! | [`a_clean_up_with_a_handful_of_large_values_runs_beside_a_large_one_at_the_5_gib_pods_allowance`] | F3 | the reservation follows the object: a retirement owing 5 references runs beside one owing 1,000 at `R_ref` = 10 MiB, both reserved at once |
-//! | [`a_clean_up_with_a_handful_of_large_values_runs_beside_a_large_one_at_the_smallest_pods_allowance`] | F3 | the same at the 2,709 MiB pod's `R_ref` = 5 MiB |
+//! | [`a_clean_up_with_a_handful_of_large_values_runs_beside_a_large_one_at_the_smallest_pods_allowance`] | F3 | the same at the 2,687 MiB pod's `R_ref` = 5 MiB |
 //! | [`a_delete_whose_index_grew_after_its_size_read_widens_its_page_before_reading_past_it`] | F3 | the estimate low: an index grown while the delete queued is read past the object's page only after a forced top-up to the full page `W` |
 //! | [`a_delete_whose_layer_is_replaced_while_it_waits_deletes_the_replacement_on_this_replica`] | D4-T11 | the delete-vs-replace retarget on one replica |
 //! | [`a_delete_whose_layer_is_replaced_on_another_replica_retires_the_old_objects_entries_here`] | D4-T11 | the cross-replica row: the retarget retires the replaced object's admission and cache entries on the deleting replica (the one-shot guard drop), and leaves none for the replacement |
@@ -63,7 +68,7 @@
 //! | [`a_delete_meeting_a_foreign_header_or_obj_ext_counts_it_once_skips_the_release_and_removes_it`] | D4-T15 | `DeleteLayer`: answered OK, the foreign key gone, one tick on `header` / `ext_index`, nothing released, `W` reserved |
 //! | [`an_overwrite_body_meeting_a_foreign_header_or_obj_ext_counts_it_once_skips_the_release_and_removes_it`] | D4-T15 | the overwrite body, the same |
 //! | [`a_sweep_retirement_meeting_a_foreign_obj_ext_counts_it_once_skips_the_release_and_removes_it`] | D4-T15 | the sweep's generic arm, a foreign `obj:ext` |
-//! | [`a_delete_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there`] | D4-T15 | `DeleteLayer`, each of the five indices foreign: the tick under its family (a value index's walk ticks once more), `W` reserved, a set index's release scheduled and a value index's not begun, the teardown stopped at the index after taking the header, and the delete answered `INTERNAL` with the mapping deleted and the layers-index member left |
+//! | [`a_delete_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there`] | D4-T15 | `DeleteLayer`, each of the five indices foreign: the tick under its family (a value index's walk ticks once more), `W` reserved, a set index's release scheduled and a value index's not begun, the teardown stopped at the index after taking the header, and the delete answered `INTERNAL` with the layer already unmapped: the mapping and the layers-index member gone |
 //! | [`an_overwrite_body_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there`] | D4-T15 | the overwrite body: the tick, `W`, the release and the teardown's stop, as on `DeleteLayer` |
 //! | [`a_sweep_retirement_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there`] | D4-T15 | the sweep's generic arm: the tick, `W`, the release and the teardown's stop, as on `DeleteLayer` |
 //! | [`a_delete_whose_largest_index_is_any_one_of_the_five_reserves_its_page_one_member_past_it`] | D4-T15 | each of the five counts sizes the page: 10 members in one index alone reserve 11 rows |
@@ -94,68 +99,97 @@
 //! # Worst case per test
 //!
 //! Every wait for a condition is bounded by [`BUDGET`] (20 s), and none is
-//! reached on a healthy store. A test's worst case is its number of such
+//! reached on a healthy store; [`eventually`]'s deadline bounds its
+//! condition's own awaits too. A test's worst case is its number of such
 //! waits × `BUDGET` — a wait on several objects at once is one wait
-//! ([`until_objects_gone`]), [`Rig::sweep_until`] is two (its condition
-//! and its join), and a test that runs its cases at once (the
-//! foreign-structural-index tests) counts one case's waits — and each stays
-//! inside nextest's 120 s hang-killer:
+//! ([`until_objects_gone`]), and [`Rig::sweep_until`] is two (its condition
+//! and its join) — plus 15 s per [`Rig`] for its fixture's drop: 5 s for the
+//! first unanswered step of the `TestValkey` key purge, then 10 s for its
+//! client's quit. The purge's answered round trips come on top (one `SCAN`
+//! page per 5,000 keys of the whole shared database, one `UNLINK` per 100 of
+//! the test's own keys), so no total is fixed.
 //!
-//! | Test | Bounded waits | Worst case |
-//! |---|---|---|
-//! | `the_test_allowances_…` | 0 | — |
-//! | `concurrent_retirements_…` | 5 | 100 s |
-//! | `retirements_are_granted_in_arrival_order` | 4 | 80 s |
-//! | `a_retirement_whose_teardown_page_fails_…` | 0 | — |
-//! | `a_delete_dropped_mid_walk_…` | 2 | 40 s |
-//! | `wait_for_cleanup_ends_a_queued_body_…` | 3 | 60 s |
-//! | `a_body_reaching_…_that_fits_…` | 4 | 80 s |
-//! | `a_body_reaching_…_that_would_wait_…` | 3½ | 70 s |
-//! | `an_overwrite_body_whose_wake_up_never_lands_…` | 2 | 40 s |
-//! | `a_delete_whose_deadline_passes_…` | 2 | 40 s |
-//! | `a_delete_at_shutdown_that_would_wait_…` | 1 | 20 s |
-//! | `a_delete_at_shutdown_that_fits_…` | 0 | — |
-//! | `an_oversized_retirement_…` | 3 | 60 s |
-//! | `a_retirement_with_no_obj_ext_…` | 1 | 20 s |
-//! | `a_clean_up_with_a_handful_…_5_gib_…` | 3 | 60 s |
-//! | `a_clean_up_with_a_handful_…_smallest_…` | 3 | 60 s |
-//! | `a_delete_whose_index_grew_…` | 3 | 60 s |
-//! | `…_replaced_while_it_waits_…_on_this_replica` | 3 | 60 s |
-//! | `…_replaced_on_another_replica_…` | 2 | 40 s |
-//! | `an_overwrite_body_wakes_its_stream_…` | 3 | 60 s |
-//! | `the_orphan_sweep_runs_one_retirement_at_a_time` | 3 | 60 s |
-//! | `a_duplicate_run_of_an_overwrite_tail_…` | 5 | 100 s |
-//! | `a_delete_meeting_a_foreign_…` | 0 | — |
-//! | `an_overwrite_body_meeting_a_foreign_…` | 3 | 60 s |
-//! | `a_sweep_retirement_meeting_a_foreign_…` | 2 | 40 s |
-//! | `a_delete_meeting_a_foreign_structural_index_…` | 1 | 20 s |
-//! | `an_overwrite_body_meeting_a_foreign_structural_index_…` | 3 | 60 s |
-//! | `a_sweep_retirement_meeting_a_foreign_structural_index_…` | 2 | 40 s |
-//! | `a_delete_whose_largest_index_is_any_one_…` | 2 | 40 s |
-//! | `a_delete_whose_size_read_meets_a_wrong_type_…` | 1 | 20 s |
-//! | `a_delete_whose_size_read_fails_permanently_…` | 0 | — |
-//! | `a_delete_whose_size_read_fails_…` | 1 | 20 s |
-//! | `a_retirement_ticks_the_retirement_series_…` | 1 | 20 s |
-//! | `a_delete_whose_retirement_panics_…` | 2 | 40 s |
-//! | `a_delete_whose_mapping_re_read_fails_…` | 2 | 40 s |
-//! | `two_deletes_of_one_layer_…` | 3 | 60 s |
-//! | `an_overwrite_body_whose_size_read_fails_…` | 4 | 80 s |
-//! | `a_sweep_retirement_whose_size_read_fails_…` | 4 | 80 s |
-//! | `a_sweep_retirement_cancelled_while_it_waits_…` | 2 | 40 s |
+//! The six [`ForeignIndex`] tests run their five cases at once, in one
+//! `join_all` on the test's thread, and bound each wait for the call under
+//! test (the delete's answer, the object-key scan) with `BUDGET` and a
+//! message naming it. Each case runs under [`CASE_BUDGET`] (60 s, the three
+//! bounded waits of the largest case) and sets a step tracker as it goes:
+//! past the budget, [`within_case_budget`] fails the test naming the case and
+//! its step in flight, whatever the case is stuck in. The cases run at once,
+//! and a case stuck in an await its own waits do not bound (its setup, its
+//! fixture writes, its assertions' reads) is cut off only by `CASE_BUDGET`,
+//! so each such test's cases take up to `CASE_BUDGET`, whatever their bounded
+//! waits add up to. Their five drops do not overlap, since each blocks the
+//! thread until it returns, so they add 5 × 15 s = 75 s: each of the six
+//! comes to at most `CASE_BUDGET` + 75 s = 135 s.
+//!
+//! | Test | Bounded waits | Rigs | Worst case |
+//! |---|---|---|---|
+//! | `the_test_allowances_…` | 0 | 0 | — |
+//! | `concurrent_retirements_…` | 5 | 1 | 115 s |
+//! | `retirements_are_granted_in_arrival_order` | 4 | 1 | 95 s |
+//! | `a_retirement_whose_teardown_page_fails_…` | 0 | 1 | 15 s |
+//! | `a_delete_dropped_mid_walk_…` | 2 | 1 | 55 s |
+//! | `wait_for_cleanup_ends_a_queued_body_…` | 3 | 1 | 75 s |
+//! | `a_body_reaching_…_that_fits_…` | 4 | 1 | 95 s |
+//! | `a_body_reaching_…_that_would_wait_…` | 3½ | 1 | 85 s |
+//! | `an_overwrite_body_whose_wake_up_never_lands_…` | 2 | 1 | 55 s |
+//! | `a_delete_dropped_mid_walk_leaves_…_registered_dead_…` | 3 | 1 | 75 s |
+//! | `a_delete_whose_teardown_fails_…_registered_dead` | 0 | 1 | 15 s |
+//! | `an_overwrite_body_whose_size_read_fails_has_registered_…` | 2 | 1 | 55 s |
+//! | `an_overwrite_body_ended_by_shutdown_has_registered_…` | 3½ | 1 | 85 s |
+//! | `an_overwrite_body_whose_wake_up_never_lands_has_registered_…` | 2 | 1 | 55 s |
+//! | `a_delete_whose_deadline_passes_…` | 2 | 1 | 55 s |
+//! | `a_delete_at_shutdown_that_would_wait_…` | 1 | 1 | 35 s |
+//! | `a_delete_at_shutdown_that_fits_…` | 0 | 1 | 15 s |
+//! | `an_oversized_retirement_…` | 3 | 1 | 75 s |
+//! | `a_retirement_with_no_obj_ext_…` | 1 | 1 | 35 s |
+//! | `a_clean_up_with_a_handful_…_5_gib_…` | 3 | 1 | 75 s |
+//! | `a_clean_up_with_a_handful_…_smallest_…` | 3 | 1 | 75 s |
+//! | `a_delete_whose_index_grew_…` | 3 | 1 | 75 s |
+//! | `…_replaced_while_it_waits_…_on_this_replica` | 3 | 1 | 75 s |
+//! | `…_replaced_on_another_replica_…` | 2 | 1 | 55 s |
+//! | `an_overwrite_body_wakes_its_stream_…` | 3 | 1 | 75 s |
+//! | `the_orphan_sweep_runs_one_retirement_at_a_time` | 3 | 1 | 75 s |
+//! | `a_duplicate_run_of_an_overwrite_tail_…` | 5 | 1 | 115 s |
+//! | `a_delete_meeting_a_foreign_…` | 0 | 2 | 30 s |
+//! | `an_overwrite_body_meeting_a_foreign_…` | 3 | 2 | 90 s |
+//! | `a_sweep_retirement_meeting_a_foreign_…` | 2 | 1 | 55 s |
+//! | `a_delete_meeting_a_foreign_structural_index_…` | 2 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `an_overwrite_body_meeting_a_foreign_structural_index_…` | 3 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `a_sweep_retirement_meeting_a_foreign_structural_index_…` | 2 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `a_delete_whose_largest_index_is_any_one_…` | 2 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `a_delete_whose_size_read_meets_a_wrong_type_…` | 3 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `a_delete_whose_size_read_fails_permanently_…` | 1 per case | 5 | ≤ `CASE_BUDGET` + 75 s = 135 s |
+//! | `a_delete_whose_size_read_fails_…` | 1 | 1 | 35 s |
+//! | `a_retirement_ticks_the_retirement_series_…` | 1 | 1 | 35 s |
+//! | `a_delete_whose_retirement_panics_…` | 2 | 1 | 55 s |
+//! | `a_delete_whose_mapping_re_read_fails_…` | 2 | 1 | 55 s |
+//! | `two_deletes_of_one_layer_…` | 3 | 1 | 75 s |
+//! | `an_overwrite_body_whose_size_read_fails_…` | 4 | 1 | 95 s |
+//! | `a_sweep_retirement_whose_size_read_fails_…` | 4 | 1 | 95 s |
+//! | `a_sweep_retirement_cancelled_while_it_waits_…` | 2 | 1 | 55 s |
 //!
 //! The joins of spawned deletes that the test has already seen finish their
 //! wait are not counted: a hang there is the hang-killer's to report.
 //!
+//! The largest worst case, 135 s, is past nextest's global 120 s hang-killer,
+//! and a killed test prints nothing, so `.config/nextest.toml` raises the kill
+//! for every test of this module to 180 s (60 s × 3): 45 s over the largest
+//! row for the purge's answered round trips.
+//!
 //! Requires Valkey (`TEST_VALKEY_URL`) and the `test-fault-injection`
 //! feature: the module is compiled out without it.
 
+use std::cell::Cell;
 use std::collections::{BTreeSet, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface, StreamsInterface};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use live_edit::domain::types::ObjectState;
@@ -186,7 +220,7 @@ use crate::storage::structural_cache_retirement_test::{
 };
 
 /// The retirement allowance every store here runs at unless a test names
-/// another: the smallest pod's (`L / 500` at 2,709 MiB), so `P` = 64 and
+/// another: the smallest pod's (`L / 500` at 2,687 MiB), so `P` = 64 and
 /// `W` = 2.5 MiB. Checked against the pod memory plan by
 /// [`the_test_allowances_are_the_pod_memory_plans_at_the_smallest_and_the_reference_pod`].
 pub(crate) const R_REF: u64 = 5 * 1024 * 1024;
@@ -197,8 +231,8 @@ const R_REF_5_GIB: u64 = 10 * 1024 * 1024;
 
 /// Bound on every wait for a condition: unreachable on a healthy store. A
 /// test's worst case is its count of these, each a deadline rather than a
-/// sleep, and stays inside nextest's 120 s hang-killer (the module docs'
-/// table).
+/// sleep, plus its fixtures' drops, and stays inside the 180 s hang-killer
+/// `.config/nextest.toml` sets for this module (the module docs' table).
 pub(crate) const BUDGET: Duration = Duration::from_secs(20);
 
 /// The poll interval inside [`BUDGET`] — not an additional wait.
@@ -211,7 +245,10 @@ pub(crate) fn page_bytes() -> u64 {
     RetirementPaging::for_allowance(R_REF).page_bytes()
 }
 
-/// Poll `condition` until it holds, failing after [`BUDGET`].
+/// Poll `condition` until it holds, failing after [`BUDGET`]. The deadline
+/// bounds each `condition()` await too, so a condition stuck in an await (such
+/// as [`until_objects_gone`]'s whole-keyspace `SCAN`) fails at the deadline
+/// like one that never holds.
 pub(crate) async fn eventually<F, Fut>(what: &str, mut condition: F)
 where
     F: FnMut() -> Fut,
@@ -219,7 +256,15 @@ where
 {
     let deadline = Instant::now() + BUDGET;
     loop {
-        if condition().await {
+        let held = tokio::time::timeout_at(deadline, condition())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "timed out after {BUDGET:?} waiting for: {what} (the condition's own await \
+                     had not returned)"
+                )
+            });
+        if held {
             return;
         }
         assert!(
@@ -227,6 +272,35 @@ where
             "timed out after {BUDGET:?} waiting for: {what}"
         );
         tokio::time::sleep(POLL).await;
+    }
+}
+
+/// Bound on one case of a test that runs its cases at once (the
+/// [`ForeignIndex`] tests' `join_all`s): 3 × [`BUDGET`], the most bounded
+/// waits any one case has. It also bounds the case's unbounded awaits (its
+/// setup, its fixture writes, its assertions' reads), so a case stuck anywhere
+/// fails within it, naming its step in flight ([`within_case_budget`]).
+const CASE_BUDGET: Duration = Duration::from_secs(60);
+
+/// Run `case` under [`CASE_BUDGET`]; past it, panic naming the case `name` and
+/// the step `step` holds, which the case sets as it goes.
+///
+/// The case is pinned here, outside the `select!`, and the panic is raised
+/// while it is still alive: the case, and the [`Rig`] it owns, drop during the
+/// unwind, where the fixture's drop only reports a cleanup step it could not
+/// finish (on stderr), so this message is the one the test reports. A timeout
+/// that dropped the case first would drop its `Rig` on a thread not yet
+/// panicking, and a client the stuck case left broken would fail that drop
+/// with a panic of its own, replacing this message.
+async fn within_case_budget(name: &str, step: &Cell<&'static str>, case: impl Future<Output = ()>) {
+    let mut case = std::pin::pin!(case);
+    tokio::select! {
+        biased;
+        () = &mut case => {}
+        () = tokio::time::sleep(CASE_BUDGET) => panic!(
+            "{name}: the case did not finish within {CASE_BUDGET:?}; its step in flight: {}",
+            step.get()
+        ),
     }
 }
 
@@ -242,7 +316,12 @@ pub(crate) struct Rig {
 
 impl Rig {
     pub(crate) async fn new(label: &str) -> Self {
-        let tv = TestValkey::setup().await;
+        Self::on(TestValkey::setup().await, label).await
+    }
+
+    /// [`Self::new`] on the fixture `tv`, such as one connected through a
+    /// proxy.
+    pub(crate) async fn on(tv: TestValkey, label: &str) -> Self {
         let metrics = Arc::new(crate::common::metrics_scrape_only(label));
         tv.client()
             .install_observability_hooks(Arc::clone(&metrics))
@@ -270,6 +349,29 @@ impl Rig {
         LayerStore::new(self.tv.client().clone(), self.tv.key_schema().clone(), 4096)
             .with_metrics(Arc::clone(&self.metrics))
             .with_retirement_budget_bytes(r_ref)
+    }
+
+    /// [`Self::store`] with dead-object registration on, as `main.rs` wires
+    /// it when checkpointing is enabled against a real adapter.
+    pub(crate) fn registering_store(&self) -> LayerStore {
+        self.store().with_dead_object_registration(true)
+    }
+
+    /// Whether `oid` is a member of the checkpoint dead-object set
+    /// (`le:ckpt:{recon}:dead`).
+    pub(crate) async fn registered_dead(&self, oid: u64) -> bool {
+        use fred::interfaces::SortedSetsInterface;
+        let score: Option<f64> = self
+            .tv
+            .client()
+            .pool
+            .zscore(
+                self.tv.key_schema().checkpoint_reconcile_dead(),
+                oid.to_string(),
+            )
+            .await
+            .expect("ZSCORE of the dead-object set must succeed");
+        score.is_some()
     }
 
     /// The largest cardinality of `oid`'s five structural indices, as the
@@ -541,15 +643,20 @@ const EVERY_WAKE: usize = 4;
 /// tag, refs)` through a store of its own whose every wake-up of the old
 /// stream fails, so its cleanup body gives up with the old object fenced and
 /// unmapped. One bounded wait covers every body's last wake-up failure.
-/// Returns each old and new object with the store its body runs on.
-async fn stranded_overwrites(rig: &Rig, specs: &[(&str, u32, u32)]) -> Vec<(u64, u64, LayerStore)> {
+/// `store` builds each layer's store before its fault injector is installed
+/// (`|| rig.store()` for the default). Returns each old and new object with
+/// the store its body runs on.
+async fn stranded_overwrites(
+    rig: &Rig,
+    store: impl Fn() -> LayerStore,
+    specs: &[(&str, u32, u32)],
+) -> Vec<(u64, u64, LayerStore)> {
     let mut stranded = Vec::new();
     let mut every_wake = Vec::new();
     for &(layer, tag, refs) in specs {
         let wakes = failing_wakes(EVERY_WAKE);
-        let ls = rig
-            .store()
-            .with_create_layer_overwrite_xadd_fault_injector_for_test(Arc::clone(&wakes));
+        let ls =
+            store().with_create_layer_overwrite_xadd_fault_injector_for_test(Arc::clone(&wakes));
         let old = rig.layer(&ls, layer, tag, refs).await;
         let new = rig.layer(&ls, layer, tag + 1, 0).await;
         every_wake.push(wakes);
@@ -586,7 +693,7 @@ pub(crate) async fn until_objects_gone(rig: &Rig, oids: &[u64]) {
 
 /// An orphan of the generic arm: `layer`'s object with its mapping and
 /// layers-index member removed, as a `DeleteLayer` that stopped after its
-/// mapping delete leaves it.
+/// unmap leaves it (the unmap removes both in one step).
 async fn generic_orphan(rig: &Rig, ls: &LayerStore, layer: &str, tag: u32, refs: u32) -> u64 {
     let oid = rig.layer(ls, layer, tag, refs).await;
     let keys = rig.tv.key_schema();
@@ -668,7 +775,7 @@ fn assert_returned(budget: &MemoryBudget, context: &str) {
 
 /// The allowances the stores here run at are the pod memory plan's
 /// (`L / 500`, whole MiB): [`R_REF`] at the smallest limit the chart's
-/// configuration allows, 2,709 MiB, and [`R_REF_5_GIB`] at the 5 GiB
+/// configuration allows, 2,687 MiB, and [`R_REF_5_GIB`] at the 5 GiB
 /// reference limit. If the plan's retirement term or its minimum moves, this
 /// fails rather than leaving the tests below at allowances no pod has.
 #[test]
@@ -684,7 +791,7 @@ fn the_test_allowances_are_the_pod_memory_plans_at_the_smallest_and_the_referenc
     let minimum_mib = reference
         .minimum_limit_mib()
         .expect("the chart's configuration has a minimum limit");
-    assert_eq!(minimum_mib, 2_709, "the smallest pod this module names");
+    assert_eq!(minimum_mib, 2_687, "the smallest pod this module names");
     let smallest = PodMemoryPlan::derive(
         PodMemorySource::Fixed(minimum_mib * 1024 * 1024).resolve(),
         &PlanInputs::reference(),
@@ -726,6 +833,7 @@ async fn concurrent_retirements_on_every_route_hold_at_most_the_allowance_and_gi
     }
     let stranded: Vec<u64> = stranded_overwrites(
         &rig,
+        || rig.store(),
         &[("stranded-0", 300, REFS), ("stranded-1", 302, REFS)],
     )
     .await
@@ -1041,16 +1149,16 @@ async fn assert_header_kept_and_unbegun(rig: &Rig, oid: u64, context: &str) {
 /// an object with 10 indexed references under `layer` replaced on it, and a
 /// hold on the replaced object's size read armed while its body is parked —
 /// so the body is spawned and tracked but has not reached the allowance.
-/// Returns the store, the replaced object, and the hold once the body is
-/// parked on it.
+/// `store` is the store the gate is installed on (`rig.store()` for the
+/// default). Returns the store, the replaced object, and the hold once the
+/// body is parked on it.
 async fn body_parked_in_its_size_read(
     rig: &Rig,
+    store: LayerStore,
     layer: &str,
 ) -> (LayerStore, u64, Arc<SnapshotReadHold>) {
     let gate = Arc::new(tokio::sync::Barrier::new(2));
-    let ls = rig
-        .store()
-        .with_overwrite_cleanup_gate_for_test(Arc::clone(&gate));
+    let ls = store.with_overwrite_cleanup_gate_for_test(Arc::clone(&gate));
     let old = rig.layer(&ls, layer, 1, 10).await;
     rig.layer(&ls, layer, 2, 0).await;
     let hold = rig
@@ -1072,7 +1180,7 @@ async fn body_parked_in_its_size_read(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_body_reaching_the_allowance_after_shutdown_began_that_fits_completes_within_the_drain() {
     let rig = Rig::new("rref-late-fits").await;
-    let (ls, old, hold) = body_parked_in_its_size_read(&rig, "late-fits").await;
+    let (ls, old, hold) = body_parked_in_its_size_read(&rig, rig.store(), "late-fits").await;
     let ls = Arc::new(ls);
     let budget = Arc::clone(ls.retirement_budget());
 
@@ -1117,7 +1225,7 @@ async fn a_body_reaching_the_allowance_after_shutdown_began_that_fits_completes_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_body_reaching_the_allowance_after_shutdown_began_that_would_wait_ends_at_once() {
     let rig = Rig::new("rref-late-waits").await;
-    let (ls, old, hold) = body_parked_in_its_size_read(&rig, "late-waits").await;
+    let (ls, old, hold) = body_parked_in_its_size_read(&rig, rig.store(), "late-waits").await;
     let ls = Arc::new(ls);
     let budget = Arc::clone(ls.retirement_budget());
     let full = budget
@@ -1161,7 +1269,7 @@ async fn a_body_reaching_the_allowance_after_shutdown_began_that_would_wait_ends
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_overwrite_body_whose_wake_up_never_lands_reserves_nothing() {
     let rig = Rig::new("rref-no-wake").await;
-    let (old, _, ls) = stranded_overwrites(&rig, &[("never-woken", 1, 10)])
+    let (old, _, ls) = stranded_overwrites(&rig, || rig.store(), &[("never-woken", 1, 10)])
         .await
         .remove(0);
     tokio::time::timeout(BUDGET, ls.wait_for_cleanup(BUDGET * 2))
@@ -1177,6 +1285,207 @@ async fn an_overwrite_body_whose_wake_up_never_lands_reserves_nothing() {
     }
     assert_returned(ls.retirement_budget(), "after the body ended");
     assert!(rig.header_exists(old).await);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// b.g65 (D) — every retirement exit leaves the object registered dead
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// A retirement that stops part-way must still leave the object on the
+// checkpoint dead-object set (`le:ckpt:{recon}:dead`), the only record that its
+// backups owe a reclamation: `DeleteLayer` registers right after its unmap
+// (D.i) and the overwrite clean-up at its body's start (D.iii). Each test below
+// drives one exit of the fixture named, on a registering store.
+
+/// T1: a `DeleteLayer` dropped while its walk is parked (the RPC deadline or a
+/// client cancel mid-walk) leaves the object unmapped with its header standing
+/// AND registered dead; the orphan sweep that later retires the object
+/// registers nothing and leaves the registration in place. A client retry
+/// answers `NOT_FOUND` and the sweep never registers, so before (D) — which
+/// registered at the success exit only — this object's backups leaked for
+/// good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_dropped_mid_walk_leaves_its_object_registered_dead_through_the_sweep() {
+    let rig = Rig::new("rref-dead-dropped").await;
+    let ls = rig.registering_store();
+    let oid = rig.layer(&ls, "dead-dropped", 1, 10).await;
+    let injector = rig.injector();
+    let hold = hold_walk_at_obj_ext(&injector);
+
+    {
+        let delete = ls.delete_layer(&rig.session_id, "dead-dropped", rig.ext.clone());
+        tokio::pin!(delete);
+        tokio::select! {
+            result = &mut delete => panic!("the delete must park on its walk; got {result:?}"),
+            () = parked(&hold) => {}
+        }
+    }
+    hold.release();
+
+    assert!(
+        rig.mapping("dead-dropped").await.is_none() && rig.header_exists(oid).await,
+        "fixture: the dropped delete left the object unmapped with its header"
+    );
+    assert!(
+        rig.registered_dead(oid).await,
+        "the delete registered the object dead right after its unmap, before the walk it was \
+         dropped in"
+    );
+
+    rig.sweep_until(
+        rig.registering_store()
+            .with_orphan_sweep_grace(Duration::ZERO),
+        "the sweep retired the dropped delete's object",
+        || async { rig.object_keys(oid).await.is_empty() },
+    )
+    .await;
+    assert!(
+        rig.registered_dead(oid).await,
+        "and it is still registered once the sweep retired the object: nothing else would ever \
+         record it, so its backups are reclaimed only through this registration"
+    );
+}
+
+/// T2: a `DeleteLayer` whose teardown fails part-way (one attempt, a later
+/// teardown page failing after the header's `UNLINK`) answers `Aborted` with
+/// the header gone — no sweep can find the object again — and the object is
+/// registered dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_whose_teardown_fails_after_the_header_leaves_its_object_registered_dead() {
+    let rig = Rig::new("rref-dead-page-error").await;
+    let faults = Arc::new(Mutex::new(VecDeque::from([Some(fred::error::Error::new(
+        fred::error::ErrorKind::Timeout,
+        "injected teardown page failure",
+    ))])));
+    let ls = rig
+        .registering_store()
+        .with_update_layer_retry_max_attempts(1)
+        .with_retirement_teardown_faults_for_test(Arc::clone(&faults));
+    let oid = rig.layer(&ls, "dead-page-error", 1, 10).await;
+
+    let result = ls
+        .delete_layer(&rig.session_id, "dead-page-error", rig.ext.clone())
+        .await;
+
+    assert!(
+        matches!(result, Err(ServiceError::Aborted(_))),
+        "fixture: the injected page failure ends the one attempt; got {result:?}"
+    );
+    assert!(
+        !rig.header_exists(oid).await,
+        "fixture: the failure came after the header's UNLINK"
+    );
+    assert!(
+        rig.registered_dead(oid).await,
+        "the object is registered dead though the delete failed: with its header gone, this \
+         registration is the only record that its backups owe a reclamation"
+    );
+}
+
+/// T3: an overwrite clean-up body whose size read fails keeps the replaced
+/// object for the sweep — header kept, nothing begun — and the object is
+/// registered dead before any sweep runs: the body registers at its start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overwrite_body_whose_size_read_fails_has_registered_the_replaced_object_dead() {
+    let rig = Rig::new("rref-dead-body-size-read").await;
+    let gate = Arc::new(tokio::sync::Barrier::new(2));
+    let ls = rig
+        .registering_store()
+        .with_overwrite_cleanup_gate_for_test(Arc::clone(&gate));
+    let old = rig.layer(&ls, "dead-body-size-read", 1, 10).await;
+    rig.layer(&ls, "dead-body-size-read", 2, 0).await;
+    let injector = rig.injector();
+    injector.push(fred::error::Error::new(
+        fred::error::ErrorKind::Timeout,
+        "injected size-read timeout",
+    ));
+    tokio::time::timeout(BUDGET, gate.wait())
+        .await
+        .expect("the body is parked on its gate");
+    tokio::time::timeout(BUDGET, ls.wait_for_cleanup(BUDGET * 2))
+        .await
+        .expect("the body ends");
+
+    assert_eq!(
+        injector.remaining(),
+        0,
+        "fixture: the size read took the fault"
+    );
+    assert_header_kept_and_unbegun(&rig, old, "after the failed size read").await;
+    assert!(
+        rig.registered_dead(old).await,
+        "the replaced object is registered dead before any sweep: the body registered it at \
+         its start, not after the teardown it never reached"
+    );
+}
+
+/// T4: an overwrite body that reaches the allowance after shutdown began and
+/// would have to wait ends at once (`Closed`), the replaced object kept — and
+/// registered dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overwrite_body_ended_by_shutdown_has_registered_the_replaced_object_dead() {
+    let rig = Rig::new("rref-dead-late-waits").await;
+    let (ls, old, hold) =
+        body_parked_in_its_size_read(&rig, rig.registering_store(), "dead-late-waits").await;
+    let ls = Arc::new(ls);
+    let budget = Arc::clone(ls.retirement_budget());
+    let full = budget
+        .reserve(R_REF, None)
+        .await
+        .expect("the test takes the whole allowance");
+
+    let drain = tokio::spawn({
+        let ls = Arc::clone(&ls);
+        async move { ls.wait_for_cleanup(BUDGET).await }
+    });
+    eventually("shutdown reached the allowance", || async {
+        budget.waits_ended() || budget.is_closed()
+    })
+    .await;
+    hold.release();
+    tokio::time::timeout(BUDGET / 2, drain)
+        .await
+        .expect("the body that would wait ends at once")
+        .expect("the drain task must not panic");
+
+    assert_eq!(
+        rig.waits("cancelled"),
+        1.0,
+        "fixture: the body's reservation was refused at once"
+    );
+    assert_header_kept_and_unbegun(&rig, old, "the late body").await;
+    assert!(
+        rig.registered_dead(old).await,
+        "the replaced object is registered dead though the body ended before its teardown"
+    );
+    drop(full);
+}
+
+/// T5: an overwrite body whose wake-up of the old stream never lands leaves
+/// the replaced object fenced and unmapped for the sweep — and registered
+/// dead, with its header still standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overwrite_body_whose_wake_up_never_lands_has_registered_the_replaced_object_dead() {
+    let rig = Rig::new("rref-dead-no-wake").await;
+    let (old, _, ls) = stranded_overwrites(
+        &rig,
+        || rig.registering_store(),
+        &[("dead-never-woken", 1, 10)],
+    )
+    .await
+    .remove(0);
+    tokio::time::timeout(BUDGET, ls.wait_for_cleanup(BUDGET * 2))
+        .await
+        .expect("the body ends once its last wake-up failed");
+
+    assert!(
+        rig.header_exists(old).await,
+        "fixture: the header still stands"
+    );
+    assert!(
+        rig.registered_dead(old).await,
+        "the replaced object is registered dead though no wake-up landed"
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1553,7 +1862,7 @@ async fn a_clean_up_with_a_handful_of_large_values_runs_beside_a_large_one_at_th
     a_handful_runs_beside_a_thousand("rref-beside-5gib", R_REF_5_GIB).await;
 }
 
-/// F3, at the smallest pod's allowance (2,709 MiB, `R_ref` = 5 MiB): the
+/// F3, at the smallest pod's allowance (2,687 MiB, `R_ref` = 5 MiB): the
 /// same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clean_up_with_a_handful_of_large_values_runs_beside_a_large_one_at_the_smallest_pods_allowance(
@@ -1834,8 +2143,12 @@ async fn an_overwrite_body_wakes_its_stream_before_it_queues_for_the_allowance()
 async fn the_orphan_sweep_runs_one_retirement_at_a_time() {
     const REFS: u32 = 10;
     let rig = Rig::new("rref-sweep-serial").await;
-    let stranded =
-        stranded_overwrites(&rig, &[("stranded-a", 1, REFS), ("stranded-b", 3, REFS)]).await;
+    let stranded = stranded_overwrites(
+        &rig,
+        || rig.store(),
+        &[("stranded-a", 1, REFS), ("stranded-b", 3, REFS)],
+    )
+    .await;
     let (first, second) = (stranded[0].0, stranded[1].0);
     // Each object's charge, read while its indices stand: once the sweep has
     // retired it, its indices read empty.
@@ -2253,12 +2566,13 @@ async fn assert_met_foreign_index(
 /// D4-T15, `DeleteLayer`: a foreign `obj:secs`, `obj:dels`, `obj:chs`,
 /// `obj:flds` or `obj:tss` meets the size read, which counts it under the
 /// index's own family and WARNs; the delete reserves the full page and goes
-/// on past it: the mapping is deleted, and with a set index the release is
-/// scheduled (with a value index the walk fails on it, and none is). The
-/// teardown then stops at the foreign index after its first `UNLINK` (b.yz5:
-/// the index's rows stay behind), so the delete answers `INTERNAL` and never
-/// reaches its layers-index `SREM`: the member stays. One delete per index,
-/// all at once.
+/// on past it: its unmap removes the mapping and the layers-index member
+/// together, and with a set index the release is scheduled (with a value
+/// index the walk fails on it, and none is). The teardown then stops at the
+/// foreign index after its first `UNLINK` (b.yz5: the index's rows stay
+/// behind), so the delete answers `INTERNAL` with the layer already
+/// unmapped: neither the mapping nor the member is left. One delete per
+/// index, all at once.
 ///
 /// The `key_family` tick is the assertion a size read that counts no index
 /// fails: it reads 0 for a set index there, and 1 for a value index (the
@@ -2267,41 +2581,55 @@ async fn assert_met_foreign_index(
 async fn a_delete_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there(
 ) {
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-foreign-index-delete").await;
-        let ls = rig.store();
-        let oid = rig
-            .layer(&ls, "foreign-index", 1, FOREIGN_INDEX_REFS)
-            .await;
-        let key = index.key(&rig, oid);
-        make_foreign(&rig, &key).await;
-        let injector = rig.injector();
-        let walk = hold_walk_at_header(&injector);
-
-        let delete = ls.delete_layer(&rig.session_id, "foreign-index", rig.ext.clone());
-        tokio::pin!(delete);
-        tokio::select! {
-            result = &mut delete => panic!("{index:?}: the delete must park on its walk; got {result:?}"),
-            () = parked(&walk) => {}
-        }
-        let reserved = ls.retirement_budget().reserved_bytes();
-        walk.release();
-        let answer = delete.await;
-
         let context = format!("{index:?}, delete");
-        assert!(
-            matches!(answer, Err(ServiceError::Internal(_))),
-            "{context}: the teardown's refused index page answers INTERNAL; got {answer:?}"
-        );
-        assert_eq!(
-            rig.mapping("foreign-index").await,
-            None,
-            "{context}: the delete went on past its size read and deleted the mapping"
-        );
-        assert!(
-            rig.indexed("foreign-index").await,
-            "{context}: the delete stopped before its layers-index SREM, so the member stays"
-        );
-        assert_met_foreign_index(&rig, &injector, index, oid, &key, reserved, &context).await;
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-foreign-index-delete").await;
+            let ls = rig.store();
+            step.set("creating the layer");
+            let oid = rig
+                .layer(&ls, "foreign-index", 1, FOREIGN_INDEX_REFS)
+                .await;
+            let key = index.key(&rig, oid);
+            step.set("making the index foreign");
+            make_foreign(&rig, &key).await;
+            let injector = rig.injector();
+            let walk = hold_walk_at_header(&injector);
+
+            step.set("the delete parking on its walk");
+            let delete = ls.delete_layer(&rig.session_id, "foreign-index", rig.ext.clone());
+            tokio::pin!(delete);
+            tokio::select! {
+                result = &mut delete => panic!("{context}: the delete must park on its walk; got {result:?}"),
+                () = parked(&walk) => {}
+            }
+            let reserved = ls.retirement_budget().reserved_bytes();
+            walk.release();
+            step.set("the delete answering after its walk's release");
+            let answer = tokio::time::timeout(BUDGET, delete)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: the delete did not answer within {BUDGET:?} of its walk's release")
+                });
+
+            step.set("checking what the delete left");
+            assert!(
+                matches!(answer, Err(ServiceError::Internal(_))),
+                "{context}: the teardown's refused index page answers INTERNAL; got {answer:?}"
+            );
+            assert_eq!(
+                rig.mapping("foreign-index").await,
+                None,
+                "{context}: the delete went on past its size read and unmapped the layer"
+            );
+            assert!(
+                !rig.indexed("foreign-index").await,
+                "{context}: the unmap removed the layers-index member with the mapping, before \
+                 the teardown stopped"
+            );
+            assert_met_foreign_index(&rig, &injector, index, oid, &key, reserved, &context).await;
+        })
+        .await;
     }))
     .await;
 }
@@ -2315,30 +2643,40 @@ async fn a_delete_meeting_a_foreign_structural_index_counts_it_under_its_family_
 async fn an_overwrite_body_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there(
 ) {
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-foreign-index-overwrite").await;
-        let gate = Arc::new(tokio::sync::Barrier::new(2));
-        let ls = rig
-            .store()
-            .with_overwrite_cleanup_gate_for_test(Arc::clone(&gate));
-        let old = rig.layer(&ls, "foreign-index", 1, FOREIGN_INDEX_REFS).await;
-        rig.layer(&ls, "foreign-index", 2, 0).await;
-        let key = index.key(&rig, old);
-        make_foreign(&rig, &key).await;
-        let injector = rig.injector();
-        let walk = hold_walk_at_header(&injector);
-
-        tokio::time::timeout(BUDGET, gate.wait())
-            .await
-            .expect("the body is parked on its gate");
-        parked(&walk).await;
-        let reserved = ls.retirement_budget().reserved_bytes();
-        walk.release();
-        tokio::time::timeout(BUDGET, ls.wait_for_cleanup(BUDGET * 2))
-            .await
-            .expect("the body ends");
-
         let context = format!("{index:?}, overwrite body");
-        assert_met_foreign_index(&rig, &injector, index, old, &key, reserved, &context).await;
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-foreign-index-overwrite").await;
+            let gate = Arc::new(tokio::sync::Barrier::new(2));
+            let ls = rig
+                .store()
+                .with_overwrite_cleanup_gate_for_test(Arc::clone(&gate));
+            step.set("creating and overwriting the layer");
+            let old = rig.layer(&ls, "foreign-index", 1, FOREIGN_INDEX_REFS).await;
+            rig.layer(&ls, "foreign-index", 2, 0).await;
+            let key = index.key(&rig, old);
+            step.set("making the index foreign");
+            make_foreign(&rig, &key).await;
+            let injector = rig.injector();
+            let walk = hold_walk_at_header(&injector);
+
+            step.set("the body reaching its gate");
+            tokio::time::timeout(BUDGET, gate.wait())
+                .await
+                .expect("the body is parked on its gate");
+            step.set("the body parking on its walk");
+            parked(&walk).await;
+            let reserved = ls.retirement_budget().reserved_bytes();
+            walk.release();
+            step.set("the body ending after its walk's release");
+            tokio::time::timeout(BUDGET, ls.wait_for_cleanup(BUDGET * 2))
+                .await
+                .expect("the body ends");
+
+            step.set("checking what the body left");
+            assert_met_foreign_index(&rig, &injector, index, old, &key, reserved, &context).await;
+        })
+        .await;
     }))
     .await;
 }
@@ -2351,37 +2689,45 @@ async fn an_overwrite_body_meeting_a_foreign_structural_index_counts_it_under_it
 async fn a_sweep_retirement_meeting_a_foreign_structural_index_counts_it_under_its_family_reserves_the_full_page_and_stops_its_teardown_there(
 ) {
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-foreign-index-sweep").await;
-        let ls = rig.store();
-        let oid = generic_orphan(&rig, &ls, "foreign-index", 1, FOREIGN_INDEX_REFS).await;
-        let key = index.key(&rig, oid);
-        make_foreign(&rig, &key).await;
-        let injector = rig.injector();
-        let walk = hold_walk_at_header(&injector);
-        let sweep = rig.store().with_orphan_sweep_grace(Duration::ZERO);
-        let budget = Arc::clone(sweep.retirement_budget());
-
-        // Read the reservation once the walk parks, then let it go on.
-        let reserved = std::sync::OnceLock::new();
-        rig.sweep_until(
-            sweep,
-            "the walk parked, then the teardown took the header",
-            || async {
-                if walk.is_parked() {
-                    reserved.get_or_init(|| {
-                        let held = budget.reserved_bytes();
-                        walk.release();
-                        held
-                    });
-                }
-                reserved.get().is_some() && !rig.header_exists(oid).await
-            },
-        )
-        .await;
-        let reserved = *reserved.get().expect("the walk parked");
-
         let context = format!("{index:?}, sweep");
-        assert_met_foreign_index(&rig, &injector, index, oid, &key, reserved, &context).await;
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-foreign-index-sweep").await;
+            let ls = rig.store();
+            step.set("creating the orphan");
+            let oid = generic_orphan(&rig, &ls, "foreign-index", 1, FOREIGN_INDEX_REFS).await;
+            let key = index.key(&rig, oid);
+            step.set("making the index foreign");
+            make_foreign(&rig, &key).await;
+            let injector = rig.injector();
+            let walk = hold_walk_at_header(&injector);
+            let sweep = rig.store().with_orphan_sweep_grace(Duration::ZERO);
+            let budget = Arc::clone(sweep.retirement_budget());
+
+            // Read the reservation once the walk parks, then let it go on.
+            step.set("the sweep parking on its walk, then its teardown taking the header");
+            let reserved = std::sync::OnceLock::new();
+            rig.sweep_until(
+                sweep,
+                "the walk parked, then the teardown took the header",
+                || async {
+                    if walk.is_parked() {
+                        reserved.get_or_init(|| {
+                            let held = budget.reserved_bytes();
+                            walk.release();
+                            held
+                        });
+                    }
+                    reserved.get().is_some() && !rig.header_exists(oid).await
+                },
+            )
+            .await;
+            let reserved = *reserved.get().expect("the walk parked");
+
+            step.set("checking what the sweep left");
+            assert_met_foreign_index(&rig, &injector, index, oid, &key, reserved, &context).await;
+        })
+        .await;
     }))
     .await;
 }
@@ -2444,35 +2790,44 @@ async fn a_delete_whose_largest_index_is_any_one_of_the_five_reserves_its_page_o
         "fixture: the seeded page is below the full page and above the empty object's"
     );
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-largest-index").await;
-        let ls = rig.store();
-        let oid = rig
-            .layer(&ls, "largest-index", 1, FOREIGN_INDEX_REFS)
-            .await;
-        index.seed(&rig, oid, SEEDED_MEMBERS).await;
-        let injector = rig.injector();
-        let walk = hold_walk_at_header(&injector);
+        let context = format!("{index:?}");
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-largest-index").await;
+            let ls = rig.store();
+            step.set("creating the layer");
+            let oid = rig
+                .layer(&ls, "largest-index", 1, FOREIGN_INDEX_REFS)
+                .await;
+            step.set("seeding the index");
+            index.seed(&rig, oid, SEEDED_MEMBERS).await;
+            let injector = rig.injector();
+            let walk = hold_walk_at_header(&injector);
 
-        let reserved = {
-            let delete = ls.delete_layer(&rig.session_id, "largest-index", rig.ext.clone());
-            tokio::pin!(delete);
-            tokio::select! {
-                result = &mut delete => panic!("{index:?}: the delete must park on its walk; got {result:?}"),
-                () = parked(&walk) => {}
-            }
-            ls.retirement_budget().reserved_bytes()
-        };
-        walk.release();
-        eventually("the dropped delete's reservation given back", || async {
-            ls.retirement_budget().reserved_bytes() == 0
+            step.set("the delete parking on its walk");
+            let reserved = {
+                let delete = ls.delete_layer(&rig.session_id, "largest-index", rig.ext.clone());
+                tokio::pin!(delete);
+                tokio::select! {
+                    result = &mut delete => panic!("{context}: the delete must park on its walk; got {result:?}"),
+                    () = parked(&walk) => {}
+                }
+                ls.retirement_budget().reserved_bytes()
+            };
+            walk.release();
+            step.set("the dropped delete giving its reservation back");
+            eventually("the dropped delete's reservation given back", || async {
+                ls.retirement_budget().reserved_bytes() == 0
+            })
+            .await;
+
+            assert_eq!(
+                reserved, seeded_charge,
+                "{context}: the page is one member past the {SEEDED_MEMBERS} members of the \
+                 largest index"
+            );
         })
         .await;
-
-        assert_eq!(
-            reserved, seeded_charge,
-            "{index:?}: the page is one member past the {SEEDED_MEMBERS} members of the largest \
-             index"
-        );
     }))
     .await;
 }
@@ -2504,60 +2859,75 @@ async fn a_delete_whose_size_read_meets_a_wrong_type_on_one_index_count_counts_i
         u64::from(FOREIGN_INDEX_REFS),
     );
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-count-wrongtype").await;
-        let ls = rig.store();
-        let oid = rig
-            .layer(&ls, "count-wrongtype", 1, FOREIGN_INDEX_REFS)
-            .await;
-        let injector = rig.injector();
-        injector.push_at(
-            ObjectSnapshotReadFaultTarget::retirement_size_read(index.family()),
-            wrongtype(),
-        );
-        let walk = hold_walk_at_header(&injector);
-
-        let delete = ls.delete_layer(&rig.session_id, "count-wrongtype", rig.ext.clone());
-        tokio::pin!(delete);
-        tokio::select! {
-            result = &mut delete => panic!("{index:?}: the delete must park on its walk; got {result:?}"),
-            () = parked(&walk) => {}
-        }
-        let reserved = ls.retirement_budget().reserved_bytes();
-        walk.release();
-        let answer = delete.await;
-
-        assert_eq!(
-            (injector.remaining(), injector.holds_remaining()),
-            (0, 0),
-            "{index:?}: fixture: the size read took the error and both holds were taken"
-        );
-        assert!(
-            answer.is_ok(),
-            "{index:?}: the delete goes on and succeeds; got {answer:?}"
-        );
-        for &cell in live_edit::observability::metrics::SNAPSHOT_READ_KEY_FAMILIES {
-            assert_eq!(
-                rig.type_errors(cell),
-                if cell == index.family() { 1.0 } else { 0.0 },
-                "{index:?}: the ticks on key_family={cell}"
+        let context = format!("{index:?}");
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-count-wrongtype").await;
+            let ls = rig.store();
+            step.set("creating the layer");
+            let oid = rig
+                .layer(&ls, "count-wrongtype", 1, FOREIGN_INDEX_REFS)
+                .await;
+            let injector = rig.injector();
+            injector.push_at(
+                ObjectSnapshotReadFaultTarget::retirement_size_read(index.family()),
+                wrongtype(),
             );
-        }
-        assert_eq!(
-            reserved, full_charge,
-            "{index:?}: the count failed, so the full page was reserved"
-        );
-        assert_eq!(
-            rig.ext.pending_count(),
-            FOREIGN_INDEX_REFS as usize,
-            "{index:?}: the release was scheduled"
-        );
-        assert_eq!(rig.mapping("count-wrongtype").await, None);
-        assert!(!rig.indexed("count-wrongtype").await);
-        assert_eq!(
-            rig.object_keys(oid).await,
-            Vec::<String>::new(),
-            "{index:?}: the object is gone"
-        );
+            let walk = hold_walk_at_header(&injector);
+
+            step.set("the delete parking on its walk");
+            let delete = ls.delete_layer(&rig.session_id, "count-wrongtype", rig.ext.clone());
+            tokio::pin!(delete);
+            tokio::select! {
+                result = &mut delete => panic!("{context}: the delete must park on its walk; got {result:?}"),
+                () = parked(&walk) => {}
+            }
+            let reserved = ls.retirement_budget().reserved_bytes();
+            walk.release();
+            step.set("the delete answering after its walk's release");
+            let answer = tokio::time::timeout(BUDGET, delete)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: the delete did not answer within {BUDGET:?} of its walk's release")
+                });
+
+            step.set("checking what the delete left");
+            assert_eq!(
+                (injector.remaining(), injector.holds_remaining()),
+                (0, 0),
+                "{context}: fixture: the size read took the error and both holds were taken"
+            );
+            assert!(
+                answer.is_ok(),
+                "{context}: the delete goes on and succeeds; got {answer:?}"
+            );
+            for &cell in live_edit::observability::metrics::SNAPSHOT_READ_KEY_FAMILIES {
+                assert_eq!(
+                    rig.type_errors(cell),
+                    if cell == index.family() { 1.0 } else { 0.0 },
+                    "{context}: the ticks on key_family={cell}"
+                );
+            }
+            assert_eq!(
+                reserved, full_charge,
+                "{context}: the count failed, so the full page was reserved"
+            );
+            assert_eq!(
+                rig.ext.pending_count(),
+                FOREIGN_INDEX_REFS as usize,
+                "{context}: the release was scheduled"
+            );
+            assert_eq!(rig.mapping("count-wrongtype").await, None);
+            assert!(!rig.indexed("count-wrongtype").await);
+            step.set("scanning for the object's keys");
+            let left = tokio::time::timeout(BUDGET, rig.object_keys(oid))
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: the scan for the object's keys did not finish within {BUDGET:?}")
+                });
+            assert_eq!(left, Vec::<String>::new(), "{context}: the object is gone");
+        })
+        .await;
     }))
     .await;
 }
@@ -2576,49 +2946,63 @@ async fn a_delete_whose_size_read_meets_a_wrong_type_on_one_index_count_counts_i
 async fn a_delete_whose_size_read_fails_permanently_on_one_index_count_answers_internal_and_changes_nothing(
 ) {
     futures::future::join_all(ForeignIndex::ALL.map(|index| async move {
-        let rig = Rig::new("rref-count-refused").await;
-        let ls = rig.store();
-        let oid = rig.layer(&ls, "count-refused", 1, FOREIGN_INDEX_REFS).await;
-        let injector = rig.injector();
-        injector.push_at(
-            ObjectSnapshotReadFaultTarget::retirement_size_read(index.family()),
-            fred::error::Error::new(fred::error::ErrorKind::Protocol, "injected protocol error"),
-        );
-
-        let answer = ls
-            .delete_layer(&rig.session_id, "count-refused", rig.ext.clone())
-            .await;
-
-        assert_eq!(
-            injector.remaining(),
-            0,
-            "{index:?}: fixture: the size read took the error"
-        );
-        assert!(
-            matches!(answer, Err(ServiceError::Internal(_))),
-            "{index:?}: a permanent size-read failure answers INTERNAL; got {answer:?}"
-        );
-        assert_eq!(
-            rig.sample(
-                "live_edit_snapshot_read_refused_total",
-                &[("kind", "protocol")]
-            ),
-            Some(1.0),
-            "{index:?}: counted once as a protocol refusal"
-        );
-        for &cell in live_edit::observability::metrics::SNAPSHOT_READ_KEY_FAMILIES {
-            assert_eq!(rig.type_errors(cell), 0.0, "{index:?}: no type error");
-        }
-        assert_eq!(rig.mapping("count-refused").await, Some(oid.to_string()));
-        assert!(rig.indexed("count-refused").await);
-        assert!(rig.header_exists(oid).await, "{index:?}: the object stands");
-        for outcome in ["immediate", "waited", "cancelled"] {
-            assert_eq!(
-                rig.waits(outcome),
-                0.0,
-                "{index:?}: {outcome}: nothing was reserved"
+        let context = format!("{index:?}");
+        let step = Cell::new("setting up the rig");
+        within_case_budget(&context, &step, async {
+            let rig = Rig::new("rref-count-refused").await;
+            let ls = rig.store();
+            step.set("creating the layer");
+            let oid = rig.layer(&ls, "count-refused", 1, FOREIGN_INDEX_REFS).await;
+            let injector = rig.injector();
+            injector.push_at(
+                ObjectSnapshotReadFaultTarget::retirement_size_read(index.family()),
+                fred::error::Error::new(
+                    fred::error::ErrorKind::Protocol,
+                    "injected protocol error",
+                ),
             );
-        }
+
+            step.set("the delete answering its size read's failure");
+            let answer = tokio::time::timeout(
+                BUDGET,
+                ls.delete_layer(&rig.session_id, "count-refused", rig.ext.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{context}: the delete did not answer within {BUDGET:?}"));
+
+            step.set("checking what the delete left");
+            assert_eq!(
+                injector.remaining(),
+                0,
+                "{context}: fixture: the size read took the error"
+            );
+            assert!(
+                matches!(answer, Err(ServiceError::Internal(_))),
+                "{context}: a permanent size-read failure answers INTERNAL; got {answer:?}"
+            );
+            assert_eq!(
+                rig.sample(
+                    "live_edit_snapshot_read_refused_total",
+                    &[("kind", "protocol")]
+                ),
+                Some(1.0),
+                "{context}: counted once as a protocol refusal"
+            );
+            for &cell in live_edit::observability::metrics::SNAPSHOT_READ_KEY_FAMILIES {
+                assert_eq!(rig.type_errors(cell), 0.0, "{context}: no type error");
+            }
+            assert_eq!(rig.mapping("count-refused").await, Some(oid.to_string()));
+            assert!(rig.indexed("count-refused").await);
+            assert!(rig.header_exists(oid).await, "{context}: the object stands");
+            for outcome in ["immediate", "waited", "cancelled"] {
+                assert_eq!(
+                    rig.waits(outcome),
+                    0.0,
+                    "{context}: {outcome}: nothing was reserved"
+                );
+            }
+        })
+        .await;
     }))
     .await;
 }
@@ -2834,6 +3218,30 @@ impl ExternalValueStore for PanickingReleaseStore {
         self.inner.probe_values(hashes).await
     }
 
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<live_edit::storage::external_values::ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
+    }
+
     async fn process_pending(
         &self,
         policy: &live_edit::storage::external_values::GcPolicy,
@@ -2957,7 +3365,7 @@ async fn a_delete_whose_mapping_re_read_fails_changes_nothing_and_a_retry_works(
     assert_eq!(
         rig.mapping("re-read").await.as_deref(),
         Some(CORRUPT),
-        "nothing was written: the retry loop's mapping DEL never ran"
+        "nothing was written: the retry loop's unmap never ran"
     );
     assert!(rig.indexed("re-read").await && rig.header_exists(oid).await);
     assert!(
@@ -2989,8 +3397,8 @@ async fn a_delete_whose_mapping_re_read_fails_changes_nothing_and_a_retry_works(
 /// allowance together (the test holds it; two reservations of `W` + 10 KiB
 /// do not fit side by side). The first is granted, deletes the layer and
 /// gives its reservation back; the second, granted then, re-reads a mapping
-/// that is gone and goes on for the same object, as a mapping gone before
-/// the retry loop's `DEL` always has: both answer OK, and the object is gone.
+/// that is gone and goes on for the same object, its unmap answering
+/// `ABSENT`: both answer OK, and the object is gone.
 /// Fails on a nil re-read answered `NOT_FOUND`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_deletes_of_one_layer_waiting_together_both_answer_ok() {

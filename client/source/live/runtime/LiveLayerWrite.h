@@ -148,12 +148,15 @@ public:
 // The layer owner must enforce FIFO/incarnation/recovery and retain authored
 // intent after OUTCOME_UNKNOWN; request release is not recovery/discard consent.
 // A nonempty operationId is sent in the header; only an owner re-sending the
-// same bytes under the same ID after an unknown outcome may reuse it.
+// same bytes under the same ID after an unknown outcome may reuse it. The call
+// holds `slot`, a slot of the endpoint's call budget its owner obtained; without
+// one it takes a free call unit, or is refused RESOURCE_EXHAUSTED before
+// anything issues.
 std::shared_ptr<Request> submitLayerCreate(Runtime& runtime, OmniUsdLiveEndpoint endpoint, std::string_view sessionId,
     std::string_view layerName, std::string_view bytes, UnaryCallback<rpc::CreateLayerResponse> callback,
     uint32_t timeoutMs = 0, LayerWriteTransport* transport = nullptr,
     std::shared_ptr<LayerWriteReceipt> receipt = nullptr, LayerWriteDiagnostics diagnostics = {},
-    std::string_view operationId = {});
+    std::string_view operationId = {}, CallSlot slot = {});
 // A supplied reservation on the same endpoint, at least layerUpdateCharge of
 // the submission, backs its wire buffers instead of a new reservation, so the
 // submission cannot be refused for pending bytes. The request shares it. A
@@ -167,7 +170,7 @@ std::shared_ptr<Request> submitLayerUpdate(Runtime& runtime, OmniUsdLiveEndpoint
     UnaryCallback<rpc::UpdateLayerResponse> callback, uint32_t timeoutMs = 0, LayerWriteTransport* transport = nullptr,
     std::shared_ptr<LayerWriteReceipt> receipt = nullptr, LayerWriteDiagnostics diagnostics = {},
     std::shared_ptr<PendingBytes> reservation = nullptr, std::string_view operationId = {},
-    const std::string* previousOperationId = nullptr, bool noWait = false);
+    const std::string* previousOperationId = nullptr, bool noWait = false, CallSlot slot = {});
 // An upper bound on the encoded UpdateLayer header of this identity and
 // writer, for any object ID, timestamp, operation ID and predecessor.
 size_t layerUpdateHeaderBound(std::string_view sessionId, std::string_view layerName, std::string_view writerId);

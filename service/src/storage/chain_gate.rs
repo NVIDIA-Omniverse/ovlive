@@ -24,23 +24,35 @@
 //! — is that predecessor, or is its own operation (it then answers
 //! `ALREADY_COMMITTED`). The `UpdateLayer` handler runs the gate after the
 //! call's content is read and before its parse, so a waiting call holds only
-//! its upload reservation (its fixed charge plus its content): no processing
-//! charge or overflow slot, no external-value reference, no per-object writer
-//! permit, no pool slot. A predecessor therefore never waits for anything a
+//! its upload reservation (its fixed charge plus its content, in `B`): no
+//! processing charge or overflow slot, no external-value reference, no
+//! per-object writer permit, no pool slot. A chained call's receive growth
+//! never takes the overflow slot, as an unchained call's may, so it cannot
+//! arrive here holding it. A predecessor therefore never waits for anything a
 //! waiting successor holds, except room in the upload budget `B`
 //! (`grpc::upload_admission`). A predecessor that finds it full at admission
 //! waits at most the admission wait and is then refused `UPLOAD_CAPACITY`,
-//! applying nothing (a receive-growth charge that does not fit is refused at
-//! once). Past admission, a predecessor's processing step is never refused
-//! for capacity: it waits, up to its RPC deadline, for room in `B` (which
-//! waiting successors hold) or for the overflow slot. That slot's holder may
-//! itself be waiting at the external-value release budget (SDD §5.4; the
+//! applying nothing (a receive growth that fits neither `B` nor, for an
+//! unchained predecessor, the free slot is refused at once). Past admission,
+//! a predecessor's processing step is never refused for capacity: it waits,
+//! up to its RPC deadline, for room in `B` (which waiting successors hold) or
+//! for the overflow slot. That slot's holder may itself be waiting outside
+//! the upload gate: at the external-value release budget (SDD §5.4; the
 //! `UpdateLayer` and `CreateLayer` handlers await it while holding their
-//! processing charge, and so the slot if they run in it), so the predecessor,
-//! and the chain waiting behind it, can wait up to that holder's
-//! release-budget wait. It is still deadlock-free: there the slot's holder
-//! waits only on GC — the GC loop bringing the release total below the
-//! budget — never on a chained call.
+//! processing charge, and so the slot if they run in it), or, when it took
+//! the slot while still receiving, on its own client, up to its RPC deadline.
+//! So the predecessor, and the chain waiting behind it, can wait up to that
+//! holder's release-budget wait or its client's pace. It is still
+//! deadlock-free: there the slot's holder waits only on GC — the GC loop
+//! bringing the release total below the budget — or on its own client, never
+//! on a chained call. One edge runs back to the upload gate: a holder still
+//! receiving waits for its client's DATA, which flows through a connection
+//! window that admission waiters share, and they wait on `B`. The admission
+//! wait (`LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS`, 2 s by default) bounds that
+//! edge — each waiter is granted or refused by then, and a refused waiter's
+//! stream gives its window back — so a slot waiter, and the chain behind it,
+//! can also wait up to that, and no cycle holds beyond it
+//! (`grpc::upload_admission`, *Waiting*).
 //!
 //! # No call tracking
 //!

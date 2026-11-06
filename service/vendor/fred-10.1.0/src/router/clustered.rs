@@ -319,7 +319,7 @@ pub fn process_response_frame(
   #[cfg(feature = "partial-tracing")]
   let _ = command.traces.network.take();
 
-  if frame.is_redirection() {
+  if crate::live_edit::redirect::is_redirection(&frame) { // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
     redirect_command(inner, &conn.server, command, frame);
     return Ok(());
   }
@@ -459,7 +459,7 @@ pub async fn cluster_slots_backchannel(
         )
         .await?;
         let host = transport.default_host.clone();
-        inner.update_backchannel(transport).await;
+        crate::live_edit::end_sync_backchannel(inner, transport); // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
 
         (frame, host)
       } else {
@@ -475,7 +475,7 @@ pub async fn cluster_slots_backchannel(
       )
       .await?;
       let host = transport.default_host.clone();
-      inner.update_backchannel(transport).await;
+      crate::live_edit::end_sync_backchannel(inner, transport); // live-edit patch: see vendor/fred-10.1.0.SOURCE.md
 
       (frame, host)
     };

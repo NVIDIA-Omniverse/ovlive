@@ -45,6 +45,15 @@
 -- An `XX`/plain ZADD would refresh the score every pass and nothing would ever
 -- expire.
 --
+-- One exception lives outside this script, and it only ever moves a score
+-- LATER (b.g65): the clean-up re-dates a member it claimed and deferred for a
+-- reason of its own to the current `TIME` with `ZADD XX GT` — a tombstone a
+-- writer re-armed (`recon_ext_commit.lua`), and a tombstone the collect found
+-- still live in Valkey or an orphan or dead-object member its phase could not
+-- finish (`recon_redate.lua`). `XX` never creates a member and
+-- `GT` never lowers a score, so a re-dated member is claimable later than this
+-- script alone would allow, never earlier: the grace argument above only gains.
+--
 -- ── Valkey-side TIME ──────────────────────────────────────────────────────
 --
 -- Same discipline, and the same reason, as `gc_claim_pending.lua` (b.u96 item
@@ -63,7 +72,8 @@
 -- ── Contract ─────────────────────────────────────────────────────────────
 --
 -- KEYS:
---   [1]  zset_key    (le:ckpt:{recon}:orphans or le:ckpt:{recon}:tomb)
+--   [1]  zset_key    (le:ckpt:{recon}:orphans, le:ckpt:{recon}:tomb or
+--                     le:ckpt:{recon}:dead)
 --
 -- ARGV:
 --   [1]  grace_ms    (milliseconds a candidate must have been registered for

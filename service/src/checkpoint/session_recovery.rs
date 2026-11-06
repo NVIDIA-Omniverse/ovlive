@@ -60,7 +60,8 @@
 //! `AlreadyPresent` outcome is a new value distinct to session recovery: it
 //! ticks the `already_present` cell on the recovery metric and signals to
 //! the caller that the underlying state was found on the pre-acquire (or
-//! post-acquire) `EXISTS` check, with no apply attempt issued. Callers
+//! post-acquire) `EXISTS` check, with no apply attempt issued, or by the
+//! apply's conditional record step, which then wrote nothing. Callers
 //! handle `AlreadyPresent` and `Recovered` the same way — retry the
 //! original lookup — but the metric distinction lets operators reason
 //! about the proportion of admission-contended attempts vs. genuine
@@ -72,8 +73,9 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use fred::interfaces::KeysInterface;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::session::apply_session_checkpoint;
+use crate::checkpoint::session::{apply_session_checkpoint, SessionApplied, SessionApplySteps};
 use crate::checkpoint::session_payload::SessionCheckpoint;
 use crate::checkpoint::store::{CheckpointError, CheckpointStore};
 use crate::config::Config;
@@ -88,15 +90,19 @@ use crate::storage::keys::KeySchema;
 ///
 /// `NoCheckpoint` — recovery cannot proceed because no checkpoint exists
 /// for this `session_id`, or because the session carries a deletion marker
-/// (it was deleted and its checkpoint may still await its tombstone), or
+/// (it was deleted and its checkpoint may still await its tombstone; read
+/// before the fetch, after it, and by the apply's record step), or
 /// because checkpointing is disabled. The caller SHOULD surface `NotFound` to its
 /// client (matches the Epic-1 layer hook's `NotRecoverable` arm under the
 /// `Ok(None)` branch from the adapter).
 ///
 /// `AlreadyPresent` — the pre-acquire (or post-acquire) `EXISTS
-/// le:{sid}:sess` check returned `true`. Either a peer replica landed the
+/// le:{sid}:sess` check returned `true`, or the apply's record step found the
+/// record present and wrote nothing. Either a peer replica landed the
 /// recovery first, or the previous admission-mutex holder on this replica
-/// did. The caller SHOULD retry its original lookup; no apply pipeline ran.
+/// did, or an earlier send of this apply's record step did. The caller
+/// SHOULD retry its original lookup. From the `EXISTS` checks no apply ran;
+/// from the record step, only Step A's index writes did.
 ///
 /// `Error(_)` — a transient / permanent backend failure occurred. The
 /// caller MAY retry later (transient) or SHOULD surface an internal error
@@ -200,6 +206,11 @@ pub struct SessionRecoveryHook {
     /// drop. Parallel to (NOT shared with) the layer-recovery admission
     /// map.
     admission: Arc<DashMap<String, Arc<AdmissionEntry>>>,
+    /// The hold write fence (`checkpoint::hold_fence`), cancelled at a
+    /// disaster-recovery hold's entry and at a stale hold verdict's; `None` unless
+    /// [`Self::with_hold_fence`] set it. Read only through
+    /// [`Self::hold_fence`].
+    hold_fence: Option<CancellationToken>,
 }
 
 impl SessionRecoveryHook {
@@ -229,7 +240,47 @@ impl SessionRecoveryHook {
             service_label,
             enabled,
             admission: Arc::new(DashMap::new()),
+            hold_fence: None,
         }
+    }
+
+    /// Set the hold write fence (SDD SR-6.2): `main.rs` passes the token the
+    /// hold and stale-verdict entry routines cancel. Once it is cancelled a session restore
+    /// sends no new store write: its checkpoint fetch is raced against the
+    /// token, and the token is checked again before the apply and inside it,
+    /// immediately before each of its two sends, Step A's `EXEC` and the
+    /// record step's `EVALSHA`
+    /// (`checkpoint::session::apply_session_checkpoint`). A send already
+    /// made runs to its end within the Valkey command timeout. A refused
+    /// restore ends
+    /// [`SessionRecoveryOutcome::Error`] with a `Transient` error, which the
+    /// callers already answer `UNAVAILABLE`, and ticks the `error`
+    /// recovery-attempt cell.
+    pub fn with_hold_fence(mut self, fence: CancellationToken) -> Self {
+        self.hold_fence = Some(fence);
+        self
+    }
+
+    /// The hold write fence, the one site every fence check of a session
+    /// restore reads — the fetch race, the check before the apply and, passed
+    /// in, the apply's checks before its two sends.
+    fn hold_fence(&self) -> Option<&CancellationToken> {
+        self.hold_fence.as_ref()
+    }
+
+    /// End a session restore refused by the hold write fence: tick the
+    /// `error` recovery-attempt cell and answer `Error(Transient)`.
+    fn refuse_for_hold(&self, session_id: &str) -> SessionRecoveryOutcome {
+        tracing::info!(
+            session_id,
+            "session recovery stopped before writing: this replica entered a \
+             disaster-recovery hold or lost contact with the store's hold state"
+        );
+        self.metrics
+            .inc_checkpoint_recovery_attempt("error", "session", &self.service_label);
+        SessionRecoveryOutcome::Error(CheckpointError::Transient {
+            source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+        })
     }
 
     /// Current size of the admission map.
@@ -289,11 +340,19 @@ impl SessionRecoveryHook {
     ///    Step 6a: re-check the deletion marker, as in step 4a. The admission
     ///    mutex is per replica, so while this replica fetched, another could
     ///    restore the session and a `DeleteSession` delete (and mark) it
-    ///    again. The re-check narrows that race to the apply below; it does
-    ///    not close it.
-    /// 7. Apply via [`apply_session_checkpoint`]. `Ok(())` →
-    ///    [`SessionRecoveryOutcome::Recovered`]. `Err(_)` →
-    ///    [`SessionRecoveryOutcome::Error`].
+    ///    again. The re-check narrows that race to the apply below, whose
+    ///    record step closes it.
+    /// 7. Apply via [`apply_session_checkpoint`] in its conditional mode
+    ///    ([`SessionApplySteps::PathIndexThenRecordIfAbsent`]): Step A, then a
+    ///    record step that writes only while neither the record nor the
+    ///    deletion marker exists, atomically, the record last. So a peer
+    ///    replica's restore of the same session, or a re-send of this one,
+    ///    overwrites no write made since. `Applied` →
+    ///    [`SessionRecoveryOutcome::Recovered`]; `RecordPresent` (the record
+    ///    landed first) → [`SessionRecoveryOutcome::AlreadyPresent`];
+    ///    `Deleted` (the marker appeared after step 6a) →
+    ///    [`SessionRecoveryOutcome::NoCheckpoint`], counted `not_recoverable`
+    ///    as in steps 4a and 6a. `Err(_)` → [`SessionRecoveryOutcome::Error`].
     /// 8. Admission entry retired by [`AdmissionMapGuard::drop`] when the
     ///    last in-flight attempt for this `session_id` exits.
     pub async fn try_recover_session(&self, session_id: &str) -> SessionRecoveryOutcome {
@@ -423,30 +482,45 @@ impl SessionRecoveryHook {
         // `list_layer_checkpoints` → `get_layer_checkpoint` step in
         // `checkpoint/recovery.rs`. Recorded in place so "did we catch every
         // restore path?" is answerable without re-deriving it.
+        //
+        // The hold write fence races the fetch: it is a pure read, so a hold
+        // that begins during it drops it and the restore writes nothing.
         let fetch_budget = self.config.checkpoint_recovery_fetch_budget();
-        let fetch =
-            match tokio::time::timeout(fetch_budget, self.store.get_session_checkpoint(session_id))
-                .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        session_id,
-                        budget_ms = fetch_budget.as_millis() as u64,
-                        "session recovery abandoned its checkpoint fetch at the recovery fetch \
+        let fetch = tokio::select! {
+            biased;
+            () = crate::checkpoint::hold_fence::closed(self.hold_fence()) => {
+                return self.refuse_for_hold(session_id);
+            }
+            fetch = tokio::time::timeout(
+                fetch_budget,
+                self.store.get_session_checkpoint(session_id),
+            ) => fetch,
+        };
+        let fetch = match fetch {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    session_id,
+                    budget_ms = fetch_budget.as_millis() as u64,
+                    "session recovery abandoned its checkpoint fetch at the recovery fetch \
                      budget; the adapter's own ceiling is far longer than any caller waits, and \
                      holding the per-session admission mutex meanwhile would queue every other \
                      joiner of this session behind it"
-                    );
-                    Err(CheckpointError::Transient {
-                        source: format!(
-                            "get_session_checkpoint exceeded the {}ms recovery fetch budget",
-                            fetch_budget.as_millis()
-                        )
-                        .into(),
-                    })
-                }
-            };
+                );
+                Err(CheckpointError::Transient {
+                    source: format!(
+                        "get_session_checkpoint exceeded the {}ms recovery fetch budget",
+                        fetch_budget.as_millis()
+                    )
+                    .into(),
+                })
+            }
+        };
+        // Either answer may come from the backup store's cache rather than a
+        // fresh read: a not-found for a backup written since, or an earlier
+        // body (`Config::checkpoint_storage_api_not_found_cache_secs`). Taken
+        // at its word here: the residual SDD §22.16 states for the on-access
+        // readers.
         let blob = match fetch {
             Ok(Some(blob)) => blob,
             Ok(None) => {
@@ -494,24 +568,70 @@ impl SessionRecoveryHook {
         // recoveries on this replica only: during the fetch above, another
         // replica can restore the session and a `DeleteSession` can then delete
         // it again, marking it. Applying now would restore it a second time.
-        // This narrows that race to the apply itself; it does not close it (the
-        // marker is not read inside the apply's transactions).
+        // The apply's record step reads the marker again, atomically with its
+        // writes, and closes the rest of that race; this check spares a
+        // deleted session Step A's index writes.
         if let Some(outcome) = self.refuse_if_deleted(session_id).await {
             return outcome;
+        }
+
+        // The hold write fence, immediately before the apply's writes.
+        if crate::checkpoint::hold_fence::is_closed(self.hold_fence()) {
+            return self.refuse_for_hold(session_id);
         }
 
         // Step 7: apply. `apply_session_checkpoint` is the Task 5 applier
         // — it splits into the two-step path-index-first / session-scoped-
         // second protocol per SR-2.7 and classifies all backend failures
-        // as `CheckpointError::Transient`.
-        match apply_session_checkpoint(&self.client, &self.keys, session_id, &checkpoint).await {
-            Ok(()) => {
+        // as `CheckpointError::Transient`. In the conditional mode its record
+        // step (Step B) writes only while neither the session's record nor its
+        // deletion marker exists, in one atomic script, so a peer replica's
+        // restore, a re-send of this one, or a `DeleteSession` that landed
+        // since the checks above leaves nothing overwritten and nothing
+        // brought back. It checks the hold write fence again before each
+        // step's send; a refusal there is a `Transient`, the `Err` arm below.
+        match apply_session_checkpoint(
+            &self.client,
+            &self.keys,
+            session_id,
+            &checkpoint,
+            self.hold_fence(),
+            SessionApplySteps::PathIndexThenRecordIfAbsent,
+        )
+        .await
+        {
+            Ok(SessionApplied::Applied) => {
                 self.metrics.inc_checkpoint_recovery_attempt(
                     "restored",
                     "session",
                     &self.service_label,
                 );
                 SessionRecoveryOutcome::Recovered
+            }
+            // The record landed first: another replica's restore, or an
+            // earlier send of this one. Callers treat it as `Recovered`.
+            Ok(SessionApplied::RecordPresent) => {
+                self.metrics.inc_checkpoint_recovery_attempt(
+                    "already_present",
+                    "session",
+                    &self.service_label,
+                );
+                SessionRecoveryOutcome::AlreadyPresent
+            }
+            // The session was deleted after step 6a: the same answer as
+            // steps 4a and 6a.
+            Ok(SessionApplied::Deleted) => {
+                tracing::debug!(
+                    session_id,
+                    "session recovery refused at its record step: the session was deleted \
+                     (deletion marker present)"
+                );
+                self.metrics.inc_checkpoint_recovery_attempt(
+                    "not_recoverable",
+                    "session",
+                    &self.service_label,
+                );
+                SessionRecoveryOutcome::NoCheckpoint
             }
             Err(err) => {
                 self.metrics.inc_checkpoint_recovery_attempt(
@@ -633,7 +753,6 @@ mod tests {
 
     fn test_config(enabled: bool) -> Config {
         Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -715,6 +834,10 @@ mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: enabled,
@@ -907,6 +1030,10 @@ mod tests {
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.record("ext_blob_exists");
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -1944,6 +2071,14 @@ mod tests {
             observer: fred::clients::Client,
             key_prefix: String,
         },
+        /// Notify `parked`, then hold the fetch until `release` is notified:
+        /// the hook has passed every presence and marker check before its
+        /// fetch, and acts on what the test does meanwhile only from step 6a
+        /// on. Both are `Notify` permits, so neither side can miss the other.
+        Park {
+            parked: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        },
     }
 
     /// An in-memory checkpoint store that counts session fetches and runs an
@@ -2061,6 +2196,10 @@ mod tests {
                         crate::storage::test_support::stall_pool(pool, observer, key_prefix).await;
                     self.stalls.lock().unwrap().extend(stalls);
                 }
+                OnFetch::Park { parked, release } => {
+                    parked.notify_one();
+                    release.notified().await;
+                }
             }
             self.inner.get_session_checkpoint(session_id).await
         }
@@ -2078,6 +2217,10 @@ mod tests {
         }
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
             self.inner.delete_ext_blob(hash_hex).await
@@ -2275,5 +2418,102 @@ mod tests {
         assert_eq!(store.fetches(), 1);
         assert!(session_meta_exists(&tv, &session_id).await);
         assert_eq!(metric_value(&metrics, "restored"), 1);
+    }
+
+    // ── The conditional record step (step 7) ──────────────────────────────
+
+    /// Two replicas restore one session at once, and a `DeleteLayer` lands
+    /// between their applies (fail-on-old). Each replica's hook has its own
+    /// admission mutex, so both pass their presence and marker checks: the
+    /// late replica's fetch is held while the first replica restores the
+    /// session and the `DeleteLayer` removes its one layer's mapping and
+    /// layers-index member. Released, the late replica applies the same
+    /// backup: its record step finds the record, writes nothing and answers
+    /// `AlreadyPresent`, so the layer stays deleted. With step 7 sending the
+    /// unconditional Step B, the late apply put the deleted layer back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_recoveries_on_two_replicas_keep_a_layer_deleted_between_their_applies() {
+        /// Bounds each wait on the other replica; unreachable when healthy.
+        const WAIT: Duration = Duration::from_secs(20);
+        const LAYER: &str = "root.usda";
+
+        let tv = TestValkey::setup().await;
+        let session_id = format!("two-replicas-{}", uuid::Uuid::new_v4());
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let late_store = OnFetchStore::holding_checkpoint(
+            &session_id,
+            OnFetch::Park {
+                parked: Arc::clone(&parked),
+                release: Arc::clone(&release),
+            },
+        )
+        .await;
+        let first_store = OnFetchStore::holding_checkpoint(&session_id, OnFetch::Nothing).await;
+        let (late_metrics, first_metrics) = (make_metrics(), make_metrics());
+        let late = Arc::new(hook_over(Arc::clone(&late_store), &tv, &late_metrics));
+        let first = hook_over(Arc::clone(&first_store), &tv, &first_metrics);
+        let mapping_key = tv.key_schema().layer_mapping(&session_id, LAYER);
+        let layers_index_key = tv.key_schema().layers_index(&session_id);
+
+        let late_attempt = {
+            let (late, session_id) = (Arc::clone(&late), session_id.clone());
+            tokio::spawn(async move { late.try_recover_session(&session_id).await })
+        };
+        tokio::time::timeout(WAIT, parked.notified())
+            .await
+            .expect("the late replica must reach its fetch");
+        let first_outcome = first.try_recover_session(&session_id).await;
+        assert!(
+            matches!(first_outcome, SessionRecoveryOutcome::Recovered),
+            "fixture: the first replica restores the session; got {first_outcome:?}"
+        );
+        let _: i64 = tv
+            .client()
+            .pool
+            .del(&mapping_key)
+            .await
+            .expect("DEL the mapping, as DeleteLayer does");
+        let _: i64 = tv
+            .client()
+            .pool
+            .srem(&layers_index_key, hex_encode(LAYER))
+            .await
+            .expect("SREM the layers-index member, as DeleteLayer does");
+        release.notify_one();
+        let late_outcome = tokio::time::timeout(WAIT, late_attempt)
+            .await
+            .expect("the late replica's recovery must finish")
+            .expect("join");
+
+        let mapping: Option<String> = tv.client().pool.get(&mapping_key).await.expect("GET");
+        assert_eq!(
+            mapping, None,
+            "the late replica's apply must not put the deleted layer's mapping back"
+        );
+        let layers: Vec<String> = tv
+            .client()
+            .pool
+            .smembers(&layers_index_key)
+            .await
+            .expect("SMEMBERS");
+        assert!(
+            layers.is_empty(),
+            "the late replica's apply must not put the deleted layer's layers-index member \
+             back; got {layers:?}"
+        );
+        assert!(
+            matches!(late_outcome, SessionRecoveryOutcome::AlreadyPresent),
+            "the late replica's record step found the record; got {late_outcome:?}"
+        );
+        assert_eq!(
+            late_store.fetches(),
+            1,
+            "fixture self-check: the late replica passed its presence checks and fetched"
+        );
+        assert_eq!(metric_value(&late_metrics, "already_present"), 1);
+        assert_eq!(metric_value(&late_metrics, "restored"), 0);
+        assert_eq!(metric_value(&first_metrics, "restored"), 1);
+        assert_eq!(late.admission_len(), 0);
     }
 }

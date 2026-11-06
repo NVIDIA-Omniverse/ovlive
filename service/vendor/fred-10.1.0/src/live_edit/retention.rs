@@ -35,10 +35,10 @@
 //! Draining a byte buffer does not free its allocation: a flush advances the buffer and a decode splits the frame
 //! off, and the next `reserve` reclaims the whole allocation for reuse.
 //!
-//! A client also holds a backchannel connection (`Backchannel::transport`), opened lazily beside its pipelined
-//! connections: for `CLIENT UNBLOCK` under `Blocking::Interrupt` (from a reader's first interrupt), and for
-//! `CLUSTER SLOTS` at a cluster client's topology sync (re-created at every sync of a healthy client). Its buffers
-//! grow like any other connection's, and nothing in stock fred cuts them back.
+//! A client can also hold a backchannel connection (`Backchannel::transport`), opened lazily beside its pipelined
+//! connections by fred's backchannel commands (`CLIENT UNBLOCK`, `FUNCTION KILL`, `FUNCTION STATS`); stock fred also
+//! kept there the connection a cluster sync opens for `CLUSTER SLOTS`, which `super::end_sync_backchannel` drops. Its
+//! buffers grow like any other connection's, and nothing in stock fred cuts them back. The live-edit service has none.
 //!
 //! # The rule
 //!
@@ -121,25 +121,25 @@
 //!   each read, so an unallocated read buffer would grow by doubling from a few bytes and take several reads for
 //!   even a 1 KiB reply. At 8 KiB, a connection used again reads a reply of up to 8 KiB in one read.
 //! - **The backchannel is taken with `try_write`.** Its lock is a tokio `RwLock` that a caller task holds while it
-//!   uses the backchannel (to interrupt a blocked command, or for a topology sync). The router task must never wait
+//!   uses the backchannel (a backchannel command, or a topology sync's look for one). The router task must never wait
 //!   on a caller, so the sweep takes the lock only when it is free; a busy lock skips the backchannel for that pass,
 //!   and a later pass tries again.
 //! - **The backchannel is cut after any traffic**, not after traffic above a size. That makes "8 KiB read + 8 KiB
 //!   write" exact by construction: a size threshold would have to prove, from bytes' growth rules, that no frame
 //!   under it can grow the buffer (one from 4 to 8 KiB can double it to 16 KiB behind a setup reply's prefix), and
 //!   that a credential in its HELLO never grows the write buffer. The cost is two 8 KiB allocations per use, and use
-//!   is rare: one per cluster sync, which already opens a new connection, and one per reader interrupt.
+//!   is rare: one per backchannel command, none of which the live-edit service sends.
 //!
 //! # Why the cluster routing table and the sentinel primary own their strings
 //!
 //! fred parses `CLUSTER SLOTS` without copying: every string in the reply frame, and so each `SlotRange`'s `id`,
 //! primary `host` and TLS server name, is a view into the read-buffer allocation the reply was read into. Those
 //! strings outlive the sync that read them. They are kept by the routing state (in `ClientInner` and in the
-//! router's cache), by every connection-map key and `Connection::server` added at that sync, by the next
-//! backchannel's `server` (`connect_any` takes it from the old routing), and by each `Server` a caller clones from
-//! the routing, such as the live-edit service's stream readers, whose client config keeps their owner's `Server`
-//! for life. Each one would pin a whole read-buffer allocation, however the backchannel's buffer is cut, and the
-//! pins would grow with the primary count and the sync history. [`own_slot_ranges`], called at the end of
+//! router's cache), by every connection-map key and `Connection::server` added at that sync, by the next sync's
+//! `CLUSTER SLOTS` connection's `server` (`connect_any` takes it from the old routing), and by each `Server` a caller
+//! clones from the routing, such as the live-edit service's stream readers, whose client config keeps their owner's
+//! `Server` for life. Each one would pin a whole read-buffer allocation, however a connection's buffer is cut, and
+//! the pins would grow with the primary count and the sync history. [`own_slot_ranges`], called at the end of
 //! `ClusterRouting::rebuild`, copies them out, so the reply's allocation is freed when the sync ends and every
 //! `Server` cloned later shares the small owned strings.
 //!

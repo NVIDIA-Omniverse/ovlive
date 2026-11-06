@@ -56,9 +56,9 @@
 //! Compiled only under `test-fault-injection` (see `storage/mod.rs`). The
 //! cluster keepalive and slot-rebind tests also self-gate on
 //! `LIVE_EDIT_TEST_CLUSTER_URL`; they are not `#[ignore]`d, so CI's
-//! `test-cluster:` job, which runs the whole suite with that variable and the
-//! feature set, runs them. One test is `#[ignore]`d and self-gates on
-//! `LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL`. Each prints a SKIP line when its
+//! `test-cluster:` job, which runs the tests whose names contain `cluster`
+//! with that variable and the feature set, runs them. One test is
+//! `#[ignore]`d and self-gates on `LIVE_EDIT_TEST_DISRUPTIVE_VALKEY_URL`. Each prints a SKIP line when its
 //! variable is unset (the disruptive one fails instead under CI's
 //! `GITLAB_CI`).
 //!
@@ -534,7 +534,7 @@ async fn a_permanent_probe_error_ends_every_subscription_counts_under_probe_and_
 /// A one-reader cluster fixture, or `None` (with a `SKIP:` line) when no
 /// cluster is configured.
 async fn one_reader_cluster() -> Option<TestValkey> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
         return None;
     };
@@ -1062,8 +1062,10 @@ async fn the_idle_keepalive_neither_charges_nor_resets_the_transient_budget() {
 }
 
 /// With a read in flight the keepalive never runs: over many intervals no
-/// tick is counted and the read is never interrupted — a `PING` on the
-/// reader's connection would `CLIENT UNBLOCK` it, re-planning a new read.
+/// tick is counted and the read is never re-issued — a `PING` on the reader's
+/// connection would queue behind the read's BLOCK (fred's default
+/// `Blocking::Block`), fail at its probe bound and force a reconnect, which
+/// re-plans a new read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_keepalive_never_runs_while_a_read_is_in_flight() {
     const OID: u64 = 131;
@@ -1102,7 +1104,7 @@ async fn the_keepalive_never_runs_while_a_read_is_in_flight() {
     assert_eq!(
         tv.client().stream_mux.snapshot().xreads(),
         xreads,
-        "the read in flight was not interrupted"
+        "the read in flight was not ended or re-issued"
     );
 }
 
@@ -1247,7 +1249,7 @@ async fn commands_on_connection(tv: &TestValkey, node: &Server, id: i64) -> u64 
 async fn an_idle_cluster_readers_keepalive_pings_its_one_connection_to_its_slot_owner() {
     const TICKS: i64 = 3;
     const OID: u64 = 1;
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
         return;
     };

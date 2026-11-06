@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 import zipfile
 
@@ -57,6 +58,14 @@ class PackageTests(unittest.TestCase):
 
     def test_tagged_identity(self):
         self.assertEqual(package.identity(record()), (NAME, VERSION))
+
+    def test_missing_launcher_names_its_path_before_running(self):
+        with mock.patch.object(package, 'PACKMAN', self.root / 'tools/packman/packman'), \
+                mock.patch.object(package, 'ROOT', self.root), \
+                mock.patch.object(package.subprocess, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'vendored launcher at tools/packman/packman'):
+                package.pack(['packman', 'pack'], check=True)
+            run.assert_not_called()
 
     def test_identity_is_the_extension_version_with_or_without_a_tag(self):
         # A candidate qualifies main before its tag exists, and finalize promotes the same bytes.
@@ -146,9 +155,10 @@ class PackageCheckTests(unittest.TestCase):
 
     def test_package_checks_against_its_manifest(self):
         record = package.check(self.path)
+        version = package.archive.version()
         self.assertEqual(record['package'], dict(name='omni_usd_live_openusd_0.25.11_py_3.12',
-                                                 version='0.1.0.manylinux_2_35_x86_64.release'))
-        self.assertEqual(record['archive_root'], 'ovlive-0.1.0-stock-25.11-linux-x86_64')
+                                                 version=version + '.manylinux_2_35_x86_64.release'))
+        self.assertEqual(record['archive_root'], f'ovlive-{version}-stock-25.11-linux-x86_64')
         self.assertEqual(set(record['files']), {'omni_usd_live/' + name for name in self.members
                                                 if name != package.MANIFEST})
 

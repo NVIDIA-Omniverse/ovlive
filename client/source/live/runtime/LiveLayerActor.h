@@ -33,6 +33,10 @@ public:
         // writes). Status reports it and counts it as
         // unconfirmed edits; noteHostEdits republishes it.
         std::shared_ptr<BufferedEditCount> bufferedEdits;
+        // Optional pending-byte watcher the actor adds to its endpoint's
+        // watchers when it is constructed, so every pending-byte release on
+        // the endpoint reports to it; the endpoint holds it weakly.
+        std::shared_ptr<BufferedEditCount> releaseWatcher;
         void (*beforeAdmissionForTest)(void*) noexcept = nullptr;
         // Private seam between a submission's byte reservation and its ledger
         // admission, under the admission lock; a throw refuses the admission.
@@ -223,6 +227,11 @@ public:
     // so that one pass can settle several completions in chain order. The
     // hook must not throw or call into the actor and must tolerate null.
     static void setBeforeSettleWritesForTest(bool (*hook)(void*, size_t) noexcept, void* context) noexcept;
+    // Test seam: an actor worker with a read calls hook(context, read, ended)
+    // after it observes whether that read has ended and before it checks for
+    // queued frames; null disables it. The hook must not throw or call into
+    // the actor and must tolerate null.
+    static void setBetweenReadObservationsForTest(void (*hook)(void*, Request&, bool) noexcept, void* context) noexcept;
     // Publication follows LayerProgress's nonthrowing commit contract. The
     // caller may hold its journal guard: lock order is journal -> admission ->
     // progress. All fallible preparation precedes commit; wake cannot throw.
@@ -247,6 +256,8 @@ public:
     OmniUsdLiveResult pollSave() noexcept { return saveImpl(0, false, nullptr); }
     // Fixed before open returns; binds only this actor's claimed reservation.
     uint64_t subjectId() const noexcept { return subject_; }
+    // The layer's canonical live:// URI.
+    const std::string& uri() const noexcept { return uri_; }
     // Whether the last auth evaluation found no usable credential. A caller
     // whose own wait on this actor expires classifies it with expiredWait.
     bool credentialStarved() const noexcept { return waitingAuth_.load(); }
@@ -263,6 +274,9 @@ public:
     // Thread-safe. Emit flush_unsupported (numeric reason only) with this
     // subject and its status incident; the caller has latched the failure.
     void reportFlushUnsupported(uint32_t reason) noexcept;
+    // Thread-safe. Emit section_replaced for a section this layer's client
+    // created that the peer commit applied through `sequence` replaced.
+    void reportSectionReplaced(uint64_t section, uint64_t sequence) noexcept;
     // Terminal failure, not close: preserve owners while ordinary worker
     // cleanup stops transport and queued application.
     OmniUsdLiveResult failPublication(OmniUsdLiveResult) noexcept;
@@ -350,6 +364,7 @@ private:
     OmniUsdLiveResult activityAdmission_ = OMNI_USD_LIVE_OK;
     mutable std::mutex mutex_, admissionMutex_, statusMutex_;
     uint64_t subject_ = 0;
+    std::string uri_;
     OmniUsdLiveRequestError statusError_{}; // Guarded by statusMutex_.
     std::atomic<bool> statusClosed_{false};
     std::atomic<bool> holdOpening_{false};
@@ -377,8 +392,13 @@ private:
     std::shared_ptr<const Effect> writeEffect_;
     bool writeResent_ = false;
     uint64_t writeId_ = 0, writeOrdinal_ = 0;
-    // The re-send waits for a usable token; no request is in flight meanwhile.
+    // The re-send waits for a usable token or a call unit; no request is in
+    // flight meanwhile.
     bool resendPending_ = false;
+    // Worker-owned: the layer's queue position for a unit of its endpoint's
+    // call budget, and whether the current pass asked for a unit.
+    std::shared_ptr<CallWaiter> callWaiter_;
+    bool callAcquired_ = false;
     OmniUsdLiveRequestError resendEvidence_{}; // The unknown attempt the pending re-send follows.
     // When the unchained write's first attempt was submitted, at or after the
     // start of its request_timeout_ms deadline.
@@ -526,15 +546,20 @@ private:
     bool chainedInFlightThrough(uint64_t ordinal) const noexcept;
     uint32_t chainWindow() const noexcept;
     void publishWindow() noexcept;
+    // Whether the read has ended, observed before whether frames are queued.
+    bool observeRead(Request* read, bool& queuedFrames);
     void settleRead(std::shared_ptr<Request>& read, Clock::time_point now);
     Clock::time_point stepClosing(bool read, bool write, bool queuedFrames, Clock::time_point now,
         Clock::time_point next);
     bool startRead(const std::weak_ptr<LayerActor>& weak, Clock::time_point now, std::shared_ptr<Request>& read);
     bool issueWrites(const std::weak_ptr<LayerActor>& weak, Clock::time_point now, Clock::time_point& next);
     InFlight submitWrite(const std::weak_ptr<LayerActor>& weak, std::shared_ptr<const Effect> effect, uint64_t id,
-        uint64_t ordinal, bool chained, bool noWait = false);
+        uint64_t ordinal, bool chained, CallSlot slot, bool noWait = false);
+    // A unit of the endpoint's call budget for one write attempt, or empty with
+    // this layer queued for the next one, whose hand-over wakes the layer.
+    CallSlot acquireCall(const std::weak_ptr<LayerActor>& weak, uint32_t operation);
     void track(InFlight write);
-    enum class Resend { NotOffered, Issued, AwaitingAuth };
+    enum class Resend { NotOffered, Issued, AwaitingAuth, AwaitingCall };
     Resend resendWrite(Clock::time_point now, const OmniUsdLiveRequestError& error);
     Resend issueResend(Clock::time_point now);
     void settleAttempt(uint64_t id, uint64_t authFailure, OmniUsdLiveResult result,

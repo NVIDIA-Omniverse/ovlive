@@ -23,7 +23,8 @@
 //      (session_id, layer_name, etc.), and validates it. No chunk is read.
 //   2. `read_upload_body` reads the remaining messages — OMPF byte chunks —
 //      under the upload's admission reservation, enforcing the size and
-//      chunk-count caps.
+//      chunk-count caps, and grows the reservation as they arrive, in the
+//      upload budget or its overflow slot.
 // An upload is applied only if its stream ended with END_STREAM: wherever the
 // stream ends, the record decides, and every other ending — a reset, a lost
 // connection, a GOAWAY — is `CANCELLED` before anything is applied.
@@ -47,11 +48,16 @@ use crate::grpc::proto::{
 };
 use crate::grpc::request_end::{RequestStreamEnd, StreamEnding};
 use crate::grpc::upload_admission::{
-    UploadRefusal, UploadReservation, FIXED_CHARGE_BYTES, RECEIVE_CHARGE_FACTOR,
+    log_upload_runs_beyond_budget, UploadRefusal, UploadReservation, FIXED_CHARGE_BYTES,
+    RECEIVE_CHARGE_FACTOR,
 };
+use crate::observability::metrics::UPLOAD_PHASE_RECEIVING;
+use crate::storage::ompf_payload::OmpfPayload;
 
-/// Chunk size for server-streaming OMPF delivery (1 MiB, SDD §12.7).
-const OMPF_CHUNK_SIZE: usize = 1_048_576;
+/// Chunk size for server-streaming OMPF delivery (1 MiB, SDD §12.7): also the
+/// page size of a catch-up payload (`storage::ompf_payload::OMPF_PAGE_BYTES`),
+/// whose page `i` is chunk `i`.
+pub const OMPF_CHUNK_SIZE: usize = crate::storage::ompf_payload::OMPF_PAGE_BYTES;
 
 /// Header fields for an OMPF server-streaming delivery.
 pub struct OmpfStreamHeader {
@@ -61,21 +67,12 @@ pub struct OmpfStreamHeader {
     pub client_timestamp: u64,
 }
 
-/// Build a sequence of `SubscribeReadLayerResponse` messages from OMPF bytes.
-///
-/// The first message contains the header (object_id, sequence_num, total_size,
-/// timestamps). Subsequent messages contain data chunks of up to 1 MiB each.
-///
-/// Returns an iterator so each proto message is allocated just in time and
-/// the caller never has to hold a `Vec` of all chunks in memory alongside
-/// the source buffer (b.jr8 lows). The only copy of each byte that lives
-/// past `next()` is the one inside the yielded `SubscribeReadLayerChunk`.
-pub fn chunk_ompf_for_stream<'a>(
-    ompf_bytes: &'a [u8],
+/// The header message of an OMPF delivery of `total_size` bytes.
+fn stream_header_message(
+    total_size: u64,
     header_fields: &OmpfStreamHeader,
-) -> impl Iterator<Item = SubscribeReadLayerResponse> + 'a {
-    let total_size = ompf_bytes.len() as u64;
-    let header_msg = SubscribeReadLayerResponse {
+) -> SubscribeReadLayerResponse {
+    SubscribeReadLayerResponse {
         response_type: Some(subscribe_read_layer_response::ResponseType::Header(
             SubscribeReadLayerHeader {
                 object_id: header_fields.object_id,
@@ -85,17 +82,54 @@ pub fn chunk_ompf_for_stream<'a>(
                 server_timestamp_microseconds_since_epoch: header_fields.server_timestamp,
             },
         )),
-    };
+    }
+}
 
-    std::iter::once(header_msg).chain(ompf_bytes.chunks(OMPF_CHUNK_SIZE).map(|chunk| {
-        SubscribeReadLayerResponse {
-            response_type: Some(subscribe_read_layer_response::ResponseType::Chunk(
-                SubscribeReadLayerChunk {
-                    data: chunk.to_vec(),
-                },
-            )),
-        }
-    }))
+/// One chunk message carrying `data`.
+fn chunk_message(data: Bytes) -> SubscribeReadLayerResponse {
+    SubscribeReadLayerResponse {
+        response_type: Some(subscribe_read_layer_response::ResponseType::Chunk(
+            SubscribeReadLayerChunk { data },
+        )),
+    }
+}
+
+/// Build a sequence of `SubscribeReadLayerResponse` messages from OMPF bytes.
+///
+/// The first message contains the header (object_id, sequence_num, total_size,
+/// timestamps). Subsequent messages contain data chunks of up to
+/// [`OMPF_CHUNK_SIZE`] (1 MiB) each, every one exactly that size but the last.
+///
+/// Zero-copy: each chunk is a [`Bytes::slice`] of `ompf_bytes`, so every
+/// subscriber of a relayed entry sends slices of the entry's one shared copy,
+/// and the copy is freed when the last slice anywhere is dropped — for a
+/// response message, when tonic has encoded it (SDD §12.6). The messages are
+/// byte-identical to copies'. Returns an iterator so each message is made just
+/// in time.
+pub fn chunk_ompf_for_stream(
+    ompf_bytes: Bytes,
+    header_fields: &OmpfStreamHeader,
+) -> impl Iterator<Item = SubscribeReadLayerResponse> {
+    let total_size = ompf_bytes.len();
+    let header_msg = stream_header_message(total_size as u64, header_fields);
+    let chunks = (0..total_size).step_by(OMPF_CHUNK_SIZE).map(move |start| {
+        chunk_message(ompf_bytes.slice(start..(start + OMPF_CHUNK_SIZE).min(total_size)))
+    });
+    std::iter::once(header_msg).chain(chunks)
+}
+
+/// [`chunk_ompf_for_stream`] for a catch-up payload built as pages
+/// ([`OmpfPayload`]): the header, then one chunk per page, in order. Page `i`
+/// is chunk `i`, so the chunks are exactly the ones [`chunk_ompf_for_stream`]
+/// cuts from the same bytes. Each page moves into its message, so a page's
+/// share of the catch-up payload budget is repaid when tonic has encoded its
+/// chunk, or when the message is dropped unsent (SDD §12.3).
+pub fn chunk_pages_for_stream(
+    payload: OmpfPayload,
+    header_fields: &OmpfStreamHeader,
+) -> impl Iterator<Item = SubscribeReadLayerResponse> {
+    let header_msg = stream_header_message(payload.len(), header_fields);
+    std::iter::once(header_msg).chain(payload.into_pages().map(chunk_message))
 }
 
 /// Trait abstracting the header-or-data oneof pattern shared by
@@ -321,22 +355,40 @@ where
 ///   reservation leaves its receive phase, so a truncated upload is never
 ///   handed on. The reservation is left for the caller's drop to release.
 /// - After each chunk passes the caps, grows `reservation` by
-///   [`RECEIVE_CHARGE_FACTOR`] × its length, in budget at once or not at all
-///   ([`UploadReservation::try_grow_in_budget`]): a refusal answers its
-///   [`UploadRefusal::into_service_error`], `UNAVAILABLE` — the budget is full
-///   now. Never for size: the budget is floored so that the receive phase of
-///   an upload under `max_size` fits it on its own.
+///   [`RECEIVE_CHARGE_FACTOR`] × its length, at once or not at all, never
+///   waiting ([`UploadReservation::try_grow_receive`]): in budget when it
+///   fits; otherwise, when `may_enter_overflow` is set, in the overflow slot if
+///   it is free and no processing step is queued. A refusal answers its
+///   [`UploadRefusal::into_service_error`], `UNAVAILABLE` — neither the budget
+///   nor the slot can hold the growth now. Never for size: the budget is
+///   floored so that the receive phase of an upload under `max_size` fits it
+///   on its own. The handlers set `may_enter_overflow` for every upload but a
+///   chained `UpdateLayer`, which must hold no slot while it waits in the
+///   chain gate after its body (`grpc::upload_admission` module docs).
 /// - Keeps the chunks as received and concatenates them once, at an
 ///   END_STREAM end of the stream, into an exact-size buffer (no doubling
 ///   reallocation; a single chunk is handed on without a copy). Then drops the
 ///   stream — freeing tonic's receive buffer — ends the reservation's receive
-///   phase and shrinks it to `FIXED_CHARGE_BYTES` + the body length.
+///   phase and shrinks it to `FIXED_CHARGE_BYTES` + the body length, in budget
+///   or on the slot.
 /// - Empty content (header only, no data chunks) is valid when the stream
 ///   ended with END_STREAM — returns empty `Bytes`.
+/// - A growth that moves the upload into the overflow slot logs the INFO line
+///   "upload runs beyond the upload budget" there and then, once
+///   ([`log_upload_runs_beyond_budget`], phase `receiving`, at the charge the
+///   slot was booked at, `waited_ms = 0`): at entry, beside the
+///   `live_edit_upload_overflow_runs_total` tick, so the line exists whatever
+///   ends the call afterwards and appears while the upload holds the slot.
+///   `session_id` and `layer_name` are the call's, for that line. The
+///   processing steps that follow find the upload already in the slot and log
+///   nothing more.
 pub async fn read_upload_body<R>(
     mut stream: UploadStream<R>,
     max_size: usize,
     reservation: &mut UploadReservation,
+    may_enter_overflow: bool,
+    session_id: &str,
+    layer_name: &str,
 ) -> Result<Bytes, ServiceError>
 where
     R: StreamingRequest,
@@ -384,12 +436,21 @@ where
                 }
                 received += chunk.len();
                 let received_bytes = u64::try_from(received).unwrap_or(u64::MAX);
-                reservation
-                    .try_grow_in_budget(
-                        receive_base
-                            .saturating_add(RECEIVE_CHARGE_FACTOR.saturating_mul(received_bytes)),
-                    )
-                    .map_err(UploadRefusal::into_service_error)?;
+                let target = receive_base
+                    .saturating_add(RECEIVE_CHARGE_FACTOR.saturating_mul(received_bytes));
+                if reservation
+                    .try_grow_receive(target, may_enter_overflow)
+                    .map_err(UploadRefusal::into_service_error)?
+                {
+                    log_upload_runs_beyond_budget(
+                        reservation,
+                        UPLOAD_PHASE_RECEIVING,
+                        session_id,
+                        layer_name,
+                        target,
+                        std::time::Duration::ZERO,
+                    );
+                }
                 if !chunk.is_empty() {
                     chunks.push(chunk);
                 }
@@ -530,7 +591,15 @@ mod tests {
             )
             .await
             .expect("an idle gate at the default budget admits at once");
-        let body = read_upload_body(stream, max_size, &mut reservation).await?;
+        let body = read_upload_body(
+            stream,
+            max_size,
+            &mut reservation,
+            true,
+            "sess-1",
+            "layer-1",
+        )
+        .await?;
         Ok((header, body))
     }
 
@@ -937,7 +1006,7 @@ mod tests {
             .await
             .expect("a valid header");
 
-        let body = read_upload_body(stream, 4096, &mut reservation)
+        let body = read_upload_body(stream, 4096, &mut reservation, true, "sess-1", "layer-1")
             .await
             .expect("the content fits");
 
@@ -953,32 +1022,153 @@ mod tests {
         assert_eq!(g.reserved_bytes(), FIXED_CHARGE_BYTES + 300);
     }
 
-    /// A chunk whose charge the budget cannot hold right now is refused
-    /// `UNAVAILABLE` — nothing applied, retry — at once, with the retry hint
-    /// `UPLOAD_CAPACITY` (`cause` = `growth`).
-    #[tokio::test]
-    async fn read_upload_body_growth_the_budget_cannot_hold_now_is_unavailable() {
-        const CHUNK: usize = 100;
+    /// The size of the one chunk the growth tests below send.
+    const GROWTH_CHUNK: usize = 100;
+
+    /// What the overflow slot's holder is booked at, when a fixture has one:
+    /// more than the whole `4A` budget.
+    const SLOT_HOLDER_BYTES: u64 = 8 * RECEIVE_ALLOWANCE_BYTES;
+
+    /// A gate at `4A` whose budget is left with less room than one
+    /// [`GROWTH_CHUNK`]'s receive charge beside `reservation`'s admission:
+    /// `other`, admitted beside it, holds the rest. With `slot_held`, a third
+    /// upload took the overflow slot first, at [`SLOT_HOLDER_BYTES`], its
+    /// admission leaving the budget with it. Returns the gate, `reservation`,
+    /// and the uploads holding the rest, to keep alive.
+    async fn budget_without_room_for_the_chunk(
+        slot_held: bool,
+    ) -> (
+        Arc<UploadAdmissionGate>,
+        UploadReservation,
+        Vec<UploadReservation>,
+    ) {
         let budget = 4 * RECEIVE_ALLOWANCE_BYTES;
         let g = gate(budget);
-        let mut reservation = admitted(&g, "sess-1").await;
+        let reservation = admitted(&g, "sess-1").await;
+        let mut held = Vec::new();
+        if slot_held {
+            let mut holder = admitted(&g, "holder").await;
+            assert!(
+                holder
+                    .try_hold_processing(SLOT_HOLDER_BYTES)
+                    .expect("the free slot")
+                    .entered_overflow,
+                "fixture self-check: the holder takes the slot"
+            );
+            held.push(holder);
+        }
         let mut other = admitted(&g, "other").await;
-        // Leave less room than the chunk's charge.
         other
-            .try_grow_in_budget(budget - admission_charge() - CHUNK as u64)
+            .try_grow_in_budget(budget - admission_charge() - GROWTH_CHUNK as u64)
             .expect("fill the budget");
+        held.push(other);
+        (g, reservation, held)
+    }
+
+    /// A header, one [`GROWTH_CHUNK`]-byte chunk and END_STREAM, with the
+    /// header already read.
+    async fn one_chunk_after_its_header() -> UploadStream<CreateLayerRequest> {
         let (mut stream, _) = counted_stream(
-            vec![make_header(), make_data(vec![1; CHUNK])],
+            vec![make_header(), make_data(vec![1; GROWTH_CHUNK])],
             Ending::EndStream,
         );
         read_upload_header(&mut stream, |_| Ok(()))
             .await
             .expect("a valid header");
+        stream
+    }
 
-        let err = read_upload_body(stream, 4096, &mut reservation)
-            .await
-            .expect_err("the budget cannot hold the chunk now");
-        match &err {
+    /// A chunk whose charge neither the budget nor the overflow slot can hold
+    /// right now is refused `UNAVAILABLE` — nothing applied, retry — at once,
+    /// with the retry hint `UPLOAD_CAPACITY` (`cause` = `growth`): for an
+    /// upload not allowed to take the slot (`may_enter_overflow` false, a
+    /// chained `UpdateLayer`) with the slot free, and for one allowed to take
+    /// it while another upload holds it.
+    #[tokio::test]
+    async fn read_upload_body_growth_the_budget_cannot_hold_now_is_unavailable() {
+        // Not allowed to take the slot; the slot is free.
+        let (g, mut reservation, _held) = budget_without_room_for_the_chunk(false).await;
+        let err = read_upload_body(
+            one_chunk_after_its_header().await,
+            4096,
+            &mut reservation,
+            false,
+            "sess-1",
+            "layer-1",
+        )
+        .await
+        .expect_err("the budget cannot hold the chunk, and the slot is not open to it");
+        assert_growth_refusal(&err, &reservation);
+        assert_eq!(g.overflow_bytes(), 0, "the free slot was not taken");
+
+        // Allowed to take the slot, which another upload holds.
+        let (g, mut reservation, _held) = budget_without_room_for_the_chunk(true).await;
+        let err = read_upload_body(
+            one_chunk_after_its_header().await,
+            4096,
+            &mut reservation,
+            true,
+            "sess-1",
+            "layer-1",
+        )
+        .await
+        .expect_err("the budget cannot hold the chunk, and the slot is held");
+        assert_growth_refusal(&err, &reservation);
+        assert!(!reservation.in_overflow());
+        assert_eq!(
+            g.overflow_bytes(),
+            SLOT_HOLDER_BYTES,
+            "the holder keeps the slot"
+        );
+    }
+
+    /// A chunk whose charge the budget cannot hold, of an upload allowed to
+    /// take the overflow slot, takes the free slot at once: its admission
+    /// leaves the budget with it, the read completes, and the slot was booked
+    /// at entry at the receive charge, `F + A + 2 × the chunk` (its
+    /// high-water). At the end of the body the reservation stays on the slot,
+    /// shrunk to `F` + the body length.
+    #[tokio::test]
+    async fn read_upload_body_growth_past_the_budget_takes_the_free_overflow_slot() {
+        let (g, mut reservation, _held) = budget_without_room_for_the_chunk(false).await;
+        let in_budget_before = g.reserved_bytes();
+
+        let body = read_upload_body(
+            one_chunk_after_its_header().await,
+            4096,
+            &mut reservation,
+            true,
+            "sess-1",
+            "layer-1",
+        )
+        .await
+        .expect("the free slot holds the chunk the budget cannot");
+
+        let entry = admission_charge() + RECEIVE_CHARGE_FACTOR * GROWTH_CHUNK as u64;
+        assert_eq!(body.len(), GROWTH_CHUNK);
+        assert!(reservation.in_overflow());
+        assert!(!reservation.is_receiving());
+        assert_eq!(
+            reservation.reserved(),
+            FIXED_CHARGE_BYTES + GROWTH_CHUNK as u64
+        );
+        assert_eq!(g.overflow_bytes(), FIXED_CHARGE_BYTES + GROWTH_CHUNK as u64);
+        assert_eq!(
+            g.overflow_high_water_bytes(),
+            entry,
+            "the slot was booked at the receive charge"
+        );
+        assert_eq!(
+            g.reserved_bytes(),
+            in_budget_before - admission_charge(),
+            "the upload's admission left the budget with it"
+        );
+        assert_eq!(g.receiving_uploads("sess-1"), 0);
+    }
+
+    /// `err` is the growth refusal, and `reservation` reserved nothing more.
+    fn assert_growth_refusal(err: &ServiceError, reservation: &UploadReservation) {
+        match err {
             ServiceError::UnavailableWithDetail { detail, .. } => {
                 assert_eq!(
                     detail.reason,
@@ -1023,7 +1213,7 @@ mod tests {
             .await
             .expect("a valid header");
 
-        let err = read_upload_body(stream, 4096, &mut reservation)
+        let err = read_upload_body(stream, 4096, &mut reservation, true, "sess-1", "layer-1")
             .await
             .expect_err("the transport failed mid-content");
         assert!(
@@ -1166,7 +1356,8 @@ mod tests {
         read_upload_header(&mut stream, |_| Ok(()))
             .await
             .expect("a valid header");
-        let result = read_upload_body(stream, 4096, &mut reservation).await;
+        let result =
+            read_upload_body(stream, 4096, &mut reservation, true, "sess-1", "layer-1").await;
         (result, reservation)
     }
 
@@ -1244,7 +1435,7 @@ mod tests {
         read_upload_header(&mut stream, |_| Ok(()))
             .await
             .expect("a valid header");
-        let err = read_upload_body(stream, 4096, &mut reservation)
+        let err = read_upload_body(stream, 4096, &mut reservation, true, "sess-1", "layer-1")
             .await
             .expect_err("an unset record must not read as END_STREAM");
         assert!(
@@ -1296,7 +1487,7 @@ mod tests {
 
     #[test]
     fn chunk_ompf_zero_bytes_returns_header_only() {
-        let messages: Vec<_> = chunk_ompf_for_stream(&[], &test_stream_header()).collect();
+        let messages: Vec<_> = chunk_ompf_for_stream(Bytes::new(), &test_stream_header()).collect();
         assert_eq!(messages.len(), 1, "0 bytes should produce header only");
 
         let header = extract_header(&messages[0]);
@@ -1312,7 +1503,8 @@ mod tests {
     #[test]
     fn chunk_ompf_500kb_returns_header_plus_one_data() {
         let data = vec![0xAB; 500 * 1024]; // 500 KB < 1 MB chunk size
-        let messages: Vec<_> = chunk_ompf_for_stream(&data, &test_stream_header()).collect();
+        let messages: Vec<_> =
+            chunk_ompf_for_stream(Bytes::from(data.clone()), &test_stream_header()).collect();
 
         assert_eq!(
             messages.len(),
@@ -1332,7 +1524,8 @@ mod tests {
     #[test]
     fn chunk_ompf_1mb_exact_returns_header_plus_one_data() {
         let data = vec![0xCD; OMPF_CHUNK_SIZE]; // exactly 1 MiB
-        let messages: Vec<_> = chunk_ompf_for_stream(&data, &test_stream_header()).collect();
+        let messages: Vec<_> =
+            chunk_ompf_for_stream(Bytes::from(data.clone()), &test_stream_header()).collect();
 
         assert_eq!(
             messages.len(),
@@ -1352,7 +1545,8 @@ mod tests {
     #[test]
     fn chunk_ompf_1mb_plus_one_returns_header_plus_two_data() {
         let data = vec![0xEF; OMPF_CHUNK_SIZE + 1]; // 1 MiB + 1
-        let messages: Vec<_> = chunk_ompf_for_stream(&data, &test_stream_header()).collect();
+        let messages: Vec<_> =
+            chunk_ompf_for_stream(Bytes::from(data.clone()), &test_stream_header()).collect();
 
         assert_eq!(
             messages.len(),
@@ -1377,7 +1571,8 @@ mod tests {
     #[test]
     fn chunk_ompf_5mb_returns_header_plus_five_data() {
         let data = vec![0x99; 5 * OMPF_CHUNK_SIZE]; // exactly 5 MiB
-        let messages: Vec<_> = chunk_ompf_for_stream(&data, &test_stream_header()).collect();
+        let messages: Vec<_> =
+            chunk_ompf_for_stream(Bytes::from(data.clone()), &test_stream_header()).collect();
 
         assert_eq!(
             messages.len(),

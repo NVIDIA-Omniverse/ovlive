@@ -19,8 +19,7 @@
 //! ## What this test proves
 //!
 //! The faithful late-join catch-up snapshot
-//! (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true`, `compute_faithful_full_content_at_cut`)
-//! emits each field with a DENSE-UNIQUE `set_order` (`0..N-1`, b.bdx), assigned
+//! (`compute_faithful_full_content_at_cut`) emits each field with a DENSE-UNIQUE `set_order` (`0..N-1`, b.bdx), assigned
 //! by sorting the net-live fields on the composite key `(version,
 //! authoring_set_order)` — NOT the raw authoring rank and NOT the collapsed
 //! cumulative cursor. `authoring_set_order` is materialized server-side (distinct
@@ -258,10 +257,7 @@ fn emitted_section_ids(body: &[u8]) -> HashSet<u64> {
 /// and identical relative order, and both MUST drop the abandoned prim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_catch_up_authoring_rank_survives_checkpoint_restore() {
-    let mut harness = setup_checkpoint_harness(1).await;
-    // Faithful late-join snapshot mode — the path whose emitted set_order is
-    // the true authoring rank rather than the cumulative cursor.
-    harness.svc.catchup_snapshot_enabled = true;
+    let harness = setup_checkpoint_harness(1).await;
 
     // Create the session + layer. The harness exposes an Arc<SessionStore>, but
     // a fresh store against the same Valkey is sufficient for the write path

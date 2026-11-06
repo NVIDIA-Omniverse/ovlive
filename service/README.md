@@ -176,6 +176,7 @@ docker rm "$container"
 ```
 
 To check an image's source archive, notices and binary checksums, run `sh tools/check-container-oss.sh {IMAGE}`.
+For the conformance-test image, name its binary too: `sh tools/check-container-oss.sh {IMAGE} live-edit-conformance`.
 
 ## Deploy on Kubernetes
 

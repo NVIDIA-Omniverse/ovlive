@@ -838,7 +838,13 @@ async fn commit_every_shape(fx: &Fx) {
     fx.commit(structural(vec![delete_cmd(WORLD, CUBE)])).await;
     fx.commit(empty_delta()).await;
     fx.commit_through(&fx.ls, WRITER, None, CLIENT_TS).await;
-    fx.commit(reset_delta("usda")).await;
+    // A reset carrying a source format, restating `WORLD` under the root: a
+    // reset leaving the layer no top-level section is refused (SDD §9.7).
+    fx.commit(OwnedDelta {
+        struct_commands: delta_with_diff_change_section(ROOT, WORLD, "World", 1, 0).struct_commands,
+        ..reset_delta("usda")
+    })
+    .await;
     fx.commit(delta_with_diff_change_section(
         ROOT,
         NEW_SECTION + 2,
@@ -2270,6 +2276,92 @@ async fn read_for_structural_edit_rematerialized_at_the_same_seq_reloads_identit
     rematerialize_same_seq(&fx.tv, fx.oid).await;
 
     assert_reloads(&fx, "identity", RepairBounds::PRODUCTION).await;
+}
+
+/// A prim (`SdfSpecType` 6) created under [`WORLD`] named as `CUBE`, an
+/// attribute: the two hold distinct collision slots, so the create cascades
+/// nothing, where the earlier `(parent_id, name)` rule cascaded `CUBE`.
+fn prim_beside_the_cube() -> OwnedDelta {
+    structural(vec![StructCommand::CreateSection(
+        oodf_ffi::CommandCreateSection {
+            parent_id: WORLD,
+            section_id: NEW_SECTION,
+            section_name: "Cube".to_owned(),
+            section_type: 6,
+        },
+    )])
+}
+
+/// A record whose replay counts a collision-rule divergence ends a warm
+/// entry's repair with one `collision_rule` reload, and the reloaded entry is
+/// the stored cut: a create beside a same-named sibling of another kind, and
+/// a same-parent rename onto an occupied name (`SIBLING` renamed `World`,
+/// cascading `WORLD` and `CUBE`). Another build may have committed either
+/// under the earlier rule, so the repair reads the object again rather than
+/// trust its replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_for_structural_edit_repair_across_a_collision_rule_divergent_record_reloads_collision_rule(
+) {
+    let cases: [(&str, OwnedDelta, &[u64], &[u64]); 2] = [
+        (
+            "a prim beside a same-named attribute",
+            prim_beside_the_cube(),
+            &[WORLD, CUBE, NEW_SECTION],
+            &[],
+        ),
+        (
+            "a rename onto an occupied name",
+            structural(vec![move_cmd(SIBLING, ROOT, ROOT, "World")]),
+            &[SIBLING],
+            &[WORLD, CUBE],
+        ),
+    ];
+    for (index, (what, delta, live, gone)) in cases.into_iter().enumerate() {
+        let fx = Fx::new(&format!("scr-collision-rule-{index}")).await;
+        fx.warm().await;
+
+        fx.commit(delta).await;
+        let stored = normalized_fresh_state(&fx.tv, fx.oid).await;
+        assert!(
+            live.iter().all(|id| stored.sections.contains_key(id))
+                && gone.iter().all(|id| !stored.sections.contains_key(id)),
+            "{what}: precondition: the commit keeps {live:?} and deletes {gone:?}"
+        );
+
+        assert_reloads_in(&fx, "collision_rule", RepairBounds::PRODUCTION, what).await;
+    }
+}
+
+/// A structural record whose collision outcome the two rules agree on — a
+/// create onto `CUBE`'s name of the same kind, cascading it — replays onto a
+/// warm entry with no reload: a hit that repairs one entry to the stored
+/// cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_for_structural_edit_repair_across_a_same_kind_collision_replays_with_no_reload() {
+    let fx = Fx::new("scr-collision-same-kind").await;
+    fx.warm().await;
+
+    fx.commit(structural(vec![create_cmd(WORLD, NEW_SECTION, "Cube")]))
+        .await;
+    let stored = normalized_fresh_state(&fx.tv, fx.oid).await;
+    assert!(
+        !stored.sections.contains_key(&CUBE) && stored.sections.contains_key(&NEW_SECTION),
+        "precondition: the create cascaded the same-kind occupant"
+    );
+
+    let reloads_before = fx.reloads();
+    let ready = expect_ready(fx.read().await, "the repair");
+    assert_eq!(
+        (ready.path, ready.repair.replayed_entries),
+        (StructuralPath::Structural, 1),
+        "a hit that replays the one record"
+    );
+    fx.assert_current(ready.entry.entry(), "the repair").await;
+    assert_eq!(
+        fx.reloads_since(&reloads_before),
+        BTreeMap::new(),
+        "no reload"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

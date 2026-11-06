@@ -734,7 +734,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
     /// The walk itself lives in [`Self::list_live_ext_set`] (b.oya); this
     /// method is its projection onto the hash set.
     async fn list_referenced_ext_hashes(&self) -> Result<HashSet<String>, CheckpointError> {
-        Ok(self.list_live_ext_set().await?.hashes)
+        self.list_live_ext_set().await?.into_complete_hashes()
     }
 
     /// The live-set walk [`Self::list_referenced_ext_hashes`] documents, plus
@@ -747,26 +747,32 @@ impl CheckpointStore for InMemoryCheckpointStore {
         let state = self.state.lock().await;
         let listed_layer_artifacts = layer_artifacts_of(&state.layer_checkpoints).len();
         let mut hashes: HashSet<String> = HashSet::new();
-        for per_object in state.layer_checkpoints.values() {
-            for slot in per_object.values() {
+        for (object_id, per_object) in state.layer_checkpoints.iter() {
+            for (snap_seq, slot) in per_object.iter() {
                 let Some(sidecar) = slot.base.as_ref().and_then(|e| e.sidecar.as_ref()) else {
                     continue;
                 };
                 // Per SR-1.5 we treat the sidecar bytes as opaque at put
                 // time; parsing happens here on demand. A malformed sidecar
-                // surfaces as `Permanent` (it cannot be retried into
-                // success), matching the LocalDisk adapter's behavior so the
-                // conformance harness sees consistent classification.
-                let parsed: ExtRefsSidecar =
-                    serde_json::from_slice(sidecar).map_err(|err| CheckpointError::Permanent {
-                        source: Box::new(err),
-                    })?;
+                // surfaces as `Permanent` naming its persisted name (it
+                // cannot be retried into success), matching the LocalDisk
+                // adapter's behavior so the conformance harness sees
+                // consistent classification.
+                let parsed: ExtRefsSidecar = serde_json::from_slice(sidecar).map_err(|err| {
+                    CheckpointError::malformed_ext_refs_sidecar(
+                        format!("{object_id}.{snap_seq}.ext-refs.json"),
+                        err,
+                    )
+                })?;
                 hashes.extend(parsed.ext_hashes);
             }
         }
+        // One lock covers the listing and every read, so no listed sidecar
+        // can read absent: `absent` is always empty here (b.g65).
         Ok(LiveExtSet {
             hashes,
             listed_layer_artifacts,
+            absent: Vec::new(),
         })
     }
 
@@ -811,10 +817,12 @@ impl CheckpointStore for InMemoryCheckpointStore {
         // contract — re-reading the same bytes will not produce a
         // different parse result, so surface to the caller instead of
         // silently dropping references for that handle.
-        let parsed: ExtRefsSidecar =
-            serde_json::from_slice(sidecar).map_err(|err| CheckpointError::Permanent {
-                source: Box::new(err),
-            })?;
+        let parsed: ExtRefsSidecar = serde_json::from_slice(sidecar).map_err(|err| {
+            CheckpointError::malformed_ext_refs_sidecar(
+                format!("{}.{}.ext-refs.json", handle.object_id, handle.snap_seq),
+                err,
+            )
+        })?;
         Ok(parsed.ext_hashes.into_iter().collect())
     }
 
@@ -846,6 +854,15 @@ impl CheckpointStore for InMemoryCheckpointStore {
         self.maybe_inject("list_layer_artifacts")?;
         let state = self.state.lock().await;
         Ok(layer_artifacts_of(&state.layer_checkpoints))
+    }
+
+    /// `Ok(())` with no I/O: every listing here reads the same map under the
+    /// same lock as every by-key read, so there is no separate listing route
+    /// to prove. The DR Jobs never call it on this adapter (they treat
+    /// `InMemory` like `Disabled`), but a harness can fail it through the
+    /// fault injector under the label `verify_list_route`.
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.maybe_inject("verify_list_route")
     }
 }
 
@@ -1447,6 +1464,11 @@ mod tests {
             "malformed sidecar must classify as Permanent (cannot retry into success); got {:?}",
             err
         );
+        assert!(
+            err.to_string()
+                .contains("ext-refs sidecar 1.1.ext-refs.json is malformed"),
+            "b.g65 (C): the walk's error names the sidecar by its persisted name; got: {err}"
+        );
     }
 
     /// `set_layer_sidecar` on a `(object_id, snap_seq)` pair that has NOT
@@ -1591,6 +1613,18 @@ mod tests {
             matches!(err, CheckpointError::Permanent { .. }),
             "malformed sidecar must classify as Permanent; got {:?}",
             err
+        );
+        assert!(
+            err.to_string()
+                .contains("ext-refs sidecar 52.9.ext-refs.json is malformed"),
+            "b.g65 (C): the per-handle error names the sidecar by its persisted name; got: {err}"
+        );
+        let source = std::error::Error::source(&err)
+            .and_then(std::error::Error::source)
+            .expect("the serde error is the typed source's own source");
+        assert!(
+            source.is::<serde_json::Error>(),
+            "the parse error is carried as the source, not flattened into text: {source:?}"
         );
     }
 

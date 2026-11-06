@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! b.xje, b.ze1 — every subscriber ends with the server's sibling order,
-//! however it joined, in both catch-up modes.
+//! however it joined.
 //!
 //! Each subscriber builds its scene from exactly what the stream sends it,
 //! with an independent client reader model (`tests/common/sibling_model.rs`;
@@ -71,7 +71,7 @@
 //! Before b.xje the server stored commit 2's C at order 0 and placed it after
 //! A, while the early subscriber appended; it rejected commit 8 for naming the
 //! deleted B; and it installed each reorder's list as P's whole list, dropping
-//! the attributes. Measured by perturbation on that code (both modes):
+//! the attributes. Measured by perturbation on that code:
 //!
 //! * `apply_create_section` storing order 0 again — the server-list assertion
 //!   fails, reading `[S, A, C, p1, D, p2]` under P;
@@ -110,22 +110,12 @@
 //! 11's unnamed RD is already last, so the Kit client's slot fill agrees with
 //! USD's ordering here and the live Kit subscriber is checked too.)
 //!
-//! In snapshot mode a reconnector receives one coalesced diff, which restates
-//! every listed child of each parent with a new or changed child at its
-//! position: both readers rebuild the server's order from it, whatever keys
-//! they held. A diff restating only the changed children — QD at 3, C at 6;
-//! RD at 4 and RC, RA, RB at 0–2 — leaves the Kit reconnector with
-//! `[QA, QC, QD, QX]`, P's prims `[A, B, C, D]` and `[RC, RA, RB, RD, RE]`.
-//!
-//! In rollback mode a reconnector replays one diff per commit, each emitting
-//! the changed sections at their stored keys. The Kit reader holds exactly
-//! those keys and rebuilds every list. The C++ client library's reader
-//! renumbered its keys when it placed the earlier diffs, so it reads commit
-//! 11's stored keys 0, 2 and 3 as indexes among renumbered siblings and
-//! misplaces R's prims (measured: `[RC, RE, RA, RB, RD]`); rollback mode
-//! keeps that legacy emission unchanged by design (SDD §12.10), so for that
-//! reader R is left out of the rollback comparison and its other lists are
-//! checked.
+//! A reconnector receives one coalesced diff, which restates every listed
+//! child of each parent with a new or changed child at its position: both
+//! readers rebuild the server's order from it, whatever keys they held. A
+//! diff restating only the changed children — QD at 3, C at 6; RD at 4 and
+//! RC, RA, RB at 0–2 — leaves the Kit reconnector with `[QA, QC, QD, QX]`,
+//! P's prims `[A, B, C, D]` and `[RC, RA, RB, RD, RE]`.
 //!
 //! # Wait budget
 //!
@@ -480,35 +470,26 @@ async fn create_layer(
     (session_id, object_id)
 }
 
-/// Require `model`'s order in every child list, optionally leaving out the
-/// lists under `except_parent`, to equal `server`'s.
+/// Require `subscriber`'s model's order in every child list to equal
+/// `server`'s.
 fn assert_child_lists(
     case: &str,
     subscriber: &Subscriber,
     server: &BTreeMap<ChildListKey, Vec<u64>>,
-    except_parent: Option<u64>,
 ) {
-    let keep = |(key, _): &(&ChildListKey, &Vec<u64>)| Some(key.0) != except_parent;
-    let held = subscriber.model.child_lists();
-    let held: BTreeMap<&ChildListKey, &Vec<u64>> = held.iter().filter(keep).collect();
-    let expected: BTreeMap<&ChildListKey, &Vec<u64>> = server.iter().filter(keep).collect();
     assert_eq!(
-        held, expected,
+        &subscriber.model.child_lists(),
+        server,
         "[{case} / {}] the subscriber must hold the server's children, in order, in every \
          child list",
         subscriber.who
     );
 }
 
-async fn every_subscriber_ends_with_the_servers_sibling_order(catchup_snapshot_enabled: bool) {
-    let case = if catchup_snapshot_enabled {
-        "snapshot mode"
-    } else {
-        "rollback mode"
-    };
+async fn run_every_subscriber_ends_with_the_servers_sibling_order() {
+    let case = "scenario 1";
     let tv = TestValkey::setup().await;
-    let mut svc = build_service(&tv, Arc::new(AllowAllPermissions));
-    svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
     let (session_id, object_id) = create_layer(&tv, &svc, &seed()).await;
 
     // The early client and both reconnectors join at the seeded layer.
@@ -571,7 +552,7 @@ async fn every_subscriber_ends_with_the_servers_sibling_order(catchup_snapshot_e
     );
     let server = server_child_lists(&state);
     for subscriber in std::iter::once(&early).chain(&joiners).chain(&reconnectors) {
-        assert_child_lists(case, subscriber, &server, None);
+        assert_child_lists(case, subscriber, &server);
     }
 }
 
@@ -658,15 +639,10 @@ fn gapped_seed() -> OwnedDelta {
     }
 }
 
-async fn reconnectors_over_gapped_keys_end_with_the_servers_order(catchup_snapshot_enabled: bool) {
-    let case = if catchup_snapshot_enabled {
-        "snapshot mode"
-    } else {
-        "rollback mode"
-    };
+async fn run_reconnectors_over_gapped_keys_end_with_the_servers_order() {
+    let case = "scenario 2";
     let tv = TestValkey::setup().await;
-    let mut svc = build_service(&tv, Arc::new(AllowAllPermissions));
-    svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
+    let svc = build_service(&tv, Arc::new(AllowAllPermissions));
     let (session_id, object_id) = create_layer(&tv, &svc, &gapped_seed()).await;
 
     let mut live = Vec::new();
@@ -742,19 +718,12 @@ async fn reconnectors_over_gapped_keys_end_with_the_servers_order(catchup_snapsh
         "[{case}] precondition: the server's lists after the window"
     );
     let server = server_child_lists(&state);
-    for subscriber in live.iter().chain(&joiners) {
-        assert_child_lists(case, subscriber, &server, None);
-    }
-    for reconnector in &reconnectors {
-        // Rollback mode's per-commit stored keys are not indexes the C++
-        // client library's renumbered siblings can take (module header).
-        let except = (!catchup_snapshot_enabled && reconnector.model.reader() == Reader::Ovlive)
-            .then_some(GAP_R);
-        assert_child_lists(case, reconnector, &server, except);
+    for subscriber in live.iter().chain(&joiners).chain(&reconnectors) {
+        assert_child_lists(case, subscriber, &server);
     }
 }
 
-/// Run `scenario` in one catch-up mode under [`SCENARIO_BUDGET`].
+/// Run `scenario` under [`SCENARIO_BUDGET`].
 async fn within_budget<F: std::future::Future<Output = ()>>(scenario: F) {
     tokio::time::timeout(SCENARIO_BUDGET, Box::pin(scenario))
         .await
@@ -762,27 +731,11 @@ async fn within_budget<F: std::future::Future<Output = ()>>(scenario: F) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_subscriber_ends_with_the_servers_sibling_order_snapshot_mode() {
-    within_budget(every_subscriber_ends_with_the_servers_sibling_order(true)).await;
+async fn every_subscriber_ends_with_the_servers_sibling_order() {
+    within_budget(run_every_subscriber_ends_with_the_servers_sibling_order()).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_subscriber_ends_with_the_servers_sibling_order_rollback_mode() {
-    within_budget(every_subscriber_ends_with_the_servers_sibling_order(false)).await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconnectors_over_gapped_keys_end_with_the_servers_order_snapshot_mode() {
-    within_budget(reconnectors_over_gapped_keys_end_with_the_servers_order(
-        true,
-    ))
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconnectors_over_gapped_keys_end_with_the_servers_order_rollback_mode() {
-    within_budget(reconnectors_over_gapped_keys_end_with_the_servers_order(
-        false,
-    ))
-    .await;
+async fn reconnectors_over_gapped_keys_end_with_the_servers_order() {
+    within_budget(run_reconnectors_over_gapped_keys_end_with_the_servers_order()).await;
 }

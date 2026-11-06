@@ -15,7 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */ -}}
 
-{{- if .Values.tests.enabled }}
+{{- /* Never while a disaster-recovery action is set: live-edit-service.drActionSet. */}}
+{{- if and .Values.tests.enabled (ne (include "live-edit-service.drActionSet" .) "true") }}
 {{- if not .Values.tests.storageApiResourceBase }}
 {{- fail "tests.storageApiResourceBase is required when tests.enabled=true — set it to a base storage path the smoke principal has write permission on in the upstream permissions service (e.g. https://storage.example.com/mybucket/). See values.yaml for context." }}
 {{- end }}
@@ -34,8 +35,13 @@ metadata:
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0
-  {{- if gt (int .Values.tests.ttlSecondsAfterFinished) 0 }}
-  ttlSecondsAfterFinished: {{ .Values.tests.ttlSecondsAfterFinished }}
+  {{- $ttl := .Values.tests.ttlSecondsAfterFinished }}
+  {{- if not (or (kindIs "invalid" $ttl) (eq (toString $ttl) "")) }}
+  {{- $ttlSeconds := include "live-edit-service.nonNegativeInteger" (dict "key" "tests.ttlSecondsAfterFinished" "value" $ttl "hint" "seconds, 0 to keep the Job") }}
+  {{- /* 0, however written, renders nothing: to Kubernetes it would mean "delete at once". */}}
+  {{- if ne $ttlSeconds "0" }}
+  ttlSecondsAfterFinished: {{ $ttlSeconds }}
+  {{- end }}
   {{- end }}
   template:
     metadata:

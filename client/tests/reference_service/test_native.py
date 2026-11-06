@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
+import sys
 import unittest
 
 import grpc
@@ -28,6 +30,28 @@ PROBE_MODES = {"actor-auth-timeout": (6, 0)}
 
 def sha(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def exit_status(status):
+    """A driver's exit status, with the name of the signal that ended it; real-time signals have no Signals member."""
+    if status >= 0:
+        return f"driver exit status {status}"
+    try:
+        name = signal.Signals(-status).name
+    except ValueError:
+        try:
+            name = signal.strsignal(-status) or f"signal {-status}"
+        except ValueError:
+            name = f"signal {-status}"
+    return f"driver exit status {status} ({name})"
+
+
+class ExitStatusTests(unittest.TestCase):
+    def test_every_signal_number_is_reported_with_the_status(self):
+        self.assertEqual(exit_status(0), "driver exit status 0")
+        self.assertEqual(exit_status(-signal.SIGABRT), f"driver exit status {-signal.SIGABRT} (SIGABRT)")
+        for number in sorted(signal.valid_signals()) + [max(signal.valid_signals()) + 1]:
+            self.assertTrue(exit_status(-number).startswith(f"driver exit status {-number} ("), number)
 
 
 class NativeTests(unittest.IsolatedAsyncioTestCase):
@@ -137,7 +161,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         if steps:
             self.assertEqual(completed_steps, [marker for marker, _ in steps])
         data = json.loads(tail.splitlines()[-1])
-        if mode.startswith(("diag-", "actor-flood-", "actor-read-pause", "actor-read-deadline-", "actor-auth-wait-", "actor-host-fault-", "actor-release-notices", "actor-buffer-emptied", "actor-issue-reservation", "actor-drop-without-close", "actor-auth-server-", "actor-auth-stale-generation")) or mode == "join-auth-wait-close":
+        if mode.startswith(("diag-", "actor-flood-", "actor-read-pause", "actor-read-end-queued", "actor-read-deadline-", "actor-auth-wait-", "actor-host-fault-", "actor-release-notices", "actor-buffer-emptied", "actor-issue-reservation", "actor-drop-without-close", "actor-auth-server-", "actor-auth-stale-generation", "actor-call-budget")) or mode == "join-auth-wait-close":
             return data
         self.assertEqual((data["result"], data["grpc_status"]), (result, code))
         if mode.startswith("actor-"):
@@ -293,6 +317,19 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.attempts,
                          {"CreateSession": 1, "CreateLayer": 1, "Ping": 1, "ListSessions": 2, "StatLayer": 2})
         self.check_diagnostic_snapshot(data, 5, {(13, 0): 1, (10, 0): 1, (10, 8): 1, (12, 0): 1, (12, 8): 1})
+        # Each finite read's UNAVAILABLE attempt schedules one retry of the
+        # same request, correlated with that attempt's rpc_failed record.
+        records = data["snapshot"]["recent_records"]
+        failed = {r["fields"]["operation"]: r["fields"] for r in records if r["event_name"] == "rpc_failed"}
+        retries = [r for r in records if r["event_name"] == "retry_scheduled"]
+        self.assertEqual(sorted(r["fields"]["operation"] for r in retries), [10, 12])
+        for record in retries:
+            fields = record["fields"]
+            self.assertEqual((record["event_code"], record["subject_id"]), (21, 0))
+            self.assertEqual((fields["reason"], fields["attempt_id"], fields["auth_generation"]), (8, 2, 1))
+            self.assertEqual(fields["request_id"], failed[fields["operation"]]["request_id"])
+            self.assertLessEqual(fields["delay_ms"], 20)
+            self.assertNotIn("result", fields)
 
     async def test_blocked_diagnostic_sinks_preserve_rpc_and_status_progress(self):
         session = await self.create_layer()
@@ -384,6 +421,30 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                 failures = [r for r in snapshot['recent_records'] if r['event_name'] == 'auth_failed']
                 self.assertEqual(len(failures), 1)
                 self.assertEqual(failures[0]['fields']['auth_failure_cause'], failure)
+            records = snapshot['recent_records']
+            challenges = [r for r in records if r['event_name'] == 'auth_challenge']
+            self.assertEqual(len(challenges), 1)
+            challenge = challenges[0]
+            self.assertEqual((challenge['event_code'], challenge['severity']), (5, 3))
+            self.assertEqual((challenge['fields']['operation'], challenge['fields']['reason']), (8, reason))
+            self.assertGreater(challenge['fields']['challenge_id'], 0)
+            # The host callback refreshes the token except when the auth
+            # deadline expires inside it; the refresh is one replacement.
+            replaced = [r for r in records if r['event_name'] == 'auth_replaced']
+            self.assertEqual(len(replaced), 0 if failure == 1 else 1)
+            for record in replaced:
+                self.assertEqual((record['event_code'], record['severity'], record['subject_id']),
+                                 (6, 2, challenge['subject_id']))
+                fields = record['fields']
+                self.assertEqual((fields['operation'], fields['result']), (8, 0))
+                self.assertGreater(fields['auth_generation'], challenge['fields']['auth_generation'])
+                if failure is None:
+                    self.assertEqual(fields['challenge_id'], challenge['fields']['challenge_id'])
+            # The driver copies the snapshot after its final UnregisterEndpoint.
+            closed = [r for r in records if r['event_name'] == 'endpoint_closed']
+            self.assertEqual(len(closed), 1)
+            self.assertEqual((closed[0]['event_code'], closed[0]['subject_id'], closed[0]['fields']['state']),
+                             (2, challenge['subject_id'], 9))
             for secret in ('synthetic-writer', 'synthetic-invalid', 'Bearer', self.address):
                 self.assertNotIn(secret, json.dumps(snapshot))
         data = await self.driver("public-auth-missing", token="")
@@ -815,10 +876,10 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         # Fits the general 6 MiB channel limit but exceeds this RPC's 2 MiB
         # frame allowance, proving the method-specific limit is actually active.
         address = await self.read_script([self.read_header(3 * 1024 * 1024), self.read_chunk(b"x" * (3 * 1024 * 1024))])
-        # The pinned native/Python SDK pair returns CANCELLED here, not
-        # RESOURCE_EXHAUSTED. Preserve the observed raw status; never infer a
-        # quota cause by parsing arbitrary transport error strings.
-        data = await self.driver("read-error", 10, 1, extra=["scripted"], address=address)
+        # The pinned gRPC reports a received message over the method's limit as
+        # RESOURCE_EXHAUSTED (raw 8), which maps to the result of the same name; never
+        # infer a quota cause by parsing arbitrary transport error strings.
+        data = await self.driver("read-error", 13, 8, extra=["scripted"], address=address)
         self.assertEqual(data["updates"], [])
         self.assertEqual(data["closed"], 1)
         # A single frame at the supported chunk boundary still delivers exactly.
@@ -944,7 +1005,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
     async def actor_read_pause(self, mode):
         from unittest.mock import patch
         from service import LiveService
-        frames, cancelled, resumed = asyncio.Queue(), asyncio.Event(), asyncio.Event()
+        frames, cancelled, resumed, written = asyncio.Queue(), asyncio.Event(), asyncio.Event(), asyncio.Event()
         service_end = mode == "actor-read-pause-service-end"
         # The service-ended stream carries peers 2..33; the reconnect carries 34..37.
         split = 34 if service_end else 38
@@ -976,6 +1037,9 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                         await context.abort(grpc.StatusCode.UNAVAILABLE, "service ended the paused reader")
                     for response in frame(sequence):
                         yield response
+                    # gRPC asks for the next response only after it has sent this one.
+                    if sequence == split - 1:
+                        written.set()
             finally:
                 cancelled.set()
         with patch.object(LiveService, "SubscribeReadLayer", stream):
@@ -986,6 +1050,8 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         async def burst():
             for sequence in range(2, split):  # At least 32 peers, above the high-water mark of 28.
                 await frames.put(sequence)
+            # The driver waits for the pause only once the whole burst is on the connection.
+            await written.wait()
 
         async def paused():
             self.assertFalse(cancelled.is_set())  # Paused, not failed or reconnected.
@@ -1047,7 +1113,7 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         from unittest.mock import patch
         from service import LiveService
         paced = mode == "actor-read-deadline-paced"
-        frames, ended = asyncio.Queue(), asyncio.Event()
+        frames, ended, written = asyncio.Queue(), asyncio.Event(), asyncio.Event()
         cursors, stalls = [], []
 
         def frame(sequence):
@@ -1076,6 +1142,9 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
             while (sequence := await frames.get()) is not None:
                 for response in frame(sequence):
                     yield response
+                # gRPC asks for the next response only after it has sent this one.
+                if sequence == 33:
+                    written.set()
             ended.set()
             await context.abort(grpc.StatusCode.UNAVAILABLE, "service ended the first read")
 
@@ -1088,6 +1157,8 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
             if paced:
                 for sequence in range(2, 34):  # 32 peers, above the high-water mark of 28.
                     await frames.put(sequence)
+                # The driver waits for the pause only once the whole burst is on the connection.
+                await written.wait()
             else:
                 await frames.put(None)
                 await asyncio.wait_for(ended.wait(), 3)
@@ -1136,6 +1207,42 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_actor_host_failure_while_paused_cancels_the_read_and_keeps_retained_work(self):
         await self.actor_read_pause("actor-read-pause-terminal")
+
+    async def test_actor_read_ending_with_queued_frames_reconnects_after_its_last_frame(self):
+        # The service sends peers 2..9 and ends the stream while an actor step that saw the read running
+        # is held before its queue check; the actor consumes every queued frame before it settles the end.
+        from unittest.mock import patch
+        from service import LiveService
+        ended = asyncio.Event()
+        cursors = []
+
+        async def stream(service, request, context):
+            await service.begin("SubscribeReadLayer", context)
+            cursors.append((request.object_id, request.sequence_num))
+            yield self.read_header(0, sequence=request.sequence_num)
+            if len(cursors) > 1:
+                await asyncio.Event().wait()  # The reconnect stays open until the client closes.
+            await ended.wait()
+            for sequence in range(2, 10):
+                yield self.read_header(1024, sequence=sequence)
+                yield self.read_chunk(bytes([ord('a') + sequence % 26]) * 1024)
+            await context.abort(grpc.StatusCode.UNAVAILABLE, "service ended the read")
+
+        with patch.object(LiveService, "SubscribeReadLayer", stream):
+            server = ReferenceServer(self.state, "read-end-queued")
+        self.servers.append(server)
+        address = await server.start()
+
+        async def end():
+            ended.set()
+        data = await self.driver("actor-read-end-queued", 0, extra=["scripted"], address=address,
+                                 steps=[(b"actor-read-observed", end)])
+        self.assertEqual(cursors, [(1, 1), (1, 9)])
+        self.assertEqual((data["applied"], data["covered"], data["generations"]), (9, 9, 2))
+        records = data["diagnostics"]["recent_records"]
+        disconnects = [r["fields"] for r in records if r["event_name"] == "stream_disconnected"]
+        self.assertEqual([(d["result"], d["read_sequence"]) for d in disconnects], [(8, 9)], records)
+        self.assertEqual(self.state.attempts["SubscribeReadLayer"], 2)
 
     async def test_layer_read_cancel_before_header_and_partial_payload(self):
         session = await self.create_layer()
@@ -1213,6 +1320,191 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
                                  steps=[(b"actor-dropped", read_cancelled)])
         self.assertEqual(data, {"result": 0, "closed": True})
         self.assertEqual(self.state.attempts.get("SubscribeReadLayer"), 1)
+
+    async def call_budget(self, budget):
+        """Runs actor-call-budget with max_calls_per_endpoint `budget` against a server that counts its open calls.
+
+        The server holds UpdateLayer calls until the driver reaches budget-held: with a budget, until the call share's
+        two writes arrive, and without one until more than eight calls are open at once. Returns the driver's data,
+        the most calls the driver's connection held open at once, and the session.
+        """
+        from unittest.mock import patch
+        from service import CallCounter, LiveService
+        session = await self.layer_session()
+        for i in range(5):
+            messages = [pb.CreateLayerRequest(header=pb.CreateLayerHeader(session_id=session,
+                                                                          layer_name=f"budget-{i}.live")),
+                        pb.CreateLayerRequest(chunk=pb.CreateLayerChunk(data=b"opaque-base"))]
+            await self.stub.CreateLayer(iter(messages), metadata=WRITER, timeout=5)
+        calls, release, held = CallCounter(), asyncio.Event(), []
+        original = LiveService.UpdateLayer
+
+        async def gated(service, stream, context):
+            held.append(context.peer())
+            calls.changed.set()
+            await release.wait()
+            return await original(service, stream, context)
+        with patch.object(LiveService, "UpdateLayer", gated):
+            server = ReferenceServer(self.state, "budget", calls=calls)
+        self.servers.append(server)
+        address = await server.start()
+
+        def peak():
+            return max(calls.peak.values(), default=0)
+
+        async def saturated():
+            if budget:
+                # Four reads, two joins and the call share's two writes: every other write and the four finite
+                # requests wait on the client, not at the service.
+                await calls.until(lambda: len(held) == 2)
+                self.assertEqual(sum(calls.open.values()), budget)
+                self.assertNotIn("ListSessions", self.state.attempts)
+                self.assertNotIn("StatLayer", self.state.attempts)
+            else:
+                await calls.until(lambda: peak() > 8)
+            release.set()
+
+        async def rejoin():
+            # Ends the first join's stream; it rejoins on the stream unit it holds.
+            async with self.state.changed:
+                self.assertTrue(self.state.evict(self.state.joins[0]["connection"]))
+
+        async def closed():
+            # The closed layer's read has ended at the service before the refused layer opens.
+            await calls.until(lambda: sum(calls.open.values()) == 5)
+        steps = [(b"budget-held", saturated)]
+        if budget:
+            steps += [(b"budget-rejoin", rejoin), (b"budget-closed", closed)]
+        data = await self.driver("actor-call-budget", extra=[session, budget], address=address, steps=steps)
+        self.assertEqual(len(set(held)), 1, held)  # One endpoint, one connection.
+        return data, peak(), session
+
+    async def test_endpoint_call_budget_bounds_open_calls(self):
+        data, peak, session = await self.call_budget(8)
+        # Never more than the budget open on the connection, by the client's count and the service's.
+        self.assertLessEqual(data["peak"], 8)
+        self.assertLessEqual(peak, 8)
+        self.assertEqual(data["limit"], 8)
+        # The stream share holds four reads and two joins; the fifth layer and the third join are refused
+        # RESOURCE_EXHAUSTED, never a timeout, and the layer opens once a closed layer returns its unit.
+        self.assertEqual(data["layer_results"], [0, 0, 0, 0, 13])
+        self.assertEqual(data["join_results"], [0, 0, 13])
+        # On the full share a read reconnects and a join rejoins on the units they hold, and a layer closed while
+        # its owner still holds it returns its unit, so the refused layer opens.
+        self.assertTrue(data["reconnected"])
+        self.assertTrue(data["reopened"])
+        # Writes and finite requests waited on the client for a call unit and completed exactly once each.
+        self.assertEqual(data["retired"], [6, 6, 6, 6, 0])
+        self.assertEqual(data["finite"], [0, 0, 0, 0])
+        for i in range(4):
+            commits = [c for c in self.state.ledger if c.session == session and c.layer == f"budget-{i}.live"
+                       and c.operation == "UpdateLayer"]
+            self.assertEqual([c.payload for c in commits], [f"w-{i}-{k}".encode() for k in range(6)])
+        self.assertEqual(self.state.attempts["UpdateLayer"], 24)
+        self.assertEqual(self.state.attempts["SubscribeReadLayer"], 6)
+        self.assertEqual(self.state.attempts["JoinSession"], 3)
+        # call_budget_exhausted records each refusal, operation OPEN (1) or JOIN (6) with reason 1, and the first
+        # write that waited, operation UPDATE (4) with reason 2.
+        records = [r for r in data["records"] if r["event"] == "call_budget_exhausted"]
+        self.assertTrue(all(r["severity"] == 3 and r["limit"] == 8 for r in records), records)
+        self.assertEqual([(r["operation"], r["reason"]) for r in records if r["reason"] == 1], [(1, 1), (6, 1)])
+        self.assertIn((4, 2), [(r["operation"], r["reason"]) for r in records])
+        self.assertTrue(all(r["count"] <= 8 for r in records), records)
+
+    async def gated_server(self, *methods):
+        """A server that counts its open calls and, per unary method, can hold calls and record their deadlines.
+
+        Each gate holds the method's calls while `hold` is set until `release` is set, and records each call's
+        remaining deadline in seconds."""
+        import contextlib
+        from unittest.mock import patch
+        from service import CallCounter, LiveService
+        calls = CallCounter()
+        gates = {method: dict(hold=False, release=asyncio.Event(), remaining=[]) for method in methods}
+        with contextlib.ExitStack() as stack:
+            for method in methods:
+                gate, original = gates[method], getattr(LiveService, method)
+
+                async def gated(service, request, context, gate=gate, original=original):
+                    gate["remaining"].append(context.time_remaining())
+                    calls.changed.set()
+                    if gate["hold"]:
+                        await gate["release"].wait()
+                    return await original(service, request, context)
+                stack.enter_context(patch.object(LiveService, method, gated))
+            server = ReferenceServer(self.state, "gated", calls=calls)
+        self.servers.append(server)
+        return await server.start(), calls, gates
+
+    async def test_endpoint_call_budget_wait_expiry_reports_resource_exhausted(self):
+        session = await self.layer_session()
+        address, calls, gates = await self.gated_server("Ping", "ListSessions")
+        gates["Ping"]["hold"] = True
+
+        async def held():
+            await calls.until(lambda: len(gates["Ping"]["remaining"]) == 2)
+
+        async def stat_expired():
+            # The stat waited past its 400 ms deadline without issuing; one released Ping lets the ListSessions,
+            # queued before it, issue with its whole 2000 ms deadline although it waited longer than 400 ms.
+            self.assertNotIn("StatLayer", self.state.attempts)
+            self.assertNotIn("ListSessions", self.state.attempts)
+            gates["Ping"]["release"].set()
+            await calls.until(lambda: len(gates["ListSessions"]["remaining"]) == 1)
+        data = await self.driver("actor-call-budget-expiry", extra=[session], address=address,
+                                 steps=[(b"expiry-held", held), (b"expiry-stat", stat_expired)])
+        # The metadata stat ends RESOURCE_EXHAUSTED, not TIMEOUT, although its callback could not retire.
+        self.assertEqual((data["stat"], data["list"]), (13, 0), data)
+        self.assertNotIn("StatLayer", self.state.attempts)
+        self.assertGreater(gates["ListSessions"]["remaining"][0], 1.7)
+        records = [(r["operation"], r["reason"]) for r in data["records"] if r["event"] == "call_budget_exhausted"]
+        self.assertIn((12, 4), records)
+
+    async def test_endpoint_call_budget_resend_waits_for_a_call_and_commits_once(self):
+        session = await self.create_layer()
+        self.state.chained_writes = False  # Writes go unchained, so an unknown outcome takes the single re-send.
+        address, calls, gates = await self.gated_server("Ping", "ListSessions")
+        fault = self.state.plan("UpdateLayer", "after_commit", code=grpc.StatusCode.UNAVAILABLE, pause=True)
+
+        async def ready():
+            gates["Ping"]["hold"] = gates["ListSessions"]["hold"] = True
+
+        async def write_held():
+            await asyncio.wait_for(fault.reached.wait(), 3)
+            await calls.until(lambda: len(gates["Ping"]["remaining"]) == 2)  # The capability Ping and the held one.
+
+        async def queued():
+            fault.release.set()  # The write ends with an unknown outcome; its unit serves the ListSessions.
+            await calls.until(lambda: len(gates["ListSessions"]["remaining"]) == 1)
+
+        async def awaiting():
+            # The re-send waits on the client for a call unit.
+            self.assertEqual(self.state.attempts["UpdateLayer"], 1)
+            gates["Ping"]["release"].set()
+            gates["ListSessions"]["release"].set()
+        data = await self.driver("actor-call-budget-resend", extra=[session], address=address, steps=[
+            (b"resend-ready", ready), (b"resend-write", write_held), (b"resend-queued", queued),
+            (b"resend-awaiting", awaiting)])
+        self.assertEqual((data["failed"], data["layer_result"], data["retired"], data["list"]), (False, 0, 1, 0), data)
+        self.assertEqual(self.state.attempts["UpdateLayer"], 2)
+        commits = [c for c in self.state.ledger if c.session == session and c.operation == "UpdateLayer"]
+        self.assertEqual([c.payload for c in commits], [b"resent-once"])
+        # The ListSessions began the wait (operation LIST, reason 2); the re-send waited in the same episode.
+        self.assertIn((10, 2), [(r["operation"], r["reason"]) for r in data["records"]])
+
+    async def test_endpoint_without_the_call_budget_exceeds_it(self):
+        # The same plan under the default budget: nothing is refused, and the connection carries more than eight
+        # calls at once, which the bounded run never does.
+        data, peak, session = await self.call_budget(0)
+        self.assertGreater(peak, 8)
+        self.assertGreater(data["peak"], 8)
+        self.assertEqual(data["limit"], 1024)
+        self.assertEqual(data["layer_results"], [0] * 5)
+        self.assertEqual(data["join_results"], [0] * 3)
+        self.assertEqual(data["retired"], [6] * 5)
+        self.assertEqual(data["finite"], [0, 0, 0, 0])
+        self.assertEqual(self.state.attempts["UpdateLayer"], 30)
+        self.assertEqual(data["records"], [])
 
     async def test_actor_issuance_uses_the_admission_reservation(self):
         session = await self.create_layer()
@@ -1600,6 +1892,47 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.state.attempts["SubscribeReadLayer"], 5)
         self.assertEqual(self.state.attempts["UpdateLayer"], 3)
 
+    async def test_actor_auth_idle_watchdog_reports_auth_state_and_stacks_before_aborting(self):
+        # The worker-idle watchdog of both modes that wait on it is failure-only, so the seam expires it at once.
+        fields = ("expiry", "auth_failed", "auth_failure_serial", "challenge", "auth_deadline_remaining_ms", "gate",
+                  "result", "worker_scheduled", "wake_pending", "read_ended", "queued_read_frames", "read_paused",
+                  "timing_pending")
+        for mode, (result, code) in (("actor-auth-expiry-idle", (6, 0)),
+                                     ("actor-auth-timeout", PROBE_MODES["actor-auth-timeout"])):
+            with self.subTest(mode=mode):
+                session = await self.create_layer()
+                name = f"{self.id().split('.')[-1]}.{mode}"
+                prefix = self.artifact / f"{name}.stacks"
+                process = await asyncio.create_subprocess_exec(os.environ["LIVE_TEST_UNARY_DRIVER"],
+                    self.address, mode, str(result), str(code), "synthetic-writer", session,
+                    stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=dict(os.environ, LIVE_TEST_EXPIRE_AUTH_IDLE_WATCHDOG="1", LIVE_STACK_DUMP_PREFIX=str(prefix)))
+                self.children.append(process)
+                output, _ = await asyncio.wait_for(process.communicate(), 30)
+                (self.artifact / f"{name}.native.log").write_bytes(output)
+                text = output.decode(errors="replace")
+                # A negative return code is the signal that ended the driver, which tells an abort after a
+                # complete dump from a process killed during it.
+                status = process.returncode
+                exited = exit_status(status)
+                self.assertNotEqual(status, 0, f"{exited}\n{text[-4096:]}")
+                report = [line for line in text.splitlines() if line.startswith("auth-idle-watchdog ")]
+                self.assertEqual(len(report), 1, f"{exited}\n{text[-4096:]}")
+                values = dict(item.partition("=")[::2] for item in report[0].split()[1:])
+                self.assertEqual(values.get("mode"), mode, f"{exited}: {report[0]}")
+                for field in fields:
+                    self.assertRegex(values.get(field, ""), r"^-?[0-9]+$", f"{field}, {exited}: {report[0]}")
+                self.assertEqual(values["auth_failed"], "0", f"{exited}: {report[0]}")
+                if mode == "actor-auth-expiry-idle":
+                    # The driver's expiry raised a challenge before this wait.
+                    self.assertNotEqual(values["challenge"], "0", f"{exited}: {report[0]}")
+                if sys.platform.startswith("linux"):
+                    dumps = list(prefix.parent.glob(prefix.name + ".*"))
+                    self.assertEqual(len(dumps), 1, f"{exited}: {dumps}")
+                    self.assertIn("live-stack-dump end pid=", dumps[0].read_text(errors="replace"),
+                                  f"{exited}\n{text[-4096:]}")
+
     async def test_actor_update_unauthenticated_is_reissued_once_after_refresh(self):
         self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
         # The service authenticates before executing an update, so a rejected
@@ -1747,9 +2080,8 @@ class NativeTests(unittest.IsolatedAsyncioTestCase):
             updates = sum(r["count"] for r in data["diagnostics"]["metrics"]["rpc_attempts_by_operation"]
                           if r["operation"] == 4)
             self.assertEqual(updates, 2)  # The issue and its one reissue; never a third.
-            # The proxy forwards a rejected header block, so the service starts
-            # and counts each rejected update before the reset cancels it.
-            self.assertEqual(self.state.attempts["UpdateLayer"], before + 2)
+            # A rejected update never reaches the service; only a reissue past the ingress does.
+            self.assertEqual(self.state.attempts.get("UpdateLayer", 0), before + 2 - rejections)
             self.assertEqual(data["answers"], [0])
             commits = [c.payload for c in self.state.ledger if c.session == session and c.operation == "UpdateLayer"]
             self.assertEqual(commits, [b"local-0"] if expected == 0 else [])

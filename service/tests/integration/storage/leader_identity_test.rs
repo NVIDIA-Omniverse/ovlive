@@ -83,13 +83,13 @@ fn identities() -> (LeaderIdentity, LeaderIdentity) {
 }
 
 async fn acquire(client: &ValkeyClient, key: &str, who: &LeaderIdentity) -> bool {
-    try_acquire_leader_lock(client, key, who, SHORT_TTL_MS)
+    try_acquire_leader_lock(client, key, &who.lock_value(), SHORT_TTL_MS)
         .await
         .unwrap_or_else(|e| panic!("acquire as {who} must not error: {e}"))
 }
 
 async fn refresh(client: &ValkeyClient, key: &str, who: &LeaderIdentity) -> bool {
-    refresh_leader_lock_if_held(client, key, who, SHORT_TTL_MS)
+    refresh_leader_lock_if_held(client, key, &who.lock_value(), SHORT_TTL_MS)
         .await
         .unwrap_or_else(|e| panic!("refresh as {who} must not error: {e}"))
 }

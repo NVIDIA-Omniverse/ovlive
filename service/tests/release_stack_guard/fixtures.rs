@@ -184,8 +184,6 @@ pub fn ompf(delta: &OwnedDelta) -> Vec<u8> {
 pub struct Opts {
     /// `LIVE_EDIT_UPDATE_LAYER_BACKEND`.
     pub backend: UpdateLayerBackend,
-    /// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` (production default: on).
-    pub snapshot: bool,
     /// An enabled layer recovery hook over this store, as with checkpointing
     /// on; disabled when `None`.
     pub layer_checkpoints: Option<Arc<dyn CheckpointStore>>,
@@ -200,7 +198,6 @@ impl Default for Opts {
     fn default() -> Self {
         Opts {
             backend: UpdateLayerBackend::Lua,
-            snapshot: true,
             layer_checkpoints: None,
             session_checkpoints: None,
             client: None,
@@ -335,7 +332,6 @@ impl Fx {
             None => (base.session_recovery.clone(), SessionBasePathCache::new()),
         };
         LiveEditService {
-            catchup_snapshot_enabled: opts.snapshot,
             session_store: Arc::new(SessionStore::new(client.clone(), keys.clone())),
             layer_store,
             ext_value_store: Arc::new(ValkeyExternalValueStore::new(client.clone(), keys.clone())),
@@ -725,9 +721,8 @@ pub fn catch_ups(svc: &LiveEditService, regime: &str, catchup_mode: &str) -> f64
     )
 }
 
-/// Diff builds that record their case (`live_diff_case_total`): the
-/// snapshot mode's faithful builds do, the rollback mode's legacy builds
-/// and per-commit replays do not.
+/// Diff builds that record their case (`live_diff_case_total`): every
+/// faithful catch-up build records one.
 pub fn faithful_builds(svc: &LiveEditService) -> f64 {
     metric(svc, "live_diff_case_total", &[("service", SERVICE_LABEL)])
 }

@@ -41,8 +41,7 @@ use fred::{
     prelude::{Builder, ReconnectPolicy},
     types::{
         config::{
-            Blocking, Config as FredConfig, CredentialProvider, PerformanceConfig, Server,
-            ServerConfig,
+            Config as FredConfig, CredentialProvider, PerformanceConfig, Server, ServerConfig,
         },
         ClientState, ClusterHash, ConnectHandle, FromValue, RespVersion,
     },
@@ -135,6 +134,10 @@ pub const POOL_LABEL_PUBSUB: &str = crate::observability::metrics::VALKEY_POOL_S
 /// the trigger by construction. The counted upload write sites note it
 /// through [`refuse_store_write`], which takes an origin too.
 ///
+/// It also marks the `txn_pool`'s cluster routing stale on a redirect refusal
+/// received on that pool through a [`Self::client`] origin (b.4q2; see
+/// [`Self::observe_error`]).
+///
 /// A site that hands the error on to a mapper, or receives it from
 /// `WatchedTxn::exec`, must not also count it; each received error is counted
 /// once, where it was received. Noting a refusal twice is harmless (the
@@ -195,14 +198,31 @@ impl<'a> FredErrOrigin<'a> {
     /// `Canceled` are left alone because fred already broadcasts the connection
     /// event behind them, which [`spawn_error_metric`] counts.
     ///
-    /// Observing only: it borrows the error, returns nothing and steers
-    /// nothing. The note requests an out-of-memory collection and wakes this
-    /// replica's GC loop, at most once a second, without waiting
-    /// (`storage::store_oom`).
+    /// On a `txn_pool` origin built with [`Self::client`], it also marks the
+    /// pool's cluster routing stale when `e` is a redirect refusal
+    /// ([`is_txn_redirect_refusal`]: a single command or a pipeline met a
+    /// `MOVED` or an `-ASK`), so every other member re-syncs its routing at its
+    /// next checkout ([`ValkeyClient::mark_txn_routing_stale`]). The `txn_pool`
+    /// receipt sites pass such an origin, and the three mappers call this, so
+    /// a redirect a `txn_pool` command meets reaches the mark. The one
+    /// exception is `WatchGuard`'s teardown `UNWATCH`, whose origin carries
+    /// no client. A fred `Transaction`'s redirect is marked by
+    /// [`ValkeyClient::exec_txn`] instead.
+    ///
+    /// Observing only: it borrows the error, returns nothing and changes no
+    /// caller's answer. The note requests an out-of-memory collection and
+    /// wakes this replica's GC loop, at most once a second, without waiting
+    /// (`storage::store_oom`); the mark advances an in-memory epoch, at most
+    /// once a second, without waiting.
     pub fn observe_error(&self, e: &fred::error::Error) {
         if store_write_refusal(e) == Some(StoreWriteRefusal::OutOfMemory) {
             self.note_out_of_memory();
             return;
+        }
+        if let OriginMetrics::Client(client) = self.metrics {
+            if self.pool == POOL_LABEL_TXN && is_txn_redirect_refusal(e) {
+                client.mark_txn_routing_stale(TXN_ROUTING_STALE_TRIGGER_COMMAND);
+            }
         }
         if !matches!(e.kind(), FredErrorKind::Timeout) {
             return;
@@ -325,11 +345,13 @@ const TXN_STATE_PROOF_STREAK_MAX_NODES: usize = 64;
 ///
 /// The knob both are written against is
 /// **`LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS`** (30 s default), not
-/// `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`: `ValkeyClient::quit` runs inside
-/// `main.rs`'s `shutdown_sequence`, which is wrapped in one
-/// `tokio::time::timeout(shutdown_overall_budget, …)`. The per-task budget
-/// derived from `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` bounds the individual
-/// background-task joins earlier in that sequence, never this pool teardown.
+/// `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`: `ValkeyClient::quit` runs at the end of
+/// the post-server shutdown sequence
+/// (`grpc::transport::run_post_server_sequence`), which is wrapped in one
+/// `tokio::time::timeout` of the overall budget and starts `quit()` with at
+/// least `MIN_SHUTDOWN_BUDGET_HEADROOM_SECS` of it left. The per-task budget
+/// derived from `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` bounds the waits earlier in
+/// that sequence, never this pool teardown.
 /// The arithmetic is unchanged either way — 2 s + 2 s of drain is a small
 /// fraction of the 30 s the whole sequence gets, and `Config::from_env` rejects
 /// `overall < timeout + 15` so the overall budget cannot be configured below
@@ -830,8 +852,8 @@ pub const STORE_NOT_SERVING_SHAPES: [&str; 9] = [
 /// pool goes through — the write path can observe it exactly as the subscriber
 /// can, and both want the same verdict. `-UNBLOCKED`
 /// ([`is_client_unblocked_error`]) is structurally confined to the stream
-/// reader connections, the only clients with `Blocking::Interrupt` and the
-/// only ones issuing a blocking command, so folding *that* in would reclassify a genuine
+/// reader connections, the only clients issuing a blocking command, so
+/// folding *that* in would reclassify a genuine
 /// `Unknown` on the write path for no caller's benefit.
 pub fn is_router_no_connection_error(e: &fred::error::Error) -> bool {
     matches!(e.kind(), FredErrorKind::Unknown | FredErrorKind::Routing)
@@ -886,7 +908,9 @@ pub fn is_router_no_connection_error(e: &fred::error::Error) -> bool {
 /// - `-MOVED` → `process_moved` (`router/commands.rs:288`) syncs the cluster,
 ///   passes `decr_check_redirections` (`:304`), and re-enters `write_command` at
 ///   `:309` with `attempts_remaining` already 0 → dies `Unknown` / `"Too many
-///   failed write attempts."`.
+///   failed write attempts."`. (On the `txn_pool`, whose redirection budget is
+///   zero, the check at `:304` fails instead, after the sync: `Routing` /
+///   `"Too many redirections."`, as for an `-ASK` there.)
 /// - `-ASK` → `process_ask` (`router/commands.rs:251`) passes
 ///   `decr_check_redirections` (`:261`). A script command with a write
 ///   attempt left fails `Routing` / `"Max attempts reached."` at once, with
@@ -1018,6 +1042,60 @@ pub fn is_router_retry_budget_exhausted_error(e: &fred::error::Error) -> bool {
     }
 }
 
+/// Whether a fred error is a `txn_pool` command's refusal of a cluster
+/// redirect: `ErrorKind::Routing` with `"Too many redirections."` — the one
+/// error shape that proves the command it failed never ran (b.4q2).
+///
+/// # The proof
+///
+/// - **One origin.** The text is built only by
+///   `Command::decr_check_redirections`
+///   (`vendor/fred-10.1.0/src/protocol/command.rs:1789-1795`), which is called
+///   only from `process_ask` (`router/commands.rs:261`) and `process_moved`
+///   (`:304`). The router reaches those two only for a `-MOVED` / `-ASK`
+///   **reply frame** to the command (`RouterCommand::Ask` / `Moved`,
+///   `router/clustered.rs:279-280`), raised at `:322` only for an error frame
+///   (vendored fred change 10, `live_edit::redirect::is_redirection`): a data
+///   reply that merely reads like a redirect is returned to its caller as
+///   data and never reaches either function.
+/// - **The redirect ran nothing.** Valkey answers `-MOVED` / `-ASK` from its
+///   cluster check, before it calls the command (`server.c:4306-4325`).
+/// - **fred sent nothing more.** It fails the command at the budget check,
+///   before it would write the command again. On the `txn_pool`
+///   (`max_redirections = 0`, `max_command_attempts = 1`) the check fails on
+///   the first redirect, so the command was written once, and that one write
+///   was answered with the redirect. A `MOVED` re-syncs the member's routing
+///   first (`process_moved`, `:298-303`); an `-ASK` re-syncs nothing.
+///
+/// So the command, or each command of a pipeline that fails this way, did not
+/// run anywhere. That holds for a single command or a pipeline on this pool:
+/// a fred `Transaction` meets a redirect as `Unknown` "Max redirections
+/// exceeded" instead ([`is_transaction_router_exhausted_error`]), which is
+/// not this shape and proves nothing across fred's one replay of the
+/// transaction.
+///
+/// # What it is not
+///
+/// No other shape proves nothing ran: not `Unknown` "Too many failed write
+/// attempts." (a one-attempt command re-written from the retry buffer after
+/// its connection closed, its first write possibly landed with its reply
+/// lost), not `Routing` "Max attempts reached.", and not a timeout (the
+/// command may still be on the wire). The match is kind-gated and
+/// prefix-anchored, like [`is_router_retry_budget_exhausted_error`], which
+/// this shape is one entry of.
+///
+/// # Consumers
+///
+/// - [`FredErrOrigin::observe_error`] marks the `txn_pool`'s routing stale on
+///   it ([`ValkeyClient::mark_txn_routing_stale`]).
+/// - `LayerStore::create_layer_with_operation` leaves its commit marker
+///   unset after a commit run that failed this way, the one commit-run
+///   outcome that keeps a new layer's call answerable as having applied
+///   nothing (`UPSTREAM_UNAVAILABLE`).
+pub fn is_txn_redirect_refusal(e: &fred::error::Error) -> bool {
+    matches!(e.kind(), FredErrorKind::Routing) && e.details().starts_with("Too many redirections")
+}
+
 /// The authoritative `(kind, message)` table for
 /// [`is_router_retry_budget_exhausted_error`], and the single record of where
 /// each shape comes from in fred (b.cv4).
@@ -1048,7 +1126,7 @@ pub fn is_router_retry_budget_exhausted_error(e: &fred::error::Error) -> bool {
 /// | # | Kind | Message | Origin |
 /// |---|---|---|---|
 /// | 0 | `Unknown` | `"Too many failed write attempts."` | `protocol/command.rs:1778`, `Command::decr_check_attempted` (fn at `:1776`) — the **only** origin of this text |
-/// | 1 | `Routing` | `"Too many redirections."` | `protocol/command.rs:1791`, `Command::decr_check_redirections` (fn at `:1789`) — what an `-ASK` gives a `txn_pool` command (`max_redirections = 0`); the router survives |
+/// | 1 | `Routing` | `"Too many redirections."` | `protocol/command.rs:1791`, `Command::decr_check_redirections` (fn at `:1789`) — what an `-ASK`, or a `MOVED` after its sync, gives a `txn_pool` command (`max_redirections = 0`); the router survives. The one shape that proves the command never ran ([`is_txn_redirect_refusal`]) |
 /// | 2 | `Routing` | `"Max attempts reached."` | Two origins, both raised before anything is written: `router/utils.rs:469`, `send_asking_with_policy` — the `-ASK` twin, for a command with no write attempt left; with the vendored patch it fails only the command (stock fred 10.1.0 also ended the client's router). And `live_edit/ask.rs:180-183`, the vendored `live_edit::ask::follow` — an `-ASK` to a script command with a write attempt left, which is never followed |
 /// | 3 | `Routing` | `"Unable to route command or reconnect."` | `router/utils.rs:454`, the same function's `next_sleep!` fallback; unreachable in the vendored fred, which calls that function only with no attempt left |
 ///
@@ -1150,9 +1228,10 @@ const TRANSACTION_ATTEMPTS_EXHAUSTED: &str = "Max attempts exceeded";
 ///
 /// **Remediation class: backoff only, never a forced reconnect.** A redirect
 /// means the slot moved or is moving; the fix for a moved slot is a routing
-/// sync of the one member that met it, which the callers run, not a rebuilt
-/// connection map. The `retry!(None)` arms have already reconnected once
-/// inside fred.
+/// sync of the member that met it, which `ValkeyClient::exec_txn` runs, and
+/// of every other member at its next checkout, after the pool-wide mark
+/// (`ValkeyClient::mark_txn_routing_stale`) — not a rebuilt connection map.
+/// The `retry!(None)` arms have already reconnected once inside fred.
 ///
 /// # Anti-creep
 ///
@@ -1175,6 +1254,31 @@ pub fn is_transaction_router_exhausted_error(e: &fred::error::Error) -> bool {
     let details = e.details();
     details.starts_with(TRANSACTION_REDIRECTIONS_EXHAUSTED)
         || details.starts_with(TRANSACTION_ATTEMPTS_EXHAUSTED)
+}
+
+/// The `trigger` of a `txn_pool` routing-stale mark
+/// ([`ValkeyClient::mark_txn_routing_stale`]) raised by a single command or a
+/// pipeline refusing a redirect ([`is_txn_redirect_refusal`], through
+/// [`FredErrOrigin::observe_error`]).
+const TXN_ROUTING_STALE_TRIGGER_COMMAND: &str = "command_redirect";
+
+/// The `trigger` of a `txn_pool` routing-stale mark raised by a fred
+/// `Transaction` failing with `"Max redirections exceeded"`
+/// ([`ValkeyClient::exec_txn`]).
+const TXN_ROUTING_STALE_TRIGGER_TRANSACTION: &str = "transaction_redirect";
+
+/// Who re-syncs a `txn_pool` checkout's cluster routing when the pool's
+/// routing was marked stale since the slot last synced
+/// ([`ValkeyClient::acquire_txn_inner`]). Either way the checkout records the
+/// pool's epoch for the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckoutRoutingResync {
+    /// The checkout syncs, before its hygiene probe. Every caller but one.
+    AtCheckout,
+    /// The caller syncs right after the checkout, so the checkout does not:
+    /// the `CreateLayer` commit's repeated run
+    /// ([`ValkeyClient::acquire_txn_for_caller_synced`]).
+    ByCaller,
 }
 
 /// Whether a fred error is fred's `Transaction` router out of
@@ -1213,10 +1317,11 @@ pub(crate) enum TxnRoutingSyncFailure {
 /// Whether a fred error is the server's `-UNBLOCKED` reply to a `CLIENT
 /// UNBLOCK ... ERROR` (b.9uq round 4).
 ///
-/// fred's [`Blocking::Interrupt`](fred::types::config::Blocking::Interrupt) —
-/// which the stream reader connections and only they enable, see
-/// `ValkeyClient::reader_builder` — sends `CLIENT UNBLOCK <id> ERROR` when a command
-/// would otherwise queue behind a blocking one on the same client. The blocked
+/// The service never sends `CLIENT UNBLOCK` itself: every client runs fred's
+/// default `Blocking::Block` (see `ValkeyClient::reader_builder`), so a
+/// `CLIENT UNBLOCK <id> ERROR` that reaches a stream reader's live `XREAD
+/// BLOCK` comes from outside the service — an operator or another client
+/// on the store. The blocked
 /// command then fails with `-UNBLOCKED client unblocked via CLIENT UNBLOCK`,
 /// which fred's `pretty_error` classifies as `ErrorKind::Unknown` (its match
 /// arms cover `ERR` / `WRONGTYPE` / `NOAUTH` / `WRONGPASS` / `MOVED` / `ASK` /
@@ -1365,9 +1470,14 @@ pub fn is_server_wrongtype_error(e: &fred::error::Error) -> bool {
 /// `classify_restore_header_read_error`), which refuse the restore as
 /// permanent instead of retrying it, and the structural cache cold start's
 /// commit-token `HGET` (`storage::structural_cache_cold_start`), which answers
-/// the commit paths' `WRONGTYPE_KEY` refusal. Each turns one refusal into
-/// another, never into "no data", so it fails closed whichever way it
-/// matches. That is why these sites may branch on it, while
+/// the commit paths' `WRONGTYPE_KEY` refusal, and the DR restore Job's
+/// authoritative recount (`storage::ext_reconcile`), which reads a
+/// `WRONGTYPE` from its walks or its count set as a corrupt record (exit 3)
+/// rather than a store fault (exit 1), as its un-hold (`dr::job::finish`)
+/// does a `WRONGTYPE` from `scripts/dr_unhold.lua`; the service stays held
+/// either way.
+/// Each turns one refusal into another, never into "no data", so it fails
+/// closed whichever way it matches. That is why these sites may branch on it, while
 /// [`is_server_wrongtype_error`] stays for counting and logging only (its
 /// documentation gives the snapshot-read hazard a branch there would open).
 /// Its anchor has no trailing space, as each of those sites tested before it
@@ -1461,17 +1571,34 @@ impl StoreWriteRefusal {
         ))
     }
 
-    /// The answer at the `create_commit` stage: plain `UNAVAILABLE` saying
-    /// the store refused, with no retry hint and no nothing-applied claim.
+    /// The answer at the `create_commit` stage's writes after `CreateLayer`'s
+    /// commit marker (`storage::layer::CreateCommitMarker`): plain
+    /// `UNAVAILABLE` saying the store refused, with no `STORE_WRITE_REFUSED`
+    /// hint and no nothing-applied claim in the message.
     ///
-    /// A `CreateLayer` refusal at its commit stage never carries the hint
-    /// (SDD §18.1; its pre-commit refusals — admission, receive growth, the
-    /// external-value pre-store — keep theirs): a wrong
-    /// "applied nothing" invites a re-send that can replace a layer, which is
-    /// destructive, while a missing one only leaves the outcome unknown. And
-    /// one of the stage's writes cannot prove it: the overwrite `superseded`
-    /// mark is a data-pool `HSET` fred replays after a dropped connection, so
-    /// a refused replay can follow a mark that landed.
+    /// How each `CreateLayer` failure at that stage is answered:
+    ///
+    /// - **a store write refusal before the marker** — the object-id
+    ///   allocation, the counter repair writes and the materialization
+    ///   `EXEC` — answers [`Self::into_service_error`] instead
+    ///   ([`refuse_store_write_hinted`]): `STORE_WRITE_REFUSED` with its
+    ///   `condition` and retry hint, which the handler's pre-commit choke
+    ///   point passes through unchanged. Nothing of the call is visible: at
+    ///   most an unmapped object for the orphan sweep;
+    /// - **any other failure before the marker** (a timeout, a redirect, a
+    ///   connection failure) is a plain `UNAVAILABLE`, which the choke point
+    ///   answers carrying `UPSTREAM_UNAVAILABLE`;
+    /// - **the overwrite `superseded` mark and a commit run** come after the
+    ///   marker is set and answer this value, so the answer stays plain,
+    ///   outcome unknown. A wrong "applied nothing" there invites a re-send
+    ///   that can replace a layer, which is destructive, while a missing one
+    ///   only leaves the outcome unknown. And the mark's refusal cannot prove
+    ///   it: the `superseded` mark is a data-pool `HSET` fred replays after a
+    ///   dropped connection, so a refused replay can follow a mark that
+    ///   landed.
+    ///
+    /// `CreateLayer`'s refusals before step 7 — admission, receive growth,
+    /// the external-value pre-store — carry their own hints (SDD §18.1).
     pub fn into_unhinted_service_error(self) -> crate::error::ServiceError {
         crate::error::ServiceError::Unavailable(format!(
             "the backing store refused a write this request needed because {}; retry",
@@ -1523,20 +1650,35 @@ pub(crate) const STORE_WRITE_NOTHING_APPLIED: &str = "; nothing was applied, ret
 /// retries `UNAVAILABLE` itself.
 ///
 /// **Counted, at the write sites below, before any mapper**: all reached
-/// from the upload RPCs and each provably nothing-applied: the external-value
-/// pre-store (`external_values::ValkeyExternalValueStore::store_values`), the
-/// commit script's untagged errors (`LayerStore::map_update_script_error`),
-/// the WATCH path's discarded transaction
+/// from the upload RPCs: the external-value pre-store
+/// (`external_values::ValkeyExternalValueStore::store_values`), the commit
+/// script's untagged errors (`LayerStore::map_update_script_error`), the
+/// WATCH path's discarded transaction
 /// ([`crate::storage::watched_txn::WatchedExec::Discarded`]), and
 /// `CreateLayer`'s object-id allocation (with the counter repair writes an
 /// absent counter triggers, `CounterStore::initialize_object_id_counter_if_absent`
 /// and `CounterStore::seed_object_id_if_below`), materialization `EXEC`,
-/// overwrite `superseded` mark and new-layer commit. None is retried
-/// in-process. The upload's pre-store and the `UpdateLayer` commit answer
-/// [`StoreWriteRefusal::into_service_error`], with the retry hint; every
-/// `CreateLayer` site, at `stage="create_commit"`, answers
-/// [`StoreWriteRefusal::into_unhinted_service_error`], without it
-/// ([`refuse_store_write`]).
+/// overwrite `superseded` mark and new-layer commit. The refused write
+/// applied nothing at every site, and the call left nothing a client can
+/// observe at every site but one (a materialization replay refused after a
+/// landed first send leaves only an unmapped orphan): the overwrite
+/// `superseded` mark is a data-pool `HSET` fred replays after a dropped
+/// connection, so its refused replay can follow a mark that landed. None is
+/// retried in-process. The answers, all counted by stage:
+/// - the upload's pre-store, the `UpdateLayer` commit, and `CreateLayer`'s
+///   writes before its commit marker (the allocation, the counter repair
+///   writes and the materialization `EXEC`, counted at
+///   `stage="create_commit"`; [`refuse_store_write_hinted`]) answer
+///   [`StoreWriteRefusal::into_service_error`]: `STORE_WRITE_REFUSED` with
+///   the retry hint, which `CreateLayer`'s pre-commit choke point passes
+///   through unchanged;
+/// - the overwrite `superseded` mark and a new layer's commit run, after the
+///   marker, answer [`StoreWriteRefusal::into_unhinted_service_error`]
+///   ([`refuse_store_write`]): plain, outcome unknown.
+///
+/// `CreateLayer`'s other failures before the marker are plain `UNAVAILABLE`s
+/// the choke point answers carrying `UPSTREAM_UNAVAILABLE` (see
+/// [`StoreWriteRefusal::into_unhinted_service_error`]).
 ///
 /// Two of those sites are shared primitives, so the same answer also reaches
 /// callers outside the upload RPCs:
@@ -1548,8 +1690,9 @@ pub(crate) const STORE_WRITE_NOTHING_APPLIED: &str = "; nothing was applied, ret
 ///   (`checkpoint::counter_seed`, `initialize_object_id_counter_if_absent` in
 ///   its absent-sidecar arm and `seed_object_id_if_below`), and the
 ///   Disabled-adapter `SET NX` in `main.rs`. Those `CounterStore`s carry no
-///   metrics handle, so a refusal there answers the same `UNAVAILABLE`, which
-///   is logged, but counts nothing (`CounterStore::with_metrics`).
+///   metrics handle, so a refusal there answers the same hinted
+///   `UNAVAILABLE`, which is logged, but counts nothing
+///   (`CounterStore::with_metrics`).
 ///
 /// A new consumer of any of these sites inherits the answer, and belongs in
 /// this list.
@@ -1593,8 +1736,7 @@ pub fn store_write_refusal(e: &fred::error::Error) -> Option<StoreWriteRefusal> 
 
 /// [`store_write_refusal`] at one of its write sites (the upload writes, and
 /// the writes sharing their stages: the DR restore's pre-store and a read's
-/// recovery rewrite at `ext_store`, the object-id counter repair writes at
-/// `create_commit`): when `e` is a store write refusal, tick
+/// recovery rewrite at `ext_store`): when `e` is a store write refusal, tick
 /// `live_edit_store_write_refused_total{stage, reason}` on `origin`'s metrics
 /// (when it has them), note an `-OOM` on `origin`'s store out-of-memory signal
 /// (b.pa1; [`FredErrOrigin`]), and return the `UNAVAILABLE` answer; otherwise
@@ -1604,16 +1746,19 @@ pub fn store_write_refusal(e: &fred::error::Error) -> Option<StoreWriteRefusal> 
 /// picks the answer: `create_commit` the unhinted one
 /// ([`StoreWriteRefusal::into_unhinted_service_error`]), every other stage
 /// the hinted one ([`StoreWriteRefusal::into_service_error`]).
+///
+/// Through this function `create_commit` covers only `CreateLayer`'s writes
+/// after its commit marker: the overwrite `superseded` mark and a new
+/// layer's commit run. The writes before the marker — the object-id
+/// allocation, the counter repair writes and the materialization `EXEC` —
+/// use [`refuse_store_write_hinted`] instead: they count at `create_commit`
+/// but answer the hinted refusal.
 pub(crate) fn refuse_store_write(
     origin: FredErrOrigin<'_>,
     stage: &'static str,
     e: &fred::error::Error,
 ) -> Option<crate::error::ServiceError> {
-    let refusal = store_write_refusal(e)?;
-    origin.count_store_write_refused(stage, refusal.reason_label());
-    if refusal == StoreWriteRefusal::OutOfMemory {
-        origin.note_out_of_memory();
-    }
+    let refusal = count_store_write_refusal(origin, stage, e)?;
     Some(
         if stage == crate::observability::metrics::STORE_WRITE_REFUSED_STAGE_CREATE_COMMIT {
             refusal.into_unhinted_service_error()
@@ -1621,6 +1766,39 @@ pub(crate) fn refuse_store_write(
             refusal.into_service_error()
         },
     )
+}
+
+/// [`refuse_store_write`], answering the hinted refusal
+/// ([`StoreWriteRefusal::into_service_error`], `STORE_WRITE_REFUSED` with its
+/// `condition` and retry hint) at any `stage`. For the `CreateLayer` writes
+/// before the call's commit marker (`storage::layer::CreateCommitMarker`),
+/// counted at `stage="create_commit"`: the object-id allocation and the
+/// counter repair writes (`CounterStore`), and the materialization `EXEC`
+/// (`LayerStore::write_object`). A refusal there leaves nothing of the call a
+/// client can reach, so the call applied nothing, and the handler's
+/// pre-commit choke point passes the detailed status through unchanged.
+pub(crate) fn refuse_store_write_hinted(
+    origin: FredErrOrigin<'_>,
+    stage: &'static str,
+    e: &fred::error::Error,
+) -> Option<crate::error::ServiceError> {
+    count_store_write_refusal(origin, stage, e).map(StoreWriteRefusal::into_service_error)
+}
+
+/// The shared front of [`refuse_store_write`] and
+/// [`refuse_store_write_hinted`]: classify `e`, and when it is a store write
+/// refusal, count it at `stage` on `origin` and note an `-OOM`.
+fn count_store_write_refusal(
+    origin: FredErrOrigin<'_>,
+    stage: &'static str,
+    e: &fred::error::Error,
+) -> Option<StoreWriteRefusal> {
+    let refusal = store_write_refusal(e)?;
+    origin.count_store_write_refused(stage, refusal.reason_label());
+    if refusal == StoreWriteRefusal::OutOfMemory {
+        origin.note_out_of_memory();
+    }
+    Some(refusal)
 }
 
 /// Minimum spacing between steady-state auth-rejection hints across the entire
@@ -2119,6 +2297,12 @@ const STATIC_AUTH_REJECTION_HINT: &str = "Valkey rejected the credential this se
 /// or flush). Must exceed the longest legitimate single-command wait — a stream
 /// reader's `XREAD BLOCK` budget, `XREAD_BLOCK_MS + 5 s` = 35 s — with margin.
 /// See [`apply_connect_timeout`].
+///
+/// The write or flush wait is also how long a frame fred wrote before its
+/// caller gave up can still take to reach the socket (fred's change 9 writes
+/// no frame after the give-up, but recalls none it had written), so the
+/// disaster-recovery hold's after-entry bounds add it after every give-up
+/// (`dr::hold::hold_write_bound` and its siblings) and read this constant.
 pub(crate) const UNRESPONSIVE_MAX_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// The client-time allowance, in µs, a whole-write transaction's timeout adds
@@ -2168,10 +2352,13 @@ pub(crate) const TXN_TIMEOUT_PER_COMMAND: Duration =
 ///   wait measured 5–6.5 s in an optimised build and 27–30 s in an unoptimised
 ///   one).
 ///
-/// Used by exactly two transactions, each passing its own count: `write_object`
-/// (`CreateLayer`'s object write) and the WATCH-route `UpdateLayer` commit
-/// (WA3's queued prediction). fred reads a transaction's timeout from its
-/// first command, which each sets it on.
+/// Used by exactly three writers, each passing its own count: `write_object`
+/// (`CreateLayer`'s object write), the WATCH-route `UpdateLayer` commit
+/// (WA3's queued prediction), and the restore Job's batch writer
+/// (`storage::layer::dr_restore`: each batch of at most
+/// `RESTORE_BATCH_COMMANDS`, its header transaction and its clear-flags
+/// transaction). fred reads a transaction's timeout from its first command,
+/// which each sets it on.
 pub(crate) fn txn_timeout(command_timeout: Duration, commands: u64) -> Duration {
     if command_timeout.is_zero() {
         return Duration::ZERO;
@@ -2361,8 +2548,10 @@ pub(crate) const UNWATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// failure ends it). What that replay does to each `Transaction` user is
 /// stated at the `txn` pool's config in [`ValkeyClient::connect`] (*ONE
 /// EXCEPTION*) and in SDD §15.3: not every user is safe under it — the
-/// session checkpoint applier's Step B mapping `SET`s can overwrite a
-/// `DeleteLayer` or `CreateLayer` writer that landed in the reconnect window.
+/// session checkpoint applier's unconditional Step B, which only the restore
+/// Job runs, re-applies its mapping `SET`s, which is safe only because the
+/// held fleet leaves the Job the only writer (on-access recovery's Step B is
+/// a conditional script on the data pool, not a `Transaction`).
 /// A `CreateLayer` materialization whose landed `EXEC` reply was lost, and
 /// whose replay then reaches the store, answers `UNAVAILABLE` and leaves an
 /// unmapped orphan object for the orphan sweep; a re-send creates the layer.
@@ -2593,8 +2782,8 @@ pub(crate) fn derive_pubsub_config(shared: &FredConfig) -> (FredConfig, bool) {
 /// Returns the derived config plus the shared config's provider *unwrapped*
 /// (the same `Arc`), or `None` when the shared config has none.
 ///
-/// **The fourth sanctioned divergence: only the `credential_provider`'s
-/// *cadence*.** When a provider is present it is wrapped in a
+/// **The readers' re-`AUTH` cadence divergence: only the
+/// `credential_provider`'s *cadence*.** When a provider is present it is wrapped in a
 /// [`NoRefreshCredentialProvider`] — the same inner `Arc`, `refresh_interval()
 /// = None` — so fred spawns no credential-refresh task on any reader client.
 /// The wrapper delegates `fetch()` verbatim, so a reader's handshake presents a
@@ -2605,10 +2794,9 @@ pub(crate) fn derive_pubsub_config(shared: &FredConfig) -> (FredConfig, bool) {
 ///
 /// **Why the readers.** A reader keeps its one connection parked in `XREAD
 /// BLOCK`. fred's refresh is a second, independent task writing to that
-/// connection, and fred decides whether to interrupt the block at send time,
-/// outside the router, where it can race the read (a refresh that checks
-/// before the router marks the read blocked, or one that loses to the reader's
-/// re-issued read after an interrupt, queues behind a fresh 30 s `BLOCK`). With
+/// connection, and the readers run fred's default `Blocking::Block`, so fred
+/// never interrupts a read: a fred-scheduled `AUTH` would queue behind every
+/// live read and wait out its `BLOCK`, up to 30 s, each time. With
 /// fred's refresh off, a reader takes the same tick itself — the provider's
 /// `refresh_interval()` and `fetch(None)` gate, through the provider returned
 /// here — and sends the `AUTH` on its own connection between reads, waking an
@@ -3214,6 +3402,162 @@ pub fn map_fred_err_for_grpc(
     }
 }
 
+/// Whether a disaster-recovery hold write fence (SDD SR-6.2) is closed:
+/// `false` when there is none. The one check every storage-side fence site
+/// reads — the counter repair's writes, a restore's pre-store and release
+/// enqueue, the external-value fetch-on-miss rewrite, and their re-sends
+/// ([`evalsha_with_fenced_reload`]); the token itself comes from the calling
+/// path's `hold_fence()` accessor in `checkpoint`, or, for the fetch-on-miss
+/// rewrite, from `ValkeyExternalValueStore`'s recovery hold fence.
+pub(crate) fn hold_fence_closed(hold_fence: Option<&CancellationToken>) -> bool {
+    hold_fence.is_some_and(CancellationToken::is_cancelled)
+}
+
+/// The message a storage-side write refused by a closed hold write fence
+/// carries. Nothing was sent for it. It names both causes that close the
+/// fence: a fleet hold, and a stale hold verdict. It reaches clients in an
+/// `UNAVAILABLE` message (a fetch-on-miss read in flight, for example).
+pub(crate) const HOLD_FENCE_UNSENT: &str =
+    "not sent: this replica entered a disaster-recovery hold or lost contact with the store's \
+     hold state, which stops every on-access repair and restore write";
+
+/// Whether `e` is a storage-side hold write fence refusal: the
+/// `Unavailable(`[`HOLD_FENCE_UNSENT`]`)` a fenced primitive answers when it
+/// sent nothing more, as opposed to a failure of something it did send.
+pub(crate) fn is_hold_fence_refusal(e: &crate::error::ServiceError) -> bool {
+    matches!(e, crate::error::ServiceError::Unavailable(m) if m == HOLD_FENCE_UNSENT)
+}
+
+/// Why [`evalsha_with_fenced_reload`] did not answer the script's reply.
+#[derive(Debug)]
+pub(crate) enum FencedEvalError {
+    /// The `EVALSHA`, `SCRIPT LOAD` or re-send failed: the caller maps it
+    /// exactly as it mapped `evalsha_with_reload`'s error.
+    Fred(fred::error::Error),
+    /// The hold write fence was closed before the next send, which was not
+    /// made ([`HOLD_FENCE_UNSENT`]).
+    Held,
+}
+
+/// `Script::evalsha_with_reload` under a hold write fence (SDD SR-6.2).
+///
+/// With `hold_fence` `None` this IS `evalsha_with_reload`, unchanged. With a
+/// fence it does the same three steps itself and checks the fence
+/// ([`hold_fence_closed`]) before each send: before the first `EVALSHA`,
+/// and — on `NOSCRIPT`, which a store that lost its keyspace usually answers
+/// because it lost its script cache too — before the `SCRIPT LOAD` and again
+/// before the re-sent `EVALSHA`. A closed fence answers
+/// [`FencedEvalError::Held`] and sends nothing more, so no copy of the
+/// script is sent after the fence closes; a copy already sent runs to its
+/// end within the command timeout. `NOSCRIPT` proves the copy that answered
+/// it ran nothing.
+///
+/// Not an `async fn`, so an unfenced call's future is `evalsha_with_reload`'s
+/// own and no larger: an `async fn` keeps its arguments for its whole life,
+/// so a wrapper would hold `keys` and `args` beside the copies the call it
+/// awaits holds. The upload paths send unfenced — the commits' release
+/// enqueue and the external-value stores — inside futures an upload holds
+/// whole, and its charge prices them (`grpc::upload_admission`). The fenced
+/// steps run boxed ([`fenced_evalsha_with_reload`]), so their larger state
+/// does not size the unfenced call's future either.
+pub(crate) fn evalsha_with_fenced_reload<'a, R, K, V>(
+    script: &'a fred::types::scripts::Script,
+    client: &'a Client,
+    keys: K,
+    args: V,
+    hold_fence: Option<&'a CancellationToken>,
+) -> impl std::future::Future<Output = Result<R, FencedEvalError>> + 'a
+where
+    R: FromValue + 'a,
+    K: Into<fred::types::MultipleKeys> + Send + 'a,
+    V: TryInto<fred::types::MultipleValues> + Send + 'a,
+    V::Error: Into<fred::error::Error> + Send,
+{
+    use futures::future::{Either, FutureExt};
+    match hold_fence {
+        None => Either::Left(
+            script
+                .evalsha_with_reload(client, keys, args)
+                .map(|reply| reply.map_err(FencedEvalError::Fred)),
+        ),
+        Some(hold_fence) => Either::Right(Box::pin(fenced_evalsha_with_reload(
+            script, client, keys, args, hold_fence,
+        ))),
+    }
+}
+
+/// [`evalsha_with_fenced_reload`]'s steps under a fence: the fence is checked
+/// before the `EVALSHA` and, on `NOSCRIPT`, before the `SCRIPT LOAD` and the
+/// re-send.
+async fn fenced_evalsha_with_reload<R, K, V>(
+    script: &fred::types::scripts::Script,
+    client: &Client,
+    keys: K,
+    args: V,
+    hold_fence: &CancellationToken,
+) -> Result<R, FencedEvalError>
+where
+    R: FromValue,
+    K: Into<fred::types::MultipleKeys> + Send,
+    V: TryInto<fred::types::MultipleValues> + Send,
+    V::Error: Into<fred::error::Error> + Send,
+{
+    let hold_fence = Some(hold_fence);
+    if hold_fence_closed(hold_fence) {
+        return Err(FencedEvalError::Held);
+    }
+    let keys: fred::types::MultipleKeys = keys.into();
+    let args: fred::types::MultipleValues = args
+        .try_into()
+        .map_err(|e| FencedEvalError::Fred(e.into()))?;
+    match script
+        .evalsha::<R, _, _, _>(client, keys.clone(), args.clone())
+        .await
+    {
+        Err(e) if e.details().starts_with("NOSCRIPT") => {
+            if hold_fence_closed(hold_fence) {
+                return Err(FencedEvalError::Held);
+            }
+            script.load(client).await.map_err(FencedEvalError::Fred)?;
+            if hold_fence_closed(hold_fence) {
+                return Err(FencedEvalError::Held);
+            }
+            script
+                .evalsha(client, keys, args)
+                .await
+                .map_err(FencedEvalError::Fred)
+        }
+        other => other.map_err(FencedEvalError::Fred),
+    }
+}
+
+/// Run `call` cut at `command_timeout`: `Some` with its output, or `None`
+/// when the cut fired first. The cut drops `call`, which is a give-up, so
+/// fred writes no frame of it not yet written (SDD §15.3 *Vendored fred*
+/// change 9). One cut covers every fred call `call` makes, so a
+/// `Script::evalsha_with_reload`'s `NOSCRIPT` reload — its `SCRIPT LOAD` and
+/// re-sent `EVALSHA`, each with a timer of its own — ends with it. A zero
+/// `command_timeout` is fred's "no timeout" and cuts nothing.
+///
+/// For a clean-up that must give up within one command timeout of its start
+/// whatever the store answers: the disaster-recovery hold's after-entry
+/// bounds count each such clean-up at one command timeout
+/// (`dr::hold::hold_write_bound`, `dr::hold::join_teardown_write_bound`).
+///
+/// Not an `async fn`, so its future holds `call` once, beside the timer: an
+/// `async fn` would keep its `call` argument as well as the timeout wrapping
+/// it, twice `call`'s size in the future that awaits it.
+pub(crate) fn cut_at_command_timeout<F: std::future::Future>(
+    command_timeout: Duration,
+    call: F,
+) -> impl std::future::Future<Output = Option<F::Output>> {
+    use futures::future::{Either, FutureExt};
+    if command_timeout.is_zero() {
+        return Either::Left(call.map(Some));
+    }
+    Either::Right(tokio::time::timeout(command_timeout, call).map(Result::ok))
+}
+
 /// Minimum reconnect backoff in ms (exponential backoff starts here).
 const RECONNECT_MIN_DELAY_MS: u32 = 100;
 /// Exponential base for the reconnect backoff (delay *= base each attempt).
@@ -3329,10 +3673,12 @@ pub(crate) const PUBSUB_BROADCAST_CHANNEL_CAPACITY: usize = 4096;
 /// old token is dropped by the backing store at that token's expiry, so only a
 /// re-AUTH landing after the sidecar rotates and before the old token dies
 /// carries the fresh credential onto the existing connection. The width of that
-/// window is set by the **sidecar's** refresh lead less up to one
-/// `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` (15 s by default) — not by this
-/// service's ≥ 3 min proactive re-read lead, which withholds nothing (`fetch()`
-/// reads [`ServiceTokenProvider::cached_bearer_if_unexpired`], so a cached token
+/// window is set by the **sidecar's** refresh lead less the pickup delay — up
+/// to one `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` (15 s by default), or
+/// about 250 ms when the sidecar's lead is within this service's ≥ 3 min
+/// proactive re-read lead, whose fast re-read is then already running. That
+/// lead withholds nothing (`fetch()` reads
+/// [`ServiceTokenProvider::cached_bearer_if_unexpired`], so a cached token
 /// authenticates for its whole real lifetime). A `300–360 s` cadence usually
 /// missed that window outright; `60–90 s` usually lands in it. So the change
 /// cuts broadcasts *and* improves pickup.
@@ -3387,29 +3733,48 @@ const VALKEY_TOKEN_REAUTH_JITTER_BOUND: Duration = Duration::from_secs(30);
 /// [`VALKEY_TOKEN_REAUTH_JITTER_BOUND`] (`90 s`).
 ///
 /// Named for what it is — the tick ceiling — and no longer, post-b.7td, the
-/// prolongation floor: a tick only *sends* an `AUTH` when the rotation gate
-/// opens, so the latency a rotation actually takes to reach every connection is
-/// [`VALKEY_TOKEN_ROTATION_FANOUT_CEILING`], not this.
+/// prolongation floor itself. A rotation reaches every client's tick within one
+/// of these intervals of its pickup, but a busy stream reader's `AUTH` lands
+/// some seconds after its tick, so the floor is
+/// [`VALKEY_TOKEN_ROTATION_FANOUT_CEILING`]: one of these intervals of fan-out
+/// plus one of slack.
 pub const VALKEY_TOKEN_REAUTH_MAX_INTERVAL: Duration =
     VALKEY_TOKEN_REAUTH_BASE_INTERVAL.saturating_add(VALKEY_TOKEN_REAUTH_JITTER_BOUND);
 
-/// Worst-case latency from "the polling task caches a rotated token" to "every
-/// pooled connection has re-`AUTH`ed with it" (`180 s`) — and therefore the
-/// **prolongation floor** handed to the Redis-scoped [`ServiceTokenProvider`].
+/// The **prolongation floor** handed to the Redis-scoped [`ServiceTokenProvider`]
+/// (`180 s`): two [`VALKEY_TOKEN_REAUTH_MAX_INTERVAL`]s, one of fan-out and one
+/// of slack (b.7td). It bounds the time from "the polling task caches a rotated
+/// token" to "every connection carries it", loosely, hence the name.
 ///
-/// Two tick intervals, not one, and the doubling is the whole point of the
-/// constant (b.7td). Under the rotation gate a fan-out has two serial stages:
+/// **Fan-out takes at most one interval.** The rotation's
+/// [`VALKEY_TOKEN_AUTH_FANOUT_WINDOW`] opens at the first `fetch` after the
+/// polling task caches the new token, and every client — a pooled client
+/// through fred's refresh task, a stream reader through its own re-AUTH tick —
+/// ticks at most one interval apart. So every client's first tick after the
+/// pickup comes within one interval of it, and falls inside the window, which
+/// is at least one interval long and opened no later than that tick. No client
+/// waits a second interval: a client whose last tick fell between the pickup
+/// and the window opening would itself have opened the window. (A stream
+/// reader's tick may also be late by the inline step it is waiting out — it
+/// schedules its next tick from when it services one — which the slack also
+/// covers.)
 ///
-/// 1. Up to one [`VALKEY_TOKEN_REAUTH_MAX_INTERVAL`] passes before *any* client
-///    ticks and first observes the new token — that observation is what opens
-///    [`VALKEY_TOKEN_AUTH_FANOUT_WINDOW`].
-/// 2. Up to one more passes before the *last* client takes its next tick inside
-///    that window and re-`AUTH`s.
+/// **The second interval is slack**, and a busy stream reader spends part of
+/// it. Its `AUTH` cannot go out until its in-flight XREAD returns, so it lands
+/// up to the reader's `REAUTH_LANDING_BOUND` (49 s) after its tick, at the
+/// default command timeout and excluding the residuals below. A `const`
+/// assertion beside that bound, in `storage::stream_mux`'s reader, holds one
+/// interval plus the bound within this floor; a late reader tick and a
+/// `-MOVED` head check's routing sync (bounded by
+/// `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`) spend the remaining slack without
+/// being asserted (see that bound's docs). The floor is deliberately not
+/// lowered to that tighter sum (139 s): the per-rotation headroom WARN and the
+/// operator docs' alert keep the published 180 s line.
 ///
 /// A rotation picked up with less headroom than this before the outgoing token's
-/// expiry cannot be guaranteed to reach every live connection, so the stragglers
-/// are dropped and re-established at expiry instead of prolonged — which is
-/// exactly the condition the provider's per-rotation headroom WARN reports.
+/// expiry may not reach every live connection in time; a connection it misses
+/// is dropped at expiry and re-established instead of prolonged. That is the
+/// condition the provider's per-rotation headroom WARN reports.
 ///
 /// Still less than the `360 s` the pre-b.7td (ungated, `300–360 s`) path
 /// required, so the operator-facing sidecar-lead recommendation derived from it
@@ -3564,17 +3929,14 @@ pub struct ValkeyClient {
     /// field by field can hold, admits without bound.
     pub subscriber_admission: Arc<SubscriberAdmissionGate>,
     /// Bounds `SubscribeReadLayer` catch-ups holding a slot for their
-    /// backing-store reads and build — and, in rollback mode
-    /// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) on a same-object reconnect,
-    /// the cluster stream-reader wait — at once. A shared fenced-read flight
+    /// backing-store reads and build at once. A shared fenced-read flight
     /// (`storage::snapshot_flights`) holds one slot for its whole life, fence
     /// sleeps and its attached catch-ups' build turns included, and each of
     /// its extra builds one more ([`CatchUpGate::try_acquire`]).
     pub catchup_gate: Arc<CatchUpGate>,
     /// Bounds the catch-up atomic snapshot reads in flight at once
     /// (`LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY`, the atomic read-permit
-    /// class; Spec SDD SR-7.1). A catch-up — a legacy in-window replay's
-    /// per-commit reads included — takes a permit only while holding a
+    /// class; Spec SDD SR-7.1). A catch-up takes a permit only while holding a
     /// [`Self::catchup_gate`] slot; the steady state never reads layer state,
     /// so it takes none. Each holds it across its atomic read alone. Closed by
     /// [`Self::quit`] with the other gates.
@@ -3598,6 +3960,15 @@ pub struct ValkeyClient {
     /// the slot's CPU bound and the read permits. Closed by
     /// [`Self::quit`] with the gates.
     pub catchup_build_budget: Arc<MemoryBudget>,
+    /// The per-replica catch-up payload budget `D_c`, derived from the pod
+    /// memory limit (`config::memory_plan`; SDD §12.3): every catch-up payload
+    /// reserves its exact size here, inside its catch-up slot or build turn,
+    /// after its external values' lengths are probed and before their first
+    /// byte is read, and each page repays its share as the stream sends it
+    /// (`storage::ompf_payload`). Its own metric series
+    /// (`storage::memory_budget::CATCHUP_PAYLOAD_SERIES`). Closed by
+    /// [`Self::quit`] with the gates, so a catch-up's wait for it ends there.
+    pub catchup_payload_budget: Arc<MemoryBudget>,
     /// XREAD multiplexer over its own readers
     /// (`LIVE_EDIT_SUBSCRIBER_POOL_SIZE`), each with its own connection —
     /// opened when the reader first serves a subscription, and on a cluster to
@@ -3605,8 +3976,9 @@ pub struct ValkeyClient {
     /// cannot starve `UpdateLayer` transactions.
     pub stream_mux: Arc<StreamMux>,
     /// Dedicated connection pool for the periodic GC sweep + orphan sweep
-    /// (b.kf1 H-stor-5), and the reference-count reconciler's and the
-    /// external-value backup repair's keyspace walks. Sized very small
+    /// (b.kf1 H-stor-5), the reference-count reconciler's and the
+    /// external-value backup repair's keyspace walks, and the checkpoint
+    /// clean-up's `{recon}` reads and scripts. Sized very small
     /// (default 1) because all of them
     /// are gated behind the `le:gc:leader` lock and normally one replica runs
     /// them at a time (two can briefly overlap after a lock takeover). Kept off the multiplexed data `pool` so that a long
@@ -4175,7 +4547,7 @@ impl ValkeyClient {
         // pool_size as the shared pool — each concurrent UpdateLayer takes one
         // exclusive client for its transaction window.
         //
-        // ── The second deliberate per-pool config divergence (b.bhb) ─────────
+        // ── The txn pool's deliberate per-pool config divergence (b.bhb) ─────
         //
         // This pool alone runs at `max_command_attempts = 1` and
         // `max_redirections = 0`. Everything else is the shared data-pool
@@ -4272,17 +4644,22 @@ impl ValkeyClient {
         //   - `SessionStore::delete` (`DEL` ×2 + `SET` of the deletion
         //     marker) is idempotent: a replay after a landed `EXEC` writes the
         //     same state again.
-        //   - The session checkpoint applier's two transactions
-        //     (`checkpoint::session::apply_session_checkpoint`: Step A's
-        //     `SADD`s; Step B's `HSET` + layer-mapping `SET`s + `SADD`s) are
+        //   - The session checkpoint applier's transactions
+        //     (`checkpoint::session::apply_session_checkpoint`) are
         //     idempotent against their OWN write, not against another
-        //     writer's: Step B's mapping `SET`s are unconditional, so a replay
-        //     after a landed `EXEC` re-applies them over any writer that
-        //     landed in the reconnect window — a `DeleteLayer` removal, or a
-        //     `CreateLayer` mapping flip once the session is visible — and
-        //     that writer's change is overwritten. The same class as the
-        //     unconditional-`SET` residual SDD §7.9 states for the create
-        //     flow (*Residuals of the create flow*).
+        //     writer's. Step A's `SADD`s, in every mode: a replay only
+        //     re-adds the session's index members, which at worst leaves a
+        //     ghost of a session deleted in the window, and the next
+        //     `ListSessions` walk retires it (recovery refuses the marked id).
+        //     Step B's `HSET` + layer-mapping `SET`s + `SADD`s run as a
+        //     `Transaction` only in the restore Job's unconditional mode: a
+        //     replay re-applies them over any writer that landed in the
+        //     reconnect window, which is safe only because the held fleet
+        //     leaves the Job the only writer. On-access recovery's Step B is
+        //     not a `Transaction`: it is one conditional `EVALSHA` on the data
+        //     pool (`session_record_restore.lua`) that writes nothing once the
+        //     record or the deletion marker exists, so its re-send overwrites
+        //     no `DeleteLayer` removal or `CreateLayer` mapping flip.
         //   - `LayerStore::write_object` (create materialization): when a
         //     landed `EXEC`'s reply is lost and the replay reaches the store,
         //     the replay re-applies the same state but its `XADD 1-0` is
@@ -4301,35 +4678,54 @@ impl ValkeyClient {
         //     leaves the object it wrote: a complete, unmapped orphan for the
         //     orphan sweep. A re-send creates the layer under a new id.
         //
-        // REDIRECTS. With the redirection budget at zero, fred's `Transaction`
-        // router fails a transaction that meets a `MOVED` or an `ASK` at once
-        // ("Max redirections exceeded", `transactions.rs:212-217`, `:240-243`)
-        // and, unlike `process_moved` for a single command
-        // (`router/commands.rs:298-307`), re-syncs nothing first. Each slot is
-        // its own fred client with its own routing table, so a member that met
-        // a `MOVED` would keep sending that slot's transactions to the old
-        // owner. Every fred `Transaction` caller therefore sends its `EXEC`
-        // through `ValkeyClient::exec_txn`, which re-syncs the transaction's own
-        // checkout on that error before returning it to the caller.
+        // REDIRECTS. With the redirection budget at zero, a `MOVED` and an
+        // `-ASK` fail alike on this pool, and neither is followed:
+        //   - A single command or a pipeline fails `Routing` "Too many
+        //     redirections." at `decr_check_redirections`
+        //     (`router/commands.rs:261` for an `-ASK`; `:304` for a `MOVED`,
+        //     after `process_moved` has re-synced this member's routing at
+        //     `:298-303`). That shape proves the command never ran
+        //     (`is_txn_redirect_refusal`).
+        //   - A fred `Transaction` fails `Unknown` "Max redirections exceeded"
+        //     (`transactions.rs:212-217`, `:240-243`) and re-syncs nothing,
+        //     hence `ValkeyClient::exec_txn`: every fred `Transaction` caller
+        //     sends its `EXEC` through it, and it re-syncs the transaction's
+        //     own checkout on that error before returning it to the caller.
+        // Each slot is its own fred client with its own routing table, so a
+        // redirect met by one member leaves every other member routing by the
+        // old layout. Either shape therefore marks the pool's routing stale
+        // (`ValkeyClient::mark_txn_routing_stale`, at most once a second), and
+        // every other slot re-syncs at its next checkout
+        // (`ValkeyClient::acquire_txn_inner`).
         //
-        // The one data-pool command that opts out per command is the
-        // `UpdateLayer` commit, `EVALSHA update_layer_fast`, in both of the
-        // script's modes (the field / time-sample fast path and the structural
-        // commit, `storage::structural::commit_structural`): fred replays commands
-        // still in flight when a connection drops, and a replay of a commit is
-        // a second execution at an unbounded later time — possibly after the
-        // same client's next commit, where no record check can recognise it.
-        // It is therefore sent with `max_attempts = 1`
+        // The data pool sends three commands at one attempt (its redirection
+        // budget stays fred's default, 5): the `UpdateLayer` commit,
+        // `EVALSHA update_layer_fast`, in both of the script's modes (the
+        // field / time-sample fast path and the structural commit,
+        // `storage::structural::commit_structural`); an operation-id call's
+        // start-record `HGET`; and the chain gate's probe pipeline
+        // (`storage::chain_gate`, `CHAIN_PROBE_MAX_ATTEMPTS`). For the commit,
+        // fred replays commands still in flight when a connection drops, and a
+        // replay of a commit is a second execution at an unbounded later time
+        // — possibly after the same client's next commit, where no record
+        // check can recognise it. It is therefore sent with `max_attempts = 1`
         // (`storage::lua::evalsha_once_with_reload`): written to the wire at
         // most once. A dropped connection fails that attempt transiently
-        // instead, and so does a redirect it cannot follow — a `MOVED` as
-        // `Unknown` "Too many failed write attempts.", an `-ASK` as `Routing`
-        // "Max attempts reached." (the vendored fred patch keeps the router
-        // running through the `-ASK`; `vendor/fred-10.1.0.SOURCE.md`).
+        // instead, and so does a redirect it cannot follow. On the data pool a
+        // `MOVED` fails `Unknown` "Too many failed write attempts.", because
+        // `process_moved` re-syncs and spends a redirection and the re-write
+        // then finds no attempt left (`router/commands.rs:304-309`, then
+        // `:111`); an `-ASK` fails `Routing` "Max attempts reached." (the
+        // vendored fred patch keeps the router running through the `-ASK`;
+        // `vendor/fred-10.1.0.SOURCE.md`). The `Unknown` text does not prove
+        // nothing ran: a one-attempt command in flight on a connection that a
+        // cluster sync closes is re-written from the retry buffer and fails
+        // the same way (`router/clustered.rs:507`, `:559-560`;
+        // `router/mod.rs:373-390`; `protocol/connection.rs:911`).
         // `update_layer`'s own retry loop runs the next attempt, whose
-        // commit-token check reports the commit if it did land. An
-        // operation-id call's start-record `HGET` is sent once for the same
-        // reason. "Once" bounds the writes; the caller's own timeout bounds
+        // commit-token check reports the commit if it did land. The
+        // start-record `HGET` is sent once for the same reason. "Once" bounds
+        // the writes; the caller's own timeout bounds
         // when the one write happens: a command still queued in fred's channel
         // while its router reconnects (or while the router supervisor restarts
         // a router that ended with an error) is written when the router next
@@ -4354,17 +4750,16 @@ impl ValkeyClient {
         // never sits in front of a writer's command. Nothing is connected
         // here: the `ReaderConnector` built below from this template connects
         // a reader the first time it serves a subscription — on a cluster, to
-        // its bound slot's primary alone, the third sanctioned divergence (see
-        // `ReaderConnector`).
+        // its bound slot's primary alone, the readers' per-connection `server`
+        // divergence (see `ReaderConnector`).
         //
-        // The template is `Self::reader_builder`'s, which makes the readers'
-        // one per-pool config divergence (`Blocking::Interrupt`; read its docs
-        // before adding a second). The readers build from `reader_fred_config`,
-        // derived from the shared config inside `build_fred_config` (its
-        // provider cadence-wrapped), and MOVED there; `fred_config` is dropped
-        // right after its last read, so "nothing reads the shared config after
-        // the readers' divergence" stays a compile-time fact rather than a
-        // reading exercise.
+        // The template is `Self::reader_builder`'s, which makes no per-pool
+        // config divergence (read its docs before adding one). The readers
+        // build from `reader_fred_config`, derived from the shared config
+        // inside `build_fred_config` (its provider cadence-wrapped), and MOVED
+        // there; `fred_config` is dropped right after its last read, so
+        // "nothing reads the shared config after the readers' config is
+        // derived" stays a compile-time fact rather than a reading exercise.
         let cluster = matches!(fred_config.server, ServerConfig::Clustered { .. });
         drop(fred_config);
         let reader_builder = Self::reader_builder(config, reader_fred_config, &peer_replies);
@@ -4565,6 +4960,12 @@ impl ValkeyClient {
             config.catchup_build_memory_budget_mib.saturating_mul(1024),
             metrics_slot.clone(),
         ));
+        // `D_c`, from the same plan, in KiB, on its own series.
+        let catchup_payload_budget = Arc::new(MemoryBudget::with_series(
+            config.pod_memory.catchup_payload_budget_bytes() / 1024,
+            metrics_slot.clone(),
+            &crate::storage::memory_budget::CATCHUP_PAYLOAD_SERIES,
+        ));
 
         // Validate transaction pool by PINGing one acquired client.
         {
@@ -4610,6 +5011,7 @@ impl ValkeyClient {
             cluster,
             subscriber_pool_size,
             StreamMuxKnobs::new(),
+            config.pod_memory.live_delivery_budget_bytes(),
             metrics_slot.clone(),
         ));
         // The member replacer over the three multiplexed pools and the `txn`
@@ -4713,6 +5115,7 @@ impl ValkeyClient {
             catchup_read_gate,
             catchup_fenced_read_gate,
             catchup_build_budget,
+            catchup_payload_budget,
             stream_mux,
             maintenance_pool,
             snapshot_pool,
@@ -4775,61 +5178,65 @@ impl ValkeyClient {
     /// ([`apply_connect_timeout`]) every other `Builder` carries, with the
     /// shared `peer_replies` registry from `connect` but the slow unresponsive
     /// verdict only ([`UnresponsiveVerdicts::SlowOnly`]), the reader class of
-    /// connection buffer limits ([`connection_buffers::READER_LIMITS`]), plus
-    /// the readers' one `FredConfig` divergence below. Called once, by
-    /// [`Self::connect`].
+    /// connection buffer limits ([`connection_buffers::READER_LIMITS`]).
+    /// Called once, by [`Self::connect`].
     ///
-    /// ── The readers' deliberate per-pool config divergence (b.9uq round 4) ──
+    /// ── No per-pool config divergence ──
     ///
-    /// `Config::blocking` is set to `Blocking::Interrupt` here and NOWHERE
-    /// else. This is the only place `connect` (through this fn) mutates a
-    /// `FredConfig` after `build_fred_config` returned it, so read the next
-    /// three paragraphs before adding a second one. (`ReaderConnector::connect`
+    /// `reader_fred_config` is used exactly as `build_fred_config` returned
+    /// it: nothing here writes a `FredConfig` field, so read the paragraphs
+    /// below before adding the first such write. (`ReaderConnector::connect`
     /// later rewrites `server` and `database` on each connection's clone of
     /// this template — the per-connection divergence, documented and pinned
     /// with `ReaderConnector`, not a per-pool one. The pub/sub client's and
-    /// the readers' re-AUTH cadence divergences are NOT a second one either:
+    /// the readers' re-AUTH cadence divergences are not per-pool ones either:
     /// both are derived inside `build_fred_config` itself, before `connect`
     /// sees any value — see `derive_pubsub_config` and `derive_reader_config`.)
     ///
-    /// WHY the readers need it. Each reader client is parked in `XREAD
-    /// BLOCK`, and a reader sends its own other commands — its probes, head
-    /// checks, keepalive and credential re-AUTH — only between its reads.
-    /// fred's periodic credential refresh no longer reaches a reader at all
-    /// (b.19i: the reader config's provider is cadence-wrapped, so fred
-    /// schedules no refresh there, and the reader wakes an in-flight read and
-    /// re-AUTHs between reads). What is left is the residual case: the next
-    /// command after a client-side XREAD timeout that did not force a
-    /// reconnect, while the old read is still blocked on the server, would
-    /// queue server-side behind up to 30 s of that BLOCK.
-    /// `Blocking::Interrupt` makes fred send `CLIENT UNBLOCK <id> ERROR` (via
-    /// its lazily opened backchannel connection) first. Every reader client is
-    /// a single-node client, on a cluster too, so this is fred's non-cluster
-    /// interrupt path for every deployment. The read it interrupts is the
-    /// reader's own abandoned one: a client-side timeout only marks fred's
-    /// command `timed_out`, so it stays first in the connection's buffer and
-    /// its `-UNBLOCKED` reply goes to that command's dropped caller. The reader
-    /// never sees it — nothing is re-planned and nothing is counted; the case
-    /// costs the backchannel connection only. (A `-UNBLOCKED` that does reach
-    /// a reader's live read comes from outside the service; the reader
-    /// re-plans it cheaply from its durable per-subscription cursors —
-    /// `is_client_unblocked_error` — so nothing is lost.) Safe because a
-    /// reader issues its XREADs one at a time and nothing else while one is in
-    /// flight.
+    /// WHY the readers keep fred's default `Blocking::Block` (b.9sh). Each
+    /// reader client is parked in `XREAD BLOCK`, and a reader sends its own
+    /// other commands — its probes, head checks, keepalive and credential
+    /// re-AUTH — only between its reads. fred's periodic credential refresh
+    /// does not reach a reader at all (b.19i: the reader config's provider is
+    /// cadence-wrapped, so fred schedules no refresh there, and the reader
+    /// wakes an in-flight read and re-AUTHs between reads), and shutdown ends
+    /// a live read with a stream wake. What is left is the residual case: the
+    /// reader's next command after a client-side XREAD timeout that did not
+    /// force a reconnect (a timeout streak forces one only on its first and
+    /// every `FORCE_RECONNECT_REARM_EVERY`th timeout), while the old read is
+    /// still blocked on the server. Under `Block` fred writes that command to
+    /// the same connection, and the store runs it once the abandoned read's
+    /// BLOCK ends: it waits at most the read's remaining BLOCK (under 30 s),
+    /// cut short by the command's own bound — the idle→active probe's timeout
+    /// forces a reconnect, a re-AUTH is cut at its 2 s probe bound and counted
+    /// `failed`, and an XREAD timeout continues the streak. The abandoned
+    /// read's late reply never reaches that command: a client-side timeout
+    /// only marks fred's command `timed_out`, so it stays first in the
+    /// connection's in-flight buffer, and its reply pops it and goes to its
+    /// dropped caller. Entries that reply carried are read again from the
+    /// reader's durable per-subscription cursors, so nothing is lost.
     ///
-    /// WHY it must never diverge for auth / TLS. `apply_fred_config_overrides`
-    /// is the single mutation point for `FredConfig` (see
-    /// `build_fred_config`) so that all six connection sets provably agree on
-    /// credentials, credential provider, and TLS policy — a divergence there
-    /// is a security property silently lost on one pool, and it would not
-    /// fail any test that does not specifically look for it. `blocking` is
-    /// categorically different: it is a client-side command-scheduling policy,
-    /// invisible to the server's authn/authz, and it is meaningful only on
-    /// clients that issue blocking commands — the readers and no other.
-    /// Diverging it here therefore cannot weaken the shared-policy guarantee,
-    /// and enabling it globally would be actively wrong: the data, txn,
-    /// maintenance, snapshot and pub/sub pools are multiplexed, so a command
-    /// queued behind another there is normal pipelining, not a stale block.
+    /// WHY not `Blocking::Interrupt`. It would have fred send `CLIENT UNBLOCK
+    /// <id> ERROR` before that residual command, over a backchannel: a second
+    /// connection per reader, opened on first use and kept for the life of
+    /// the client, so the store's worst-case connection count would carry one
+    /// per reader (SDD §15.3 *Connection count*) to shorten a wait no
+    /// production path depends on. `Blocking::Error` would fail the residual
+    /// command instead, which needs reader handling that `Block` does not.
+    /// With no unblock sent by the service, a `-UNBLOCKED` that reaches a
+    /// reader's live read comes from outside the service; the reader re-plans
+    /// it cheaply from its cursors (`is_client_unblocked_error`).
+    ///
+    /// WHY a per-pool write here must never touch auth / TLS.
+    /// `apply_fred_config_overrides` is the single mutation point for
+    /// `FredConfig` (see `build_fred_config`) so that all six connection sets
+    /// provably agree on credentials, credential provider, and TLS policy — a
+    /// divergence there is a security property silently lost on one pool, and
+    /// it would not fail any test that does not specifically look for it. A
+    /// field written here instead must be categorically outside that policy —
+    /// a client-side command-scheduling setting such as `blocking`, invisible
+    /// to the server's authn/authz — and must be right for a client parked in
+    /// `XREAD BLOCK`.
     ///
     /// Nothing is connected here: each reader connection is built from a
     /// clone of this template when the reader first serves a subscription
@@ -4839,9 +5246,7 @@ impl ValkeyClient {
         reader_fred_config: FredConfig,
         peer_replies: &PeerReplies,
     ) -> Builder {
-        let mut subscriber_fred_config = reader_fred_config;
-        subscriber_fred_config.blocking = Blocking::Interrupt;
-        let mut reader_builder = Builder::from_config(subscriber_fred_config);
+        let mut reader_builder = Builder::from_config(reader_fred_config);
         reader_builder
             .set_policy(shared_reconnect_policy(config))
             .set_performance_config(shared_performance_config(config));
@@ -5070,6 +5475,30 @@ impl ValkeyClient {
     #[cfg(any(test, feature = "test-support"))]
     pub fn txn_slot_client_ids_for_test(&self) -> Vec<String> {
         self.txn_pool.slot_client_ids_for_test()
+    }
+
+    /// Hold the next `txn` slot replacement right after it reads the pool's
+    /// routing epoch and before it builds and connects the fresh client, on
+    /// the two-party `gate`, which it waits on twice: arrival, then release.
+    /// A test marks the pool's routing stale between its own two waits
+    /// ([`Self::mark_txn_routing_stale_for_test`]) and then sees the swapped
+    /// slot recorded at the epoch from before the mark
+    /// (`txn_pool.slot_routing_epochs_for_test()`), owing a re-sync. One-shot.
+    /// **Test-only** (`test-support`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_txn_replacement_after_epoch_read_for_test(&self, gate: Arc<tokio::sync::Barrier>) {
+        self.member_replacer
+            .hold_txn_after_epoch_read_for_test(gate);
+    }
+
+    /// Mark the `txn_pool`'s cluster routing stale as a redirect would
+    /// ([`Self::mark_txn_routing_stale`], trigger `test`): a no-op on a client
+    /// not configured for a clustered store, and subject to the mark gate.
+    /// Answers the epoch an accepted mark advanced the pool to. **Test-only**
+    /// (`test-support`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mark_txn_routing_stale_for_test(&self) -> Option<u64> {
+        self.mark_txn_routing_stale("test")
     }
 
     /// The fred client ids the router supervisor watches as `txn` slots: after
@@ -5525,7 +5954,8 @@ impl ValkeyClient {
     /// permit in one value whose drop order releases them in that sequence
     /// (b.f4f) — callers no longer have a scoping rule to get right.
     pub async fn acquire_txn(&self) -> CheckedOutClient {
-        self.acquire_txn_inner(None).await
+        self.acquire_txn_inner(None, CheckoutRoutingResync::AtCheckout)
+            .await
     }
 
     /// Acquire a `txn_pool` slot for a transaction that will touch `hash_key`,
@@ -5544,7 +5974,33 @@ impl ValkeyClient {
     /// describes a connection the caller will never use. Same defect b.ji8 fixed
     /// for UNWATCH teardown, same fix.
     pub async fn acquire_txn_for(&self, hash_key: &str) -> CheckedOutClient {
-        self.acquire_txn_inner(Some(hash_key)).await
+        self.acquire_txn_inner(Some(hash_key), CheckoutRoutingResync::AtCheckout)
+            .await
+    }
+
+    /// [`Self::acquire_txn_for`] for a caller that syncs the checkout's
+    /// cluster routing itself, right after the checkout, with
+    /// [`Self::sync_txn_checkout_routing`]: the one caller is the
+    /// `CreateLayer` commit's repeated run
+    /// (`LayerStore::dispatch_create_layer_commit` with `sync_routing` set).
+    ///
+    /// When the pool's routing was marked stale since the slot last synced,
+    /// the checkout still records the pool's epoch for the slot, but runs no
+    /// sync of its own: the caller's sync is the one sync, so a hung
+    /// `CLUSTER SLOTS` costs the repeated run one command timeout, not two,
+    /// and a failing store still costs at most one sync attempt per member per
+    /// mark. Everything else — the probe, any recycle — is
+    /// [`Self::acquire_txn_for`]'s.
+    ///
+    /// **The hygiene probe runs on the pre-sync routing.** The caller's sync
+    /// comes after the checkout, so the probe pinned to `hash_key` is routed by
+    /// the member's table as it stood: on a repeated commit run after a slot
+    /// move, it reaches the slot's old owner. If that node is unreachable, the
+    /// probe times out (its 650 ms deadline) and the slot is recycled before
+    /// the caller's sync runs.
+    pub(crate) async fn acquire_txn_for_caller_synced(&self, hash_key: &str) -> CheckedOutClient {
+        self.acquire_txn_inner(Some(hash_key), CheckoutRoutingResync::ByCaller)
+            .await
     }
 
     /// Run a fred `Transaction`'s `EXEC` on its `txn_pool` checkout — **the
@@ -5568,7 +6024,9 @@ impl ValkeyClient {
     /// caller has to. Sending every `EXEC` through this helper puts the
     /// re-sync on the error path, before the caller sees the error, by
     /// construction. That it runs on the transaction's own checkout rests on
-    /// the precondition above, not on construction. The callers then map the
+    /// the precondition above, not on construction. The re-sync also marks the
+    /// whole pool's routing stale ([`Self::mark_txn_routing_stale`]), so the
+    /// other members re-sync at their next checkout. The callers then map the
     /// error exactly as before.
     pub(crate) async fn exec_txn<R>(
         &self,
@@ -5611,6 +6069,19 @@ impl ValkeyClient {
     /// at WARN (with the pinned `key` as the field) when it fails, and it
     /// never changes the caller's answer. An `ASK` re-syncs too, which is
     /// harmless: the slot keeps its owner until the migration ends.
+    ///
+    /// **Then the whole pool's routing is marked stale** (b.4q2;
+    /// [`Self::mark_txn_routing_stale`]): the redirect says the store's slot
+    /// layout changed, and every other member still routes by the old one, so
+    /// each re-syncs at its next checkout. This member is recorded as synced
+    /// at the epoch the mark produced when that is the epoch read before its
+    /// sync plus one, so its own next checkout does not sync it again.
+    /// Otherwise — the mark gate suppressed the mark, or another trigger's
+    /// mark was accepted while the sync was in flight — it is recorded at the
+    /// epoch read before its sync, and its next checkout re-syncs for the
+    /// marks the sync may not have seen. The mark comes after the sync, as on
+    /// every path that marks after receiving the error; it changes nothing the
+    /// caller sees.
     async fn resync_txn_routing_after_redirect(
         &self,
         checkout: &Client,
@@ -5621,6 +6092,7 @@ impl ValkeyClient {
         if !is_transaction_redirections_exhausted_error(error) {
             return;
         }
+        let epoch_before_sync = self.txn_pool.routing_epoch();
         match self.sync_txn_checkout_routing(checkout).await {
             Ok(()) => {}
             Err(TxnRoutingSyncFailure::Failed(e)) => tracing::warn!(
@@ -5637,6 +6109,57 @@ impl ValkeyClient {
                  redirected timed out; returning the transaction's error"
             ),
         }
+        // The epoch this member's sync covers. The mark's own epoch only when
+        // it is the next after the one read before the sync: a mark another
+        // trigger made while the sync was in flight (a sync can outlast the
+        // mark gate's interval) may describe a layout change the sync did not
+        // see, so the member keeps that mark's re-sync at its next checkout.
+        let synced_at = match self.mark_txn_routing_stale(TXN_ROUTING_STALE_TRIGGER_TRANSACTION) {
+            Some(epoch) if epoch == epoch_before_sync + 1 => epoch,
+            _ => epoch_before_sync,
+        };
+        if let Some(slot) = self.txn_pool.slot_of(checkout.id()) {
+            self.txn_pool.record_routing_synced(slot, synced_at);
+        }
+    }
+
+    /// Mark the `txn_pool`'s cluster routing stale after one of its members
+    /// met a cluster redirect (b.4q2), so that every member re-syncs its
+    /// routing at its next checkout ([`Self::acquire_txn_inner`]). Each member
+    /// is its own fred client with its own routing table, and a redirect seen
+    /// by one says the store's slot layout changed under all of them.
+    ///
+    /// Two triggers call it: [`FredErrOrigin::observe_error`] for a single
+    /// command or a pipeline refusing a redirect ([`is_txn_redirect_refusal`]),
+    /// and [`Self::exec_txn`] for a fred `Transaction` redirected past the
+    /// pool's zero budget. `trigger` names which. Tests also call it, through
+    /// the `test-support` `mark_txn_routing_stale_for_test`, with trigger
+    /// `test`.
+    ///
+    /// Does nothing on a client not configured for a clustered store. Accepted
+    /// at most once per
+    /// [`TXN_ROUTING_STALE_MARK_MIN_INTERVAL`](crate::storage::checkout::TXN_ROUTING_STALE_MARK_MIN_INTERVAL)
+    /// (the first always), which bounds the cost at one re-sync per member per
+    /// accepted mark; a suppressed mark is covered by the next one, and by the
+    /// `CreateLayer` commit's own sync before a repeated run. Answers the
+    /// epoch an accepted mark advanced the pool to, `None` otherwise.
+    ///
+    /// Logs one INFO line per accepted mark, at most once per
+    /// [`TXN_ROUTING_STALE_LOG_MIN_INTERVAL`](crate::storage::checkout::TXN_ROUTING_STALE_LOG_MIN_INTERVAL),
+    /// carrying `trigger` and the number of marks accepted since the last
+    /// line. Synchronous: it never waits, and changes no caller's answer.
+    pub(crate) fn mark_txn_routing_stale(&self, trigger: &'static str) -> Option<u64> {
+        let accepted = self.txn_pool.mark_routing_stale()?;
+        if let Some(marks) = accepted.log_marks {
+            tracing::info!(
+                trigger,
+                marks,
+                epoch = accepted.epoch,
+                "txn-pool cluster routing marked stale after a cluster redirect; each txn-pool \
+                 connection re-syncs its routing at its next checkout"
+            );
+        }
+        Some(accepted.epoch)
     }
 
     /// Sync one `txn_pool` checkout's cluster routing (`CLUSTER SLOTS`, then
@@ -5654,10 +6177,11 @@ impl ValkeyClient {
     /// checkout's hygiene: a connection the sync opens carries no transaction
     /// state.
     ///
-    /// Shared by [`Self::resync_txn_routing_after_redirect`] and the
-    /// `CreateLayer` commit's repeated runs — an overwrite's second run, and
-    /// every run of its in-process finisher
-    /// (`LayerStore::dispatch_create_layer_commit`).
+    /// Shared by [`Self::resync_txn_routing_after_redirect`], the checkout's
+    /// re-sync after the pool's routing was marked stale
+    /// ([`Self::acquire_txn_inner`]), and the `CreateLayer` commit's repeated
+    /// runs — an overwrite's second run, and every run of its in-process
+    /// finisher (`LayerStore::dispatch_create_layer_commit`).
     pub(crate) async fn sync_txn_checkout_routing(
         &self,
         checkout: &Client,
@@ -5857,11 +6381,56 @@ impl ValkeyClient {
     /// (retry loops, `map_fred_err_for_grpc`) is already the right machinery
     /// for a connection that then misbehaves, and denying the checkout would
     /// turn a recoverable slot into a hard outage for that request.
-    async fn acquire_txn_inner(&self, hash_key: Option<&str>) -> CheckedOutClient {
+    ///
+    /// **A slot whose routing is behind re-syncs first** (b.4q2). When the
+    /// pool's routing was marked stale since the slot last synced
+    /// ([`Self::mark_txn_routing_stale`]; `ExclusiveCheckout::claim_routing_sync`),
+    /// the checkout records the pool's epoch for the slot and then runs
+    /// [`Self::sync_txn_checkout_routing`], before the hygiene probe, so the
+    /// probe and the caller's commands — a `WATCH` included — reach the slot's
+    /// current owner. Recording the epoch first means a failing store costs at
+    /// most one sync attempt per member per mark. The sync is bounded by the
+    /// command timeout and never fails the checkout: a failure or a timeout is
+    /// logged at WARN and the checkout continues, for the same reason a failed
+    /// repair does above. A checkout cancelled during the sync keeps the
+    /// recorded epoch, and the sync finishes in the member's router. It runs
+    /// only on a member about to be used, never on one mid-`WATCH`: the
+    /// member is held by this checkout. On a standalone store the epoch never
+    /// moves, and a slot that is current costs two atomic loads per checkout
+    /// (the pool's epoch and the slot's), no write. With `resync`
+    /// [`CheckoutRoutingResync::ByCaller`] the epoch is still recorded but
+    /// the sync is left to the caller, which runs it right after the checkout
+    /// ([`Self::acquire_txn_for_caller_synced`]).
+    async fn acquire_txn_inner(
+        &self,
+        hash_key: Option<&str>,
+        resync: CheckoutRoutingResync,
+    ) -> CheckedOutClient {
         // The checkout mints the pool-use token itself, so the gauge still
         // covers the probe and any recycle — the slot is genuinely held for that
         // whole window.
         let mut checkout = self.txn_pool.acquire().await;
+
+        if self.txn_pool.claim_routing_sync(checkout.slot())
+            && resync == CheckoutRoutingResync::AtCheckout
+        {
+            match self.sync_txn_checkout_routing(&checkout).await {
+                Ok(()) => {}
+                Err(TxnRoutingSyncFailure::Failed(e)) => tracing::warn!(
+                    key = hash_key.unwrap_or_default(),
+                    error = %e,
+                    kind = ?e.kind(),
+                    "Cluster routing re-sync of a txn-pool connection at checkout, after the \
+                     pool's routing was marked stale, failed; continuing with the checkout"
+                ),
+                Err(TxnRoutingSyncFailure::TimedOut { timeout_ms }) => tracing::warn!(
+                    key = hash_key.unwrap_or_default(),
+                    timeout_ms,
+                    "Cluster routing re-sync of a txn-pool connection at checkout, after the \
+                     pool's routing was marked stale, timed out; continuing with the checkout"
+                ),
+            }
+        }
 
         match probe_txn_slot(
             &checkout,
@@ -6165,13 +6734,14 @@ impl ValkeyClient {
         // `&Client`, and the composite has to be moved into the task whole so
         // the slot, the gauge and the semaphore permit all stay held for the
         // repair's duration.
+        let slot = checkout.slot();
         let (guard, token, entitlement) = checkout.into_parts();
         let handle = self.txn_recycle_tracker.spawn(async move {
             client.repair_held_txn_slot(&guard, reason).await;
             // All three travel back to the caller here; the slot has been held
             // — and the gauge has counted it, and the permit has withheld it
             // from every other caller — continuously since the checkout.
-            CheckedOutClient::reassemble(guard, token, entitlement)
+            CheckedOutClient::reassemble(slot, guard, token, entitlement)
         });
 
         match handle.await {
@@ -6671,6 +7241,14 @@ impl ValkeyClient {
             *guard = Some(metrics.clone());
         }
 
+        // The live-delivery ledger's usage gauges, read at each collection.
+        let ledger = Arc::clone(self.stream_mux.delivery_ledger());
+        let exempt_ledger = Arc::clone(&ledger);
+        metrics.register_delivery_ledger_gauges(
+            move || ledger.charged_bytes(),
+            move || exempt_ledger.exempt_bytes(),
+        );
+
         let mut new_handles: Vec<JoinHandle<()>> = Vec::new();
 
         // b.cbe: every error hook below gets a clone of the SAME
@@ -6825,6 +7403,11 @@ impl ValkeyClient {
         self.catchup_read_gate.close();
         self.catchup_fenced_read_gate.close();
         self.catchup_build_budget.close();
+        // `close`, as for `T`, not `end_waits`: `D_c` serves only catch-ups,
+        // which shutdown ends anyway (`UNAVAILABLE "server shutting down"`);
+        // granting one whose payload fits would only build and queue content
+        // for a stream the paced ending is about to end.
+        self.catchup_payload_budget.close();
         // Abort fred-owned background tasks (manage_subscriptions + event
         // hooks) first so they don't log spurious reconnect/error events as
         // the connections tear down. Take the Vec under the mutex and drop
@@ -6853,13 +7436,14 @@ impl ValkeyClient {
         // the store while the data pool it runs on is still open. A lease
         // released here frees the other replicas' writers of its layer now;
         // one cut off by the pool teardown below would hold them paused until
-        // it lapsed. By the time `main.rs` calls this, graceful shutdown has
-        // dropped every fenced read whose task its joins saw end: the catch-up
-        // flights with the subscriptions on the service shutdown token, the
-        // checkpoint's with the checkpoint loop's cancellation. Run beside the
-        // recycle drain rather than after it, so it adds nothing to this
-        // function's worst case, which `Config::from_env`'s shutdown-budget
-        // floor is written against.
+        // it lapsed. By the time the post-server shutdown sequence
+        // (`grpc::transport::run_post_server_sequence`) calls this, graceful
+        // shutdown has dropped every fenced read whose task its joins saw end:
+        // the catch-up flights with the subscriptions on the service shutdown
+        // token, the checkpoint's with the checkpoint loop's cancellation. Run
+        // beside the recycle drain rather than after it, so it adds nothing to
+        // this function's worst case, which `Config::from_env`'s
+        // shutdown-budget floor is written against.
         self.txn_recycle_tracker.close();
         self.fence_guard_cleanup_tracker.close();
         let (recycles, fence_cleanups) = tokio::join!(
@@ -7545,8 +8129,9 @@ pub struct ReaderConn {
 }
 
 impl ReaderConn {
-    /// The reader's client: one connection, plus fred's lazily opened
-    /// backchannel when a `CLIENT UNBLOCK` interrupts its XREAD.
+    /// The reader's client: one connection, and never a backchannel (the
+    /// readers run fred's default `Blocking::Block`, so fred sends no `CLIENT
+    /// UNBLOCK`; see `ValkeyClient::reader_builder`).
     pub fn client(&self) -> &Client {
         &self.client
     }
@@ -7649,12 +8234,12 @@ pub(crate) struct RetireOutcome {
 /// **single-node** client built from one template: the reader `FredConfig`
 /// `build_fred_config` derived from the shared one (its credential provider
 /// cadence-wrapped so fred schedules no periodic re-`AUTH` on a reader, the
-/// fourth sanctioned divergence — see `derive_reader_config`), with
-/// `Blocking::Interrupt` set by `ValkeyClient::reader_builder` (the readers'
-/// per-pool divergence), the shared reconnect policy, performance config and
-/// connect-timeout settings. On a cluster URL each
-/// connect makes the **third sanctioned divergence**, on a clone of that
-/// template: `server` becomes the slot owner's `Server` — taken whole from the
+/// readers' re-`AUTH` cadence divergence — see `derive_reader_config`), built
+/// by `ValkeyClient::reader_builder` with fred's default `Blocking::Block`
+/// (so a reader never opens a `CLIENT UNBLOCK` backchannel), the shared
+/// reconnect policy, performance config and connect-timeout settings. On a
+/// cluster URL each connect makes the **readers' per-connection `server`
+/// divergence**, on a clone of that template: `server` becomes the slot owner's `Server` — taken whole from the
 /// readers' routing view (below), so it carries the `tls_server_name` fred mapped
 /// under `TlsHostMapping::DefaultHost` and is never rebuilt from `host:port` —
 /// and `database` is cleared, because fred skips `SELECT` only for clustered
@@ -7675,9 +8260,9 @@ pub(crate) struct RetireOutcome {
 /// one client, the sync refreshes exactly the view every later read uses.
 ///
 /// **One sync at a time.** fred runs a `CLUSTER SLOTS` sync inside the routing
-/// client's router task, stalling that data-pool member's traffic, and a sync
-/// that finds the cluster healthy also replaces its backchannel connection (a
-/// fresh TCP, TLS and `AUTH` handshake). So the readers' syncs are
+/// client's router task, stalling that data-pool member's traffic, and every
+/// sync opens a fresh connection for its `CLUSTER SLOTS` (a TCP, TLS and
+/// `AUTH` handshake), dropped when the sync ends. So the readers' syncs are
 /// single-flight ([`Self::sync_routing`]): one caller at a time issues one,
 /// and a reader that waited while another reader's sync ended — answered,
 /// or cut off by its bound — does not sync again: it reads the view that
@@ -7972,7 +8557,8 @@ impl ReaderConnector {
                 });
             };
             let server = owner.clone();
-            // The third sanctioned divergence (see the type docs).
+            // The readers' per-connection `server` divergence (see the type
+            // docs).
             builder.with_config(|config| {
                 config.server = ServerConfig::Centralized { server };
                 config.database = None;
@@ -8129,7 +8715,8 @@ impl ReaderConnector {
 /// Resolve the effective maintenance pool size. Defaults to 1 (the absolute
 /// minimum a fred `Pool` accepts) which is sufficient because every task that
 /// uses the pool for long walks (the GC sweep, the orphan sweep, the
-/// reference-count reconciler, the external-value backup repair)
+/// reference-count reconciler, the external-value backup repair, the
+/// checkpoint clean-up)
 /// is gated behind the `le:gc:leader` lock, so normally one replica runs them
 /// at a time (two can briefly overlap after a lock takeover). Operators can
 /// raise this for very large keyspaces, but values above ~4 are rarely
@@ -8193,7 +8780,7 @@ pub(crate) fn effective_subscriber_pool_size(configured: u32) -> usize {
 /// in URLs like `redis://:secret@host:6379` are never written to logs. Uses
 /// the *last* `@` to handle passwords that contain literal `@` characters.
 /// Returns the original string unchanged if no `@` is present or parsing fails.
-fn redact_url_credentials(url: &str) -> String {
+pub(crate) fn redact_url_credentials(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
@@ -8209,6 +8796,9 @@ fn redact_url_credentials(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use aws_credential_types::Credentials;
+    // Only the tests name a `Blocking` policy: every client runs fred's
+    // default (see `ValkeyClient::reader_builder`).
+    use fred::types::config::Blocking;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -9245,7 +9835,6 @@ mod tests {
     /// and `checkpoint::apply::tests::test_config`).
     fn connect_timeout_test_config(timeout_secs: u64) -> Config {
         Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -9327,6 +9916,10 @@ mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: false,
@@ -9781,28 +10374,17 @@ mod tests {
         assert_eq!(txn_timeout(Duration::MAX, 1), Duration::MAX);
     }
 
-    #[test]
-    fn unresponsive_max_timeout_clears_longest_command_budget() {
-        // A stream reader's XREAD BLOCK budget (`block_ms + 5 s`) is the
-        // single longest per-command budget in `src/`; every other single
-        // command is bounded by the 5 s `default_command_timeout`. (The two
-        // whole-write transactions wait longer, `txn_timeout`, but at the
-        // default command timeout that wait is capped at
-        // `UNRESPONSIVE_MAX_TIMEOUT` itself, and their replies
-        // stream back while they are written.) If
-        // `UNRESPONSIVE_MAX_TIMEOUT` ever dropped to or below it, the
-        // unresponsive check would start reaping perfectly healthy idle reader
-        // connections mid-BLOCK.
-        let longest_command_budget =
-            Duration::from_millis(crate::storage::notifications::XREAD_BLOCK_MS + 5_000);
-        assert!(
-            UNRESPONSIVE_MAX_TIMEOUT > longest_command_budget,
-            "UNRESPONSIVE_MAX_TIMEOUT ({UNRESPONSIVE_MAX_TIMEOUT:?}) must exceed the \
-             longest legitimate per-command budget ({longest_command_budget:?} = \
-             XREAD_BLOCK_MS + 5 s) or the check can reap healthy connections; \
-             raising XREAD_BLOCK_MS requires raising UNRESPONSIVE_MAX_TIMEOUT too"
-        );
-    }
+    // `UNRESPONSIVE_MAX_TIMEOUT` must clear the longest per-command budget in
+    // `src/`, a stream reader's XREAD client timeout (`XREAD_BLOCK_MS` plus
+    // the reader's `XREAD_CLIENT_TIMEOUT_MARGIN`), or the unresponsive check
+    // reaps healthy idle reader connections mid-BLOCK. Every other single
+    // command is bounded by the 5 s `default_command_timeout`; the two
+    // whole-write transactions wait longer (`txn_timeout`), but at the default
+    // command timeout that wait is capped at `UNRESPONSIVE_MAX_TIMEOUT` itself,
+    // and their replies stream back while they are written. The margin is
+    // defined in `storage::stream_mux`'s private reader module, out of reach
+    // from here, so the check lives there:
+    // `unresponsive_max_timeout_clears_the_xread_client_timeout`.
 
     #[test]
     fn unresponsive_check_interval_is_under_half_max_timeout() {
@@ -9821,157 +10403,144 @@ mod tests {
         );
     }
 
-    // ── b.9uq round 4: `Blocking::Interrupt` on the subscriber_pool ONLY ──
+    // ── b.9sh: every client keeps fred's default `Blocking::Block` ─────────
     //
-    // `Config::blocking` is the readers' per-pool `FredConfig` divergence (the
-    // other reader divergence, b.azh's per-connection `server`, is pinned by
+    // No client `connect` builds writes `Config::blocking`, the stream readers
+    // included. Under `Blocking::Interrupt` (the readers' setting from b.9uq
+    // round 4 until b.9sh) fred sends `CLIENT UNBLOCK` over a backchannel
+    // connection before a command queued behind a blocking one, so every
+    // reader that ever hit that case held a second connection for the life of
+    // its client: one more store connection per reader in the replica's worst
+    // case. The one case left for it was a reader's next command after a
+    // client-side XREAD timeout that did not force a reconnect; under `Block`
+    // that command waits for the abandoned read's BLOCK to end, bounded by its
+    // own timeout (`ValkeyClient::reader_builder` gives the reasons). On the
+    // multiplexed data / txn / maintenance / snapshot / pub-sub connections a
+    // command queued behind another is ordinary pipelining, where `Interrupt`
+    // would `CLIENT UNBLOCK` live traffic. (The readers' two other
+    // divergences, b.azh's per-connection `server` and b.19i's credential
+    // cadence, are pinned by
     // `reader_connector_diverges_only_the_server_and_database_of_its_template`
-    // below; the readers' credential-cadence divergence, b.19i's, is derived
-    // inside `build_fred_config` and pinned in `pubsub_credential_refresh`). It
-    // exists because the `subscriber_pool` clients are the stream multiplexer's
-    // readers, each parked in `XREAD BLOCK`. A reader sends its own other
-    // commands — its probes, head checks, keepalive and credential re-AUTH —
-    // only between reads, and fred schedules no credential refresh on a reader
-    // (b.19i), so what is left is the residual case: the reader's next command
-    // after a client-side XREAD timeout that did not force a reconnect, while
-    // the old read is still blocked on the server, would otherwise queue
-    // server-side behind up to 30 s of that BLOCK. `Interrupt` makes fred send
-    // `CLIENT UNBLOCK` first. The read it interrupts is that timed-out one,
-    // whose `-UNBLOCKED` goes to a caller that already dropped it: nothing is
-    // re-planned or counted. (A reader re-plans on `-UNBLOCKED` only when
-    // something outside the service unblocks a live read.)
-    //
-    // The divergence must stay scoped to that one pool. The data / txn /
-    // maintenance / pub-sub connections are MULTIPLEXED: a command queued behind
-    // another there is normal pipelining, so `Interrupt` would make fred send
-    // `CLIENT UNBLOCK` against perfectly ordinary traffic.
+    // below and in `pubsub_credential_refresh`.)
     //
     // Two guards, because neither alone is sufficient:
     //
-    //   * the source guard below pins WHERE the mutation happens (exactly one
-    //     site, on the readers' config, before the readers' Builder — the
-    //     template every lazily connected reader is built from — is made) —
-    //     `connect` is async, consumes its `Builder`s internally and returns
-    //     only a connected `ValkeyClient`, so single-site-ness is not observable
-    //     from any runtime value. Same technique, and same rationale, as the
-    //     sibling `connect_applies_fred_config_overrides_before_the_first_clone`
-    //     / `connect_has_no_second_credential_provider_mutation_site` guards;
+    //   * the source guard below pins that `connect` (with
+    //     `ValkeyClient::reader_builder`) writes no `blocking` field at all
+    //     and builds the readers' template from the seam-derived reader config
+    //     as `build_fred_config` returned it — `connect` is async, consumes its
+    //     `Builder`s internally and returns only a connected `ValkeyClient`, so
+    //     the absence of a write is not observable from any runtime value. Same
+    //     technique as the sibling
+    //     `connect_applies_fred_config_overrides_before_the_first_clone` /
+    //     `connect_has_no_second_credential_provider_mutation_site` guards;
     //   * the runtime guard in `tests/integration/storage/client_test.rs`
-    //     (`connect_enables_blocking_interrupt_on_the_subscriber_pool_only`)
+    //     (`connect_keeps_blocking_block_on_every_pool_and_every_reader`)
     //     reads `blocking` back off every live pool, and off a reader's client
     //     once a subscription has connected it, through fred's
-    //     `ClientLike::client_config()`, which is what actually proves the
-    //     divergence landed where it was meant to.
+    //     `ClientLike::client_config()`.
+    // The behaviour itself — a reader's command behind its own timed-out read
+    // opens no second connection — is pinned in
+    // `tests/integration/storage/stream_mux_reader_connect_test.rs`
+    // (`a_command_behind_a_cluster_readers_timed_out_read_opens_no_second_connection_and_gets_its_own_reply`).
 
     #[test]
-    fn fred_blocking_default_is_block_so_the_divergence_is_meaningful() {
-        // Pre-state guard: the whole "one pool diverges" claim is only
-        // meaningful while fred's default is `Block`. A fred bump that changed
-        // the default would make every OTHER pool silently interrupt-capable
-        // without failing any assertion that only checks the stream readers.
+    fn fred_blocking_default_is_block_so_no_client_sends_client_unblock() {
+        // Pre-state guard: "no client writes `blocking`" means "every client
+        // runs `Block`" only while fred's default is `Block`. A fred bump that
+        // changed the default would make every pool, the readers included,
+        // send CLIENT UNBLOCK (and open a backchannel) without failing the
+        // source guard below.
         let fred_config =
             FredConfig::from_url("redis://127.0.0.1:6379").expect("static URL must parse");
         assert_eq!(
             fred_config.blocking,
             Blocking::Block,
             "precondition: fred's `Config::blocking` default must be `Block`. If a fred \
-             upgrade changes it, every pool but the stream readers starts sending CLIENT UNBLOCK \
-             against ordinary pipelined traffic and the b.9uq round-4 divergence has to \
-             be re-thought"
-        );
-        assert_ne!(
-            Blocking::Interrupt,
-            Blocking::Block,
-            "sanity: the value the readers set must differ from the default it is diverging \
-             from"
+             upgrade changes it, every client starts sending CLIENT UNBLOCK over a backchannel \
+             connection and the b.9sh connection count no longer holds"
         );
     }
 
     // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
     #[test]
-    fn connect_sets_blocking_interrupt_exactly_once_on_the_subscriber_pool_config() {
+    fn connect_writes_no_blocking_policy_so_every_client_keeps_freds_default() {
         // The whole of `connect`, not `connect_fn_body()`: the readers'
         // template is made by `ValkeyClient::reader_builder`, the associated
         // fn between `connect` and `start_router_supervision`, which this
         // slice spans (and `connect_fn_body()` does not).
         let body = connect_whole_body();
 
-        // Exactly one `blocking` field assignment in the slice (`connect` plus
-        // `reader_builder`).
-        // The needle is the assignment form (`.blocking = `), so the prose in
-        // the surrounding comment block — which necessarily says "blocking"
-        // and "blocked" many times — cannot cross-match.
+        // No `blocking` field write in the slice (`connect` plus
+        // `reader_builder`), in either form: the assignment
+        // (`….blocking = …`) or a struct literal (`FredConfig { blocking: …,
+        // .. }`). The needles are code forms, so the prose in the comments —
+        // which necessarily says "blocking", "blocked" and names the variants
+        // — cannot cross-match. Under `Blocking::Interrupt` (the readers'
+        // setting until b.9sh) every reader that ever sent a command behind a
+        // blocked read held a backchannel connection for good.
         assert_eq!(
             body.matches(".blocking = ").count(),
-            1,
-            "connect must contain exactly ONE `blocking` assignment. A second one is how \
-             `Blocking::Interrupt` leaks onto a multiplexed pool, where a command queued \
-             behind another is normal pipelining and CLIENT UNBLOCK would abort live \
-             traffic (b.9uq round 4)"
+            0,
+            "connect must write no `blocking` field: every client keeps fred's default \
+             `Blocking::Block`, so no client opens a CLIENT UNBLOCK backchannel (b.9sh)"
         );
-        assert_eq!(
-            body.matches("subscriber_fred_config.blocking = Blocking::Interrupt")
-                .count(),
-            1,
-            "the sole `blocking` assignment must target the readers' own `FredConfig` \
-             (`subscriber_fred_config`) — not the shared `fred_config` every other connection \
-             is built from"
-        );
-        // The struct-literal form of the same divergence
-        // (`FredConfig { blocking: …, .. }`) would slip past the assignment
-        // needle above, so exclude it outright. (`Blocking::…` alone is not a
-        // usable needle: `reader_builder`'s rustdoc names the variant several
-        // times, and comments are part of this slice.)
         assert_eq!(
             body.matches("blocking:").count(),
             0,
-            "connect must not set `blocking` through a struct literal — the one divergence \
-             goes through the documented `subscriber_fred_config.blocking = …` assignment \
-             so the single-site needle above stays load-bearing"
+            "connect must not set `blocking` through a struct literal either"
         );
-
-        // …and it must land BEFORE the readers' Builder is made from that
-        // config, otherwise the readers inherit the default and the mutation
-        // is dead code.
-        let mutation_idx = body
-            .find("subscriber_fred_config.blocking = Blocking::Interrupt")
-            .expect("checked above");
-        let builder_idx = body
-            .find("Builder::from_config(subscriber_fred_config)")
-            .expect(
-                "connect must build the readers' Builder from the mutated \
-                 `subscriber_fred_config` — an anchor-not-found panic here is an \
-                 intentional loud maintenance signal, not a flake",
-            );
-        assert!(
-            mutation_idx < builder_idx,
-            "the `Blocking::Interrupt` mutation must precede `Builder::from_config` for the \
-             readers — the other order silently builds them from an un-mutated config"
-        );
-
-        // b.19i: the config `blocking` is set on is the readers' own, derived
-        // inside `build_fred_config` (`derive_reader_config`, its provider
-        // cadence-wrapped), never the shared one. Built from `fred_config`,
-        // the readers would carry the unwrapped provider and fred would run its
-        // periodic refresh on them again — a second task writing to a
-        // connection parked in `XREAD BLOCK`, which is what b.19i removed.
+        // The whole production source, not only `connect`: no other client
+        // the service builds (a member replacement's, the readers' per-connect
+        // `with_config`) may write it either. Sliced above this test module so
+        // the needles do not match their own literals.
+        let production = production_source();
         assert_eq!(
-            body.matches("let mut subscriber_fred_config = reader_fred_config;")
+            production.matches(".blocking = ").count() + production.matches("blocking:").count(),
+            0,
+            "no code in client.rs may write a fred `blocking` policy (b.9sh)"
+        );
+
+        // b.19i: the readers' template is built from the readers' own config,
+        // derived inside `build_fred_config` (`derive_reader_config`, its
+        // provider cadence-wrapped), taken whole and never the shared one.
+        // Built from `fred_config`, the readers would carry the unwrapped
+        // provider and fred would run its periodic refresh on them again — a
+        // second task writing to a connection parked in `XREAD BLOCK`, which
+        // is what b.19i removed.
+        assert_eq!(
+            body.matches("Builder::from_config(reader_fred_config)")
                 .count(),
             1,
-            "the readers' config must be the seam-derived `reader_fred_config`, taken whole"
+            "the readers' template must be made once, from the seam-derived \
+             `reader_fred_config` as build_fred_config returned it — an anchor miss here is an \
+             intentional loud maintenance signal"
         );
+        let reader_builder_fn = {
+            let start = body
+                .find("fn reader_builder(")
+                .expect("the reader_builder anchor moved — update this guard");
+            let len = body[start..]
+                .find("\n    }\n")
+                .expect("reader_builder ends with a four-space `}` line");
+            &body[start..start + len]
+        };
         assert_eq!(
-            body.matches("subscriber_fred_config = fred_config").count(),
-            0,
-            "the readers must not be built from the shared `fred_config`, whose provider fred \
-             refreshes"
+            (
+                reader_builder_fn.matches("Builder::from_config(").count(),
+                reader_builder_fn
+                    .matches("Builder::from_config(reader_fred_config)")
+                    .count()
+            ),
+            (1, 1),
+            "the readers' template must be its one Builder, made from `reader_fred_config` — \
+             not from the shared `fred_config`, whose provider fred refreshes"
         );
         assert_eq!(
             body.matches("reader_fred_config.").count(),
             0,
-            "connect must not write a field of `reader_fred_config` beyond the one `blocking` \
-             divergence on its moved value"
+            "connect must not write a field of `reader_fred_config`: it is used as \
+             build_fred_config returned it"
         );
         assert_eq!(
             body.matches("derive_reader_config(").count(),
@@ -9984,23 +10553,8 @@ mod tests {
         // more: it is the template every reader connection is built from,
         // handed to the `ReaderConnector`. Pinned over the whole of `connect`
         // (`connect_fn_body()` stops at the data-pool retry, above the
-        // connector): the connector must take exactly that Builder, after the
-        // mutation, and `connect` must still hold exactly one `blocking`
-        // assignment once the connector is built.
+        // connector): the connector must take exactly that Builder.
         let whole = connect_whole_body();
-        assert_eq!(
-            whole.matches(".blocking = ").count(),
-            1,
-            "the whole of connect must contain exactly ONE `blocking` assignment"
-        );
-        assert_eq!(
-            whole
-                .matches("let mut reader_builder = Builder::from_config(subscriber_fred_config);")
-                .count(),
-            1,
-            "the readers' template must be made once, from the mutated config, as \
-             `reader_builder` — an anchor miss here is an intentional loud maintenance signal"
-        );
         assert_eq!(
             whole.matches("Self::reader_builder(").count(),
             1,
@@ -10017,17 +10571,15 @@ mod tests {
         assert_eq!(
             whole.matches("builder: reader_builder").count(),
             1,
-            "the ReaderConnector must be built from the mutated `reader_builder`, exactly once — \
-             a connector built from any other Builder connects its readers without \
-             Blocking::Interrupt"
+            "the ReaderConnector must be built from `reader_builder`, exactly once — a \
+             connector built from any other Builder connects its readers from another template"
         );
         let connector_idx = whole
             .find("builder: reader_builder")
             .expect("checked above");
         assert!(
             template_idx < connector_idx,
-            "the connector must be handed the readers' Builder after it was made from the \
-             mutated config"
+            "the connector must be handed the readers' Builder after it was made"
         );
         // b.19i: the connector is handed the provider the same seam returned
         // (unwrapped, the very `Arc` the pools carry), so each reader schedules
@@ -10043,6 +10595,17 @@ mod tests {
             0,
             "connect must not rebind `reader_reauth`: it comes from build_fred_config alone"
         );
+    }
+
+    /// client.rs above this test module: every line of code the service
+    /// builds its clients with, and none of the guards' own needles. An
+    /// anchor-not-found panic is an intentional loud maintenance signal.
+    fn production_source() -> &'static str {
+        let src = include_str!("client.rs");
+        let end = src
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module's anchor moved — update production_source");
+        &src[..end]
     }
 
     /// From `ValkeyClient::connect`'s opener to `start_router_supervision`:
@@ -10080,13 +10643,14 @@ mod tests {
     }
 
     // Guard test: pinned by name in scripts/guard-tests.sh; rename or remove it there too.
-    /// b.azh, the third sanctioned `FredConfig` divergence: a cluster reader's
-    /// connection goes to its bound slot's primary alone, so its config — a
-    /// clone of the readers' template — gets that primary's `Server` and no
-    /// database, and NOTHING else. The two shared-policy divergences are
-    /// pinned above (`blocking`) and in `derive_pubsub_config`'s guards; this
-    /// one may not grow into a credential, TLS or blocking write, which would
-    /// make the readers' auth or transport differ from every other pool's.
+    /// b.azh, the readers' per-connection `server` divergence: a cluster
+    /// reader's connection goes to its bound slot's primary alone, so its
+    /// config — a clone of the readers' template — gets that primary's
+    /// `Server` and no database, and NOTHING else. No client writes
+    /// `blocking` (pinned above), and the credential-cadence divergences are
+    /// pinned in `derive_pubsub_config`'s guards; this one may not grow into a
+    /// credential, TLS or blocking write, which would make the readers' auth,
+    /// transport or connection count differ from every other pool's.
     ///
     /// Source inspection, as for the `connect` guards: the connect needs a
     /// live cluster, and what it builds is observable only on the connected
@@ -11065,6 +11629,7 @@ mod tests {
             false,
             1,
             StreamMuxKnobs::default(),
+            u64::MAX,
             Arc::new(Mutex::new(None)),
         );
         let hold = || MuxFault::Hold(tokio::sync::oneshot::channel::<()>().1);
@@ -11103,8 +11668,10 @@ mod tests {
 
     // ── b.9uq round 4: `-UNBLOCKED` classification ────────────────────────
     //
-    // `Blocking::Interrupt` above is only safe because the error it produces on
-    // the interrupted command is understood downstream. Valkey replies
+    // A `CLIENT UNBLOCK … ERROR` from outside the service (the service sends
+    // none: every client runs fred's default `Blocking::Block`) is harmless
+    // to a stream reader only because the error it produces on the
+    // interrupted read is understood downstream. Valkey replies
     // `-UNBLOCKED client unblocked via CLIENT UNBLOCK`, which fred's
     // `pretty_error` classifies as `ErrorKind::Unknown` — its match arms cover
     // only ERR / WRONGTYPE / NOAUTH / WRONGPASS / MOVED / ASK / CLUSTERDOWN /
@@ -11131,7 +11698,7 @@ mod tests {
         );
         assert!(
             is_client_unblocked_error(&e),
-            "the predicate must recognise the `-UNBLOCKED` reply `Blocking::Interrupt` \
+            "the predicate must recognise the `-UNBLOCKED` reply a `CLIENT UNBLOCK … ERROR` \
              provokes; missing it makes a stream reader treat a deliberate unblock as a \
              permanent failure and tear its subscriptions down"
         );
@@ -12427,12 +12994,15 @@ mod tests {
     ///
     /// - `main.rs` passes it whole to the Redis-scoped `ServiceTokenProvider` as
     ///   that instance's prolongation floor, so it is the threshold of the
-    ///   per-rotation headroom WARN an operator will see in the logs.
-    /// - The operator recommendation in `docs/service/docs/backing-store-azure.md`
-    ///   § Token refresh for the sidecar's refresh lead (195 s) is *derived*
-    ///   from it: the ceiling plus the 15 s default
-    ///   `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` pickup delay. Changing this constant silently invalidates that published
-    ///   number, so a change here must be accompanied by a docs change.
+    ///   per-rotation headroom WARN an operator will see in the logs, and the
+    ///   line the operator docs' headroom alert compares against.
+    /// - SDD §15.4's minimum sidecar refresh lead (195 s at the defaults) is
+    ///   *derived* from it: the ceiling plus the 15 s default
+    ///   `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` pickup delay. The customer
+    ///   docs (`docs/service/docs/backing-store-azure.md`) publish a larger
+    ///   recommendation (420 s) that must stay above that minimum. Changing
+    ///   this constant silently moves the minimum, the WARN and the alert, so a
+    ///   change here must be accompanied by a docs change.
     #[test]
     fn published_reauth_constants_match_the_shipped_parts() {
         assert_eq!(
@@ -12452,17 +13022,21 @@ mod tests {
             VALKEY_TOKEN_ROTATION_FANOUT_CEILING,
             Duration::from_secs(180),
             "the published rotation fan-out ceiling must stay 180 s: it is `main.rs`'s \
-             prolongation floor for the Redis-scoped ServiceTokenProvider, and the operator \
-             docs' sidecar-lead recommendation is this value plus the 15 s default token-file \
-             poll interval"
+             prolongation floor for the Redis-scoped ServiceTokenProvider and the operator \
+             docs' alert line, SDD §15.4's minimum sidecar lead is this value plus the 15 s \
+             default token-file poll interval, and the default \
+             LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS must stay at or above it (the WARN says \
+             so; `config`'s default-auth-mode test asserts it)"
         );
         assert_eq!(
             VALKEY_TOKEN_ROTATION_FANOUT_CEILING,
             VALKEY_TOKEN_REAUTH_MAX_INTERVAL * 2,
-            "the fan-out ceiling must remain exactly TWO tick intervals — one for the first \
-             client to observe a rotation (which opens the fan-out window) and one for the last \
-             client to take its next tick inside it. Collapsing it to a single interval would \
-             set the per-rotation headroom WARN below the latency the gate can actually deliver"
+            "the fan-out ceiling must remain exactly TWO tick intervals — one in which every \
+             client takes its first tick after the pickup, inside the fan-out window, and one \
+             of slack, not a second fan-out stage. A busy stream reader spends that slack \
+             landing its AUTH after its tick (the reader's const assertion on \
+             REAUTH_LANDING_BOUND); collapsing the ceiling to a single interval would leave \
+             those readers' AUTH landing after the old token expires with no WARN"
         );
     }
 
@@ -13034,8 +13608,8 @@ mod tests {
             assert!(
                 reader.refresh_interval().is_none(),
                 "{mode}: the readers' provider must schedule NO fred refresh — fred's refresh \
-                 task would be a second writer on a connection parked in XREAD BLOCK, which \
-                 races its interrupt and can queue behind a 30 s BLOCK (b.19i)"
+                 task would be a second writer on a connection parked in XREAD BLOCK, and its \
+                 AUTH would queue behind up to a 30 s BLOCK (b.19i)"
             );
             let reauth = configs.reader_reauth.as_ref().unwrap_or_else(|| {
                 panic!(
@@ -13189,10 +13763,10 @@ mod tests {
         #[test]
         fn reader_config_matches_shared_on_every_non_auth_field() {
             // As for the pub/sub config: nothing but the provider may ride
-            // along. `blocking` in particular stays at the default here —
-            // `ValkeyClient::reader_builder` sets `Blocking::Interrupt` on the
-            // value `connect` moves into it, the one per-pool divergence
-            // pinned by the connect guards.
+            // along. `blocking` in particular stays at the default here, and
+            // `ValkeyClient::reader_builder` writes no field of the value
+            // `connect` moves into it (pinned by the connect guards), so every
+            // reader runs fred's default `Blocking::Block` (b.9sh).
             let configs = build_fred_config(&iam_config(), None, Some(stub_iam_credentials()))
                 .expect("iam mode must build");
 
@@ -13240,8 +13814,8 @@ mod tests {
             );
             assert_eq!(
                 configs.pubsub.blocking, configs.shared.blocking,
-                "`Blocking::Interrupt` belongs to the subscriber_pool alone (b.9uq \
-                 round 4); the pub/sub client is multiplexed and must keep the default"
+                "the pub/sub client is multiplexed and must keep fred's default \
+                 `Blocking::Block`, as every client does (b.9sh)"
             );
             assert_eq!(
                 configs.pubsub.fail_fast, configs.shared.fail_fast,
@@ -17128,6 +17702,76 @@ mod tests {
                      answers Unavailable: {ran:?}"
                 );
             }
+        }
+    }
+
+    /// [`cut_at_command_timeout`], the cut every drop-spawned clean-up and
+    /// the join teardown's unregister run under (kl-retire F1, F2, F4): a
+    /// call still pending at the command timeout is dropped — the drop is
+    /// the give-up fred reads — and answers `None`; one that answers first
+    /// is returned; a zero timeout, fred's "no timeout", cuts nothing. Under
+    /// paused tokio time, so the cut lands at an exact instant.
+    mod cut_at_command_timeout_cuts {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        use super::*;
+
+        /// Records that the future holding it was dropped.
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_call_pending_at_the_command_timeout_is_cut_and_dropped() {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let flag = DropFlag(Arc::clone(&dropped));
+            let started = tokio::time::Instant::now();
+
+            let cut = cut_at_command_timeout(Duration::from_secs(5), async move {
+                let _flag = flag;
+                std::future::pending::<u32>().await
+            })
+            .await;
+
+            assert_eq!(cut, None, "a call still pending at T is cut");
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_secs(5),
+                "the cut lands at T exactly (paused time)"
+            );
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "the cut drops the call, so fred sees its caller give up"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_call_answering_before_the_command_timeout_is_returned() {
+            let answered = cut_at_command_timeout(Duration::from_secs(5), async {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                7u32
+            })
+            .await;
+            assert_eq!(answered, Some(7));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_zero_command_timeout_cuts_nothing() {
+            let answered = cut_at_command_timeout(Duration::ZERO, async {
+                tokio::time::sleep(Duration::from_secs(3_600)).await;
+                7u32
+            })
+            .await;
+            assert_eq!(
+                answered,
+                Some(7),
+                "a zero command timeout is fred's no-timeout: the call runs to its end"
+            );
         }
     }
 }

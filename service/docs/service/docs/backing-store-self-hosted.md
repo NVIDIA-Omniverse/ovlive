@@ -72,14 +72,14 @@ commonConfiguration: |-
   save ""
   maxmemory 3072mb
   maxmemory-policy noeviction
-  maxclients 20000
+  maxclients 12000
 ```
 
 - `maxmemory-policy noeviction` is required.
 - `maxmemory` must sit below the pod's memory limit, leaving about 20 % for persistence and replication buffers.
   Without it, the kernel's out-of-memory killer, not Valkey, decides what happens when memory runs out.
-- `maxclients 20000` covers a rollout at the chart's default `autoscaling.maxReplicas` of 10; Valkey's default of 10,000 does not.
-  Raise it if you raise `autoscaling.maxReplicas` ({ref}`Connections <live-edit-backing-store-connections>`).
+- `maxclients 12000` covers a rollout at the chart's defaults, on a single primary or a cluster; on a cluster Valkey's default of 10,000 does not.
+  If you change a connection pool or `autoscaling.maxReplicas`, check it as {ref}`Connections <live-edit-backing-store-connections>` shows.
 - `appendonly yes` with `appendfsync everysec` limits crash loss to about one second; `save ""` turns off RDB snapshots, which AOF replaces.
 
 (live-edit-backing-store-self-hosted-auth)=
@@ -166,7 +166,7 @@ commonConfiguration: |-
   save ""
   maxmemory 1500mb
   maxmemory-policy noeviction
-  maxclients 20000
+  maxclients 12000
 tls:
   enabled: true
   authClients: false
@@ -203,7 +203,7 @@ valkey:
   configmap: |-
     maxmemory 3072mb
     maxmemory-policy noeviction
-    maxclients 20000
+    maxclients 12000
   resources:
     requests: { cpu: "2", memory: 4Gi }
     limits:   { cpu: "2", memory: 6Gi }
@@ -247,7 +247,7 @@ From `valkey-cli` connected to each primary, run:
 
 ```bash
 CONFIG GET maxmemory-policy   # noeviction
-CONFIG GET maxclients         # 20000; Valkey lowers it if the open-file limit is too low
+CONFIG GET maxclients         # 12000; Valkey lowers it if the open-file limit is too low
 INFO persistence              # aof_enabled:1
 ```
 

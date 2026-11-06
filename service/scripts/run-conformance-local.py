@@ -16,6 +16,11 @@
 #
 """Exercise a production binary locally with the same unsigned test JWT as CI.
 
+Starts the service binary (two replicas with --replicas 2), then runs the
+conformance suite binary against it with `--profile deployment`, adding
+`--profile multi_replica` for two replicas. Build both first:
+`cargo build -p live-edit -p live-edit-conformance`.
+
 Uses TEST_VALKEY_URL and creates only suite-owned sessions. No flush/reset.
 """
 
@@ -38,7 +43,7 @@ def port():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", default="target/debug/live-edit")
-    parser.add_argument("--decoder", default="target/debug/examples/decode_ompf")
+    parser.add_argument("--suite", default="target/debug/live-edit-conformance")
     parser.add_argument("--report-dir")
     parser.add_argument("--replicas", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
@@ -77,7 +82,6 @@ def main():
             "CONFORMANCE_GRPC_ENDPOINT": f"http://127.0.0.1:{grpc_port}",
             "CONFORMANCE_AUTH_TOKEN_FILE": str(root / "conformance_tests/local-test-token.jwt"),
             "CONFORMANCE_BASE_PATH": "https://example.test/conformance/base.usda",
-            "CONFORMANCE_DECODER": str(Path(args.decoder).resolve()),
             "CONFORMANCE_REPORT_DIR": str(reports),
         }
     )
@@ -112,13 +116,7 @@ def main():
                 )
                 env["CONFORMANCE_PEER_ENDPOINT"] = f"http://127.0.0.1:{peer_port}"
             runner = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "live_edit_conformance.runner",
-                    "--profile",
-                    "deployment",
-                ]
+                [str(Path(args.suite).resolve()), "--profile", "deployment"]
                 + (["--profile", "multi_replica"] if args.replicas == 2 else []),
                 env=env,
             )
@@ -126,7 +124,12 @@ def main():
             while runner.poll() is None:
                 if any(process.poll() is not None for process in processes[:-1]):
                     runner.terminate()
-                    runner.wait(timeout=10)
+                    # 30 s covers the suite's whole stop allowance, with room
+                    # to spare: up to 10 s closing its case
+                    # (INTERRUPT_CLEANUP_BOUND), plus 10 s for the DELETE when
+                    # it provisions (this launcher never does), before it
+                    # writes its reports.
+                    runner.wait(timeout=30)
                     print((reports / "service.log").read_text(), file=sys.stderr)
                     return 2
                 time.sleep(0.1)

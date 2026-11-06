@@ -25,8 +25,8 @@ use crate::domain::types::{Field, FieldValue, ObjectState, Section, TimeSample};
 
 // ── DiffError ────────────────────────────────────────────────────────────────
 
-/// Errors produced by [`DiffEngine::plan`] when the section tree violates a
-/// hard invariant. All variants indicate malformed input (e.g. a section-tree
+/// Errors produced by the [`DiffEngine`] planners when the section tree
+/// violates a hard invariant. All variants indicate malformed input (e.g. a section-tree
 /// depth that would previously have blown the thread stack).
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DiffError {
@@ -41,39 +41,35 @@ pub enum DiffError {
 
 // ── DiffPlan ─────────────────────────────────────────────────────────────────
 
-/// The result of planning a diff for a subscriber.
+/// The result of planning a delta from layer state.
 ///
-/// Routing follows SDD §10.1:
-/// - Case 1: object_id mismatch or have_version == 0 → FullContent
-/// - Case 2: same object_id, have_version < current  → Incremental
-/// - Case 3: have_version >= current_version          → UpToDate
+/// - `FullContent`: the whole state, for a client holding nothing of this
+///   object ([`DiffEngine::plan_faithful_snapshot`]) or for the checkpoint
+///   base ([`DiffEngine::plan_full_content`]).
+/// - `Incremental`: what changed after a reconnector's `have_version`
+///   ([`DiffEngine::plan_faithful_coalesced`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum DiffPlan {
-    /// Subscriber is current — nothing to send (Case 3).
-    UpToDate,
-
-    /// Full content delivery: object_id mismatch or have_version=0 (Case 1).
+    /// Full content delivery.
     /// Sections are in DFS order over the children lists. From
     /// [`DiffEngine::plan_faithful_snapshot`]: reachable sections only, each
-    /// after its parent on any stored shape. From the legacy
-    /// `plan_full_content`: each after the section whose list names it, which
-    /// on a stale listing stored before b.xje is not its parent, with orphans
-    /// appended after the reachable sections.
+    /// after its parent on any stored shape. From
+    /// [`DiffEngine::plan_full_content`]: each after the section whose list
+    /// names it, which on a stale listing stored before b.xje is not its
+    /// parent, with orphans appended after the reachable sections.
     FullContent {
         sections: Vec<Section>,
         fields: Vec<Field>,
         time_samples: Vec<TimeSample>,
     },
 
-    /// Incremental diff: same object_id, subscriber is behind (Case 2).
+    /// Incremental diff: same object_id, subscriber is behind.
     Incremental {
         /// Sections with first_version > have_version, in DFS order.
         new_sections: Vec<Section>,
         /// Existing sections (`first_version <= have_version`) the subscriber
-        /// must re-apply. From the legacy `plan_incremental`: those with
-        /// `last_version > have_version`. From
-        /// [`DiffEngine::plan_faithful_coalesced`]: those, plus every other
-        /// listed child of a parent that has an emitted (new or changed)
+        /// must re-apply: those with `last_version > have_version`, plus every
+        /// other listed child of a parent that has an emitted (new or changed)
         /// child, so that parent's whole children sequence is restated.
         modified_sections: Vec<Section>,
         /// Tombstones for sections the subscriber knew about that were deleted since.
@@ -96,42 +92,8 @@ pub struct DiffEngine;
 type FaithfulWalk = (Vec<Section>, HashSet<u64>, HashMap<u64, u32>);
 
 impl DiffEngine {
-    /// Plan a diff for a subscriber who reports `(have_object_id, have_version)`.
-    ///
-    /// `tombstones` are `(section_id, first_version, last_version)` tuples loaded
-    /// from storage — they are not part of ObjectState because deleted sections
-    /// are no longer in the live section index.
-    ///
-    /// `upper_version` optionally bounds the diff window. `None` emits everything
-    /// newer than `have_version`. `Some(u)` filters to the half-open interval
-    /// `(have_version, u]` — any change with version > u is skipped. Used by the
-    /// per-commit replay path (`catch_up_in_window`'s per-commit reads) so
-    /// that the diff labelled for a given sequence_num doesn't accidentally
-    /// include content from sequences committed after it under a write burst.
-    pub fn plan(
-        state: &ObjectState,
-        tombstones: &[(u64, u64, u64)],
-        have_object_id: u64,
-        have_version: u64,
-        upper_version: Option<u64>,
-    ) -> Result<DiffPlan, DiffError> {
-        // Case 1: object_id mismatch or subscriber at version 0 → full content.
-        // FullContent ignores the upper bound — it's a cold-start delivery and
-        // the caller (Regime 1 / Regime 3) wants everything currently stored.
-        if have_object_id != state.object_id || have_version == 0 {
-            return Self::plan_full_content(state);
-        }
-
-        // Case 3: subscriber is up to date (or ahead — treat the same).
-        if have_version >= state.sequence_num {
-            return Ok(DiffPlan::UpToDate);
-        }
-
-        // Case 2: incremental diff.
-        Self::plan_incremental(state, tombstones, have_version, upper_version)
-    }
-
-    /// Case 1: emit everything in DFS order, orphans after reachable sections.
+    /// The checkpoint base's full content: emit everything in DFS order,
+    /// orphans after reachable sections.
     ///
     /// **Every one of the three emitted collections is a TOTAL order over the
     /// CONTENT of [`ObjectState`]** — not over any `HashMap`'s internal table
@@ -154,15 +116,12 @@ impl DiffEngine {
     /// **SORT ONLY — the cumulative `set_order` is preserved verbatim.** This
     /// path deliberately does NOT call
     /// [`dense_reindex_by_authoring`](Self::dense_reindex_by_authoring), which
-    /// overwrites `set_order` with the dense emit index. Two consumers depend on
-    /// the cumulative cursor surviving: the checkpoint assembler
-    /// (`build_reset_ompf_from_state` overwrites the slot with
-    /// `authoring_set_order` itself) and the legacy catch-up cold-start wire,
-    /// which emits the stored cursor.
+    /// overwrites `set_order` with the dense emit index: the checkpoint
+    /// assembler (`build_reset_ompf_from_state`) overwrites the slot with
+    /// `authoring_set_order` itself, from the field it is handed.
     ///
-    /// **Why the total order matters (SR-9.2).** Both consumers of this plan —
-    /// the checkpoint base assembly and `DiffEngine::plan`'s `have_version == 0`
-    /// cold-start branch — previously inherited `HashMap` iteration order, so the
+    /// **Why the total order matters (SR-9.2).** The checkpoint base assembly
+    /// previously inherited `HashMap` iteration order from this plan, so the
     /// same logical snapshot produced byte-divergent (occasionally
     /// different-LENGTH, via FlatBuffers vtable sharing) base OMPF blobs and a
     /// byte-divergent ext-refs sidecar across replicas. The sidecar's
@@ -173,13 +132,7 @@ impl DiffEngine {
     /// identical bytes ⇒ a re-base PUT at the same key is byte-idempotent, giving
     /// SR-9.2's cross-replica duplicate-leader argument a structural ground
     /// rather than a set-semantic one.
-    ///
-    /// **Scope fence.** [`plan_incremental`](Self::plan_incremental)'s
-    /// `modified_sections` / `changed_fields` / `changed_time_samples` stay
-    /// unsorted: it is not a checkpoint consumer, and reordering the legacy
-    /// incremental catch-up wire is a separate parity surface (deliberately left
-    /// alone by b.3pe).
-    fn plan_full_content(state: &ObjectState) -> Result<DiffPlan, DiffError> {
+    pub fn plan_full_content(state: &ObjectState) -> Result<DiffPlan, DiffError> {
         let sections = Self::sections_in_dfs_order(state)?;
 
         let mut fields: Vec<Field> = state.fields.values().cloned().collect();
@@ -192,102 +145,6 @@ impl DiffEngine {
             sections,
             fields,
             time_samples,
-        })
-    }
-
-    /// Case 2: filter by version, emit new sections in DFS order.
-    ///
-    /// When `upper_version` is `Some(u)`, every version-indexed filter also
-    /// caps at `u` so the diff reflects only commits in `(have_version, u]`.
-    /// `None` preserves the open-ended behavior — everything newer than
-    /// `have_version` is emitted.
-    ///
-    /// **Deliberately outside the b.gcb/b.vz7 determinism scope.**
-    /// `modified_sections` / `changed_fields` / `changed_time_samples` are
-    /// collected in `HashMap` iteration order and stay that way: this path is not
-    /// a checkpoint consumer, and reordering the legacy incremental catch-up wire
-    /// is a separate parity surface that b.3pe left alone. Only `new_sections`
-    /// gains determinism, transitively, because it filters
-    /// [`sections_in_dfs_order`](Self::sections_in_dfs_order)'s output.
-    fn plan_incremental(
-        state: &ObjectState,
-        tombstones: &[(u64, u64, u64)],
-        have_version: u64,
-        upper_version: Option<u64>,
-    ) -> Result<DiffPlan, DiffError> {
-        // Helper: `true` if `v` is within the upper bound (or unbounded).
-        let within_upper = |v: u64| upper_version.is_none_or(|u| v <= u);
-
-        // -- Sections (3 passes per SDD §10.1 Case 2) --
-
-        // Collect new section IDs for DFS-ordered emission.
-        // A section is "new to the subscriber" if first_version > have_version.
-        // Under an upper bound, also require the section to have been created
-        // at or before `u` — sections created in commits > u belong to a later
-        // per-commit diff, not this one.
-        let new_section_ids: HashSet<u64> = state
-            .sections
-            .values()
-            .filter(|s| s.first_version > have_version && within_upper(s.first_version))
-            .map(|s| s.section_id)
-            .collect();
-
-        // New sections in DFS order (parent-first per §10.3, except on a stale
-        // listing stored before b.xje; see `reachable_sections_in_dfs_order`).
-        let all_dfs = Self::sections_in_dfs_order(state)?;
-        let new_sections: Vec<Section> = all_dfs
-            .into_iter()
-            .filter(|s| new_section_ids.contains(&s.section_id))
-            .collect();
-
-        // Modified sections: existed before have_version but changed since.
-        // Under an upper bound, the latest modification must be at or before u
-        // — otherwise it belongs to a later per-commit diff.
-        let modified_sections: Vec<Section> = state
-            .sections
-            .values()
-            .filter(|s| {
-                s.first_version <= have_version
-                    && s.last_version > have_version
-                    && within_upper(s.last_version)
-            })
-            .cloned()
-            .collect();
-
-        // Deleted sections: tombstones the subscriber needs to know about.
-        // The subscriber knew the section (first_version <= have_version) and
-        // it was deleted after their version (last_version > have_version).
-        // Under an upper bound, the delete must have happened at or before u.
-        let deleted_sections: Vec<(u64, u64, u64)> = tombstones
-            .iter()
-            .filter(|(_, first_ver, last_ver)| {
-                *first_ver <= have_version && *last_ver > have_version && within_upper(*last_ver)
-            })
-            .copied()
-            .collect();
-
-        // -- Fields --
-        let changed_fields: Vec<Field> = state
-            .fields
-            .values()
-            .filter(|f| f.version > have_version && within_upper(f.version))
-            .cloned()
-            .collect();
-
-        // -- Time samples --
-        let changed_time_samples: Vec<TimeSample> = state
-            .time_samples
-            .values()
-            .filter(|ts| ts.version > have_version && within_upper(ts.version))
-            .cloned()
-            .collect();
-
-        Ok(DiffPlan::Incremental {
-            new_sections,
-            modified_sections,
-            deleted_sections,
-            changed_fields,
-            changed_time_samples,
         })
     }
 
@@ -426,12 +283,11 @@ impl DiffEngine {
 
     /// Build a faithful **coalesced incremental** diff for a reconnector — the
     /// corrected catch-up path for BOTH reconnect regimes (Plan b.msb, Task 2;
-    /// SDD §12.3 Regimes 2 & 3 / §12.9). Under the shipped default
-    /// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true` the in-window (Regime 2) and
+    /// SDD §12.3 Regimes 2 & 3 / §12.9). The in-window (Regime 2) and
     /// out-of-window (Regime 3) paths CONVERGE on this builder — the only
-    /// surviving distinction is the regime metric label (see the dispatch in
-    /// `src/grpc/subscribe.rs::catch_up_in_window`). `false` reverts Regime 2 to
-    /// legacy per-commit replay and Regime 3 to the legacy coalesced diff.
+    /// surviving distinction is the regime metric label (see
+    /// `src/grpc/subscribe.rs::catch_up_in_window` and
+    /// `catch_up_out_of_window`).
     ///
     /// The reconnector has, by definition, `0 < have_version < current_seq` on
     /// the SAME `object_id`, so its per-object sequence HAS advanced past 0. It
@@ -441,12 +297,11 @@ impl DiffEngine {
     /// sequence has advanced (SDD §12.3, §12.9; the Kit client's behaviour at
     /// the revision recorded in `docs-internal/cross-repo-debugging.md`).
     /// This builder therefore emits a `DiffPlan::Incremental` so the
-    /// storage layer keeps the exact client-accepted envelope today's legacy
-    /// coalesced diff uses (`is_diff = true`, `base_version = have_version`) —
-    /// it corrects the CONTENT inside that envelope, not the envelope.
+    /// storage layer keeps the client-accepted envelope (`is_diff = true`,
+    /// `base_version = have_version`) the removed legacy coalesced diff used —
+    /// it corrected the CONTENT inside that envelope, not the envelope.
     ///
-    /// Three corrections over the legacy version-diffing
-    /// [`plan_incremental`](Self::plan_incremental):
+    /// Three corrections over that removed legacy version-diffing planner:
     ///
     /// 0. **Real sibling `section_order`, restated per touched parent.** Every
     ///    emitted section (new and modified) carries its 0-based position
@@ -480,10 +335,10 @@ impl DiffEngine {
     ///    NEVER emitted as live content. `deleted_sections` is the UNIFIED ghost
     ///    set: it retracts (via `DiffDeleteSection`) every section the
     ///    reconnector could still hold (`first_version <= have_version`) that is
-    ///    no longer net-live — a SUPERSET of the legacy tombstone-only
+    ///    no longer net-live — a SUPERSET of the removed legacy tombstone-only
     ///    retraction, covering BOTH explicitly-deleted sections (tombstones, as
-    ///    the legacy path does) AND sections that dropped out of the reachable
-    ///    set during the trimmed window (which the legacy version-diff leaves as
+    ///    the legacy planner did) AND sections that dropped out of the reachable
+    ///    set during the trimmed window (which the legacy version-diff left as
     ///    stale ghosts). Sections first created AFTER `have_version` that are now
     ///    unreachable are simply DROPPED (the client never had them; nothing to
     ///    retract) — matching the from-empty builder's drop semantics.
@@ -496,8 +351,8 @@ impl DiffEngine {
     ///    the two builders are CONVERGED on this rule via that single
     ///    implementation; there is no divergence to preserve. The helper's doc
     ///    carries the full rationale. What is specific to THIS builder: emitting
-    ///    the stored cumulative `set_order` verbatim (which the legacy coalesced
-    ///    diff does) re-orders every multi-field commit collapsed into this
+    ///    the stored cumulative `set_order` verbatim (which the removed legacy
+    ///    coalesced diff did) re-orders every multi-field commit collapsed into this
     ///    window, because that cursor encodes WIRE-ARRIVAL order and the Kit
     ///    writer serializes a commit's fields out of a `std::unordered_map` —
     ///    hash-bucket order, uncorrelated with the writer's declared
@@ -514,8 +369,7 @@ impl DiffEngine {
     /// fresh `object_id` generation) is deliberately not implemented here. See
     /// the wiring site in `src/grpc/subscribe.rs`.
     ///
-    /// Kept DISTINCT from both `plan_incremental` (byte-stable for the legacy
-    /// path) and `plan_faithful_snapshot`; it shares the
+    /// Kept DISTINCT from `plan_faithful_snapshot`; it shares the
     /// [`faithful_walk`](Self::faithful_walk) and
     /// [`dense_reindex_by_authoring`](Self::dense_reindex_by_authoring) with
     /// the latter.
@@ -572,16 +426,15 @@ impl DiffEngine {
         // filters. Such an id can still be a new live section AND an arm-(a)
         // ghost in the same diff (SDD §9.2).
         //
-        //   (a) Tombstoned deletes — SAME filter the legacy `plan_incremental`
-        //       uses: the subscriber knew the section (first <= have_version)
+        //   (a) Tombstoned deletes: the subscriber knew the section (first <= have_version)
         //       and it was deleted after their version (last > have_version).
         //   (b) Abandoned / detached-to-unreachable prims — sections still in
         //       the live index but NOT reached by the faithful walk, that the
         //       reconnector could still hold (first_version <= have_version).
         //       That includes a section stored before b.xje that is listed only
         //       under a parent other than its own. Their version tuple is
-        //       sourced from the live section row. This is the arm the legacy
-        //       version-diff omits, leaving stale ghosts.
+        //       sourced from the live section row. This is the arm the removed
+        //       legacy version-diff omitted, leaving stale ghosts.
         let mut deleted_sections: Vec<(u64, u64, u64)> = tombstones
             .iter()
             .filter(|(_, first_ver, last_ver)| {
@@ -602,8 +455,7 @@ impl DiffEngine {
         // Valkey SET read, (b) from a `HashMap` — so the unified set is sorted
         // on `section_id` (unique across both arms, since the two are disjoint)
         // to make the emitted retraction sequence deterministic for identical
-        // state. Ordering only; no emitted value changes, and the byte-stable
-        // legacy `plan_incremental` is untouched.
+        // state. Ordering only; no emitted value changes.
         deleted_sections.sort_unstable();
 
         // Changed fields: newer than have_version AND anchored to a net-live
@@ -732,11 +584,10 @@ impl DiffEngine {
     /// [`reachable_sections_in_dfs_order`](Self::reachable_sections_in_dfs_order),
     /// whose order is parent-first except on a stale listing stored before
     /// b.xje (see that function). Sections not reachable from root are orphans
-    /// and are emitted after all reachable ones (SDD §10.4). Feeds only the
-    /// legacy [`plan_full_content`](Self::plan_full_content) and
-    /// [`plan_incremental`](Self::plan_incremental); the faithful builders
-    /// walk with [`faithful_walk`](Self::faithful_walk) instead and append no
-    /// orphans.
+    /// and are emitted after all reachable ones (SDD §10.4). Feeds only
+    /// [`plan_full_content`](Self::plan_full_content), the checkpoint base's
+    /// plan; the faithful builders walk with
+    /// [`faithful_walk`](Self::faithful_walk) instead and append no orphans.
     ///
     /// **The reachable DFS prefix is byte-for-byte identical to the prior
     /// single-function implementation. The orphan TAIL is not — it gained an
@@ -749,15 +600,6 @@ impl DiffEngine {
     /// only ADDS determinism: it replaces a sequence that had no defined order
     /// with one that does, and never reorders a sequence that was already
     /// deterministic.
-    ///
-    /// One transitive effect is in scope and intended:
-    /// [`plan_incremental`](Self::plan_incremental) filters this function's output
-    /// for its `new_sections`, so ITS orphaned-new sections become deterministic
-    /// too. That is the same add-only improvement, not a wire change — and it is
-    /// the ONLY determinism `plan_incremental` gains here; its own
-    /// `modified_sections` / `changed_fields` / `changed_time_samples` remain
-    /// unsorted by design (see [`plan_full_content`](Self::plan_full_content)'s
-    /// scope fence).
     fn sections_in_dfs_order(state: &ObjectState) -> Result<Vec<Section>, DiffError> {
         let (mut ordered, reachable_ids) = Self::reachable_sections_in_dfs_order(state)?;
 
@@ -780,11 +622,10 @@ impl DiffEngine {
     /// Walk the children lists from root, returning the reached sections in DFS
     /// order together with the set of their `section_id`s.
     ///
-    /// The legacy walk, used only by
+    /// The checkpoint base's walk, used only by
     /// [`sections_in_dfs_order`](Self::sections_in_dfs_order) (which appends
-    /// orphans on top of this result) for the legacy
-    /// [`plan_full_content`](Self::plan_full_content) /
-    /// [`plan_incremental`](Self::plan_incremental). This helper NEVER appends
+    /// orphans on top of this result) for
+    /// [`plan_full_content`](Self::plan_full_content). This helper NEVER appends
     /// orphans — the returned `Vec` and id set contain reached sections only.
     ///
     /// **Unchanged by design, stale listings included.** It descends through
@@ -792,8 +633,8 @@ impl DiffEngine {
     /// stored before b.xje (a child also or only listed under a parent other
     /// than its own) it can emit the child ahead of its real parent. It stays
     /// that way because its output is the checkpoint base's bytes, which two
-    /// leaders on different builds must write identically (SDD §22.20.2), and
-    /// the byte-stable rollback wire. The faithful builders use
+    /// leaders on different builds must write identically (SDD §22.20.2). The
+    /// faithful builders use
     /// [`faithful_walk`](Self::faithful_walk), which is parent-first on any
     /// stored shape.
     ///
@@ -861,10 +702,9 @@ impl DiffEngine {
     /// children.
     ///
     /// Used by [`plan_faithful_snapshot`](Self::plan_faithful_snapshot) and
-    /// [`plan_faithful_coalesced`](Self::plan_faithful_coalesced) only. The
-    /// legacy [`reachable_sections_in_dfs_order`](Self::reachable_sections_in_dfs_order)
-    /// stays as it is for the checkpoint base and the rollback wire (see that
-    /// function).
+    /// [`plan_faithful_coalesced`](Self::plan_faithful_coalesced) only.
+    /// [`reachable_sections_in_dfs_order`](Self::reachable_sections_in_dfs_order)
+    /// stays as it is for the checkpoint base (see that function).
     ///
     /// Starting from list `0`, for each parent `P` the walk reaches, it reads
     /// `P`'s children list in order. An entry `c` is a **true child** of `P`
@@ -895,7 +735,7 @@ impl DiffEngine {
     /// two faithful builders, and dropped with the call.
     ///
     /// Iterative, with the same [`MAX_SECTION_TREE_DEPTH`] cap and visited
-    /// guard as the legacy walk; a breach returns
+    /// guard as the checkpoint base's walk; a breach returns
     /// [`DiffError::SectionTreeTooDeep`].
     fn faithful_walk(state: &ObjectState) -> Result<FaithfulWalk, DiffError> {
         let mut visited: HashSet<u64> = HashSet::new();
@@ -1147,60 +987,7 @@ mod tests {
         sections.iter().map(|s| s.section_id).collect()
     }
 
-    // ── Case 3: Up to date ──────────────────────────────────────────────────
-
-    #[test]
-    fn plan_have_version_equals_sequence_num_returns_up_to_date() {
-        let state = ObjectState {
-            object_id: 1,
-            sequence_num: 5,
-            ..Default::default()
-        };
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
-        assert_eq!(result, DiffPlan::UpToDate);
-    }
-
-    #[test]
-    fn plan_have_version_greater_than_sequence_num_returns_up_to_date() {
-        let state = ObjectState {
-            object_id: 1,
-            sequence_num: 5,
-            ..Default::default()
-        };
-        let result = DiffEngine::plan(&state, &[], 1, 10, None).unwrap();
-        assert_eq!(result, DiffPlan::UpToDate);
-    }
-
-    // ── Case 1: Full content ────────────────────────────────────────────────
-
-    #[test]
-    fn plan_object_id_mismatch_returns_full_content() {
-        let state = ObjectState {
-            object_id: 42,
-            sequence_num: 5,
-            ..Default::default()
-        };
-        let result = DiffEngine::plan(&state, &[], 99, 3, None).unwrap();
-        assert!(
-            matches!(result, DiffPlan::FullContent { .. }),
-            "object_id mismatch must produce FullContent, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn plan_have_version_zero_returns_full_content() {
-        let state = ObjectState {
-            object_id: 1,
-            sequence_num: 5,
-            ..Default::default()
-        };
-        // Same object_id, but have_version=0 → still FullContent.
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
-        assert!(
-            matches!(result, DiffPlan::FullContent { .. }),
-            "have_version=0 must produce FullContent, got {result:?}"
-        );
-    }
+    // ── plan_full_content: the checkpoint base's lossy full content ─────────
 
     #[test]
     fn plan_full_content_empty_object_returns_empty_collections() {
@@ -1209,7 +996,7 @@ mod tests {
             sequence_num: 1,
             ..Default::default()
         };
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent {
                 sections,
@@ -1247,7 +1034,7 @@ mod tests {
         insert_section(&mut state, make_section(4, 1, 1, 5));
         insert_section(&mut state, make_section(5, 2, 1, 5));
 
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent { sections, .. } => {
                 let ids = section_ids(&sections);
@@ -1278,7 +1065,7 @@ mod tests {
         // Don't register 99 in children under 77 because 77 itself is not in sections;
         // the DFS from root won't reach it either way.
 
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent { sections, .. } => {
                 let ids = section_ids(&sections);
@@ -1307,7 +1094,7 @@ mod tests {
         insert_time_sample(&mut state, make_time_sample(1, 0.0, 1));
         insert_time_sample(&mut state, make_time_sample(1, 1.0, 4));
 
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent {
                 fields,
@@ -1321,10 +1108,16 @@ mod tests {
         }
     }
 
-    // ── Case 2: Incremental ─────────────────────────────────────────────────
+    // ── plan_faithful_coalesced: the have_version window ────────────────────
+    //
+    // Which sections, tombstones, fields and time samples a reconnector at
+    // `have_version` is sent: strictly newer content only, and a tombstone
+    // only for a section the reconnector could hold. The builder's own
+    // additions (restated siblings, ghost retraction, dense `set_order`) are
+    // pinned further down.
 
     #[test]
-    fn plan_incremental_new_sections_included() {
+    fn faithful_coalesced_includes_a_section_created_after_have_version_as_new() {
         let mut state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1333,7 +1126,7 @@ mod tests {
         // Section created at version 8 — after subscriber's version 5.
         insert_section(&mut state, make_section(1, 0, 8, 10));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 new_sections,
@@ -1349,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_modified_sections_included() {
+    fn faithful_coalesced_includes_a_section_changed_after_have_version_as_modified() {
         let mut state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1358,7 +1151,7 @@ mod tests {
         // Section existed before version 5 (first_version=2), modified after (last_version=7).
         insert_section(&mut state, make_section(1, 0, 2, 7));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 new_sections,
@@ -1377,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_unchanged_sections_excluded() {
+    fn faithful_coalesced_excludes_a_section_unchanged_since_have_version() {
         let mut state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1386,7 +1179,7 @@ mod tests {
         // Section untouched since before subscriber's version.
         insert_section(&mut state, make_section(1, 0, 1, 4));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 new_sections,
@@ -1404,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_deleted_sections_from_tombstones() {
+    fn faithful_coalesced_retracts_a_tombstone_known_at_have_version_and_deleted_after() {
         let state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1413,7 +1206,7 @@ mod tests {
         // Tombstone: section 50 existed before have_version (first=2), deleted after (last=7).
         let tombstones = vec![(50, 2, 7)];
 
-        let result = DiffEngine::plan(&state, &tombstones, 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &tombstones, 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 deleted_sections, ..
@@ -1426,7 +1219,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_tombstone_before_have_version_excluded() {
+    fn faithful_coalesced_excludes_a_tombstone_deleted_before_have_version() {
         let state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1435,7 +1228,7 @@ mod tests {
         // Tombstone: deleted before subscriber's version — they already know.
         let tombstones = vec![(50, 1, 3)];
 
-        let result = DiffEngine::plan(&state, &tombstones, 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &tombstones, 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 deleted_sections, ..
@@ -1450,17 +1243,18 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_tombstone_created_after_have_version_excluded() {
+    fn faithful_coalesced_excludes_a_tombstone_created_and_deleted_after_have_version() {
         let state = ObjectState {
             object_id: 1,
             sequence_num: 10,
             ..Default::default()
         };
-        // Tombstone: section created AND deleted after subscriber's version.
-        // Subscriber never knew about it → no need to tell them it was deleted.
+        // Tombstone: section created at 7 AND deleted at 9, both after the
+        // subscriber's version 5. The subscriber never knew it → no need to
+        // tell them it was deleted.
         let tombstones = vec![(50, 7, 9)];
 
-        let result = DiffEngine::plan(&state, &tombstones, 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &tombstones, 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 deleted_sections, ..
@@ -1475,7 +1269,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_changed_fields_included_unchanged_excluded() {
+    fn faithful_coalesced_includes_only_fields_changed_after_have_version() {
         let mut state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1487,7 +1281,7 @@ mod tests {
         // Field unchanged — version at or before subscriber's version.
         insert_field(&mut state, make_field(1, "size", 3));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental { changed_fields, .. } => {
                 assert_eq!(changed_fields.len(), 1, "only changed field included");
@@ -1498,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_changed_time_samples_included_unchanged_excluded() {
+    fn faithful_coalesced_includes_only_time_samples_changed_after_have_version() {
         let mut state = ObjectState {
             object_id: 1,
             sequence_num: 10,
@@ -1510,7 +1304,7 @@ mod tests {
         // Time sample unchanged.
         insert_time_sample(&mut state, make_time_sample(1, 1.0, 2));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 changed_time_samples,
@@ -1527,33 +1321,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn plan_incremental_section_created_and_deleted_in_same_range() {
-        // Section created at version 7, deleted at version 9. Subscriber is at version 5.
-        // The section is gone from ObjectState but the tombstone covers it.
-        // Because first_version > have_version, the subscriber never knew this section,
-        // so the tombstone should NOT be sent.
-        let state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        let tombstones = vec![(50, 7, 9)];
-
-        let result = DiffEngine::plan(&state, &tombstones, 1, 5, None).unwrap();
-        match result {
-            DiffPlan::Incremental {
-                deleted_sections, ..
-            } => {
-                assert!(
-                    deleted_sections.is_empty(),
-                    "section created+deleted after have_version should not produce a tombstone"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
     // ── Edge cases ──────────────────────────────────────────────────────────
 
     #[test]
@@ -1565,7 +1332,7 @@ mod tests {
         };
         insert_section(&mut state, make_section(1, 0, 1, 3));
 
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent { sections, .. } => {
                 assert_eq!(sections.len(), 1);
@@ -1590,7 +1357,7 @@ mod tests {
         state.sections.insert(90, orphan_a);
         state.sections.insert(91, orphan_b);
 
-        let result = DiffEngine::plan(&state, &[], 1, 0, None).unwrap();
+        let result = DiffEngine::plan_full_content(&state).unwrap();
         match result {
             DiffPlan::FullContent { sections, .. } => {
                 assert_eq!(sections.len(), 3, "1 reachable + 2 orphans");
@@ -1608,8 +1375,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_new_sections_in_dfs_order() {
-        // Verify that new sections emitted in incremental diff maintain DFS order.
+    fn faithful_coalesced_emits_new_sections_in_dfs_order() {
+        // Verify that new sections emitted in the coalesced diff keep DFS order.
         //   root(0)
         //     └── 1 (old, v1)
         //         ├── 2 (new, v7)
@@ -1625,13 +1392,15 @@ mod tests {
         insert_section(&mut state, make_section(3, 1, 7, 7));
         insert_section(&mut state, make_section(4, 2, 7, 7));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 new_sections,
                 modified_sections,
                 ..
             } => {
+                // Section 1 is untouched, and its own parent (the root)
+                // gained no new child, so nothing restates it.
                 assert!(modified_sections.is_empty());
                 let ids = section_ids(&new_sections);
                 assert_eq!(ids.len(), 3, "sections 2, 3, 4 are new");
@@ -1647,7 +1416,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_boundary_last_version_equals_have_version_excluded() {
+    fn faithful_coalesced_excludes_a_section_last_changed_at_have_version() {
         // last_version == have_version means the section has NOT changed since the
         // subscriber's version. It should be excluded from modified sections.
         let mut state = ObjectState {
@@ -1657,7 +1426,7 @@ mod tests {
         };
         insert_section(&mut state, make_section(1, 0, 2, 5));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 new_sections,
@@ -1675,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_field_at_have_version_excluded() {
+    fn faithful_coalesced_excludes_a_field_at_have_version() {
         // Field with version == have_version should be excluded (not strictly >).
         let mut state = ObjectState {
             object_id: 1,
@@ -1685,7 +1454,7 @@ mod tests {
         insert_section(&mut state, make_section(1, 0, 1, 1));
         insert_field(&mut state, make_field(1, "exact", 5));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental { changed_fields, .. } => {
                 assert!(
@@ -1698,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_incremental_time_sample_at_have_version_excluded() {
+    fn faithful_coalesced_excludes_a_time_sample_at_have_version() {
         // Time sample with version == have_version should be excluded.
         let mut state = ObjectState {
             object_id: 1,
@@ -1708,7 +1477,7 @@ mod tests {
         insert_section(&mut state, make_section(1, 0, 1, 1));
         insert_time_sample(&mut state, make_time_sample(1, 0.0, 5));
 
-        let result = DiffEngine::plan(&state, &[], 1, 5, None).unwrap();
+        let result = DiffEngine::plan_faithful_coalesced(&state, &[], 5).unwrap();
         match result {
             DiffPlan::Incremental {
                 changed_time_samples,
@@ -1717,154 +1486,6 @@ mod tests {
                 assert!(
                     changed_time_samples.is_empty(),
                     "time sample with version == have_version should be excluded"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
-    // ── upper_version bound tests ───────────────────────────────────────
-
-    #[test]
-    fn plan_incremental_upper_version_bounds_changed_fields() {
-        // have=1, upper=5, sequence_num=10. Fields at versions 2, 5, 7 should
-        // yield only versions 2 and 5 (in (have, upper]).
-        let mut state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        insert_section(&mut state, make_section(1, 0, 1, 10));
-        insert_field(&mut state, make_field(1, "a", 2));
-        insert_field(&mut state, make_field(1, "b", 5));
-        insert_field(&mut state, make_field(1, "c", 7));
-
-        let result = DiffEngine::plan(&state, &[], 1, 1, Some(5)).unwrap();
-        match result {
-            DiffPlan::Incremental { changed_fields, .. } => {
-                let versions: Vec<u64> = changed_fields.iter().map(|f| f.version).collect();
-                assert!(
-                    versions.contains(&2) && versions.contains(&5),
-                    "fields at versions 2 and 5 must be included, got {versions:?}"
-                );
-                assert!(
-                    !versions.contains(&7),
-                    "field at version 7 must be excluded by upper bound 5, got {versions:?}"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_incremental_upper_version_bounds_time_samples() {
-        let mut state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        insert_section(&mut state, make_section(1, 0, 1, 10));
-        insert_time_sample(&mut state, make_time_sample(1, 0.0, 3));
-        insert_time_sample(&mut state, make_time_sample(1, 1.0, 6));
-        insert_time_sample(&mut state, make_time_sample(1, 2.0, 8));
-
-        let result = DiffEngine::plan(&state, &[], 1, 2, Some(6)).unwrap();
-        match result {
-            DiffPlan::Incremental {
-                changed_time_samples,
-                ..
-            } => {
-                let versions: Vec<u64> = changed_time_samples.iter().map(|ts| ts.version).collect();
-                assert!(
-                    versions.contains(&3) && versions.contains(&6),
-                    "samples at versions 3 and 6 must be included, got {versions:?}"
-                );
-                assert!(
-                    !versions.contains(&8),
-                    "sample at version 8 must be excluded by upper bound, got {versions:?}"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_incremental_upper_version_bounds_new_sections() {
-        // Section 1 created at v2, section 2 created at v8. have=1, upper=5 →
-        // only section 1 emitted.
-        let mut state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        insert_section(&mut state, make_section(1, 0, 2, 2));
-        insert_section(&mut state, make_section(2, 0, 8, 8));
-
-        let result = DiffEngine::plan(&state, &[], 1, 1, Some(5)).unwrap();
-        match result {
-            DiffPlan::Incremental { new_sections, .. } => {
-                let ids: Vec<u64> = new_sections.iter().map(|s| s.section_id).collect();
-                assert!(
-                    ids.contains(&1),
-                    "section created at v2 must be emitted, got {ids:?}"
-                );
-                assert!(
-                    !ids.contains(&2),
-                    "section created at v8 must be excluded by upper 5, got {ids:?}"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_incremental_upper_version_bounds_deleted_sections() {
-        let state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        // tombstones: section 1 existed at v1, deleted at v4; section 2 existed at v1, deleted at v9.
-        let tombstones = vec![(1u64, 1u64, 4u64), (2u64, 1u64, 9u64)];
-
-        let result = DiffEngine::plan(&state, &tombstones, 1, 2, Some(5)).unwrap();
-        match result {
-            DiffPlan::Incremental {
-                deleted_sections, ..
-            } => {
-                let ids: Vec<u64> = deleted_sections.iter().map(|(sid, ..)| *sid).collect();
-                assert!(
-                    ids.contains(&1),
-                    "tombstone deleted at v4 must be in (have=2, upper=5], got {ids:?}"
-                );
-                assert!(
-                    !ids.contains(&2),
-                    "tombstone deleted at v9 must be excluded by upper=5, got {ids:?}"
-                );
-            }
-            other => panic!("expected Incremental, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn plan_incremental_upper_version_none_matches_original_behavior() {
-        // With upper_version=None, behavior must be identical to the old plan.
-        let mut state = ObjectState {
-            object_id: 1,
-            sequence_num: 10,
-            ..Default::default()
-        };
-        insert_section(&mut state, make_section(1, 0, 1, 10));
-        insert_field(&mut state, make_field(1, "a", 2));
-        insert_field(&mut state, make_field(1, "b", 9));
-
-        let result = DiffEngine::plan(&state, &[], 1, 1, None).unwrap();
-        match result {
-            DiffPlan::Incremental { changed_fields, .. } => {
-                let versions: Vec<u64> = changed_fields.iter().map(|f| f.version).collect();
-                assert!(
-                    versions.contains(&2) && versions.contains(&9),
-                    "None upper bound must include everything > have_version, got {versions:?}"
                 );
             }
             other => panic!("expected Incremental, got {other:?}"),
@@ -2138,25 +1759,11 @@ mod tests {
         assert_eq!(delta.set_fields[1].ext_value_index, 1);
     }
 
-    #[test]
-    fn build_diff_payload_up_to_date_returns_empty() {
-        use crate::storage::diff_read::build_diff_payload;
-
-        let plan = DiffPlan::UpToDate;
-        let scan = ExternalValueScan {
-            ordered_hashes: vec![],
-            hash_to_index: HashMap::new(),
-        };
-        let ompf_bytes = build_diff_payload(&plan, "usd", 5, &scan, &HashMap::new())
-            .expect("build_diff_payload should succeed in test");
-        assert!(ompf_bytes.is_empty());
-    }
-
     // ── C-4 regression: deep-chain stack-overflow protection ─────────────────
     //
     // Before b.55p, `sections_in_dfs_order` used a recursive walker. A linear
     // parent → child chain of ~10K–80K sections (trivially within the 100 MB
-    // layer cap) would blow the thread stack on `plan(…) → plan_full_content`.
+    // layer cap) would blow the thread stack in `plan_full_content`.
     // The iterative rewrite caps traversal at `MAX_SECTION_TREE_DEPTH` and
     // returns `DiffError::SectionTreeTooDeep` on breach instead of panicking.
     //
@@ -2268,7 +1875,8 @@ mod tests {
     /// `plan_faithful_snapshot`'s sections, or `plan_faithful_coalesced`'s
     /// new and modified sections at `have_version` 0 (every chain section is
     /// newer, so it is new). Both walk with `faithful_walk`, which has its
-    /// own depth check, separate from the legacy walk's.
+    /// own depth check, separate from the checkpoint base's walk
+    /// (`sections_in_dfs_order`).
     fn faithful_walk_sections(
         coalesced: bool,
         state: &ObjectState,
@@ -2285,7 +1893,6 @@ mod tests {
                 modified_sections,
                 ..
             } => Ok(new_sections.into_iter().chain(modified_sections).collect()),
-            other => panic!("a faithful builder planned {other:?}"),
         }
     }
 
@@ -3240,9 +2847,8 @@ mod tests {
 
     // ── b.gcb / b.vz7: plan_full_content deterministic emission ──────────────
     //
-    // `plan_full_content` is the SHARED emitter behind the checkpoint base
-    // assembly (`build_reset_ompf_from_state`) and the legacy catch-up
-    // cold-start branch (`DiffEngine::plan` with `have_version == 0`). All three
+    // `plan_full_content` is the emitter behind the checkpoint base assembly
+    // (`build_reset_ompf_from_state`). All three
     // of its emitted vectors used to inherit `HashMap` iteration order, so the
     // same logical snapshot produced byte-divergent base OMPF blobs (and a
     // byte-divergent ext-refs sidecar) across replicas — the SR-9.2
@@ -3392,10 +2998,8 @@ mod tests {
             state
         };
 
-        // `have_object_id = 0` mismatches `state.object_id = 1` AND
-        // `have_version = 0` — the cold-start route into `plan_full_content`.
-        let plan_a = DiffEngine::plan(&build(false), &[], 0, 0, None).unwrap();
-        let plan_b = DiffEngine::plan(&build(true), &[], 0, 0, None).unwrap();
+        let plan_a = DiffEngine::plan_full_content(&build(false)).unwrap();
+        let plan_b = DiffEngine::plan_full_content(&build(true)).unwrap();
         assert_eq!(
             plan_a, plan_b,
             "plan_full_content must emit an identical plan — including the VECTOR ORDER of \
@@ -3407,8 +3011,8 @@ mod tests {
         // interior mutability or clock/randomness leaks into the plan).
         let state = build(false);
         assert_eq!(
-            DiffEngine::plan(&state, &[], 0, 0, None).unwrap(),
-            DiffEngine::plan(&state, &[], 0, 0, None).unwrap(),
+            DiffEngine::plan_full_content(&state).unwrap(),
+            DiffEngine::plan_full_content(&state).unwrap(),
             "two calls on one state must agree"
         );
 
@@ -3454,8 +3058,8 @@ mod tests {
         // (2) SORT ONLY — engineer seam E-3 and the Task's 2026-09-01 amendment:
         // `plan_full_content` reorders fields but PRESERVES each field's
         // cumulative `set_order` verbatim. It must not have grown a
-        // `dense_reindex_by_authoring` call, which would rewrite the legacy
-        // catch-up cold-start wire's `set_order` to the dense emit index.
+        // `dense_reindex_by_authoring` call, which would rewrite each field's
+        // `set_order` to the dense emit index: the plan stays lossy.
         for f in &fields {
             let stored = &state.fields[&(f.section_id, f.key_name.clone())];
             assert_eq!(
@@ -3605,8 +3209,8 @@ mod tests {
             state
         };
 
-        let plan_a = DiffEngine::plan(&build(false), &[], 0, 0, None).unwrap();
-        let plan_b = DiffEngine::plan(&build(true), &[], 0, 0, None).unwrap();
+        let plan_a = DiffEngine::plan_full_content(&build(false)).unwrap();
+        let plan_b = DiffEngine::plan_full_content(&build(true)).unwrap();
 
         let unwrap = |plan: DiffPlan| match plan {
             DiffPlan::FullContent {

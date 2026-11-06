@@ -60,7 +60,7 @@ use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
 
 use crate::storage::snapshot_read_support::{
-    assert_atomic_equals_reference, monitor_fence, read_atomic, MonitorTap,
+    assert_atomic_equals_reference, monitor_fence, read_atomic, MonitorTap, MonitoredCommand,
 };
 
 /// Upper bound on layers created while looking for one per primary. With
@@ -69,7 +69,7 @@ use crate::storage::snapshot_read_support::{
 const MAX_LAYERS_PER_SEARCH: usize = 200;
 
 async fn cluster() -> Option<TestValkey> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run this"
@@ -302,12 +302,77 @@ fn is_window_script_run(
         && command.args.get(3).map(String::as_str) == Some(header_key)
 }
 
+/// Check the window scripts of the read of the object whose header is
+/// `header_key` in the `MONITOR` record `seen`: at least one was sent, every
+/// send ([`is_window_script_run`]) is either followed by the script's reads
+/// or sent again later, and every read after any send names a key under
+/// `tag`. `Err` says what failed.
+///
+/// A window is identified by its `EVALSHA`'s arguments, as
+/// `snapshot_read_unfenced_test`'s `window_scripts_sent` counts them, and a
+/// window's last send has no later one, so every window the read sent ran
+/// with its reads in the record. A send with no reads is allowed only where
+/// the same window is sent again: a window script's first `EVALSHA` on a node
+/// that does not hold the script yet (a fresh cluster, or a concurrent
+/// `SCRIPT FLUSH`) is answered `NOSCRIPT`, and
+/// `storage::lua::evalsha_reload_rebuilding` loads the script and sends the
+/// window once more with the same arguments. The record then shows the
+/// refused send, a `SCRIPT LOAD` and no reads, then the same window with its
+/// reads. A check that every send is followed by reads fails on that record,
+/// so it failed the first try of a run on a cluster without the script loaded
+/// and passed the retry.
+fn check_window_script_runs(
+    seen: &[MonitoredCommand],
+    header_key: &str,
+    tag: &str,
+) -> Result<(), String> {
+    let runs: Vec<usize> = seen
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| is_window_script_run(c, header_key))
+        .map(|(i, _)| i)
+        .collect();
+    if runs.is_empty() {
+        return Err(format!(
+            "the MONITOR record holds no window script of the read for {header_key}"
+        ));
+    }
+    for (nth, &run) in runs.iter().enumerate() {
+        let window = &seen[run].args;
+        let reads: Vec<_> = seen[run + 1..]
+            .iter()
+            .take_while(|c| c.issued_by_script())
+            .collect();
+        for c in &reads {
+            let key = c.args.get(1).map(String::as_str).unwrap_or_default();
+            if !key.starts_with(tag) {
+                return Err(format!(
+                    "every key a window script touches must carry the object's hash tag \
+                     ({tag}…); it touched {key:?} with {c:?}"
+                ));
+            }
+        }
+        let sent_again = runs[nth + 1..]
+            .iter()
+            .any(|&later| &seen[later].args == window);
+        if reads.is_empty() && !sent_again {
+            return Err(format!(
+                "each window script's reads must be in the record: the send of {window:?} has \
+                 no reads after it, and that window is not sent again (only a send refused \
+                 NOSCRIPT, then sent again, may have none)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// For every primary, an object whose `{oid}` slot it serves: the
 /// structural read through its window scripts returns the atomic read's
 /// compact projection on each shard (so the shard accepted the script's
 /// undeclared same-slot reads), and the `MONITOR` record of that primary
-/// shows at least one window script naming the object's header and every
-/// key each window script touched carrying the object's tag.
+/// shows every window the read sent running with its reads in the record,
+/// each key they touched carrying the object's tag
+/// ([`check_window_script_runs`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn structural_read_window_scripts_answer_for_an_object_on_every_shard() {
     use live_edit::storage::diff_read::{
@@ -379,39 +444,127 @@ async fn structural_read_window_scripts_answer_for_an_object_on_every_shard() {
                 other.map(|_| ())
             ),
         }
-        let runs: Vec<usize> = seen
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| is_window_script_run(c, &header_key))
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            !runs.is_empty(),
-            "{shard}: the MONITOR record holds the read's window scripts for {header_key}"
-        );
-        for run in runs {
-            let script: Vec<_> = seen[run + 1..]
-                .iter()
-                .take_while(|c| c.issued_by_script())
-                .collect();
-            assert!(
-                !script.is_empty(),
-                "{shard}: each window script's reads must be in the record"
-            );
-            for c in script {
-                let key = c.args.get(1).map(String::as_str).unwrap_or_default();
-                assert!(
-                    key.starts_with(&tag),
-                    "{shard}: every key a window script touches must carry the object's hash \
-                     tag ({tag}…); it touched {key:?} with {c:?}"
-                );
-            }
+        if let Err(finding) = check_window_script_runs(&seen, &header_key, &tag) {
+            panic!("{shard}: {finding}");
         }
     }
 
     println!(
         "CLUSTER-GATED RAN: storage::snapshot_read_cluster_test::structural_read_window_scripts_answer_for_an_object_on_every_shard shards={}",
         per_shard.len()
+    );
+}
+
+// ── `check_window_script_runs` over synthetic records (no cluster needed) ──
+
+/// The object the synthetic records read: id 7 under the prefix `test_p:`.
+const SYNTHETIC_OID: &str = "7";
+
+fn synthetic_keys() -> KeySchema {
+    KeySchema::new("test_p:")
+}
+
+/// The tag every key of [`SYNTHETIC_OID`] carries, as the cluster test builds
+/// it.
+fn synthetic_tag() -> String {
+    format!("test_p:{{{SYNTHETIC_OID}}}:obj:")
+}
+
+/// A record line from a client.
+fn from_client(args: &[&str]) -> MonitoredCommand {
+    MonitoredCommand {
+        client: "127.0.0.1:50000".to_owned(),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    }
+}
+
+/// A record line issued by a script.
+fn from_script(args: &[&str]) -> MonitoredCommand {
+    MonitoredCommand {
+        client: "lua".to_owned(),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+    }
+}
+
+/// A send of the window script for [`SYNTHETIC_OID`]; `window` stands for
+/// the arguments that tell one window from another.
+fn window_send(window: &str) -> MonitoredCommand {
+    let sha: &str = live_edit::storage::lua::FANOUT_WINDOW_READ_SCRIPT.sha1();
+    let header = synthetic_keys().obj_header(SYNTHETIC_OID);
+    from_client(&["EVALSHA", sha, "1", &header, window])
+}
+
+/// One read the window script issues, of a key of [`SYNTHETIC_OID`].
+fn tagged_read() -> MonitoredCommand {
+    from_script(&[
+        "SMEMBERS",
+        &synthetic_keys().obj_sections_index(SYNTHETIC_OID),
+    ])
+}
+
+fn check(seen: &[MonitoredCommand]) -> Result<(), String> {
+    check_window_script_runs(
+        seen,
+        &synthetic_keys().obj_header(SYNTHETIC_OID),
+        &synthetic_tag(),
+    )
+}
+
+/// A window whose first send was refused `NOSCRIPT` (no reads, then the
+/// script's `SCRIPT LOAD`) and that was sent again with its reads passes:
+/// the record a fresh cluster leaves.
+#[test]
+fn window_script_check_passes_a_window_sent_again_after_noscript() {
+    assert_eq!(
+        synthetic_keys().obj_header(SYNTHETIC_OID),
+        format!("{}hdr", synthetic_tag()),
+        "fixture: the header key carries the tag the reads are checked against"
+    );
+    let seen = [
+        window_send("window-a"),
+        from_client(&["SCRIPT", "LOAD", "<fanout_window_read.lua>"]),
+        window_send("window-a"),
+        tagged_read(),
+        tagged_read(),
+        window_send("window-b"),
+        tagged_read(),
+    ];
+
+    assert_eq!(check(&seen), Ok(()));
+}
+
+/// A window whose only send has no reads after it fails, even beside another
+/// window that ran with its reads.
+#[test]
+fn window_script_check_fails_a_window_whose_only_send_has_no_reads() {
+    let seen = [
+        window_send("window-a"),
+        tagged_read(),
+        window_send("window-b"),
+        from_client(&["EXISTS", "test_p:{7}:monitor-fence"]),
+    ];
+
+    let finding = check(&seen).expect_err("window-b never ran");
+    assert!(
+        finding.contains("each window script's reads must be in the record")
+            && finding.contains("window-b"),
+        "the finding names the window that never ran; got {finding:?}"
+    );
+}
+
+/// A read of a key without the object's tag after a send fails.
+#[test]
+fn window_script_check_fails_a_read_without_the_objects_tag() {
+    let seen = [
+        window_send("window-a"),
+        tagged_read(),
+        from_script(&["SMEMBERS", &synthetic_keys().obj_sections_index("8")]),
+    ];
+
+    let finding = check(&seen).expect_err("the second read is of another object");
+    assert!(
+        finding.contains("must carry the object's hash tag") && finding.contains("{8}"),
+        "the finding names the untagged key; got {finding:?}"
     );
 }
 

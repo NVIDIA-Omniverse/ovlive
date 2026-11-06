@@ -387,7 +387,7 @@ async fn slot_migration_disruptive_multi_key_commits_meet_the_real_tryagain_and_
     use crate::common::owned_delta::delta_with_diff_change_section;
     use crate::storage::cluster_subscriber_test::SlotMigration;
 
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster-disruptive:` job \

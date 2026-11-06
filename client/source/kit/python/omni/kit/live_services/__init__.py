@@ -15,6 +15,13 @@ from ._bootstrap import load_api
 # outlives those modules, so a second start fails before any import.
 _STARTED = "_omni_kit_live_services_started"
 
+# How long on_shutdown waits for a started host to stop its threads, which can't happen in zero time. close answers
+# BUSY at once, without waiting, while live layers, session catalogues or session roots are attached: that work is the
+# application's to preserve before it disables the extension. Joined sessions are left, and in-flight requests
+# drained, within the budget, so a stalled leave can hold the main thread for all of it. Kit's own Live Session
+# shutdown (omni.kit.usd.layers) calls close_host(5000) before this hook runs; keep the two budgets equal.
+_SHUTDOWN_TIMEOUT_MS = 5000
+
 
 def get_host():
     """Return the retained owner, including incomplete startup/shutdown owners."""
@@ -59,7 +66,7 @@ class Extension(omni.ext.IExt):
         owner = getattr(self, "_owner", None)
         if owner is None or owner is not get_host():
             return  # Failed startup must never close another instance's owner.
-        result = close_host(0)
+        result = close_host(_SHUTDOWN_TIMEOUT_MS)
         if result != 0:
             carb.log_error("Live Services shutdown incomplete: " + result.name +
                            ". Preserve pending work and finish close_host before disabling the extension.")

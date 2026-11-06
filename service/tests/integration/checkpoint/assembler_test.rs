@@ -132,6 +132,9 @@ fn expect_written(decision: AssemblyDecision) -> AssemblerOutcome {
         AssemblyDecision::LeaseLost => {
             panic!("assembler was handed a keeper that never loses its lease; got LeaseLost")
         }
+        AssemblyDecision::DeferredCleanup => {
+            panic!("the clean-up fence deferred the PUT, but no clean-up runs in this fixture")
+        }
         AssemblyDecision::ShuttingDown => {
             panic!("assembler was handed a keeper that never shuts down; got ShuttingDown")
         }
@@ -1764,6 +1767,23 @@ async fn fence_readers(tv: &TestValkey, object_id: u64) -> Vec<String> {
     fields.into_keys().filter(|k| k.starts_with("r:")).collect()
 }
 
+/// The store's clock (`TIME`), in milliseconds, read through `client`. Takes a
+/// client rather than the `TestValkey` (as the in-crate twin in
+/// `lease_tests` does) because a keeper here holds only a client clone.
+async fn store_now_ms(client: &live_edit::storage::client::ValkeyClient) -> i64 {
+    use fred::interfaces::LuaInterface;
+    client
+        .pool
+        .eval(
+            "local t = redis.call('TIME') \
+             return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)",
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+        )
+        .await
+        .expect("the store clock must be readable")
+}
+
 /// Whether `object_id`'s snapshot fence key exists at all.
 #[cfg(feature = "test-fault-injection")]
 async fn fence_key_exists(tv: &TestValkey, object_id: u64) -> bool {
@@ -1907,8 +1927,6 @@ async fn assembler_fenced_read_broken_on_every_attempt_is_transient_and_persists
 /// checkpoint takes no capacity, so nothing else bounds the wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assembler_fenced_read_refuses_a_fence_wait_past_reader_wait_max_as_transient() {
-    use fred::interfaces::LuaInterface;
-
     /// How far past the store's clock the staged gap ends.
     const FAR_MS: i64 = 600_000;
 
@@ -1916,17 +1934,7 @@ async fn assembler_fenced_read_refuses_a_fence_wait_past_reader_wait_max_as_tran
     let oid = fenced_layer(&tv, "fenced-wait-cap").await;
     let fenced = fenced_path_client().await;
 
-    let now_ms: i64 = tv
-        .client()
-        .pool
-        .eval(
-            "local t = redis.call('TIME') \
-             return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)",
-            Vec::<String>::new(),
-            Vec::<String>::new(),
-        )
-        .await
-        .expect("the store clock must be readable");
+    let now_ms = store_now_ms(tv.client()).await;
     let fence_key = tv.key_schema().obj_snapshot_fence(&oid.to_string());
     let _: () = tv
         .client()
@@ -1989,6 +1997,76 @@ async fn assembler_fenced_read_refuses_a_fence_wait_past_reader_wait_max_as_tran
 #[cfg(feature = "test-fault-injection")]
 const TIMING_EVENT_MSG: &str = "layer checkpoint timing";
 
+/// A layer size whose fence lease outlasts nextest's 120 s kill: the size
+/// [`stage_fence_lease_for_whole_test`] stages. At this size `hold(L)` is
+/// about 2,658.5 s, so `lease(L) = hold(L)/4` is about 664.6 s and its
+/// renewal period about 166 s: no renewal of the lease falls due before the
+/// kill. Bytes are the items at the fitted 16.1 B per item
+/// (`snapshot_fence::cost::FITTED_BYTES_PER_ITEM`).
+#[cfg(feature = "test-fault-injection")]
+const WHOLE_TEST_FENCE_SIZE: live_edit::storage::snapshot_fence::LayerSize =
+    live_edit::storage::snapshot_fence::LayerSize {
+        items: 700_000_000,
+        bytes: 11_270_000_000,
+    };
+
+/// The least fence lease [`stage_fence_lease_for_whole_test`] accepts: past
+/// nextest's 120 s kill (`.config/nextest.toml`, 40 s × 3).
+#[cfg(feature = "test-fault-injection")]
+const FAR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Take a fenced read's own fence lease off the test's path (test-writing
+/// guide § Synchronization Patterns, rule (b)): stage
+/// [`WHOLE_TEST_FENCE_SIZE`] as `object_id`'s stored fence size, which the
+/// acquire uses in place of the reader's estimate, so the lease the read is
+/// granted lasts past nextest's kill and no renewal has to land while a test
+/// holds its window open. Call it before the read's acquire.
+///
+/// Asserts, from `reader`'s own fence coefficients, that the staged size gives
+/// a lease of at least [`FAR_DEADLINE`]. The key is given the same expiry, so
+/// it is still there when the read acquires; the grant then sets the key's
+/// expiry itself.
+///
+/// Valid only where a larger staged size lengthens, never shrinks, anything
+/// the reader derives from it: the checkpoint's fenced read takes no capacity,
+/// and its only derived wait cap, `reader_wait_max(L)`, only lengthens. The
+/// in-crate twin is `lease_tests::stage_fence_lease_for_whole_test`
+/// (`src/checkpoint/checkpointer.rs`).
+#[cfg(feature = "test-fault-injection")]
+async fn stage_fence_lease_for_whole_test(
+    tv: &TestValkey,
+    reader: &live_edit::storage::client::ValkeyClient,
+    object_id: u64,
+) {
+    let lease_ms = live_edit::storage::snapshot_fence::coefficients(reader)
+        .timing(WHOLE_TEST_FENCE_SIZE)
+        .lease_ms;
+    assert!(
+        lease_ms >= FAR_DEADLINE.as_millis() as f64,
+        "fixture: the staged fence size must give a lease ({lease_ms} ms) of at least \
+         {FAR_DEADLINE:?}, past nextest's 120 s kill"
+    );
+    let fence_key = tv.key_schema().obj_snapshot_fence(&object_id.to_string());
+    let _: () = tv
+        .client()
+        .pool
+        .hset(
+            &fence_key,
+            [
+                ("size_e", WHOLE_TEST_FENCE_SIZE.items.to_string()),
+                ("size_b", WHOLE_TEST_FENCE_SIZE.bytes.to_string()),
+            ],
+        )
+        .await
+        .expect("staging the fence size must succeed");
+    let _: i64 = tv
+        .client()
+        .pool
+        .pexpire(&fence_key, FAR_DEADLINE.as_millis() as i64, None)
+        .await
+        .expect("staging the fence key's expiry must succeed");
+}
+
 /// Run one assembly of a fenced layer whose keeper stops it with `stop` once
 /// the read is inside its held-back first fan-out window, under its fence:
 /// the fence lease granted (a reader field on the fence key) and the
@@ -1997,11 +2075,20 @@ const TIMING_EVENT_MSG: &str = "layer checkpoint timing";
 /// alone would race the fan-out's start, and a keeper that fired before it
 /// would end the read before the fan-out began.
 ///
-/// Asserts what every stop shares: the assembly decides (no error) within
-/// half the held-back window, the window was reached, nothing is persisted,
-/// the dropped read's fence lease is released (its reader field gone — only
-/// the drop can have released it in time), and the assembly's one
-/// `layer checkpoint timing` event carries `outcome`. Returns the decision.
+/// The delay seam is one-shot, so the read's own fence lease is staged past
+/// nextest's kill first ([`stage_fence_lease_for_whole_test`]): no fence
+/// renewal has to land while the window is held back, so a starved renewal
+/// cannot break the held attempt and leave an unheld retry to finish before
+/// the keeper fires.
+///
+/// Asserts what every stop shares: the read's fence lease, read as the keeper
+/// fires, outlasts the held-back window by the store's clock; the assembly
+/// decides (no error) within half the held-back window; the window was
+/// reached; nothing is persisted; the dropped read's fence lease is released
+/// (its reader field gone — neither the held-back window nor the staged lease
+/// could have ended in time, so only the drop can have released it); and the
+/// assembly's one `layer checkpoint timing` event carries `outcome`. Returns
+/// the decision.
 #[cfg(feature = "test-fault-injection")]
 async fn stopped_mid_fenced_read(
     label: &str,
@@ -2014,17 +2101,24 @@ async fn stopped_mid_fenced_read(
     };
 
     /// How long the read's first window is held back: far past this test's
-    /// whole budget, so only a dropped read can release the fence in time.
+    /// whole budget, so with the read's own fence lease staged past it too
+    /// ([`stage_fence_lease_for_whole_test`]), only a dropped read can release
+    /// the fence in time.
     const HELD_BACK: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Stops the read with `stop` once it is inside its held-back fan-out
     /// window: the injector's delay has been taken, and `object_id`'s fence
-    /// shows a live reader.
+    /// shows a live reader. Records, as it fires, how long that reader's
+    /// lease has left by the store's clock.
     struct StopInsideTheHeldBackWindow {
         tv_client: live_edit::storage::client::ValkeyClient,
         fence_key: String,
         injector: Arc<ObjectSnapshotReadFaultInjector>,
         stop: KeeperStop,
+        /// The live readers' lease deadlines minus the store's `TIME`, in ms,
+        /// read once the window is reached (fields before the clock, so never
+        /// more than a lease really has left).
+        lease_left_ms: Vec<i64>,
     }
 
     #[async_trait::async_trait]
@@ -2040,6 +2134,19 @@ async fn stopped_mid_fenced_read(
                 if self.injector.delays_remaining() == 0
                     && fields.keys().any(|k| k.starts_with("r:"))
                 {
+                    let now_ms = store_now_ms(&self.tv_client).await;
+                    self.lease_left_ms = fields
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("r:"))
+                        .map(|(name, value)| {
+                            value.parse::<i64>().unwrap_or_else(|_| {
+                                panic!(
+                                    "fence reader field {name} must hold a deadline in ms; got \
+                                     {value:?}"
+                                )
+                            }) - now_ms
+                        })
+                        .collect();
                     return self.stop;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -2050,6 +2157,7 @@ async fn stopped_mid_fenced_read(
     let tv = TestValkey::setup().await;
     let oid = fenced_layer(&tv, label).await;
     let fenced = fenced_path_client().await;
+    stage_fence_lease_for_whole_test(&tv, &fenced, oid).await;
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
     injector.push_delay_at(ObjectSnapshotReadFaultTarget::next_read(), HELD_BACK);
     fenced.install_object_snapshot_read_fault_injector_for_test(Arc::clone(&injector));
@@ -2058,6 +2166,7 @@ async fn stopped_mid_fenced_read(
         fence_key: tv.key_schema().obj_snapshot_fence(&oid.to_string()),
         injector: Arc::clone(&injector),
         stop,
+        lease_left_ms: Vec::new(),
     };
 
     let store = InMemoryCheckpointStore::new();
@@ -2083,6 +2192,18 @@ async fn stopped_mid_fenced_read(
         "fixture: the held-back window was reached (the keeper fires only once it is), so the \
          read really was under its fence"
     );
+    assert_eq!(
+        keeper.lease_left_ms.len(),
+        1,
+        "fixture: the held read was the fence's one reader as the keeper fired"
+    );
+    assert!(
+        keeper.lease_left_ms[0] >= HELD_BACK.as_millis() as i64,
+        "the held read's own fence lease must outlast the {HELD_BACK:?} held-back window by the \
+         store's clock, so no fence renewal has to land while the window is held \
+         (stage_fence_lease_for_whole_test, rule (b)); it had {} ms left",
+        keeper.lease_left_ms[0]
+    );
     assert!(
         store
             .list_layer_checkpoints(oid)
@@ -2094,7 +2215,8 @@ async fn stopped_mid_fenced_read(
     assert!(
         fence_released_within_budget(&tv, oid).await,
         "the dropped read's fence lease must be released (its reader field gone) — the held-back \
-         window had {HELD_BACK:?} to run, so only the drop can have released it; still live: {:?}",
+         window had {HELD_BACK:?} to run and the staged lease longer still, so only the drop can \
+         have released it; still live: {:?}",
         fence_readers(&tv, oid).await
     );
     let timing = captured.only(TIMING_EVENT_MSG);

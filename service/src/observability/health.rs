@@ -37,8 +37,9 @@
 //!
 //! Post-b.3z7 H-obs-2, the readiness status is no longer pinned to
 //! `SERVING` at startup; a supervised background task periodically pings
-//! Valkey (plus the service-identity token, counter-seed startup gate, and
-//! full-API-server startup gate, when wired) and flips the readiness status
+//! Valkey (plus the service-identity token, counter-seed startup gate,
+//! full-API-server startup gate, and stale disaster-recovery hold verdict,
+//! when wired) and flips the readiness status
 //! to `NOT_SERVING` whenever a
 //! dependency becomes unreachable, then back to `SERVING` once it
 //! recovers. During an outage, Kubernetes routes
@@ -128,8 +129,8 @@ pub fn health_service_from_reporter(reporter: &HealthReporter) -> HealthServer<H
 /// Configuration for the health supervisor.
 ///
 /// Readiness is gated on Valkey (hard, one-strike) plus the optional
-/// service-identity token provider, counter-seed startup gate, and
-/// full-API-server startup gate. Auth
+/// service-identity token provider, counter-seed startup gate,
+/// full-API-server startup gate, and stale hold verdict. Auth
 /// backends are deliberately NOT probed for readiness — gating readiness
 /// on a shared downstream would flip the entire replica fleet to
 /// `NOT_SERVING` at once on a correlated auth-backend outage (b.9f4,
@@ -203,6 +204,20 @@ pub struct HealthSupervisorConfig {
     /// readiness flip lands on the transition rather than up to one
     /// `probe_interval` after it.
     pub api_serving: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Whether this replica's disaster-recovery hold verdict is stale (SDD
+    /// SR-5.4, SR-6.5): `true` while it has had no successful hold read for
+    /// the stale threshold, held or serving. The hold reactor publishes it
+    /// (`grpc::hold::HoldReactorSettings::verdict_stale`). Readiness is
+    /// `NOT_SERVING` while it is `true`: a replica that has lost the store's
+    /// counter shard, with a Valkey `PING` that may still pass (one dead
+    /// client among several), must leave the load balancer. A fleet hold
+    /// alone never sets it, so readiness stays `SERVING` while held (P1).
+    ///
+    /// Hard signal — no smoothing, same posture as `api_serving`, and the
+    /// supervisor also wakes on its `changed()`, so the flip lands when the
+    /// verdict goes stale rather than up to one `probe_interval` later.
+    /// `None` collapses the contribution to `true` (input absent).
+    pub verdict_stale: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl Default for HealthSupervisorConfig {
@@ -214,6 +229,7 @@ impl Default for HealthSupervisorConfig {
             service_token_provider: None,
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         }
     }
 }
@@ -233,13 +249,14 @@ impl std::fmt::Debug for HealthSupervisorConfig {
             )
             .field("counter_seed_ready", &self.counter_seed_ready.is_some())
             .field("api_serving", &self.api_serving.is_some())
+            .field("verdict_stale", &self.verdict_stale.is_some())
             .finish()
     }
 }
 
 /// Spawn a background task that periodically probes Valkey (plus the
-/// service-identity token, counter-seed startup gate, and full-API-server
-/// startup gate, when wired) and
+/// service-identity token, counter-seed startup gate, full-API-server
+/// startup gate, and stale hold verdict, when wired) and
 /// flips the gRPC readiness status so Kubernetes routes traffic away from
 /// replicas whose backing dependencies are unreachable (b.3z7 H-obs-2;
 /// auth-backend probing removed in b.9f4).
@@ -262,7 +279,9 @@ impl std::fmt::Debug for HealthSupervisorConfig {
 /// Besides the periodic tick, the loop wakes on a change to
 /// [`HealthSupervisorConfig::api_serving`] (b.rgs) so the readiness flip
 /// lands the moment the full-API server takes over the socket rather than up
-/// to one `probe_interval` later.
+/// to one `probe_interval` later, and on a change to
+/// [`HealthSupervisorConfig::verdict_stale`], so a stale hold verdict takes
+/// the replica out of the load balancer at once.
 pub fn spawn_health_supervisor(
     reporter: HealthReporter,
     valkey: ValkeyClient,
@@ -289,12 +308,14 @@ pub fn spawn_health_supervisor(
 
         let readiness = Arc::<str>::from(cfg.readiness_service_name.clone());
 
-        // A second receiver used ONLY as a wakeup source (b.rgs). The verdict
-        // itself still reads `cfg.api_serving`'s `borrow()`, so a dropped
-        // sender never changes the observed value — it only stops the wakeups,
-        // which `wait_for_api_serving_change` degrades to `pending()` so the
-        // loop parks on the timer instead of spinning on `Err`.
+        // Second receivers used ONLY as wakeup sources (b.rgs, SR-6.5). The
+        // verdict itself still reads `cfg.api_serving`'s and
+        // `cfg.verdict_stale`'s `borrow()`, so a dropped sender never changes
+        // the observed value — it only stops the wakeups, which
+        // `wait_for_input_change` degrades to `pending()` so the loop parks on
+        // the timer instead of spinning on `Err`.
         let mut api_serving_wakeup = cfg.api_serving.clone();
+        let mut verdict_stale_wakeup = cfg.verdict_stale.clone();
 
         loop {
             tokio::select! {
@@ -303,7 +324,8 @@ pub fn spawn_health_supervisor(
                     break;
                 }
                 _ = timer.tick() => {}
-                () = wait_for_api_serving_change(&mut api_serving_wakeup) => {}
+                () = wait_for_input_change(&mut api_serving_wakeup) => {}
+                () = wait_for_input_change(&mut verdict_stale_wakeup) => {}
             }
 
             let valkey_ok = probe_valkey(&valkey, cfg.probe_timeout).await;
@@ -398,7 +420,19 @@ pub fn spawn_health_supervisor(
                 true
             };
 
-            let serving = valkey_ok && service_token_ok && counter_seed_ok && api_serving_ok;
+            // ── Stale hold verdict (SR-5.4, SR-6.5) ──
+            //
+            // Hard signal — no smoothing, same posture as `api_serving`.
+            // `true` while the hold reactor reads this replica's hold
+            // verdict as stale, held or not. When `None` the input is absent
+            // and never holds readiness down.
+            let verdict_stale = cfg.verdict_stale.as_ref().is_some_and(|rx| *rx.borrow());
+
+            let serving = valkey_ok
+                && service_token_ok
+                && counter_seed_ok
+                && api_serving_ok
+                && !verdict_stale;
 
             if last_serving != Some(serving) {
                 let first_verdict = last_serving.is_none();
@@ -427,6 +461,7 @@ pub fn spawn_health_supervisor(
                             service_token_ok,
                             counter_seed_ok,
                             api_serving_ok,
+                            verdict_stale,
                             first_verdict,
                             "health supervisor: readiness flipped to NOT_SERVING (dependency unreachable)"
                         );
@@ -437,14 +472,15 @@ pub fn spawn_health_supervisor(
     })
 }
 
-/// Wait for the next change on the `api_serving` startup gate (b.rgs).
+/// Wait for the next change on a `watch` readiness input: the `api_serving`
+/// startup gate (b.rgs) or the stale hold verdict (SR-6.5).
 ///
-/// Resolves when the watch value is republished. When the gate is unwired
+/// Resolves when the watch value is republished. When the input is unwired
 /// (`None`) — or once the sender has been dropped, which leaves the last
 /// value permanently readable via `borrow()` — this parks forever so the
 /// supervisor's `select!` falls back to the periodic timer instead of
 /// spinning on an immediately-ready `Err`.
-async fn wait_for_api_serving_change(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+async fn wait_for_input_change(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
     match rx.as_mut() {
         Some(rx) => {
             if rx.changed().await.is_err() {
@@ -499,13 +535,18 @@ mod tests {
     // watching `HealthReporter` state via `set_service_status` —
     // tonic_health's `HealthReporter` doesn't expose a read API, so we
     // stand up a tiny tonic server and query via the gRPC health client.
+    // They reach the store through `real_valkey`: with `TEST_VALKEY_URL` set
+    // an unreachable store fails them, and they skip only when it is unset
+    // outside CI.
 
+    /// A one-connection client on `TEST_VALKEY_URL` (default
+    /// `redis://127.0.0.1:6379`), through
+    /// [`connect_test_client_or_skip`](crate::storage::test_support::connect_test_client_or_skip):
+    /// `None` only when the variable is unset outside CI and no store answered.
     async fn real_valkey() -> Option<ValkeyClient> {
-        let valkey_url = std::env::var("TEST_VALKEY_URL")
-            .or_else(|_| std::env::var("LIVE_EDIT_VALKEY_ADDR"))
+        let valkey_url = std::env::var(crate::storage::test_support::TEST_VALKEY_URL_VAR)
             .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
         let cfg = crate::config::Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url,
@@ -587,6 +628,10 @@ mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs: 60,
             checkpoint_enabled: false,
             checkpoint_adapter: crate::checkpoint::CheckpointAdapter::Disabled,
@@ -613,18 +658,53 @@ mod tests {
             service_token_poll_interval_secs: 15,
             service_token_client_credentials_enabled: false,
         };
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::storage::test_support::connect_test_client(&cfg),
-        )
-        .await
-        {
-            Ok(Ok(c)) => Some(c),
-            _ => None,
-        }
+        crate::storage::test_support::connect_test_client_or_skip(&cfg).await
     }
 
     const READINESS_SERVICE: &str = "nvidia.omniverse.live.v1alpha.LiveService";
+
+    /// Hang guard on every positive wait in this module — a readiness status,
+    /// a gauge value, the provider's cache — that has to contain a supervisor
+    /// tick: at least one probe bound ([`healthy_probe_timeout`]) plus a probe
+    /// interval, and far below nextest's 120 s kill. A hang guard, not a
+    /// timing claim: a healthy run observes its state within one tick, and a
+    /// loaded shared Valkey can make one probe take up to the client's command
+    /// timeout without being unhealthy.
+    const STATUS_HANG_GUARD: Duration = Duration::from_secs(30);
+
+    /// A probe interval past any test's lifetime. The interval's first tick
+    /// fires immediately, so with this interval that first tick is the only
+    /// periodic one: a test that claims a verdict "on the first probe" gets
+    /// it from that tick alone, and a test that needs a later tick drives it
+    /// on demand by republishing `api_serving` (each send wakes the
+    /// supervisor), so no claim about which tick did what rests on a clock.
+    const PROBE_INTERVAL_PAST_THE_TEST: Duration = Duration::from_secs(600);
+
+    /// The probe bound for a `PING` this test expects Valkey to answer: the
+    /// client's own command timeout (test-writing guide § Synchronization
+    /// Patterns, "a one-shot read the test expects to answer"), never a tighter
+    /// bound. Under load one round trip on the shared Valkey outlasts 50 ms,
+    /// and a probe that times out reads as an unhealthy store and flips
+    /// readiness, so a tight bound here is a timing assertion in disguise.
+    fn healthy_probe_timeout(valkey: &ValkeyClient) -> Duration {
+        valkey.pool.next().perf_config().default_command_timeout
+    }
+
+    /// Wait until `provider` has cached an unexpired bearer — the state the
+    /// supervisor's token probe reads — under [`STATUS_HANG_GUARD`].
+    async fn wait_for_cached_bearer(provider: &ServiceTokenProvider) {
+        let cached = tokio::time::timeout(STATUS_HANG_GUARD, async {
+            while provider.cached_bearer_if_unexpired().is_none() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            cached.is_ok(),
+            "precondition: the ServiceTokenProvider must cache the fixture token within the \
+             {STATUS_HANG_GUARD:?} hang guard"
+        );
+    }
 
     /// Stand up a tonic server exposing the supplied HealthServer on a
     /// random port and return (addr, shutdown).
@@ -811,8 +891,9 @@ mod tests {
 
     /// Poll cadence for the in-test `ServiceTokenProvider`. Matches the
     /// 20 ms used by the existing `service_token.rs` tests so a write /
-    /// delete is picked up within roughly one supervisor probe interval
-    /// (200 ms).
+    /// delete is picked up quickly. No test relies on that: each one that
+    /// needs the cache in a given state waits for the state
+    /// ([`wait_for_cached_bearer`]) rather than for a number of polls.
     const TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
     /// Provider present and the token file holds a valid token → backend
@@ -822,7 +903,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_provider_some_with_valid_token_stays_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -837,9 +917,9 @@ mod tests {
             TOKEN_POLL_INTERVAL,
             token_cancel.clone(),
         );
-        // Wait for the polling task's first tick to populate the cache
-        // before the supervisor's first probe lands.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Wait for the polling task to populate the cache before the
+        // supervisor's first probe lands — the state, not a guessed interval.
+        wait_for_cached_bearer(&provider).await;
 
         let (reporter, service) = create_health_service(READINESS_SERVICE).await;
         let cancel = CancellationToken::new();
@@ -849,11 +929,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -863,12 +944,14 @@ mod tests {
 
         // Since b.rgs readiness is registered NOT_SERVING and raised by the
         // supervisor's first tick, so wait for that before sampling — a bare
-        // sample would race the first probe rather than test anything.
+        // sample would race the first probe rather than test anything. The
+        // probe is bounded by the client's command timeout, so a slow but
+        // healthy PING cannot read as an outage in the window below.
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "precondition: a valid token + healthy Valkey must raise readiness to SERVING"
@@ -906,10 +989,14 @@ mod tests {
     /// change (readiness starts `NOT_SERVING`) would make the wait below
     /// succeed at t=0 against a supervisor that never evaluated the token
     /// gate at all.
+    ///
+    /// "On the FIRST probe" is exact, not a timing claim: the probe interval
+    /// outlasts the test ([`PROBE_INTERVAL_PAST_THE_TEST`]), so the interval's
+    /// immediate first tick is the only tick, and a smoother that needed a
+    /// second `None` would never flip; the wait for it is a hang guard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_provider_some_with_missing_file_flips_not_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -934,12 +1021,13 @@ mod tests {
             valkey.clone(),
             metrics,
             HealthSupervisorConfig {
-                probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -949,13 +1037,13 @@ mod tests {
 
         // Readiness was seeded SERVING above, so this is a real transition:
         // even though Valkey would otherwise be OK, the missing token file
-        // must pull readiness back down within ONE probe interval — a hard
+        // must pull readiness back down on the first (and only) tick — a hard
         // signal with no consecutive-failure smoothing.
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "missing token file (cached_bearer_if_unexpired() = None) must drive readiness from the \
@@ -985,7 +1073,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_provider_none_does_not_write_gauge_or_flip_readiness() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         // Keep a reader clone of the metrics so we can render `/metrics` and
@@ -1014,12 +1101,13 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 // Explicitly None — the gating field this test pins.
                 service_token_provider: None,
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1033,7 +1121,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "precondition: with no service-token gate and a healthy Valkey the supervisor \
@@ -1073,7 +1161,7 @@ mod tests {
     }
 
     /// No-smoother contract: a `None → Some → None` sequence must flip
-    /// readiness on EVERY transition within a single probe interval — the
+    /// readiness on EVERY transition, on the first tick that observes it — the
     /// signal is hard, with no consecutive-failure smoothing (acceptance
     /// criterion #4 (c)).
     ///
@@ -1088,12 +1176,19 @@ mod tests {
     ///
     /// If the supervisor had introduced a smoother on this signal, step
     /// 3 would require multiple consecutive `None` observations before
-    /// flipping. The bounded-wait assertions guarantee single-tick
-    /// transitions.
+    /// flipping.
+    ///
+    /// Every tick is driven on demand, so "the FIRST tick" is exact rather
+    /// than a timing claim: the probe interval outlasts the test
+    /// ([`PROBE_INTERVAL_PAST_THE_TEST`]), so its immediate first tick is the
+    /// only periodic one, and each later tick is the one a republished
+    /// `api_serving = true` wakes (it contributes `true`, so it changes no
+    /// verdict). Before each wake the test waits for the provider's cache to
+    /// hold the state the step names. A smoother would need a second tick
+    /// that never comes, and the waits for the flips are hang guards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_none_to_some_to_none_flips_immediately_on_each_transition() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1108,6 +1203,8 @@ mod tests {
             TOKEN_POLL_INTERVAL,
             token_cancel.clone(),
         );
+        // The tick trigger: each `send(true)` wakes the supervisor once.
+        let (tick_tx, tick_rx) = tokio::sync::watch::channel(true);
 
         let (reporter, service) = create_health_service(READINESS_SERVICE).await;
         // Transition 1 below asserts a downward flip; seed SERVING so it is
@@ -1120,12 +1217,13 @@ mod tests {
             valkey.clone(),
             metrics,
             HealthSupervisorConfig {
-                probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
-                service_token_provider: Some(provider),
+                service_token_provider: Some(Arc::clone(&provider)),
                 counter_seed_ready: None,
-                api_serving: None,
+                api_serving: Some(tick_rx),
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1133,25 +1231,30 @@ mod tests {
         let (addr, shutdown) = spawn_health_server(service).await;
         let mut client = connect_health(addr).await;
 
-        // Transition 1: None → readiness NOT_SERVING.
+        // Transition 1: None → readiness NOT_SERVING, on the interval's
+        // immediate first tick.
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "initial absent token file must drive readiness from the seeded SERVING down \
-             to NOT_SERVING within one probe"
+             to NOT_SERVING on the first tick"
         );
 
         // Transition 2: write valid token → readiness flips back to SERVING.
         write_valid_token_file(&token_path, "recovered-token").await;
+        wait_for_cached_bearer(&provider).await;
+        tick_tx
+            .send(true)
+            .expect("the supervisor holds the receiver");
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "writing a valid token must restore readiness SERVING on the FIRST tick that \
@@ -1180,12 +1283,28 @@ mod tests {
         tokio::fs::write(&token_path, body)
             .await
             .expect("write expired fixture");
+        // The provider has cached the expired token once its accessor answers
+        // `None` again (it answered with the recovered token until then).
+        let recached = tokio::time::timeout(STATUS_HANG_GUARD, async {
+            while provider.cached_bearer_if_unexpired().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            recached.is_ok(),
+            "precondition: the provider must cache the expired token within the \
+             {STATUS_HANG_GUARD:?} hang guard"
+        );
+        tick_tx
+            .send(true)
+            .expect("the supervisor holds the receiver");
 
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "an actually-expired cached token must flip readiness NOT_SERVING on the FIRST \
@@ -1209,7 +1328,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_provider_some_writes_gauge_each_tick() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1235,8 +1353,8 @@ mod tests {
             token_cancel.clone(),
         );
         // Let the polling task fill the cache before the supervisor's
-        // first probe.
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // first probe — the state, not a guessed interval.
+        wait_for_cached_bearer(&provider).await;
 
         let (reporter, service) = create_health_service(READINESS_SERVICE).await;
         let cancel = CancellationToken::new();
@@ -1246,11 +1364,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1258,11 +1377,11 @@ mod tests {
         let (addr, shutdown) = spawn_health_server(service).await;
         let _client = connect_health(addr).await;
 
-        // Wait long enough for at least one supervisor tick to land.
-        // After that the gauge must read `1` (token available).
+        // Wait for a supervisor tick to land, under the hang guard. After
+        // that the gauge must read `1` (token available).
         let start = std::time::Instant::now();
         let mut gauge_value = read_gauge();
-        while start.elapsed() < Duration::from_secs(2) && gauge_value != Some(1.0) {
+        while start.elapsed() < STATUS_HANG_GUARD && gauge_value != Some(1.0) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             gauge_value = read_gauge();
         }
@@ -1307,7 +1426,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_inside_refresh_lead_but_unexpired_stays_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1333,14 +1451,7 @@ mod tests {
             token_cancel.clone(),
         );
         // Precondition: the accessor the supervisor reads serves the token…
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while provider.cached_bearer_if_unexpired().is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "precondition: the provider must cache the 30 s token within 5 s"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_cached_bearer(&provider).await;
         // …and the fixture really does sit in the band this test names. Asserted
         // arithmetically on the cached expiry because there is no longer an
         // accessor whose `None` would report it (b.mq8 deleted the withholding
@@ -1365,11 +1476,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1381,7 +1493,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "a cached token that is 30 s from expiry is a working credential: readiness must \
@@ -1423,7 +1535,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn service_token_actually_expired_flips_not_serving_and_gauge_zero() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1448,12 +1559,13 @@ mod tests {
             TOKEN_POLL_INTERVAL,
             token_cancel.clone(),
         );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + STATUS_HANG_GUARD;
         while provider.cached_token_expires_on().is_none() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "precondition: the provider must have parsed and cached the expired token \
-                 within 5 s, or the NOT_SERVING below would prove nothing about expiry"
+                 within the {STATUS_HANG_GUARD:?} hang guard, or the NOT_SERVING below would \
+                 prove nothing about expiry"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1469,11 +1581,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1485,7 +1598,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "an actually-expired cached token is not a credential: readiness must fall to \
@@ -1494,7 +1607,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         let mut gauge_value = read_gauge();
-        while start.elapsed() < Duration::from_secs(2) && gauge_value != Some(0.0) {
+        while start.elapsed() < STATUS_HANG_GUARD && gauge_value != Some(0.0) {
             tokio::time::sleep(Duration::from_millis(50)).await;
             gauge_value = read_gauge();
         }
@@ -1541,8 +1654,10 @@ mod tests {
     //
     // Mirrors the service-token tests above structurally — the
     // `Option<watch::Receiver<bool>>` hard-signal-no-smoothing posture is
-    // identical, so the timing assertions reuse the same 200 ms / 2 s
-    // bounded-wait shape.
+    // identical, so the tests reuse the same shape: a probe bounded by the
+    // client's command timeout, waits bounded only by `STATUS_HANG_GUARD`,
+    // and, where a claim is about which tick flipped readiness, a probe
+    // interval past the test with every later tick driven on demand.
 
     /// `counter_seed_ready: None` (the checkpoint-disabled wiring) MUST NOT
     /// gate readiness — the supervisor's `None` branch collapses the
@@ -1552,10 +1667,15 @@ mod tests {
     ///
     /// Mirrors `supervisor_no_auth_clients_never_probes_auth_backends` and
     /// `service_token_provider_none_does_not_write_gauge_or_flip_readiness`.
+    ///
+    /// The Valkey probe is bounded by the client's command timeout
+    /// ([`healthy_probe_timeout`]): a PING that is merely slow on a loaded
+    /// shared Valkey must not read as an outage and flip readiness inside the
+    /// sampling window, which is a property of the probe bound, not of the
+    /// gate under test.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_probe_counter_seed_none_does_not_gate_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1568,12 +1688,13 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: None,
                 // The gating field this test pins.
                 counter_seed_ready: None,
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1587,7 +1708,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "precondition: an inert counter-seed gate must let readiness reach SERVING"
@@ -1616,21 +1737,25 @@ mod tests {
     }
 
     /// `counter_seed_ready: Some(rx)` with `*rx.borrow() == false` MUST flip
-    /// readiness to `NOT_SERVING` within ONE probe interval — no
-    /// consecutive-failure smoother. Pins the `Some(false) → contributes
-    /// false → readiness gated` half of the classifier AND the no-smoother
-    /// contract on the initial failure.
+    /// readiness to `NOT_SERVING` on the first tick — no consecutive-failure
+    /// smoother. Pins the `Some(false) → contributes false → readiness gated`
+    /// half of the classifier AND the no-smoother contract on the initial
+    /// failure.
     ///
     /// Readiness is pre-seeded `SERVING` (see [`preseed_readiness_serving`])
     /// so the assertion is a genuine supervisor-driven transition rather than
     /// a restatement of the `NOT_SERVING` state `create_health_service`
     /// registers since b.rgs.
     ///
+    /// The probe interval outlasts the test
+    /// ([`PROBE_INTERVAL_PAST_THE_TEST`]), so the interval's immediate first
+    /// tick is the only tick: "on the first tick" is exact, and the wait is a
+    /// hang guard.
+    ///
     /// Mirrors `service_token_provider_some_with_missing_file_flips_not_serving`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_probe_counter_seed_some_false_flips_not_serving_immediately() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1650,12 +1775,13 @@ mod tests {
             valkey.clone(),
             metrics,
             HealthSupervisorConfig {
-                probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: None,
                 counter_seed_ready: Some(rx),
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1666,14 +1792,14 @@ mod tests {
         // The counter-seed gate is a hard signal — even though Valkey is
         // probing OK and auth + service-token are `None` (each
         // contributing `true`), the `false` gate must pull readiness from
-        // the seeded SERVING down to NOT_SERVING within ONE probe interval.
-        // A regression that introduced a consecutive-failure smoother on
-        // this signal would fail this bounded wait.
+        // the seeded SERVING down to NOT_SERVING on the first (and only)
+        // tick. A regression that introduced a consecutive-failure smoother
+        // on this signal would never flip here.
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "counter_seed_ready=Some(false) must drive readiness from the seeded SERVING \
@@ -1697,7 +1823,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_probe_counter_seed_some_true_does_not_gate_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1716,11 +1841,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: None,
                 counter_seed_ready: Some(rx),
                 api_serving: None,
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1734,7 +1860,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(5),
+                STATUS_HANG_GUARD,
             )
             .await,
             "precondition: counter_seed_ready=Some(true) must let readiness reach SERVING"
@@ -1774,16 +1900,23 @@ mod tests {
     /// the gate once it flips OK.
     ///
     /// Mirrors the `false → true` half of
-    /// `service_token_none_to_some_to_none_flips_immediately_on_each_transition`.
+    /// `service_token_none_to_some_to_none_flips_immediately_on_each_transition`,
+    /// and drives its ticks the same way: the probe interval outlasts the test
+    /// ([`PROBE_INTERVAL_PAST_THE_TEST`]), so the interval's immediate first
+    /// tick is the only periodic one, and the "next tick" after the flip is the
+    /// one a republished `api_serving = true` wakes (it contributes `true`, so
+    /// it changes no verdict) — "on its next tick" is exact, and the waits are
+    /// hang guards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_probe_counter_seed_false_to_true_transition_restores_serving() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
+        // The tick trigger: each `send(true)` wakes the supervisor once.
+        let (tick_tx, tick_rx) = tokio::sync::watch::channel(true);
 
         let (reporter, service) = create_health_service(READINESS_SERVICE).await;
         // Phase 1 below is a downward flip; seed SERVING so it is one rather
@@ -1796,12 +1929,13 @@ mod tests {
             valkey.clone(),
             metrics,
             HealthSupervisorConfig {
-                probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: None,
                 counter_seed_ready: Some(rx),
-                api_serving: None,
+                api_serving: Some(tick_rx),
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1818,22 +1952,26 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "initial counter_seed_ready=Some(false) must drive readiness from the seeded \
-             SERVING down to NOT_SERVING within one probe interval"
+             SERVING down to NOT_SERVING on the first tick"
         );
 
         // Phase 2: flip the gate `false → true` — simulates
         // `seed_object_id_counter` completing successfully. The supervisor
-        // must observe the new value on its next tick and restore SERVING.
+        // must observe the new value on its next tick, which the test wakes,
+        // and restore SERVING.
         tx.send(true).expect("send true");
+        tick_tx
+            .send(true)
+            .expect("the supervisor holds the receiver");
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "flipping counter_seed_ready from false to true must restore readiness \
@@ -1900,7 +2038,6 @@ mod tests {
     #[tokio::test]
     async fn readiness_probe_api_serving_some_false_holds_not_serving_and_warn_names_it() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
@@ -1919,19 +2056,11 @@ mod tests {
         // Wait on the observable fact (cache populated) rather than a blanket
         // sleep: if the supervisor's first tick beat the provider's first
         // poll, `service_token_ok` would be false and the WARN-field
-        // assertions below would be pinning the wrong cause.
-        let cache_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        // Same accessor the supervisor's probe reads (b.e49) — a precondition
-        // spelled through the *other* accessor could go true (or stay false) on
-        // a different rule than the one under test.
-        while provider.cached_bearer_if_unexpired().is_none() {
-            assert!(
-                std::time::Instant::now() < cache_deadline,
-                "precondition: the ServiceTokenProvider must cache the fixture token \
-                 within 5s so `service_token_ok` is genuinely true for this test"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // assertions below would be pinning the wrong cause. Same accessor the
+        // supervisor's probe reads (b.e49) — a precondition spelled through
+        // the *other* accessor could go true (or stay false) on a different
+        // rule than the one under test.
+        wait_for_cached_bearer(&provider).await;
 
         // Counter-seed gate already open.
         let (_seed_tx, seed_rx) = tokio::sync::watch::channel(true);
@@ -1958,11 +2087,12 @@ mod tests {
             metrics,
             HealthSupervisorConfig {
                 probe_interval: Duration::from_millis(200),
-                probe_timeout: Duration::from_millis(50),
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: Some(provider),
                 counter_seed_ready: Some(seed_rx),
                 api_serving: Some(api_rx),
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -1974,7 +2104,7 @@ mod tests {
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                Duration::from_secs(2),
+                STATUS_HANG_GUARD,
             )
             .await,
             "api_serving=Some(false) must drive readiness from the seeded SERVING down to \
@@ -2039,33 +2169,24 @@ mod tests {
     /// from plain next-tick pickup.
     ///
     /// The bound is structural, not a wall-clock performance assertion: the
-    /// probe interval is set to 30 s, far longer than any scheduling delay a
-    /// loaded runner can produce, so a supervisor that only re-evaluated on
-    /// its periodic tick could not satisfy the 5 s deadline no matter how
-    /// fast the machine is, and one that wakes on `changed()` satisfies it no
-    /// matter how slow. Deleting `wait_for_api_serving_change` from the
-    /// `select!` is invisible to every other test in this file — they all use
-    /// a short probe interval, so next-tick pickup passes them.
+    /// probe interval outlasts the test ([`PROBE_INTERVAL_PAST_THE_TEST`]), so
+    /// a supervisor that only re-evaluated on its periodic tick could never
+    /// raise readiness inside the test, however fast the machine is, and one
+    /// that wakes on `changed()` raises it however slow; the wait is only a
+    /// hang guard ([`STATUS_HANG_GUARD`]). Deleting the `api_serving` arm
+    /// (`wait_for_input_change(&mut api_serving_wakeup)`) from the
+    /// `select!` is invisible to every test in this file that ticks
+    /// periodically, since next-tick pickup passes them.
     ///
     /// Shape copied from
     /// `readiness_probe_counter_seed_false_to_true_transition_restores_serving`;
-    /// the probe interval and the deadline relationship are the difference.
+    /// the woken input is the difference.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn readiness_probe_api_serving_false_to_true_wakes_supervisor_before_next_tick() {
         let Some(valkey) = real_valkey().await else {
-            eprintln!("SKIP: Valkey not reachable");
             return;
         };
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
-
-        // Deliberately far longer than the post-flip deadline below. The
-        // interval's FIRST tick still fires immediately, so Phase 1 does not
-        // wait on it.
-        const LONG_PROBE_INTERVAL: Duration = Duration::from_secs(30);
-        // Post-flip budget. 6x margin over any plausible scheduling delay,
-        // and 6x *under* `LONG_PROBE_INTERVAL` — the gap between those two
-        // numbers is what makes the assertion structural.
-        const FLIP_DEADLINE: Duration = Duration::from_secs(5);
 
         let (tx, rx) = tokio::sync::watch::channel(false);
 
@@ -2078,12 +2199,13 @@ mod tests {
             valkey.clone(),
             metrics,
             HealthSupervisorConfig {
-                probe_interval: LONG_PROBE_INTERVAL,
-                probe_timeout: Duration::from_millis(500),
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
                 readiness_service_name: READINESS_SERVICE.to_string(),
                 service_token_provider: None,
                 counter_seed_ready: None,
                 api_serving: Some(rx),
+                verdict_stale: None,
             },
             cancel.clone(),
         );
@@ -2093,14 +2215,14 @@ mod tests {
 
         // Phase 1: the gate starts shut, and `tokio::time::interval` fires
         // its first tick immediately, so the supervisor publishes a
-        // NOT_SERVING verdict without waiting out the 30 s period. This also
+        // NOT_SERVING verdict without waiting out the period. This also
         // establishes that the supervisor is parked in its `select!` — the
-        // precondition Phase 2's measurement needs.
+        // precondition Phase 2 needs.
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::NotServing,
-                FLIP_DEADLINE,
+                STATUS_HANG_GUARD,
             )
             .await,
             "initial api_serving=Some(false) must drive readiness from the seeded SERVING \
@@ -2108,21 +2230,209 @@ mod tests {
         );
 
         // Phase 2: open the gate — the `main.rs` handoff moment. The next
-        // periodic tick is ~30 s away, so observing SERVING inside
-        // `FLIP_DEADLINE` is only possible via the `changed()` wakeup arm.
+        // periodic tick is past the test, so observing SERVING at all is only
+        // possible via the `changed()` wakeup arm.
         tx.send(true).expect("send true");
         assert!(
             wait_for_status(
                 &mut client,
                 tonic_health::pb::health_check_response::ServingStatus::Serving,
-                FLIP_DEADLINE,
+                STATUS_HANG_GUARD,
             )
             .await,
             "opening the api_serving gate must wake the supervisor immediately via its \
-             `changed()` select arm: with probe_interval={LONG_PROBE_INTERVAL:?} the next \
-             periodic tick could not have landed inside the {FLIP_DEADLINE:?} budget, so \
-             a supervisor relying on next-tick pickup would leave readiness NOT_SERVING \
-             for ~30 s after the full-API server took over the socket"
+             `changed()` select arm: with probe_interval={PROBE_INTERVAL_PAST_THE_TEST:?} the \
+             next periodic tick could not have landed inside the {STATUS_HANG_GUARD:?} hang \
+             guard, so a supervisor relying on next-tick pickup would leave readiness \
+             NOT_SERVING long after the full-API server took over the socket"
+        );
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), supervisor).await;
+        let _ = shutdown.send(());
+        valkey.quit().await;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Stale disaster-recovery hold verdict (SDD SR-5.4, SR-6.5)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// `verdict_stale: Some(rx)` with `*rx.borrow() == true` holds readiness
+    /// `NOT_SERVING` while every other input is healthy, and the WARN names
+    /// it with `verdict_stale=true` beside `valkey_ok=true`: a replica whose
+    /// hold verdict went stale leaves the load balancer even though its
+    /// Valkey `PING` still passes (one dead client among several), and the
+    /// operator reads the cause from that field.
+    ///
+    /// Default `current_thread` flavor for the thread-local log capture, as
+    /// in `readiness_probe_api_serving_some_false_holds_not_serving_and_warn_names_it`.
+    #[tokio::test]
+    async fn readiness_probe_verdict_stale_some_true_holds_not_serving_and_warn_names_it() {
+        let Some(valkey) = real_valkey().await else {
+            return;
+        };
+        let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
+        // The input under test, held stale. Sender kept alive for the whole
+        // test so the receiver never observes a closed channel.
+        let (_stale_tx, stale_rx) = tokio::sync::watch::channel(true);
+
+        let (writer, captured) = CapturingWriter::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let dispatch_guard = tracing::subscriber::set_default(subscriber);
+
+        let (reporter, service) = create_health_service(READINESS_SERVICE).await;
+        // The assertion below is a downward flip; seed SERVING so it is one.
+        preseed_readiness_serving(&reporter).await;
+        let cancel = CancellationToken::new();
+        let supervisor = spawn_health_supervisor(
+            reporter.clone(),
+            valkey.clone(),
+            metrics,
+            HealthSupervisorConfig {
+                probe_interval: Duration::from_millis(200),
+                probe_timeout: healthy_probe_timeout(&valkey),
+                readiness_service_name: READINESS_SERVICE.to_string(),
+                service_token_provider: None,
+                counter_seed_ready: None,
+                api_serving: None,
+                verdict_stale: Some(stale_rx),
+            },
+            cancel.clone(),
+        );
+
+        let (addr, shutdown) = spawn_health_server(service).await;
+        let mut client = connect_health(addr).await;
+
+        assert!(
+            wait_for_status(
+                &mut client,
+                tonic_health::pb::health_check_response::ServingStatus::NotServing,
+                STATUS_HANG_GUARD,
+            )
+            .await,
+            "verdict_stale=Some(true) must drive readiness from the seeded SERVING down to \
+             NOT_SERVING with Valkey healthy: the input is ANDed into the verdict"
+        );
+        // And hold there for several probe cycles: the input is read on every
+        // tick, not only the first.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            assert_eq!(
+                observe_status(&mut client).await,
+                tonic_health::pb::health_check_response::ServingStatus::NotServing,
+                "verdict_stale=Some(true) must keep readiness NOT_SERVING while it stays true"
+            );
+        }
+
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), supervisor).await;
+        let _ = shutdown.send(());
+        valkey.quit().await;
+        drop(dispatch_guard);
+
+        let buf = captured
+            .lock()
+            .expect("capture buffer must not be poisoned");
+        let output = String::from_utf8_lossy(&buf);
+        assert!(
+            output.contains("readiness flipped to NOT_SERVING"),
+            "the stale verdict's NOT_SERVING must be logged; captured: {output}"
+        );
+        for field in [
+            "verdict_stale=true",
+            "valkey_ok=true",
+            "api_serving_ok=true",
+        ] {
+            assert!(
+                output.contains(field),
+                "the NOT_SERVING WARN must report `{field}`, so it names the stale verdict as \
+                 the cause and exonerates the store; captured: {output}"
+            );
+        }
+    }
+
+    /// A change of `verdict_stale` wakes the supervisor at once, in both
+    /// directions, rather than at its next tick: the probe interval outlasts
+    /// the test ([`PROBE_INTERVAL_PAST_THE_TEST`]), so no flip can land on a
+    /// periodic tick at all, and each flip observed (within the
+    /// [`STATUS_HANG_GUARD`] hang guard) came through the input's own
+    /// `changed()` arm. `false → true` is the direction that matters in
+    /// production: a replica whose verdict goes stale leaves the load
+    /// balancer when it stops serving, not up to one probe interval later.
+    ///
+    /// Shape of `readiness_probe_api_serving_false_to_true_wakes_supervisor_before_next_tick`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readiness_probe_verdict_stale_flip_wakes_supervisor_before_next_tick() {
+        let Some(valkey) = real_valkey().await else {
+            return;
+        };
+        let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only("test"));
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let (reporter, service) = create_health_service(READINESS_SERVICE).await;
+        let cancel = CancellationToken::new();
+        let supervisor = spawn_health_supervisor(
+            reporter.clone(),
+            valkey.clone(),
+            metrics,
+            HealthSupervisorConfig {
+                probe_interval: PROBE_INTERVAL_PAST_THE_TEST,
+                probe_timeout: healthy_probe_timeout(&valkey),
+                readiness_service_name: READINESS_SERVICE.to_string(),
+                service_token_provider: None,
+                counter_seed_ready: None,
+                api_serving: None,
+                verdict_stale: Some(rx),
+            },
+            cancel.clone(),
+        );
+
+        let (addr, shutdown) = spawn_health_server(service).await;
+        let mut client = connect_health(addr).await;
+
+        // Phase 1: the interval's immediate first tick raises readiness from
+        // the registered NOT_SERVING, and parks the supervisor in its
+        // `select!` with the next periodic tick past the test.
+        assert!(
+            wait_for_status(
+                &mut client,
+                tonic_health::pb::health_check_response::ServingStatus::Serving,
+                STATUS_HANG_GUARD,
+            )
+            .await,
+            "precondition: a fresh verdict must let the first tick raise readiness to SERVING"
+        );
+
+        // Phase 2: the verdict goes stale.
+        tx.send(true).expect("send true");
+        assert!(
+            wait_for_status(
+                &mut client,
+                tonic_health::pb::health_check_response::ServingStatus::NotServing,
+                STATUS_HANG_GUARD,
+            )
+            .await,
+            "a stale verdict must wake the supervisor through its `changed()` arm and take \
+             readiness to NOT_SERVING within the {STATUS_HANG_GUARD:?} hang guard; the next \
+             periodic tick is {PROBE_INTERVAL_PAST_THE_TEST:?} away"
+        );
+
+        // Phase 3: a held replica's read succeeds again.
+        tx.send(false).expect("send false");
+        assert!(
+            wait_for_status(
+                &mut client,
+                tonic_health::pb::health_check_response::ServingStatus::Serving,
+                STATUS_HANG_GUARD,
+            )
+            .await,
+            "a verdict that is fresh again must wake the supervisor and raise readiness within \
+             the {STATUS_HANG_GUARD:?} hang guard; the next periodic tick is \
+             {PROBE_INTERVAL_PAST_THE_TEST:?} away"
         );
 
         cancel.cancel();

@@ -34,7 +34,6 @@ PAYLOAD_FILES = (
     "share/omni_usd_live/LICENSE", "share/omni_usd_live/NOTICE", "share/omni_usd_live/THIRD_PARTY_NOTICES.md",
     "share/omni_usd_live/THIRD_PARTY_LICENSES.txt", "share/omni_usd_live/BOM.json",
     "share/omni_usd_live/provenance/live-proto.md",
-    "share/omni_usd_live/provenance/wire-schema/provenance.json",
     "share/omni_usd_live/provenance/wire-schema/UPSTREAM-NOTICE.txt",
     "share/omni_usd_live/provenance/flatbuffers/LICENSE.txt",
     "share/omni_usd_live/provenance/flatbuffers/provenance.json",
@@ -224,7 +223,7 @@ def python_sdk(root, name):
                 library=root / f"lib/libpython3.12.{suffix}")
 
 
-def _usd_libraries(root, profile, platform="linux-x86_64"):
+def _usd_libraries(root, profile, platform="linux-x86_64", configuration="release"):
     if not isinstance(profile, str) or profile not in USD_PROFILES:
         raise ValueError("Unsupported USD profile: " + str(profile))
     header_path = root / "include/pxr/pxr.h"
@@ -242,6 +241,8 @@ def _usd_libraries(root, profile, platform="linux-x86_64"):
                   "usd_arch", "usd_trace", "usd_work", "usd_python", "usd_js", "tbb"))
     # A Windows consumer links the import library; the DLL is a runtime dependency.
     windows = platforms.get(platform).binary_format == "pe"
+    if windows and configuration == "debug":
+        libraries = tuple("tbb_debug" if library == "tbb" else library for library in libraries)
     suffix = "dylib" if platforms.get(platform).binary_format == "macho" else "so"
     for library in libraries:
         _path(root / "lib" / (f"{library}.lib" if windows else f"lib{library}.{suffix}"))
@@ -270,7 +271,7 @@ def plan(args):
     sdks = {key: _path(getattr(args, key), directory=True, preserve_selection=True) for key in
             ("usd_root", "python_root", "dependency_root", "pybind11_root")}
     usd_profile = getattr(args, "usd_profile", "stock-25.11")
-    _usd_libraries(sdks["usd_root"], usd_profile, args.platform)
+    _usd_libraries(sdks["usd_root"], usd_profile, args.platform, config)
     python = python_sdk(sdks["python_root"], args.platform)
     _define(python["patchlevel"], "PY_MAJOR_VERSION", 3)
     _define(python["patchlevel"], "PY_MINOR_VERSION", 12)
@@ -398,6 +399,15 @@ def validate_stage(path, root=None, *, expected_platform=None, expected_configur
     if record.get("support_identity") != _support_identity(support):
         raise ValueError("Package SDK/tools changed; rebuild Live Services")
     return record
+
+
+def stage_identity(path, platform):
+    """The identity a test run records for the validated stage of `platform` at `path`, a
+    `<target-dir>/usd/omniverse/live` package: its absolute path and its manifest's SHA-256, which covers every
+    member's hash and the source inputs and SDK the stage was built from."""
+    path = Path(path).absolute()
+    validate_stage(path, expected_platform=platform)
+    return {"path": str(path), "manifest_sha256": _hash(path / MANIFEST)}
 
 
 def assemble_install(install, package):

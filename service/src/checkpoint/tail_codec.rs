@@ -429,9 +429,18 @@ impl TailEnvelope {
 ///
 /// Takes a plain [`IntoIterator`] rather than an [`ExactSizeIterator`]: the
 /// `record_count` field sits at a fixed header offset, so the encoder writes a
-/// placeholder, streams the records, and backfills the final count. Callers may
-/// therefore stream records straight out of an adapter chain without collecting
-/// them first, and no caller-supplied size hint can influence the output bytes.
+/// placeholder, writes the records, and backfills the final count, and no
+/// caller-supplied size hint can influence the output bytes.
+///
+/// The output is allocated once, at its exact size, computed from the records
+/// themselves (the header plus each record's prefix and payload) before any
+/// byte is written: the records are gathered first, which holds only their
+/// payload handles, not copies. A buffer grown by doubling would keep up to
+/// twice the envelope's size of capacity, and the returned `Bytes` keeps that
+/// allocation through the upload; at its exact size the tail capture peaks at
+/// its captured entries plus one envelope, about twice
+/// `LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES`, which is what the pod memory plan
+/// charges for it (`config::memory_plan::tail_capture_peak_bytes`).
 pub fn encode_tail_envelope<I>(header: &TailHeader, records: I) -> Result<Bytes, TailCodecError>
 where
     I: IntoIterator<Item = TailRecord>,
@@ -459,10 +468,17 @@ where
         });
     }
 
-    // Capacity for the header only. Sizing from a caller-supplied hint would
-    // put a value that cannot affect the output bytes within reach of doing so;
-    // `Vec` growth is invisible to the encoded result.
-    let mut out = Vec::with_capacity(TAIL_HEADER_SIZE);
+    // The exact size, from the records themselves rather than from a
+    // caller-supplied hint, so it cannot change the output bytes: capacity is
+    // invisible to the encoded result. A size that does not fit `usize` falls
+    // back to the header alone and lets the vector grow; the record-length
+    // checks below refuse any payload that large first.
+    let records: Vec<TailRecord> = records.into_iter().collect();
+    let encoded_len = records.iter().try_fold(TAIL_HEADER_SIZE, |len, record| {
+        len.checked_add(TAIL_RECORD_PREFIX_SIZE)?
+            .checked_add(record.ompf().map_or(0, |ompf| ompf.len()))
+    });
+    let mut out = Vec::with_capacity(encoded_len.unwrap_or(TAIL_HEADER_SIZE));
     out.extend_from_slice(&TAIL_ENVELOPE_MAGIC);
     out.extend_from_slice(&TAIL_FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&header.object_id.to_le_bytes());
@@ -474,7 +490,7 @@ where
     debug_assert_eq!(out.len(), TAIL_HEADER_SIZE);
 
     let mut count: u64 = 0;
-    for (index, record) in records.into_iter().enumerate() {
+    for (index, record) in records.iter().enumerate() {
         // The envelope covers `(from_seq, to_seq]` with exactly one record per
         // sequence number — no gaps, no repeats (SR-1.2 contiguity).
         let expected = header.from_seq + 1 + count;
@@ -486,9 +502,13 @@ where
                 got,
             });
         }
-        write_tail_record(&mut out, index, &record)?;
+        write_tail_record(&mut out, index, record)?;
         count += 1;
     }
+    debug_assert!(
+        encoded_len.is_none_or(|len| out.len() == len),
+        "the envelope's precomputed size is its encoded size"
+    );
 
     let range_span = header.to_seq - header.from_seq;
     if count != range_span {

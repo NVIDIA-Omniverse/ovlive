@@ -34,12 +34,9 @@
 //!   sequence): register the stream at the header sequence and ack it. No
 //!   slot, no content.
 //! - *Regime 2* (the stream still holds `{have_version+1}-0`): one coalesced
-//!   diff based at `have_version` (`catch_up_in_window_snapshot`), decided by
-//!   two single-entry reads (`read_in_window_point`); in rollback mode
-//!   (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) one reconstructed diff per
-//!   retained commit (`catch_up_in_window`), read in byte-sized pages
-//!   (`read_in_window_replay`).
-//! - *Regime 3* (otherwise): one coalesced diff based at `have_version`
+//!   diff based at `have_version` (`catch_up_in_window`), decided by two
+//!   single-entry reads (`read_in_window_point`).
+//! - *Regime 3* (otherwise): the same coalesced diff based at `have_version`
 //!   (`catch_up_out_of_window`).
 //!
 //! A state-reading regime reads the header (P), reserves a stream reader
@@ -60,7 +57,17 @@
 //! fenced path — which it attaches to with no slot), registers its
 //! stream at that cut, builds and acks there, and releases the hold when the
 //! rebuild ends; only a blob still missing under a hold the store confirms
-//! live takes fetch-on-miss and, failing that, `INTERNAL`.
+//! live takes fetch-on-miss and, failing that, `INTERNAL`. Each
+//! `build_catch_up` call races the subscription's endings
+//! (`subscription_ending`: shutdown, which a fleet hold's ending also fires,
+//! session cancellation, client disconnect, the live-delivery hold's ending),
+//! ending first, so an ending drops
+//! the build — its store reads and its read-hold take, renewals and release
+//! with it (a dropped hold spawns its one `HDEL`), its build turn and its
+//! slot — and the catch-up ends by its cause, with the status and exit reason
+//! a send would have given it. A stream's catch-up sends no store write after
+//! its ending but the clean-ups the drop leaves, each given up within one
+//! command timeout (`storage::snapshot_fence`, # Guards).
 //!
 //! A layer above the atomic-read limits is read once per replica, by its
 //! shared fenced-read flight (`storage::snapshot_flights`, held on
@@ -75,18 +82,13 @@
 //! from the shared snapshot and gives the turn back before it sends. The
 //! reader, slot and permit waits, and an attached catch-up's share of its
 //! flight's slot, fenced-permit and memory waits, draw on one
-//! `CapacityBudget`. (Rollback mode reserves its reader under the slot, and
-//! its in-window replay registers at the last entry it read and reads each
-//! commit atomically under a permit of its own inside the slot; on a layer
-//! above the atomic-read limits it hands over to the out-of-window route,
-//! which attaches to the flight.) So no commit is lost between the state read
+//! `CapacityBudget`. So no commit is lost between the state read
 //! and the stream, and since the cursor is the acked cut, no commit the
 //! snapshot folded in is delivered again. A `NotFound` on a state read runs
 //! the layer recovery hook, then the mapping re-read
 //! (`read_state_with_recovery`, `handle_deleted_and_rebootstrap`); so does one
 //! on an external-value miss's re-read, once its read hold is released
-//! (`recover_after_reread_not_found`). The rollback-mode in-window replay's
-//! per-commit reads re-bootstrap on a `NotFound` without the hook.
+//! (`recover_after_reread_not_found`).
 //!
 //! **Steady state (`run_steady_state`).** An `Update` at or below the tracked
 //! version is dropped; a self-echo advances the tracked version and sends
@@ -98,32 +100,44 @@
 //! otherwise the RPC ends `NOT_FOUND`.
 //!
 //! **Endings.** Every ending but a client disconnect returns `Err(status)`,
-//! written into a response-channel slot reserved before anything was sent
-//! (`send_terminal_status`), so no server-driven ending reads as `OK`. Each
-//! ending after admission records one exit reason
-//! (`live_edit_subscriber_stream_exits_total`); an admission refusal is logged
-//! by the handler and not counted there.
+//! written into the response queue's status slot, reserved before anything
+//! was sent (`send_terminal_status`), so no server-driven ending reads as
+//! `OK`; the data still queued is dropped first, so the status is the next
+//! message the client gets. Each ending after admission records one exit
+//! reason (`live_edit_subscriber_stream_exits_total`); an admission refusal is
+//! logged by the handler and not counted there.
+//!
+//! **Memory (SDD §12.6).** Each RPC registers one live-delivery hold
+//! (`storage::stream_mux::delivery_ledger`) for its whole life: its queued
+//! relay entries count on it from the stream reader's offer until the stream
+//! takes their last message, and the live-delivery budget ends the
+//! subscription holding the most of them `delivery_budget`. Every wait that
+//! races `tx.closed()` races that hold's ending too. A catch-up payload is
+//! built as pages and reserves the catch-up payload budget before its
+//! external values are read (`build_catch_up_once`); its pages repay their
+//! shares as the stream sends them.
 
 use bytes::Bytes;
 use fred::interfaces::StreamsInterface;
 use std::collections::HashMap;
 use std::time::Instant;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use super::auth_helpers::{check_read_permission, extract_token, BasePathSource};
+use super::graceful_shutdown::{HoldCause, StreamShutdown};
 use super::proto::{
     subscribe_read_layer_response, SubscribeReadLayerHeader, SubscribeReadLayerRequest,
     SubscribeReadLayerResponse,
 };
+use super::response_queue::{response_queue, ResponseSender, RESPONSE_QUEUE_DATA_SLOTS};
 use super::rpc_log::{self, RpcLogContext, RpcStage};
 use super::service::LiveEditService;
 use super::session::{session_absent_status, SessionCancel, SessionCancelCause};
-use super::streaming::{chunk_ompf_for_stream, OmpfStreamHeader};
+use super::streaming::{chunk_ompf_for_stream, chunk_pages_for_stream, OmpfStreamHeader};
 use super::subscriber_delivery::{
-    DeliveryTally, LiveDelivery, Outbound, SendKind, SendStall, TransportLagStream,
-    DELIVERY_TALLY_FLUSH_INTERVAL,
+    DeliveryTally, LiveDelivery, Outbound, OutboundRelease, SendKind, SendStall,
+    TransportLagStream, DELIVERY_TALLY_FLUSH_INTERVAL,
 };
 use super::transport::server_shutting_down;
 use crate::checkpoint::RecoveryOutcome;
@@ -134,20 +148,27 @@ use crate::observability::metrics::{
     CATCHUP_EXT_VALUE_MISS_OUTCOME_GENUINE, CATCHUP_EXT_VALUE_MISS_OUTCOME_STALE_RETRIED,
     CATCHUP_EXT_VALUE_MISS_READ_ATOMIC, CATCHUP_EXT_VALUE_MISS_READ_SHARED_FENCED,
     ENDPOINT_SUBSCRIBE_READ_LAYER, STREAM_EXIT_CATCHUP_CAPACITY, STREAM_EXIT_CLIENT_DISCONNECT,
-    STREAM_EXIT_ERROR, STREAM_EXIT_FENCED_READ_WAIT_CAP, STREAM_EXIT_INNER_WATCHDOG,
-    STREAM_EXIT_READER_CAPACITY, STREAM_EXIT_SESSION_ABSENT, STREAM_EXIT_SESSION_CANCEL,
-    STREAM_EXIT_SHUTDOWN, STREAM_EXIT_SLOW_READER_DEADLINE, STREAM_EXIT_STREAM_GAP,
+    STREAM_EXIT_DELIVERY_BUDGET, STREAM_EXIT_ERROR, STREAM_EXIT_FENCED_READ_WAIT_CAP,
+    STREAM_EXIT_HELD, STREAM_EXIT_INNER_WATCHDOG, STREAM_EXIT_READER_CAPACITY,
+    STREAM_EXIT_SESSION_ABSENT, STREAM_EXIT_SESSION_CANCEL, STREAM_EXIT_SHUTDOWN,
+    STREAM_EXIT_SLOW_READER_DEADLINE, STREAM_EXIT_STALE_VERDICT, STREAM_EXIT_STREAM_GAP,
 };
 use crate::storage::diff_read::{
-    compute_diff_at_cut, compute_faithful_coalesced_at_cut, compute_faithful_full_content_at_cut,
-    compute_per_commit_diff_at_cut, empty_commit_payload, read_object_snapshot, AtomicSnapshot,
-    Built, DiffCut, DiffResponse, ExtValueReads, PerCommitDiff, SnapshotRead, SnapshotReadConsumer,
-    SnapshotTooLarge, SnapshotTooLargeAt, SubscriberState,
+    compute_faithful_coalesced_at_cut, compute_faithful_full_content_at_cut, empty_commit_payload,
+    read_object_snapshot, AtomicSnapshot, Built, DiffCut, DiffResponse, ExtValueReads, LaidOut,
+    SnapshotRead, SnapshotReadConsumer, SnapshotTooLarge, SnapshotTooLargeAt,
 };
 use crate::storage::external_values::{ReadHold, ReadHoldRenewal};
-use crate::storage::notifications::{LayerNotification, StreamCursor, OUTER_SEND_DEADLINE};
+use crate::storage::memory_budget::MemoryGrant;
+use crate::storage::notifications::{
+    LayerNotification, ReceivedEntry, StreamCursor, OUTER_SEND_DEADLINE,
+};
+use crate::storage::ompf_payload::{restore_in_batches, PayloadGrant, EXT_RESTORE_CHARGE_CENTI};
 use crate::storage::snapshot_fence::{probe_fence, FenceProbe, LayerSize};
 use crate::storage::snapshot_flights::{BuildTurn, FlightRead, FlightWaitError};
+use crate::storage::stream_mux::delivery_ledger::{
+    HoldIdentity, PipelineEntry, SubscriptionHold, DELIVERY_BUDGET_ENDING_MSG,
+};
 use crate::storage::subscriber_admission::{
     cancelled_or_never, AdmissionRefusal, CapacityBudget, CatchUpPermit, CatchUpReadPermit,
     CatchUpRefusal,
@@ -156,13 +177,6 @@ use crate::storage::{reserve_layer_stream, ConsumeError, LayerStreamConsumer, Re
 
 type BoxStream<T> =
     std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send + 'static>>;
-
-/// Default entry cap for the rollback-mode in-window replay when the
-/// LayerStore has no configured MAXLEN. MAXLEN is the natural ceiling (a
-/// subscriber can't possibly be more entries behind than the stream retains),
-/// but when MAXLEN is 0 (no entry cap) we still need a guardrail so a
-/// very-behind subscriber doesn't replay an unbounded window.
-const IN_WINDOW_XRANGE_SOFT_CAP: u64 = 8192;
 
 /// Handler for the `SubscribeReadLayer` RPC.
 ///
@@ -187,16 +201,21 @@ const IN_WINDOW_XRANGE_SOFT_CAP: u64 = 8192;
 /// admission leaves of it is all the task may then spend waiting for a stream
 /// reader (cluster mode, [`reserve_stream`]), for catch-up slots
 /// ([`acquire_catchup_slot`]), for snapshot read permits
-/// ([`acquire_snapshot_read_permit`]) and, attached to a shared fenced-read
+/// ([`acquire_snapshot_read_permit`]), attached to a shared fenced-read
 /// flight, for its share of the flight's slot, fenced-permit and memory waits
-/// ([`read_through_flight`]). A catch-up waiting for capacity holds at most a
-/// reader reservation, which queues nothing: its layer stream is registered
-/// only at its proven read's cut, after every capacity wait
-/// ([`catch_up_proven_read`]). Those waits come after the stream opened; when
+/// ([`read_through_flight`]), and for the catch-up payload budget
+/// ([`reserve_catchup_payload`]). A catch-up waiting for a stream reader, a
+/// slot, a read permit or its flight holds at most a reader reservation,
+/// which queues nothing: its layer stream is registered only at its proven
+/// read's cut, after those waits ([`catch_up_proven_read`]). The catch-up
+/// payload budget wait alone comes after that, inside the slot or build turn,
+/// with the stream registered: live entries queue for it meanwhile, charged
+/// to the live-delivery budget, and the wait ends as soon as that
+/// registration ends. Those waits come after the stream opened; when
 /// the budget runs out they end it in-stream with `UNAVAILABLE` under
 /// `reason="reader_capacity"` or `reason="catchup_capacity"`: before any
-/// content during catch-up, in both catch-up modes; after the caught-up ack
-/// only for a steady-state overwrite re-bootstrap. A re-bootstrap onto a new
+/// content during catch-up; after the caught-up ack only for a steady-state
+/// overwrite re-bootstrap. A re-bootstrap onto a new
 /// object refills the budget. Nothing else in the steady state waits for
 /// capacity: it never reads layer state.
 ///
@@ -204,7 +223,11 @@ const IN_WINDOW_XRANGE_SOFT_CAP: u64 = 8192;
 /// `UNAVAILABLE "server shutting down"` in every phase — admission, catch-up,
 /// delivery and the idle wait — which the client retries; this replica has
 /// stopped accepting connections, so where the retry lands is the ingress's
-/// choice. A
+/// choice. The fleet hold's ending, which cancels the same enrolled token with a cause
+/// (SDD SR-6.3), ends it in every phase by that cause instead: `UNAVAILABLE`
+/// `SERVICE_HELD` (`reason="held"`) for a fleet hold, `UNAVAILABLE`
+/// `UPSTREAM_UNAVAILABLE` (`reason="stale_verdict"`) for a stale hold verdict;
+/// both are retried. A
 /// deleted session ends it `NOT_FOUND`, which the client does not retry: `NOT_FOUND
 /// "session was deleted"` with `reason="session_cancel"` when the session token
 /// is observed, in any phase, but `NOT_FOUND "layer '<name>' was deleted"` with
@@ -327,12 +350,15 @@ async fn subscribe_read_layer_inner(
     // This subscription's enrolled child of the service shutdown token (SDD
     // §5.6): what admission, every send and the idle wait race, and the only
     // way graceful shutdown reaches the subscription — cancelled in its batch of
-    // the paced ending. A child rather than a shared token for the reason
+    // the paced ending — and the fleet hold's ending too, which cancels it with a cause
+    // (SDD SR-6.3). A child rather than a shared token for the reason
     // `JoinCtx::shutdown` is one (`presence.rs`): polling a token locks that
     // token's own mutex and waiter list, and on a process-wide token those
     // locks would be shared by every stream on the replica on every send; the
     // child's are this subscription's alone. Enrolled before admission, so it
-    // is born cancelled if the paced ending has already started. The
+    // is born cancelled if the paced ending has already started, or the fleet
+    // hold's ending has run (then carrying the hold's cause), and admission then
+    // refuses it before the task is spawned. The
     // enrollment moves into the subscription task, which holds it for the
     // RPC's whole life; a refusal before the spawn drops it here.
     let (shutdown, shutdown_enrollment) = service.shutdown.enroll_stream();
@@ -366,8 +392,10 @@ async fn subscribe_read_layer_inner(
     // A refusal is logged by the handler wrapper at `stage=admission`, with
     // session, layer, client and `base_path`, the cause in `status_message`:
     // WARN `UNAVAILABLE` for saturation, INFO `UNAVAILABLE` for a shutdown (the
-    // context is marked shutdown-caused), INFO `NOT_FOUND` for a deletion, and
-    // WARN `UNAVAILABLE` for a session found missing from the live store.
+    // context is marked shutdown-caused) or a fleet hold (marked hold-caused),
+    // WARN `UNAVAILABLE` for a stale hold verdict, INFO `NOT_FOUND` for a
+    // deletion, and WARN `UNAVAILABLE` for a session found missing from the
+    // live store.
     log.at(RpcStage::Admission);
     let admission_started = tokio::time::Instant::now();
     let admission = match service
@@ -379,10 +407,16 @@ async fn subscribe_read_layer_inner(
         .await
     {
         Ok(admission) => admission,
+        // A shutdown refusal comes from this subscription's own token or from
+        // the gate `ValkeyClient::quit` closed. The token leg ends by the
+        // token's cause: a token the fleet hold's ending cancelled (or that was
+        // born cancelled after it) carries the hold's cause, recorded before the
+        // cancel; any other is graceful shutdown's, as is the closed gate.
+        Err(AdmissionRefusal::ShuttingDown) => {
+            log.stream_shutdown_caused(&shutdown);
+            return Err(shutdown.ending_status());
+        }
         Err(refusal) => {
-            if refusal == AdmissionRefusal::ShuttingDown {
-                log.shutdown_caused();
-            }
             let cause = session_cancel.as_ref().map(SessionCancel::cause);
             return Err(refusal_to_status(refusal, cause));
         }
@@ -410,11 +444,11 @@ async fn subscribe_read_layer_inner(
 
     // Bridge the spawned task to the gRPC response stream.
     //
-    // **33, not 32, and the extra slot is reserved immediately** (b.f4f). The
-    // delivery capacity for data is unchanged at 32; the 33rd exists so the
-    // terminal trailer always has somewhere to go. Without it the trailer
+    // **32 data slots, and a status slot apart from them, reserved at
+    // creation** (b.f4f; `grpc::response_queue`). The status slot exists so
+    // the terminal trailer always has somewhere to go. Without it the trailer
     // competes with the backlog it is usually reporting on — the
-    // `slow_reader_deadline` tear-down is *reached* because the channel is full
+    // `slow_reader_deadline` tear-down is *reached* because the queue is full
     // — and a trailer that cannot be enqueued leaves the stream ending with a
     // bare EOS, i.e. gRPC `OK`. The Kit client does not retry `OK` (its retry
     // policy retries only DEADLINE_EXCEEDED, UNAVAILABLE, RESOURCE_EXHAUSTED
@@ -423,20 +457,23 @@ async fn subscribe_read_layer_inner(
     // behaviour), so a server-driven tear-down would kill the
     // subscription without a reconnect: exactly what the b.c7a contract
     // forbids, reached by a timeout instead of by an exit reason.
-    let (tx, rx) = mpsc::channel::<Outbound>(33);
+    let (tx, rx) = response_queue::<Outbound>(RESPONSE_QUEUE_DATA_SLOTS);
 
-    // Taken here, on a channel that is empty by construction, so it resolves
-    // without waiting. `reserve_owned` fails only when the receiver has been
-    // dropped, and `rx` is still owned by this function two lines up — the arm
-    // is unreachable, and is written as an error rather than an `expect` so an
-    // unreachable case can never take a connection down.
-    let trailer_permit = tx.clone().reserve_owned().await.map_err(|_| {
-        ServiceError::Internal(
-            "SubscribeReadLayer could not reserve its terminal-trailer slot on a freshly created \
-             response channel"
-                .to_owned(),
-        )
-    })?;
+    // This RPC's place in the live-delivery budget (SDD §12.6), registered for
+    // its whole life: every stream registration it makes charges its queued
+    // entries here, the response stream stamps its takes on it, and the
+    // budget — or a stalled catch-up holder's ending — ends the subscription
+    // through its token. It moves into the task with the admission.
+    let hold = service
+        .valkey
+        .stream_mux
+        .delivery_ledger()
+        .register_hold(HoldIdentity {
+            session_id: session_id.clone(),
+            layer_name: layer_name.clone(),
+            client_id: client_id.clone(),
+        });
+    let take_clock = hold.take_clock();
 
     let svc = service.clone();
     let session_id_owned = session_id.clone();
@@ -465,6 +502,7 @@ async fn subscribe_read_layer_inner(
             let ctx = SubscriberCtx {
                 svc: &svc,
                 tx: &tx,
+                hold: &hold,
                 shutdown: &shutdown,
                 session_cancel: session_cancel.as_ref(),
                 session_id: &session_id_owned,
@@ -497,10 +535,14 @@ async fn subscribe_read_layer_inner(
         outcome.record_into(&mut tail_log);
         tail_log.exit_reason(reason);
         tail_log.caught_up(caught_up);
-        // A shutdown ending is expected on every rolling restart: its
-        // `UNAVAILABLE` line is INFO, not WARN (see `rpc_log::failure_level`).
+        // A shutdown ending is expected on every rolling restart, and a fleet
+        // hold's ending is a consequence of the hold, reported on its own: their
+        // `UNAVAILABLE` lines are INFO, not WARN (see `rpc_log::failure_level`).
+        // A hold is not a shutdown, so it has its own marker.
         if reason == STREAM_EXIT_SHUTDOWN {
             tail_log.shutdown_caused();
+        } else if reason == STREAM_EXIT_HELD {
+            tail_log.hold_caused();
         }
         if let (TeardownEvent::CompletionLine, Err(status)) =
             (teardown_event(&result, reason, caught_up), &result)
@@ -523,13 +565,14 @@ async fn subscribe_read_layer_inner(
             //
             // Every other reason surfaces its status, and it matters that they
             // do:
-            //   * `slow_reader_deadline` and `inner_watchdog` — server-driven
-            //     tear-downs. `UNAVAILABLE`, per the b.c7a contract, so the
-            //     client re-subscribes and catches up from the position it
-            //     holds. An `inner_watchdog` (or any other ending of the
-            //     subscription's stream registration) recorded before the
-            //     catch-up's first message ends the catch-up before any
-            //     content (`end_catch_up_if_stream_ended`).
+            //   * `slow_reader_deadline`, `delivery_budget` and
+            //     `inner_watchdog` — server-driven tear-downs. `UNAVAILABLE`,
+            //     per the b.c7a contract, so the client re-subscribes and
+            //     catches up from the position it holds. An `inner_watchdog`
+            //     (or any other ending of the subscription's stream
+            //     registration) recorded before the catch-up's first message
+            //     ends the catch-up before any content
+            //     (`end_catch_up_if_stream_ended`).
             //   * `shutdown` — graceful shutdown, in any phase: mid-catch-up,
             //     mid-delivery or idle. `UNAVAILABLE "server shutting down"`,
             //     so the client re-subscribes with the position it holds and
@@ -538,6 +581,11 @@ async fn subscribe_read_layer_inner(
             //     connections. The Kit client
             //     never retries `OK`, so a clean end here would silently end its
             //     live feed on every rolling restart.
+            //   * `held` and `stale_verdict` — the fleet hold's ending cancelled the
+            //     subscription's token, in any phase: `UNAVAILABLE` with
+            //     `SERVICE_HELD` (a fleet hold, naming its incident) or
+            //     `UPSTREAM_UNAVAILABLE` (this replica's hold verdict went
+            //     stale), so the client retries after the retry delay.
             //   * `session_cancel` — the session token was observed cancelled
             //     for an explicit `DeleteSession`, in any phase. `NOT_FOUND
             //     "session was deleted"`: there is nothing to reconnect to, and
@@ -592,30 +640,46 @@ async fn subscribe_read_layer_inner(
             // Reaching `send_terminal_status` means the status IS enqueued: it
             // writes into a slot reserved before this subscription sent anything,
             // so there is no arm on which a server-driven tear-down degrades into
-            // a bare EOS the client would read as `OK`.
+            // a bare EOS the client would read as `OK`. Every such ending first
+            // discards the data still queued, so the status is the next message
+            // a client that resumes reading gets.
             if reason != STREAM_EXIT_CLIENT_DISCONNECT {
-                send_terminal_status(trailer_permit, status);
+                send_terminal_status(tx, status);
             }
         }
+        // The hold leaves the ledger only after the queue was cleared, so the
+        // pending release the budget credited for an ended subscription stays
+        // counted until its bytes are released.
+        drop(hold);
         // Exactly one exit observation per established subscription — that is
         // what makes `sum by (reason)` the total (b.f4f).
         svc.metrics.inc_subscriber_stream_exit(reason);
     });
 
-    // The channel's items, unchanged, with the `transport` delivery lag
-    // measured as tonic polls each stamped one.
-    let stream = TransportLagStream::new(rx, service.metrics.clone());
+    // The queue's items, unchanged, with the `transport` delivery lag
+    // measured as tonic polls each stamped one, and each take stamped on the
+    // hold.
+    let stream = TransportLagStream::new(rx, service.metrics.clone(), Some(take_clock));
     Ok(Response::new(Box::pin(stream)))
 }
 
-/// Enqueue the terminal trailer into the slot reserved for it when the response
-/// channel was created (b.f4f).
+/// Discard the data still queued and enqueue the terminal trailer into the
+/// status slot the response queue reserved when it was created (b.f4f; SDD
+/// §12.6).
+///
+/// **The discard.** Every server-driven ending drops the data messages still
+/// queued before its status: a client that resumes reading after the ending
+/// gets the status next, and reconnects to catch up, rather than the stretch
+/// of updates the server had queued for it. Dropping them releases at once
+/// what they held — their relay copies' and catch-up pages' shares of the
+/// live-delivery and catch-up payload budgets — instead of when, or if, a
+/// stalled peer drains them. A client disconnect sends no status and needs no
+/// discard: its queue went with its receiver.
 ///
 /// **Synchronous, infallible and unconditional**, and all three matter.
-/// `OwnedPermit::send` writes into capacity this subscription has held since
-/// before it did any work, so there is no await, nothing to race, and no way for
-/// a full channel to refuse it. The status is therefore *always* enqueued ahead
-/// of the stream's end.
+/// The status slot was reserved before this subscription did any work, so
+/// there is no await, nothing to race, and no way for a full queue to refuse
+/// it. The status is therefore *always* enqueued ahead of the stream's end.
 ///
 /// The obvious alternatives are both wrong, and the reason is the same in each
 /// case — a trailer is not an ordinary message and must not queue behind the
@@ -641,11 +705,11 @@ async fn subscribe_read_layer_inner(
 /// business: a receiver that is never drained never sees it, and a dropped
 /// receiver discards it. Neither can turn a server-driven tear-down into an
 /// `OK`, which is the property this function exists to hold.
-fn send_terminal_status(permit: mpsc::OwnedPermit<Outbound>, status: Status) {
-    // Returns the `Sender` the permit was reserved from; dropping it here is
-    // correct — this is the last thing the subscription sends. The trailer
-    // ends no live delivery, so it carries no commit stamp.
-    let _sender = permit.send(Outbound::unstamped(Err(status)));
+fn send_terminal_status(tx: ResponseSender<Outbound>, status: Status) {
+    tx.clear_data();
+    // This is the last thing the subscription sends: it consumes the sender.
+    // The trailer ends no live delivery, so it carries no commit stamp.
+    tx.send_status(Outbound::unstamped(Err(status)));
 }
 
 /// Map an admission refusal to the gRPC status the client sees.
@@ -663,7 +727,10 @@ fn send_terminal_status(permit: mpsc::OwnedPermit<Outbound>, status: Status) {
 /// `docs-internal/cross-repo-debugging.md` § Kit client retry and reconnect
 /// behaviour). A shutdown refusal carries
 /// the same status as every other shutdown ending
-/// ([`server_shutting_down`]).
+/// ([`server_shutting_down`]). The handler maps a shutdown refusal itself,
+/// by its enrolled token's cause ([`StreamShutdown::ending_status`]), so a
+/// refusal by the fleet hold's ending carries the hold's status; this arm is
+/// the mapping for no hold cause.
 ///
 /// A cancelled session token maps by its cause (`session_cause`, the
 /// handler's [`SessionCancel::cause`]), to the same status an established
@@ -765,6 +832,9 @@ impl StreamExitCell {
     const CATCHUP_CAPACITY: u8 = 8;
     const STREAM_GAP: u8 = 9;
     const FENCED_READ_WAIT_CAP: u8 = 10;
+    const HELD: u8 = 11;
+    const STALE_VERDICT: u8 = 12;
+    const DELIVERY_BUDGET: u8 = 13;
 
     fn set(&self, code: u8) {
         self.0.store(code, std::sync::atomic::Ordering::Release);
@@ -784,6 +854,9 @@ impl StreamExitCell {
             STREAM_EXIT_CATCHUP_CAPACITY => Self::CATCHUP_CAPACITY,
             STREAM_EXIT_FENCED_READ_WAIT_CAP => Self::FENCED_READ_WAIT_CAP,
             STREAM_EXIT_STREAM_GAP => Self::STREAM_GAP,
+            STREAM_EXIT_HELD => Self::HELD,
+            STREAM_EXIT_STALE_VERDICT => Self::STALE_VERDICT,
+            STREAM_EXIT_DELIVERY_BUDGET => Self::DELIVERY_BUDGET,
             _ => Self::ERROR,
         });
     }
@@ -800,6 +873,9 @@ impl StreamExitCell {
             Self::CATCHUP_CAPACITY => STREAM_EXIT_CATCHUP_CAPACITY,
             Self::FENCED_READ_WAIT_CAP => STREAM_EXIT_FENCED_READ_WAIT_CAP,
             Self::STREAM_GAP => STREAM_EXIT_STREAM_GAP,
+            Self::HELD => STREAM_EXIT_HELD,
+            Self::STALE_VERDICT => STREAM_EXIT_STALE_VERDICT,
+            Self::DELIVERY_BUDGET => STREAM_EXIT_DELIVERY_BUDGET,
             _ => STREAM_EXIT_ERROR,
         }
     }
@@ -1010,13 +1086,28 @@ fn teardown_event(
 /// Shared context for the spawned subscription task.
 struct SubscriberCtx<'a> {
     svc: &'a LiveEditService,
-    tx: &'a mpsc::Sender<Outbound>,
-    /// This subscription's enrolled child of the service shutdown token.
-    /// Cancelled only by graceful shutdown — in its batch of the paced ending,
-    /// or with the service token; every observation ends the RPC with
-    /// [`server_shutting_down`] and `reason="shutdown"`. Checked before
+    /// The response queue (`grpc::response_queue`): 32 data slots, the status
+    /// slot apart from them.
+    tx: &'a ResponseSender<Outbound>,
+    /// This RPC's live-delivery hold (`storage::stream_mux::delivery_ledger`).
+    /// Its token fires when the live-delivery budget ends the subscription
+    /// (`delivery_budget`) or a catch-up waiting for catch-up payload memory
+    /// ends it as a stalled holder (`slow_reader_deadline`); every wait that
+    /// races `tx.closed()` races it too, right after
+    /// ([`SubscriberCtx::end_on_hold`]). Not the fleet (disaster-recovery)
+    /// hold, which reaches the subscription through `shutdown` below.
+    hold: &'a SubscriptionHold,
+    /// This subscription's enrolled child of the service shutdown token, with
+    /// its own cause slot. Cancelled by graceful shutdown — in its batch of the
+    /// paced ending, or with the service token — or by the fleet hold's
+    /// ending, which records its cause first. Every observation ends the RPC
+    /// through [`SubscriberCtx::end_on_shutdown`], by the cause:
+    /// [`server_shutting_down`] and `reason="shutdown"` for a shutdown,
+    /// `SERVICE_HELD` and `reason="held"` for a fleet hold,
+    /// `UPSTREAM_UNAVAILABLE` and `reason="stale_verdict"` for a stale hold
+    /// verdict. Checked before
     /// `session_cancel` everywhere both are observed.
-    shutdown: &'a CancellationToken,
+    shutdown: &'a StreamShutdown,
     /// The per-session token, cancelled only once the session is gone from the
     /// store. Every observation ends the RPC by the cancel's cause
     /// ([`SubscriberCtx::end_on_session_cancel`]): [`session_deleted`] with
@@ -1052,6 +1143,25 @@ impl SubscriberCtx<'_> {
         self.session_cancel.map(SessionCancel::token)
     }
 
+    /// End the subscription for an observed cancel of its enrolled shutdown
+    /// token: record the exit reason for the token's cause and return its
+    /// status ([`StreamShutdown::ending_status`]) — `shutdown` and
+    /// [`server_shutting_down`] when graceful shutdown cancelled it, `held`
+    /// and `SERVICE_HELD` for a fleet hold, `stale_verdict` and
+    /// `UPSTREAM_UNAVAILABLE` for a stale hold verdict. Every arm that
+    /// observes the token ends through here, so the phases cannot disagree.
+    /// The endings driven by the shutdown sequence alone (a gate or the
+    /// multiplexer closed by `ValkeyClient::quit`, a flight closed) do not:
+    /// they stay `shutdown`.
+    fn end_on_shutdown(&self) -> Status {
+        self.exit.set(match self.shutdown.hold_cause() {
+            None => StreamExitCell::SHUTDOWN,
+            Some(HoldCause::Held { .. }) => StreamExitCell::HELD,
+            Some(HoldCause::StaleVerdict) => StreamExitCell::STALE_VERDICT,
+        });
+        self.shutdown.ending_status()
+    }
+
     /// End the subscription for an observed session-token cancel: record the
     /// exit reason for the cancel's cause and return its status
     /// ([`session_cancel_status`]). Every arm that observes the session token
@@ -1064,6 +1174,39 @@ impl SubscriberCtx<'_> {
         });
         session_cancel_status(cause)
     }
+
+    /// End the subscription for an observed live-delivery hold ending (not
+    /// the fleet hold, which ends through [`Self::end_on_shutdown`]): record the exit
+    /// reason the ledger gave and return its status. `delivery_budget` — the
+    /// live-delivery budget picked this subscription — ends `UNAVAILABLE`
+    /// with [`DELIVERY_BUDGET_ENDING_MSG`]; `slow_reader_deadline` — a
+    /// catch-up waiting for catch-up payload memory found this one's queue
+    /// holding catch-up pages with nothing taken for the outer send deadline
+    /// — ends with the slow-reader status. Both are retried by clients. Every
+    /// arm that observes the hold ends through here.
+    fn end_on_hold(&self) -> Status {
+        match self.hold.ending_reason() {
+            Some(STREAM_EXIT_SLOW_READER_DEADLINE) => {
+                self.exit.set(StreamExitCell::SLOW_READER_DEADLINE);
+                slow_reader_status(outer_send_deadline(self.svc))
+            }
+            _ => {
+                self.exit.set(StreamExitCell::DELIVERY_BUDGET);
+                ServiceError::Unavailable(DELIVERY_BUDGET_ENDING_MSG.to_owned()).into()
+            }
+        }
+    }
+}
+
+/// The status of a `slow_reader_deadline` ending: `UNAVAILABLE`, so the client
+/// re-subscribes. One constructor for the outer-send deadline and the
+/// stalled-catch-up-holder ending, so both say the same thing.
+fn slow_reader_status(deadline: std::time::Duration) -> Status {
+    ServiceError::Unavailable(format!(
+        "subscriber did not read its stream within {}ms; tearing down",
+        deadline.as_millis()
+    ))
+    .into()
 }
 
 /// Tracked subscriber position after catch-up. Feeds the steady-state loop.
@@ -1077,7 +1220,7 @@ struct CatchUpOutcome {
     consumer: LayerStreamConsumer,
     /// Catch-up delivery mode for the `catchup_mode` metric attribute (Plan
     /// b.msb): `"snapshot"` ONLY for the corrected faithful full-state path
-    /// (`send_full_state`'s `Snapshot` arm); `"legacy"` for every other outcome.
+    /// (`send_full_state`); `"legacy"` for every other outcome.
     catchup_mode: &'static str,
     /// OMPF bytes delivered to the subscriber during this catch-up regime, fed
     /// to the `live_subscribe_catch_up_delivered_bytes` histogram (Plan b.msb).
@@ -1121,20 +1264,13 @@ struct CatchUpContent {
 /// attached catch-up, its flight's shared fenced read's; `unverified` for a
 /// read whose cut regressed below the catch-up's first header read, which
 /// ends the catch-up `UNAVAILABLE` ([`catch_up_regressed`]), or for a
-/// rollback-mode in-window replay's per-commit read whose cut is below the
-/// commit it rebuilds, which ends it the same way
-/// ([`per_commit_regressed`]; the only replay read recorded here), or for a
 /// re-read after an external-value miss whose cut is below the first read's
 /// ([`reread_and_rebuild`]).
 ///
 /// `regime` is the literal of the catch-up path that took the read (`brand_new`
 /// | `in_window` | `out_of_window`). It matches what the caller's regime reports
 /// to `observe_subscribe_regime`, so the stable-cut counters join against
-/// `subscribe_regime_total`, with one deliberate exception: a rollback-mode
-/// in-window replay that hands over above the ceiling
-/// ([`OutOfWindowEntry::AboveCeiling`]) records `out_of_window` here, because
-/// the read is Regime 3's, while `subscribe_regime_total` still counts the
-/// catch-up `in_window` (SDD §12.3).
+/// `subscribe_regime_total`.
 fn record_stable_cut(ctx: &SubscriberCtx<'_>, verified: bool, regime: &'static str) {
     ctx.svc
         .metrics
@@ -1159,12 +1295,10 @@ fn record_stable_cut(ctx: &SubscriberCtx<'_>, verified: bool, regime: &'static s
 /// is sent: a catch-up payload with no proven cut cannot say what it serves.
 ///
 /// **Empty payloads.** No regime reaches here with zero OMPF bytes. A
-/// coalesced diff is an incremental delta — always from the faithful builder,
-/// and from the legacy `compute_diff_at_cut` whenever the state it read is above
-/// `have_version`, which every catch-up's is: a regime that serves content
-/// read its header sequence P above `have_version`, and a cut below P ends the
-/// catch-up before it builds, in every regime and in both modes — and an
-/// incremental delta is never zero bytes. So a reconnector whose gap held
+/// coalesced diff is an incremental delta from the faithful builder — a
+/// regime that serves content read its header sequence P above
+/// `have_version`, and a cut below P ends the catch-up before it builds, in
+/// every regime — and an incremental delta is never zero bytes. So a reconnector whose gap held
 /// only empty commits still receives one delta, empty of changes, based at
 /// `have_version` and labelled with the served version, which is what keeps
 /// the client's sequence contiguous.
@@ -1172,10 +1306,18 @@ fn record_stable_cut(ctx: &SubscriberCtx<'_>, verified: bool, regime: &'static s
 /// Regime 1 enforces the same rule *before* calling here: a from-empty
 /// establishment payload must never be empty, so `send_full_state` fails it as
 /// `INTERNAL` (SR-1.2) rather than reaching this helper with zero bytes.
+///
+/// **Pages.** The payload is consumed: each page moves into its chunk message
+/// (`chunk_pages_for_stream`), so its share of the catch-up payload budget is
+/// repaid when the stream has sent it, and a page still queued when the
+/// subscription ends is dropped with the queue. While queued, each page counts
+/// on the subscription's hold ([`SubscriptionHold::queue_catchup_page`]), so a
+/// catch-up waiting for catch-up payload memory can find a holder that stopped
+/// reading.
 async fn deliver_catch_up_content(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
-    diff_response: &DiffResponse,
+    diff_response: DiffResponse,
     regime: &'static str,
     catchup_mode: &'static str,
 ) -> Result<CatchUpContent, Status> {
@@ -1199,7 +1341,8 @@ async fn deliver_catch_up_content(
         }
     };
 
-    if !diff_response.ompf_bytes.is_empty() {
+    let delivered_bytes = diff_response.payload.len();
+    if !diff_response.payload.is_empty() {
         let stream_header = OmpfStreamHeader {
             object_id,
             sequence_num: effective_version,
@@ -1211,8 +1354,16 @@ async fn deliver_catch_up_content(
         // no dead local for the optimiser to have to remove.
         #[cfg(any(test, feature = "test-fault-injection"))]
         let mut chunks_sent = 0usize;
-        for msg in chunk_ompf_for_stream(&diff_response.ompf_bytes, &stream_header) {
-            send_or_disconnect(ctx, msg).await?;
+        for msg in chunk_pages_for_stream(diff_response.payload, &stream_header) {
+            let release = match &msg.response_type {
+                Some(subscribe_read_layer_response::ResponseType::Chunk(chunk)) => {
+                    Some(OutboundRelease::CatchUpPage(
+                        ctx.hold.queue_catchup_page(chunk.data.len() as u64),
+                    ))
+                }
+                _ => None,
+            };
+            send_or_disconnect_as(ctx, msg, SendKind::CatchUp, release).await?;
             // Test-only park, after the FIRST chunk only: content has been
             // delivered, the caught-up ack has not, and the test can now fire a
             // cancellation into exactly that window (b.f4f). A no-op when no
@@ -1230,7 +1381,7 @@ async fn deliver_catch_up_content(
     }
 
     Ok(CatchUpContent {
-        delivered_bytes: diff_response.ompf_bytes.len() as u64,
+        delivered_bytes,
         catchup_mode,
         effective_version,
     })
@@ -1257,10 +1408,8 @@ async fn run_subscription(ctx: &SubscriberCtx<'_>) -> Result<(), Status> {
 /// — that's the branch `run_catch_up` selected. See b.qxe.
 ///
 /// Takes no catch-up slot itself: each regime takes one around its
-/// backing-store reads and build (and, in rollback mode on a same-object
-/// reconnect, its cluster stream-reader wait) only, and has released it before
-/// its first send, so the caught-up ack below never waits behind, or holds, a
-/// slot.
+/// backing-store reads and build only, and has released it before its first
+/// send, so the caught-up ack below never waits behind, or holds, a slot.
 async fn run_catch_up(ctx: &SubscriberCtx<'_>) -> Result<CatchUpOutcome, Status> {
     let start = Instant::now();
     let (outcome, regime) = run_catch_up_inner(ctx).await?;
@@ -1281,11 +1430,11 @@ async fn run_catch_up(ctx: &SubscriberCtx<'_>) -> Result<CatchUpOutcome, Status>
     // never leaves initial-sync and silently stashes subsequent live updates
     // (b.dy5, sibling of b.rdr). Placed AFTER `observe_subscribe_regime` so the
     // regime metric stays exactly-once even if this send fails. MUST carry
-    // `outcome.tracked_version` (the last replayed/delivered endpoint per
-    // regime), NOT a recomputed `current_seq`: for the in-window under-replay
-    // case `tracked_version` is the last *replayed* sequence while `current_seq`
-    // is the header's value, and acking `current_seq` there would make the
-    // client treat the unreplayed real edits as already-seen.
+    // `outcome.tracked_version` (the version the regime's content was stamped
+    // with, `CatchUpContent::effective_version`; the header sequence for
+    // `up_to_date`), NOT a recomputed `current_seq`: the header sequence read
+    // before the capacity waits can be below the proven cut the content
+    // served, and the ack must name exactly what the content carried.
     send_ack_header(ctx, outcome.tracked_object_id, outcome.tracked_version).await?;
     // The first caught-up ack is enqueued: from here a client disconnect is a
     // client leaving an established stream, which the tail does not log. A
@@ -1457,41 +1606,24 @@ async fn run_catch_up_inner(
     // fenced-read flight, whose own slot covers the read and the build turns
     // (`catch_up_proven_read`).
     //
-    // Snapshot mode (the default) RESERVES the stream reader HERE, before the
-    // slot, so a cluster-mode wait for a reader never holds a slot. The
-    // reservation queues nothing: each regime registers the stream only at
-    // its proven read's cut (`catch_up_proven_read`), after every capacity
-    // wait — so nothing that lands during the capacity waits is queued only
-    // to be dropped as already covered by the ack.
-    //
-    // The rollback mode (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) instead
-    // takes its reader under the slot, after the in-window read: the legacy
-    // in-window replay registers at the last entry it read, which only that
-    // read names, and the out-of-window regime reserves there and registers
-    // where snapshot mode does. Its reader wait is still bounded by the
-    // capacity budget, and runs holding the slot.
-    let reserved = if ctx.svc.catchup_snapshot_enabled {
-        Some(reserve_stream(ctx, object_id).await?)
-    } else {
-        None
-    };
+    // The stream reader is RESERVED HERE, before the slot, so a cluster-mode
+    // wait for a reader never holds a slot. The reservation queues nothing:
+    // each regime registers the stream only at its proven read's cut
+    // (`catch_up_proven_read`), after every capacity wait before the read — so
+    // nothing that lands during those waits is queued only to be dropped as
+    // already covered by the ack. (The catch-up payload budget wait comes
+    // after the read, with the stream registered: `reserve_catchup_payload`.)
+    let reserved = reserve_stream(ctx, object_id).await?;
     let slot = acquire_catchup_slot(ctx).await?;
 
     // The regime test: the subscriber is in-window when the stream still
     // holds exactly `{have_version+1}-0`, the first commit it has not seen.
-    // Otherwise fall through to Regime 3. Both modes read under the slot, and
-    // neither pulls the retained window into one reply:
-    //
-    // - Snapshot mode (the default) needs only two answers, never an entry's
-    //   bytes: is `{have_version+1}-0` there, and is the stream's last entry a
-    //   `deleted` sentinel. Two single-entry reads in one round trip
-    //   (`read_in_window_point`), so a catch-up moves at most two entries
-    //   whatever the window holds.
-    // - Rollback mode replays every retained commit, so it reads the window
-    //   in byte-sized pages, each parsed and dropped before the next, and
-    //   falls through to Regime 3 when `{have_version+1}-0` is gone after a
-    //   multi-page read (a trim between pages may have left a hole)
-    //   (`read_in_window_replay`).
+    // Otherwise fall through to Regime 3. It reads under the slot, and never
+    // pulls the retained window into one reply: it needs only two answers,
+    // never an entry's bytes — is `{have_version+1}-0` there, and is the
+    // stream's last entry a `deleted` sentinel. Two single-entry reads in one
+    // round trip (`read_in_window_point`), so a catch-up moves at most two
+    // entries whatever the window holds.
     let start_id = format!("{}-0", ctx.have_version + 1);
     let stream_key = ctx.svc.key_schema.layer_stream(object_id);
 
@@ -1499,70 +1631,42 @@ async fn run_catch_up_inner(
     // holding the catch-up slot — so a test can deterministically interleave
     // a `create_layer` overwrite
     // between the header read above and the in-window stream read below —
-    // exactly the production race that makes the literal `catch_up_in_window`
-    // mid-window `Deleted` variant untestable without a seam. Gated behind
-    // `test-fault-injection` so release builds never see this branch.
+    // exactly the production race that leaves a `deleted` sentinel at the
+    // stream's end for `catch_up_in_window` to find, untestable without a
+    // seam. Gated behind `test-fault-injection` so release builds never see
+    // this branch.
     #[cfg(any(test, feature = "test-fault-injection"))]
     if let Some(seam) = ctx.svc.catch_up_xrange_seam_for_test.as_ref() {
         seam.arrive_and_wait().await;
     }
 
-    if let Some(reserved) = reserved {
-        let point = read_in_window_point(ctx, &stream_key, &start_id).await?;
-        if point.in_window {
-            let outcome = Box::pin(catch_up_in_window_snapshot(
-                ctx,
-                object_id,
-                point.deleted_sentinel,
-                current_seq,
-                reserved,
-                slot,
-            ))
-            .await?;
-            return Ok((outcome, "in_window"));
-        }
-        // Regime 3: out of window. Fall back to the coalesced diff + tail from
-        // the proven read's cut.
-        let outcome = Box::pin(catch_up_out_of_window(
-            ctx,
-            object_id,
-            current_seq,
-            reserved,
-            slot,
-            OutOfWindowEntry::ProvenRead,
-        ))
-        .await?;
-        return Ok((outcome, "out_of_window"));
-    }
-
-    if let Some(replay) = read_in_window_replay(ctx, &stream_key, &start_id).await? {
+    let point = read_in_window_point(ctx, &stream_key, &start_id).await?;
+    if point.in_window {
         let outcome = Box::pin(catch_up_in_window(
             ctx,
             object_id,
-            replay,
+            point.deleted_sentinel,
             current_seq,
+            reserved,
             slot,
         ))
         .await?;
         return Ok((outcome, "in_window"));
     }
-
-    // Regime 3, rollback mode: the reader is reserved under the slot; the
-    // stream is registered where snapshot mode registers it.
-    let reserved = reserve_stream(ctx, object_id).await?;
+    // Regime 3: out of window. Fall back to the coalesced diff + tail from
+    // the proven read's cut.
     let outcome = Box::pin(catch_up_out_of_window(
         ctx,
         object_id,
         current_seq,
         reserved,
         slot,
-        OutOfWindowEntry::ProvenRead,
     ))
     .await?;
     Ok((outcome, "out_of_window"))
 }
 
-/// Snapshot mode's in-window regime test ([`read_in_window_point`]).
+/// The in-window regime test ([`read_in_window_point`]).
 struct InWindowPoint {
     /// The stream holds `{have_version+1}-0`.
     in_window: bool,
@@ -1570,7 +1674,7 @@ struct InWindowPoint {
     deleted_sentinel: Option<String>,
 }
 
-/// Snapshot mode's in-window regime test, under the caller's catch-up slot:
+/// The in-window regime test, under the caller's catch-up slot:
 /// `XRANGE key {h+1}-0 {h+1}-0` and `XREVRANGE key + {h+1}-0 COUNT 1`, pipelined
 /// in one round trip on one connection (the same key, so the same slot).
 ///
@@ -1652,179 +1756,6 @@ async fn read_in_window_point(
         in_window: point.first().is_some_and(|(id, _)| id == start_id),
         deleted_sentinel,
     })
-}
-
-/// Rollback mode's in-window window, as [`read_in_window_replay`] read it.
-struct InWindowReplay {
-    /// The id of the last entry read, the steady-state consumer's start.
-    last_entry_id: String,
-    /// Every entry read whose `payload` parsed, in stream order: its id, its
-    /// notification, and whether it carried relay bytes (an `ompf` field).
-    replay: Vec<(String, LayerNotification, bool)>,
-}
-
-/// Rollback mode's in-window read, under the caller's catch-up slot: the
-/// stream from `{h+1}-0` to its end, `None` when the stream no longer holds
-/// `{h+1}-0` (out of window; nothing past the first page is read).
-///
-/// Paged with `XRANGE key <cursor> + COUNT n`, each page's `n` byte-sized from
-/// the largest entry read so far ([`crate::storage::stream_mux::paged_xrange_count`],
-/// the soft rule of the stream multiplexer's reads), the cursor advanced to
-/// the exclusive `({last id}`. Each page is parsed into `(id, notification,
-/// has_ompf)` and dropped, `ompf` bytes included, before the next is read, so
-/// a catch-up never holds more than one page of relay payload. The relay byte
-/// budget bounds the whole window at about one budget's bytes.
-///
-/// Paging makes the read non-atomic, so a read of more than one page ends with
-/// one more `XRANGE key {h+1}-0 {h+1}-0`, and answers `None` (out of window)
-/// when `{h+1}-0` is gone. A head trim between two pages (`MAXLEN ~` on a
-/// concurrent `XADD`, or the relay byte budget's `XTRIM MINID ~`) can remove
-/// entries past the cursor, and the next page would then start beyond the
-/// hole, acking commits it never replays. Trimming is head-only and monotone,
-/// so any trim that removed an entry past `{h+1}-0` removed `{h+1}-0` first,
-/// and a check issued after the last page sees it. A one-page read is one
-/// atomic `XRANGE`, which cannot hold a hole, so it skips the check.
-///
-/// The read stops at the stream's end (a page shorter than its `COUNT`) or
-/// after [`in_window_xrange_count`] entries. Past that cap the replay
-/// under-replays, which is safe: the steady-state consumer opens at the last
-/// entry read and relays the remainder live. The loop runs to the end rather
-/// than stopping after one page because the live remainder lands in the
-/// subscription's bounded backlog, which a window of large entries would
-/// overflow.
-///
-/// An entry with no `payload`, a non-UTF-8 one, or one that does not parse is
-/// skipped with a WARN, as the replay always has, but still moves
-/// `last_entry_id`. Single-attempt reads with no in-process retry: a
-/// transient failure answers `UNAVAILABLE`, a permanent one `INTERNAL`.
-async fn read_in_window_replay(
-    ctx: &SubscriberCtx<'_>,
-    stream_key: &str,
-    start_id: &str,
-) -> Result<Option<InWindowReplay>, Status> {
-    let entry_cap = in_window_xrange_count(ctx.svc);
-    let map_err = |what: &'static str, e: fred::error::Error| -> Status {
-        crate::storage::client::map_fred_err_for_grpc(
-            crate::storage::client::FredErrOrigin::client(
-                &ctx.svc.valkey,
-                crate::storage::client::POOL_LABEL_DATA,
-            ),
-            what,
-            e,
-        )
-        .into()
-    };
-    let mut cursor = start_id.to_owned();
-    let mut read: u64 = 0;
-    let mut pages: u32 = 0;
-    let mut largest_entry_bytes: Option<u64> = None;
-    let mut last_entry_id: Option<String> = None;
-    let mut replay: Vec<(String, LayerNotification, bool)> = Vec::new();
-    loop {
-        let count = crate::storage::stream_mux::paged_xrange_count(largest_entry_bytes)
-            .min(entry_cap - read);
-        // Field VALUES decode as `Bytes` (not `String`): see
-        // `read_in_window_point`. The replay re-validates `payload` as UTF-8,
-        // and of `ompf` uses only its presence.
-        let page: Vec<(String, HashMap<String, Bytes>)> = ctx
-            .svc
-            .valkey
-            .pool
-            .xrange_values(stream_key, cursor.as_str(), "+", Some(count))
-            .await
-            .map_err(|e| map_err("XRANGE in-window replay page", e))?;
-        pages = pages.saturating_add(1);
-        if last_entry_id.is_none() && page.first().is_none_or(|(id, _)| id != start_id) {
-            // Out of window: the stream no longer holds `{h+1}-0`.
-            return Ok(None);
-        }
-        let page_len = page.len() as u64;
-        read += page_len;
-        for (entry_id, fields) in page {
-            let entry_bytes = crate::storage::stream_mux::stream_entry_bytes(&entry_id, &fields);
-            largest_entry_bytes =
-                Some(largest_entry_bytes.map_or(entry_bytes, |largest| largest.max(entry_bytes)));
-            if let Some(notification) = parse_replay_entry(ctx, &entry_id, &fields) {
-                replay.push((
-                    entry_id.clone(),
-                    notification,
-                    fields.contains_key(crate::storage::notifications::RELAY_OMPF_FIELD),
-                ));
-            }
-            last_entry_id = Some(entry_id);
-        }
-        let Some(last) = last_entry_id.as_deref() else {
-            // Unreachable: the in-window check above saw a first entry.
-            return Ok(None);
-        };
-        if page_len < count || read >= entry_cap {
-            if pages > 1 {
-                // A head trim between two pages can have removed entries past
-                // the cursor; any such trim removed `{h+1}-0` first (head-only,
-                // monotone), and this check runs after the last page.
-                let still_held: Vec<(String, HashMap<String, Bytes>)> = ctx
-                    .svc
-                    .valkey
-                    .pool
-                    .xrange_values(stream_key, start_id, start_id, Some(1))
-                    .await
-                    .map_err(|e| map_err("XRANGE in-window replay window-start check", e))?;
-                if still_held.first().is_none_or(|(id, _)| id != start_id) {
-                    // Trimmed mid-replay: the pages may hold a hole, so the
-                    // window is out, never replayed with the hole acked.
-                    return Ok(None);
-                }
-            }
-            return Ok(Some(InWindowReplay {
-                last_entry_id: last.to_owned(),
-                replay,
-            }));
-        }
-        cursor = format!("({last}");
-    }
-}
-
-/// One in-window entry's notification, or `None` — with the WARN the replay
-/// has always logged — when the entry has no `payload`, a non-UTF-8 one, or
-/// one that does not parse.
-fn parse_replay_entry(
-    ctx: &SubscriberCtx<'_>,
-    entry_id: &str,
-    fields: &HashMap<String, Bytes>,
-) -> Option<LayerNotification> {
-    let Some(payload_bytes) = fields.get(crate::storage::notifications::NOTIFICATION_PAYLOAD_FIELD)
-    else {
-        tracing::warn!(
-            session_id = %ctx.session_id,
-            layer_name = %ctx.layer_name,
-            entry_id = %entry_id,
-            "in-window entry missing payload field; skipping"
-        );
-        return None;
-    };
-    let Ok(payload) = std::str::from_utf8(payload_bytes) else {
-        tracing::warn!(
-            session_id = %ctx.session_id,
-            layer_name = %ctx.layer_name,
-            entry_id = %entry_id,
-            "in-window entry payload field is not valid UTF-8; skipping"
-        );
-        return None;
-    };
-    match LayerNotification::parse(payload) {
-        Ok(notification) => Some(notification),
-        Err(e) => {
-            tracing::warn!(
-                session_id = %ctx.session_id,
-                layer_name = %ctx.layer_name,
-                entry_id = %entry_id,
-                payload = %payload,
-                error = %e,
-                "failed to parse in-window stream entry; skipping"
-            );
-            None
-        }
-    }
 }
 
 /// Regime 1: brand-new subscriber (or overwrite-on-reconnect).
@@ -1914,19 +1845,24 @@ async fn catch_up_brand_new(
     // re-read after a miss replaces `consumer` in place, registered at the
     // re-read's cut, and gives the slot back if it attaches to a flight; the
     // slot, if still held, goes back here, before the ending check and the
-    // send.
-    let built = Box::pin(build_catch_up(
-        ctx,
-        object_id,
-        CatchUpBuild::FullState,
-        snapshot,
-        "brand_new",
-        &mut slot,
-        Some(&mut consumer),
-    ))
-    .await;
+    // send. The build races the subscription's endings, ending first: an
+    // ending drops it (its read hold, build turn and slot with it) and ends
+    // the catch-up by its cause.
+    let built = tokio::select! {
+        biased;
+        ending = subscription_ending(ctx) => return Err(ending),
+        built = Box::pin(build_catch_up(
+            ctx,
+            object_id,
+            CatchUpBuild::FullState,
+            snapshot,
+            "brand_new",
+            &mut slot,
+            &mut consumer,
+        )) => built,
+    };
     drop(slot);
-    let Some((diff_response, regime_mode)) = cut_based_payload(built?)? else {
+    let Some(diff_response) = cut_based_payload(built?) else {
         // The miss protocol's re-read answered `NotFound`, and its read hold
         // is released: stop the stream (a no-op: the re-read released its
         // registration), then the recovery the first read would have run,
@@ -1942,7 +1878,7 @@ async fn catch_up_brand_new(
     // Released; end the catch-up before its first message if its stream
     // registration ended during the build.
     end_catch_up_if_stream_ended(ctx, &consumer)?;
-    let content = send_full_state(ctx, object_id, &diff_response, regime_mode).await?;
+    let content = send_full_state(ctx, object_id, diff_response).await?;
 
     Ok(CatchUpOutcome {
         tracked_object_id: object_id,
@@ -1953,356 +1889,18 @@ async fn catch_up_brand_new(
     })
 }
 
-/// Regime 2, rollback mode (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`): known
-/// subscriber with the gap fully inside the retention window, replayed as the
-/// legacy per-commit reconstruction.
+/// Regime 2 (Plan b.msb, SR-2.1): deliver one re-established coalesced diff
+/// based at `have_version` to an in-window reconnector.
 ///
-/// Replays each retained entry as an individual per-commit diff, applying
-/// self-echo suppression per entry, and opens the steady-state consumer from
-/// the last replayed stream ID so nothing is duplicated on the steady-state
-/// loop. The default mode takes [`catch_up_in_window_snapshot`] instead
-/// (Plan b.msb, SR-2.1), which delivers a SINGLE re-established coalesced diff
-/// based at `have_version` — converging on the same primitive the out-of-window
-/// regime already uses; the only surviving distinction there is the regime
-/// metric label (`in_window`).
+/// NOT a full-state snapshot: this regime emits `is_diff=true`,
+/// `base_version=have_version`, carrying only net-live content newer than
+/// `have_version` plus the unified retraction set. The client's resulting
+/// scene is the FOLD of it onto the state it retained. That distinction is
+/// load-bearing — reading it as a full-state payload and comparing its content
+/// against the whole scene is a category error that only holds when
+/// `have_version` precedes every edit (Issue b.xvq).
 ///
-/// Entered holding the catch-up `slot` the caller took around the in-window
-/// read ([`read_in_window_replay`]), and every read and build of the replay
-/// runs under that one slot; only then is anything sent. `current_seq` is the
-/// header sequence the caller read before its capacity waits, P. In order:
-///
-/// 1. Take the window the paged read parsed, page by page, into
-///    `(id, notification, has_ompf)`; no `ompf` bytes are held.
-/// 2. Scan for a `deleted` sentinel. If there is one, release the slot and
-///    re-bootstrap before any consumer is opened or anything is sent — the
-///    check [`catch_up_in_window_snapshot`] makes from its point read.
-/// 3. Open the steady-state consumer at the window's last entry (its cluster
-///    reader wait bounded by the capacity budget).
-/// 4. Compute every commit's diff in order ([`replay_commit_diff`]): each from
-///    its own atomic read, under its own read permit taken inside the slot and
-///    charged to the capacity budget (Spec SDD SR-3.4, SR-7.1) — except an
-///    empty commit (an entry without relay bytes above sequence 1), whose
-///    empty delta is built with no read and no permit
-///    ([`empty_commit_payload`]). A read whose cut is below the commit it
-///    rebuilds (a sequence regression) is refused by the build itself
-///    ([`compute_per_commit_diff_at_cut`]) and ends the catch-up `UNAVAILABLE`
-///    ([`per_commit_regressed`]). Each commit's build runs under the
-///    external-value miss protocol ([`build_catch_up`]): a blob its read
-///    references that was collected since is re-read, under a new permit
-///    inside the slot, before it counts as missing. A `NotFound`
-///    (the OLD object's state gone, b.jvx Site A) releases the slot, stops the
-///    consumer and re-bootstraps, still before any content. On the first
-///    `TOO_LARGE` (the layer is above the atomic-read limits) — or, before a
-///    commit's read, on finding the object's shared fenced-read flight
-///    registered, which skips that atomic attempt — the replay stops: it
-///    drops the diffs computed so far, stops the consumer, reserves a reader
-///    under the same slot and hands the slot and P to the out-of-window route
-///    ([`catch_up_out_of_window`] with [`OutOfWindowEntry::AboveCeiling`]),
-///    which gives the slot back, attaches to the object's flight
-///    ([`catch_up_flight_read`]), registers at the flight's cut and delivers
-///    one coalesced diff — so the rollback switch never issues one fenced read
-///    per replayed commit.
-/// 5. Release the slot, end the catch-up if its stream registration already
-///    ended ([`end_catch_up_if_stream_ended`]), then send the stored diffs in
-///    order ([`send_per_commit_payload`]), freeing each after its send.
-///
-/// So every capacity wait of this catch-up — the slot, the reader, every read
-/// permit, and those of the out-of-window route or of a re-bootstrap it
-/// enters — comes before its first content message.
-async fn catch_up_in_window(
-    ctx: &SubscriberCtx<'_>,
-    object_id: u64,
-    window: InWindowReplay,
-    current_seq: u64,
-    slot: CatchUpPermit,
-) -> Result<CatchUpOutcome, Status> {
-    ctx.outcome
-        .set_regime(SubscriptionOutcomeCells::REGIME_IN_WINDOW);
-
-    // 1. The window as `read_in_window_replay` read it: each page was parsed
-    // into the replay's `(id, notification, has_ompf)` triples and dropped,
-    // relay `ompf` bytes included, so none stays pinned across the computes
-    // and sends; an entry with no payload, one that is not UTF-8, or one that
-    // does not parse was skipped there with the warning the replay has always
-    // logged for it. `last_entry_id` is the last entry read, skipped or not:
-    // the stream ID we'll hand off to the steady-state consumer.
-    let InWindowReplay {
-        last_entry_id,
-        replay,
-    } = window;
-
-    // 2. Overwrite handling: a `deleted` sentinel anywhere in the entries
-    // the in-window read returned means the OLD object is gone — re-resolve via the mapping and
-    // either terminate or re-bootstrap on the new object's stream. Scanned
-    // up-front, before any consumer is opened or anything is sent, so the
-    // OLD object's commits are not replayed ahead of the new object's state
-    // (which supersedes them) and the re-bootstrap's capacity waits come
-    // before any content.
-    if let Some((entry_id, _, _)) = replay
-        .iter()
-        .find(|(_, notification, _)| matches!(notification, LayerNotification::Deleted))
-    {
-        tracing::debug!(
-            session_id = %ctx.session_id,
-            layer_name = %ctx.layer_name,
-            object_id = object_id,
-            entry_id = %entry_id,
-            "in-window replay: deleted sentinel in the in-window read; re-bootstrapping"
-        );
-        drop(replay);
-        drop(slot);
-        return handle_deleted_and_rebootstrap(ctx, object_id, RebootstrapCause::DeletedSentinel)
-            .await;
-    }
-
-    // 3. Open the consumer BEFORE we deliver anything — if more entries land
-    // while we're replaying the window, the consumer picks them up from the
-    // last replayed ID onward. Position it at the last replayed stream ID.
-    let mut consumer =
-        open_consumer(ctx, object_id, StreamCursor::From(last_entry_id.clone())).await?;
-
-    // 4. Compute every commit's diff, in order, under the same slot. Each is
-    // stored with what its send needs; self-echo entries advance the tracked
-    // version and store nothing.
-    let mut tracked_version = ctx.have_version;
-    let mut diffs: Vec<ReplayDiff> = Vec::with_capacity(replay.len());
-    #[cfg(any(test, feature = "test-fault-injection"))]
-    let mut computed = 0usize;
-    for (_entry_id, notification, has_relay_ompf) in replay {
-        let LayerNotification::Update {
-            object_id: notif_oid,
-            sequence_num,
-            client_id: notif_client_id,
-            client_ts,
-            server_ts,
-            // b.gze: in-window catch-up keeps reconstructing per-commit
-            // diffs (the relay path is steady-state only; in-window's
-            // relay-vs-reconstruct question is a separately-filed deferred
-            // refinement). It uses only whether the entry carried relay bytes
-            // (`has_relay_ompf`, captured at parse), never the bytes.
-            relay_ompf: _,
-        } = notification
-        else {
-            // The scan above returned on any `Deleted`.
-            continue;
-        };
-        if notif_oid != object_id {
-            // Should not happen — the stream is per-object. Log and skip so
-            // we don't misattribute a diff.
-            tracing::warn!(
-                session_id = %ctx.session_id,
-                layer_name = %ctx.layer_name,
-                tracked_object_id = object_id,
-                notif_object_id = notif_oid,
-                "in-window entry object_id mismatch; skipping"
-            );
-            continue;
-        }
-
-        if is_self_echo(ctx.client_id, &notif_client_id) {
-            tracked_version = sequence_num;
-            continue;
-        }
-
-        // An entry without relay bytes above sequence 1 is an empty commit
-        // (SDD §12.2): store the empty delta based at the tracked version,
-        // built with no read and no permit, which is byte-identical to what
-        // its read would have built ([`empty_commit_payload`]). Sequence 1 is
-        // always the `CreateLayer` seed entry, which carries no relay bytes
-        // but is not empty (a restore appends no stream entry and seeds the
-        // sequence far above 1), so it keeps its read below and still
-        // delivers the full content. An empty commit performs no read, so it
-        // detects no sequence regression and is not counted by the
-        // between-computes seam below. Nor does it discover `TOO_LARGE` or the
-        // OLD object's state gone (b.jvx Site A's `NotFound`): an all-empty
-        // in-window replay racing an overwrite sends its empty deltas and the caught-up
-        // ack for the OLD object, and the stream's `deleted` entry then
-        // re-bootstraps through the steady-state overwrite path, whose
-        // capacity refusal, if any, comes after content. Closest
-        // deterministic test (no seam can park an all-empty replay):
-        // `a_rollback_replay_whose_empty_commits_race_an_overwrite_sends_them_then_rebootstraps_in_steady_state`
-        // in `tests/integration/grpc/subscribe_capacity_budget_test.rs`,
-        // window `[2, 3 empty, 4 empty]`.
-        if !has_relay_ompf && sequence_num > 1 {
-            // At least 1: the replay starts at `have_version + 1`, so with
-            // `have_version` 0 its first entry is the seed, which raised the
-            // tracked version to 1 before any later entry.
-            debug_assert!(
-                tracked_version >= 1,
-                "an empty commit's delta must be based at a sequence of at least 1"
-            );
-            diffs.push(ReplayDiff {
-                sequence_num,
-                from_version: tracked_version,
-                client_ts,
-                server_ts,
-                diff_response: empty_commit_payload(tracked_version)?,
-            });
-            tracked_version = sequence_num;
-            continue;
-        }
-
-        // b.jvx Site A: route `ServiceError::NotFound` from the OLD object's
-        // per-commit read into the same rebootstrap path the explicit
-        // `Deleted`-sentinel arm uses. The atomic read answers `NotFound` only
-        // for an absent header, or one without a numeric `seq` — what a
-        // concurrent `cleanup_old_object_retrying` UNLINK leaves — so matching the
-        // variant alone is safe. The background cleanup can UNLINK the OLD
-        // data keys while the replay computes, even when the in-window read
-        // returned no `deleted` sentinel (SDD §12.3 Regime 2). All other `ServiceError`
-        // variants propagate to the client via `From<ServiceError> for
-        // Status` — a transient read failure (`Aborted` or `Unavailable`) as
-        // `UNAVAILABLE`, which Kit retries — and so does a read-permit wait's
-        // ending (a capacity refusal, shutdown, session cancellation or client
-        // disconnect) and the regression ending of a read whose cut is below
-        // this commit ([`per_commit_regressed`]), which is never
-        // routed through NotFound recovery. Nothing has been sent yet on any
-        // of these endings.
-        //
-        // Boxed (b.9qr, Spec SDD SR-3.5): the permit wait, the atomic read and
-        // the build would otherwise sit inline in this regime's future.
-        match Box::pin(replay_commit_diff(
-            ctx,
-            object_id,
-            tracked_version,
-            sequence_num,
-        ))
-        .await
-        {
-            Ok(Ok(ReplayCommit::Built(diff_response))) => diffs.push(ReplayDiff {
-                sequence_num,
-                from_version: tracked_version,
-                client_ts,
-                server_ts,
-                diff_response,
-            }),
-            Ok(Ok(ReplayCommit::AboveCeiling(size))) => {
-                // The layer is above the atomic-read limits: replaying it one
-                // read per commit would multiply the fenced reads, and the
-                // writer pauses each one costs, by the replay length, so take
-                // the out-of-window route's one coalesced read through the
-                // object's shared fenced-read flight instead (Spec SDD
-                // SR-3.4). Its delivery is based at `have_version`, so the
-                // diffs computed so far are dropped unsent, and the consumer
-                // opened at the last entry the in-window read returned is
-                // stopped before the route registers its own stream — never a
-                // second registration on this one. The route reserves a reader under
-                // the slot this replay holds, as the rollback-mode
-                // out-of-window regime does, and gives the slot back before it
-                // attaches; it never waits for a slot.
-                tracing::debug!(
-                    session_id = %ctx.session_id,
-                    layer_name = %ctx.layer_name,
-                    object_id = object_id,
-                    sequence_num,
-                    pin = current_seq,
-                    "in-window replay: layer is above the atomic-read limits; delivering one \
-                     coalesced diff through the out-of-window route instead"
-                );
-                drop(diffs);
-                consumer.shutdown_and_release().await;
-                let reserved = reserve_stream(ctx, object_id).await?;
-                return Box::pin(catch_up_out_of_window(
-                    ctx,
-                    object_id,
-                    current_seq,
-                    reserved,
-                    slot,
-                    OutOfWindowEntry::AboveCeiling(size),
-                ))
-                .await;
-            }
-            Ok(Err(ending)) => return Err(ending),
-            Err(ServiceError::NotFound(_)) => {
-                drop(diffs);
-                drop(slot);
-                consumer.shutdown_and_release().await;
-                return handle_deleted_and_rebootstrap(ctx, object_id, RebootstrapCause::StateGone)
-                    .await;
-            }
-            Err(other) => return Err(other.into()),
-        }
-        tracked_version = sequence_num;
-
-        // Test-only: synchronization seam. If installed with
-        // `new_between_replay_computes`, park here — after the FIRST
-        // per-commit read and build (an empty commit takes no read and never
-        // reaches here), holding the catch-up slot, with nothing sent —
-        // so a test can land an overwrite and its cleanup between two
-        // computes. Gated behind `test-fault-injection` so release builds
-        // never see this branch.
-        #[cfg(any(test, feature = "test-fault-injection"))]
-        {
-            computed += 1;
-            if computed == 1 {
-                if let Some(seam) = ctx.svc.catch_up_state_read_seam_for_test.as_ref() {
-                    seam.arrive_between_replay_computes().await;
-                }
-            }
-        }
-    }
-
-    // 5. Everything is read and built: release the slot, end the catch-up
-    // before its first message if its stream registration ended meanwhile,
-    // then send.
-    drop(slot);
-    end_catch_up_if_stream_ended(ctx, &consumer)?;
-    // Accumulate the per-commit OMPF bytes delivered across the replay, the
-    // empty commits' deltas included, for the
-    // `live_subscribe_catch_up_delivered_bytes` metric (Plan b.msb).
-    // Self-echo-suppressed entries deliver nothing. Consuming
-    // the vector frees each diff after its send; a send that ends the
-    // subscription drops the rest on return. Its status is the subscription's
-    // ending, returned as-is.
-    let mut delivered_bytes: u64 = 0;
-    for diff in diffs {
-        delivered_bytes += send_per_commit_payload(
-            ctx,
-            object_id,
-            diff.from_version,
-            diff.sequence_num,
-            diff.client_ts,
-            diff.server_ts,
-            &diff.diff_response,
-            SendKind::CatchUp,
-        )
-        .await?;
-    }
-
-    Ok(CatchUpOutcome {
-        tracked_object_id: object_id,
-        tracked_version,
-        consumer,
-        catchup_mode: "legacy",
-        delivered_bytes,
-    })
-}
-
-/// One commit of a rollback-mode in-window replay, computed under the
-/// catch-up slot and sent after it is released ([`catch_up_in_window`]).
-struct ReplayDiff {
-    /// The commit's sequence number, which labels its payload.
-    sequence_num: u64,
-    /// The tracked version the diff is based at.
-    from_version: u64,
-    client_ts: u64,
-    server_ts: i64,
-    diff_response: DiffResponse,
-}
-
-/// Regime 2 `Snapshot` arm (Plan b.msb, SR-2.1): deliver one re-established
-/// coalesced diff based at `have_version` to an in-window reconnector.
-///
-/// NOT a full-state snapshot, despite the `Snapshot` mode name (which selects
-/// the corrected builders across all regimes, not a delivery shape): this arm
-/// emits `is_diff=true`, `base_version=have_version`, carrying only net-live
-/// content newer than `have_version` plus the unified retraction set. The
-/// client's resulting scene is the FOLD of it onto the state it retained. That
-/// distinction is load-bearing — reading it as a full-state payload and
-/// comparing its content against the whole scene is a category error that only
-/// holds when `have_version` precedes every edit (Issue b.xvq).
-///
-/// Structurally mirrors `catch_up_out_of_window`'s `Snapshot` arm: takes its
+/// Structurally mirrors `catch_up_out_of_window`: takes its
 /// proven read ([`catch_up_proven_read`]; above the atomic-read limits, its
 /// share of the object's shared fenced-read flight's read) and registers the
 /// stream on the reader the caller reserved, at the read's cut, so no
@@ -2326,7 +1924,7 @@ struct ReplayDiff {
 /// header sequence read before the capacity waits, P — the proven read's
 /// regression pin. Before the delivery it ends the catch-up if its stream
 /// registration already ended ([`end_catch_up_if_stream_ended`]).
-async fn catch_up_in_window_snapshot(
+async fn catch_up_in_window(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
     deleted_sentinel: Option<String>,
@@ -2340,17 +1938,16 @@ async fn catch_up_in_window_snapshot(
 
     // Overwrite handling: a `deleted` sentinel at or above `{have_version+1}-0`
     // means the OLD object is gone — re-resolve via the mapping and either
-    // terminate or re-bootstrap on the new object's stream. Mirrors the legacy
-    // arm's `Deleted` branch, decided up-front from the point read
-    // (`read_in_window_point`: a sentinel can only be the stream's last
-    // entry), since this arm reconstructs no per-commit diffs.
+    // terminate or re-bootstrap on the new object's stream. Decided up-front
+    // from the point read (`read_in_window_point`: a sentinel can only be the
+    // stream's last entry), before any state read.
     if let Some(entry_id) = deleted_sentinel {
         tracing::debug!(
             session_id = %ctx.session_id,
             layer_name = %ctx.layer_name,
             object_id = object_id,
             entry_id = %entry_id,
-            "in-window snapshot: deleted sentinel at the stream's end; re-bootstrapping"
+            "in-window catch-up: deleted sentinel at the stream's end; re-bootstrapping"
         );
         // Release the slot and the OLD stream's reader reservation before the
         // re-bootstrap reserves the new object's (it takes a slot of its own).
@@ -2374,7 +1971,7 @@ async fn catch_up_in_window_snapshot(
     }
 
     // The proven read, and the stream registered at its cut. Do NOT register
-    // at a legacy `From(<last retained entry>)` cursor here: it sits at or
+    // at a `From(<last retained entry>)` cursor here: it sits at or
     // below the header, so it would replay commits the coalesced diff already
     // folded in. The cut is at or ahead of everything the point read saw — it
     // was read before the state read — and strictly ahead when commits landed
@@ -2396,19 +1993,23 @@ async fn catch_up_in_window_snapshot(
         CatchUpRead::Proven { snapshot, consumer } => (consumer, snapshot),
         CatchUpRead::Rebootstrapped(outcome) => return Ok(outcome),
     };
-    // This regime runs in snapshot mode only, so the build is the faithful
-    // coalesced one, under the external-value miss protocol (b.yuo).
+    // The build is the faithful coalesced one, under the external-value miss
+    // protocol (b.yuo).
     let snapshot = Box::pin(take_build_turn(ctx, snapshot, &consumer)).await?;
-    let built = Box::pin(build_catch_up(
-        ctx,
-        object_id,
-        CatchUpBuild::Coalesced,
-        snapshot,
-        "in_window",
-        &mut slot,
-        Some(&mut consumer),
-    ))
-    .await;
+    // Raced against the subscription's endings, ending first, as Regime 1's.
+    let built = tokio::select! {
+        biased;
+        ending = subscription_ending(ctx) => return Err(ending),
+        built = Box::pin(build_catch_up(
+            ctx,
+            object_id,
+            CatchUpBuild::Coalesced,
+            snapshot,
+            "in_window",
+            &mut slot,
+            &mut consumer,
+        )) => built,
+    };
     // Built: the build gave back the snapshot handle (on the fenced path, the
     // build turn and the place in the flight with it) as it returned, and a
     // re-read after a miss replaced `consumer` in place (and gave the slot
@@ -2416,7 +2017,7 @@ async fn catch_up_in_window_snapshot(
     // before the delivery, and end the catch-up before its first message if
     // its stream registration ended meanwhile.
     drop(slot);
-    let Some((diff_response, _)) = cut_based_payload(built?)? else {
+    let Some(diff_response) = cut_based_payload(built?) else {
         // The miss protocol's re-read answered `NotFound` (the OLD object's
         // keys UNLINKed, or the state lost), and its read hold is released:
         // stop the stream (a no-op: the re-read released its registration),
@@ -2439,21 +2040,22 @@ async fn catch_up_in_window_snapshot(
     // `catchup_mode` attribute — `"snapshot"` is reserved for the from-empty
     // full-state path only (Plan b.msb taxonomy, matching
     // `catch_up_out_of_window`).
+    let (case, sections_count) = (diff_response.case, diff_response.sections_count);
     let content =
-        deliver_catch_up_content(ctx, object_id, &diff_response, "in_window", "legacy").await?;
+        deliver_catch_up_content(ctx, object_id, diff_response, "in_window", "legacy").await?;
 
     tracing::info!(
         session_id = %ctx.session_id,
         layer_name = %ctx.layer_name,
         object_id = object_id,
-        case = diff_response.case.as_label(),
-        sections_count = diff_response.sections_count,
-        ompf_size = diff_response.ompf_bytes.len(),
+        case = case.as_label(),
+        sections_count = sections_count,
+        ompf_size = content.delivered_bytes,
         regime = "in_window",
         // The DELIVERY shape, which is a coalesced diff based at
-        // `have_version` — not the `Snapshot` mode name that selected this arm,
-        // and deliberately not the `catchup_mode` METRIC label (`legacy`, set
-        // above), which is a separate taxonomy this log line must not restate.
+        // `have_version` — deliberately not the `catchup_mode` METRIC label
+        // (`legacy`, set above), which is a separate taxonomy this log line
+        // must not restate.
         mode = "coalesced",
         "catch-up coalesced diff sent"
     );
@@ -2467,56 +2069,34 @@ async fn catch_up_in_window_snapshot(
     })
 }
 
-/// How [`catch_up_out_of_window`] reaches the layer's state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutOfWindowEntry {
-    /// Through its own proven read ([`catch_up_proven_read`]): the regime as
-    /// `run_catch_up` dispatches it.
-    ProvenRead,
-    /// Straight onto the object's shared fenced-read flight
-    /// ([`catch_up_flight_read`]), sized as [`FlightSizing`] says: a
-    /// rollback-mode in-window replay whose per-commit atomic read answered
-    /// `TOO_LARGE`, or that found the flight registered, under the slot it
-    /// hands over (Spec SDD SR-3.4). No second atomic attempt of a layer
-    /// already known to be above the limits.
-    AboveCeiling(FlightSizing),
-}
-
 /// Regime 3: out-of-window — the stream no longer holds `{have_version+1}-0`
-/// (trimmed before the in-window read, or, in rollback mode, during its
-/// paging).
+/// (trimmed before the in-window read).
 ///
-/// Builds one coalesced diff from the subscriber's last version to current.
+/// Builds one coalesced diff from the subscriber's last version to current —
+/// the same diff Regime 2 builds ([`catch_up_in_window`]); the two differ only
+/// in their regime label.
 /// Takes its proven read ([`catch_up_proven_read`]; above the atomic-read
 /// limits, its share of the object's shared fenced-read flight's read) and
 /// registers the stream on the reader the caller reserved at the read's cut,
 /// so no commit falls between snapshot and stream and none lands in both.
 ///
 /// Entered holding the catch-up `slot` the caller took around the in-window
-/// `XRANGE` probe, and the stream reader the caller `reserved` (before the
-/// slot wait in snapshot mode, under the slot in rollback mode); the proven
-/// read (its read permit inside the slot), the stream registration and the
-/// diff build run under the slot, and it is released before the delivery and
-/// before any re-bootstrap. Above the atomic-read limits the slot is given
-/// back before the catch-up attaches to the flight, and the build runs in its
-/// build turn instead ([`take_build_turn`]). `current_seq` is the header
-/// sequence the caller read before the capacity waits, P — the proven read's
-/// regression pin. Before the delivery it ends the catch-up if its stream
-/// registration already ended ([`end_catch_up_if_stream_ended`]).
-///
-/// `entry` says how the state is reached: through the proven read, or — when
-/// a rollback-mode in-window replay ([`catch_up_in_window`]) hands over after
-/// its per-commit atomic read answered `TOO_LARGE`, or after it found the
-/// object's flight registered, under this same slot — straight onto the
-/// flight ([`catch_up_flight_read`]), with no second atomic read of a layer
-/// already known to be above the limits.
+/// point read, and the stream reader the caller `reserved` before the slot
+/// wait; the proven read (its read permit inside the slot), the stream
+/// registration and the diff build run under the slot, and it is released
+/// before the delivery and before any re-bootstrap. Above the atomic-read
+/// limits the slot is given back before the catch-up attaches to the flight,
+/// and the build runs in its build turn instead ([`take_build_turn`]).
+/// `current_seq` is the header sequence the caller read before the capacity
+/// waits, P — the proven read's regression pin. Before the delivery it ends
+/// the catch-up if its stream registration already ended
+/// ([`end_catch_up_if_stream_ended`]).
 async fn catch_up_out_of_window(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
     current_seq: u64,
     reserved: ReservedStream,
     slot: CatchUpPermit,
-    entry: OutOfWindowEntry,
 ) -> Result<CatchUpOutcome, Status> {
     ctx.outcome
         .set_regime(SubscriptionOutcomeCells::REGIME_OUT_OF_WINDOW);
@@ -2559,52 +2139,29 @@ async fn catch_up_out_of_window(
     // policy — SR-2.4 (b.fgj): on `Restored` retry the read exactly once; on
     // `NotRecoverable` drop the reservation and fall through to the
     // re-bootstrap path; on `Error(_)` classify per b.33e (`Transient` →
-    // UNAVAILABLE, everything else → INTERNAL; SDD §18.1). The structure is
-    // identical across both modes — the race (§7.9/§7.11 asymmetric grace)
-    // hits this path regardless of mode. A replay's hand-over gives the slot
-    // back and attaches to the object's flight directly, under the same
-    // recovery policy.
-    let read = match entry {
-        OutOfWindowEntry::ProvenRead => {
-            Box::pin(catch_up_proven_read(
-                ctx,
-                object_id,
-                current_seq,
-                "out_of_window",
-                &mut reserved,
-                &mut slot,
-            ))
-            .await?
-        }
-        OutOfWindowEntry::AboveCeiling(size) => {
-            // An attached catch-up holds no slot (Spec SDD SR-7.5).
-            slot = None;
-            Box::pin(catch_up_flight_read(
-                ctx,
-                object_id,
-                current_seq,
-                "out_of_window",
-                size,
-                &mut reserved,
-            ))
-            .await?
-        }
-    };
+    // UNAVAILABLE, everything else → INTERNAL; SDD §18.1). The race
+    // (§7.9/§7.11 asymmetric grace) hits this path whatever the layer's size.
+    let read = Box::pin(catch_up_proven_read(
+        ctx,
+        object_id,
+        current_seq,
+        "out_of_window",
+        &mut reserved,
+        &mut slot,
+    ))
+    .await?;
 
     // Out-of-window (Regime 3): deliver everything in one coalesced diff up
     // to the current materialized state. No upper bound — the client will
     // receive a single envelope labelled with the version it serves, the
     // proven cut of the snapshot it was built from.
     //
-    // Mode branch (Plan b.msb, Task 2): `Off` (rollback knob;
-    // `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) runs today's legacy
-    // `compute_diff_at_cut` coalesced path byte-for-byte; `Snapshot` (the shipped
-    // default) routes through Task 2's DR-independent faithful coalesced
-    // entrypoint, which corrects the CONTENT (net-live prims only, unified
-    // ghost retraction, dense-unique `set_order`) while keeping the
-    // SAME `is_diff=true` / `base_version=have_version` envelope the legacy path
-    // emits. No `base_version=0` reset is ever emitted to an advanced
-    // reconnector, so the client never rejects message #1.
+    // The build is the DR-independent faithful coalesced entrypoint (Plan
+    // b.msb, Task 2), whose CONTENT is net-live prims only, unified ghost
+    // retraction and dense-unique `set_order`, in an `is_diff=true` /
+    // `base_version=have_version` envelope. No `base_version=0` reset is ever
+    // emitted to an advanced reconnector, so the client never rejects message
+    // #1.
     //
     // The in-place `base=have_version` reconciliation was validated live
     // against two real Kit clients on 2026-08-24 (b.vsw, closed PASSED; SDD
@@ -2617,16 +2174,20 @@ async fn catch_up_out_of_window(
         CatchUpRead::Rebootstrapped(outcome) => return Ok(outcome),
     };
     let snapshot = Box::pin(take_build_turn(ctx, snapshot, &consumer)).await?;
-    let built = Box::pin(build_catch_up(
-        ctx,
-        object_id,
-        CatchUpBuild::OutOfWindow,
-        snapshot,
-        "out_of_window",
-        &mut slot,
-        Some(&mut consumer),
-    ))
-    .await;
+    // Raced against the subscription's endings, ending first, as Regime 1's.
+    let built = tokio::select! {
+        biased;
+        ending = subscription_ending(ctx) => return Err(ending),
+        built = Box::pin(build_catch_up(
+            ctx,
+            object_id,
+            CatchUpBuild::Coalesced,
+            snapshot,
+            "out_of_window",
+            &mut slot,
+            &mut consumer,
+        )) => built,
+    };
     // Built: the build gave back the snapshot handle (on the fenced path, the
     // build turn and the place in the flight with it) as it returned, and a
     // re-read after a miss replaced `consumer` in place (and gave the slot
@@ -2634,7 +2195,7 @@ async fn catch_up_out_of_window(
     // before the delivery, and end the catch-up before its first message if
     // its stream registration ended meanwhile.
     drop(slot);
-    let Some((diff_response, regime_mode)) = cut_based_payload(built?)? else {
+    let Some(diff_response) = cut_based_payload(built?) else {
         // The miss protocol's re-read answered `NotFound` (b.jvx Site C's
         // race, or state loss, met on the re-read), and its read hold is
         // released: stop the stream (a no-op: the re-read released its
@@ -2655,22 +2216,25 @@ async fn catch_up_out_of_window(
     // also documents why a payload here is never empty (a gap of empty commits
     // still gets a non-empty, change-free delta).
     //
-    // Both `Off` and Task 2's `Snapshot` coalesced deliveries are classified
-    // `legacy`: the out-of-window path is not the from-empty faithful full-state
-    // snapshot (Plan b.msb taxonomy).
+    // The coalesced delivery is classified `legacy` for the `catchup_mode`
+    // attribute: the out-of-window path is not the from-empty faithful
+    // full-state snapshot (Plan b.msb taxonomy, matching `catch_up_in_window`).
+    let (case, sections_count) = (diff_response.case, diff_response.sections_count);
     let content =
-        deliver_catch_up_content(ctx, object_id, &diff_response, "out_of_window", "legacy").await?;
+        deliver_catch_up_content(ctx, object_id, diff_response, "out_of_window", "legacy").await?;
 
     tracing::info!(
         session_id = %ctx.session_id,
         layer_name = %ctx.layer_name,
         object_id = object_id,
-        case = diff_response.case.as_label(),
-        sections_count = diff_response.sections_count,
-        ompf_size = diff_response.ompf_bytes.len(),
+        case = case.as_label(),
+        sections_count = sections_count,
+        ompf_size = content.delivered_bytes,
         regime = "out_of_window",
-        mode = regime_mode,
-        "catch-up diff sent"
+        // The DELIVERY shape, as on `catch_up_in_window`'s line: both
+        // reconnect regimes build the same coalesced diff.
+        mode = "coalesced",
+        "catch-up coalesced diff sent"
     );
 
     Ok(CatchUpOutcome {
@@ -2737,7 +2301,10 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
         //     the position it holds and catches up in-window, on whichever
         //     replica the ingress picks (this one has stopped accepting
         //     connections). An `OK` here silently ended every idle subscriber's
-        //     live feed on every rolling restart.
+        //     live feed on every rolling restart. The same token cancelled by
+        //     the fleet hold's ending ends by the hold's cause instead
+        //     (`SubscriberCtx::end_on_shutdown`): `SERVICE_HELD` or
+        //     `UPSTREAM_UNAVAILABLE`, both retried.
         //   * **Session deletion**, seen through the token here, ends
         //     `NOT_FOUND "session was deleted"` with `reason="session_cancel"`.
         //     A subscriber that reads the deletion's `deleted` sentinel off its
@@ -2756,8 +2323,7 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
         // pre-checks catch a token that fired while the loop was busy
         // delivering.
         if ctx.shutdown.is_cancelled() {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
-            return Err(server_shutting_down());
+            return Err(ctx.end_on_shutdown());
         }
         if ctx
             .session_token()
@@ -2774,22 +2340,27 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
             ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
             return Ok(());
         }
+        // The live-delivery hold ended while the loop was busy delivering: the
+        // live-delivery budget picked this subscription, or a catch-up
+        // waiting for catch-up payload memory found it stalled.
+        if ctx.hold.ending_reason().is_some() {
+            return Err(ctx.end_on_hold());
+        }
 
         // `consumer.recv()` is the subscription's IDLE await — a quiet layer
         // parks here, on its stream multiplexer registration, for as long as
         // nothing is committed.
         // It carries no deadline, and must not: `OUTER_SEND_DEADLINE` bounds a
-        // *blocked delivery*, not waiting for work (b.f4f). The three arms above
+        // *blocked delivery*, not waiting for work (b.f4f). The four arms above
         // it are the only things that may end this wait — shutdown, deletion,
-        // client disconnect, in that order. An absent session token's arm never
-        // resolves. The tally's flush arm may interrupt the wait — only while
-        // deliveries are pending, at most once per
-        // `DELIVERY_TALLY_FLUSH_INTERVAL` — and then loops straight back.
-        let maybe_pair = tokio::select! {
+        // client disconnect, the live-delivery hold's ending, in that order. An absent
+        // session token's arm never resolves. The tally's flush arm may
+        // interrupt the wait — only while deliveries are pending, at most once
+        // per `DELIVERY_TALLY_FLUSH_INTERVAL` — and then loops straight back.
+        let received = tokio::select! {
             biased;
             () = ctx.shutdown.cancelled() => {
-                ctx.exit.set(StreamExitCell::SHUTDOWN);
-                return Err(server_shutting_down());
+                return Err(ctx.end_on_shutdown());
             }
             () = cancelled_or_never(ctx.session_token()) => {
                 return Err(ctx.end_on_session_cancel());
@@ -2802,6 +2373,7 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                 ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
                 return Ok(());
             }
+            () = ctx.hold.ended() => return Err(ctx.end_on_hold()),
             () = &mut flush_timer, if tally.has_pending() => {
                 tally.flush();
                 flush_timer.as_mut().reset(
@@ -2809,10 +2381,19 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                 );
                 continue;
             }
-            n = consumer.recv() => n,
+            n = consumer.recv_held() => n,
         };
 
-        let Some((_entry_id, notification)) = maybe_pair else {
+        // The entry stays in this subscription's live-delivery pipeline while
+        // `pipeline` lives: dropped here for an entry sent nothing (a
+        // duplicate, a self-echo, a skip, `Deleted`), or carried on a
+        // delivery's last message and released when the stream takes it.
+        let Some(ReceivedEntry {
+            notification,
+            pipeline,
+            ..
+        }) = received
+        else {
             // Consumer ended. Per `LayerStreamConsumer`'s ending contract, an
             // empty terminal slot is reserved for the consumer closing itself,
             // which this loop never does before reading it; every
@@ -2866,6 +2447,8 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
 
         match notification {
             LayerNotification::Deleted => {
+                // The sentinel is sent nothing: out of the pipeline now.
+                drop(pipeline);
                 // Publish this generation's pending deliveries before the
                 // re-bootstrap's full catch-up, which can hold the loop away
                 // from its idle flush for as long as that catch-up takes.
@@ -2970,9 +2553,9 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                 // catch-up overlap to close.
                 //
                 // It covers at-least-once re-delivery from the transport:
-                // fred replaying an interrupted `XREAD` (the
-                // `Blocking::Interrupt` / transient-retry paths re-issue from
-                // the same durable cursor) and any out-of-band entry at or
+                // a re-issued `XREAD` (the reader's `-UNBLOCKED`, timeout and
+                // transient-retry paths re-read from the same durable cursor)
+                // and any out-of-band entry at or
                 // below the tracked sequence. And it keeps the empty-commit
                 // delta below (an entry with no relay bytes) from being based
                 // at or above its own sequence, and drops the `CreateLayer`
@@ -3050,6 +2633,7 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                 // build can produce one).
                 match relay_ompf {
                     Some(ompf_bytes) => {
+                        let relay_bytes = ompf_bytes.len();
                         let stream_header = OmpfStreamHeader {
                             object_id: tracked_object_id,
                             sequence_num,
@@ -3057,15 +2641,25 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                             client_timestamp: client_ts,
                         };
                         // A live delivery: its last chunk carries the commit
-                        // stamp the transport stage is measured against.
+                        // stamp the transport stage is measured against, and
+                        // the entry's pipeline place, released when the stream
+                        // takes it. Every chunk is a slice of the entry's one
+                        // relay copy, shared by every subscriber of it.
                         let kind = SendKind::Live {
                             commit_end: Some(server_ts),
                         };
+                        let mut pipeline = Some(pipeline);
                         let mut chunks =
-                            chunk_ompf_for_stream(&ompf_bytes, &stream_header).peekable();
+                            chunk_ompf_for_stream(ompf_bytes, &stream_header).peekable();
                         while let Some(msg) = chunks.next() {
                             let is_last = chunks.peek().is_none();
-                            send_or_disconnect_as(ctx, msg, kind.for_chunk(is_last)).await?;
+                            let release = if is_last {
+                                pipeline.take().map(OutboundRelease::Live)
+                            } else {
+                                None
+                            };
+                            send_or_disconnect_as(ctx, msg, kind.for_chunk(is_last), release)
+                                .await?;
                         }
                         // Every chunk of this commit is enqueued.
                         tally.record(LiveDelivery {
@@ -3079,7 +2673,7 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                             object_id = tracked_object_id,
                             sequence_num,
                             subscriber_client_id = %ctx.client_id,
-                            relay_bytes = ompf_bytes.len(),
+                            relay_bytes,
                             "pushed relayed writer OMPF to subscriber"
                         );
                     }
@@ -3094,8 +2688,8 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                         // `tracked_version` is at least 1 here: every
                         // catch-up acks at or above the `CreateLayer` seed's
                         // sequence 1, and an entry at or below the tracked
-                        // version was dropped above. At 0 a read would have
-                        // planned full content, not an empty delta.
+                        // version was dropped above. A base of 0 would be the
+                        // from-empty reset shape, not an empty delta.
                         debug_assert!(
                             tracked_version >= 1,
                             "an empty commit's delta must be based at a sequence of at least 1"
@@ -3108,10 +2702,8 @@ async fn run_steady_state(ctx: &SubscriberCtx<'_>, outcome: CatchUpOutcome) -> R
                             sequence_num,
                             client_ts,
                             server_ts,
-                            &payload,
-                            SendKind::Live {
-                                commit_end: Some(server_ts),
-                            },
+                            payload,
+                            pipeline,
                         )
                         .await?;
                         // Every chunk of this commit is enqueued. The empty
@@ -3162,11 +2754,8 @@ enum RebootstrapCause {
     /// `CreateLayer` overwrite retired this object.
     DeletedSentinel,
     /// A state read answered `NotFound` and recovery could not — or would not,
-    /// with checkpointing disabled — restore the layer; or, in a rollback-mode
-    /// in-window replay, a per-commit read (or its external-value miss
-    /// re-read) answered `NotFound`, which re-bootstraps at once without
-    /// asking recovery (b.jvx Site A). Nothing observed says the layer was
-    /// deleted; its materialized state is simply gone.
+    /// with checkpointing disabled — restore the layer. Nothing observed says
+    /// the layer was deleted; its materialized state is simply gone.
     StateGone,
 }
 
@@ -3340,165 +2929,17 @@ async fn handle_deleted_and_rebootstrap(
 
 // ── Diff + send helpers ─────────────────────────────────────────────────────
 
-/// One commit of a rollback-mode in-window replay, as
-/// [`replay_commit_diff`] leaves it.
-enum ReplayCommit {
-    /// The commit's diff, built from its atomic read.
-    Built(DiffResponse),
-    /// The layer is above the atomic-read limits — the atomic read answered
-    /// `TOO_LARGE`, or the object's shared fenced-read flight was found
-    /// registered — and the replay switches to the coalesced route, which
-    /// attaches to the flight sized as this says.
-    AboveCeiling(FlightSizing),
-}
-
-/// Read and build one commit of a rollback-mode in-window replay
-/// ([`catch_up_in_window`]; Spec SDD SR-3.4): its atomic read under its own
-/// read permit inside the replay's slot ([`read_replay_commit_snapshot`]),
-/// then the diff covering `(from_version, to_version]` built from it
-/// ([`build_catch_up`] with [`CatchUpBuild::PerCommit`], under the
-/// external-value miss protocol). A `TOO_LARGE` answer builds nothing
-/// and returns [`ReplayCommit::AboveCeiling`] with the answer's SR-11.1
-/// sizing ([`FlightSizing::from_too_large`]; an early-out's fence probe is
-/// left to the attach, [`read_through_flight`]); so does finding the object's
-/// shared fenced-read flight registered before the read (sized as that flight
-/// knows the layer), with no atomic attempt, and so does the miss protocol's
-/// re-read meeting either.
-/// Only a commit that owes content comes here: an empty commit takes no read
-/// ([`empty_commit_payload`]).
-///
-/// Error layers as on [`read_catch_up_snapshot`]: the outer
-/// `Err(ServiceError)` is the read's (the replay routes its `NotFound`, which
-/// the miss protocol's re-read reports as well), the inner `Err(Status)` an
-/// ending of the subscription, returned as-is — the permit wait's, a build's
-/// failure, the miss protocol's own ending, or the regression ending
-/// ([`per_commit_regressed`]) when the read's cut is below the commit.
-async fn replay_commit_diff(
-    ctx: &SubscriberCtx<'_>,
-    object_id: u64,
-    from_version: u64,
-    to_version: u64,
-) -> Result<Result<ReplayCommit, Status>, ServiceError> {
-    // A registered flight means the layer is above the atomic-read limits:
-    // hand over without an atomic attempt that would only answer `TOO_LARGE`
-    // (Spec SDD SR-7.5, a catch-up attaches without an atomic attempt).
-    if let Some(found) = ctx.svc.snapshot_flights.lookup(object_id) {
-        return Ok(Ok(ReplayCommit::AboveCeiling(FlightSizing::Known(
-            found.size,
-        ))));
-    }
-    let read = match read_replay_commit_snapshot(ctx, object_id).await? {
-        Ok(read) => read,
-        Err(ending) => return Ok(Err(ending)),
-    };
-    let commit = match read {
-        SnapshotRead::Snapshot(snapshot) => {
-            let built = Box::pin(build_catch_up(
-                ctx,
-                object_id,
-                CatchUpBuild::PerCommit {
-                    from_version,
-                    to_version,
-                },
-                BuildSnapshot::Atomic(snapshot),
-                "in_window",
-                // A per-commit build never gives a slot back (above the
-                // limits it answers `AboveCeiling`, and the replay hands over
-                // with the slot it holds) and never swaps a registration (the
-                // replay acks each commit at its own sequence).
-                &mut None,
-                None,
-            ))
-            .await;
-            match built {
-                Ok(CatchUpBuilt::Diff { diff_response, .. }) => ReplayCommit::Built(diff_response),
-                Ok(CatchUpBuilt::Regressed { cut, to_version }) => {
-                    return Ok(Err(per_commit_regressed(
-                        ctx,
-                        object_id,
-                        from_version,
-                        cut,
-                        to_version,
-                    )));
-                }
-                Ok(CatchUpBuilt::AboveCeiling(size)) => ReplayCommit::AboveCeiling(size),
-                // The re-read answered `NotFound` (the OLD object's state
-                // gone): handled as the replay's own read's `NotFound`, by its
-                // arm (b.jvx Site A), which re-bootstraps.
-                Ok(CatchUpBuilt::RereadNotFound) => {
-                    return Err(ServiceError::NotFound(
-                        "the layer's state was gone when the in-window replay re-read it"
-                            .to_owned(),
-                    ));
-                }
-                Err(ending) => return Ok(Err(ending)),
-            }
-        }
-        SnapshotRead::TooLarge(too_large) => {
-            ReplayCommit::AboveCeiling(FlightSizing::from_too_large(&too_large))
-        }
-    };
-    Ok(Ok(commit))
-}
-
-/// The ending of a rollback-mode in-window replay whose per-commit read's
-/// `cut` is below the commit it rebuilds, `to_version`.
-///
-/// **A cut below `to_version` ends the subscription (Spec SDD SR-3.2's rule,
-/// applied to a per-commit read).** The read was taken after the commit was
-/// streamed, so its cut is at or above the commit — unless the layer's
-/// sequence regressed in between, as a restore with an undersized sequence
-/// band does. The state then lacks changes the commit made, and a diff built
-/// from it would be acked at `to_version` while missing them. The check is
-/// [`compute_per_commit_diff_at_cut`]'s own, so no caller can skip it: it
-/// builds nothing and answers [`PerCommitDiff::Regressed`], which
-/// [`build_catch_up`] passes on as [`CatchUpBuilt::Regressed`]. This function
-/// maps that refusal to the subscription's ending: it WARNs,
-/// records `unverified` on `live_subscribe_stable_cut_total` under
-/// `regime="in_window"` (a replay adds to that counter only when a read
-/// regresses: a replay that succeeds adds +1 to
-/// `live_subscribe_regime_total{regime="in_window"}` and nothing to the
-/// stable-cut counter), and answers [`sequence_regressed`] — `UNAVAILABLE`,
-/// before any content, since the replay sends only after every commit is
-/// built. It never goes through NotFound recovery: the layer exists. The exit
-/// reason stays `error`.
-fn per_commit_regressed(
-    ctx: &SubscriberCtx<'_>,
-    object_id: u64,
-    from_version: u64,
-    cut: u64,
-    to_version: u64,
-) -> Status {
-    tracing::warn!(
-        session_id = %ctx.session_id,
-        layer_name = %ctx.layer_name,
-        object_id = object_id,
-        from_version = from_version,
-        upper_version = to_version,
-        cut = cut,
-        regime = "in_window",
-        "in-window replay's per-commit atomic read's cut is below the commit it rebuilds \
-         (the layer's sequence regressed, as a restore with an undersized sequence band \
-         does); ending the subscription UNAVAILABLE before any content so the client \
-         re-subscribes from the current header"
-    );
-    record_stable_cut(ctx, false, "in_window");
-    sequence_regressed()
-}
-
 /// Deliver one per-commit payload labelled `to_version`: the steady-state
-/// loop's empty delta for an empty commit ([`empty_commit_payload`]), or a
-/// legacy in-window replay's commit ([`replay_commit_diff`], or the empty
-/// delta there too). Returns the OMPF bytes delivered — the legacy in-window
-/// replay sums them for the `live_subscribe_catch_up_delivered_bytes` metric
-/// (Plan b.msb) — or the send's status, verbatim: it already says how the
-/// subscription ends (`CANCELLED` for a client disconnect, `UNAVAILABLE` for a
-/// shutdown or the slow-reader deadline, `NOT_FOUND` for a deleted session),
-/// and callers return it as-is.
-///
-/// `kind` is what the payload is: [`SendKind::Live`] for the steady-state
-/// empty delta, whose stamp goes on the payload's last chunk, and
-/// [`SendKind::CatchUp`] for a legacy in-window replay's commit.
+/// loop's empty delta for an empty commit ([`empty_commit_payload`]), as a
+/// live delivery ([`SendKind::Live`]) whose commit stamp goes on the
+/// payload's last chunk. Returns the OMPF bytes delivered, or the send's
+/// status, verbatim: it already says how the subscription ends (`CANCELLED`
+/// for a client disconnect, `UNAVAILABLE` for a shutdown or the slow-reader
+/// deadline, `NOT_FOUND` for a deleted session), and callers return it as-is.
+/// `pipeline`, the commit's entry in the live-delivery pipeline, rides on the
+/// payload's last chunk.
+// The commit's identity and stamps are separate scalars the caller already
+// holds; bundling them into a struct for this one call would only move them.
 #[allow(clippy::too_many_arguments)]
 async fn send_per_commit_payload(
     ctx: &SubscriberCtx<'_>,
@@ -3507,23 +2948,15 @@ async fn send_per_commit_payload(
     to_version: u64,
     client_ts: u64,
     server_ts: i64,
-    diff_response: &DiffResponse,
-    kind: SendKind,
+    diff_response: DiffResponse,
+    pipeline: PipelineEntry,
 ) -> Result<u64, Status> {
-    if diff_response.ompf_bytes.is_empty() {
-        // Unreachable: every payload handed here is an incremental delta, or
-        // the seed's full content at base 0; neither is zero bytes. The
-        // empty-commit delta is incremental by construction. A replayed
-        // commit's diff is built from a read whose cut is at or above the
-        // commit (`compute_per_commit_diff_at_cut` refuses to build otherwise,
-        // and the subscription ends), above its base, so the plan is never
-        // `UpToDate`: it is
-        // incremental, or full content when its base is 0 — the seed entry
-        // replayed for a client that sent the current `have_object_id` with
-        // `have_version` 0, which is routed in-window rather than brand-new.
-        // Kept as a defensive arm: should a zero-byte payload ever
-        // arrive, send nothing rather than an empty message, and surface it.
-        // The caller still advances its tracked version past the commit.
+    if diff_response.payload.is_empty() {
+        // Unreachable: the empty-commit delta is an incremental delta by
+        // construction, and an incremental delta is never zero bytes. Kept as
+        // a defensive arm: should a zero-byte payload ever arrive, send
+        // nothing rather than an empty message, and surface it. The caller
+        // still advances its tracked version past the commit.
         tracing::warn!(
             session_id = %ctx.session_id,
             layer_name = %ctx.layer_name,
@@ -3535,7 +2968,7 @@ async fn send_per_commit_payload(
         return Ok(0);
     }
 
-    let delivered_bytes = diff_response.ompf_bytes.len() as u64;
+    let delivered_bytes = diff_response.payload.len();
     let stream_header = OmpfStreamHeader {
         object_id,
         sequence_num: to_version,
@@ -3543,21 +2976,29 @@ async fn send_per_commit_payload(
         client_timestamp: client_ts,
     };
 
-    let mut chunks = chunk_ompf_for_stream(&diff_response.ompf_bytes, &stream_header).peekable();
+    let kind = SendKind::Live {
+        commit_end: Some(server_ts),
+    };
+    let mut pipeline = Some(pipeline);
+    let mut chunks = chunk_pages_for_stream(diff_response.payload, &stream_header).peekable();
     while let Some(msg) = chunks.next() {
         let is_last = chunks.peek().is_none();
+        let release = if is_last {
+            pipeline.take().map(OutboundRelease::Live)
+        } else {
+            None
+        };
         // The send's status goes back verbatim: it already says how the
         // subscription ends (see this function's rustdoc).
-        send_or_disconnect_as(ctx, msg, kind.for_chunk(is_last)).await?;
+        send_or_disconnect_as(ctx, msg, kind.for_chunk(is_last), release).await?;
     }
     Ok(delivered_bytes)
 }
 
 // ── Catch-up builds and the external-value miss protocol (b.yuo) ───────────
 //
-// Every catch-up build — Regime 1's full state, a reconnector's coalesced diff
-// in either regime, the rollback-mode legacy diffs and the rollback-mode
-// in-window replay's per-commit diffs — goes through [`build_catch_up`], and
+// Every catch-up build — Regime 1's full state and a reconnector's coalesced
+// diff in either regime — goes through [`build_catch_up`], and
 // [`build_catch_up_once`] is the one place a catch-up calls a
 // `storage::diff_read` builder.
 
@@ -3566,193 +3007,236 @@ async fn send_per_commit_payload(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatchUpBuild {
     /// Regime 1 / overwrite-on-reconnect: the full state, built with no read
-    /// and no send. `catchup_snapshot_enabled` (default `true`, Plan b.msb)
-    /// builds the corrected late-join snapshot — net-live sections only,
-    /// fields carrying true authoring `set_order`, no tombstones, real
-    /// ext-value blobs, `base_version = 0` so message #1 is a valid
-    /// from-empty create (SR-1.2), always-on with no
-    /// `LIVE_EDIT_CHECKPOINT_ENABLED` dependency (SR-4.1); `false` builds the
-    /// legacy `compute_diff_at_cut` full content. Both feed the same
+    /// and no send — the corrected late-join snapshot (Plan b.msb): net-live
+    /// sections only, fields carrying true authoring `set_order`, no
+    /// tombstones, real ext-value blobs, `base_version = 0` so message #1 is
+    /// a valid from-empty create (SR-1.2), always-on with no
+    /// `LIVE_EDIT_CHECKPOINT_ENABLED` dependency (SR-4.1). It feeds the
     /// chunk/send tail in [`send_full_state`]. The payload's cut is the
     /// snapshot's ([`DiffCut::Atomic`]).
     FullState,
-    /// A reconnector's faithful coalesced diff based at `have_version`
-    /// (Regime 2's snapshot-mode arm, [`catch_up_in_window_snapshot`]).
+    /// A reconnector's faithful coalesced diff based at `have_version`, in
+    /// either reconnect regime ([`catch_up_in_window`],
+    /// [`catch_up_out_of_window`]).
     Coalesced,
-    /// Regime 3 ([`catch_up_out_of_window`]): the faithful coalesced diff
-    /// based at `have_version` in snapshot mode, the legacy version diff
-    /// (`compute_diff_at_cut`) in rollback mode.
-    OutOfWindow,
-    /// One commit of a rollback-mode in-window replay
-    /// ([`replay_commit_diff`]): the single-version diff covering
-    /// `(from_version, to_version]`, version-bounded by `to_version` so
-    /// commits the read's cut holds above it are left out, and acked at the
-    /// commit's own sequence number.
-    PerCommit { from_version: u64, to_version: u64 },
 }
 
 /// What a catch-up build came to ([`build_catch_up`]).
 enum CatchUpBuilt {
-    /// The payload, with the tracing mode (`"snapshot"` | `"off"`) the
-    /// regimes that switch on `catchup_snapshot_enabled` log.
-    Diff {
-        diff_response: DiffResponse,
-        mode: &'static str,
-    },
-    /// [`CatchUpBuild::PerCommit`] only: the read's cut is below the commit
-    /// ([`PerCommitDiff::Regressed`]); nothing was built
-    /// ([`per_commit_regressed`]).
-    Regressed { cut: u64, to_version: u64 },
+    /// The payload.
+    Diff { diff_response: DiffResponse },
     /// The miss protocol's re-read answered `NotFound`: the layer's state was
     /// gone at the re-read (an overwrite's cleanup, or keyspace loss). Nothing
     /// was built, and no recovery was attempted — the re-read met it under
     /// the read hold, which no restore may run under. The caller, after the
     /// hold is released, handles it as its own read's `NotFound`, before any
-    /// content: a cut-based caller through [`recover_after_reread_not_found`],
-    /// a rollback-mode replay through its own `NotFound` arm.
+    /// content, through [`recover_after_reread_not_found`].
     RereadNotFound,
-    /// [`CatchUpBuild::PerCommit`] only: the miss protocol's re-read found
-    /// the layer above the atomic-read limits (`TOO_LARGE`, or the object's
-    /// shared fenced-read flight registered), sized as on
-    /// [`ReplayCommit::AboveCeiling`]; the replay hands over to the coalesced
-    /// route as it does for its own read.
-    AboveCeiling(FlightSizing),
 }
 
-/// A cut-based build's payload and mode ([`CatchUpBuilt::Diff`]), or `None`
-/// when the miss protocol's re-read answered `NotFound`
-/// ([`CatchUpBuilt::RereadNotFound`]) and the caller must run its recovery
-/// ([`recover_after_reread_not_found`]). The other two outcomes come only
-/// from a per-commit build, so a cut-based caller meeting one is a bug,
-/// answered `INTERNAL`.
-fn cut_based_payload(built: CatchUpBuilt) -> Result<Option<(DiffResponse, &'static str)>, Status> {
+/// A build's payload ([`CatchUpBuilt::Diff`]), or `None` when the miss
+/// protocol's re-read answered `NotFound` ([`CatchUpBuilt::RereadNotFound`])
+/// and the caller must run its recovery ([`recover_after_reread_not_found`]).
+fn cut_based_payload(built: CatchUpBuilt) -> Option<DiffResponse> {
     match built {
-        CatchUpBuilt::Diff {
-            diff_response,
-            mode,
-        } => Ok(Some((diff_response, mode))),
-        CatchUpBuilt::RereadNotFound => Ok(None),
-        CatchUpBuilt::Regressed { .. } | CatchUpBuilt::AboveCeiling(_) => {
-            Err(ServiceError::Internal(
-                "a catch-up's cut-based build answered a per-commit outcome".to_owned(),
-            )
-            .into())
-        }
+        CatchUpBuilt::Diff { diff_response } => Some(diff_response),
+        CatchUpBuilt::RereadNotFound => None,
     }
 }
 
 /// Build `build` from `snapshot` once, reading its external values as
 /// `ext_reads` says: the one place a catch-up calls a `storage::diff_read`
 /// builder. Answers [`Built::Missing`] only under [`ExtValueReads::PROBE`],
-/// and only [`CatchUpBuilt::Diff`] or (per-commit) [`CatchUpBuilt::Regressed`]
-/// otherwise. Each builder is boxed (b.9qr).
+/// and only [`CatchUpBuilt::Diff`] otherwise. Each builder is boxed (b.9qr).
+///
+/// **The catch-up payload budget (SDD §12.3).** The build runs in two steps.
+/// The layout plans the payload, serialises its delta and probes each
+/// external value's stored length, holding no value byte. Under
+/// fetch-on-miss, values the probe finds not stored come back unrestored
+/// ([`LaidOut::Restore`]), and this catch-up restores them through the
+/// checkpoint adapter in batches of at most
+/// [`EXT_RESTORE_PARALLELISM`](crate::storage::ompf_payload::EXT_RESTORE_PARALLELISM)
+/// ([`restore_in_batches`]): each batch re-probes its values, then reserves
+/// their charge — 4.24 per declared byte ([`EXT_RESTORE_CHARGE_CENTI`]) — from the
+/// same budget through the same capacity wait as the payload, probes them
+/// again and gives back the share of any another catch-up restored
+/// meanwhile, charges bytes fetched beyond a value's declared size as a
+/// forced top-up until its write-back returns, and holds each
+/// value's share only until that value's write-back returns, so a restored
+/// value's bytes are dropped once its length is known; the layout is then
+/// finished from those lengths. Then this catch-up reserves the whole
+/// payload — its exact size plus its ranged reads' replies in flight — from
+/// the replica's catch-up payload budget ([`reserve_catchup_payload`]),
+/// holding nothing of the budget while it waits — no restore batch's share
+/// is held by then: inside its slot or its build turn, where every caller is,
+/// with its stream registered (`consumer`), charged to its capacity budget,
+/// and refused `catchup_capacity` before any content when that runs out. Only
+/// then are the values read in ranges, a restored one read back from the
+/// store, into the payload's pages, each page carrying its share of the grant
+/// until the stream has sent it. Nothing here waits for a slot, a permit, a
+/// `T` grant or a build turn while holding the grant or a restore batch's.
 async fn build_catch_up_once(
     ctx: &SubscriberCtx<'_>,
     snapshot: &AtomicSnapshot,
     build: CatchUpBuild,
     ext_reads: ExtValueReads,
-) -> Result<Built<CatchUpBuilt>, ServiceError> {
+    consumer: &LayerStreamConsumer,
+) -> Result<Built<CatchUpBuilt>, Status> {
     let ext_store = ctx.svc.ext_value_store.as_ref();
-    let diff = |mode: &'static str| {
-        move |diff_response: DiffResponse| CatchUpBuilt::Diff {
-            diff_response,
-            mode,
-        }
-    };
-    let faithful = ctx.svc.catchup_snapshot_enabled;
-    let built = match build {
-        CatchUpBuild::FullState if faithful => Box::pin(compute_faithful_full_content_at_cut(
-            snapshot,
-            ext_store,
-            ext_reads,
-            Some(&ctx.svc.metrics),
-            &ctx.svc.service_label,
-        ))
-        .await?
-        .map(diff("snapshot")),
+    // The restore's charge per byte, one binding for both places it is
+    // charged: the batches restored before the layout, and a value the fill
+    // restores because it was gone at the closing check.
+    let restore_charge_centi = EXT_RESTORE_CHARGE_CENTI;
+    let laid_out = match build {
         CatchUpBuild::FullState => {
-            // have_object_id=0 forces Case 1 (full content) in the diff plan.
-            let subscriber_state = SubscriberState {
-                have_object_id: 0,
-                have_version: 0,
-            };
-            Box::pin(compute_diff_at_cut(
+            Box::pin(compute_faithful_full_content_at_cut(
                 snapshot,
-                &subscriber_state,
                 ext_store,
                 ext_reads,
-                None,
-                "subscribe_read_layer",
+                Some(&ctx.svc.metrics),
+                &ctx.svc.service_label,
             ))
             .await?
-            .map(diff("off"))
         }
-        CatchUpBuild::Coalesced => Box::pin(compute_faithful_coalesced_at_cut(
-            snapshot,
-            ctx.have_version,
-            ext_store,
-            ext_reads,
-            Some(&ctx.svc.metrics),
-            &ctx.svc.service_label,
-        ))
-        .await?
-        .map(diff("snapshot")),
-        CatchUpBuild::OutOfWindow if faithful => Box::pin(compute_faithful_coalesced_at_cut(
-            snapshot,
-            ctx.have_version,
-            ext_store,
-            ext_reads,
-            Some(&ctx.svc.metrics),
-            &ctx.svc.service_label,
-        ))
-        .await?
-        .map(diff("snapshot")),
-        CatchUpBuild::OutOfWindow => {
-            let subscriber_state = SubscriberState {
-                have_object_id: ctx.have_object_id,
-                have_version: ctx.have_version,
-            };
-            Box::pin(compute_diff_at_cut(
+        CatchUpBuild::Coalesced => {
+            Box::pin(compute_faithful_coalesced_at_cut(
                 snapshot,
-                &subscriber_state,
+                ctx.have_version,
                 ext_store,
                 ext_reads,
-                None,
-                "subscribe_read_layer",
+                Some(&ctx.svc.metrics),
+                &ctx.svc.service_label,
             ))
             .await?
-            .map(diff("off"))
-        }
-        CatchUpBuild::PerCommit {
-            from_version,
-            to_version,
-        } => {
-            let subscriber_state = SubscriberState {
-                have_object_id: snapshot.state.object_id,
-                have_version: from_version,
-            };
-            Box::pin(compute_per_commit_diff_at_cut(
-                snapshot,
-                &subscriber_state,
-                to_version,
-                ext_store,
-                ext_reads,
-                None,
-                "subscribe_read_layer",
-            ))
-            .await?
-            .map(|commit| match commit {
-                PerCommitDiff::Built(diff_response) => CatchUpBuilt::Diff {
-                    diff_response,
-                    mode: "off",
-                },
-                PerCommitDiff::Regressed { cut, to_version } => {
-                    CatchUpBuilt::Regressed { cut, to_version }
-                }
-            })
         }
     };
-    Ok(built)
+    let layout = match laid_out {
+        Built::Ready(LaidOut::Ready(layout)) => layout,
+        Built::Ready(LaidOut::Restore(pending)) => {
+            let total = ctx.svc.valkey.catchup_payload_budget.total_bytes();
+            let restored = Box::pin(restore_in_batches(
+                ext_store,
+                &pending,
+                restore_charge_centi,
+                total,
+                |bytes| reserve_catchup_payload(ctx, bytes, consumer),
+            ))
+            .await?;
+            pending.finish(&restored)?
+        }
+        Built::Missing(missing) => return Ok(Built::Missing(missing)),
+    };
+    let grant = reserve_catchup_payload(ctx, layout.reservation_bytes(), consumer).await?;
+    let charge = PayloadGrant {
+        grant,
+        restore_charge_centi,
+    };
+    let built = Box::pin(layout.fill(ext_store, Some(charge))).await?;
+    Ok(built.map(|diff_response| CatchUpBuilt::Diff { diff_response }))
+}
+
+/// The status a catch-up ends with when its capacity budget ran out waiting
+/// for the catch-up payload budget (`reason="catchup_capacity"`), before any
+/// content. Retryable, with the retry hint
+/// [`CATCHUP_CAPACITY`](refusal_reason::CATCHUP_CAPACITY) and no `wait`
+/// metadata, as [`flight_capacity_refused`].
+fn catchup_payload_refused() -> Status {
+    RefusalDetail::new(refusal_reason::CATCHUP_CAPACITY, Some(CAPACITY_RETRY_DELAY)).unavailable(
+        "this replica's catch-up payload memory, sized from its pod memory limit, is in use by \
+         other catch-ups; retry",
+    )
+}
+
+/// Reserves `bytes` of the replica's catch-up payload budget for one catch-up
+/// payload, or for one batch of the external values a catch-up restores
+/// before its layout ([`build_catch_up_once`]; SDD §12.3): at once when it
+/// fits and no catch-up waits ahead, otherwise after a first-in, first-out
+/// wait, clamped to the budget's total so an oversized payload or restore
+/// runs alone. The catch-up holds nothing of the budget while it waits.
+///
+/// A capacity wait, like the slot's and the read permit's: it ends at the
+/// subscription's capacity-budget deadline and is charged to the budget; it
+/// races the subscription's endings first (shutdown, session cancellation,
+/// client disconnect, its hold's ending); a closed budget ends the
+/// subscription `shutdown`; and a budget that runs out ends it `UNAVAILABLE`
+/// with `reason="catchup_capacity"` ([`catchup_payload_refused`]), before any
+/// content — after the caught-up ack only on a steady-state overwrite
+/// re-bootstrap.
+///
+/// Unlike the slot and permit waits, it runs with the catch-up's stream
+/// registered (`consumer`), so live entries queue for it meanwhile, charged
+/// to the live-delivery budget. So it also ends as soon as that registration
+/// ends — a hard backlog cap reached, the multiplexer shutting down — checked
+/// every [`BUILD_TURN_STREAM_CHECK`] with [`end_catch_up_if_stream_ended`], as
+/// [`take_build_turn`] does, rather than waiting out a reservation and a build
+/// it can no longer send.
+///
+/// **Stalled holders.** While it waits, every `OUTER_SEND_DEADLINE` (the first
+/// time as the wait begins), every other subscription whose response queue
+/// holds catch-up pages and has had nothing taken for that long is ended
+/// `slow_reader_deadline`, with a WARN naming this waiting catch-up
+/// ([`DeliveryLedger::end_stalled_catchup_holders`](crate::storage::stream_mux::delivery_ledger::DeliveryLedger::end_stalled_catchup_holders)).
+/// So the budget always drains: a client that stopped reading cannot hold its
+/// catch-up's pages while other joins wait. A slow but working reader, and
+/// every subscription when nothing waits, is never ended this way.
+async fn reserve_catchup_payload(
+    ctx: &SubscriberCtx<'_>,
+    bytes: u64,
+    consumer: &LayerStreamConsumer,
+) -> Result<MemoryGrant, Status> {
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    let budget_before = ctx.budget.remaining();
+    let started = tokio::time::Instant::now();
+    let deadline = ctx.budget.deadline();
+    let stalled_for = outer_send_deadline(ctx.svc);
+    let reserve = ctx
+        .svc
+        .valkey
+        .catchup_payload_budget
+        .reserve(bytes, Some(deadline));
+    tokio::pin!(reserve);
+    let mut stalled_check = tokio::time::interval(stalled_for);
+    stalled_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut stream_check = tokio::time::interval(BUILD_TURN_STREAM_CHECK);
+    stream_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let reserved = loop {
+        tokio::select! {
+            biased;
+            ending = subscription_ending(ctx) => return Err(ending),
+            reserved = &mut reserve => break reserved,
+            _ = stream_check.tick() => end_catch_up_if_stream_ended(ctx, consumer)?,
+            _ = stalled_check.tick() => {
+                ctx.svc
+                    .valkey
+                    .stream_mux
+                    .delivery_ledger()
+                    .end_stalled_catchup_holders(ctx.hold, stalled_for);
+            }
+        }
+    };
+    let waited = started.elapsed();
+    ctx.budget.charge(waited);
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    record_budget_charge(
+        ctx,
+        BudgetWait::CatchUpPayload,
+        budget_before,
+        started,
+        Some(deadline),
+        waited,
+    );
+    match reserved {
+        Ok(grant) => Ok(grant),
+        // `ValkeyClient::quit` closed the budget: the replica is shutting down.
+        Err(CatchUpRefusal::Closed) => {
+            ctx.exit.set(StreamExitCell::SHUTDOWN);
+            Err(server_shutting_down())
+        }
+        Err(CatchUpRefusal::TimedOut) => {
+            ctx.exit.set(StreamExitCell::CATCHUP_CAPACITY);
+            Err(catchup_payload_refused())
+        }
+    }
 }
 
 /// Build a catch-up's payload from its proven snapshot under the
@@ -3816,16 +3300,11 @@ async fn build_catch_up_once(
 /// this returns, or, on a miss, before its hold is taken. A re-read
 /// replaces the registration in `consumer` in place, and a re-read that
 /// attaches to a flight gives the slot back (`slot` `None`); the caller
-/// releases whatever slot is left. A per-commit build
-/// ([`CatchUpBuild::PerCommit`]) passes no `consumer` and no slot: its re-read
-/// swaps nothing and, above the limits, answers
-/// [`CatchUpBuilt::AboveCeiling`] to its replay, which hands over with the
-/// slot it holds.
+/// releases whatever slot is left.
 ///
-/// [`CatchUpBuilt::RereadNotFound`] and, for a per-commit build,
-/// [`CatchUpBuilt::AboveCeiling`] come only from the re-read; the caller
-/// handles them as it handles its own read's `NotFound` and `TOO_LARGE`, the
-/// `NotFound`'s recovery attempt included, once the hold is released.
+/// [`CatchUpBuilt::RereadNotFound`] comes only from the re-read; the caller
+/// handles it as it handles its own read's `NotFound`, the recovery attempt
+/// included, once the hold is released.
 async fn build_catch_up(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
@@ -3833,7 +3312,7 @@ async fn build_catch_up(
     snapshot: BuildSnapshot,
     regime: &'static str,
     slot: &mut Option<CatchUpPermit>,
-    consumer: Option<&mut LayerStreamConsumer>,
+    consumer: &mut LayerStreamConsumer,
 ) -> Result<CatchUpBuilt, Status> {
     // Test-only: park between the snapshot and the build's first blob read
     // (the probe), so a test can land a commit that releases a blob the
@@ -3851,6 +3330,7 @@ async fn build_catch_up(
         &snapshot,
         build,
         ExtValueReads::PROBE,
+        consumer,
     ))
     .await?
     {
@@ -3935,10 +3415,10 @@ struct CatchUpHeld<'a> {
     /// flight). Given back, set to `None`, when the re-read attaches to a
     /// flight.
     slot: &'a mut Option<CatchUpPermit>,
-    /// A cut-based build's stream registration, swapped for a fresh
-    /// reservation before the re-read and replaced in place by its
-    /// registration at the re-read's cut. `None` for a per-commit build.
-    consumer: Option<&'a mut LayerStreamConsumer>,
+    /// The build's stream registration, swapped for a fresh reservation
+    /// before the re-read and replaced in place by its registration at the
+    /// re-read's cut.
+    consumer: &'a mut LayerStreamConsumer,
 }
 
 /// A build with [`ExtValueReads::recover`] answered [`Built::Missing`],
@@ -3984,10 +3464,9 @@ enum Reread {
 /// Where the miss protocol's re-read gets its fresh cut
 /// ([`reread_and_rebuild`]).
 enum RereadRoute {
-    /// The build's own read: a cut-based build's atomic read — or, above the
-    /// atomic-read limits (the object's flight registered, or the read
-    /// answering `TOO_LARGE`), the object's flight — and a per-commit build's
-    /// replay read.
+    /// The build's own read: its atomic read — or, above the atomic-read
+    /// limits (the object's flight registered, or the read answering
+    /// `TOO_LARGE`), the object's flight.
     Own,
     /// The object's fenced-read flight — a successor of the flight whose
     /// shared snapshot missed, which the catch-up has already left — sized
@@ -4155,14 +3634,20 @@ async fn rebuild_and_check(
     route: RereadRoute,
     held: CatchUpHeld<'_>,
 ) -> Result<CatchUpBuilt, Status> {
+    let CatchUpHeld { slot, consumer } = held;
+    let held = CatchUpHeld {
+        slot,
+        consumer: &mut *consumer,
+    };
     match Box::pin(reread_and_rebuild(ctx, object_id, build, run, route, held)).await? {
         Reread::Done(built) => Ok(built),
         // A re-read through a flight keeps its build turn in that flight
         // across the genuine check and the fetch-on-miss build, and gives it
-        // back as this returns.
+        // back as this returns. The re-read left `consumer` registered at its
+        // cut.
         Reread::StillMissing(snapshot) => {
             Box::pin(genuine_miss_rebuild(
-                ctx, object_id, hold, build, &snapshot, run,
+                ctx, object_id, hold, build, &snapshot, run, consumer,
             ))
             .await
         }
@@ -4186,6 +3671,7 @@ async fn genuine_miss_rebuild(
     build: CatchUpBuild,
     snapshot: &AtomicSnapshot,
     run: MissRun,
+    consumer: &LayerStreamConsumer,
 ) -> Result<CatchUpBuilt, Status> {
     let recover = match hold.confirm_live().await {
         Ok(Some(live)) => ExtValueReads::recover(&live),
@@ -4206,7 +3692,7 @@ async fn genuine_miss_rebuild(
          under a GC read hold the store confirmed live; building with fetch-on-miss through the \
          checkpoint adapter"
     );
-    match Box::pin(build_catch_up_once(ctx, snapshot, build, recover)).await? {
+    match Box::pin(build_catch_up_once(ctx, snapshot, build, recover, consumer)).await? {
         Built::Ready(built) => Ok(built),
         Built::Missing(_) => Err(unreachable_recover_miss()),
     }
@@ -4241,14 +3727,7 @@ fn read_hold_lost(ctx: &SubscriberCtx<'_>, object_id: u64, error: Option<&Servic
 /// The re-read and rebuild of [`rebuild_under_read_hold`], run while the
 /// `{gc}` read hold lives.
 ///
-/// **A per-commit build** ([`CatchUpBuild::PerCommit`]) re-reads as
-/// `replay_commit_diff` reads: the object's flight registered, or its replay
-/// read ([`read_replay_commit_snapshot`], under a new read permit inside the
-/// replay's slot) answering `TOO_LARGE`, answers
-/// [`CatchUpBuilt::AboveCeiling`] for the replay to hand over; it swaps no
-/// registration and checks its own cut against its commit.
-///
-/// **A cut-based build** first swaps its stream registration (`held.consumer`)
+/// The build first swaps its stream registration (`held.consumer`)
 /// for a fresh reservation: [`reserve_stream`] first — it never waits, since
 /// the registration it replaces keeps the reader bound — then
 /// `shutdown_and_release` of the old registration, so no backlog queues
@@ -4295,51 +3774,6 @@ async fn reread_and_rebuild(
     held: CatchUpHeld<'_>,
 ) -> Result<Reread, Status> {
     let CatchUpHeld { slot, consumer } = held;
-    if matches!(build, CatchUpBuild::PerCommit { .. }) {
-        debug_assert!(
-            matches!(route, RereadRoute::Own),
-            "a per-commit build reads atomically, never through a flight's shared snapshot"
-        );
-        // As `replay_commit_diff`: a registered flight means the layer is
-        // above the atomic-read limits, so hand over with no atomic attempt.
-        if let Some(found) = ctx.svc.snapshot_flights.lookup(object_id) {
-            return Ok(Reread::Done(CatchUpBuilt::AboveCeiling(
-                FlightSizing::Known(found.size),
-            )));
-        }
-        let snapshot = match read_replay_commit_snapshot(ctx, object_id).await {
-            Ok(Ok(SnapshotRead::Snapshot(snapshot))) => snapshot,
-            // As `replay_commit_diff`: an early-out's fence probe is left to
-            // the attach (`read_through_flight`).
-            Ok(Ok(SnapshotRead::TooLarge(too_large))) => {
-                return Ok(Reread::Done(CatchUpBuilt::AboveCeiling(
-                    FlightSizing::from_too_large(&too_large),
-                )));
-            }
-            Ok(Err(ending)) => return Err(ending),
-            Err(ServiceError::NotFound(_)) => {
-                return Ok(Reread::Done(CatchUpBuilt::RereadNotFound));
-            }
-            Err(other) => return Err(other.into()),
-        };
-        return match Box::pin(build_catch_up_once(
-            ctx,
-            &snapshot,
-            build,
-            ExtValueReads::PROBE,
-        ))
-        .await?
-        {
-            Built::Ready(built) => Ok(Reread::Done(built)),
-            Built::Missing(_) => Ok(Reread::StillMissing(BuildSnapshot::Atomic(snapshot))),
-        };
-    }
-    let Some(consumer) = consumer else {
-        return Err(ServiceError::Internal(
-            "a catch-up's cut-based re-read was given no stream registration to swap".to_owned(),
-        )
-        .into());
-    };
 
     // The swap: reserve first, while the registration being replaced keeps
     // the reader bound, then release the old one.
@@ -4372,6 +3806,7 @@ async fn reread_and_rebuild(
                         &snapshot,
                         build,
                         ExtValueReads::PROBE,
+                        consumer,
                     ))
                     .await?
                     {
@@ -4435,7 +3870,15 @@ async fn reread_and_rebuild(
         consumer,
     ))
     .await?;
-    match Box::pin(build_catch_up_once(ctx, &turn, build, ExtValueReads::PROBE)).await? {
+    match Box::pin(build_catch_up_once(
+        ctx,
+        &turn,
+        build,
+        ExtValueReads::PROBE,
+        consumer,
+    ))
+    .await?
+    {
         Built::Ready(built) => Ok(Reread::Done(built)),
         Built::Missing(_) => Ok(Reread::StillMissing(turn)),
     }
@@ -4451,8 +3894,7 @@ async fn reread_and_rebuild(
 async fn send_full_state(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
-    diff_response: &DiffResponse,
-    regime_mode: &'static str,
+    diff_response: DiffResponse,
 ) -> Result<CatchUpContent, Status> {
     // Enforce the brand-new-establishment invariant (SR-2.4 / SR-1.2): the
     // from-empty full-state message #1 must ALWAYS be a valid non-empty OMPF
@@ -4465,20 +3907,13 @@ async fn send_full_state(
     // terminator-only sequence the client treats as fatal empty content. The
     // terminator remains the ONE legitimate zero-size signal and is still
     // emitted exactly once by `run_catch_up`, never here.
-    if diff_response.ompf_bytes.is_empty() {
+    if diff_response.payload.is_empty() {
         return Err(ServiceError::Internal(format!(
-            "brand-new full-state establishment produced an empty OMPF payload for object_id={object_id} (mode={regime_mode}); \
+            "brand-new full-state establishment produced an empty OMPF payload for object_id={object_id}; \
              message #1 must be a valid non-empty from-empty create"
         ))
         .into());
     }
-    // Map the tracing "off"/"snapshot" mode to the metric taxonomy: only the
-    // corrected faithful full-state path is `"snapshot"` (Plan b.msb).
-    let catchup_mode = if regime_mode == "snapshot" {
-        "snapshot"
-    } else {
-        "legacy"
-    };
 
     // Label the content with the cut the snapshot actually represents and
     // return that same value for the ack — see the ack-≤-content invariant
@@ -4488,9 +3923,12 @@ async fn send_full_state(
     // for it, and recording the stable cut only past the guard means such a
     // failure records no `verified` cut either — a build that served nothing
     // never counts as a served cut. (The two counters are not 1:1 in general;
-    // see `live_subscribe_stable_cut_total`'s doc.)
+    // see `live_subscribe_stable_cut_total`'s doc.) The corrected faithful
+    // full-state path is the one `catchup_mode="snapshot"` delivery (Plan
+    // b.msb taxonomy).
+    let (case, sections_count) = (diff_response.case, diff_response.sections_count);
     let content =
-        deliver_catch_up_content(ctx, object_id, diff_response, "brand_new", catchup_mode).await?;
+        deliver_catch_up_content(ctx, object_id, diff_response, "brand_new", "snapshot").await?;
 
     // Content-only: this helper delivers the full-state snapshot but does NOT
     // emit the `total_size == 0` caught-up terminator. The terminator is sent
@@ -4503,11 +3941,11 @@ async fn send_full_state(
         session_id = %ctx.session_id,
         layer_name = %ctx.layer_name,
         object_id = object_id,
-        case = diff_response.case.as_label(),
-        sections_count = diff_response.sections_count,
-        ompf_size = diff_response.ompf_bytes.len(),
+        case = case.as_label(),
+        sections_count = sections_count,
+        ompf_size = content.delivered_bytes,
         regime = "brand_new",
-        mode = regime_mode,
+        mode = "snapshot",
         "full-state catch-up sent"
     );
     Ok(content)
@@ -4546,8 +3984,11 @@ async fn send_ack_header(
 /// resolves the deadline, records the exit reason and maps each outcome to the
 /// status the client sees:
 ///
-/// * [`SendOutcome::ShuttingDown`] — graceful shutdown. `reason="shutdown"`,
-///   [`server_shutting_down`]: `UNAVAILABLE`, so the client re-subscribes,
+/// * [`SendOutcome::ShuttingDown`] — the shutdown token fired, ending by its
+///   cause ([`SubscriberCtx::end_on_shutdown`]): graceful shutdown is
+///   `reason="shutdown"`, [`server_shutting_down`]; a hold is `reason="held"`
+///   or `reason="stale_verdict"`, with its own status. Each is `UNAVAILABLE`,
+///   so the client re-subscribes,
 ///   wherever the ingress routes it. Reaching it means a message was in flight, so the client
 ///   holds a truncated OMPF sequence and, mid-catch-up, never received its
 ///   caught-up ack; the retry re-establishes it.
@@ -4577,19 +4018,21 @@ async fn send_ack_header(
 /// naming them is the point — the claim is per-chunk, not per-loop:
 ///
 /// * `deliver_catch_up_content` — the chunk loop for the full-state,
-///   in-window-snapshot and out-of-window regimes.
-/// * `send_per_commit_payload` — the chunk loop for the legacy in-window replay
-///   (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`, the documented rollback knob)
-///   and for the steady-state empty delta of a commit with no relay bytes to
-///   forward.
+///   in-window and out-of-window regimes.
+/// * `send_per_commit_payload` — the chunk loop for the steady-state empty
+///   delta of a commit with no relay bytes to forward.
 /// * `run_steady_state`'s verbatim relay — the b.gze path that forwards the
 ///   writer's own OMPF.
 ///
 /// Reaching the slow-reader outcome therefore means one specific thing: the
-/// channel's 32 delivery slots are full and tonic has not drained them. (The
-/// channel is built with 33; the 33rd is reserved for the terminal trailer
-/// before any data is sent and is not available here — see
-/// `send_terminal_status`.)
+/// queue's 32 data slots are full and tonic has not drained them. (The
+/// terminal trailer's slot is apart from them, reserved when the queue was
+/// made, and is not available here — see `send_terminal_status`.)
+///
+/// **The hold.** Every send also races the subscription's live-delivery hold
+/// ([`SendOutcome::Ended`]): the live-delivery budget, or a catch-up waiting
+/// for catch-up payload memory, can end a subscription whose send is parked
+/// on a full queue, and it ends at once rather than at the deadline.
 ///
 /// **Stall accounting.** A send that finds those 32 slots already full is a
 /// stall ([`SendStall`]): it is counted on
@@ -4601,27 +4044,30 @@ async fn send_ack_header(
 /// `phase="catchup"`: catch-up content and every ack. The other chunk loops
 /// call [`send_or_disconnect_as`] with their kind: the steady-state relay and
 /// empty delta as [`SendKind::Live`], labelled `phase="live"`, stamping their
-/// last message for the `transport` delivery lag; the legacy in-window replay
-/// as [`SendKind::CatchUp`].
+/// last message for the `transport` delivery lag.
 async fn send_or_disconnect(
     ctx: &SubscriberCtx<'_>,
     msg: SubscribeReadLayerResponse,
 ) -> Result<(), Status> {
-    send_or_disconnect_as(ctx, msg, SendKind::CatchUp).await
+    send_or_disconnect_as(ctx, msg, SendKind::CatchUp, None).await
 }
 
 /// [`send_or_disconnect`] for a send of the given `kind`: its stall `phase`,
 /// and the commit stamp a live delivery's last message carries
-/// ([`Outbound::commit_end`]).
+/// ([`Outbound::commit_end`]); `release` rides on the message
+/// ([`Outbound::release`]) and is released when the response stream takes
+/// it, or when it is dropped unsent.
 async fn send_or_disconnect_as(
     ctx: &SubscriberCtx<'_>,
     msg: SubscribeReadLayerResponse,
     kind: SendKind,
+    release: Option<OutboundRelease>,
 ) -> Result<(), Status> {
     let deadline = outer_send_deadline(ctx.svc);
     let outbound = Outbound {
         item: Ok(msg),
         commit_end: kind.commit_end(),
+        release,
     };
     // Held across the send, so its wait is recorded however the send ends,
     // the task being dropped included.
@@ -4631,6 +4077,7 @@ async fn send_or_disconnect_as(
         outbound,
         ctx.shutdown,
         ctx.session_token(),
+        Some(ctx.hold),
         deadline,
     )
     .await;
@@ -4643,15 +4090,15 @@ async fn send_or_disconnect_as(
             Err(Status::cancelled("client disconnected"))
         }
         SendOutcome::ShuttingDown => {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
             // `Unavailable`, not `Cancelled`: the Kit client retries the former
             // and not the latter (its retry policy covers DEADLINE_EXCEEDED /
             // UNAVAILABLE / RESOURCE_EXHAUSTED / INTERNAL; the inspected
             // revision and line anchors: `docs-internal/cross-repo-debugging.md`
             // § Kit client retry and reconnect behaviour), and
-            // a shutdown caught mid-delivery has left it with a partial stream
-            // it must re-establish, wherever the ingress routes the retry.
-            Err(server_shutting_down())
+            // a shutdown or hold caught mid-delivery has left it with a partial
+            // stream it must re-establish, wherever the ingress routes the
+            // retry. Every cause's status is `UNAVAILABLE`.
+            Err(ctx.end_on_shutdown())
         }
         SendOutcome::SessionCancelled => Err(ctx.end_on_session_cancel()),
         SendOutcome::SlowReader => {
@@ -4666,12 +4113,9 @@ async fn send_or_disconnect_as(
                  deadline; tearing the subscription down so its buffers, task and \
                  stream registration are released"
             );
-            Err(ServiceError::Unavailable(format!(
-                "subscriber did not read its stream within {}ms; tearing down",
-                deadline.as_millis()
-            ))
-            .into())
+            Err(slow_reader_status(deadline))
         }
+        SendOutcome::Ended => Err(ctx.end_on_hold()),
     }
 }
 
@@ -4686,19 +4130,22 @@ enum SendOutcome {
     ShuttingDown,
     /// The session token fired; its cause decides the ending.
     SessionCancelled,
-    /// The deadline elapsed with the channel still full.
+    /// The deadline elapsed with the queue still full.
     SlowReader,
+    /// The subscription's live-delivery hold was ended
+    /// ([`SubscriberCtx::end_on_hold`]).
+    Ended,
 }
 
 /// Race one send on `tx` against every reason it might never complete, and
-/// report which won. Takes nothing but the channel, the message, the two
-/// tokens and the deadline, so it is testable on a bare `mpsc` channel; its one
-/// production caller is [`send_or_disconnect_as`], which maps the outcome to
-/// the client's status.
+/// report which won. Takes nothing but the queue, the message, the two
+/// tokens, the hold and the deadline, so it is testable on a bare response
+/// queue; its one production caller is [`send_or_disconnect_as`], which maps
+/// the outcome to the client's status.
 ///
-/// Five arms, `biased` so the terminal conditions are checked before the send
+/// Six arms, `biased` so the terminal conditions are checked before the send
 /// can win a race it is already losing — without `biased`, a send into a
-/// channel with room and a token that has already fired are both ready, and
+/// queue with room and a token that has already fired are both ready, and
 /// tokio would pick between them at random:
 ///
 /// 1. `shutdown` — [`SendOutcome::ShuttingDown`]. First, so a subscription that
@@ -4707,15 +4154,18 @@ enum SendOutcome {
 /// 2. `session_cancel` — [`SendOutcome::SessionCancelled`]. An absent token's
 ///    arm never resolves.
 /// 3. `tx.closed()` — [`SendOutcome::Disconnected`].
-/// 4. the send itself — [`SendOutcome::Sent`], or
+/// 4. the hold's ending — [`SendOutcome::Ended`]. An absent hold's arm never
+///    resolves.
+/// 5. the send itself — [`SendOutcome::Sent`], or
 ///    [`SendOutcome::Disconnected`] if the receiver dropped under it.
-/// 5. `deadline` — [`SendOutcome::SlowReader`]. It arms only around this one
+/// 6. `deadline` — [`SendOutcome::SlowReader`]. It arms only around this one
 ///    send; see [`send_or_disconnect`].
 async fn send_racing_endings<T>(
-    tx: &mpsc::Sender<T>,
+    tx: &ResponseSender<T>,
     msg: T,
     shutdown: &CancellationToken,
     session_cancel: Option<&CancellationToken>,
+    hold: Option<&SubscriptionHold>,
     deadline: std::time::Duration,
 ) -> SendOutcome {
     let send = tx.send(msg);
@@ -4725,6 +4175,7 @@ async fn send_racing_endings<T>(
         () = shutdown.cancelled() => SendOutcome::ShuttingDown,
         () = cancelled_or_never(session_cancel) => SendOutcome::SessionCancelled,
         () = tx.closed() => SendOutcome::Disconnected,
+        () = hold_ended_or_never(hold) => SendOutcome::Ended,
         result = &mut send => match result {
             Ok(()) => SendOutcome::Sent,
             Err(_) => SendOutcome::Disconnected,
@@ -4733,13 +4184,21 @@ async fn send_racing_endings<T>(
     }
 }
 
+/// Resolves when `hold` is ended; never when there is none.
+async fn hold_ended_or_never(hold: Option<&SubscriptionHold>) {
+    match hold {
+        Some(hold) => hold.ended().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Test-only two-phase seam inside [`deliver_catch_up_content`]'s chunk loop
-/// (b.f4f) — the loop that serves the full-state, in-window-snapshot and
+/// (b.f4f) — the loop that serves the full-state, in-window and
 /// out-of-window regimes.
 ///
 /// Deliberately not installed on the other two chunk loops on this path
-/// (`send_per_commit_payload`, which owns the legacy in-window replay's sends,
-/// and `run_steady_state`'s verbatim relay): the window this seam exists to
+/// (`send_per_commit_payload`, which owns the steady-state empty delta's
+/// sends, and `run_steady_state`'s verbatim relay): the window this seam exists to
 /// open is "content delivered, caught-up ack not yet sent", which only the
 /// catch-up phase has.
 ///
@@ -4747,13 +4206,15 @@ async fn send_racing_endings<T>(
 /// releases its slot before its first send.
 ///
 /// Installed via `LiveEditService::catch_up_chunk_seam_for_test`. The subscriber
-/// parks after its FIRST content chunk has been handed to
-/// [`send_or_disconnect`]; the test then knows content is on the wire and the
+/// parks after its FIRST content message has been handed to
+/// [`send_or_disconnect_as`]; the test then knows content is queued and the
 /// caught-up ack is not, fires its cancellation, and releases the park. The next
-/// `send_or_disconnect` — the following chunk, or `send_ack_header` when the
-/// payload was a single chunk — observes the cancellation and the RPC ends
-/// `UNAVAILABLE` (a shutdown) or `NOT_FOUND` (a deletion) rather than with a
-/// truncated-but-`OK` stream.
+/// send — the following chunk, or `send_ack_header` when the payload was a
+/// single chunk — observes the cancellation and the RPC ends `UNAVAILABLE` (a
+/// shutdown) or `NOT_FOUND` (a deletion) rather than with a
+/// truncated-but-`OK` stream. Content still queued when it ends is discarded
+/// before the status (`send_terminal_status`), so a client that had not read
+/// it yet gets the status next.
 ///
 /// **Why a rendezvous rather than a chunk-size override.** Shrinking
 /// `OMPF_CHUNK_SIZE` so a small layer produces >32 chunks would have to thread a
@@ -4887,12 +4348,13 @@ fn stream_cursor_at(sequence_num: u64) -> StreamCursor {
 ///
 /// A catch-up's stream is registered at its proven read's cut (its own atomic
 /// read's, or its flight's shared fenced read's), after every capacity wait
-/// ([`catch_up_proven_read`]), so this runs where a registered stream has had
-/// time to end: after the slot (or build turn) is released and before the
-/// first message, and, attached to a flight, all along its wait for a build
-/// turn ([`take_build_turn`]), so a registration that reached a hard backlog
-/// cap ends the catch-up there rather than after a build it can no longer
-/// send. Before the registration there is only a [`ReservedStream`], which
+/// before the read ([`catch_up_proven_read`]), so this runs where a
+/// registered stream has had time to end: after the slot (or build turn) is
+/// released and before the first message, and, all along its wait for a
+/// build turn ([`take_build_turn`]) and for the catch-up payload budget
+/// ([`reserve_catchup_payload`]), so a registration that reached a hard
+/// backlog cap ends the catch-up there rather than after a build it can no
+/// longer send. Before the registration there is only a [`ReservedStream`], which
 /// queues nothing and cannot end.
 ///
 /// Without this check the ending would surface only in `run_steady_state`,
@@ -4973,9 +4435,7 @@ fn fenced_read_wait_refused() -> Status {
 }
 
 /// Takes a `LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS` slot for one
-/// catch-up's backing-store reads and build (and, in rollback mode
-/// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`) on a same-object reconnect, its
-/// cluster stream-reader wait). The caller drops the returned
+/// catch-up's backing-store reads and build. The caller drops the returned
 /// permit before its first send, before any recovery attempt and before any
 /// re-bootstrap, and never calls this while it holds another.
 ///
@@ -4984,8 +4444,8 @@ fn fenced_read_wait_refused() -> Status {
 /// observes them: shutdown, session cancellation, client disconnect. A budget
 /// that runs out ends the subscription `UNAVAILABLE` with
 /// `reason="catchup_capacity"` and records the wait as `timed_out`. Every
-/// catch-up takes its slot before its first content message, in both catch-up
-/// modes, so this refusal comes before any content — except on a steady-state
+/// catch-up takes its slot before its first content message, so this refusal
+/// comes before any content — except on a steady-state
 /// overwrite re-bootstrap, where it comes after the subscription's caught-up
 /// ack.
 async fn acquire_catchup_slot(ctx: &SubscriberCtx<'_>) -> Result<CatchUpPermit, Status> {
@@ -4996,8 +4456,7 @@ async fn acquire_catchup_slot(ctx: &SubscriberCtx<'_>) -> Result<CatchUpPermit, 
     let acquired = tokio::select! {
         biased;
         () = ctx.shutdown.cancelled() => {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
-            return Err(server_shutting_down());
+            return Err(ctx.end_on_shutdown());
         }
         () = cancelled_or_never(ctx.session_token()) => {
             return Err(ctx.end_on_session_cancel());
@@ -5006,6 +4465,7 @@ async fn acquire_catchup_slot(ctx: &SubscriberCtx<'_>) -> Result<CatchUpPermit, 
             ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
             return Err(Status::cancelled("client disconnected"));
         }
+        () = ctx.hold.ended() => return Err(ctx.end_on_hold()),
         acquired = ctx.svc.valkey.catchup_gate.acquire(deadline) => acquired,
     };
     let waited = started.elapsed();
@@ -5051,10 +4511,7 @@ fn snapshot_read_capacity_refused() -> Status {
 /// sequence regressed (Spec SDD SR-3.2), before any content: a regime's proven
 /// read — its own atomic read, or its flight's shared fenced read, checked
 /// per attached catch-up — whose cut is below the header sequence it read
-/// first ([`catch_up_regressed`]), or a rollback-mode in-window replay's
-/// per-commit read whose cut is below the commit it rebuilds, which
-/// [`compute_per_commit_diff_at_cut`] refuses and
-/// [`per_commit_regressed`] maps to this status, or a re-read after an
+/// first ([`catch_up_regressed`]), or a re-read after an
 /// external-value miss whose cut is below the first read's
 /// ([`reread_and_rebuild`]). The layer exists, so
 /// this is no `NOT_FOUND`, and a retried subscribe re-reads the current header
@@ -5068,10 +4525,9 @@ fn sequence_regressed() -> Status {
 
 /// Takes a `LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY` read permit for one
 /// catch-up atomic snapshot read (Spec SDD SR-7.1), observed on
-/// `live_edit_catchup_snapshot_read_wait_seconds` under `consumer`: a regime's
-/// proven read (`catchup`, [`read_catch_up_snapshot`]) or one commit of a
-/// rollback-mode in-window replay (`catchup_legacy_per_commit`,
-/// [`read_replay_commit_snapshot`]). The caller holds its catch-up slot across
+/// `live_edit_catchup_snapshot_read_wait_seconds` under `consumer="catchup"`:
+/// a regime's proven read ([`read_catch_up_snapshot`]). The caller holds its
+/// catch-up slot across
 /// this call and the read, and drops the permit as soon as the read returns; it
 /// never waits for a slot while holding a permit.
 ///
@@ -5092,7 +4548,6 @@ fn sequence_regressed() -> Status {
 /// subscription's caught-up ack, as the slot wait does.
 async fn acquire_snapshot_read_permit(
     ctx: &SubscriberCtx<'_>,
-    consumer: SnapshotReadConsumer,
 ) -> Result<CatchUpReadPermit, Status> {
     #[cfg(any(test, feature = "test-fault-injection"))]
     let budget_before = ctx.budget.remaining();
@@ -5101,8 +4556,7 @@ async fn acquire_snapshot_read_permit(
     let acquired = tokio::select! {
         biased;
         () = ctx.shutdown.cancelled() => {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
-            return Err(server_shutting_down());
+            return Err(ctx.end_on_shutdown());
         }
         () = cancelled_or_never(ctx.session_token()) => {
             return Err(ctx.end_on_session_cancel());
@@ -5111,11 +4565,12 @@ async fn acquire_snapshot_read_permit(
             ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
             return Err(Status::cancelled("client disconnected"));
         }
+        () = ctx.hold.ended() => return Err(ctx.end_on_hold()),
         acquired = ctx
             .svc
             .valkey
             .catchup_read_gate
-            .acquire(deadline, consumer) => acquired,
+            .acquire(deadline, SnapshotReadConsumer::Catchup) => acquired,
     };
     let waited = started.elapsed();
     ctx.budget.charge(waited);
@@ -5168,12 +4623,7 @@ async fn read_catch_up_snapshot(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
 ) -> Result<Result<SnapshotRead, Status>, ServiceError> {
-    let permit = match Box::pin(acquire_snapshot_read_permit(
-        ctx,
-        SnapshotReadConsumer::Catchup,
-    ))
-    .await
-    {
+    let permit = match Box::pin(acquire_snapshot_read_permit(ctx)).await {
         Ok(permit) => permit,
         Err(ending) => return Ok(Err(ending)),
     };
@@ -5183,43 +4633,6 @@ async fn read_catch_up_snapshot(
         &ctx.svc.key_schema,
         &oid,
         SnapshotReadConsumer::Catchup,
-    ))
-    .await;
-    drop(permit);
-    read.map(Ok)
-}
-
-/// One commit's atomic read in a rollback-mode in-window replay
-/// ([`catch_up_in_window`]; Spec SDD SR-3.4, SR-7.1): take a read permit inside
-/// the replay's catch-up slot ([`acquire_snapshot_read_permit`], charged to the
-/// capacity budget like every catch-up wait), run [`read_object_snapshot`] for
-/// the `catchup_legacy_per_commit` consumer, and release the permit as the read
-/// returns. One permit per read, never one across the replay.
-///
-/// Error layers as on [`read_catch_up_snapshot`]: the outer `Err(ServiceError)`
-/// is the read's own (the replay routes its `NotFound`), the inner
-/// `Err(Status)` the permit wait's ending, returned as-is. Deliberately not
-/// [`read_catch_up_snapshot`]: per-commit reads are never shared between
-/// catch-ups (Spec SDD SR-3.4), so they stay off the regimes' one read call.
-async fn read_replay_commit_snapshot(
-    ctx: &SubscriberCtx<'_>,
-    object_id: u64,
-) -> Result<Result<SnapshotRead, Status>, ServiceError> {
-    let permit = match Box::pin(acquire_snapshot_read_permit(
-        ctx,
-        SnapshotReadConsumer::CatchupLegacyPerCommit,
-    ))
-    .await
-    {
-        Ok(permit) => permit,
-        Err(ending) => return Ok(Err(ending)),
-    };
-    let oid = object_id.to_string();
-    let read = Box::pin(read_object_snapshot(
-        &ctx.svc.valkey,
-        &ctx.svc.key_schema,
-        &oid,
-        SnapshotReadConsumer::CatchupLegacyPerCommit,
     ))
     .await;
     drop(permit);
@@ -5276,8 +4689,8 @@ impl std::ops::Deref for BuildSnapshot {
 }
 
 /// A catch-up's proven read and stream registration, shared by every regime
-/// that serves state (brand-new in both modes, in-window snapshot,
-/// out-of-window in both modes; Spec SDD SR-3.1–SR-3.3, SR-3.6, SR-7.5).
+/// that serves state (brand-new, in-window, out-of-window; Spec SDD
+/// SR-3.1–SR-3.3, SR-3.6, SR-7.5).
 ///
 /// Entered holding the reader `reserved` for the object's stream (`Some`) and,
 /// in `slot`, the catch-up slot — `None` only for a brand-new catch-up that
@@ -5446,8 +4859,7 @@ impl FlightSizing {
 ///
 /// The probe writes nothing and runs after the pin P was read and before
 /// `attach_or_create`, holding no catch-up slot or read permit and waiting
-/// for nothing: a catch-up has given its slot back before it attaches, and so
-/// has a rollback-mode replay handing over ([`ReplayCommit::AboveCeiling`]).
+/// for nothing: a catch-up has given its slot back before it attaches.
 /// It only refines an estimate, so it never ends the catch-up: a probe that
 /// fails, or finds the key absent, wrong-typed or holding no `bpi`, sizes from
 /// the fitted value — the flight's fence acquire meets and reports any real
@@ -5478,9 +4890,7 @@ async fn flight_size(
 /// The fenced path of a catch-up's proven read (Spec SDD SR-3.1, SR-3.2,
 /// SR-6.4, SR-7.5): attach to the object's shared fenced-read flight, wait
 /// for its read, check its cut against this catch-up's own pin, and register
-/// the stream at that cut. Reached from [`catch_up_proven_read`], and from
-/// [`catch_up_out_of_window`] when a rollback-mode in-window replay hands over
-/// ([`OutOfWindowEntry::AboveCeiling`]).
+/// the stream at that cut. Reached from [`catch_up_proven_read`].
 ///
 /// Entered holding the reader `reserved` for the object's stream and no
 /// catch-up slot or read permit: an attached catch-up holds none; the
@@ -5498,7 +4908,7 @@ async fn flight_size(
 /// 2. If the flight's cut is below `first_read`, the layer's sequence
 ///    regressed under this catch-up's pin: end it alone, `UNAVAILABLE`,
 ///    before any content ([`catch_up_regressed`]); the flight goes on for the
-///    others. Checked per catch-up, in every regime and in both modes.
+///    others. Checked per catch-up, in every regime.
 /// 3. Register the stream at the flight's cut. From here until its build
 ///    turn the stream's backlog queues outside the catch-up memory budget, and
 ///    a registration that reaches the multiplexer's hard backlog cap ends the
@@ -5584,7 +4994,8 @@ async fn catch_up_flight_read(
 /// |---|---|---|
 /// | [`FlightWaitError::CapacityExhausted`] | [`flight_capacity_refused`] | `catchup_capacity` |
 /// | [`FlightWaitError::ReaderWaitCap`] | [`fenced_read_wait_refused`] | `fenced_read_wait_cap` |
-/// | [`FlightWaitError::ShuttingDown`], or the shutdown token | [`server_shutting_down`] | `shutdown` |
+/// | [`FlightWaitError::ShuttingDown`] (the flight closed by the shutdown sequence) | [`server_shutting_down`] | `shutdown` |
+/// | the shutdown token | by its cause ([`SubscriberCtx::end_on_shutdown`]) | `shutdown` / `held` / `stale_verdict` |
 /// | the session token | by its cause ([`SubscriberCtx::end_on_session_cancel`]) | `session_cancel` / `session_absent` |
 /// | client disconnect | `CANCELLED` | `client_disconnect` |
 async fn read_through_flight(
@@ -5666,7 +5077,9 @@ const BUILD_TURN_STREAM_CHECK: std::time::Duration = std::time::Duration::from_m
 /// The turn wait is work: never charged to the capacity budget and not capped
 /// by the server. It is bounded by the builds ahead of this catch-up and ends
 /// only on the subscription's own endings (shutdown, session cancellation,
-/// client disconnect, in that order) or on its stream registration ending,
+/// client disconnect, then its live-delivery hold's ending, `delivery_budget`
+/// or `slow_reader_deadline`, in that order: [`subscription_ending`]) or on
+/// its stream registration ending,
 /// which a multiplexer hard backlog cap reached by the backlog queueing while
 /// it waits does — checked every [`BUILD_TURN_STREAM_CHECK`]. All before
 /// content. Leaving the wait gives up the catch-up's place and leaves the
@@ -5715,23 +5128,23 @@ async fn take_build_turn(
     Ok(BuildSnapshot::Turn(turn))
 }
 
-/// Resolves when one of the subscription's own endings fires — shutdown, then
-/// session cancellation, then client disconnect, in the order every wait
-/// observes them — with the exit reason recorded and the status it ends with.
-/// For a wait that has no other way to observe them; race it first, under
-/// `biased`.
+/// Resolves when one of the subscription's own endings fires — its shutdown
+/// token (by the token's cause, [`SubscriberCtx::end_on_shutdown`]), then
+/// session cancellation, then client disconnect, then its live-delivery
+/// hold's ending (`delivery_budget` or `slow_reader_deadline`), in the order
+/// every wait observes them — with the exit reason recorded and the status it
+/// ends with. For a wait that has no other way to observe them; race it first,
+/// under `biased`.
 async fn subscription_ending(ctx: &SubscriberCtx<'_>) -> Status {
     tokio::select! {
         biased;
-        () = ctx.shutdown.cancelled() => {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
-            server_shutting_down()
-        }
+        () = ctx.shutdown.cancelled() => ctx.end_on_shutdown(),
         () = cancelled_or_never(ctx.session_token()) => ctx.end_on_session_cancel(),
         () = ctx.tx.closed() => {
             ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
             Status::cancelled("client disconnected")
         }
+        () = ctx.hold.ended() => ctx.end_on_hold(),
     }
 }
 
@@ -5777,9 +5190,8 @@ fn catch_up_regressed(
 }
 
 /// Register this subscription's stream with the multiplexer at once, for a
-/// path with no capacity wait after it (up-to-date, and the rollback-mode
-/// in-window replay, which registers under its slot at the last entry its
-/// in-window read returned): [`reserve_stream`] then [`register_stream`].
+/// path with no capacity wait after it (up-to-date): [`reserve_stream`] then
+/// [`register_stream`].
 async fn open_consumer(
     ctx: &SubscriberCtx<'_>,
     object_id: u64,
@@ -5793,8 +5205,9 @@ async fn open_consumer(
 /// stream ([`ReservedStream`]): nothing is queued for it until
 /// [`register_stream`]. A catch-up reserves before its capacity waits, so the
 /// reader — on a cluster, its hash slot — stays bound to it through them, and
-/// registers at its proven read's cut, after every capacity wait
-/// ([`catch_up_proven_read`]).
+/// registers at its proven read's cut, after every capacity wait before the
+/// read ([`catch_up_proven_read`]); only the catch-up payload budget wait
+/// comes after it ([`reserve_catchup_payload`]).
 ///
 /// In cluster mode the reservation may wait for a free stream reader; that
 /// wait ends at the subscription's capacity-budget deadline and is charged to
@@ -5810,8 +5223,7 @@ async fn reserve_stream(ctx: &SubscriberCtx<'_>, object_id: u64) -> Result<Reser
     let reserved = tokio::select! {
         biased;
         () = ctx.shutdown.cancelled() => {
-            ctx.exit.set(StreamExitCell::SHUTDOWN);
-            return Err(server_shutting_down());
+            return Err(ctx.end_on_shutdown());
         }
         () = cancelled_or_never(ctx.session_token()) => {
             return Err(ctx.end_on_session_cancel());
@@ -5820,6 +5232,7 @@ async fn reserve_stream(ctx: &SubscriberCtx<'_>, object_id: u64) -> Result<Reser
             ctx.exit.set(StreamExitCell::CLIENT_DISCONNECT);
             return Err(Status::cancelled("client disconnected"));
         }
+        () = ctx.hold.ended() => return Err(ctx.end_on_hold()),
         reserved = reserve_layer_stream(
             &ctx.svc.valkey,
             &ctx.svc.key_schema,
@@ -5841,8 +5254,9 @@ async fn reserve_stream(ctx: &SubscriberCtx<'_>, object_id: u64) -> Result<Reser
     reserved.map_err(|err| consume_error_status(ctx, err))
 }
 
-/// Register a reserved stream at `cursor` and return its consumer. No wait:
-/// the reader was reserved by [`reserve_stream`]. A multiplexer that closed
+/// Register a reserved stream at `cursor` and return its consumer, its queued
+/// entries charged to the subscription's live-delivery hold. No wait: the
+/// reader was reserved by [`reserve_stream`]. A multiplexer that closed
 /// meanwhile ends the subscription `shutdown` ([`consume_error_status`]); the
 /// reservation is dropped either way on failure, releasing the reader.
 fn register_stream(
@@ -5851,6 +5265,7 @@ fn register_stream(
     cursor: &StreamCursor,
 ) -> Result<LayerStreamConsumer, Status> {
     reserved
+        .with_hold(ctx.hold)
         .register(cursor)
         .map_err(|err| consume_error_status(ctx, err))
 }
@@ -5954,11 +5369,11 @@ enum RestoredRerun {
     /// a fresh brand-new catch-up of the object, whose from-empty full state
     /// is what this site sends.
     BrandNew,
-    /// A reconnector's site — Regime 2's snapshot arm or Regime 3: a fresh
+    /// A reconnector's site — Regime 2 or Regime 3: a fresh
     /// Regime 3 catch-up ([`catch_up_out_of_window`] through its proven
     /// read), whose coalesced diff is based at the client's `have_version`,
     /// never a `base_version = 0` reset an advanced reconnector would refuse.
-    /// Regime 2's snapshot arm builds the same faithful coalesced diff, and a
+    /// Regime 2 builds the same faithful coalesced diff, and a
     /// restore appends no stream entry, which is what sends a restored
     /// layer's reconnector to Regime 3 ([`try_recover_after_notfound`]).
     /// `current_seq` is the site's pin P.
@@ -6004,8 +5419,8 @@ async fn recover_after_reread_not_found(
     match rerun {
         RestoredRerun::BrandNew => Box::pin(catch_up_brand_new(ctx, object_id)).await,
         RestoredRerun::OutOfWindow { current_seq } => {
-            // Reader first, then the slot, as every snapshot-mode catch-up
-            // takes them: a cluster-mode reader wait never holds a slot.
+            // Reader first, then the slot, as every catch-up takes them: a
+            // cluster-mode reader wait never holds a slot.
             let reserved = reserve_stream(ctx, object_id).await?;
             let slot = acquire_catchup_slot(ctx).await?;
             Box::pin(catch_up_out_of_window(
@@ -6014,7 +5429,6 @@ async fn recover_after_reread_not_found(
                 current_seq,
                 reserved,
                 slot,
-                OutOfWindowEntry::ProvenRead,
             ))
             .await
         }
@@ -6075,9 +5489,8 @@ enum CatchUpStream<'a> {
 /// recovery attempt, a slot wait or a re-bootstrap either, and the retried
 /// read takes its permit again under the re-acquired slot.
 ///
-/// Callers keep what differs between them: the read itself, its mode and
-/// regime labels, and any test seam, which fires once before the first
-/// attempt.
+/// Callers keep what differs between them: the read itself, its regime
+/// label, and any test seam, which fires once before the first attempt.
 ///
 /// Stack (b.9qr): `read` is awaited at one point for both attempts, and the
 /// rarely taken recovery attempt and re-bootstrap — the latter inlines
@@ -6127,20 +5540,6 @@ where
     ))
     .await?;
     Ok(StateRead::Rebootstrapped(outcome))
-}
-
-/// Pick the entry cap of the rollback-mode in-window replay
-/// ([`read_in_window_replay`], which pages up to it). Uses the LayerStore's
-/// configured MAXLEN when available (a subscriber can't be more entries
-/// behind than the stream retains), falling back to a soft cap so a stream
-/// with no entry cap doesn't yield an unbounded replay.
-fn in_window_xrange_count(svc: &LiveEditService) -> u64 {
-    let maxlen = svc.layer_store.layer_stream_maxlen();
-    if maxlen == 0 {
-        IN_WINDOW_XRANGE_SOFT_CAP
-    } else {
-        maxlen
-    }
 }
 
 /// Self-echo suppression predicate (SDD §12.5).
@@ -6601,7 +6000,7 @@ impl CatchUpOutOfWindowSeam {
 
 /// Test-only synchronization seam for the catch-up **state read** (b.vd8).
 /// When installed on a `LiveEditService` via
-/// `catch_up_state_read_seam_for_test`, the subscriber pauses at up to four
+/// `catch_up_state_read_seam_for_test`, the subscriber pauses at up to three
 /// distinct points. The first two sit in the gap between the header sequence
 /// the catch-up read first (P) and the state read whose result it serves —
 /// after the capacity waits for the reader and the slot, before the read
@@ -6610,8 +6009,7 @@ impl CatchUpOutOfWindowSeam {
 /// reservation and queues nothing:
 ///
 ///   * **Pre-full-state** — inside `catch_up_brand_new` (Regime 1).
-///   * **Pre-coalesced** — inside `catch_up_in_window_snapshot` (Regime 2,
-///     default `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=true` arm).
+///   * **Pre-coalesced** — inside `catch_up_in_window` (Regime 2).
 ///
 ///   Each parks once per catch-up, before its proven read: the atomic attempt
 ///   or, above the atomic-read limits, the attach to the object's shared
@@ -6622,26 +6020,14 @@ impl CatchUpOutOfWindowSeam {
 ///   after P — first awaits
 ///   [`Self::wait_until_parked_pre_full_state`] /
 ///   [`Self::wait_until_parked_pre_coalesced`].
-///   * **Between replay computes** — inside `catch_up_in_window` (Regime 2,
-///     rollback `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false` arm), after its
-///     FIRST per-commit read (and the diff built from it) and before the
-///     next, with nothing sent. Empty commits are skipped: their stored delta
-///     is built with no read and does not trigger the park, so in a window
-///     `[s empty, s+1, …]` it parks after the second stored diff. Lets a test
-///     land an overwrite and drain its cleanup so a later read answers
-///     `NotFound` (b.jvx Site A). A two-phase park
-///     ([`Self::wait_until_parked_between_replay_computes`] /
-///     [`Self::release_between_replay_computes`]): the subscriber stays
-///     parked until the test releases it.
 ///   * **Pre-ext-probe** (b.yuo) — inside [`build_catch_up`], which every
 ///     catch-up build goes through: after the catch-up's state read (its own
 ///     atomic read, or its flight's shared fenced read, in its build turn)
 ///     and before the build reads any external-value blob, so a test can land
 ///     a commit that releases a blob the snapshot references and let the GC
 ///     collect it — the stale-miss race the external-value miss protocol
-///     resolves. Parks only the FIRST build to reach it in the seam's life (a
-///     rollback-mode replay's first per-commit build that takes a read; the
-///     build a re-bootstrap enters passes). A two-phase park
+///     resolves. Parks only the FIRST build to reach it in the seam's life
+///     (the build a re-bootstrap enters passes). A two-phase park
 ///     ([`Self::wait_until_parked_pre_ext_probe`] /
 ///     [`Self::release_pre_ext_probe`]).
 ///
@@ -6653,7 +6039,7 @@ impl CatchUpOutOfWindowSeam {
 /// the cut the stream registers at — so it must be delivered exactly once, in
 /// the snapshot, and acked.
 ///
-/// The four park points sit after the catch-up has taken its
+/// The three park points sit after the catch-up has taken its
 /// `LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS` slot, so a subscriber parked
 /// at any of them holds that slot (unlike one parked at [`CatchUpChunkSeam`],
 /// which released it before its first send) — except a brand-new catch-up
@@ -6662,7 +6048,7 @@ impl CatchUpOutOfWindowSeam {
 /// and a catch-up building from its flight's shared snapshot, which parks at
 /// the pre-ext-probe point holding its build turn instead.
 ///
-/// Each instance installs exactly one of the four park points — selected by
+/// Each instance installs exactly one of the three park points — selected by
 /// the constructor used — so a test can scope its parked window to the
 /// regime under test. Mirrors [`CatchUpOutOfWindowSeam`]'s multi-slot shape,
 /// including the 1-party auto-complete barriers in the non-selected slots: the
@@ -6677,9 +6063,6 @@ impl CatchUpOutOfWindowSeam {
 pub struct CatchUpStateReadSeam {
     park_before_full_state: Option<SeamParkPoint>,
     park_before_coalesced: Option<SeamParkPoint>,
-    /// `(parked, released)`: two 2-party barriers when selected, two 1-party
-    /// auto-complete barriers otherwise.
-    park_between_replay_computes: Option<(tokio::sync::Barrier, tokio::sync::Barrier)>,
     /// The pre-ext-probe point (b.yuo): a 2-party park when selected, a
     /// 1-party auto-complete one otherwise.
     park_before_ext_probe: Option<SeamParkPoint>,
@@ -6700,14 +6083,13 @@ impl CatchUpStateReadSeam {
         Self {
             park_before_full_state: Some(SeamParkPoint::new(2)),
             park_before_coalesced: Some(SeamParkPoint::new(1)),
-            park_between_replay_computes: Some(Self::auto_complete_two_phase()),
             park_before_ext_probe: Some(SeamParkPoint::new(1)),
             ext_probe_reached: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Build a seam that parks the subscriber inside
-    /// `catch_up_in_window_snapshot` (Regime 2) after its in-window point
+    /// `catch_up_in_window` (Regime 2) after its in-window point
     /// read and its slot
     /// wait, before its read permit and state read.
     ///
@@ -6718,30 +6100,6 @@ impl CatchUpStateReadSeam {
         Self {
             park_before_full_state: Some(SeamParkPoint::new(1)),
             park_before_coalesced: Some(SeamParkPoint::new(2)),
-            park_between_replay_computes: Some(Self::auto_complete_two_phase()),
-            park_before_ext_probe: Some(SeamParkPoint::new(1)),
-            ext_probe_reached: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    /// Build a seam that parks the subscriber inside `catch_up_in_window`
-    /// (Regime 2, rollback mode) after its FIRST per-commit read (and the diff
-    /// built from it), holding the catch-up slot, with nothing sent. Empty
-    /// commits are skipped: they take no read and do not trigger the park.
-    /// The subscriber stays parked until
-    /// [`Self::release_between_replay_computes`].
-    ///
-    /// The other three slots hold single-party auto-complete barriers — see
-    /// the type-level docs — so a re-bootstrap the release leads to passes
-    /// `catch_up_brand_new`'s arrival without waiting.
-    pub fn new_between_replay_computes() -> Self {
-        Self {
-            park_before_full_state: Some(SeamParkPoint::new(1)),
-            park_before_coalesced: Some(SeamParkPoint::new(1)),
-            park_between_replay_computes: Some((
-                tokio::sync::Barrier::new(2),
-                tokio::sync::Barrier::new(2),
-            )),
             park_before_ext_probe: Some(SeamParkPoint::new(1)),
             ext_probe_reached: std::sync::atomic::AtomicBool::new(false),
         }
@@ -6754,20 +6112,15 @@ impl CatchUpStateReadSeam {
     /// subscriber stays parked until [`Self::release_pre_ext_probe`]; every
     /// later build passes.
     ///
-    /// The other three slots hold single-party auto-complete barriers — see
+    /// The other two slots hold single-party auto-complete barriers — see
     /// the type-level docs.
     pub fn new_before_ext_probe() -> Self {
         Self {
             park_before_full_state: Some(SeamParkPoint::new(1)),
             park_before_coalesced: Some(SeamParkPoint::new(1)),
-            park_between_replay_computes: Some(Self::auto_complete_two_phase()),
             park_before_ext_probe: Some(SeamParkPoint::new(2)),
             ext_probe_reached: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    fn auto_complete_two_phase() -> (tokio::sync::Barrier, tokio::sync::Barrier) {
-        (tokio::sync::Barrier::new(1), tokio::sync::Barrier::new(1))
     }
 
     /// Rendezvous at the Regime 1 pre-full-state park point. Safe to call
@@ -6826,43 +6179,6 @@ impl CatchUpStateReadSeam {
     pub async fn wait_until_parked_pre_coalesced(&self) {
         if let Some(p) = self.park_before_coalesced.as_ref() {
             p.wait_until_parked().await;
-        }
-    }
-
-    /// Subscriber side of the between-replay-computes park point: announce
-    /// the park (rendezvous 1), then block until the test releases it
-    /// (rendezvous 2). Called once per `catch_up_in_window` invocation, after
-    /// its first per-commit read (an empty commit takes none and does not
-    /// count); a no-op wait on a seam built by another constructor.
-    /// Each barrier is 2-party when selected, so a second rollback-mode replay
-    /// on the same service (a second subscription, or a retry) would hang:
-    /// install a fresh seam per replay.
-    pub async fn arrive_between_replay_computes(&self) {
-        debug_assert!(
-            self.park_between_replay_computes.is_some(),
-            "arrive_between_replay_computes called on a seam whose \
-             park_between_replay_computes slot is None; rendezvous would \
-             silently no-op"
-        );
-        if let Some((parked, released)) = self.park_between_replay_computes.as_ref() {
-            let _ = parked.wait().await;
-            let _ = released.wait().await;
-        }
-    }
-
-    /// Test side: block until the subscriber has parked after its first replay
-    /// read (rendezvous 1). It then holds its catch-up slot and has sent
-    /// nothing. Pair with a later [`Self::release_between_replay_computes`].
-    pub async fn wait_until_parked_between_replay_computes(&self) {
-        if let Some((parked, _)) = self.park_between_replay_computes.as_ref() {
-            let _ = parked.wait().await;
-        }
-    }
-
-    /// Test side: release the parked subscriber (rendezvous 2).
-    pub async fn release_between_replay_computes(&self) {
-        if let Some((_, released)) = self.park_between_replay_computes.as_ref() {
-            let _ = released.wait().await;
         }
     }
 
@@ -6933,6 +6249,11 @@ pub enum BudgetWait {
     /// less than the time from `started`, since the flight's work and its wait
     /// for a predecessor are not charged.
     FlightRead,
+    /// A catch-up payload's wait for the catch-up payload budget
+    /// ([`reserve_catchup_payload`]), made inside the catch-up slot or build
+    /// turn, after the payload is laid out and before its first external
+    /// value byte is read.
+    CatchUpPayload,
 }
 
 /// One charge to a subscription's [`CapacityBudget`], as recorded by
@@ -7299,7 +6620,7 @@ mod tests {
             unreachable!("never called: only the future's type is measured")
         }
 
-        fn measured_catch_up_futures() -> [(&'static str, usize); 5] {
+        fn measured_catch_up_futures() -> [(&'static str, usize); 4] {
             [
                 ("run_catch_up", future_size_of(run_catch_up)),
                 (
@@ -7308,18 +6629,14 @@ mod tests {
                 ),
                 (
                     "catch_up_in_window",
-                    future_size_of(|c| catch_up_in_window(c, never(), never(), never(), never())),
-                ),
-                (
-                    "catch_up_in_window_snapshot",
                     future_size_of(|c| {
-                        catch_up_in_window_snapshot(c, never(), never(), never(), never(), never())
+                        catch_up_in_window(c, never(), never(), never(), never(), never())
                     }),
                 ),
                 (
                     "catch_up_out_of_window",
                     future_size_of(|c| {
-                        catch_up_out_of_window(c, never(), never(), never(), never(), never())
+                        catch_up_out_of_window(c, never(), never(), never(), never())
                     }),
                 ),
             ]
@@ -7332,24 +6649,23 @@ mod tests {
         ///
         /// | future | measured | ceiling |
         /// |---|---|---|
-        /// | `run_catch_up` | 7,296 | 8,192 |
-        /// | `catch_up_brand_new` | 7,304 | 8,192 |
-        /// | `catch_up_in_window` | 7,768 | 8,192 |
-        /// | `catch_up_in_window_snapshot` | 7,840 | 8,192 |
-        /// | `catch_up_out_of_window` | 1,952 | 4,096 |
+        /// | `run_catch_up` | 7,464 | 8,192 |
+        /// | `catch_up_brand_new` | 7,240 | 8,192 |
+        /// | `catch_up_in_window` | 7,688 | 8,192 |
+        /// | `catch_up_out_of_window` | 1,936 | 4,096 |
         ///
-        /// Measured on a debug `--lib` test build (`cfg(test)`, so the test
-        /// seams' awaits are counted) once every catch-up regime, the
-        /// rollback-mode per-commit replay included, took its snapshot from
-        /// its proven read — its own atomic read, or above the atomic-read
-        /// limits its layer's shared fenced-read flight — with the read-permit
-        /// wait, the atomic read, the flight-size probe, the attach and wait
-        /// for the flight's read, the wait for a build turn, the build from
-        /// the snapshot, the replay's per-commit read and build and the
-        /// replay's hand-over to the out-of-window route each boxed where it
-        /// is awaited (b.y3m Epic 3 Task 7; before it, with the interim
-        /// above-ceiling fallback boxed in the same place, the four regime
-        /// futures measured 7,032 / 7,744 / 7,576 / 2,016).
+        /// Measured on an x86_64 debug `--lib` test build (`cfg(test)`, so the
+        /// test seams' awaits are counted) once the legacy catch-up was
+        /// removed (b.5kj) and every catch-up regime is the faithful one: each
+        /// takes its snapshot from its proven read — its own atomic read, or
+        /// above the atomic-read limits its layer's shared fenced-read flight
+        /// — with the read-permit wait, the atomic read, the flight-size
+        /// probe, the attach and wait for the flight's read, the wait for a
+        /// build turn and the build from the snapshot each boxed where it is
+        /// awaited (b.y3m Epic 3 Task 7). Before b.5kj the in-window regime
+        /// had two futures: the per-commit replay, which held the name
+        /// `catch_up_in_window` (7,768), and the faithful
+        /// `catch_up_in_window_snapshot` (7,840), which the name now denotes.
         ///
         /// History: before any boxing `run_catch_up` measured 23,352 bytes,
         /// because it carried every regime inline and each regime carried a
@@ -7359,12 +6675,9 @@ mod tests {
         /// 22.2–22.6 KiB from its inline snapshot-load chain; the fence was
         /// first recorded there (24,576-byte regime ceilings), and the
         /// proven-read rework was measured against it before these ceilings
-        /// were tightened. `catch_up_in_window` kept its 24,576-byte ceiling
-        /// (22,576 measured) while it still carried the per-commit load chain
-        /// (the since-deleted `compute_diff`) inline; boxing its per-commit read
-        /// brought it to 7,744, and its ceiling was tightened to 8,192.
+        /// were tightened.
         ///
-        /// Headroom: about 4–12 % on the ~7 KiB futures, room for a few small
+        /// Headroom: about 6–12 % on the ~7 KiB futures, room for a few small
         /// locals; 4,096 bytes on
         /// the 2 KiB `catch_up_out_of_window`, so a small local does not trip
         /// it. Every ceiling sits well under the smallest thing that must never
@@ -7379,11 +6692,10 @@ mod tests {
         /// a stack overflow far from the code that caused it (b.9qr). A debug
         /// build does not overlap the slots of inline futures, so their sizes
         /// add up; this fence fails at the code that grew instead.
-        const CATCH_UP_FUTURE_CEILINGS: [(&str, usize); 5] = [
+        const CATCH_UP_FUTURE_CEILINGS: [(&str, usize); 4] = [
             ("run_catch_up", 8_192),
             ("catch_up_brand_new", 8_192),
             ("catch_up_in_window", 8_192),
-            ("catch_up_in_window_snapshot", 8_192),
             ("catch_up_out_of_window", 4_096),
         ];
 
@@ -7458,7 +6770,7 @@ mod tests {
             server_timestamp: 0,
             client_timestamp: 0,
         };
-        let msgs: Vec<_> = chunk_ompf_for_stream(&bytes, &header).collect();
+        let msgs: Vec<_> = chunk_ompf_for_stream(Bytes::from(bytes), &header).collect();
         // 1 header + ceil(2.5 MiB / 1 MiB) = 1 + 3 = 4 messages.
         assert_eq!(msgs.len(), 4);
         assert!(matches!(
@@ -7499,8 +6811,11 @@ mod tests {
         capacity: usize,
         shutdown_fired: bool,
         session: Option<bool>,
-    ) -> (SendOutcome, mpsc::Receiver<u8>) {
-        let (tx, rx) = mpsc::channel::<u8>(capacity);
+    ) -> (
+        SendOutcome,
+        super::super::response_queue::ResponseReceiver<u8>,
+    ) {
+        let (tx, rx) = response_queue::<u8>(capacity);
         let shutdown = CancellationToken::new();
         if shutdown_fired {
             shutdown.cancel();
@@ -7517,6 +6832,7 @@ mod tests {
             7,
             &shutdown,
             session_token.as_ref(),
+            None,
             UNREACHED_DEADLINE,
         )
         .await;
@@ -7531,7 +6847,7 @@ mod tests {
             let (outcome, mut rx) = race_one_send(4, false, session).await;
             assert_eq!(outcome, SendOutcome::Sent, "session token {session:?}");
             assert_eq!(
-                rx.try_recv().ok(),
+                rx.try_recv(),
                 Some(7),
                 "a `Sent` outcome must mean the message is in the channel"
             );
@@ -7554,7 +6870,7 @@ mod tests {
                  `UNAVAILABLE` the client needs to reconnect"
             );
             assert!(
-                rx.try_recv().is_err(),
+                rx.try_recv().is_none(),
                 "round {round}: the shutdown arm won, so nothing may have been enqueued"
             );
         }
@@ -7572,7 +6888,7 @@ mod tests {
                  session token, so a deletion would be observed only by luck"
             );
             assert!(
-                rx.try_recv().is_err(),
+                rx.try_recv().is_none(),
                 "round {round}: the session arm won, so nothing may have been enqueued"
             );
         }
@@ -7600,7 +6916,7 @@ mod tests {
     #[tokio::test]
     async fn send_racing_endings_with_the_receiver_dropped_is_disconnected() {
         for session in [None, Some(false)] {
-            let (tx, rx) = mpsc::channel::<u8>(4);
+            let (tx, rx) = response_queue::<u8>(4);
             drop(rx);
             let shutdown = CancellationToken::new();
             let session_token = session.map(|_| CancellationToken::new());
@@ -7609,6 +6925,7 @@ mod tests {
                 7,
                 &shutdown,
                 session_token.as_ref(),
+                None,
                 UNREACHED_DEADLINE,
             )
             .await;
@@ -7629,7 +6946,7 @@ mod tests {
                 (true, false, SendOutcome::ShuttingDown),
                 (false, true, SendOutcome::SessionCancelled),
             ] {
-                let (tx, rx) = mpsc::channel::<u8>(4);
+                let (tx, rx) = response_queue::<u8>(4);
                 drop(rx);
                 let shutdown = CancellationToken::new();
                 if shutdown_fired {
@@ -7639,9 +6956,15 @@ mod tests {
                 if session_fired {
                     session.cancel();
                 }
-                let outcome =
-                    send_racing_endings(&tx, 7, &shutdown, Some(&session), UNREACHED_DEADLINE)
-                        .await;
+                let outcome = send_racing_endings(
+                    &tx,
+                    7,
+                    &shutdown,
+                    Some(&session),
+                    None,
+                    UNREACHED_DEADLINE,
+                )
+                .await;
                 assert_eq!(outcome, want, "round {round}");
             }
         }
@@ -7652,7 +6975,7 @@ mod tests {
     /// without the test waiting for it.
     #[tokio::test(start_paused = true)]
     async fn send_racing_endings_full_channel_past_the_deadline_is_slow_reader() {
-        let (tx, _rx) = mpsc::channel::<u8>(1);
+        let (tx, _rx) = response_queue::<u8>(1);
         tx.try_send(0)
             .expect("fixture: the one slot takes the first message");
         let shutdown = CancellationToken::new();
@@ -7662,6 +6985,7 @@ mod tests {
             7,
             &shutdown,
             Some(&session),
+            None,
             std::time::Duration::from_millis(50),
         )
         .await;
@@ -7675,12 +6999,12 @@ mod tests {
     /// shutdown.
     #[tokio::test]
     async fn send_racing_endings_shutdown_while_parked_on_a_full_channel_is_shutting_down() {
-        let (tx, _rx) = mpsc::channel::<u8>(1);
+        let (tx, _rx) = response_queue::<u8>(1);
         tx.try_send(0)
             .expect("fixture: the one slot takes the first message");
         let shutdown = CancellationToken::new();
         let session = CancellationToken::new();
-        let race = send_racing_endings(&tx, 7, &shutdown, Some(&session), UNREACHED_DEADLINE);
+        let race = send_racing_endings(&tx, 7, &shutdown, Some(&session), None, UNREACHED_DEADLINE);
         tokio::pin!(race);
         assert!(
             futures::poll!(race.as_mut()).is_pending(),
@@ -7693,12 +7017,78 @@ mod tests {
         assert_eq!(outcome, SendOutcome::ShuttingDown);
     }
 
-    // Confirms the default COUNT bound when no MAXLEN is configured.
+    /// A live-delivery ledger with no budget to enforce, a subscription's hold
+    /// on it, and a second hold standing for a catch-up that waits for
+    /// catch-up payload memory: the one public way to end a hold without a
+    /// stream reader, as a stalled catch-up holder.
+    fn ledger_with_a_hold_and_a_waiter() -> (
+        std::sync::Arc<crate::storage::stream_mux::delivery_ledger::DeliveryLedger>,
+        SubscriptionHold,
+        SubscriptionHold,
+    ) {
+        let ledger = crate::storage::stream_mux::delivery_ledger::DeliveryLedger::new(
+            u64::MAX,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        );
+        let hold = ledger.register_hold(HoldIdentity::default());
+        let waiter = ledger.register_hold(HoldIdentity::default());
+        (ledger, hold, waiter)
+    }
 
-    #[test]
-    fn soft_cap_is_sensible_default() {
-        const _: () = assert!(IN_WINDOW_XRANGE_SOFT_CAP >= 1024);
-        const _: () = assert!(IN_WINDOW_XRANGE_SOFT_CAP <= 1_000_000);
+    /// The hold's ending is the fourth arm (b.ntm): a hold already ended wins
+    /// over a send into a queue with room, so the subscription the
+    /// live-delivery budget or a waiting catch-up ended enqueues nothing more
+    /// for that send.
+    #[tokio::test]
+    async fn send_racing_endings_with_the_hold_already_ended_is_ended_and_enqueues_nothing() {
+        let (ledger, hold, waiter) = ledger_with_a_hold_and_a_waiter();
+        let _page = hold.queue_catchup_page(1);
+        assert_eq!(
+            ledger.end_stalled_catchup_holders(&waiter, std::time::Duration::ZERO),
+            1,
+            "fixture: the hold holding a catch-up page is ended"
+        );
+        let (tx, mut rx) = response_queue::<u8>(4);
+        let shutdown = CancellationToken::new();
+        let outcome =
+            send_racing_endings(&tx, 7, &shutdown, None, Some(&hold), UNREACHED_DEADLINE).await;
+        assert_eq!(outcome, SendOutcome::Ended);
+        assert!(
+            rx.try_recv().is_none(),
+            "the hold's arm won, so nothing may have been enqueued"
+        );
+        // A shutdown that fired too still wins: it is checked first.
+        shutdown.cancel();
+        let outcome =
+            send_racing_endings(&tx, 7, &shutdown, None, Some(&hold), UNREACHED_DEADLINE).await;
+        assert_eq!(outcome, SendOutcome::ShuttingDown);
+    }
+
+    /// A send parked on a full queue ends as soon as its hold is ended, not at
+    /// the outer send deadline: the hold's ending is raced while it waits.
+    #[tokio::test]
+    async fn send_racing_endings_parked_on_a_full_queue_ends_when_its_hold_is_ended() {
+        let (ledger, hold, waiter) = ledger_with_a_hold_and_a_waiter();
+        let (tx, _rx) = response_queue::<u8>(1);
+        tx.try_send(0)
+            .expect("fixture: the one slot takes the first message");
+        let shutdown = CancellationToken::new();
+        let race = send_racing_endings(&tx, 7, &shutdown, None, Some(&hold), UNREACHED_DEADLINE);
+        tokio::pin!(race);
+        assert!(
+            futures::poll!(race.as_mut()).is_pending(),
+            "fixture: with the queue full and nothing ended, the send must park"
+        );
+        let _page = hold.queue_catchup_page(1);
+        assert_eq!(
+            ledger.end_stalled_catchup_holders(&waiter, std::time::Duration::ZERO),
+            1
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), race)
+            .await
+            .expect("a parked send must observe its hold's ending");
+        assert_eq!(outcome, SendOutcome::Ended);
+        assert_eq!(hold.ending_reason(), Some(STREAM_EXIT_SLOW_READER_DEADLINE));
     }
 
     // ── Teardown line decision (SDD §17.2.1) ────────────────────────────────
@@ -7723,7 +7113,7 @@ mod tests {
     }
 
     /// Every reachable (outcome × exit reason × caught_up) cell agrees with the
-    /// documented table: every `Err` cell (11 × 2), and the `Ok` cells, which
+    /// documented table: every `Err` cell (14 × 2), and the `Ok` cells, which
     /// only `client_disconnect` reaches.
     ///
     /// Exhaustive over `STREAM_EXIT_REASONS`, the metric's own vocabulary, so
@@ -7737,8 +7127,8 @@ mod tests {
     fn teardown_event_matches_the_documented_table_for_every_cell() {
         assert_eq!(
             crate::observability::metrics::STREAM_EXIT_REASONS.len(),
-            11,
-            "precondition: the matrix is sized for the eleven documented exit reasons"
+            14,
+            "precondition: the matrix is sized for the fourteen documented exit reasons"
         );
         for &reason in crate::observability::metrics::STREAM_EXIT_REASONS {
             for caught_up in [false, true] {
@@ -8085,6 +7475,19 @@ mod tests {
         let cell = StreamExitCell::new();
         cell.set(StreamExitCell::SESSION_ABSENT);
         assert_eq!(cell.get(), STREAM_EXIT_SESSION_ABSENT);
+        // The fleet hold's two codes, which `SubscriberCtx::end_on_shutdown`
+        // sets.
+        let cell = StreamExitCell::new();
+        cell.set(StreamExitCell::HELD);
+        assert_eq!(cell.get(), STREAM_EXIT_HELD);
+        let cell = StreamExitCell::new();
+        cell.set(StreamExitCell::STALE_VERDICT);
+        assert_eq!(cell.get(), STREAM_EXIT_STALE_VERDICT);
+        // The live-delivery budget's ending (b.ntm) has a cell of its own: it
+        // must not read back as `error`.
+        let cell = StreamExitCell::new();
+        cell.set(StreamExitCell::DELIVERY_BUDGET);
+        assert_eq!(cell.get(), STREAM_EXIT_DELIVERY_BUDGET);
     }
 
     // ── Outcome cells ────────────────────────────────────────────────────────

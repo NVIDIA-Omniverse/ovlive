@@ -20,7 +20,7 @@ limitations under the License.
 Ready-to-file text for <https://github.com/aembke/fred.rs>, describing the
 changes in `vendor/fred-10.1.0.patch` (see `vendor/fred-10.1.0.SOURCE.md`).
 It is written for fred's maintainers and names nothing internal to this
-repository. Issues 1 and 7 have a pull request ready below; issues 2 to 6,
+repository. Issues 1, 7, 10 and 11 have a pull request ready below; issues 2 to 6,
 8 and 9 describe the defects and the fix the patch makes, for a pull request
 each once the maintainers agree on the approach. Once filed, record the links in
 the SOURCE.md's Upstream section.
@@ -899,3 +899,209 @@ command and a pipeline whose futures are dropped, a pipeline replayed from the
 retry buffer, a `Transaction` cut after its `MULTI` was written (no `EXEC`
 reaches the server and the connection is replaced), and a pipeline cut after
 its `MULTI` (a `DISCARD` follows and the next command on the connection runs).
+
+---
+
+## Issue 10
+
+**Title:** cluster client treats a data reply that reads like `MOVED`/`ASK` as a redirect
+
+**Body:**
+
+### Summary
+
+In cluster mode, a reply is taken for a `MOVED` or `ASK` redirection by its
+text alone, whatever its RESP type. A string value such as
+`MOVED 3999 127.0.0.1:7000`, returned by `GET` or any other command that
+returns a string, or a status reply of that shape, is consumed as a redirect
+and never reaches the caller: a `MOVED`-shaped value makes the client re-sync
+the cluster and re-send the command, and an `ASK`-shaped one makes it send
+`ASKING` to the node the value names. The value an application stored decides
+which node the client talks to next, and the command fails instead of
+returning it.
+
+### Versions
+
+fred 10.1.0 (also current `main`), redis-protocol 6.0.0, tokio runtime,
+`redis-cluster://` config, RESP2 or RESP3.
+
+### Cause
+
+`process_response_frame` (`src/router/clustered.rs:322`) tests every reply
+with redis-protocol's `Resp3Frame::is_redirection`
+(redis-protocol 6.0.0 `src/resp3/types.rs:894-897`). That reads the frame's
+text through `as_str` (`:1878-1889`), which answers for `SimpleString`,
+`BlobString`, `BigNumber`, `VerbatimString` and `ChunkedString` frames as well
+as for `SimpleError` and `BlobError`, and accepts any text that starts `MOVED`
+or `ASK` and has exactly three space-separated tokens (`src/utils.rs:66-73`).
+Under RESP2 a status reply (`+…`) becomes a `SimpleString` and a bulk string
+(`$…`) a `BlobString` (`src/resp2/types.rs:679-682`), so both protocols are
+affected.
+
+A matching reply goes to `redirect_command` (`:266-286`). For `MOVED`,
+`process_moved` (`src/router/commands.rs:288-315`) re-syncs the cluster and
+re-sends the command, which gets the same value again, until its write-attempt
+budget (or, if that is set higher, its redirection budget) runs out; under
+fred's defaults (`max_command_attempts: 3`, `max_redirections: 5`,
+`src/types/config.rs:480-481`) it fails `Unknown` / "Too many failed write
+attempts." (`src/protocol/command.rs:1778`). For `ASK`,
+`process_ask` (`:251-285`) sends `ASKING` to the named node when the client
+is connected to it; otherwise `Router::route` finds no connection for it
+(`src/router/mod.rs:181-182`) and `send_asking_with_policy` sleeps and fails
+(and the router task then exits, Issue 1).
+
+fred's other redirect paths already decide by type: the transaction router
+converts a reply with `protocol::utils::frame_to_error`
+(`src/protocol/utils.rs:493-502`, error frames only) before it asks
+`Error::is_moved` / `Error::is_ask` (`src/error.rs:418-426`,
+`src/router/transactions.rs:77-79`), and the cluster-wide reply parser uses
+`frame_to_error` too (`src/router/clustered.rs:85`).
+
+### Reproduction
+
+1. Against a cluster, `SET k "MOVED 3999 127.0.0.1:7000"` (any slot and
+   address of that shape).
+2. `GET k` with a `redis-cluster://` client: the client re-syncs the cluster
+   on every round and, with fred's default budgets, the call fails "Too many
+   failed write attempts." instead of returning the string.
+3. With `ASK 3999 <an address the client is not connected to>` as the value,
+   `GET k` fails (after the reconnect policy's sleeps, when one is set), and
+   the router task exits (Issue 1).
+
+### Expected
+
+Only an error reply (`SimpleError` or `BlobError`) is a redirection. Any other
+reply is returned to its command as data, whatever its text.
+
+---
+
+## Pull request for issue 10
+
+**Title:** fix(cluster): only an error reply is a MOVED/ASK redirection
+
+**Body:**
+
+`process_response_frame` decided whether a reply is a cluster redirection
+with redis-protocol's `is_redirection`, which reads the text of string data
+frames too, so a stored value or status reply that reads like
+`MOVED <slot> <host:port>` or `ASK <slot> <host:port>` was consumed as a
+redirect: the caller lost its reply, and the client re-synced, re-sent or sent
+`ASKING` to a node named by the value.
+
+This requires an error frame first and keeps redis-protocol's text rule for
+it unchanged, so every real `-MOVED` and `-ASK` is handled exactly as before.
+It matches the transaction router and the cluster-wide reply parser, which
+already go through `frame_to_error` and so accept error frames only.
+
+Fixes #<issue number>.
+
+```diff
+--- a/src/router/clustered.rs
++++ b/src/router/clustered.rs
+@@ -319,7 +319,7 @@ pub fn process_response_frame(
+   #[cfg(feature = "partial-tracing")]
+   let _ = command.traces.network.take();
+ 
+-  if frame.is_redirection() {
++  if matches!(frame, Resp3Frame::SimpleError { .. } | Resp3Frame::BlobError { .. }) && frame.is_redirection() {
+     redirect_command(inner, &conn.server, command, frame);
+     return Ok(());
+   }
+```
+
+Testing: a one-node mock cluster that answers `GET` with a bulk string
+`ASK 1234 <address>` or `MOVED 1234 <address>`, and a status reply of the same
+text, asserting that the call returns the string; and the same text as an
+error reply, asserting that it is still followed as a redirect.
+
+---
+
+## Issue 11
+
+**Title:** every cluster client keeps an idle `CLUSTER SLOTS` connection open between syncs
+
+**Body:**
+
+### Summary
+
+A clustered client keeps, besides its one connection per primary, the
+connection its last topology sync opened for `CLUSTER SLOTS`, for as long as
+the client lives. It carries nothing between syncs, and the next sync of a
+healthy client drops it and opens a new one anyway. Every such connection
+lands on the same node, so an application with many clustered clients (a pool,
+or several pools) holds one idle socket per client on one node, counted
+against that node's `maxclients`.
+
+### Versions
+
+fred 10.1.0 (also current `main`), `redis-cluster://` config, any runtime and
+protocol.
+
+### Cause
+
+`cluster_slots_backchannel` (`src/router/clustered.rs:405-498`) sends the
+sync's `CLUSTER SLOTS` on the stored backchannel connection when there is
+one; otherwise, or when that fails, it opens a connection with `connect_any`
+(`:359-397`), which tries the configured and cached nodes in the order of a
+sorted `BTreeSet` and takes the first that connects, and then stores that
+connection as the backchannel (`inner.update_backchannel(transport)`, `:462`
+and `:478`). `sync` (`:518-592`) asks for the stored connection to be dropped
+first when no connection has a pending read error (`force_disconnect`,
+`:527-533`), so a healthy client's sync never reuses it: it closes it and opens
+another. The stored connection's only lasting effect is the idle socket.
+
+### Expected
+
+A sync holds the connection it opened only while it runs, and the client keeps
+no connection a sync opened once that sync ends.
+
+---
+
+## Pull request for issue 11
+
+**Title:** fix(cluster): drop the `CLUSTER SLOTS` connection when the sync ends
+
+**Body:**
+
+`cluster_slots_backchannel` stored the connection it opened for `CLUSTER
+SLOTS` as the client's backchannel, where it stayed idle until the next sync,
+which closes it and opens another unless a connection has a pending error. So
+every clustered client kept one idle socket, all on the same node.
+
+This drops the connection once its reply is read. A drop closes the socket
+without waiting on the peer, which suits the router task the sync runs in. The
+backchannel's connection-id map, which the router refreshes from its own
+connections, is untouched, and the backchannel commands (`CLIENT UNBLOCK`,
+`FUNCTION KILL`, `FUNCTION STATS`) still open and keep their own connection.
+The cost is one connect per sync that found a connection with a pending error,
+which reused the stored connection before.
+
+Fixes #<issue number>.
+
+```diff
+--- a/src/router/clustered.rs
++++ b/src/router/clustered.rs
+@@ -459,7 +459,7 @@ pub async fn cluster_slots_backchannel(
+         )
+         .await?;
+         let host = transport.default_host.clone();
+-        inner.update_backchannel(transport).await;
++        drop(transport);
+ 
+         (frame, host)
+       } else {
+@@ -475,7 +475,7 @@ pub async fn cluster_slots_backchannel(
+       )
+       .await?;
+       let host = transport.default_host.clone();
+-      inner.update_backchannel(transport).await;
++      drop(transport);
+ 
+       (frame, host)
+     };
+```
+
+Testing: a two-node mock cluster; after a sync that opens a connection (and
+after one that fails at each step: connect, setup, the request's timeout, an
+error reply), the client's backchannel holds no connection, the mock sees that
+connection closed, and the connection-id map still lists the primaries.

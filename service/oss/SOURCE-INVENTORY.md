@@ -36,6 +36,9 @@ Its notices are at the root:
 - `oss/OSS_LICENSE.txt`: a second copy of the Apache License 2.0; `oss/SECURITY.md`: how to report a vulnerability.
 - This file and `oss/RUST-DEPENDENCY-LICENSES.md`.
 
+Its lockfiles are the workspace's `Cargo.lock` and `oodf-ffi/fuzz/Cargo.lock`, which locks what the fuzz harness is built from.
+CI audits both against the RustSec advisory database.
+
 A repository that imports the tree carries these files with it (section 6).
 
 ### Service container image
@@ -49,9 +52,11 @@ The image adds three paths:
 |---|---|
 | `/app/live-edit` | The service binary. The replica autoscaler is the same binary, run as `live-edit scaler`. |
 | `/licenses/` | `LICENSE.txt`, `NOTICE` and `ATTRIBUTIONS.md`; the FlatBuffers license and header notice; the Rust standard library's copyright file and licenses; the GCC runtime's copyright file and the GPL-3.0 text; `SOURCE-MANIFEST.json` (the build inputs: binary and `Cargo.lock` digests, `rustc`, FlatBuffers and GCC versions); `SOURCES.md`, which describes `/vendor.tar.gz`; `SHA256SUMS`. |
-| `/vendor.tar.gz` | The source of the third-party code compiled into the binary: the locked Cargo dependencies (`sources/crates/<name>-<version>`), the patched fred tree with its patch, its provenance record and its upstream-file manifest `fred-10.1.0.SHA256SUMS` (`sources/patched-crates/`), the FlatBuffers checkout, the Rust standard library sources with their locked dependencies, and the Debian GCC source package of the statically linked C++ runtime. |
+| `/vendor.tar.gz` | The source of the third-party code compiled into the binary: the locked Cargo dependencies (`sources/crates/<name>-<version>`), the patched fred tree without its `Cargo.lock`, with its patch, its provenance record and its upstream-file manifest `fred-10.1.0.SHA256SUMS` (`sources/patched-crates/`), the FlatBuffers checkout, the Rust standard library sources with their locked dependencies, and the Debian GCC source package of the statically linked C++ runtime. |
 
 `/vendor.tar.gz` is a superset: it also holds the build, test and other-platform crates of the lockfile.
+Its own files leave out the lockfiles third-party projects keep for their own development, which pin versions the binary was not built from; the only lockfiles among them are the workspace's `Cargo.lock` and the Rust standard library's.
+The FlatBuffers `git archive`, the standard library's `.crate` files and the GCC source files are kept as published, with any lockfiles inside them.
 It carries no NVIDIA application source; NVIDIA's changes to fred, in the patched tree, are the only NVIDIA-authored code in it.
 
 ### API archive
@@ -60,32 +65,36 @@ The API archive is a zip file for client developers.
 It contains:
 
 - the LiveService protocol files, `proto/nvidia/omniverse/live/`;
-- `CHANGELOG.md`, `LICENSE.txt`, `NOTICE`, `ATTRIBUTIONS.md`, `OSS_LICENSE.txt` and `SECURITY.md`;
-- `PRODUCT_TERMS_OMNIVERSE.txt`, a reference copy of the NVIDIA Omniverse product-specific terms, which the source tree does not carry;
-- the conformance suite's source, `conformance_tests/` (its `pyproject.toml`, `uv.lock`, `README.md`, the unsigned test token `local-test-token.jwt`, and `src/`);
-- `native-codec/`, a standalone Cargo workspace that builds the suite's OMPF decoder: its own `Cargo.toml`, `Cargo.lock`, `LICENSE.txt` and `NOTICE`, and the `oodf-ffi` crate's manifest, build script, Rust sources, C++ library, OODF schema (`oodf-ffi/schema/`) and decoder example.
+- `CHANGELOG.md`, `LICENSE.txt`, `NOTICE`, `OSS_LICENSE.txt` and `SECURITY.md`;
+- `PRODUCT_TERMS_OMNIVERSE.txt`, a reference copy of the NVIDIA Omniverse product-specific terms, which the source tree does not carry.
 
-`scripts/stage-conformance-archive.py` stages the conformance suite and the native codec.
+It carries no third-party code, so it has no `ATTRIBUTIONS.md`, and no conformance suite: the suite ships as the conformance-test image (below).
 
-### Conformance-test image and archive
+### Conformance-test image
 
-There is no separate conformance archive: the API archive carries the suite's source (above).
-The conformance-test image is built by `conformance_tests/Dockerfile` on `python:3.13.7-slim-bookworm`, and contains:
+Built by `Dockerfile.conformance`.
+Its builder steps are the service `Dockerfile`'s, verbatim, and it compiles only the suite's crate, `live-edit-conformance` (`conformance_tests/`); then `tools/package_oss.py --binary live-edit-conformance` collects the third-party sources and notices.
+Its runtime stage is the service image's distroless `cc` base, the same tag and digest.
+A test fails the CI pipeline when the two files' builder steps or runtime bases differ.
+The image adds these paths:
 
-- `/opt/conformance`: a Python environment holding the suite and the runtime packages in section 3, without the development group;
-- `/usr/local/bin/decode_ompf`: the native decoder, built from `oodf-ffi` with the C++ runtime statically linked;
-- `/opt/local-test-token.jwt`: the unsigned test token, which is not a credential;
-- `/usr/share/doc/live-edit-conformance-tests/`: `LICENSE.txt`, `NOTICE` and `ATTRIBUTIONS.md`.
+| Path | Contents |
+|---|---|
+| `/app/live-edit-conformance` | The suite binary, NVIDIA code with the suite's fixtures, which are NVIDIA data, built in. |
+| `/licenses/` | The same files as the service image's `/licenses/`, with `ATTRIBUTIONS.md` byte-identical; `SOURCE-MANIFEST.json` and `SHA256SUMS` bind them to the suite binary, and `SOURCES.md` has no jemalloc paragraph, since the suite binary does not link jemalloc. |
+| `/vendor.tar.gz` | The same source set as the service image's: the whole `Cargo.lock`, FlatBuffers, the Rust standard library and the GCC source package. Like the service image's, its own files' only lockfiles are the workspace's `Cargo.lock` and the standard library's, and the archives it carries keep any lockfiles inside them. |
+| `/opt/local-test-token.jwt` | The public unsigned test token, which is not a credential. |
+| `/reports/` | An empty directory owned by UID/GID 65532, the image's user, for the suite's reports. |
 
-Each installed Python package keeps the license files its wheel ships, in its `.dist-info` directory.
-The Debian and CPython content of the base image is not covered by this inventory.
+Every third-party Rust crate compiled into the suite binary is one the service binary also compiles in, at the same version; `conformance_tests/tests/dependency_fence.rs` fails otherwise.
+With the shared builder and base, one third-party component set covers both images.
 
 ### Helm charts
 
 Two charts are packaged from `helm/`:
 
 - `live-edit-service` deploys the service and its autoscaler. It includes a smoke-test Job whose test sources and generated Python gRPC stubs (`files/`) the chart mounts into a smoke-test base image it names in `smokeTest.image`.
-- `live-edit-conformance-tests` runs the conformance-test image as a Job.
+- `live-edit-conformance-tests` runs the conformance-test image as a Job, whose command is `/app/live-edit-conformance`.
 
 Every chart file carries the NVIDIA Apache-2.0 header.
 The charts hold no third-party code, carry no separate notice files, and contain no container images: they name the images they deploy, which are distributed separately.
@@ -99,6 +108,7 @@ The charts hold no third-party code, carry no separate notice files, and contain
 - **Preserved upstream files** in `vendor/fred-10.1.0/` are fred 10.1.0 as published on crates.io, under fred's MIT license with fred's own notices.
   `vendor/fred-10.1.0.SHA256SUMS` records the published bytes of every upstream file.
   The published source tree lacks two of them, the crate's `Cargo.lock` and `.vscode/settings.json`, which no build reads.
+  The container images' `/vendor.tar.gz` copy of the tree lacks the crate's `Cargo.lock` too; the manifest still lists it, as the record of the published release.
   `scripts/check-vendored-fred.sh` rebuilds the tree from the published crate and the patch, and fails on any difference.
 - **NVIDIA's modifications** to 23 of fred's files are licensed under the MIT license, so each modified file stays under MIT alone; every hunk of the patch that edits one of them carries a `live-edit patch` comment on at least one of its added lines.
 - **NVIDIA's added files** in the fred tree, under `vendor/fred-10.1.0/src/live_edit/`, are Apache-2.0 and carry NVIDIA's header.
@@ -126,6 +136,8 @@ No other crate in the root `Cargo.lock` declares MPL, LGPL, GPL, EPL or another 
 
 ### C and C++ code compiled into the service
 
+The conformance-test image's binary carries the same components, with the same notices and sources in that image, except jemalloc.
+
 | Component | License | Notice and source in the service image |
 |---|---|---|
 | FlatBuffers 24.3.25 runtime headers | Apache-2.0 | `/licenses/FLATBUFFERS-LICENSE.txt`, `/licenses/FLATBUFFERS-NOTICE.txt`; `flatbuffers.tar` in `/vendor.tar.gz` |
@@ -133,33 +145,6 @@ No other crate in the root `Cargo.lock` declares MPL, LGPL, GPL, EPL or another 
 | Rust standard library | MIT OR Apache-2.0 | `/licenses/RUST-COPYRIGHT.html`, `/licenses/rust-licenses/`; the `rust-src` sources in `/vendor.tar.gz` |
 | jemalloc, built by the `tikv-jemalloc-sys` crate | BSD-2-Clause | `ATTRIBUTIONS.md` under `tikv-jemalloc-sys`; the crate's `jemalloc/` directory in `/vendor.tar.gz` |
 | `ring`'s C and assembly code (the TLS crypto provider) | Apache-2.0 AND ISC | `ATTRIBUTIONS.md` under `ring`; the crate in `/vendor.tar.gz` |
-
-### Python packages of the conformance suite
-
-The table lists every third-party package `conformance_tests/uv.lock` locks, with the license PyPI declares for that version: `info.license_expression`, `info.license` or the license classifiers of `https://pypi.org/pypi/<name>/<version>/json`.
-Each license was checked against that record.
-
-| Package | Version | License | In the conformance image |
-|---|---|---|---|
-| `colorama` | 0.4.6 | BSD-3-Clause (PyPI classifier `BSD License`; the project's `LICENSE.txt` at tag 0.4.6 is BSD-3-Clause) | No: a `pytest` dependency on Windows only |
-| `grpcio` | 1.76.0 | Apache-2.0; its wheel's license file also carries BSD-3-Clause and MPL-2.0 texts (see below) | Yes |
-| `grpcio-health-checking` | 1.76.0 | Apache-2.0 | Yes |
-| `grpcio-tools` | 1.76.0 | Apache-2.0 | No: development group |
-| `iniconfig` | 2.3.0 | MIT | Yes |
-| `packaging` | 26.3 | Apache-2.0 OR BSD-2-Clause | Yes |
-| `pluggy` | 1.6.0 | MIT | Yes |
-| `protobuf` | 6.33.5 | BSD-3-Clause | Yes |
-| `pygments` | 2.21.0 | BSD-2-Clause | Yes |
-| `pytest` | 8.4.2 | MIT | Yes |
-| `pytest-timeout` | 2.4.0 | MIT | Yes |
-| `pyyaml` | 6.0.2 | MIT | No: development group |
-| `ruff` | 0.12.12 | MIT | No: development group |
-| `setuptools` | 84.0.0 | MIT | No: development group (a `grpcio-tools` dependency) |
-| `typing-extensions` | 4.16.0 | PSF-2.0 | Yes |
-
-The lockfile's 16th entry is the suite itself, `live-edit-conformance-tests` 0.1.0, which is this repository's Apache-2.0 code.
-The `grpcio` wheel bundles BoringSSL for TLS and a CA list, `grpc/_cython/_credentials/roots.pem`, whose header places it under MPL-2.0; the wheel's license file carries the MPL-2.0 text.
-The image's packages are installed by `uv` 0.8.22, which builds the suite with `hatchling` 1.27.0 (MIT); neither is in the image.
 
 ### Build and CI tools
 
@@ -176,7 +161,7 @@ None is distributed in a release artifact; where a tool's output is compiled in,
 | `protoc` (Debian `protobuf-compiler`) | Generating Rust gRPC code from `proto/` at build time | BSD-3-Clause |
 | `buf`, with `protoc-gen-prost`, `protoc-gen-tonic` and `protoc-gen-prost-crate` | Regenerating `capabilities-proto/` | Apache-2.0 |
 | `grpcio-tools` 1.76.0 | Regenerating the committed Python gRPC stubs | Apache-2.0 |
-| `uv` 0.8.22, `hatchling` 1.27.0 | Installing and building the conformance suite | MIT OR Apache-2.0; MIT |
+| `uv` 0.8.22 | Installing the Python packages of CI's pipeline-structure tests, which are not published | MIT OR Apache-2.0 |
 | `cargo-binstall` 1.10.13 | Installing the CI tools below | GPL-3.0-only |
 | `cargo-audit` 0.22.2 | RustSec advisory check | Apache-2.0 OR MIT |
 | `cargo-deny` | License allowlist and advisory check | MIT OR Apache-2.0 |
@@ -197,13 +182,14 @@ Each license was read from the tool's crates.io or PyPI record for the version n
   Both carry NVIDIA's Apache-2.0 header; the service's build generates its client code from them.
 - **Generated code committed to the tree**, all generated from NVIDIA protocol files and carrying NVIDIA's header:
   - `capabilities-proto/src/`, generated by `buf` and the `protoc-gen-prost` plugins from the Discovery service's published capabilities API (`scripts/regenerate-capabilities-proto.sh`);
-  - `conformance_tests/src/nvidia/omniverse/live/v1alpha/live_service_pb2*.py` and `helm/live-edit-service/files/generated/nvidia/omniverse/live/v1alpha/live_service_pb2*.py`, generated by `grpcio-tools` from `live_service.proto`.
+  - `helm/live-edit-service/files/generated/nvidia/omniverse/live/v1alpha/live_service_pb2*.py`, generated by `grpcio-tools` from `live_service.proto`.
 
   The protobuf license states that code its compiler generates is owned by the owner of the input file.
 - **Test fixtures.** `tools/license-classification.json` classifies each data fixture by its `class` field:
   - `captured-data`: bytes recorded from a C++ reference service or a Kit client, such as `tools/fixtures/gze_inbound_deltas.json`, `oodf-ffi/tests/fixtures/postman_chunk.bin` and three of the `.oodf` files in `tests/fixtures/oodf/`;
   - `captured-derived`: the `tests/fixtures/tail_lineage/` files, which a generator produces by replaying a captured fixture through the service's commit path;
-  - `synthetic-data`: fixtures the in-tree generators write, such as the other `.oodf` files and the conformance suite's `synthetic.json`.
+  - `synthetic-data`: fixtures the in-tree generators write, such as the other `.oodf` files.
+    The conformance suite builds its synthetic fixtures when it runs, from definitions in its source, so none is committed.
 
   Each `.oodf`, `.ompf` and `.letl` fixture has a Markdown sidecar beside it recording where it came from; `tests/fixtures/oodf/CAPTURE.md` describes the capture procedure.
 
@@ -254,7 +240,7 @@ The service image's base layer carries its distribution's own OpenSSL libraries,
 
 The service implements no cryptographic algorithm of its own, and does not encrypt the data it writes to the backing store or the checkpoint store; in transit, that data is protected only by the TLS connections above.
 
-The conformance-test image also uses cryptography: the `grpcio` package's bundled BoringSSL for TLS to an `https://` service endpoint, the Python runtime's `ssl` module for the optional Storage API adapter, and SHA-256 (`hashlib`) for external-value hashes.
+The conformance-test binary uses the same crates: rustls with the `ring` provider for TLS, through tonic to an `https://` service endpoint (the system store) and through reqwest to the optional Storage API endpoint (the compiled-in Mozilla CA list), a `CONFORMANCE_CA_FILE` bundle replacing both; and SHA-256 (`sha2`) for external-value content addresses and its fixtures' pinned hashes.
 
 ## 6. For repositories that import this tree
 

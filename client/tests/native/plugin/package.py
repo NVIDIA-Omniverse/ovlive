@@ -24,12 +24,29 @@ def dependents(path):
 
 
 # The C runtime and Windows system DLLs a sample may import besides the plugin.
-WINDOWS_SYSTEM = re.compile(r'(kernel32|user32|advapi32|ws2_32|bcrypt|crypt32|msvcp140(_\w+)?|vcruntime140(_\w+)?|'
-                            r'ucrtbase|api-ms-win-[\w-]+|ntdll|shell32|ole32|dbghelp)\.dll')
+WINDOWS_SYSTEM = re.compile(r'(kernel32|user32|advapi32|ws2_32|bcrypt|crypt32|msvcp140d?(_\w+)?|vcruntime140d?(_\w+)?|'
+                            r'ucrtbased?|api-ms-win-[\w-]+|ntdll|shell32|ole32|dbghelp)\.dll')
 
 
-def check_pe(package, probe, root, declared):
-    """The PE counterpart of the ELF checks: exports, import closure and relocated runs with bin on PATH."""
+def directive_exports(dependency_root):
+    """The names the static dependency closure exports through `/EXPORT` directives of its own objects.
+
+    MSVC's linker honors an object's `/EXPORT` directive for every object it links and has no option to drop one, so
+    these are the only exports outside ovlive's declared API that the DLL can carry. upb's MSVC constructor
+    (UPB_CONSTRUCTOR in gRPC's upb port) exports a force-linkage pointer this way so the linker keeps the generated
+    registry's constructor; dropping the export would drop the constructor.
+    """
+    names = set()
+    for library in sorted(Path(dependency_root).glob('*/lib/*.lib')):
+        names |= {name.decode() for name in re.findall(rb'[/-](?i:export):([A-Za-z0-9_?@$.]+)', library.read_bytes())}
+    return names
+
+
+def check_pe(package, probe, root, declared, dependency_root):
+    """The PE counterpart of the ELF checks: exports, import closure and relocated runs with bin on PATH.
+
+    The DLL exports ovlive's declared C ABI, its C++ host facade and nothing else of its own; an export from the static
+    dependencies is accepted only when that dependency's own linker directive forces it (directive_exports)."""
     library = package / 'bin/omni_usd_live.dll'
     sample = package / 'bin/live_diagnostics_sample.exe'
     participant = package / 'bin/live_participant_sample.exe'
@@ -38,8 +55,12 @@ def check_pe(package, probe, root, declared):
     report = dumpbin('/EXPORTS', library)
     exported = set(re.findall(r'^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)', report, re.M))
     assert {name for name in exported if name.startswith('omniUsdLive')} == declared, exported
-    # Every other export is the C++ host facade, which MSVC decorates with its namespace.
-    assert all(name.startswith('omniUsdLive') or '@host@live@usd@omni@@' in name for name in exported), exported
+    # Every other export is the C++ host facade, which MSVC decorates with its namespace, or one a dependency forces.
+    foreign = {name for name in exported if not name.startswith('omniUsdLive') and '@host@live@usd@omni@@' not in name}
+    forced = directive_exports(dependency_root)
+    assert foreign <= forced, sorted(foreign - forced)
+    if foreign:
+        print('exports forced by dependency linker directives: ' + ', '.join(sorted(foreign)))
     for artifact in (library, probe, sample, participant):
         imports = dependents(artifact)
         assert not any('omniclient' in name or 'resolver_runtime_component' in name for name in imports), imports
@@ -114,13 +135,15 @@ def check_dependency_metadata(path):
 
 
 def main():
-    package, probe, root = (Path(p).resolve() for p in sys.argv[1:])
+    package, probe, root, *dependency_root = (Path(p).resolve() for p in sys.argv[1:])
     sys.path.insert(0, str(root))
     from tools.live import platforms
     if platforms.host().binary_format == 'pe':
         header = (root/'include/omni/usd/live/Live.h').read_text()
         declared = set(re.findall(r'OMNI_USD_LIVE_CALL (omniUsdLive\w+)\(', header))
-        return check_pe(package, probe, root, declared)
+        if len(dependency_root) != 1:
+            raise SystemExit('A PE package check needs the dependency root of the libraries the DLL links')
+        return check_pe(package, probe, root, declared, dependency_root[0])
     # A build.py stage and an unpacked release archive are installed layouts; a CI install tree is not.
     installed = (package / 'package-manifest.json').is_file() or (package.parent / 'release-manifest.json').is_file()
     macos = sys.platform == 'darwin'

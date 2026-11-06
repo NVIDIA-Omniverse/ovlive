@@ -57,6 +57,12 @@
 //  13. an "absent" answer after this process wrote the sidecar writes
 //      nothing, with the counter rewound below it.
 //
+// Scenarios 14–16 pin the loop's shutdown and the fairness of its two
+// timers: a counters tick cancelled during its sidecar read returns at once
+// and writes nothing; the counters timer still fires while every checkpoint
+// tick overruns; and a cancel that lands while a tick is in flight starts no
+// further tick, though a timer is ready too.
+//
 // All scenarios share heavy harness setup (Valkey + spawned loop
 // + counting wrapper + `CounterStore`), so they live in a single file
 // and reuse one `CountingCheckpointStore` boilerplate impl plus one
@@ -89,7 +95,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use fred::interfaces::KeysInterface;
 use fred::types::Expiration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -98,10 +104,13 @@ use live_edit::checkpoint::{
     spawn_checkpoint_loop, CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointLoopConfig,
     CheckpointMeta, CheckpointStore, CountersSidecar, TailCaptureConfig,
 };
+use live_edit::domain::types::ObjectState;
 use live_edit::observability::metrics::{Metrics, SharedMetrics};
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::counters::CounterStore;
-use live_edit::storage::external_values::LEADER_LOCK_TTL_MS;
+use live_edit::storage::external_values::{MockExternalValueStore, LEADER_LOCK_TTL_MS};
+use live_edit::storage::layer::LayerStore;
+use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
 
 // ────────────────────────────────────────────────────────────────────────
@@ -195,6 +204,38 @@ struct CountingCheckpointStore {
     /// reading the inner store, whatever it holds: the storage-api backend's
     /// cached not-found answer for a sidecar that exists.
     answer_absent: AtomicBool,
+    /// Scenarios 14–16's gates (the loop's shutdown and timer fairness).
+    gates: LoopGates,
+}
+
+/// Gates a [`CountingCheckpointStore`] holds the loop's calls at, so a
+/// scenario decides when a tick in flight may go on. Each gate is a
+/// semaphore with no permits until the scenario adds them: one permit lets
+/// one call through.
+#[derive(Default)]
+struct LoopGates {
+    /// `get_counters_sidecar` waits here before it reads.
+    counters_get: Option<Arc<Semaphore>>,
+    /// `put_counters_sidecar` waits here before it writes.
+    counters_put: Option<Arc<Semaphore>>,
+    /// `put_layer_checkpoint` waits here and then fails `Transient`, so the
+    /// layer stays due every tick and every checkpoint tick lasts as long as
+    /// the scenario holds it.
+    layer_put_then_fail: Option<Arc<Semaphore>>,
+    /// `put_counters_sidecar` calls that reached the gate.
+    counters_puts_entered: AtomicU64,
+    /// `put_layer_checkpoint` calls that reached the gate.
+    layer_puts_entered: AtomicU64,
+}
+
+/// Wait for one permit of `gate`, if there is a gate, and use it up.
+async fn pass_gate(gate: &Option<Arc<Semaphore>>) {
+    if let Some(gate) = gate {
+        gate.acquire()
+            .await
+            .expect("a scenario never closes its gate")
+            .forget();
+    }
 }
 
 /// When a [`CountingCheckpointStore`] starts answering its stale "absent"
@@ -221,7 +262,14 @@ impl CountingCheckpointStore {
             first_get_raise: None,
             stale_absent: StaleAbsent::Never,
             answer_absent: AtomicBool::new(false),
+            gates: LoopGates::default(),
         }
+    }
+
+    /// Hold the loop's calls at `gates` (scenarios 14–16).
+    fn with_gates(mut self, gates: LoopGates) -> Self {
+        self.gates = gates;
+        self
     }
 
     /// Arm scenario #9's read-order probe on this wrapper.
@@ -263,6 +311,13 @@ impl CheckpointStore for CountingCheckpointStore {
         ompf: Bytes,
         meta: CheckpointMeta,
     ) -> Result<CheckpointHandle, CheckpointError> {
+        if self.gates.layer_put_then_fail.is_some() {
+            self.gates.layer_puts_entered.fetch_add(1, Ordering::SeqCst);
+            pass_gate(&self.gates.layer_put_then_fail).await;
+            return Err(CheckpointError::Transient {
+                source: Box::new(std::io::Error::other("held layer put, failed on release")),
+            });
+        }
         self.delegate
             .put_layer_checkpoint(object_id, snap_seq, ompf, meta)
             .await
@@ -337,11 +392,19 @@ impl CheckpointStore for CountingCheckpointStore {
         self.delegate.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.delegate.delete_ext_blob(hash_hex).await
     }
 
     async fn put_counters_sidecar(&self, body: Bytes) -> Result<(), CheckpointError> {
+        self.gates
+            .counters_puts_entered
+            .fetch_add(1, Ordering::SeqCst);
+        pass_gate(&self.gates.counters_put).await;
         let gets_before = self.get_counters_calls.load(Ordering::SeqCst);
         // Delegate FIRST so failure injection on the inner adapter is
         // honoured and the recorded result matches what the loop's
@@ -365,6 +428,7 @@ impl CheckpointStore for CountingCheckpointStore {
 
     async fn get_counters_sidecar(&self) -> Result<Option<Bytes>, CheckpointError> {
         let gets = self.get_counters_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        pass_gate(&self.gates.counters_get).await;
         if let Some(hook) = &self.first_get_raise {
             if !hook.fired.swap(true, Ordering::SeqCst) {
                 hook.fire(&self.delegate.inner).await;
@@ -463,7 +527,7 @@ async fn cancel_and_join(cancel: &CancellationToken, handle: tokio::task::JoinHa
     assert!(
         join_outcome.is_ok(),
         "checkpoint loop join must complete within 5 s of cancellation; \
-         a stuck shutdown would have wedged main.rs's drain budget too",
+         a stuck loop would run the shutdown sequence's join out to its per-task budget too",
     );
     join_outcome
         .expect("timeout already checked")
@@ -1097,7 +1161,7 @@ async fn counters_sync_put_failure_retries_with_same_value() {
 // record a write; soak; assert exactly one wrapper recorded writes
 // (the leader) and the other recorded zero. Cross-check against
 // `GET le:checkpoint:leader` to pin which replica's lock value
-// (`LeaderIdentity::lock_value()`, `label:instance`) won.
+// (`LeaderIdentity::checkpoint_lock_value()`, `le-ckpt/1|label:instance`) won.
 // ════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1132,8 +1196,8 @@ async fn counters_sync_non_leader_observes_no_writes() {
     let config_b = loop_config(REPLICA_FOLLOWER);
     // What each replica writes into the lock: `loop_config` builds its
     // leader with `test_leader`, so these are the two possible lock values.
-    let lock_a = crate::common::test_leader(REPLICA_LEADER).lock_value();
-    let lock_b = crate::common::test_leader(REPLICA_FOLLOWER).lock_value();
+    let lock_a = crate::common::test_leader(REPLICA_LEADER).checkpoint_lock_value();
+    let lock_b = crate::common::test_leader(REPLICA_FOLLOWER).checkpoint_lock_value();
 
     let cancel = CancellationToken::new();
     let handle_a = spawn_checkpoint_loop(
@@ -1362,8 +1426,8 @@ async fn counters_sync_leadership_handoff_after_rewind_never_lowers_sidecar() {
     let store_b: Arc<dyn CheckpointStore> = counting_b.clone();
     let metrics_a = make_metrics("counters-handoff-a");
     let metrics_b = make_metrics("counters-handoff-b");
-    let lock_a = crate::common::test_leader(REPLICA_A).lock_value();
-    let lock_b = crate::common::test_leader(REPLICA_B).lock_value();
+    let lock_a = crate::common::test_leader(REPLICA_A).checkpoint_lock_value();
+    let lock_b = crate::common::test_leader(REPLICA_B).checkpoint_lock_value();
 
     set_object_id_counter(&tv, HIGH).await;
     // Pinned before either loop starts, so A leads from its first probe
@@ -1887,4 +1951,303 @@ async fn counters_sync_absent_answer_after_writing_the_sidecar_never_lowers_it()
     );
 
     cancel_and_join(&cancel, handle).await;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Scenarios 14–16 — the loop's shutdown and its two timers (b.jt5's
+// checkpoint fold).
+//
+//  14. a counters tick cancelled while its sidecar read is stalled returns
+//      at once and writes nothing;
+//  15. the counters timer still fires while every checkpoint tick overruns
+//      the tick interval;
+//  16. a cancel that lands while a counters tick's PUT is in flight starts
+//      no further tick, though the checkpoint timer is ready too.
+// ════════════════════════════════════════════════════════════════════════
+
+/// The checkpoint timer's period in scenarios 15 and 16: short, so a tick
+/// held at a gate for a few periods has made it ready again.
+const FAST_TICK: Duration = Duration::from_millis(10);
+
+/// How long scenarios 15 and 16 hold a tick at its gate before they release
+/// it: three [`FAST_TICK`] periods, so the timers have elapsed. It is the
+/// timers' own period that must pass here, not another task.
+const OVERRUN: Duration = Duration::from_millis(30);
+
+/// A long period for a timer a scenario wants to fire only its immediate
+/// first tick.
+const ONCE: Duration = Duration::from_secs(3_600);
+
+/// A loop configuration with the two timers at `tick` and `counters_sync`.
+fn timers_config(
+    replica_id: &str,
+    tick: Duration,
+    counters_sync: Duration,
+) -> CheckpointLoopConfig {
+    CheckpointLoopConfig {
+        tick,
+        counters_sync,
+        ..loop_config(replica_id)
+    }
+}
+
+/// Wait, within [`LOOP_WAIT`], until `count` reads at least `at_least`.
+async fn wait_for_count(count: &AtomicU64, at_least: u64, what: &str) {
+    let start = Instant::now();
+    while count.load(Ordering::SeqCst) < at_least {
+        assert!(
+            start.elapsed() < LOOP_WAIT,
+            "{what}: {} of {at_least} within {LOOP_WAIT:?}",
+            count.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// **Scenario 14.** A counters tick whose sidecar read is stalled is stopped
+/// by the loop's cancel at once: the read is raced against the token, so the
+/// loop joins within [`cancel_and_join`]'s 5 s although the read never
+/// answers, and nothing is written, not even once the read is let through.
+/// With the read un-raced, the join would wait for the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn counters_sync_cancel_during_a_stalled_sidecar_read_returns_at_once_and_writes_nothing() {
+    let tv = TestValkey::setup_with_pool_size(8).await;
+    set_object_id_counter(&tv, 5).await;
+    let read_gate = Arc::new(Semaphore::new(0));
+    let inner = Arc::new(InMemoryCheckpointStore::new());
+    let counting = Arc::new(CountingCheckpointStore::new(Arc::clone(&inner)).with_gates(
+        LoopGates {
+            counters_get: Some(Arc::clone(&read_gate)),
+            ..LoopGates::default()
+        },
+    ));
+    let store: Arc<dyn CheckpointStore> = counting.clone();
+
+    let cancel = CancellationToken::new();
+    let handle = spawn_checkpoint_loop(
+        tv.client().clone(),
+        tv.key_schema().clone(),
+        store,
+        timers_config("counters-stalled-read-replica", ONCE, ONCE),
+        None,
+        cancel.clone(),
+    );
+    wait_for_count(
+        &counting.get_counters_calls,
+        1,
+        "the counters tick reaching its sidecar read",
+    )
+    .await;
+
+    cancel_and_join(&cancel, handle).await;
+    read_gate.add_permits(GATE_OPEN);
+
+    assert!(
+        counting.put_counters_calls_snapshot().await.is_empty(),
+        "a tick cancelled during its sidecar read writes nothing"
+    );
+    assert_eq!(
+        counting.gates.counters_puts_entered.load(Ordering::SeqCst),
+        0,
+        "and never reaches its PUT"
+    );
+    assert!(
+        inner
+            .get_counters_sidecar()
+            .await
+            .expect("inner read")
+            .is_none(),
+        "no sidecar is stored"
+    );
+}
+
+/// Permits that open a gate for good.
+const GATE_OPEN: usize = 1 << 20;
+
+/// The rounds scenario 15 gives the counters timer to fire. With both timers
+/// ready, the loop picks one at random, so a fair loop leaves the counters
+/// timer unfired through all of them with probability 2⁻²⁴.
+const STARVATION_ROUNDS: u64 = 24;
+
+/// **Scenario 15.** The counters timer is not starved while checkpoint ticks
+/// overrun the tick interval. Every checkpoint tick here is held at its
+/// layer PUT for [`OVERRUN`], three tick periods, and the PUT then fails, so
+/// the layer stays due and every tick overruns: whenever the loop next picks
+/// a timer, the checkpoint timer is ready. So is the counters timer, at the
+/// same period. The loop must still run a counters tick between overrunning
+/// checkpoint ticks. A loop that ranked the checkpoint timer first (both
+/// timers in one biased `select!`) would take it every time and the
+/// counters sidecar would never sync again, here or in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn counters_sync_still_ticks_while_every_checkpoint_tick_overruns() {
+    let tv = TestValkey::setup_with_pool_size(8).await;
+    seed_layer(&tv).await;
+    let put_gate = Arc::new(Semaphore::new(0));
+    let counting = Arc::new(
+        CountingCheckpointStore::new(Arc::new(InMemoryCheckpointStore::new())).with_gates(
+            LoopGates {
+                layer_put_then_fail: Some(Arc::clone(&put_gate)),
+                ..LoopGates::default()
+            },
+        ),
+    );
+    let store: Arc<dyn CheckpointStore> = counting.clone();
+
+    let cancel = CancellationToken::new();
+    let handle = spawn_checkpoint_loop(
+        tv.client().clone(),
+        tv.key_schema().clone(),
+        store,
+        timers_config("counters-starvation-replica", FAST_TICK, FAST_TICK),
+        None,
+        cancel.clone(),
+    );
+
+    // From the first checkpoint tick held at its PUT on, every counters tick
+    // won a pick against a ready checkpoint timer.
+    wait_for_count(
+        &counting.gates.layer_puts_entered,
+        1,
+        "the first checkpoint tick reaching its layer PUT",
+    )
+    .await;
+    let counters_before = counting.get_counters_calls.load(Ordering::SeqCst);
+    let mut counters_ticked = false;
+    for round in 1..=STARVATION_ROUNDS {
+        tokio::time::sleep(OVERRUN).await;
+        put_gate.add_permits(1);
+        wait_for_count(
+            &counting.gates.layer_puts_entered,
+            round + 1,
+            "the next checkpoint tick reaching its layer PUT",
+        )
+        .await;
+        if counting.get_counters_calls.load(Ordering::SeqCst) > counters_before {
+            counters_ticked = true;
+            break;
+        }
+    }
+
+    cancel.cancel();
+    put_gate.add_permits(GATE_OPEN);
+    cancel_and_join(&cancel, handle).await;
+    assert!(
+        counters_ticked,
+        "no counters tick ran in {STARVATION_ROUNDS} overrunning checkpoint ticks: the \
+         checkpoint timer starved the counters timer"
+    );
+}
+
+/// The trials scenario 16 runs. The loop before the fix, one unbiased
+/// `select!` over the cancel and both timers, with the cancel and the
+/// checkpoint timer ready, takes the timer a third of the time, so it
+/// survives all of them with probability (2/3)⁶⁴ ≈ 5×10⁻¹²; an unbiased
+/// outer `select!` over the cancel and the timers' arm takes the timer half
+/// the time (2⁻⁶⁴).
+const CANCEL_TRIALS: usize = 64;
+
+/// **Scenario 16.** A cancel that lands while a tick is in flight starts no
+/// further tick once that tick returns, though a timer is ready as well: the
+/// loop's `select!` is biased toward the cancel. Each trial holds a counters
+/// tick at its sidecar PUT (a PUT once sent is not abandoned) for
+/// [`OVERRUN`], so the checkpoint timer, at [`FAST_TICK`], is ready when the
+/// tick returns; cancels; and lets the PUT through. Every tick starts by
+/// acquiring or refreshing `le:checkpoint:leader`, which sets its TTL to
+/// [`LEADER_LOCK_TTL_MS`]; the trial stamps an hour-long TTL first, so a
+/// further tick shows as the TTL back under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn counters_sync_a_cancel_during_a_tick_starts_no_further_tick_though_a_timer_is_ready() {
+    const SENTINEL_TTL_MS: i64 = 3_600_000;
+
+    let tv = TestValkey::setup_with_pool_size(8).await;
+    set_object_id_counter(&tv, 5).await;
+    let lock_key = tv.key_schema().checkpoint_leader_lock();
+
+    for trial in 0..CANCEL_TRIALS {
+        let put_gate = Arc::new(Semaphore::new(0));
+        // A fresh store each trial: no sidecar stored, so the counters tick
+        // writes, and reaches its PUT.
+        let counting = Arc::new(
+            CountingCheckpointStore::new(Arc::new(InMemoryCheckpointStore::new())).with_gates(
+                LoopGates {
+                    counters_put: Some(Arc::clone(&put_gate)),
+                    ..LoopGates::default()
+                },
+            ),
+        );
+        let store: Arc<dyn CheckpointStore> = counting.clone();
+        let cancel = CancellationToken::new();
+        let handle = spawn_checkpoint_loop(
+            tv.client().clone(),
+            tv.key_schema().clone(),
+            store,
+            timers_config("counters-biased-cancel-replica", FAST_TICK, ONCE),
+            None,
+            cancel.clone(),
+        );
+        wait_for_count(
+            &counting.gates.counters_puts_entered,
+            1,
+            "the counters tick reaching its PUT",
+        )
+        .await;
+        let stamped: bool = tv
+            .client()
+            .pool
+            .pexpire(&lock_key, SENTINEL_TTL_MS, None)
+            .await
+            .expect("PEXPIRE le:checkpoint:leader");
+        assert!(stamped, "trial {trial}: fixture: the loop holds the lock");
+        tokio::time::sleep(OVERRUN).await;
+
+        cancel.cancel();
+        put_gate.add_permits(GATE_OPEN);
+        cancel_and_join(&cancel, handle).await;
+
+        let ttl: i64 = tv
+            .client()
+            .pool
+            .pttl(&lock_key)
+            .await
+            .expect("PTTL le:checkpoint:leader");
+        assert!(
+            ttl > LEADER_LOCK_TTL_MS as i64,
+            "trial {trial}: a tick started after the cancel (it set the lock's TTL to {ttl} ms), \
+             though the cancel was ready when the tick in flight returned"
+        );
+        assert_eq!(
+            counting.put_counters_calls_snapshot().await.len(),
+            1,
+            "trial {trial}: the PUT in flight at the cancel ran to its end"
+        );
+    }
+}
+
+/// Create one layer under a fresh session, never checkpointed, so every
+/// checkpoint tick finds it due.
+async fn seed_layer(tv: &TestValkey) -> u64 {
+    let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+        .create(
+            "counters-starvation-session",
+            "/stage",
+            "counters-test-user",
+        )
+        .await
+        .expect("session creation must succeed");
+    let initial_state = ObjectState {
+        sequence_num: 1,
+        first_version: 1,
+        source_format: "usd".to_string(),
+        ..Default::default()
+    };
+    LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096)
+        .create_layer(
+            &session_id,
+            "counters-starvation-layer",
+            "counters-test-user",
+            &initial_state,
+            Arc::new(MockExternalValueStore::new()),
+        )
+        .await
+        .expect("create_layer must succeed")
 }

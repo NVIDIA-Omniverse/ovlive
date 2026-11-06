@@ -15,11 +15,13 @@
 
 //! Per-process leader identity and the shared fail-closed leader lease.
 //!
-//! The checkpoint loop (`le:checkpoint:leader`) and the presence sweeper
-//! (`le:presence:sweeper:leader`) write a [`LeaderIdentity::lock_value`] into
-//! their lock through `external_values::try_acquire_leader_lock` and compare
-//! it in `refresh_leader_lock_if_held`. The GC sweep, the orphan sweep, the
-//! external-value reconciler and the external-value backup repair share
+//! The presence sweeper (`le:presence:sweeper:leader`) writes a
+//! [`LeaderIdentity::lock_value`] into its lock through
+//! `external_values::try_acquire_leader_lock` and compares it in
+//! `refresh_leader_lock_if_held`; the checkpoint loop (`le:checkpoint:leader`)
+//! does the same with the marked [`LeaderIdentity::checkpoint_lock_value`]
+//! (b.g65). The GC sweep, the orphan sweep, the external-value reconciler,
+//! the external-value backup repair and the checkpoint clean-up share
 //! `le:gc:leader`, which carries the
 //! protocol-marked [`LeaderIdentity::gc_lock_value`] instead and is taken only
 //! through `external_values::try_acquire_gc_leader` (its own script, which
@@ -34,7 +36,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::storage::client::ValkeyClient;
-use crate::storage::external_values::{refresh_leader_lock_if_held, try_acquire_leader_lock};
+use crate::storage::external_values::refresh_leader_lock_if_held;
 
 /// The identity a process writes into, and compares against, every leader
 /// lock it takes.
@@ -48,8 +50,8 @@ use crate::storage::external_values::{refresh_leader_lock_if_held, try_acquire_l
 /// would otherwise let every same-labelled replica believe it leads.
 ///
 /// **One identity per process, shared by every leader-gated task.** The GC
-/// sweep and its lease refresh ticker, the orphan sweep, the reconciler and the
-/// external-value backup repair all
+/// sweep and its lease refresh ticker, the orphan sweep, the reconciler, the
+/// external-value backup repair and the checkpoint clean-up all
 /// take `le:gc:leader` through acquire-or-refresh on their own cadences; with
 /// one instance each they would lock each other out instead of riding one
 /// leadership.
@@ -59,8 +61,9 @@ use crate::storage::external_values::{refresh_leader_lock_if_held, try_acquire_l
 /// or the `replica_id` log field) keep using `service_label` alone, so the
 /// per-process UUID never becomes a label value. Every leader-lock log line
 /// adds a separate `lock_value` field carrying the exact string this process
-/// writes to that lock — [`Self::lock_value`] for the checkpoint and presence
-/// locks, [`Self::gc_lock_value`] for `le:gc:leader` — so two same-labelled
+/// writes to that lock — [`Self::checkpoint_lock_value`] for the checkpoint
+/// lock, [`Self::lock_value`] for the presence lock, [`Self::gc_lock_value`]
+/// for `le:gc:leader` — so two same-labelled
 /// replicas can be told apart. The field names the logging process, not the
 /// lock's holder: a "skipped: another replica holds the lock" line carries the
 /// skipper's value.
@@ -114,6 +117,43 @@ impl LeaderIdentity {
     pub fn gc_lock_value(&self) -> String {
         format!("{GC_LEADER_MARKER_PREFIX}{GC_LEADER_PROTOCOL_VERSION}|{self}")
     }
+
+    /// The value written into `le:checkpoint:leader` (b.g65):
+    /// `"le-ckpt/{CHECKPOINT_LEADER_PROTOCOL_VERSION}|{service_label}:{instance}"`.
+    ///
+    /// The `le-ckpt/<v>|` prefix marks the build leading backups as one whose
+    /// backup writers follow the checkpoint clean-up's delete rule (the
+    /// pre-PUT re-arm, `checkpoint::put_guard`). The clean-up runs only while
+    /// the lock carries a marked value of version 1 or more
+    /// ([`checkpoint_lock_version`]). The lock is still taken and refreshed by
+    /// the plain CAS, with no takeover: an older build writes the bare
+    /// [`Self::lock_value`], so its equality CAS never matches a marked
+    /// value, and it leads backups again only once the key lapses.
+    pub fn checkpoint_lock_value(&self) -> String {
+        format!("{CHECKPOINT_LEADER_MARKER_PREFIX}{CHECKPOINT_LEADER_PROTOCOL_VERSION}|{self}")
+    }
+}
+
+/// The checkpoint leader-lock protocol version this build writes into
+/// `le:checkpoint:leader` ([`LeaderIdentity::checkpoint_lock_value`]).
+/// Version 1 is the first marked one: the build whose backup writers re-arm
+/// before every PUT, which the checkpoint clean-up's delete rule depends on
+/// (SDD §22.17.5). Every earlier build writes the bare
+/// [`LeaderIdentity::lock_value`].
+pub const CHECKPOINT_LEADER_PROTOCOL_VERSION: u32 = 1;
+
+/// The literal that opens a marked `le:checkpoint:leader` value, before the
+/// version digits and the `|` separator.
+pub const CHECKPOINT_LEADER_MARKER_PREFIX: &str = "le-ckpt/";
+
+/// The protocol version a `le:checkpoint:leader` value carries: `Some(v)` for
+/// a marked value `le-ckpt/<v>|…`, `None` for an unmarked one (an older
+/// build's bare `service_label:instance`) or anything that does not parse.
+/// The prefix is matched from the start of the value only.
+pub fn checkpoint_lock_version(value: &str) -> Option<u32> {
+    let rest = value.strip_prefix(CHECKPOINT_LEADER_MARKER_PREFIX)?;
+    let (version, _holder) = rest.split_once('|')?;
+    version.parse::<u32>().ok()
 }
 
 /// The GC leader-lock protocol version this build writes into `le:gc:leader`
@@ -154,7 +194,7 @@ impl fmt::Display for LeaderIdentity {
 pub enum LeaseState {
     /// The lease is provably still held by this process: either the local
     /// deadline is comfortably in the future and no refresh was due, or a
-    /// refresh (or re-acquire) just landed.
+    /// refresh just landed.
     Held,
     /// The lease could NOT be proven held — it lapsed locally, the store
     /// reported the key gone or owned by another process, or the round-trip
@@ -173,7 +213,7 @@ pub enum LeaseState {
 /// both cells on `RefreshError`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseOutcome {
-    /// A due refresh (or a re-acquire) found the lock ours and extended it.
+    /// A due refresh found the lock ours and extended it.
     Renewed,
     /// The lease is lost: the local deadline passed, or the store reported
     /// the key lapsed or held by another process.
@@ -196,7 +236,7 @@ pub enum LostCause {
     StoreError(fred::error::Error),
 }
 
-/// Result of [`LeaderLease::ensure_held`] / [`LeaderLease::reacquire`].
+/// Result of [`LeaderLease::ensure_held`].
 #[derive(Debug)]
 pub struct LeaseCheck {
     /// Whether the caller may continue mutating.
@@ -264,10 +304,15 @@ pub struct LeaderLease {
     /// Fully-qualified lock key (a `KeySchema::*_leader_lock` accessor
     /// output).
     lock_key: String,
-    /// This process's identity — its lock value must still be the lock's
-    /// value for a refresh to succeed.
+    /// This process's identity.
     identity: LeaderIdentity,
-    /// The lock TTL, applied by every refresh and re-acquire.
+    /// The value this lease holds the lock as, which must still be the
+    /// lock's value for a refresh to succeed: the identity's
+    /// [`LeaderIdentity::lock_value`], unless [`Self::with_lock_value`] set
+    /// another (the checkpoint lock's marked
+    /// [`LeaderIdentity::checkpoint_lock_value`]).
+    lock_value: String,
+    /// The lock TTL, applied by every refresh.
     ttl: Duration,
     /// Local deadline past which this process can no longer claim the lease.
     /// Always a lower bound on the server-side expiry (see the type doc).
@@ -278,8 +323,10 @@ pub struct LeaderLease {
 }
 
 impl LeaderLease {
-    /// Build the lease after `try_acquire_leader_lock(.., identity, ttl)`
-    /// returned `Ok(true)`.
+    /// Build the lease after `try_acquire_leader_lock(.., lock_value, ttl)`
+    /// returned `Ok(true)`, holding the lock as the identity's
+    /// [`LeaderIdentity::lock_value`] ([`Self::with_lock_value`] sets
+    /// another).
     ///
     /// `acquired_at` must be an `Instant` sampled **before** the acquire
     /// round-trip was issued, so the local deadline under-estimates rather
@@ -291,13 +338,24 @@ impl LeaderLease {
         acquired_at: Instant,
         ttl: Duration,
     ) -> Self {
+        let lock_value = identity.lock_value();
         Self {
             lock_key,
             identity,
+            lock_value,
             ttl,
             held_until: acquired_at + ttl,
             last_refresh: acquired_at,
         }
+    }
+
+    /// This lease holding the lock as `lock_value` instead of the identity's
+    /// [`LeaderIdentity::lock_value`]: the value the acquire wrote, which
+    /// every refresh compares. The checkpoint lock is held as the marked
+    /// [`LeaderIdentity::checkpoint_lock_value`] (b.g65).
+    pub fn with_lock_value(mut self, lock_value: String) -> Self {
+        self.lock_value = lock_value;
+        self
     }
 
     /// A lease with explicit deadlines, so a test can place
@@ -312,9 +370,11 @@ impl LeaderLease {
         held_until: Instant,
         last_refresh: Instant,
     ) -> Self {
+        let lock_value = identity.lock_value();
         Self {
             lock_key,
             identity,
+            lock_value,
             ttl,
             held_until,
             last_refresh,
@@ -329,6 +389,11 @@ impl LeaderLease {
     /// The identity this lease holds the lock as.
     pub fn identity(&self) -> &LeaderIdentity {
         &self.identity
+    }
+
+    /// The lock value this lease holds the lock as.
+    pub fn lock_value(&self) -> &str {
+        &self.lock_value
     }
 
     /// The renewal interval: one third of the TTL (see the type doc).
@@ -390,41 +455,10 @@ impl LeaderLease {
         }
 
         let ttl_ms = self.ttl_ms();
-        match refresh_leader_lock_if_held(client, &self.lock_key, &self.identity, ttl_ms).await {
+        match refresh_leader_lock_if_held(client, &self.lock_key, &self.lock_value, ttl_ms).await {
             Ok(true) => {
                 self.held_until = now + self.ttl;
                 self.last_refresh = now;
-                LeaseCheck::held(Some(LeaseOutcome::Renewed))
-            }
-            Ok(false) => LeaseCheck::lost(LeaseOutcome::Lost, LostCause::NotHeld),
-            Err(e) => LeaseCheck::lost(LeaseOutcome::RefreshError, LostCause::StoreError(e)),
-        }
-    }
-
-    /// Re-prove the lease from scratch with the acquire-or-refresh script,
-    /// replacing the deadlines with fresh ones measured from just before the
-    /// round-trip.
-    ///
-    /// Unlike [`Self::ensure_held`] this CAN claim a lapsed (unset) key, so it
-    /// is only sound after a step that mutated nothing: it does not claim
-    /// continuity across the gap, it starts a new lease, and everything after
-    /// it is gated by that new lease. It still never claims a key another
-    /// process holds.
-    ///
-    /// `Ok(true)` → `Held` / [`LeaseOutcome::Renewed`]; `Ok(false)` → `Lost` /
-    /// [`LeaseOutcome::Lost`] / [`LostCause::NotHeld`]; `Err(_)` → `Lost` /
-    /// [`LeaseOutcome::RefreshError`]. On `Lost` the old deadlines are left
-    /// as they were.
-    pub async fn reacquire(&mut self, client: &ValkeyClient) -> LeaseCheck {
-        // Sampled BEFORE the round-trip, so the new deadline under-estimates
-        // the server-side expiry — the same discipline as `new`'s caller
-        // contract.
-        let acquire_started = Instant::now();
-        let ttl_ms = self.ttl_ms();
-        match try_acquire_leader_lock(client, &self.lock_key, &self.identity, ttl_ms).await {
-            Ok(true) => {
-                self.held_until = acquire_started + self.ttl;
-                self.last_refresh = acquire_started;
                 LeaseCheck::held(Some(LeaseOutcome::Renewed))
             }
             Ok(false) => LeaseCheck::lost(LeaseOutcome::Lost, LostCause::NotHeld),
@@ -569,8 +603,84 @@ mod tests {
         assert_eq!(identity.gc_lock_value(), "le-gc/2|replica-a:1234");
         assert!(
             !identity.lock_value().starts_with(GC_LEADER_MARKER_PREFIX),
-            "the plain lock value (the checkpoint and presence locks, and every older build's \
-             GC lock) must not carry the marker"
+            "the plain lock value (the presence lock, and every older build's GC and checkpoint \
+             locks) must not carry the GC marker"
+        );
+    }
+
+    /// N5 (b.g65): the checkpoint lock value is the plain lock value behind the
+    /// `le-ckpt/<v>|` marker, version 1, and [`checkpoint_lock_version`] reads
+    /// the version from the start of a value only — an older build's bare
+    /// value, a GC-marked value and malformed markers read as unmarked, which
+    /// the clean-up gate treats as an older build leading backups.
+    #[test]
+    fn checkpoint_lock_value_is_marked_and_only_a_marked_value_carries_a_version() {
+        let identity = LeaderIdentity::new("replica-a", "1234");
+        assert_eq!(CHECKPOINT_LEADER_MARKER_PREFIX, "le-ckpt/");
+        assert_eq!(CHECKPOINT_LEADER_PROTOCOL_VERSION, 1);
+        assert_eq!(identity.checkpoint_lock_value(), "le-ckpt/1|replica-a:1234");
+        assert_eq!(
+            checkpoint_lock_version(&identity.checkpoint_lock_value()),
+            Some(1)
+        );
+        assert_eq!(checkpoint_lock_version("le-ckpt/7|peer:x"), Some(7));
+        for unmarked in [
+            identity.lock_value(),
+            identity.gc_lock_value(),
+            "x-le-ckpt/1|peer:x".to_owned(),
+            "le-ckpt/|peer:x".to_owned(),
+            "le-ckpt/one|peer:x".to_owned(),
+            "le-ckpt/1".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(
+                checkpoint_lock_version(&unmarked),
+                None,
+                "{unmarked:?} carries no checkpoint protocol version"
+            );
+        }
+    }
+
+    /// N5 (b.g65): an older build's plain-CAS acquire, writing its bare
+    /// `service_label:instance`, never matches a marked value — even one with
+    /// the same label and instance — so while a current build refreshes the
+    /// lock an older build neither takes it nor extends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_older_builds_cas_never_matches_a_marked_checkpoint_lock() {
+        let tv = TestValkey::setup().await;
+        let lock_key = tv.key_schema().checkpoint_leader_lock();
+        let identity = ours();
+        plant_lock(&tv, &lock_key, &identity.checkpoint_lock_value()).await;
+
+        let older_took_it = crate::storage::external_values::try_acquire_leader_lock(
+            tv.client(),
+            &lock_key,
+            &identity.lock_value(),
+            LEASE_TTL.as_millis() as u64,
+        )
+        .await
+        .expect("acquire");
+
+        assert!(
+            !older_took_it,
+            "the bare value does not match the marked one"
+        );
+        assert_eq!(
+            get_lock(&tv, &lock_key).await,
+            Some(identity.checkpoint_lock_value()),
+            "and the marked value is untouched"
+        );
+        assert!(pttl(&tv, &lock_key).await <= PLANTED_TTL_MS, "nor extended");
+        assert!(
+            crate::storage::external_values::try_acquire_leader_lock(
+                tv.client(),
+                &lock_key,
+                &identity.checkpoint_lock_value(),
+                LEASE_TTL.as_millis() as u64,
+            )
+            .await
+            .expect("acquire"),
+            "the current build's own marked value is recognised as already held"
         );
     }
 
@@ -775,101 +885,6 @@ mod tests {
             LeaseState::Lost,
             "an unknown lease is not a held lease: {check:?}"
         );
-        assert_eq!(check.outcome, Some(LeaseOutcome::RefreshError));
-        assert!(
-            matches!(check.cause, Some(LostCause::StoreError(_))),
-            "{check:?}"
-        );
-    }
-
-    // ── reacquire ────────────────────────────────────────────────────────
-
-    /// Re-acquire on a lapsed key claims it, even from a lease whose local
-    /// deadline has passed, and restarts both deadlines from an instant
-    /// sampled before the round-trip.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reacquire_on_a_lapsed_lock_claims_it_and_restarts_the_deadlines() {
-        let tv = TestValkey::setup().await;
-        let lock_key = tv.key_schema().presence_sweeper_leader_lock();
-
-        let mut lease = lease(&lock_key, Duration::ZERO, LEASE_TTL);
-        let before = Instant::now();
-        let check = lease.reacquire(tv.client()).await;
-        let after = Instant::now();
-
-        assert_eq!(check.state, LeaseState::Held, "{check:?}");
-        assert_eq!(check.outcome, Some(LeaseOutcome::Renewed));
-        assert!(check.cause.is_none(), "{check:?}");
-        assert_eq!(
-            get_lock(&tv, &lock_key).await,
-            Some(ours().lock_value()),
-            "the claim writes this process's lock value"
-        );
-        let ttl = pttl(&tv, &lock_key).await;
-        assert!(
-            ttl > 0 && ttl <= LEASE_TTL.as_millis() as i64,
-            "the claim's TTL is the lease's {LEASE_TTL:?}; got {ttl} ms"
-        );
-        assert!(lease.last_refresh() >= before && lease.last_refresh() <= after);
-        assert_eq!(lease.held_until(), lease.last_refresh() + LEASE_TTL);
-    }
-
-    /// Re-acquire on our own lock extends it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reacquire_on_our_lock_renews_it() {
-        let tv = TestValkey::setup().await;
-        let lock_key = tv.key_schema().presence_sweeper_leader_lock();
-        plant_lock(&tv, &lock_key, &ours().lock_value()).await;
-
-        let mut lease = lease(&lock_key, LEASE_TTL, Duration::ZERO);
-        let check = lease.reacquire(tv.client()).await;
-
-        assert_eq!(check.state, LeaseState::Held, "{check:?}");
-        assert_eq!(check.outcome, Some(LeaseOutcome::Renewed));
-        let ttl = pttl(&tv, &lock_key).await;
-        assert!(
-            ttl > PLANTED_TTL_MS && ttl <= LEASE_TTL.as_millis() as i64,
-            "re-acquiring our own lock must extend it to the lease's TTL; got {ttl} ms"
-        );
-    }
-
-    /// Re-acquire never claims a lock a same-label peer holds: `Lost` /
-    /// `Lost` / `NotHeld`, the peer untouched, our deadlines unchanged.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reacquire_on_a_same_label_peer_lock_is_lost_and_leaves_it_alone() {
-        let tv = TestValkey::setup().await;
-        let lock_key = tv.key_schema().presence_sweeper_leader_lock();
-        let peer = LeaderIdentity::new(ours().service_label, "instance-peer");
-        plant_lock(&tv, &lock_key, &peer.lock_value()).await;
-
-        let mut lease = lease(&lock_key, LEASE_TTL, Duration::ZERO);
-        let (held_until, last_refresh) = (lease.held_until(), lease.last_refresh());
-        let check = lease.reacquire(tv.client()).await;
-
-        assert_eq!(check.state, LeaseState::Lost, "{check:?}");
-        assert_eq!(check.outcome, Some(LeaseOutcome::Lost));
-        assert!(matches!(check.cause, Some(LostCause::NotHeld)), "{check:?}");
-        assert_eq!(get_lock(&tv, &lock_key).await, Some(peer.lock_value()));
-        assert!(pttl(&tv, &lock_key).await <= PLANTED_TTL_MS);
-        assert_eq!(
-            lease.held_until(),
-            held_until,
-            "Lost leaves the old deadlines"
-        );
-        assert_eq!(lease.last_refresh(), last_refresh);
-    }
-
-    /// Re-acquire that errors: `Lost` / `RefreshError` / `StoreError`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reacquire_error_is_lost_with_the_store_error() {
-        let tv = TestValkey::setup().await;
-        let lock_key = tv.key_schema().presence_sweeper_leader_lock();
-        plant_tripwire(&tv, &lock_key).await;
-
-        let mut lease = lease(&lock_key, LEASE_TTL, Duration::ZERO);
-        let check = lease.reacquire(tv.client()).await;
-
-        assert_eq!(check.state, LeaseState::Lost, "{check:?}");
         assert_eq!(check.outcome, Some(LeaseOutcome::RefreshError));
         assert!(
             matches!(check.cause, Some(LostCause::StoreError(_))),

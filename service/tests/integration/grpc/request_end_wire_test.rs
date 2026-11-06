@@ -81,6 +81,7 @@ use live_edit::grpc::request_end::{
     AttestRequestEnd, RequestBodyProgress, RequestStreamEnd, StreamEnding,
 };
 use live_edit::grpc::transport::production_server_builder;
+use live_edit::grpc::upload_admission::UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT;
 
 /// One test's whole wait budget. Unreachable on a healthy run.
 const TEST_BUDGET: Duration = Duration::from_secs(30);
@@ -193,7 +194,7 @@ impl ProbeServer {
         let task = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = ready_tx.send(());
-            production_server_builder()
+            production_server_builder(UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT)
                 .add_service(AttestRequestEnd::new(EndProbe { calls: calls_tx }))
                 .serve_with_incoming(incoming)
                 .await
@@ -575,7 +576,7 @@ async fn each_data_frame_read_moves_the_body_progress_record_forward() {
         .expect("bind a random port");
     let addr = listener.local_addr().expect("local addr");
     let server = tokio::spawn(async move {
-        production_server_builder()
+        production_server_builder(UPLOAD_ADMISSION_MAX_WAITERS_DEFAULT)
             .add_service(AttestRequestEnd::new(ProgressProbe {
                 reports: reports_tx,
             }))

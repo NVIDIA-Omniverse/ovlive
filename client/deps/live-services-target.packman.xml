@@ -1,23 +1,32 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 <project toolsVersion="5.0" chroniclePath="../_build/chronicles">
-  <!-- Pins copied from client-library deps/target-deps.packman.xml at
-       b38701a98b16ce82ea84a8b15a2b29512639cf0d. No client SDK import.
-       Caller must supply live_services_target_platform_abi and config; see README.md. -->
+  <!-- gRPC 1.83.1 fixes the Windows c-ares receive abort (grpc/grpc#37969) and GHSA-hf3w-6hpw-qp67; c-ares 1.34.9
+       fixes the advisories against 1.34.8; protobuf 5.29.5, abseil 20250127.0 and re2 20250722 are what gRPC 1.83.1
+       builds against. Caller must supply live_services_target_platform_abi and config; see README.md.
+       gRPC, protobuf, abseil and re2 share abseil's inline code, so on Linux they are the builds of the compiler
+       this client builds with (GCC): the default packages are clang builds, whose abseil hashing (__ARM_ACLE on
+       aarch64) and template mangling differ from GCC's. Linux links their release builds in both configurations;
+       the GCC debug builds carry enough debug information to exhaust CI build containers' memory. Windows (MSVC)
+       keeps per-configuration builds because debug and release runtimes cannot be mixed. -->
   <dependency name="live-grpc-${config}" linkPath="../_build/target-deps/grpc-${config}">
-    <package name="grpc" version="1.65.4-1-${live_services_target_platform_abi}-static-${config}" />
+    <package name="grpc" version="1.83.1-21-${live_services_target_platform_abi}-static-${config}" platforms="windows-x86_64" />
+    <package name="grpc" version="1.83.1-21-${live_services_target_platform_abi}-static-release-gcc" platforms="manylinux_2_35_x86_64 manylinux_2_35_aarch64" />
   </dependency>
   <dependency name="live-protobuf-${config}" linkPath="../_build/target-deps/protobuf-${config}">
-    <package name="protobuf" version="5.26.0-2-${live_services_target_platform_abi}-static-${config}" />
+    <package name="protobuf" version="5.29.5-6-${live_services_target_platform_abi}-static-${config}" platforms="windows-x86_64" />
+    <package name="protobuf" version="5.29.5-6-${live_services_target_platform_abi}-static-release-gcc" platforms="manylinux_2_35_x86_64 manylinux_2_35_aarch64" />
   </dependency>
   <dependency name="live-abseil-${config}" linkPath="../_build/target-deps/abseil-${config}">
-    <package name="abseil" version="20240116.1-1-${live_services_target_platform_abi}-static-${config}" />
+    <package name="abseil" version="20250127.0-0-${live_services_target_platform_abi}-static-${config}" platforms="windows-x86_64" />
+    <package name="abseil" version="20250127.0-0-${live_services_target_platform_abi}-static-release-gcc" platforms="manylinux_2_35_x86_64 manylinux_2_35_aarch64" />
   </dependency>
   <dependency name="live-re2-${config}" linkPath="../_build/target-deps/re2-${config}">
-    <package name="re2" version="20230301-1-${live_services_target_platform_abi}-static-${config}" />
+    <package name="re2" version="20250722-4-${live_services_target_platform_abi}-static-${config}" platforms="windows-x86_64" />
+    <package name="re2" version="20250722-4-${live_services_target_platform_abi}-static-release-gcc" platforms="manylinux_2_35_x86_64 manylinux_2_35_aarch64" />
   </dependency>
   <dependency name="live-c-ares-${config}" linkPath="../_build/target-deps/c-ares-${config}">
-    <package name="c-ares" version="1.34.8-0-${live_services_target_platform_abi}-static-${config}" />
+    <package name="c-ares" version="1.34.9-0-${live_services_target_platform_abi}-static-${config}" />
   </dependency>
   <dependency name="live-openssl-${config}" linkPath="../_build/target-deps/openssl-${config}">
     <package name="openssl" version="3.5.9-0-${live_services_target_platform_abi}-static-${config}" />

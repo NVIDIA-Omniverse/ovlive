@@ -148,6 +148,11 @@ int sessionDriver(int argc,char** argv) {
     // The session records credential starvation at construction, so a deadline that passes before its first step still ends UNAUTHENTICATED.
     if(mode=="join-auth-deadline") options.initial_open_timeout_ms=1;
     if(mode=="join-auth-wait-close") options.initial_open_timeout_ms=options.default_auth_wait_timeout_ms=30000;
+    // A stalled rejoin waits out its real first-response deadline, which a hung fixture holds; three such
+    // deadlines and their backoffs fit inside the failure-only watchdog below.
+    if(mode=="join-reconnect-stall" || mode=="join-reconnect-stall-resume") {
+        options.initial_open_timeout_ms=1000; options.reconnect_max_attempts=3;
+    }
     assert(omniUsdLiveInitialize(&options)==OMNI_USD_LIVE_OK);
     Prepared prepared; prepared.leave=mode=="send-leave-during-prepare";
     if(mode=="send-status-under-prepare" || prepared.leave)
@@ -347,6 +352,15 @@ int sessionDriver(int argc,char** argv) {
         OmniUsdLiveResult receipt=OMNI_USD_LIVE_OK;
         assert(omniUsdLiveGetRequestStatus(prepared.request,&receipt)==OMNI_USD_LIVE_INVALID_HANDLE);
         left=true;
+    } else if(mode=="join-reconnect-stall-resume") {
+        a.wait([&](const auto& v){
+            for(const auto& e:v) if(e.kind==OMNI_USD_LIVE_EVENT_CONNECTION && e.result==OMNI_USD_LIVE_OK && e.id=="connection-new") return true;
+            return false;});
+        // A connected attempt keeps no first-response deadline, so an expired one changes nothing: the message
+        // goes out on this attempt and the service echoes it without another join.
+        omni::usd::live::getRuntime()->sessions->expireAttemptForTest(first);
+        send("after-expiry"); sent.wait(sentCount);
+        a.wait([&](const auto& v){for(const auto& e:v) if(e.bytes=="echo") return true; return false;});
     } else if(mode=="join-capacity") {
         // Service withholds Connected until admission completes, so queued
         // messages cannot leave the bounded local pending queue.

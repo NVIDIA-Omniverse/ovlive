@@ -252,6 +252,27 @@ pub fn build_disabled_session_recovery_hook(
 
 // ── Service builder ──────────────────────────────────────────────────────────
 
+/// One `ListSessions` of `base_path` through the real handler, on a
+/// [`build_service`] service with [`AllowAllPermissions`]. Its session-recovery
+/// hook is disabled, so every ghost's probe answers `NoCheckpoint` and the
+/// walk vetoes and releases it. Panics if the RPC fails.
+pub async fn list_sessions_through_the_handler(
+    tv: &TestValkey,
+    base_path: &str,
+) -> live_edit::grpc::proto::ListSessionsResponse {
+    let svc = build_service(tv, Arc::new(AllowAllPermissions));
+    let mut request = Request::new(live_edit::grpc::proto::ListSessionsRequest {
+        path: base_path.to_owned(),
+    });
+    request
+        .extensions_mut()
+        .insert(BearerToken::new("list-sessions-bearer"));
+    live_edit::grpc::session::handle_list_sessions(&svc, request)
+        .await
+        .expect("ListSessions must succeed")
+        .into_inner()
+}
+
 /// Build a LiveEditService backed by a real Valkey session store and the given
 /// permissions client. The userinfo client defaults to `StubUserinfo`, which
 /// ignores the bearer token and returns a fixed `test-user` identity — fine for
@@ -290,7 +311,6 @@ pub fn build_service_with_userinfo(
     );
 
     LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),

@@ -320,7 +320,7 @@ fn regression_subscribe_read_layer_response_uses_response_type_oneof_with_chunk(
     let resp = SubscribeReadLayerResponse {
         response_type: Some(subscribe_read_layer_response::ResponseType::Chunk(
             SubscribeReadLayerChunk {
-                data: vec![0xBE, 0xEF],
+                data: vec![0xBE, 0xEF].into(),
             },
         )),
     };

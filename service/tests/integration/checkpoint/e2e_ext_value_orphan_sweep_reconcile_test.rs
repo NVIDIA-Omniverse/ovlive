@@ -17,7 +17,7 @@
 //! recovery without spurious GCs (Subtask `t3.fgj.zc.p6.3k`).
 //!
 //! Background. SR-3.2 introduced the fetch-on-miss recovery path:
-//! `compute_diff_at_cut` / `resolve_external_values` calls
+//! the catch-up build's `resolve_external_values` calls
 //! `ValkeyExternalValueStore::read_batch`, and on `MetaNotFound` /
 //! `DataNotFound` falls back to
 //! `CheckpointStore::get_ext_blob(hash) → store_recovered_values(...)`
@@ -73,7 +73,7 @@
 //!    keys intact. This is the partial Valkey-namespace-loss surface
 //!    SR-3.2 is designed to defend against.
 //! 8. SubscribeReadLayer with `have_object_id=oid, sequence_num=0`
-//!    drives `compute_diff_at_cut → resolve_external_values → read_batch` for
+//!    drives `compute_faithful_coalesced_at_cut → resolve_external_values → read_batch` for
 //!    `hash_ref`. The miss arms the singleflight, fetches the blob from
 //!    the adapter, rewrites it into Valkey via `store_recovered_values`
 //!    (`store_values`' script, no mirror copy). Drain one
@@ -117,7 +117,7 @@ use live_edit::storage::test_support::TestValkey;
 use tonic::Request;
 
 use super::helpers::*;
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external};
+use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_external, with_root};
 use crate::grpc::helpers::{make_create_data, make_create_header, make_request, streaming_create};
 
 const SESSION_NAME: &str = "orphan-sweep-reconcile-session";
@@ -157,9 +157,11 @@ async fn run_one_sweep_iteration<F, Fut>(
 
 /// Construct a SubscribeReadLayer request with the test's stable bearer
 /// extension. `have_object_id=object_id` + `have_version=0` lands in the
-/// non-brand-new + out-of-window branch (Regime 3): the subscriber's
-/// recorded version is below `current_seq` and the path falls through to
-/// `compute_diff_at_cut` → `resolve_external_values` → `read_batch` for every
+/// non-brand-new in-window branch (Regime 2, `catch_up_in_window`): the
+/// subscriber's recorded version is below `current_seq`, and CreateLayer's
+/// seed entry `1-0` = `{have_version+1}-0` is still on the stream, so the
+/// in-window point read finds it. The path builds through
+/// `compute_faithful_coalesced_at_cut` → `resolve_external_values` → `read_batch` for every
 /// external-hash field on the live object — which is the fetch-on-miss
 /// surface SR-3.2 instruments.
 fn subscribe_request(session_id: &str, object_id: u64) -> Request<SubscribeReadLayerRequest> {
@@ -409,7 +411,9 @@ async fn orphan_sweep_reconciles_ext_ref_counts_after_recovery_without_spurious_
         1,
         /*set_order=*/ 1,
     );
-    let ompf_bytes = delta_to_ompf_bytes(&delta, &[payload_referenced]);
+    // The content creates the layer's root section, holding the field (SDD §9.7),
+    // so the catch-up reaches the field and reads its external value (step 8).
+    let ompf_bytes = delta_to_ompf_bytes(&with_root(delta), &[payload_referenced]);
 
     let create_stream = streaming_create(vec![
         make_create_header(&session_id, LAYER_NAME),
@@ -514,7 +518,8 @@ async fn orphan_sweep_reconciles_ext_ref_counts_after_recovery_without_spurious_
     // ── 8. SubscribeReadLayer drives the fetch-on-miss for hash_ref ───────
     //
     // `have_object_id=live_object_id, sequence_num=0` lands in the
-    // out-of-window catch-up branch. The coalesced diff emits every
+    // in-window catch-up branch (the stream still holds CreateLayer's seed
+    // entry `1-0`). The coalesced diff emits every
     // section + field (including the ext-ref field), which routes through
     // `resolve_external_values → read_batch`. `read_batch` returns
     // `MetaNotFound` on the freshly-wiped `hash_ref`, which arms the

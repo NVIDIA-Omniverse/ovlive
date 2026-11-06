@@ -798,8 +798,12 @@ std::vector<std::shared_ptr<const void>> LayerProgress::applied(uint64_t id) {
             work.disposition != Disposition::Peer) {
             if ((work.disposition != Disposition::Acknowledged &&
                     (work.disposition != Disposition::Committed || !work.absorbedBy)) ||
-                localRetired == UINT64_MAX || work.localOrdinal != localRetired + 1)
-                throw std::logic_error("noncontiguous local acknowledgment retirement");
+                localRetired == UINT64_MAX || work.localOrdinal != localRetired + 1) {
+                // An earlier local write still unretired below this commit, such as one the service rejected
+                // before committing a later write of its window, violates commit order (design section 13).
+                stop(OMNI_USD_LIVE_MALFORMED_STREAM);
+                throw OmniUsdLiveResult(OMNI_USD_LIVE_MALFORMED_STREAM);
+            }
             ++localRetired;
         }
     }

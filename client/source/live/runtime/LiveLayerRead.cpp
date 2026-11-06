@@ -59,6 +59,9 @@ public:
     std::shared_ptr<Payload> payload;
     std::function<void()> delivery;
     std::shared_ptr<ReadCall> keepAlive;
+    // The call's slot, on its owner's stream reservation or on one it holds alone.
+    std::shared_ptr<StreamReservation> transientStream;
+    CallSlot slot;
     std::unique_ptr<Tag> start = std::make_unique<Tag>(Phase::Start);
     std::unique_ptr<Tag> finish = std::make_unique<Tag>(Phase::Finish);
     uint64_t generation = 0;
@@ -84,6 +87,10 @@ public:
         pending_.reset();
         payload->error = error;
         payload.reset(); // Sole callback/buffer owner transferred before enqueue.
+        // The stream is closed before its owner learns so: a reconnect opens
+        // its next call on the same reservation.
+        slot.reset();
+        transientStream.reset();
         request->finish(error, std::move(delivery));
         keepAlive.reset(); // Dispatcher/current tag still retains this object.
     }
@@ -287,7 +294,17 @@ std::shared_ptr<Request> subscribeLayerRead(Runtime& runtime, OmniUsdLiveEndpoin
     input.set_object_id(options.objectId);
     input.set_sequence_num(options.sequence);
     input.set_client_id(lease->writerId);
+    // A read holds its layer's stream reservation; a read without an owner
+    // reserves a unit for itself or is refused before anything issues.
+    std::shared_ptr<StreamReservation> transient;
+    auto stream = std::move(options.stream);
+    if (!stream) {
+        transient = lease->calls->reserveStream(OMNI_USD_LIVE_OPERATION_READ);
+        if (!transient) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+    }
     auto call = std::make_shared<ReadCall>(runtime, options);
+    call->slot = (stream ? stream : transient)->open();
+    call->transientStream = std::move(transient);
     if (options.drain) {
         call->start->drain = options.drain->prepare();
         call->finish->drain = options.drain->prepare();

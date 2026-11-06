@@ -37,12 +37,18 @@
 //!   flushing fed frames before the router waits, connects inline or writes where the write can reach a socket, all
 //!   connections at once, the command-queue counter's resync, pubsub classification and the state a verdict records.
 //! - [`pool`]: a `Pool`'s logical members, each re-pointable to a fresh client.
+//! - [`redirect`]: a reply is a cluster redirect only when it is an error frame (`clustered::process_response_frame`
+//!   calls [`redirect::is_redirection`] directly).
 //! - [`retention`]: what a connection keeps once its traffic drains (connection buffer limits).
+//!
+//! One hook has no submodule: [`end_sync_backchannel`] drops the connection a cluster sync opened for its
+//! `CLUSTER SLOTS` when the sync ends, instead of keeping it as the client's backchannel.
 
 pub mod abandon;
 pub mod ask;
 pub mod liveness;
 pub mod pool;
+pub mod redirect;
 pub mod retention;
 
 pub use retention::CodecState;
@@ -100,6 +106,23 @@ pub(crate) fn pipelined(inner: &RefCount<ClientInner>, transport: ExclusiveConne
   let mut conn = transport.into_pipelined(replica);
   liveness::attach(inner, &mut conn);
   conn
+}
+
+/// The end of a cluster sync's `CLUSTER SLOTS` exchange on a connection the sync opened (`connect_any`, in
+/// `clustered::cluster_slots_backchannel`): drop that connection instead of storing it as the client's backchannel,
+/// as stock fred does. Dropping closes the socket at once and waits on nothing — the sync runs inside the router
+/// task, which must not wait on a peer — as a connection judged dead is closed ([`liveness`]'s bounded waits). Every
+/// other exit of the sync drops the connection with the sync's own scope: a failed or timed-out `CLUSTER SLOTS`, and
+/// the router task's future dropped on a cancel or an abort. So the connection a sync opens never outlives the sync,
+/// and a sync holds one more connection only while it runs. The router's connection-id map
+/// (`Backchannel::connection_ids`) is the router's, not the stored connection's, and is unchanged.
+pub(crate) fn end_sync_backchannel(inner: &RefCount<ClientInner>, transport: ExclusiveConnection) {
+  _debug!(
+    inner,
+    "Dropping the CLUSTER SLOTS connection to {} at the end of its sync.",
+    transport.server
+  );
+  drop(transport);
 }
 
 /// `Connection::push_command`: record the command; returns whether it has no responses.

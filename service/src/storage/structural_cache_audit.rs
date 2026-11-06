@@ -583,7 +583,7 @@ pub enum AuditSkip {
     /// The repair could not bring the entry to the read's cut. Carries
     /// whichever [`ReloadReason`] stopped [`repair_to_target`](crate::storage::structural_cache_repair::repair_to_target): `Gap`,
     /// `Identity`, `Regressed`, `Tombstone`, `Parse`, `ReplayErr`,
-    /// `DanglingAdopted`, `TooLarge` or `TooFar` (the stream repair module's
+    /// `CollisionRule`, `DanglingAdopted`, `TooLarge` or `TooFar` (the stream repair module's
     /// checks, with the cut in place of the header). For example,
     /// [`ReloadReason::Regressed`] for a cut behind the entry or a fold that
     /// misses the cut's `commit_chain`, and [`ReloadReason::TooFar`] for a cut

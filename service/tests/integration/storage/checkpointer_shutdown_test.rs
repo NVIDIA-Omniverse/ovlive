@@ -155,9 +155,10 @@ async fn drive_commits(ls: &LayerStore, session_id: &str, layer_name: &str, oid:
 /// We adopt the production-side `TaskTracker::spawn` shape (used elsewhere
 /// for WatchGuard UNWATCH and presence cleanup) by wrapping the
 /// `JoinHandle<()>` returned from `spawn_checkpoint_loop` inside a
-/// tracker-spawned future that awaits it. This mirrors how `main.rs`
-/// composes background-task joins under a shared tracker while keeping
-/// `spawn_checkpoint_loop`'s existing `JoinHandle` return type.
+/// tracker-spawned future that awaits it, keeping `spawn_checkpoint_loop`'s
+/// existing `JoinHandle` return type. (Production joins the handle directly,
+/// beside every other background task, in the shutdown sequence's one
+/// concurrent join, `grpc::transport::run_post_server_sequence`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_case_a_clean_cancellation_joins_tracker_within_budget() {
     let tv = TestValkey::setup().await;
@@ -238,7 +239,8 @@ async fn shutdown_case_a_clean_cancellation_joins_tracker_within_budget() {
 
     timeout(SHUTDOWN_BUDGET, tracker.wait()).await.expect(
         "checkpoint loop MUST drain its TaskTracker within the 5 s SDD shutdown budget; \
-             a regression here means a hung tracker.wait() in main.rs's shutdown sequence",
+             a regression here means a loop the shutdown sequence's background-task join \
+             (run_post_server_sequence) waits out to its per-task budget",
     );
 
     let elapsed = started.elapsed();

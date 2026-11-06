@@ -375,18 +375,20 @@ pub(crate) trait EngineHooks<R: ValueRows> {
     // indexes answer what the engine otherwise rebuilds per delta. Each
     // default answers "not kept here", and the engine uses its own.
 
-    /// `domain::delta::find_child_by_name`'s answer — the lowest id among
-    /// the rows of `sections` naming `(parent_id, name)`, other than
-    /// `except_id` — from a persistent index: `Some(answer)`, or `None` when
-    /// the hooks keep none.
+    /// `domain::delta::find_child_by_name`'s two answers — the lowest id
+    /// among the rows of `sections` naming `(parent_id, name)`, other than
+    /// `except_id`, whose `collision_slot` is `slot`, and the lowest of any
+    /// slot (`SiblingLookup`) — from a persistent index: `Some(answer)`, or
+    /// `None` when the hooks keep none.
     #[inline(always)]
     fn child_by_name(
         &self,
         _sections: &HashMap<u64, Section>,
         _parent_id: u64,
+        _slot: u8,
         _name: &str,
         _except_id: Option<u64>,
-    ) -> Option<Option<u64>> {
+    ) -> Option<crate::domain::delta::SiblingLookup> {
         None
     }
 

@@ -214,10 +214,13 @@
         "tests/reference_service/test_native.py::NativeTests.test_actor_read_failure_and_bounded_retry",
         "tests/reference_service/test_native.py::NativeTests.test_public_read_retries_are_bounded",
         "tests/reference_service/test_session.py::SessionTests.test_session_cancel_before_connected_has_bounded_attempts",
+        "tests/reference_service/test_session.py::SessionTests.test_session_stalled_rejoins_time_out_and_exhaust_the_reconnect_attempts",
+        "tests/reference_service/test_session.py::SessionTests.test_session_stalled_rejoin_times_out_and_the_next_one_resumes_without_a_deadline",
         "tests/reference_service/test_scene.py::SceneTests.test_stalled_reconnect_first_responses_spend_the_reconnect_budget",
         "tests/reference_service/test_scene.py::SceneTests.test_stalled_reconnect_first_response_retries_and_a_caught_up_read_keeps_no_deadline",
         "tests/reference_service/test_native.py::NativeTests.test_actor_stalled_read_attempts_end_at_the_real_first_response_deadline",
-        "tests/reference_service/test_native.py::NativeTests.test_actor_read_held_for_pacing_keeps_its_attempt_past_the_first_response_deadline"
+        "tests/reference_service/test_native.py::NativeTests.test_actor_read_held_for_pacing_keeps_its_attempt_past_the_first_response_deadline",
+        "tests/reference_service/test_native.py::NativeTests.test_actor_read_ending_with_queued_frames_reconnects_after_its_last_frame"
       ],
       "release_required": true,
       "coverage_limit": "Native retained coverage/replay control plus real reference-service read restart at the safe cursor. Deterministic barriers hold completed read backlogs or an issued acknowledgment while queued authoring remains frozen. Opaque effects are not a scene oracle; canonical registry, OMPF/noop/aggregate reconciliation and full churn/load qualification remain. Reconnect waits are checked as drawn delays against their windows, never as elapsed time, with millisecond test bounds; the production defaults are covered only by the native distribution check, and no service retry hint exists to test."
@@ -415,6 +418,11 @@
         "tests/native/runtime/diagnostics_driver.cpp",
         "tests/reference_service/test_native.py",
         "tests/native/runtime/diagnostics.cpp::applyLagMetricsCountEveryUpdate",
+        "tests/native/scene/field_edit_intent.cpp::allocatorHistoryBound",
+        "tests/native/scene/scene_journal.cpp::bookkeepingStaysBounded",
+        "tests/native/scene/scene_journal.cpp::bookkeepingKeepsHiddenPendingCreates",
+        "tests/native/scene/scene_journal.cpp::bookkeepingFollowsShrinkingScene",
+        "tests/native/scene/scene_journal.cpp::bookkeepingKeepsWaitingSources",
         "tests/reference_service/test_scene.py::SceneTests.test_production_sdf_status_reports_read_versus_applied_lag",
         "tests/reference_service/test_scene.py::SceneTests.test_production_sdf_open_catch_up_beyond_the_lag_threshold_is_not_lag",
         "tests/reference_service/test_scene.py::SceneTests.test_production_sdf_reconnect_catch_up_beyond_the_lag_threshold_is_not_lag",
@@ -473,6 +481,27 @@
       ],
       "release_required": true,
       "coverage_limit": "Native public join/leave/status/send, independent connection identity, copied bounded FIFO, local acceptance, auth wait/refresh, terminal callbacks, UNAVAILABLE and graceful EOF reconnect, generation-bound peer reconciliation, callback quiescence and allocation rollback. The keepalive schedule is checked against explicit times (session_peers.cpp); end to end, the interval is expired through a test seam or, with a 20 ms interval, observed while the host thread blocks, and timeouts come from the reference service's controllable keepalive clock, which restarts on whole request frames where the service restarts on any bytes. The keepalive fields are placeholders until the live edit service's schema lands, and no deployed-service keepalive has been exercised. Packaged/Kit integration, failed in-flight duplicate qualification, complete transport/concurrency fault matrix and performance/memory gates remain open."
+    },
+    {
+      "id": "LIVE.presence.merge_owner",
+      "owner": "Presence/messages",
+      "requirement": "The advisory merge-owner lease is per-join opt-in: only a join whose options set OMNI_USD_LIVE_JOIN_MERGE_OWNER sets JoinSessionHeader.merge_owner, only a Connected that answers merge_owner true puts it in force, and a MergeOwnerState on any other join fails it MALFORMED_STREAM; claim, release and verify go out as control frames on the current connection and settle UNAVAILABLE when it ends; a reconnect drops ownership at once and re-claims while a CLAIM's intent stands; a join without the lease fails requests UNSUPPORTED and keeps the static creator rule (fail open); the reference service grants one live holder per session, creator only, with a new epoch per grant, releases on leave, keepalive timeout and eviction, answers lapsed credentials UNAUTHENTICATED without revoking, and sends owner changes only to negotiated joins",
+      "source": "docs/ovlive-design.md#15-sessions-presence-and-messages",
+      "status": "partial",
+      "cases": [
+        "tests/native/runtime/session_api.cpp",
+        "tests/reference_service/test_service.py::ServiceTests.test_merge_owner_is_opt_in_negotiated_and_advertised",
+        "tests/reference_service/test_service.py::ServiceTests.test_merge_owner_grants_once_fans_out_only_to_opted_in_joins_and_hands_off",
+        "tests/reference_service/test_service.py::ServiceTests.test_merge_owner_eligibility_credentials_and_release_paths",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_grants_one_of_two_same_principal_joins_and_hands_off_when_the_holder_leaves",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_keepalive_expiry_releases_and_a_reconnect_reclaims_after_a_handoff",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_reconnect_drops_ownership_and_reclaims_on_the_new_connection",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_refuses_a_non_creator_and_an_expired_credential_without_revoking_the_lease",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_fails_open_on_a_service_without_it_and_sends_nothing",
+        "tests/reference_service/test_python_sessions.py::PythonSessionTests.test_merge_owner_frames_reach_only_joins_that_opt_in"
+      ],
+      "release_required": false,
+      "coverage_limit": "Qualified only against the reference service's model of the lease; the protocol fields are placeholders until the live edit service implements it, and no deployed service has been exercised. End-to-end cases run through the Python binding over the native runtime and C ABI; native ABI admission, flag and struct-size checks run offline. The lease is advisory and binds only joins that opt in; a merge already writing storage when ownership changes hands is not fenced, and the Kit companion's use of the lease is not exercised."
     },
     {
       "id": "LIVE.time.jitter",
@@ -601,6 +630,7 @@
       "status": "partial",
       "cases": [
         "tests/reference_service/test_plugin.py::PluginTests.test_seeded_public_writers_account_every_edit_and_conflict",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_coalesced_public_writers_account_every_edit_and_conflict",
         "tests/harness/test_writer_history.py"
       ],
       "release_required": true,
@@ -628,15 +658,18 @@
       "status": "partial",
       "cases": [
         "tests/reference_service/test_plugin.py::PluginTests.test_seeded_writers_resume_queued_edits_through_two_backend_rotations",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_coalesced_writers_resume_queued_edits_through_two_backend_rotations",
         "tests/reference_service/test_scene.py::SceneInfrastructureTests.test_proxy_cut_retires_an_accepted_socket_before_forward_starts",
         "tests/reference_service/test_scene.py::SceneInfrastructureTests.test_proxy_cut_retires_pending_old_connect_without_cancelling_new_accepts",
         "tests/reference_service/test_plugin.py::PluginTests.test_rotation_before_execution_retains_uncertain_and_queued_writer_intents",
         "tests/reference_service/test_plugin.py::PluginTests.test_rotation_after_commit_retains_uncertain_and_queued_writer_intents",
         "tests/reference_service/test_plugin.py::PluginTests.test_seeded_writers_soak_with_refresh_ping_and_bounded_growth",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_writers_and_joins_survive_stream_age_expiries_after_server_token_expiry",
+        "tests/harness/test_http2_proxy.py::Http2ProxyTests.test_stream_age_limit_ends_exactly_the_aged_streams_and_keeps_the_connection",
         "tests/harness/test_writer_recovery.py"
       ],
       "release_required": true,
-      "coverage_limit": "Public-plugin root-int32 recovery across real shared-state backend TCP cuts: queued-only safe recovery plus four simultaneous uncertain writes and twelve queued intents, before execution and after commit. Explicit service cancellation, independent post-exit export validation, public status/attempt counters and fresh backend observer distinguish uncertainty from service knowledge without replay. General structures/values, the complete fault matrix, HTTP/2-specific controls, extended churn and deployed-service behavior remain open. One soak case runs 600 rotations over about 60 minutes with token refresh and bounded resources."
+      "coverage_limit": "Public-plugin root-int32 recovery across real shared-state backend TCP cuts: queued-only safe recovery plus four simultaneous uncertain writes and twelve queued intents, before execution and after commit. Explicit service cancellation, independent post-exit export validation, public status/attempt counters and fresh backend observer distinguish uncertainty from service knowledge without replay. General structures/values, the complete fault matrix, HTTP/2-specific controls, extended churn and deployed-service behavior remain open. One soak case runs 600 rotations over about 60 minutes with token refresh and bounded resources. The stream-age cases end every read and join stream at a simulated 240-minute ingress stream age through the HTTP/2 proxy, 50 times in the ci campaign and 300 in the nightly, after the service stopped accepting every token the writer held, with peer edits and presence messages between and bounded resources; they reset with RST_STREAM(CANCEL), and a deployed ingress's own reset code and timing are not exercised."
     },
     {
       "id": "LIVE.performance",
@@ -649,10 +682,11 @@
         "tests/harness/test_paired_benchmark.py",
         "tests/native/usd/scene_benchmark.cpp",
         "tests/benchmarks/scene-workloads.json",
-        "tests/native/scene/scene_journal.cpp::backlogScaling"
+        "tests/native/scene/scene_journal.cpp::backlogScaling",
+        "tests/native/scene/work_budgets.cpp::workBudgetTests"
       ],
       "release_required": true,
-      "coverage_limit": "Characterization only: per-case budgets, stable workers and comparison with the omni.client live layer path are unverified. One scaling gate is deterministic: the scene journal's work counter shows that admitting a write, applying an acknowledgment and applying a peer field update cost the same work beside 100, 1,000 and 4,000 pending writes, and that draining a backlog costs work linear in its length; it counts logical work, not time."
+      "coverage_limit": "Wall-clock storage benchmarks characterize and compare revisions; they gate nothing, and no stable benchmark worker or recorded comparison with the omni.client live layer path exists. The deterministic gates count logical work, not time: each storage benchmark workload, host turn, peer publication, wide-spec case, flush capture and composition read has a frozen budget in scene work meter counts (elements, index comparisons, owner-pin and guard atomic updates), checked on every pull request by the presubmit profile's scene-journal suite on both USD profiles; and the scene journal's work counter shows that admitting a write, applying an acknowledgment and applying a peer field update cost the same work beside 100, 1,000 and 4,000 pending writes, and that draining a backlog costs work linear in its length."
     },
     {
       "id": "LIVE.kit",
@@ -689,7 +723,6 @@
         "tests/harness/test_provision_macos.py",
         "tests/harness/test_provision_macos_transport.py",
         "tests/harness/test_provision_macos_usd.py",
-        "tests/harness/test_build_inputs.py",
         "tests/harness/test_release_archive.py"
       ],
       "release_required": true,

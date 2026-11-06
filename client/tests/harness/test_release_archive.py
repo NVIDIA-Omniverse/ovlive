@@ -19,7 +19,11 @@ from tools.release import archive
 ROOT = Path(__file__).resolve().parents[2]
 HEAD = 'a' * 40
 PLATFORM = 'linux-x86_64'
-NAME = 'ovlive-0.1.0-stock-25.11-' + PLATFORM
+VERSION = archive.version()
+# A release tag other than the extension version's.
+MAJOR, MINOR, _ = map(int, VERSION.split('.'))
+OTHER_TAG = f'v{MAJOR}.{MINOR + 1}.0'
+NAME = f'ovlive-{VERSION}-stock-25.11-' + PLATFORM
 COMMIT_TIME = archive.commit_time
 
 
@@ -109,6 +113,16 @@ class ReleaseArchiveTests(unittest.TestCase):
         target.with_name(target.name + '.sha256').write_text(f'{digest}  {target.name}\n')
         return target
 
+    def test_debug_archive_round_trip_has_a_distinct_name_and_configuration(self):
+        self.validate.return_value = dict(self.record, configuration='debug')
+        path = archive.create(self.package, self.root / 'debug-out', configuration='debug')
+        record = archive.check(path)
+        self.assertEqual(path.name, NAME + '-debug.tar.gz')
+        self.assertEqual(record['configuration'], 'debug')
+        self.assertEqual(record['archive_root'], NAME + '-debug')
+        self.validate.assert_called_once_with(self.package, archive.ROOT, expected_platform=PLATFORM,
+                                              expected_configuration='debug')
+
     def test_create_then_check_passes(self):
         path = self.create()
         self.assertEqual(path, self.root / 'out' / (NAME + '.tar.gz'))
@@ -125,7 +139,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             'schema_version', 'product', 'version', 'archive_root', 'extension_folder', 'platform', 'configuration',
             'usd_profile', 'sanitizer', 'abi_version', 'git_head', 'git_tag', 'dirty', 'source_fingerprint',
             'source_inputs_sha256', 'embedded_revision', 'stripped', 'sdk_identity', 'tool_identity', 'components')},
-            dict(schema_version=1, product='ovlive', version='0.1.0', archive_root=NAME,
+            dict(schema_version=1, product='ovlive', version=VERSION, archive_root=NAME,
                  extension_folder='omni_usd_live',
                  platform='linux-x86_64', configuration='release', usd_profile='stock-25.11', sanitizer='none',
                  abi_version='0x00010000', git_head=HEAD, git_tag=None, dirty=False, source_fingerprint='f' * 64,
@@ -184,7 +198,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         (recompressed.parent / (NAME + '.tar.gz.sha256')).unlink()
         with self.assertRaisesRegex(ValueError, 'checksum file is missing'):
             archive.compare(first, recompressed)
-        other = self.root / 'other' / 'ovlive-0.1.0-kit-25.11-linux-x86_64.tar.gz'
+        other = self.root / 'other' / f'ovlive-{VERSION}-kit-25.11-linux-x86_64.tar.gz'
         with self.assertRaisesRegex(ValueError, 'different roots'):
             archive.compare(first, other)
 
@@ -241,6 +255,22 @@ class ReleaseArchiveTests(unittest.TestCase):
             archive.create(self.package, self.root / 'leaking', extract_to=self.root / 'leaking-extract')
         self.assertEqual(list((self.root / 'leaking').iterdir()), [])
         self.assertFalse((self.root / 'leaking-extract').exists())
+
+    def test_a_bundled_pem_certificate_fails(self):
+        body = b'MIIB' + b'A' * 120 + b'\n' + b'B' * 60 + b'==\n'
+        certificate = b'-----BEGIN CERTIFICATE-----\n' + body + b'-----END CERTIFICATE-----\n'
+        library = self.package / 'lib/libomni_usd_live.so'
+        # Parser constants that name the markers without a body, as gRPC's SPIFFE parser compiles in, are not a store.
+        library.write_bytes(library.read_bytes() + b'\0-----END CERTIFICATE-----\0-----BEGIN CERTIFICATE-----\0')
+        archive.check(self.create('markers'))
+        for name, content in (('lib/libomni_usd_live.so', library.read_bytes() + b'\0' + certificate),
+                              ('python/omni/usd/live/sample.py', certificate.replace(b'\n', b'\r\n'))):
+            with self.subTest(member=name):
+                original = (self.package / name).read_bytes()
+                (self.package / name).write_bytes(content)
+                with self.assertRaisesRegex(ValueError, f'omni_usd_live/{name} carries a PEM certificate'):
+                    self.create('pem-' + name.replace('/', '-'))
+                (self.package / name).write_bytes(original)
 
     def test_build_machine_paths_match_at_path_character_boundaries(self):
         checkout = ('/' + 'home/x/checkout').encode()
@@ -413,11 +443,11 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.create('dirty')
         self.assertTrue(self.manifest_of(self.create('allowed', allow_dirty=True))['dirty'])
         self.dirty.return_value = False
-        self.tags.return_value = ['v0.2.0']
-        with self.assertRaisesRegex(ValueError, 'v0.2.0'):
+        self.tags.return_value = [OTHER_TAG]
+        with self.assertRaisesRegex(ValueError, OTHER_TAG):
             self.create('tag')
-        self.tags.return_value = ['v0.1.0', 'nightly']
-        self.assertEqual(self.manifest_of(self.create('tagged'))['git_tag'], 'v0.1.0')
+        self.tags.return_value = ['v' + VERSION, 'nightly']
+        self.assertEqual(self.manifest_of(self.create('tagged'))['git_tag'], 'v' + VERSION)
         self.tags.return_value = []
         self.head.return_value = 'b' * 40
         with self.assertRaisesRegex(ValueError, 'revision'):
@@ -435,7 +465,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         aarch64 = 'linux-aarch64'
         package = self.write_package(self.root / 'aarch64/usd/omniverse/live', aarch64)
         self.validate.return_value = dict(self.record, platform=aarch64)
-        name = 'ovlive-0.1.0-stock-25.11-' + aarch64
+        name = f'ovlive-{VERSION}-stock-25.11-' + aarch64
         extension = 'omni_usd_live/python/omni/usd/live/_live.cpython-312-aarch64-linux-gnu.so'
         with patch.object(archive.platforms, 'host', return_value=archive.platforms.PLATFORMS[aarch64]):
             path = archive.create(package, self.root / 'aarch64-out', extract_to=self.root / 'aarch64-check')
@@ -462,7 +492,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertEqual([p.name for p in target.iterdir()], [NAME])
         self.assertEqual(sorted(p.name for p in (target / NAME).iterdir()), ['omni_usd_live', 'release-manifest.json'])
         folder = target / NAME / 'omni_usd_live'
-        self.assertEqual(len([p for p in folder.rglob('*') if p.is_file()]), 29)
+        self.assertEqual(len([p for p in folder.rglob('*') if p.is_file()]), 28)
         build._validate_layout(folder, PLATFORM, exact=True)
         with self.assertRaisesRegex(ValueError, 'exists'):
             archive.check(path, target)
@@ -471,7 +501,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         self.assertEqual(created.name, NAME + '.tar.gz')
 
     def test_version_is_the_package_table_version(self):
-        self.assertEqual(archive.version(), '0.1.0')
+        self.assertRegex(archive.version(), r'^\d+\.\d+\.\d+$')
         path = self.root / 'extension.toml'
         for text in ('[package]\nversion = "0.1"\n', '[core]\nversion = "0.1.0"\n[package]\ntitle = "x"\n',
                      '[package]\ntitle = "x"\n[dependencies]\nversion = "0.1.0"\n'):

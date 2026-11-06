@@ -60,7 +60,7 @@
 //! writes included), the polled conditions ([`SETTLE`] each), the bounded
 //! sends through a retired client ([`RETIRED_SEND_BOUND`] each), the closing
 //! `quit()` (11.5 s, the sum of its internal bounds: it has no outer one), and
-//! `TestValkey`'s key purge (a `SCAN` page and an
+//! `TestValkey`'s key purge (a wait for the walk's next key and an
 //! `UNLINK`, 5 s each) — is under the 180 s kill deadline `.config/nextest.toml`
 //! sets for this module (60 s × 3), in place of the global 120 s hang-killer,
 //! which kills a test silently. On the healthy path each runs in under six

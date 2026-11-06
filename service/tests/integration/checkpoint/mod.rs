@@ -482,6 +482,15 @@
 //!   budget; leadership; the audit; per-value and pass-ending failures; the
 //!   concurrency bounds; the mirror worker's confirmation; and passes that end
 //!   early. The collect's clear of the field is a `checkpointer` unit test.
+//!
+//! ## Issue `b.yqf` — on-access recovery's conditional record step
+//!
+//! - [`e2e_session_recovery_record_step_test`] — a `DeleteSession` that marks
+//!   the session while the hook's Step A is in flight: the record step reads
+//!   the marker atomically with its writes, so the hook answers
+//!   `NoCheckpoint` and writes no record. The step's other answers are
+//!   in-crate in `src/checkpoint/session.rs`'s test module, and the
+//!   two-replica race in `src/checkpoint/session_recovery.rs`'s.
 
 pub mod helpers;
 
@@ -489,7 +498,9 @@ mod acquire_txn_pinning_fence_test;
 mod adapter_in_memory_test;
 mod adapter_local_disk_test;
 mod adapter_storage_api_401_refresh_test;
-mod adapter_storage_api_test;
+/// Also the storage-api fake the DR Job's list-route canary tests run on
+/// (`dr::job_frame_test`).
+pub(crate) mod adapter_storage_api_test;
 mod assembler_test;
 mod atomicity_local_disk_test;
 mod atomicity_session_local_disk_test;
@@ -527,11 +538,15 @@ mod e2e_session_recovery_no_checkpoint_test;
 mod e2e_session_recovery_orphan_sweep_tolerance_test;
 mod e2e_session_recovery_path_index_atomicity_test;
 mod e2e_session_recovery_per_handler_test;
+mod e2e_session_recovery_record_step_test;
 mod e2e_stat_layer_recovery_test;
 mod e2e_storage_api_recovery_test;
 mod e2e_subscribe_read_layer_recovery_test;
 mod e2e_tail_bootstrap_test;
 mod e2e_update_layer_recovery_test;
+// b.g65 N1 — the checkpoint clean-up's own task: backups run while a pass is
+// parked, the loop has no clean-up arm, and the task's cancel.
+mod checkpoint_cleanup_task_test;
 mod ext_backup_repair_test;
 mod ext_mirror_e2e_test;
 mod first_base_bootstrap_test;

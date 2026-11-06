@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! b.cyu / b.qtk — writes during a real legacy slot migration
+//! b.cyu / b.qtk / b.4q2 — writes during a real legacy slot migration
 //! (`CLUSTER SETSLOT … MIGRATING / IMPORTING` plus key-by-key `MIGRATE`).
 //!
 //! Each cluster test stages a slot `MIGRATING` on its owner and `IMPORTING` on
@@ -29,6 +29,9 @@
 //! | T-C2 [`txn_connection_resyncs_after_flip_slot_migration_disruptive`] | a one-connection txn pool whose member still routes a flipped slot to its old owner: the first `DeleteSession` meets `MOVED` (`Aborted`) and re-syncs the member; the second deletes | the second meets `MOVED` again, and both are `INTERNAL` |
 //! | T-C3 [`create_layer_slot_migration_disruptive_answers_unavailable`] | `CreateLayer` whose new object's slot is migrating: it fails closed before its transaction, at the pre-`MULTI` keyspace type probe, a script the source answers `-ASK` and fred does not follow ("Max attempts reached."): plain `Unavailable`, no txn-pool re-sync, nothing materialized or mapped; after the move it creates | — (the same pre-`MULTI` refusal) |
 //! | T-C5 [`create_layer_on_a_stale_txn_connection_slot_migration_disruptive_resyncs_it`] | a one-connection txn pool whose member still routes the new object's flipped slot to its old owner: the pre-`MULTI` guards (data pool, re-synced by the move's completion) pass, the materialization `EXEC` meets `MOVED`: plain `Unavailable` with "Max redirections exceeded", `exec_txn`'s re-sync run once, nothing materialized; a re-send creates, and a transaction on the moved slot through the member lands | `INTERNAL`, and no re-sync: the member keeps meeting `MOVED` |
+//! | T-C6 [`txn_pool_members_resync_after_one_meets_a_flipped_slot_slot_migration_disruptive`] | b.4q2: every member of a four-connection txn pool still routes a flipped slot to its old owner; one read per member in turn (the used ones held): only the first meets `MOVED`, `Routing` "Too many redirections.", whose receipt marks the pool's routing stale, and every other member re-syncs at its checkout and reads from the new owner | every read meets its own member's `MOVED` |
+//! | T-C7a [`create_layer_commit_redirected_slot_migration_disruptive_new_layer_answers_upstream_unavailable`] | b.4q2: a new layer's commit `EVALSHA` meets the real `-ASK` of its session's migrating slot (every key moved): fred fails the run `Routing` "Too many redirections." (the text the commit marker's exemption matches) and the pool is marked stale. The call then gives up, likely at its check read (the target refuses the check's multi-key `MGET` `-TRYAGAIN` while a key it names is absent), else after a second redirected run; either way no script ran, nothing is mapped, and the handler answers `UPSTREAM_UNAVAILABLE` | plain `UNAVAILABLE` |
+//! | T-C7b [`create_layer_commit_redirected_slot_migration_disruptive_overwrite_answers_plain_unavailable`] | the same on an overwrite, which fenced the old object first: plain `UNAVAILABLE`, the mapping unchanged | — (plain either way) |
 //! | T-C4 [`commit_and_watch_keysets_target_tryagain_slot_migration_disruptive`] | a premise guard (may pass without the change): with the object's keys moved, a one-attempt commit is `Aborted` "Max attempts reached."; on the target, `ASKING` + the commit's ten shared keys and `ASKING` + the `WATCH` set are each refused `-TRYAGAIN`, so following `-ASK` could not land them; after the move the commit lands | — |
 //! | T-Q1 [`b_qtk_structural_children_rebuild_slot_migration_disruptive_refuses_before_any_write`] | a structural commit rebuilding an existing children list, every key it names but its sentinel present: refused `-TRYAGAIN`, the keyspace byte-identical | runs on the source and is refused at the `RPUSH` after its `DEL`: the stream entry published, `seq` unchanged, the children list gone |
 //! | T-Q2 [`b_qtk_fast_external_value_replace_slot_migration_disruptive_refuses_before_any_write`] | a fast-mode commit replacing a layer's only external value, every key present: the same | refused at the `HGET obj:ext <new>` after the `HDEL` that emptied the index |
@@ -92,7 +95,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use live_edit::config::UpdateLayerBackend;
 use live_edit::domain::types::ObjectState;
 use live_edit::error::ServiceError;
-use live_edit::storage::client::TRYAGAIN_REPLY;
+use live_edit::storage::client::{
+    is_txn_redirect_refusal, FredErrOrigin, POOL_LABEL_TXN, TRYAGAIN_REPLY,
+};
 use live_edit::storage::external_values::{
     ExternalValueStore, MockExternalValueStore, ValkeyExternalValueStore, EXT_READ_HOLD_SCRIPT,
     EXT_STORE_VALUE_SCRIPT, GC_CLAIM_SCORE_OFFSET_MS, GC_DECREMENT_FENCE_MS,
@@ -108,6 +113,7 @@ use live_edit::storage::test_support::relay::RelayedUpdates;
 use live_edit::storage::test_support::TestValkey;
 
 use crate::common::owned_delta::{delta_with_set_field_external, delta_with_set_field_inline};
+use crate::common::refusal_detail::{assert_no_refusal_detail, assert_upstream_unavailable};
 use crate::storage::cluster_subscriber_test::{try_keys_in_slot, SlotMigration};
 use crate::storage::snapshot_read_atomic_test::{move_cmd, structural, ROOT, SIBLING, WORLD};
 use crate::storage::snapshot_read_support::{monitor_fence, test_valkey_addr, MonitorTap};
@@ -140,7 +146,7 @@ static EXT_INDEX_RECOUNT: std::sync::LazyLock<Script> = std::sync::LazyLock::new
 /// A clustered `TestValkey` with `pool` connections per pool, or `None`
 /// (logged) when `LIVE_EDIT_TEST_CLUSTER_URL` is unset.
 async fn cluster(pool: u32) -> Option<TestValkey> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster-disruptive:` job \
@@ -359,12 +365,14 @@ async fn delete_session_slot_migration_disruptive_answers_unavailable() {
     );
     assert!(!meta.is_empty(), "nothing ran: the session is kept");
 
-    // After the move completes, every txn-pool member still routes the slot
+    // After the move completes, a txn-pool member may still route the slot
     // to its old owner: `SlotMigration::complete` re-syncs a data-pool client
     // only, and the re-sync above ran while the slot was still the source's.
     // So a delete may first meet the old owner's `MOVED` (`Aborted`, and its
-    // member re-synced, as T-C2 pins); each re-sync fixes one member, so the
-    // re-sent delete lands within one attempt per member.
+    // member re-synced, as T-C2 pins). Each such redirect also marks the
+    // pool's routing stale, so a member that has not re-synced since re-syncs
+    // at its next checkout (b.4q2, T-C6); the re-sent delete lands within one
+    // attempt per member either way.
     let mut attempts = Vec::new();
     loop {
         let attempt = tokio::time::timeout(SETTLE, sessions.delete(&session_id))
@@ -744,6 +752,335 @@ async fn create_layer_on_a_stale_txn_connection_slot_migration_disruptive_resync
     );
     ran(
         "create_layer_on_a_stale_txn_connection_slot_migration_disruptive_resyncs_it",
+        &tv,
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// b.4q2 — one member's redirect re-syncs every txn-pool member; the commit's
+// real redirect refusal
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// T-C6 (b.4q2). Every member of a four-connection txn pool is warmed on a
+/// slot (each, held at once, reads a key of it from its owner), then the slot
+/// is flipped to another primary (`SETSLOT … NODE` on both nodes; nothing of
+/// the test's is in it) and no txn member is told. One read of the key is
+/// then sent from each member in turn — the members already used held, so
+/// each read takes a different member. The first meets the old owner's
+/// `MOVED`, which the txn pool does not follow: `Routing` "Too many
+/// redirections." (fred re-syncs that member first). The test receives it as
+/// every `txn_pool` receipt site does (`FredErrOrigin::observe_error`), which
+/// marks the pool's routing stale, so every other member re-syncs at its next
+/// checkout and its read reaches the new owner. Exactly one read fails: at
+/// most one is the contract, at least one is the precondition that the flip
+/// left the members stale. Without the checkout re-sync each member would
+/// meet its own `MOVED` and every read would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, moves a hash slot between shards (needs \
+            test-fault-injection and LIVE_EDIT_TEST_CLUSTER_URL)"]
+async fn txn_pool_members_resync_after_one_meets_a_flipped_slot_slot_migration_disruptive() {
+    let Some(tv) = cluster(POOL_SIZE).await else {
+        return;
+    };
+    let client = tv.client();
+    let members = client.txn_pool.slots();
+    assert!(
+        members >= 3,
+        "precondition: at least three txn-pool members"
+    );
+    let key = format!("{}{{b4q2-flip-{}}}", tv.prefix(), uuid::Uuid::new_v4());
+
+    let warmed = tokio::time::timeout(SETTLE, async {
+        let mut held = Vec::new();
+        for _ in 0..members {
+            held.push(client.acquire_txn_for(&key).await);
+        }
+        let mut reads = Vec::new();
+        for checkout in &held {
+            reads.push(checkout.get::<Option<String>, _>(&key).await);
+        }
+        reads
+    })
+    .await
+    .expect("warming every txn-pool member did not settle within its budget");
+    for read in warmed {
+        read.expect("before the flip every member reads the key's slot from its owner");
+    }
+
+    let (mut migration, p) = migrate(&tv, &key).await;
+    migration.complete().await;
+    let epoch_before = client.txn_pool.routing_epoch_for_test();
+
+    let mut ids = Vec::new();
+    let mut reads = Vec::new();
+    for used in 0..members {
+        let read = tokio::time::timeout(SETTLE, async {
+            // The members already used, held so this read takes another.
+            let mut held = Vec::new();
+            for _ in 0..used {
+                held.push(client.acquire_txn().await);
+            }
+            let checkout = client.acquire_txn_for(&key).await;
+            let id = ClientLike::id(&*checkout).to_owned();
+            let read = checkout.get::<Option<String>, _>(&key).await;
+            if let Err(e) = &read {
+                FredErrOrigin::client(client, POOL_LABEL_TXN).observe_error(e);
+            }
+            (id, read)
+        })
+        .await
+        .expect("a read of the flipped slot did not settle within its budget");
+        ids.push(read.0);
+        reads.push(read.1);
+    }
+    let marks = client.txn_pool.routing_epoch_for_test() - epoch_before;
+
+    eprintln!(
+        "B.4Q2 T-C6 DATAPOINT: slot={} {} -> {}\n  reads, one per member in turn: {reads:?}\n  \
+         routing-stale marks: {marks}",
+        p.slot, p.src, p.dst
+    );
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        members,
+        "precondition: each read went out on a different txn-pool member; got {ids:?}"
+    );
+    let failed: Vec<usize> = (0..members).filter(|i| reads[*i].is_err()).collect();
+    assert_eq!(
+        failed,
+        vec![0],
+        "exactly the first read meets the old owner's MOVED: its mark makes every other member \
+         re-sync at its next checkout; got {reads:?}"
+    );
+    match &reads[0] {
+        Err(e) => assert!(
+            is_txn_redirect_refusal(e),
+            "a txn-pool command meeting MOVED fails `Routing` \"Too many redirections.\" (the \
+             zero redirection budget, after fred's own sync); got {e:?}"
+        ),
+        Ok(_) => unreachable!("checked above"),
+    }
+    assert_eq!(
+        marks, 1,
+        "the one redirect marked the pool's routing stale once"
+    );
+    ran(
+        "txn_pool_members_resync_after_one_meets_a_flipped_slot_slot_migration_disruptive",
+        &tv,
+    );
+}
+
+/// What a T-C7 `CreateLayer` targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitTarget {
+    /// A layer the session does not have.
+    NewLayer,
+    /// One of the session's layers.
+    Overwrite,
+}
+
+/// What a T-C7 create left.
+struct CommitRedirected {
+    status: tonic::Status,
+    mapped_before: Option<String>,
+    mapped_after: Option<String>,
+    marks: u64,
+}
+
+/// A `CreateLayer` through the handler whose commit `EVALSHA` meets a real
+/// cluster redirect. The session's slot is staged `MIGRATING` with every key
+/// of it moved to the target, so the source answers any command naming those
+/// keys `-ASK`; the call's single-key data-pool reads follow it, and its
+/// commit script, on the `txn_pool`, does not. After that refused run the
+/// call likely gives up at its check read: the check's multi-key `MGET`
+/// follows the `-ASK` to the target, which refuses it `-TRYAGAIN` while a key
+/// it names (the commit claim, at least) is absent. If the check passes, a
+/// second run meets the same `-ASK`. The session is chosen off the object-id
+/// counter's slot and the next object id on a slot of its own, so neither
+/// the allocation nor the materialization is redirected: only the commit is.
+/// The service's finisher has no budget, so an overwrite's fence stays as the
+/// call left it. The migration completes before this returns.
+async fn create_whose_commit_meets_a_migrating_session_slot(
+    tv: &TestValkey,
+    label: &str,
+    target: CommitTarget,
+) -> CommitRedirected {
+    use live_edit::grpc::layer::handle_create_layer;
+    use live_edit::grpc::proto::{create_layer_request, CreateLayerHeader, CreateLayerRequest};
+
+    use crate::common::owned_delta::{delta_to_ompf_bytes, with_root};
+    use crate::grpc::helpers::{
+        build_service_with_layer_store, make_create_data, make_request, streaming_create,
+    };
+
+    let ks = tv.key_schema();
+    let counter_slot = fred::util::redis_keyslot(ks.counter_object_id().as_bytes());
+    let mut chosen = None;
+    for attempt in 0..8 {
+        let session_label = format!("{label}-{attempt}");
+        let next = next_object_on_its_own_slot(tv, &session_label).await;
+        let session_slot = fred::util::redis_keyslot(ks.session_meta(&next.session_id).as_bytes());
+        if session_slot != counter_slot {
+            chosen = Some((session_label, next));
+            break;
+        }
+    }
+    let (session_label, NextObject { session_id, .. }) =
+        chosen.expect("eight sessions in a row shared the object-id counter's slot");
+    let layer = match target {
+        CommitTarget::NewLayer => format!("{session_label}-new"),
+        CommitTarget::Overwrite => format!("{session_label}-seed-0"),
+    };
+    let mapping_key = ks.layer_mapping(&session_id, &layer);
+    async fn mapped(tv: &TestValkey, mapping_key: &str) -> Option<String> {
+        tv.client()
+            .pool
+            .get::<Option<String>, _>(mapping_key)
+            .await
+            .expect("GET mapping must succeed (the data pool follows -ASK)")
+    }
+    let mapped_before = mapped(tv, &mapping_key).await;
+    let svc = build_service_with_layer_store(
+        tv,
+        Arc::new(
+            LayerStore::new(tv.client().clone(), ks.clone(), 4096)
+                .with_create_commit_finisher_timing_for_test(
+                    Duration::from_millis(1),
+                    Duration::from_millis(1),
+                    Duration::ZERO,
+                ),
+        ),
+    );
+    let request = make_request(streaming_create(vec![
+        CreateLayerRequest {
+            message_type: Some(create_layer_request::MessageType::Header(
+                CreateLayerHeader {
+                    session_id: session_id.clone(),
+                    layer_name: layer.clone(),
+                    operation_id: String::new(),
+                },
+            )),
+        },
+        // The layer's root section holding the field: content setting the
+        // field with no top-level section is refused (SDD §9.7).
+        make_create_data(delta_to_ompf_bytes(
+            &with_root(delta_with_set_field_inline(1, "color", vec![7], 0)),
+            &[],
+        )),
+    ]));
+
+    let (mut migration, p) = migrate(tv, &ks.session_meta(&session_id)).await;
+    move_every_key(&mut migration, tv, &p).await;
+    let epoch_before = tv.client().txn_pool.routing_epoch_for_test();
+    let answer = tokio::time::timeout(SETTLE, handle_create_layer(&svc, request))
+        .await
+        .expect("the create did not settle within its budget");
+    let marks = tv.client().txn_pool.routing_epoch_for_test() - epoch_before;
+    migration.complete().await;
+    let mapped_after = mapped(tv, &mapping_key).await;
+
+    eprintln!(
+        "B.4Q2 T-C7 DATAPOINT ({target:?}): session slot={} {} -> {}\n  CreateLayer: {answer:?}\n  \
+         routing-stale marks: {marks}",
+        p.slot, p.src, p.dst
+    );
+    let status = match answer {
+        Err(status) => status,
+        Ok(response) => {
+            panic!("a create whose commit is redirected must fail; got {response:?}")
+        }
+    };
+    CommitRedirected {
+        status,
+        mapped_before,
+        mapped_after,
+        marks,
+    }
+}
+
+/// The real shape the commit marker's exemption rests on: the commit
+/// `EVALSHA` meets the migrating source's `-ASK`, which the `txn_pool`
+/// (redirection budget zero) fails `Routing` "Too many redirections." —
+/// before any write, on every run the call makes (one if it gives up at its
+/// check read, two otherwise). The call answers with that run's error, and
+/// the error marks the pool's routing stale.
+#[track_caller]
+fn assert_commit_refused_by_the_redirect(redirected: &CommitRedirected) {
+    assert_eq!(redirected.status.code(), tonic::Code::Unavailable);
+    assert!(
+        redirected
+            .status
+            .message()
+            .contains("Too many redirections"),
+        "the commit EVALSHA meets the source's -ASK through real fred and fails `Routing` \"Too \
+         many redirections.\"; got {:?}",
+        redirected.status
+    );
+    assert!(
+        redirected.marks >= 1,
+        "the commit's redirect refusal marks the txn pool's routing stale"
+    );
+    assert_eq!(
+        redirected.mapped_after, redirected.mapped_before,
+        "no run landed: the mapping is what it was"
+    );
+}
+
+/// T-C7a (b.4q2). A new layer whose commit runs meet the real `-ASK` of its
+/// session's migrating slot applied nothing — its object is
+/// materialized but unmapped — and the handler answers `UNAVAILABLE`
+/// carrying `UPSTREAM_UNAVAILABLE`: the store's commit marker stays clear
+/// after a run failed with exactly that redirect refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, stages a hash slot MIGRATING between shards \
+            (needs test-fault-injection and LIVE_EDIT_TEST_CLUSTER_URL)"]
+async fn create_layer_commit_redirected_slot_migration_disruptive_new_layer_answers_upstream_unavailable(
+) {
+    let Some(tv) = cluster(POOL_SIZE).await else {
+        return;
+    };
+    let redirected = create_whose_commit_meets_a_migrating_session_slot(
+        &tv,
+        "b4q2-tc7a",
+        CommitTarget::NewLayer,
+    )
+    .await;
+
+    assert_commit_refused_by_the_redirect(&redirected);
+    assert_eq!(redirected.mapped_after, None, "no layer was made");
+    assert_upstream_unavailable(&redirected.status);
+    ran(
+        "create_layer_commit_redirected_slot_migration_disruptive_new_layer_answers_upstream_unavailable",
+        &tv,
+    );
+}
+
+/// T-C7b (b.4q2). The same redirect on an overwrite: no run's script ran,
+/// but the call fenced the old object before its first run, so the
+/// marker is set and the handler answers a plain `UNAVAILABLE`, no detail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, stages a hash slot MIGRATING between shards \
+            (needs test-fault-injection and LIVE_EDIT_TEST_CLUSTER_URL)"]
+async fn create_layer_commit_redirected_slot_migration_disruptive_overwrite_answers_plain_unavailable(
+) {
+    let Some(tv) = cluster(POOL_SIZE).await else {
+        return;
+    };
+    let redirected = create_whose_commit_meets_a_migrating_session_slot(
+        &tv,
+        "b4q2-tc7b",
+        CommitTarget::Overwrite,
+    )
+    .await;
+
+    assert!(
+        redirected.mapped_before.is_some(),
+        "precondition: the layer exists, so the create is an overwrite"
+    );
+    assert_commit_refused_by_the_redirect(&redirected);
+    assert_no_refusal_detail(&redirected.status);
+    ran(
+        "create_layer_commit_redirected_slot_migration_disruptive_overwrite_answers_plain_unavailable",
         &tv,
     );
 }

@@ -61,9 +61,10 @@
 //!   `resync_txn_routing_after_redirect(`.
 //! - **Landmarks.** The scan sees the four transaction sites as of b.cyu —
 //!   `SessionStore::delete`, `LayerStore::write_object` and checkpoint
-//!   apply's Step A and Step B — each `fn` sending its transactions through
-//!   `exec_txn` at least once per `.multi()`, and it sees and exempts the
-//!   `WatchedTxn::exec` sites.
+//!   apply's Step A and Step B (the restore Job's unconditional Step B;
+//!   on-access recovery's Step B is a script, not a transaction) — each
+//!   `fn` sending its transactions through `exec_txn` at least once per
+//!   `.multi()`, and it sees and exempts the `WatchedTxn::exec` sites.
 //! - **Each `exec_txn` gets the transaction's own checkout.** For every
 //!   `exec_txn` call under `src/` (the helper's definition aside), its
 //!   transaction argument is a local whose nearest `let` in the same `fn` is
@@ -81,10 +82,13 @@
 //! no-op, so its run-time effect is pinned only on a cluster, and only for the
 //! sites the cluster-gated `b_cyu_slot_migration_test` reaches —
 //! `DeleteSession` (T-C1, T-C2) and the `CreateLayer` materialization (T-C3).
-//! For checkpoint apply's Step A and Step B, the re-sync is on their error
-//! path by construction (their `EXEC` goes through `exec_txn`), and on their
-//! own checkout because this guard checks the precondition statically;
-//! neither is pinned by a behavioural test.
+//! Checkpoint apply's Step A is pinned through session recovery on the
+//! clustered facade (`b_v6d_router_test`'s
+//! `redirected_session_checkpoint_step_a_resyncs_its_checkout_and_warns_on_a_slow_sync`).
+//! For the restore Job's Step B, the re-sync is on its error path by
+//! construction (its `EXEC` goes through `exec_txn`), and on its own checkout
+//! because this guard checks the precondition statically; no behavioural test
+//! pins it.
 //!
 //! Static: reads source files, needs no Valkey and no feature.
 

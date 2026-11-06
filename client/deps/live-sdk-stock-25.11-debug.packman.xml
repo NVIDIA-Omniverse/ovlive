@@ -1,0 +1,14 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project toolsVersion="5.0" chroniclePath="../_build/chronicles">
+  <!-- Windows debug hosts and plugins share the debug MSVC standard-library ABI. -->
+  <dependency name="live-sdk-usd" linkPath="../_build/sdk-deps/stock-25.11-debug/usd">
+    <package name="usd.py312.windows-x86_64.stock.debug" version="0.25.11.kit.5-gl.21397" platforms="windows-x86_64" />
+  </dependency>
+  <dependency name="live-sdk-python" linkPath="../_build/sdk-deps/stock-25.11-debug/python">
+    <package name="python" version="3.12.16+nv1-windows-x86_64" platforms="windows-x86_64" />
+  </dependency>
+  <dependency name="live-sdk-pybind11" linkPath="../_build/sdk-deps/stock-25.11-debug/pybind11">
+    <package name="pybind11" version="2.11.1-0" />
+  </dependency>
+</project>

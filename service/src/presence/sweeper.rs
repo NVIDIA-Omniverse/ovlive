@@ -352,7 +352,7 @@ impl Sweeper {
         match try_acquire_leader_lock(
             &self.client,
             &lock_key,
-            &self.leader,
+            &self.leader.lock_value(),
             self.budget.lock_ttl_ms(),
         )
         .await
@@ -1038,10 +1038,13 @@ mod tests {
     //! [`PresenceSweeperSeam`] and runs the tick on a task of its own.
     //!
     //! The tests that need a chunk's `ensure_held` to refresh hold the chunk
-    //! for [`HOLD_PAST_RENEWAL`] on purpose: the lease's renewal window is
+    //! for [`hold_past_renewal`] on purpose: the lease's renewal window is
     //! measured on `std::time::Instant`, which `tokio::time::pause` cannot move.
-    //! Every other wait is a bounded wait on a seam latch or the tick's own
-    //! return.
+    //! The sweeper builds its own lease, so those tests cannot anchor its
+    //! deadline at a check; they size its TTL by rule (c) instead
+    //! ([`short_lock_ttl`], test-writing guide § Synchronization Patterns).
+    //! Every other wait is bounded by [`SETTLE`], a hang guard on a seam latch
+    //! or the tick's own return.
     //!
     //! The seam's member-page replay and the budget checks are tested without
     //! a store.
@@ -1067,20 +1070,67 @@ mod tests {
     /// expired: every removal delay the sweep reports for one is at least this.
     const STALE_FOR_MS: u64 = 7_000;
 
-    /// The lock TTL of the tests that hold a chunk past a third of it.
-    const SHORT_LOCK_TTL: Duration = Duration::from_secs(3);
+    /// The store calls a pass makes on the lease's clock before a held chunk's
+    /// `ensure_held`: the leader probe and the two page reads before the park.
+    const STORE_CALLS_BEFORE_THE_HELD_CHECK: u32 = 3;
 
-    /// A hold past a third of [`SHORT_LOCK_TTL`] (1 s), so the held chunk's
-    /// `ensure_held` is due to refresh: the lease's clock starts before the
-    /// leader probe, so the hold alone puts the check past the third. The
-    /// slack under the whole TTL — 1.8 s for the probe, the two page reads
-    /// before the park, the park handoff and the sleep's overshoot — keeps
-    /// the lease's local deadline unpassed, so the check refreshes rather
-    /// than finding the lease overrun.
-    const HOLD_PAST_RENEWAL: Duration = Duration::from_millis(1_200);
+    /// The lock TTL of the tests that hold a chunk past a third of it, sized
+    /// by rule (c) (test-writing guide § Synchronization Patterns) from the
+    /// command timeout of `tv`'s client, which the pass's store calls run on.
+    ///
+    /// [`LeaderLease`] renews every third of its TTL, so a chunk check held
+    /// past that third refreshes with two thirds of the TTL left, minus what
+    /// ran on the lease's clock before it:
+    /// [`STORE_CALLS_BEFORE_THE_HELD_CHECK`] store calls and the hold's own
+    /// overshoot ([`HOLD_MARGIN`]). Each call either answers within the
+    /// command timeout or has already failed in the client, so two thirds of
+    /// the TTL, minus [`HOLD_MARGIN`], must exceed that many command
+    /// timeouts. The TTL is 1.6× their sum (3 × 5 s → 24 s at the shipped
+    /// timeout), which leaves 16 s − 200 ms = 15.8 s against 15 s. Because the
+    /// margin is fixed, the factor holds only for a command timeout above 1 s;
+    /// the assertion below checks the inequality itself, so a client
+    /// configured at or under that fails here rather than in the test. The
+    /// test then fails only when a call runs later than the bound past which
+    /// the service's own commands fail.
+    fn short_lock_ttl(tv: &TestValkey) -> Duration {
+        use fred::interfaces::ClientLike;
+        let command_timeout = tv
+            .client()
+            .pool
+            .next()
+            .perf_config()
+            .default_command_timeout;
+        let ttl = command_timeout * STORE_CALLS_BEFORE_THE_HELD_CHECK * 8 / 5;
+        assert!(
+            (ttl * 2 / 3).saturating_sub(HOLD_MARGIN)
+                > command_timeout * STORE_CALLS_BEFORE_THE_HELD_CHECK,
+            "fixture: two thirds of the lock TTL ({ttl:?}) minus the hold's {HOLD_MARGIN:?} \
+             margin must exceed {STORE_CALLS_BEFORE_THE_HELD_CHECK} command timeouts \
+             ({command_timeout:?} each)"
+        );
+        ttl
+    }
 
-    /// Bound on every wait. Unreachable on the healthy path.
-    const SETTLE: Duration = Duration::from_secs(10);
+    /// How far past a third of the lock TTL [`hold_past_renewal`] holds a
+    /// chunk, so its check is due to refresh rather than landing exactly on
+    /// the third. [`short_lock_ttl`] subtracts it from what the TTL has left.
+    const HOLD_MARGIN: Duration = Duration::from_millis(200);
+
+    /// A hold past a third of `ttl` (plus [`HOLD_MARGIN`]), so the held
+    /// chunk's `ensure_held` is due to refresh: the lease's clock starts
+    /// before the leader probe, so the hold alone puts the check past the
+    /// third. What is left of the TTL after the hold — two thirds of it,
+    /// minus the margin and the store calls before the park — is sized by
+    /// [`short_lock_ttl`], so the check refreshes rather than finding the
+    /// lease overrun.
+    fn hold_past_renewal(ttl: Duration) -> Duration {
+        ttl / 3 + HOLD_MARGIN
+    }
+
+    /// Hang guard on every wait: a seam latch, or the tick's own return. Far
+    /// above anything a healthy pass takes — including a held chunk's
+    /// [`hold_past_renewal`] — and below nextest's 120 s kill.
+    const SETTLE: Duration = Duration::from_secs(60);
 
     const OLDEST_AGE: &str = "live_edit_presence_sweep_oldest_stale_age_seconds";
     const REMOVAL_DELAY: &str = "live_edit_presence_stale_removal_delay_seconds";
@@ -1499,6 +1549,11 @@ mod tests {
     /// under all of it, renews the lease at that chunk's `ensure_held`
     /// (`renewed`), and the pass goes on to complete and remove every stale
     /// member. The lock is still this process's afterwards.
+    ///
+    /// Liveness under the TTL is the subject, so the TTL is sized by rule (c)
+    /// ([`short_lock_ttl`]) rather than fixed: the store calls before the held
+    /// check fit in its slack whenever they answer within the client's command
+    /// timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_chunk_held_past_a_third_of_the_lock_ttl_renews_the_lease_and_the_pass_completes() {
         let tv = TestValkey::setup().await;
@@ -1509,17 +1564,13 @@ mod tests {
         )
         .await;
         let metrics: SharedMetrics = Arc::new(metrics_scrape_only(SERVICE));
-        let (sweeper, seam) = seamed(
-            &tv,
-            budget(SHORT_LOCK_TTL, 1),
-            &metrics,
-            CancellationToken::new(),
-        );
+        let lock_ttl = short_lock_ttl(&tv);
+        let (sweeper, seam) = seamed(&tv, budget(lock_ttl, 1), &metrics, CancellationToken::new());
 
         seam.before_chunk.arm();
         let task = tick(&sweeper);
         wait_parked(&seam).await;
-        tokio::time::sleep(HOLD_PAST_RENEWAL).await;
+        tokio::time::sleep(hold_past_renewal(lock_ttl)).await;
         seam.before_chunk.release();
 
         assert_eq!(
@@ -1549,23 +1600,20 @@ mod tests {
     /// Hold a pass at its first chunk, run `steal` against the lock key while
     /// it is parked, hold it past a third of the TTL so the chunk's
     /// `ensure_held` refreshes, release it, and return the tick's outcome and
-    /// the pass's seam.
+    /// the pass's seam. The TTL is [`short_lock_ttl`]'s rule-(c) size, so the
+    /// check's verdict comes from the steal, never from an overrun deadline.
     async fn lose_the_lease_at_a_parked_chunk(
         tv: &TestValkey,
         metrics: &SharedMetrics,
         steal: impl std::future::Future<Output = ()>,
     ) -> (Option<&'static str>, Arc<PresenceSweeperSeam>) {
-        let (sweeper, seam) = seamed(
-            tv,
-            budget(SHORT_LOCK_TTL, 1),
-            metrics,
-            CancellationToken::new(),
-        );
+        let lock_ttl = short_lock_ttl(tv);
+        let (sweeper, seam) = seamed(tv, budget(lock_ttl, 1), metrics, CancellationToken::new());
         seam.before_chunk.arm();
         let task = tick(&sweeper);
         wait_parked(&seam).await;
         steal.await;
-        tokio::time::sleep(HOLD_PAST_RENEWAL).await;
+        tokio::time::sleep(hold_past_renewal(lock_ttl)).await;
         seam.before_chunk.release();
         (tick_outcome(task).await, seam)
     }

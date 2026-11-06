@@ -25,9 +25,11 @@
 //!   is absent from the Prometheus registry.
 //! - AC #2: provider wired against an absent token file → readiness flips
 //!   `NotServing` and stays there.
-//! - AC #4: token file appears → readiness flips back to `Serving` within
-//!   one poll interval + slack. Token file deleted → readiness flips back
-//!   to `NotServing` within two probe intervals + slack.
+//! - AC #4: token file appears → readiness flips back to `Serving` on the
+//!   supervisor's next tick after the provider caches it. Token no longer
+//!   usable → readiness flips back to `NotServing` on the supervisor's next
+//!   tick. These pin the flips, not their latency: every wait is bounded
+//!   only by `STATUS_HANG_GUARD`, so a slower flip still passes here.
 //! - AC #5: the gauge is registered ONLY when the provider is constructed,
 //!   verified by `Registry::gather()` (absence assertion in the no-provider
 //!   case, value 1/0 assertion in the provider-wired case across the
@@ -76,6 +78,7 @@ use live_edit::observability::health::{
 };
 use live_edit::observability::metrics::Metrics;
 use live_edit::storage::client::ValkeyClient;
+use live_edit::storage::test_support::connect_test_client_or_skip;
 
 const READINESS_SERVICE_NAME: &str = "nvidia.omniverse.live.v1alpha.LiveService";
 
@@ -84,8 +87,8 @@ const READINESS_SERVICE_NAME: &str = "nvidia.omniverse.live.v1alpha.LiveService"
 const TOKEN_FILE_NAME: &str = "access_token";
 
 /// Poll interval for the `ServiceTokenProvider`'s polling task. Short so
-/// the appears / disappears transitions resolve well inside each test's
-/// 5 s deadline budget.
+/// the appears / disappears transitions resolve quickly; each test's waits
+/// are bounded only by [`STATUS_HANG_GUARD`], never by a count of polls.
 const TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Supervisor probe interval used by every test below. The supervisor
@@ -95,9 +98,22 @@ const TOKEN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// state.
 const SUPERVISOR_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Per-probe deadline. Short enough that a healthy localhost Valkey ping
-/// is never racy and a dead-connection ping cannot succeed.
-const SUPERVISOR_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+/// Per-probe bound for the supervisor's `PING`: the client's own command
+/// timeout (test-writing guide § Synchronization Patterns, "a one-shot read
+/// the test expects to answer"). Valkey is healthy in every test here, and a
+/// tighter bound would read a merely slow PING on a loaded shared Valkey as an
+/// outage and flip readiness for a reason no test here is about.
+fn supervisor_probe_timeout(valkey: &ValkeyClient) -> Duration {
+    use fred::interfaces::ClientLike;
+    valkey.pool.next().perf_config().default_command_timeout
+}
+
+/// Hang guard on every positive wait — a readiness status, a gauge value, the
+/// provider's cache — that has to contain a supervisor tick (up to one probe
+/// bound plus a probe interval) or a provider poll. Far below nextest's 120 s
+/// kill, and not a timing claim: a healthy run observes its state within a
+/// tick.
+const STATUS_HANG_GUARD: Duration = Duration::from_secs(30);
 
 /// Build a JSON token document expiring `expires_in_secs` from now.
 ///
@@ -157,23 +173,6 @@ fn test_config() -> Config {
     cfg.subscriber_pool_size = 1;
     cfg.valkey_reconnect_max_delay_ms = 500;
     cfg
-}
-
-/// Attempt to connect to Valkey using the test config. Returns `None`
-/// when Valkey is unreachable — every test below short-circuits via
-/// `return` in that case, matching the existing pattern in
-/// `health_supervisor_test.rs`.
-async fn maybe_connect_valkey() -> Option<ValkeyClient> {
-    let cfg = test_config();
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(c)) => Some(c),
-        _ => None,
-    }
 }
 
 /// Spawn a minimal tonic server that exposes only the supplied
@@ -363,8 +362,7 @@ impl Write for CapturingWriter {
 /// whose `gather()` output omits the family entirely. AC #3 / AC #5.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_no_service_token_provider_omits_check() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -388,11 +386,12 @@ async fn supervisor_no_service_token_provider_omits_check() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: None,
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         cancel.clone(),
     );
@@ -404,12 +403,7 @@ async fn supervisor_no_service_token_provider_omits_check() {
     // supervisor's first tick, so wait for that before sampling — a bare
     // sample would race the first probe rather than test anything.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(3)
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "precondition: with provider=None and Valkey healthy the supervisor must raise \
          readiness to SERVING"
     );
@@ -464,8 +458,7 @@ async fn supervisor_no_service_token_provider_omits_check() {
 /// the hold loop then pins that the verdict does not drift back up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_service_token_absent_file_keeps_not_serving() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -492,11 +485,12 @@ async fn supervisor_service_token_absent_file_keeps_not_serving() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -508,12 +502,7 @@ async fn supervisor_service_token_absent_file_keeps_not_serving() {
     // probe — the provider's cache has nothing in it, so
     // `service_token_ok = false`.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::NotServing,
-            Duration::from_secs(3),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::NotServing, STATUS_HANG_GUARD).await,
         "AC #2: readiness must flip SERVING → NOT_SERVING when the provider is wired but \
          the token file is absent (cached_bearer_if_unexpired() returns None on a
          cold-start cache)"
@@ -547,20 +536,19 @@ async fn supervisor_service_token_absent_file_keeps_not_serving() {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// AC #4 — token file appears: flips Serving within poll + slack
+// AC #4 — token file appears: flips Serving on the supervisor's next tick
 // ───────────────────────────────────────────────────────────────────────
 
 /// Provider wired against an initially-absent path → readiness starts
 /// `NotServing`. Once the sidecar atomically writes a valid token file,
-/// the provider's polling task picks it up within ~one poll interval,
+/// the provider's polling task picks it up on its next poll,
 /// the supervisor's next probe observes
 /// `cached_bearer_if_unexpired().is_some()`,
 /// and readiness flips to `Serving`. Pins AC #4 (file-appears path) and
 /// the AC #5 gauge `0 → 1` transition.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_service_token_appears_flips_to_serving() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -585,11 +573,12 @@ async fn supervisor_service_token_appears_flips_to_serving() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -599,12 +588,7 @@ async fn supervisor_service_token_appears_flips_to_serving() {
 
     // Confirm the starting state: NotServing (file absent → cache empty).
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::NotServing,
-            Duration::from_secs(3),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::NotServing, STATUS_HANG_GUARD).await,
         "precondition: readiness must start NOT_SERVING with token file absent"
     );
 
@@ -614,22 +598,17 @@ async fn supervisor_service_token_appears_flips_to_serving() {
     atomic_write_token(&token_path, &fresh_token_json("token-arrival"));
 
     // Within ~one token poll interval (~50 ms) the provider's cache
-    // flips Some; within the next supervisor probe interval (~100 ms)
-    // the supervisor observes that and flips readiness. 3 s deadline is
-    // ample slack for CI scheduling jitter.
+    // flips Some; on the next supervisor tick (~100 ms) the supervisor
+    // observes that and flips readiness. The wait is a hang guard, not a
+    // timing claim: under load a tick can take up to one probe bound.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(3),
-        )
-        .await,
-        "AC #4: readiness must flip SERVING within ~one poll interval + supervisor probe \
-         interval after the token file appears"
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
+        "AC #4: readiness must flip SERVING on the supervisor's next tick after the provider \
+         caches the token that appeared (within the {STATUS_HANG_GUARD:?} hang guard)"
     );
 
     // AC #5: gauge transitioned 0 → 1.
-    let gauge = wait_for_gauge(&metrics, 1, Duration::from_secs(2)).await;
+    let gauge = wait_for_gauge(&metrics, 1, STATUS_HANG_GUARD).await;
     assert_eq!(
         gauge, 1,
         "AC #5: live_edit_service_token_available must read 1 after the token file appears"
@@ -643,12 +622,12 @@ async fn supervisor_service_token_appears_flips_to_serving() {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// AC #4 — token file deleted: flips NotServing within probe + slack
+// AC #4 — token file deleted: flips NotServing on the supervisor's next tick
 // ───────────────────────────────────────────────────────────────────────
 
 /// Provider starts with a valid future-expiry token → readiness boots
 /// `Serving`. The cached token becomes unusable → readiness flips
-/// `NotServing` within ≤ one supervisor probe interval + slack.
+/// `NotServing` on the supervisor's next tick.
 ///
 /// AC #4 wording is "deleting the file past the supervisor's
 /// `probe_interval` flips readiness to NotServing". A literal `unlink`
@@ -675,8 +654,7 @@ async fn supervisor_service_token_appears_flips_to_serving() {
 /// [`supervisor_service_token_inside_refresh_lead_stays_serving`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_service_token_disappears_flips_to_not_serving() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -706,11 +684,12 @@ async fn supervisor_service_token_disappears_flips_to_not_serving() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -721,15 +700,10 @@ async fn supervisor_service_token_disappears_flips_to_not_serving() {
     // Baseline: readiness comes up SERVING once the polling task has
     // read the fresh token into its cache.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(3),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "precondition: readiness must come up SERVING with a fresh token file present"
     );
-    let gauge_before = wait_for_gauge(&metrics, 1, Duration::from_secs(2)).await;
+    let gauge_before = wait_for_gauge(&metrics, 1, STATUS_HANG_GUARD).await;
     assert_eq!(
         gauge_before, 1,
         "AC #5: gauge must read 1 before the disappearance event (precondition)"
@@ -746,24 +720,19 @@ async fn supervisor_service_token_disappears_flips_to_not_serving() {
     // dependence on how long the rest of this test takes to run.
     atomic_write_token(&token_path, &token_json_expiring_in("token-expired", -30));
 
-    // The supervisor must flip NOT_SERVING within ~one poll interval
-    // (polling task re-reads) + one supervisor probe interval (supervisor
-    // observes `cached_bearer_if_unexpired() == None`). 3 s budget is well
-    // past two intervals + slack.
+    // The supervisor must flip NOT_SERVING once the polling task re-reads
+    // the file and its next tick observes `cached_bearer_if_unexpired() ==
+    // None`. The wait is a hang guard, not a timing claim.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::NotServing,
-            Duration::from_secs(3),
-        )
-        .await,
-        "AC #4: readiness must flip NOT_SERVING within ~probe_interval + slack once the \
+        wait_for_status(&mut client, PbServingStatus::NotServing, STATUS_HANG_GUARD).await,
+        "AC #4: readiness must flip NOT_SERVING on the supervisor's next tick once the \
          cached token is no longer usable (here: replaced with an already-expired token, \
-         the operator-facing equivalent of `unlink` per SR-6.2's silent-NotFound contract)"
+         the operator-facing equivalent of `unlink` per SR-6.2's silent-NotFound contract), \
+         within the {STATUS_HANG_GUARD:?} hang guard"
     );
 
     // AC #5: gauge transitioned 1 → 0.
-    let gauge_after = wait_for_gauge(&metrics, 0, Duration::from_secs(2)).await;
+    let gauge_after = wait_for_gauge(&metrics, 0, STATUS_HANG_GUARD).await;
     assert_eq!(
         gauge_after, 0,
         "AC #5: live_edit_service_token_available must transition to 0 once the cached token \
@@ -826,8 +795,7 @@ async fn supervisor_service_token_disappears_flips_to_not_serving() {
 /// post-b.e49 accessor actually satisfies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -851,11 +819,12 @@ async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
 
     // Fixture precondition, both halves. First: the accessor the supervisor
     // reads serves the token.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + STATUS_HANG_GUARD;
     while provider.cached_bearer_if_unexpired().is_none() {
         assert!(
             std::time::Instant::now() < deadline,
-            "precondition: the provider's polling task must cache the 30 s token within 5 s"
+            "precondition: the provider's polling task must cache the 30 s token within the \
+             {STATUS_HANG_GUARD:?} hang guard"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -883,11 +852,12 @@ async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -896,12 +866,7 @@ async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
     let mut client = connect_health(addr).await;
 
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(3),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "b.e49: a token 30 s from expiry is a LIVE credential — readiness must be raised to \
          SERVING. A NOT_SERVING here is the pre-fix behaviour: the supervisor treating the \
          provider's proactive re-read cadence as a validity floor"
@@ -921,7 +886,7 @@ async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
         );
     }
 
-    let gauge = wait_for_gauge(&metrics, 1, Duration::from_secs(2)).await;
+    let gauge = wait_for_gauge(&metrics, 1, STATUS_HANG_GUARD).await;
     assert_eq!(
         gauge, 1,
         "live_edit_service_token_available must read 1 for a cached, non-expired token — \
@@ -963,8 +928,7 @@ async fn supervisor_service_token_inside_refresh_lead_stays_serving() {
 /// to 0 at all; only real credential death does, and the fixture says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn supervisor_service_token_metric_registered_only_when_provider_present() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -991,11 +955,12 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
         Arc::clone(&metrics_wired),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel_wired.clone(),
     );
@@ -1012,11 +977,12 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
         Arc::clone(&metrics_unwired),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: None,
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel_unwired.clone(),
     );
@@ -1030,7 +996,7 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
         wait_for_status(
             &mut client_wired,
             PbServingStatus::Serving,
-            Duration::from_secs(3),
+            STATUS_HANG_GUARD,
         )
         .await,
         "wired-branch precondition: readiness must come up SERVING"
@@ -1042,7 +1008,7 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
         wait_for_status(
             &mut client_unwired,
             PbServingStatus::Serving,
-            Duration::from_secs(3),
+            STATUS_HANG_GUARD,
         )
         .await,
         "unwired-branch precondition: readiness must be SERVING (provider=None)"
@@ -1076,7 +1042,7 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
     // ── 1 → 0 transition on the wired branch ────────────────────────
     atomic_write_token(&token_path, &token_json_expiring_in("token-expired", -30));
 
-    let gauge_after = wait_for_gauge(&metrics_wired, 0, Duration::from_secs(3)).await;
+    let gauge_after = wait_for_gauge(&metrics_wired, 0, STATUS_HANG_GUARD).await;
     assert_eq!(
         gauge_after, 0,
         "AC #5: gauge must transition 1 -> 0 once the cached token has ACTUALLY expired \
@@ -1133,8 +1099,7 @@ async fn supervisor_service_token_metric_registered_only_when_provider_present()
 /// `malformed_json_logs_warn_*` test in `src/auth/service_token.rs`.
 #[tokio::test]
 async fn supervisor_transition_log_names_service_token_in_dependency_set() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -1188,11 +1153,12 @@ async fn supervisor_transition_log_names_service_token_in_dependency_set() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: Some(Arc::clone(&provider)),
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -1202,12 +1168,7 @@ async fn supervisor_transition_log_names_service_token_in_dependency_set() {
 
     // Wait for the NOT_SERVING verdict. The WARN line fires with it.
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::NotServing,
-            Duration::from_secs(3),
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::NotServing, STATUS_HANG_GUARD).await,
         "supervisor must flip NOT_SERVING (absent file → cache empty → \
          service_token_ok = false) so the transition WARN fires"
     );
@@ -1287,8 +1248,7 @@ async fn supervisor_transition_log_names_service_token_in_dependency_set() {
 /// Same reasoning as `supervisor_transition_log_names_service_token_in_dependency_set`.
 #[tokio::test]
 async fn supervisor_first_tick_unhealthy_dependency_logs_not_serving_verdict() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -1319,11 +1279,12 @@ async fn supervisor_first_tick_unhealthy_dependency_logs_not_serving_verdict() {
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: None,
             counter_seed_ready: Some(seed_rx),
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -1385,8 +1346,7 @@ async fn supervisor_first_tick_unhealthy_dependency_logs_not_serving_verdict() {
 /// `current_thread` flavor for the thread-local dispatcher, as above.
 #[tokio::test]
 async fn supervisor_healthy_boot_logs_readiness_raised_to_serving_exactly_once() {
-    let Some(valkey) = maybe_connect_valkey().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(valkey) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -1413,11 +1373,12 @@ async fn supervisor_healthy_boot_logs_readiness_raised_to_serving_exactly_once()
         Arc::clone(&metrics),
         HealthSupervisorConfig {
             probe_interval: SUPERVISOR_PROBE_INTERVAL,
-            probe_timeout: SUPERVISOR_PROBE_TIMEOUT,
+            probe_timeout: supervisor_probe_timeout(&valkey),
             readiness_service_name: READINESS_SERVICE_NAME.to_string(),
             service_token_provider: None,
             counter_seed_ready: None,
             api_serving: None,
+            verdict_stale: None,
         },
         supervisor_cancel.clone(),
     );
@@ -1426,12 +1387,7 @@ async fn supervisor_healthy_boot_logs_readiness_raised_to_serving_exactly_once()
     let mut client = connect_health(addr).await;
 
     assert!(
-        wait_for_status(
-            &mut client,
-            PbServingStatus::Serving,
-            Duration::from_secs(3)
-        )
-        .await,
+        wait_for_status(&mut client, PbServingStatus::Serving, STATUS_HANG_GUARD).await,
         "precondition: with every gated dependency healthy the supervisor's first tick must \
          raise readiness to SERVING"
     );

@@ -43,6 +43,9 @@ list(SORT live_path_maps)
 if(MSVC)
     list(REVERSE live_path_maps)
     add_compile_options(/experimental:deterministic)
+    # /pathmap rewrites compiler paths, but the linker otherwise embeds the absolute PDB filename in CodeView.
+    # Keep the real PDB beside the binary and record only its basename (the linker's _PDB substitution).
+    add_link_options("/PDBALTPATH:%_PDB%")
 endif()
 foreach(map IN LISTS live_path_maps)
     string(REGEX REPLACE "^[0-9]+\\|" "" map "${map}")

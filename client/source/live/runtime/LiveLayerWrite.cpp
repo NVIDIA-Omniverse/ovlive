@@ -50,6 +50,7 @@ template<class Input, class Response> struct Call : std::enable_shared_from_this
     bool uploadComplete = false;
     bool identified = false; // The header carries an operation ID.
     bool chained = false;    // The request sends a chained header.
+    CallSlot slot;           // Held from before preparation until completion.
 
     Tag* handoff(std::unique_ptr<Tag>& tag) noexcept {
         tag->owner = this->shared_from_this();
@@ -143,6 +144,7 @@ template<class Input, class Response> struct Call : std::enable_shared_from_this
         // Last payload/capture owner goes to the callback worker before enqueue.
         // Request quiescence then also proves charged wire buffers were retired.
         payload.reset();
+        slot.reset(); // The call is closed: its unit goes to a waiter before delivery.
         request->finish(error, std::move(delivery));
     }
 };
@@ -157,9 +159,12 @@ template<class Input, class Response, class Header>
 std::shared_ptr<Request> submit(Runtime& runtime, EndpointLease lease, Header header, std::string_view bytes,
     UnaryCallback<Response> callback, uint32_t timeoutMs, uint32_t operation, LayerWriteTransport* transport,
     std::shared_ptr<LayerWriteReceipt> receipt, LayerWriteDiagnostics diagnostics,
-    std::shared_ptr<PendingBytes> reservation = nullptr) {
+    std::shared_ptr<PendingBytes> reservation = nullptr, CallSlot slot = {}) {
     if (bytes.size() > runtime.options.values.max_update_bytes)
         throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+    // A caller without a slot takes a free call unit or is refused at once.
+    if (!slot) slot = lease->calls->tryAcquire(operation);
+    if (!slot) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
     // Validate identity with the same private URI codec used by the layer owner.
     const auto& base = baseHeader(header);
     makeLayerUri(makeSessionUri(lease->options.authority.canonical, base.session_id()), base.layer_name());
@@ -172,6 +177,7 @@ std::shared_ptr<Request> submit(Runtime& runtime, EndpointLease lease, Header he
             std::make_shared<PendingBytes>(std::move(lease), charged,
                 runtime.options.values.max_pending_bytes_per_endpoint));
     auto call = std::make_shared<Call<Input, Response>>();
+    call->slot = std::move(slot);
     call->identified = !base.operation_id().empty();
     call->chained = std::is_same_v<Header, rpc::ChainedUpdateLayerHeader>;
     payload->diagnostics = diagnostics;
@@ -259,7 +265,7 @@ EndpointLease acquire(Runtime& runtime, OmniUsdLiveEndpoint endpoint) {
 std::shared_ptr<Request> submitLayerCreate(Runtime& runtime, OmniUsdLiveEndpoint endpoint, std::string_view sessionId,
     std::string_view layerName, std::string_view bytes, UnaryCallback<rpc::CreateLayerResponse> callback,
     uint32_t timeoutMs, LayerWriteTransport* transport, std::shared_ptr<LayerWriteReceipt> receipt,
-    LayerWriteDiagnostics diagnostics, std::string_view operationId) {
+    LayerWriteDiagnostics diagnostics, std::string_view operationId, CallSlot slot) {
     if (sessionId.size() > kMaxUriBytes || layerName.size() > kMaxUriBytes)
         throw std::length_error("layer identity capacity");
     if (operationId.size() > kMaxOperationIdBytes) throw std::length_error("operation identity capacity");
@@ -270,14 +276,14 @@ std::shared_ptr<Request> submitLayerCreate(Runtime& runtime, OmniUsdLiveEndpoint
     header.set_operation_id(std::string(operationId));
     return submit<rpc::CreateLayerRequest, rpc::CreateLayerResponse>(runtime, std::move(lease), std::move(header),
         bytes, std::move(callback), timeoutMs, OMNI_USD_LIVE_OPERATION_CREATE, transport, std::move(receipt),
-        diagnostics);
+        diagnostics, nullptr, std::move(slot));
 }
 std::shared_ptr<Request> submitLayerUpdate(Runtime& runtime, OmniUsdLiveEndpoint endpoint, std::string_view sessionId,
     std::string_view layerName, uint64_t objectId, uint64_t estimatedServerTimeUs, std::string_view bytes,
     UnaryCallback<rpc::UpdateLayerResponse> callback, uint32_t timeoutMs, LayerWriteTransport* transport,
     std::shared_ptr<LayerWriteReceipt> receipt, LayerWriteDiagnostics diagnostics,
     std::shared_ptr<PendingBytes> reservation, std::string_view operationId, const std::string* previousOperationId,
-    bool noWait) {
+    bool noWait, CallSlot slot) {
     if (!objectId) throw std::invalid_argument("update requires an existing object incarnation");
     if (previousOperationId && (previousOperationId->size() > kMaxOperationIdBytes || operationId.empty()))
         throw std::invalid_argument("chained update identity");
@@ -299,11 +305,11 @@ std::shared_ptr<Request> submitLayerUpdate(Runtime& runtime, OmniUsdLiveEndpoint
         chained.set_no_wait(noWait);
         return submit<rpc::UpdateLayerRequest, rpc::UpdateLayerResponse>(runtime, std::move(lease), std::move(chained),
             bytes, std::move(callback), timeoutMs, OMNI_USD_LIVE_OPERATION_UPDATE, transport, std::move(receipt),
-            diagnostics, std::move(reservation));
+            diagnostics, std::move(reservation), std::move(slot));
     }
     return submit<rpc::UpdateLayerRequest, rpc::UpdateLayerResponse>(runtime, std::move(lease), std::move(header),
         bytes, std::move(callback), timeoutMs, OMNI_USD_LIVE_OPERATION_UPDATE, transport, std::move(receipt),
-        diagnostics, std::move(reservation));
+        diagnostics, std::move(reservation), std::move(slot));
 }
 namespace {
 // A bounded reader of the length-delimited fields of a protobuf message, the

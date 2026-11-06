@@ -26,9 +26,10 @@ version = "0.0.0"
 publish = false
 edition = "2021"
 
-# Pin this crate as its own workspace root so cargo does not walk up to the
-# repo-root workspace (which excludes this directory but can't suppress
-# bottom-up workspace detection from a child manifest).
+# Make this crate its own workspace root explicitly. The repo-root workspace's
+# `exclude` already keeps this directory out of that workspace, but cargo's
+# upward search for a workspace root then skips that root and keeps walking
+# into the directories above the checkout; this table ends the search here.
 [workspace]
 
 [package.metadata]

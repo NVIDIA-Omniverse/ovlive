@@ -59,7 +59,7 @@ The scaler (`live-edit scaler`) requires `LIVE_EDIT_SCALER_NAMESPACE`, `LIVE_EDI
 
 - **Durations** are whole numbers in the unit the name ends with: `Ms` (`_MS` in a variable) is milliseconds, `Secs` or `Seconds` (`_SECS`) is seconds. The `checkpoint` intervals without a unit are seconds. A unit suffix such as `15s` is refused.
 - **Sizes** are whole numbers of bytes, for names ending `Bytes` (`_BYTES`) and for `layer.maxSize`. A suffix such as `128Mi` is refused, except in the Kubernetes `resources` values. In `resources.limits.memory` and `resources.requests.memory` the chart also refuses the `m`, `u` and `n` suffixes (fractions of a byte, almost always a typo for `Mi` or `M`) and a zero memory limit. Other forms Kubernetes accepts, such as `5e9`, are read as Kubernetes reads them.
-- **Whole numbers** are plain digits. For most settings the chart refuses a negative or fractional number, or text, at install, naming the value. It does not check `valkey.memoryBytes`, `valkey.extReleaseMaxBytes`, `valkey.snapshotAtomicReadMax*`, `valkey.subscriberAdmissionMaxWaiters`, `layer.maxSize`, `layer.uploadAdmission*`, `shutdown.streamEnd*`, `observability.tracing.batch.*`, `checkpoint.tail.max*` or `autoscaling.*`. Write plain digits there, because anything else can be read as a different number, such as `0`, or be refused only when the pods start. For `autoscaling.*`, quote values of a million or more.
+- **Whole numbers** are plain digits; a large one, such as `12000000000`, needs no quotes. Write no leading zeros: unquoted in a values file, `010` is read as 8. Anything else, such as a negative or fractional number or text, fails the install, naming the value. This covers every whole-number setting the service and the scaler read, and `minReadySeconds`, `terminationGracePeriodSeconds`, `tests.ttlSecondsAfterFinished`, `dr.backoffLimit` and `dr.ttlSecondsAfterFinished`. The ports are checked when the pods start.
 - **Booleans** are `true` or `false`.
 - **Unset** values (empty or `null`) let the service choose; the Default column says what it chooses. Emptying a value that has a non-empty default can fail the render or startup, or change behaviour; leave values you don't mean to change out of your values file.
 - **`0`** means off, unlimited or refused, depending on the setting.
@@ -71,7 +71,7 @@ The scaler (`live-edit scaler`) requires `LIVE_EDIT_SCALER_NAMESPACE`, `LIVE_EDI
 |---|---|---|---|
 | `service.grpc.port` | `LIVE_EDIT_PORT` | `50001` | gRPC port for clients and health probes. |
 | `service.metrics.port` | `LIVE_EDIT_METRICS_PORT` | `9090` | HTTP port serving Prometheus `/metrics` and the autoscaler's load reads. |
-| `serviceLabel` | `LIVE_EDIT_SERVICE_LABEL` | unset (the pod name) | Value of the `service` label on every metric. Set a stable name to keep one series across pod restarts. |
+| `serviceLabel` | `LIVE_EDIT_SERVICE_LABEL` | unset (the pod name) | Value of the `service` label on the metrics that carry one. Set a stable name to keep one series across pod restarts. |
 
 (live-edit-configuration-authorization)=
 ## Authorization and identity
@@ -141,7 +141,7 @@ Exports are sent uncompressed: while trace export is on, any value of `OTEL_EXPO
 
 {ref}`Scaling <live-edit-scaling>` explains how these relate to pod resources.
 The service sizes its per-replica memory budgets (subscriptions, catch-ups of large layers, uploads, the structural-edit cache and, with backups on, large values waiting for the backup store) from `resources.limits.memory` at startup; no setting sets them.
-`LIVE_EDIT_SUBSCRIBER_MAX_SUBSCRIPTIONS`, `LIVE_EDIT_CATCHUP_BUILD_MEMORY_BUDGET_MIB`, `LIVE_EDIT_UPLOAD_MEMORY_BUDGET_MIB` and `LIVE_EDIT_STRUCTURAL_CACHE_MAX_MIB` no longer exist: see {ref}`Removed settings <live-edit-operations-removed-settings>`.
+A pod whose environment sets `LIVE_EDIT_SUBSCRIBER_MAX_SUBSCRIPTIONS`, `LIVE_EDIT_CATCHUP_BUILD_MEMORY_BUDGET_MIB`, `LIVE_EDIT_UPLOAD_MEMORY_BUDGET_MIB`, `LIVE_EDIT_STRUCTURAL_CACHE_MAX_MIB` or `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` stops at startup: remove them ({ref}`Removed settings <live-edit-operations-removed-settings>`).
 Some settings on this page also take pod memory and raise the smallest memory limit that starts; {ref}`Starting size <live-edit-scaling-starting-size>` lists them.
 
 | Helm value | Environment variable | Default | Description |
@@ -163,8 +163,8 @@ Some settings on this page also take pod memory and raise the smallest memory li
 | Helm value | Environment variable | Default | Description |
 |---|---|---|---|
 | `rpc.deadlineMs` | `LIVE_EDIT_RPC_DEADLINE_MS` | `30000` | Deadline for every call except the two long-lived streams. Raise `terminationGracePeriodSeconds` with it. |
-| `layer.maxSize` | `LIVE_EDIT_MAX_LAYER_SIZE` | `104857600` | Largest single upload, in bytes (100 MiB); larger ones fail `INVALID_ARGUMENT`. Raising it takes pod memory from the catch-up budget, and a memory limit too small for it stops startup. |
-| `layer.uploadAdmissionWaitMs` | `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS` | unset (2000 at the default deadline) | How long an upload waits for the replica's upload memory. Must be below `rpc.deadlineMs`. `0` never waits. |
+| `layer.maxSize` | `LIVE_EDIT_MAX_LAYER_SIZE` | `104857600` | Largest single upload, in bytes (100 MiB); larger ones fail `INVALID_ARGUMENT`. Raising it needs more pod memory; a memory limit too small for it stops startup. |
+| `layer.uploadAdmissionWaitMs` | `LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS` | unset (2000 at the default deadline) | How long an upload waits for the replica's upload memory. Must be below `rpc.deadlineMs`. `0` never waits. Unset it with `null`; an empty value is refused. |
 | `layer.extValueVerify` | `LIVE_EDIT_EXT_VALUE_VERIFY` | `enforce` | `enforce` refuses an upload whose large value does not match its declared size or hash; `observe` logs and stores it. Use `observe` only while rolling out clients. |
 
 (live-edit-configuration-presence-and-shutdown)=
@@ -176,8 +176,15 @@ Some settings on this page also take pod memory and raise the smallest memory li
 | `shutdown.timeoutSecs` | `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` | `5` | How long a stopping pod keeps serving after leaving the load balancer. |
 | `shutdown.streamEndRate` | `LIVE_EDIT_SHUTDOWN_STREAM_END_RATE` | `25` | Streams a stopping pod ends per second, so clients reconnect gradually. `0` ends all at once. |
 | `shutdown.streamEndMaxWindowSecs` | `LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS` | `20` | Longest time spent ending streams. |
-| `shutdown.overallBudgetSecs` | `LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS` | `30` | Cleanup time after the server stops. At least `shutdown.timeoutSecs` + 15. |
+| `shutdown.overallBudgetSecs` | `LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS` | `30` | Cleanup time after the server stops. At least `shutdown.timeoutSecs` + 15; below 3 × `shutdown.timeoutSecs` + 15, a slow cleanup can be cut short, with a `WARN`. |
 | `terminationGracePeriodSeconds` | — | `80` | Must cover the shutdown settings and `rpc.deadlineMs`; the chart refuses a value that does not and names the minimum. |
+| `shareProcessNamespace` | — | `false` | `true` lets a crash-dump agent's `SIGABRT` reach the service. Every container, sidecars included, sees every process and its command line; one running as the same user or root can signal them and read their environment, memory and files. |
+
+```{warning}
+With `shareProcessNamespace: true`, the service's environment, which a container with `CAP_SYS_PTRACE` can also read, holds the backing-store connection Secret.
+A signal from any container can then stop the service or another container.
+The core dump is written only if the node's core pattern pipes it to a host handler: the container's root filesystem is read-only.
+```
 
 (live-edit-configuration-checkpoints)=
 ## Checkpoints
@@ -197,6 +204,8 @@ With the chart defaults the service refuses to start until you choose an adapter
 | `checkpoint.retainGenerations` | `LIVE_EDIT_CHECKPOINT_RETAIN_GENERATIONS` | `2` | Full backups kept per layer. |
 | `checkpoint.tail.enabled` | `LIVE_EDIT_CHECKPOINT_TAIL_ENABLED` | `true` | Take incremental backups between full ones. |
 | `checkpoint.counterSafetyMargin` | `LIVE_EDIT_CHECKPOINT_COUNTER_SAFETY_MARGIN` | `1000000` | Headroom above the last backed-up layer id when the service recovers from a backing-store data loss. Raise it if more than a million layers could be created during a backup-store outage. Lowering it risks reused layer ids. `1` to `1000000000`. |
+| `checkpoint.notFoundCacheSecs` | `LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS` | `900` | With `StorageApi`, how long the disaster-recovery Jobs wait before treating a missing backup as lost. Keep it at least as long as your Storage service caches "not found" answers (15 minutes by default). A change still rolls the pods. |
+| `checkpoint.restoreParallelism` | `LIVE_EDIT_DR_RESTORE_PARALLELISM` | `8` | Most layers a disaster-recovery restore or accept-loss Job reads or writes at once; the service itself ignores it, though a change still rolls its pods. Lower it if such a Job runs out of memory. `0` is refused. |
 
 (live-edit-configuration-autoscaling)=
 ## Autoscaling
@@ -234,7 +243,7 @@ Leave these at their defaults unless a topic page, a startup error or NVIDIA sup
 | `observability.tracing.batch.maxExportBatchSize` | `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` |
 | `observability.tracing.batch.scheduleDelayMs` | `OTEL_BSP_SCHEDULE_DELAY` | `5000` |
 | `valkey.connectTimeoutSecs` | `LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS` | `30` |
-| `valkey.commandTimeoutMs` | `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS` | `5000` |
+| `valkey.commandTimeoutMs` | `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS` | `5000` (milliseconds; `0` is refused at startup) |
 | `valkey.reconnectMaxDelayMs` | `LIVE_EDIT_VALKEY_RECONNECT_MAX_DELAY_MS` | `30000` |
 | `valkey.subscriberMaxConcurrentCatchups` | `LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS` | `8` |
 | `valkey.subscriberAdmissionWaitMs` | `LIVE_EDIT_SUBSCRIBER_ADMISSION_WAIT_MS` | `20000` |
@@ -249,11 +258,10 @@ Leave these at their defaults unless a topic page, a startup error or NVIDIA sup
 | `userInfo.negativeTtlSecs` | `LIVE_EDIT_AUTH_USERINFO_NEGATIVE_TTL_SECS` | `5` |
 | `serviceIdentity.clientCredentials.enabled` | `LIVE_EDIT_SERVICE_TOKEN_CLIENT_CREDENTIALS_ENABLED` | `false` (no effect; leave it) |
 | `rpc.sessionListTimeoutMs` | `LIVE_EDIT_SESSION_LIST_TIMEOUT_MS` | `2000` |
-| `layer.uploadAdmissionMaxWaiters` | `LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS` | `64` |
+| `layer.uploadAdmissionMaxWaiters` | `LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS` | `64` (`1` to `2046`) |
 | `layer.updateRetryMaxAttempts` | `LIVE_EDIT_UPDATE_LAYER_RETRY_MAX_ATTEMPTS` | `128` |
 | `layer.updatePerObjectConcurrency` | `LIVE_EDIT_UPDATE_LAYER_PER_OBJECT_CONCURRENCY` | `16` |
 | `layer.updateLayerBackend` | `LIVE_EDIT_UPDATE_LAYER_BACKEND` | `lua` |
-| `layer.catchupSnapshotEnabled` | `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` | `true` |
 | `layer.structuralCacheAuditRate` | `LIVE_EDIT_STRUCTURAL_CACHE_AUDIT_RATE` | `0.001` |
 | `layer.structuralCacheAuditAboveCeiling` | `LIVE_EDIT_STRUCTURAL_CACHE_AUDIT_ABOVE_CEILING` | `true` |
 | `session.retryMaxAttempts` | `LIVE_EDIT_SESSION_RETRY_MAX_ATTEMPTS` | `32` |
@@ -287,9 +295,11 @@ Leave these at their defaults unless a topic page, a startup error or NVIDIA sup
 | `envSecretName`, `valkey` | backing-store connection, authentication and capacity | {ref}`Backing store <live-edit-backing-store>` |
 | `rpc`, `layer`, `session`, `presence`, `shutdown`, `gc` | request handling, uploads, sessions, shutdown | this page |
 | `checkpoint` | backups and recovery | {ref}`Durability <live-edit-durability>` |
+| `dr` | disaster-recovery restore and accept-loss Jobs | {ref}`Durability <live-edit-durability-held>` |
 | `allocator` | memory allocator diagnosis | leave unset |
 | `resources`, `autoscaling`, `podDisruptionBudget`, `replicaCount` | pod size and replica count | {ref}`Scaling <live-edit-scaling>` |
 | `startupProbe`, `livenessProbe`, `readinessProbe`, `terminationGracePeriodSeconds`, `strategy` | health checks and rollouts | {ref}`Operations <live-edit-operations>` |
+| `shareProcessNamespace` | crash-dump signals, by sharing processes between the pod's containers | this page |
 | `httpProxy`, `networkPolicy` | ingress and network access | {ref}`Deployment <live-edit-deployment>` |
 | `volumes`, `volumeMounts`, `nodeSelector`, `tolerations`, `affinity` | standard pod placement and storage | Kubernetes documentation |
 | `tests`, `smokeTest` | smoke tests (`helm test`) | {ref}`Deployment <live-edit-deployment>` |

@@ -31,6 +31,7 @@ pub mod base_path;
 pub mod delta;
 pub mod delta_write;
 pub mod diff;
+pub mod layer_root;
 pub mod limits;
 pub mod ompf;
 pub mod pass_timing;

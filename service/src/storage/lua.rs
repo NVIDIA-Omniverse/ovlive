@@ -349,9 +349,20 @@ const _: () = {
 /// and it can land after that `client_id`'s next commit. With one attempt, a
 /// dropped connection fails the
 /// attempt transiently instead, and so does a cluster redirect, which the one
-/// write leaves no attempt to follow: a `MOVED` fails it as `Unknown` "Too many
-/// failed write attempts." and an `-ASK` as `Routing` "Max attempts reached."
-/// (both transient, `storage::client::is_router_retry_budget_exhausted_error`).
+/// write leaves no attempt to follow. These shapes are the data pool's, the
+/// only pool that sends this commit (`storage::layer`'s `update_layer` fast
+/// path, `storage::structural::commit_structural`), with fred's default
+/// redirection budget: a `MOVED` fails it as `Unknown` "Too many failed write
+/// attempts." (`process_moved` re-syncs and spends a redirection, and the
+/// re-write finds no attempt left) and an `-ASK` as `Routing` "Max attempts
+/// reached." (both transient,
+/// `storage::client::is_router_retry_budget_exhausted_error`). On a client
+/// with a redirection budget of zero, like the `txn_pool`, both redirects
+/// would fail `Routing` "Too many redirections." instead — the shape the
+/// `CreateLayer` commit, `create_layer_commit.lua`, meets there. The `Unknown`
+/// text does not prove the commit did not run: a one-attempt command in
+/// flight on a connection that a cluster sync closes is re-written from the
+/// retry buffer and fails the same way.
 /// `update_layer`'s own retry loop decides what happens next — its next attempt
 /// starts with the commit-token check, which reports a commit that did land.
 /// The `-ASK` leaves the client's router running only because of the vendored
@@ -395,10 +406,41 @@ pub(crate) async fn evalsha_once_with_reload<R: fred::types::FromValue>(
     keys: Vec<String>,
     args: Vec<fred::types::Value>,
 ) -> Result<R, fred::error::Error> {
+    evalsha_with_attempts_and_reload(client, script, keys, args, UPDATE_LAYER_COMMIT_MAX_ATTEMPTS)
+        .await
+}
+
+/// The attempt budget of `DeleteLayer`'s conditional unmap
+/// ([`LAYER_UNMAP_SCRIPT`]): fred writes it to the wire at most once.
+///
+/// The unmap is a compare-and-delete whose comparison is only as good as the
+/// moment it runs. A send that fred re-wrote after a reconnect could run after
+/// its first write already landed and after a same-name `CreateLayer` mapped a
+/// replacement; that late run would find the replacement and answer `OTHER`,
+/// and a caller that cannot tell it from a first run would retarget the delete
+/// onto the replacement. With one attempt a lost connection or a redirect fails
+/// the send transiently instead (the shapes [`UPDATE_LAYER_COMMIT_MAX_ATTEMPTS`]
+/// describes for the data pool), and `LayerStore::delete_layer_target` treats
+/// every send after such a failure as one that may follow a landed run: it never
+/// retargets on it.
+pub const LAYER_UNMAP_MAX_ATTEMPTS: u32 = 1;
+
+/// Send `script` as `EVALSHA` over `client` with an attempt budget of
+/// `max_attempts`, loading it and trying once more on `NOSCRIPT` — the body of
+/// [`evalsha_once_with_reload`], for a caller that names its own budget
+/// (`DeleteLayer`'s unmap, [`LAYER_UNMAP_MAX_ATTEMPTS`]). Dispatch, hashing and
+/// the reload are as described there.
+pub(crate) async fn evalsha_with_attempts_and_reload<R: fred::types::FromValue>(
+    client: &fred::clients::Client,
+    script: &Script,
+    keys: Vec<String>,
+    args: Vec<fred::types::Value>,
+    max_attempts: u32,
+) -> Result<R, fred::error::Error> {
     use fred::interfaces::ClientLike;
 
     let options = fred::types::config::Options {
-        max_attempts: Some(UPDATE_LAYER_COMMIT_MAX_ATTEMPTS),
+        max_attempts: Some(max_attempts),
         ..Default::default()
     };
     let once = client.with_options(&options);
@@ -904,6 +946,23 @@ pub static CREATE_LAYER_VETO_SCRIPT: LazyLock<Script> =
 pub static RETIRED_OBJECT_WAKE_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::from_lua(include_str!("scripts/retired_object_wake.lua")));
 
+/// The compiled conditional unmap of `DeleteLayer` (SDD §7.11 step 2): while
+/// the layer mapping still holds the expected value (the object the delete
+/// resolved), removes the layer's layers-index member and deletes the
+/// mapping (`UNMAPPED`); with no mapping, removes the member (`ABSENT`); with
+/// the mapping holding any other value, writes nothing (`OTHER`, that value).
+/// One atomic step on the `{session_id}` slot. Its writes, `SREM` and `DEL`,
+/// are not refused on a full store. Driven only by
+/// `LayerStore::send_layer_unmap_once`, written to the wire at most once per
+/// send ([`LAYER_UNMAP_MAX_ATTEMPTS`]).
+///
+/// See `scripts/layer_unmap.lua` for its `KEYS` / `ARGV` contract and reply
+/// shapes.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static LAYER_UNMAP_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/layer_unmap.lua")));
+
 /// The compiled compare-and-delete of one writer's field in an object's
 /// `UpdateLayer` commit-token record (`le:{oid}:obj:wtok`). Driven only by the
 /// `update_layer` slow path, to retract the record a torn commit carrying a
@@ -914,6 +973,120 @@ pub static RETIRED_OBJECT_WAKE_SCRIPT: LazyLock<Script> =
 /// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
 pub static COMMIT_RECORD_RETRACT_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::from_lua(include_str!("scripts/commit_record_retract.lua")));
+
+/// The compiled hold-poll read (SDD SR-2.2): whether the fleet hold marker
+/// exists, and its fields, in one `EVALSHA` on the object-id counter's slot.
+/// Driven only by [`crate::storage::dr_hold::read_hold_marker`], which the
+/// hold poll and the startup hold evaluation (`crate::dr::hold`) call.
+///
+/// Read-only. See `scripts/dr_hold_poll.lua` for its `KEYS` contract and
+/// reply shape.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static DR_HOLD_POLL_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/dr_hold_poll.lua")));
+
+/// The compiled un-hold (SDD SR-4.2, SR-9.9): the lease and incident checks,
+/// the object-id counter's raise to the Job's floor and the hold marker's
+/// delete, in one `EVALSHA` on the object-id counter's slot. The hold
+/// marker's only deleter. Driven only by [`crate::storage::dr_hold::unhold`],
+/// which takes the restore or accept-loss Job's recount receipt.
+///
+/// See `scripts/dr_unhold.lua` for its `KEYS` contract and reply shape.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static DR_UNHOLD_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/dr_unhold.lua")));
+
+/// The compiled per-hash set of the restore Job's authoritative recount (SDD
+/// SR-9.8): one value's `ref_count` set to an exact count, on its meta key
+/// alone, creating a meta without data where none exists. Driven only by
+/// [`crate::storage::ext_reconcile::recount_authoritative`].
+///
+/// See `scripts/ext_ref_count_set.lua` for its `KEYS` contract and reply
+/// shape.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static EXT_REF_COUNT_SET_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/ext_ref_count_set.lua")));
+
+/// The compiled veto on a session id whose metadata is absent: unless the
+/// session's metadata hash exists (`PRESENT`) or its deletion marker does
+/// (`DELETED`, no veto written: the metadata write refuses a marked id
+/// anyway), writes the metadata veto
+/// (`le:{sid}:sess:veto`) with its TTL (`VETOED`), so
+/// [`SESSION_META_WRITE_SCRIPT`] refuses every later metadata write for the
+/// id. One atomic step on the `{session_id}` slot. Driven only by
+/// `SessionStore`: the `ListSessions` ghost walk's
+/// `retire_ghost_member` and `CreateSession`'s settle of a failed metadata
+/// write. Its `SET` follows a no-op `PEXPIRE` opener on the veto key, so it
+/// runs on a full store (the opener rule, SDD §7.5.1).
+///
+/// See `scripts/session_meta_veto.lua` for its `KEYS` / `ARGV` contract and
+/// reply shapes.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static SESSION_META_VETO_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/session_meta_veto.lua")));
+
+/// The compiled `CreateSession` metadata write: unless the id carries the
+/// session deletion marker (`DELETED`, nothing written) or the metadata veto
+/// [`SESSION_META_VETO_SCRIPT`] writes (`VETOED`, nothing written), `HSET`s
+/// the session's metadata hash (`OK`), in one atomic step on the
+/// `{session_id}` slot. Driven only by `SessionStore::finish_create`, the
+/// one production writer of a `CreateSession`'s metadata. No opener, by
+/// decision: a full store refuses it `-OOM`, so no session is created past
+/// `maxmemory`.
+///
+/// See `scripts/session_meta_write.lua` for its `KEYS` / `ARGV` contract and
+/// reply shapes.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static SESSION_META_WRITE_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/session_meta_write.lua")));
+
+/// The compiled record step of on-access session recovery: unless the
+/// session's metadata record exists (`PRESENT`) or its deletion marker does
+/// (`DELETED`), writes the backup's layer mappings, its layers-index members
+/// and, last, the record (`APPLIED`), in one atomic step on the
+/// `{session_id}` slot. Driven only by
+/// `checkpoint::session::apply_session_checkpoint` in its
+/// `SessionApplySteps::PathIndexThenRecordIfAbsent` mode; the restore Job's
+/// record step stays an unconditional `Transaction`. It has no use beyond
+/// the on-access session recovery hook, and goes when the hook does.
+///
+/// See `scripts/session_record_restore.lua` for its `KEYS` / `ARGV` contract
+/// and reply shapes.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static SESSION_RECORD_RESTORE_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/session_record_restore.lua")));
+
+/// The compiled release of one session id's two index members at a base path:
+/// the `path_index` member, then the names member, each only from a set that
+/// exists, in one atomic step on the `{hex(base_path)}` slot. Driven only by
+/// `SessionStore`: the `ListSessions` ghost walk's `retire_ghost_member` and
+/// `CreateSession`'s clean-ups. `DeleteSession` keeps its own two `SREM`s.
+///
+/// See `scripts/session_index_release.lua` for its `KEYS` / `ARGV` contract
+/// and reply shape.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static SESSION_INDEX_RELEASE_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/session_index_release.lua")));
+
+/// The compiled removal of every `path_index` member at a base path that no
+/// names member carries, in one atomic step on the `{hex(base_path)}` slot.
+/// Driven only by `SessionStore::reconcile_path_index`, which the
+/// `ListSessions` handler calls when `SessionStore::list` found a
+/// `path_index` member its names read did not list.
+///
+/// See `scripts/session_path_index_reconcile.lua` for its `KEYS` contract and
+/// reply shape.
+///
+/// Same lazy-`SHA-1` / `NOSCRIPT`-reload story as [`UPDATE_LAYER_FAST_SCRIPT`].
+pub static SESSION_PATH_INDEX_RECONCILE_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/session_path_index_reconcile.lua")));
 
 /// Stamp `pairs` onto a layer's `obj:hdr` **only if that header is still
 /// live**, atomically (b.vn6).

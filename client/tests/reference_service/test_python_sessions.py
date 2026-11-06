@@ -13,6 +13,7 @@ import sys
 import threading
 import unittest
 from unittest.mock import patch
+from dataclasses import replace
 
 import grpc
 from omni.usd import live
@@ -42,7 +43,7 @@ class PythonSessionTests(unittest.IsolatedAsyncioTestCase):
         self.state.session_wire = []
         self.server = ReferenceServer(self.state, "python-stream", service_factory=RecordedService)
         self.address = await self.server.start()
-        self.owners, self.release_events = [], []
+        self.owners, self.release_events, self.extra_servers = [], [], []
         self.addAsyncCleanup(self.cleanup)
         self.runtime = self.owner()
         self.endpoint = self.runtime.register_endpoint(self.address, access_token="synthetic-writer")
@@ -58,6 +59,8 @@ class PythonSessionTests(unittest.IsolatedAsyncioTestCase):
         for release in self.release_events:
             release.set()
         results = [await asyncio.to_thread(owner.close, 5000) for owner in reversed(self.owners)]
+        for server in self.extra_servers:
+            await server.stop()
         await self.server.stop()
         artifact = Path(os.environ["LIVE_TEST_ARTIFACT_DIR"]) / (self.id().split(".")[-1] + ".python-session.json")
         artifact.write_text(json.dumps({"seed": self.seed, "wire": self.state.session_wire,
@@ -183,6 +186,286 @@ class PythonSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(watching.connection_id, self.state.keepalive_timeouts)
         self.assertEqual(live.get_session_status(a).state, live.State.READY)
         self.assertEqual(live.get_session_status(b).state, live.State.READY)
+
+    def owner_events(self, events):
+        return [(e.merge_owner_outcome, e.connection_id, e.merge_owner_epoch, e.merge_owner_held)
+                for e in events if e.kind == live.SessionEventKind.MERGE_OWNER]
+
+    async def owner_join(self, app, runtime=None, *, uri=None, merge_owner=True):
+        events, callback = self.observer()
+        session = (runtime or self.runtime).join_session(uri or self.created.uri, app, callback,
+                                                         merge_owner=merge_owner)
+        return session, events, await self.connected(events)
+
+    async def test_merge_owner_grants_one_of_two_same_principal_joins_and_hands_off_when_the_holder_leaves(self):
+        self.state.merge_owner = True
+        a, a_events, a_connected = await self.owner_join("first")
+        b, b_events, b_connected = await self.owner_join("second")
+        self.assertTrue(a_connected.merge_owner_supported and b_connected.merge_owner_supported)
+        self.assertEqual(a.merge_owner, live.MergeOwner(True, False, False, 0))
+        answers = await asyncio.gather(a.request_merge_owner_async(live.MergeOwnerAction.CLAIM),
+                                       b.request_merge_owner_async(live.MergeOwnerAction.CLAIM))
+        self.assertEqual([result for result, _ in answers], [live.Result.OK, live.Result.OK])
+        outcomes = sorted(state.outcome for _, state in answers)
+        self.assertEqual(outcomes, [live.MergeOwnerOutcome.GRANTED, live.MergeOwnerOutcome.HELD_BY_OTHER])
+        (holder, holder_events, held), (waiter, waiter_events, waiting) = sorted(
+            [(a, a_events, answers[0][1]), (b, b_events, answers[1][1])],
+            key=lambda entry: entry[2].outcome != live.MergeOwnerOutcome.GRANTED)
+        holder_id = held.owner_connection_id
+        self.assertEqual((held.epoch, held.held, held.owner_user_name), (1, True, "writer"))
+        self.assertEqual((waiting.owner_connection_id, waiting.epoch, waiting.held), (holder_id, 1, False))
+        self.assertEqual(holder.merge_owner, live.MergeOwner(True, True, True, 1))
+        self.assertEqual(waiter.merge_owner, live.MergeOwner(True, False, True, 1))
+        self.assertEqual(await holder.request_merge_owner_async(live.MergeOwnerAction.VERIFY),
+                         (live.Result.OK, live.MergeOwnerState(live.MergeOwnerOutcome.GRANTED, holder_id, "writer", 1,
+                                                                True, True)))
+        # The holder leaves: its join's end releases the lease, and the waiter, whose claim still stands, takes it
+        # at once with a higher epoch.
+        self.assertEqual(await asyncio.to_thread(holder.leave, 3000), live.Result.OK)
+        waiter_id = next(e.connection_id for e in waiter_events if e.kind == live.SessionEventKind.CONNECTION)
+        await self.until(lambda: (live.MergeOwnerOutcome.GRANTED, waiter_id, 2, True) in self.owner_events(waiter_events))
+        owner_events = self.owner_events(waiter_events)
+        released = owner_events.index((live.MergeOwnerOutcome.RELEASED, None, 1, False))
+        self.assertEqual(owner_events[released + 1], (live.MergeOwnerOutcome.GRANTED, waiter_id, 2, True))
+        self.assertEqual(waiter.merge_owner, live.MergeOwner(True, True, True, 2))
+        result, state = await waiter.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome, state.epoch, state.held), (live.Result.OK, live.MergeOwnerOutcome.GRANTED,
+                                                                            2, True))
+        grants = [e for e in self.state.merge_owner_log if e["outcome"] == "MERGE_OWNER_OUTCOME_GRANTED"]
+        self.assertEqual([(e["owner"], e["epoch"]) for e in grants if e["request_id"]],
+                         [(holder_id, 1), (holder_id, 1), (waiter_id, 2), (waiter_id, 2)])
+
+    async def test_merge_owner_keepalive_expiry_releases_and_a_reconnect_reclaims_after_a_handoff(self):
+        self.state.merge_owner = True
+        self.state.keepalive_interval_ms = 3_600_000
+        a, a_events, old = await self.owner_join("lapsing")
+        b, b_events, _ = await self.owner_join("watching")
+        result, state = await a.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome, state.epoch), (live.Result.OK, live.MergeOwnerOutcome.GRANTED, 1))
+        await self.until(lambda: self.owner_events(b_events) == [(live.MergeOwnerOutcome.HELD_BY_OTHER,
+                                                                   old.connection_id, 1, False)])
+        # The lapsing join's rejoin waits at a pause gate, so the handoff happens before its re-claim.
+        rejoin = self.state.plan("JoinSession", "before", pause=True)
+        self.assertEqual(self.state.advance_keepalive_clock(3 * 3_600_000 - 1), [])
+        self.assertEqual(await b.send_message_async(b"still here"), live.Result.OK)
+        await self.until(lambda: any(e.kind == live.SessionEventKind.MESSAGE for e in a_events))
+        self.assertEqual(self.state.advance_keepalive_clock(1), [old.connection_id])
+        await self.until(lambda: (live.MergeOwnerOutcome.RELEASED, None, 1, False) in self.owner_events(b_events))
+        # Reconnecting drops ownership at once.
+        await self.until(lambda: any(e.kind == live.SessionEventKind.CONNECTION and e.result == live.Result.UNAVAILABLE
+                                     for e in a_events))
+        lost = next(e for e in a_events if e.kind == live.SessionEventKind.CONNECTION and e.result != live.Result.OK)
+        self.assertEqual((lost.merge_owner_supported, lost.merge_owner_held), (True, False))
+        self.assertFalse(a.merge_owner.held)
+        self.assertEqual((await a.request_merge_owner_async(live.MergeOwnerAction.VERIFY))[0], live.Result.UNAVAILABLE)
+        await rejoin.reached.wait()
+        result, state = await b.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome, state.epoch), (live.Result.OK, live.MergeOwnerOutcome.GRANTED, 2))
+        rejoin.release.set()
+        current = await self.connected(a_events, 2)
+        self.assertNotEqual(current.connection_id, old.connection_id)
+        # The rejoined connection claims again on its own, and learns that the watcher holds the lease.
+        await self.until(lambda: (live.MergeOwnerOutcome.HELD_BY_OTHER, state.owner_connection_id, 2, False)
+                         in self.owner_events(a_events))
+        self.assertEqual([(e["connection"], e["outcome"]) for e in self.state.merge_owner_log
+                          if e["connection"] == current.connection_id and e["request_id"]],
+                         [(current.connection_id, "MERGE_OWNER_OUTCOME_HELD_BY_OTHER")])
+        # VERIFY after the handoff answers the old holder NOT_HELD.
+        result, verified = await a.request_merge_owner_async(live.MergeOwnerAction.VERIFY)
+        self.assertEqual((result, verified.outcome, verified.held), (live.Result.OK, live.MergeOwnerOutcome.NOT_HELD,
+                                                                      False))
+        self.assertEqual(a.merge_owner, live.MergeOwner(True, False, True, 2))
+        self.state.assert_faults_fired()
+
+    async def test_merge_owner_reconnect_drops_ownership_and_reclaims_on_the_new_connection(self):
+        self.state.merge_owner = True
+        a, a_events, old = await self.owner_join("rotating")
+        result, state = await a.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.epoch, state.held), (live.Result.OK, 1, True))
+        async with self.state.changed:
+            peer = self.state.sessions[self.created.session_id].peers[old.connection_id]
+            peer.close_code = grpc.StatusCode.UNAVAILABLE
+            peer.ready.set()
+        current = await self.connected(a_events, 2)
+        self.assertNotEqual(current.connection_id, old.connection_id)
+        await self.until(lambda: (live.MergeOwnerOutcome.GRANTED, current.connection_id, 2, True)
+                         in self.owner_events(a_events))
+        self.assertEqual(a.merge_owner, live.MergeOwner(True, True, True, 2))
+        # A RELEASE ends the intent: the next connection does not claim again.
+        result, released = await a.request_merge_owner_async(live.MergeOwnerAction.RELEASE)
+        self.assertEqual((result, released.outcome), (live.Result.OK, live.MergeOwnerOutcome.RELEASED))
+        async with self.state.changed:
+            peer = self.state.sessions[self.created.session_id].peers[current.connection_id]
+            peer.close_code = grpc.StatusCode.UNAVAILABLE
+            peer.ready.set()
+        third = await self.connected(a_events, 3)
+        self.assertEqual(await a.request_merge_owner_async(live.MergeOwnerAction.VERIFY),
+                         (live.Result.OK, live.MergeOwnerState(live.MergeOwnerOutcome.NOT_HELD, None, None, 2, True,
+                                                                False)))
+        self.assertEqual([e["request_id"] != 0 for e in self.state.merge_owner_log
+                          if e["connection"] == third.connection_id], [True])
+
+    async def test_merge_owner_refuses_a_non_creator_and_an_expired_credential_without_revoking_the_lease(self):
+        self.state.merge_owner = True
+        self.state.tokens["synthetic-other"] = Principal("other")
+        self.state.sessions[self.created.session_id].writers.add("other")
+        holder, _, _ = await self.owner_join("holder")
+        # A second authority on the same service state carries the other principal's bearer.
+        other = ReferenceServer(self.state, "python-other", service_factory=RecordedService)
+        self.extra_servers.append(other)
+        address = await other.start()
+        self.runtime.register_endpoint(address, access_token="synthetic-other")
+        stranger, _, _ = await self.owner_join("stranger", uri=live.make_session_uri(address, self.created.session_id))
+        result, state = await stranger.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome, state.owner_connection_id), (live.Result.OK,
+                                                                             live.MergeOwnerOutcome.NOT_ELIGIBLE, None))
+        result, state = await holder.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome), (live.Result.OK, live.MergeOwnerOutcome.GRANTED))
+        # Another join of the holder's principal, on a third authority with its own bearer, whose credential then
+        # expires: its claim is refused UNAUTHENTICATED and the lease holds.
+        self.state.issue("synthetic-late", "writer")
+        late_server = ReferenceServer(self.state, "python-late", service_factory=RecordedService)
+        self.extra_servers.append(late_server)
+        late_address = await late_server.start()
+        self.runtime.register_endpoint(late_address, access_token="synthetic-late")
+        late, _, _ = await self.owner_join("late", uri=live.make_session_uri(late_address, self.created.session_id))
+        self.state.tokens["synthetic-late"] = replace(self.state.tokens["synthetic-late"], expires_us=1)
+        result, refused = await late.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, refused.outcome, refused.owner_connection_id),
+                         (live.Result.OK, live.MergeOwnerOutcome.UNAUTHENTICATED, state.owner_connection_id))
+        self.assertEqual((await holder.request_merge_owner_async(live.MergeOwnerAction.VERIFY))[1].outcome,
+                         live.MergeOwnerOutcome.GRANTED)
+        self.assertTrue(holder.merge_owner.held)
+        self.assertEqual(await asyncio.to_thread(late.leave, 3000), live.Result.OK)
+
+    async def test_merge_owner_claims_again_when_its_earlier_connection_leaves_presence_after_a_reconnect(self):
+        # A half-open reconnect: the service still lists the join's earlier connection, so the new connection's
+        # claim finds it holding; once the service drops it, the release that follows is claimed at once.
+        self.state.merge_owner = True
+        a, a_events, old = await self.owner_join("half-open")
+        result, state = await a.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome, state.epoch), (live.Result.OK, live.MergeOwnerOutcome.GRANTED, 1))
+        async with self.state.changed:
+            self.state.merge_owner_linger.add(old.connection_id)
+            peer = self.state.sessions[self.created.session_id].peers[old.connection_id]
+            peer.close_code = grpc.StatusCode.UNAVAILABLE
+            peer.ready.set()
+        current = await self.connected(a_events, 2)
+        await self.until(lambda: (live.MergeOwnerOutcome.HELD_BY_OTHER, old.connection_id, 1, False)
+                         in self.owner_events(a_events))
+        self.assertIn(old.connection_id, self.state.sessions[self.created.session_id].peers)
+        self.assertEqual(a.merge_owner, live.MergeOwner(True, False, True, 1))
+        async with self.state.changed:
+            self.assertTrue(self.state.evict(old.connection_id))
+        await self.until(lambda: (live.MergeOwnerOutcome.GRANTED, current.connection_id, 2, True)
+                         in self.owner_events(a_events))
+        self.assertEqual(a.merge_owner, live.MergeOwner(True, True, True, 2))
+        self.assertEqual([(e["request_id"], e["action"]) for e in self.state.merge_owner_requests
+                          if e["connection"] == current.connection_id],
+                         [(2, "MERGE_OWNER_ACTION_CLAIM"), (3, "MERGE_OWNER_ACTION_CLAIM")])
+
+    async def test_merge_owner_request_in_flight_settles_unavailable_on_its_connections_end_and_is_not_resent(self):
+        self.state.merge_owner = True
+        a, a_events, old = await self.owner_join("pending")
+        self.state.merge_owner_hold = True
+        pending = a.request_merge_owner_async(live.MergeOwnerAction.VERIFY)
+        await self.until(lambda: len(self.state.merge_owner_requests) == 1)
+        self.assertFalse(pending.done())
+        async with self.state.changed:
+            peer = self.state.sessions[self.created.session_id].peers[old.connection_id]
+            peer.close_code = grpc.StatusCode.UNAVAILABLE
+            peer.ready.set()
+        self.assertEqual(await pending, (live.Result.UNAVAILABLE, None))
+        current = await self.connected(a_events, 2)
+        self.state.merge_owner_hold = False
+        result, verified = await a.request_merge_owner_async(live.MergeOwnerAction.VERIFY)
+        self.assertEqual((result, verified.outcome), (live.Result.OK, live.MergeOwnerOutcome.NOT_HELD))
+        # The new connection carried only the later request: the pending one was not sent again.
+        self.assertEqual([(e["connection"], e["request_id"]) for e in self.state.merge_owner_requests],
+                         [(old.connection_id, 1), (current.connection_id, 2)])
+
+    async def test_merge_owner_request_in_flight_settles_cancelled_on_leave(self):
+        self.state.merge_owner = True
+        a, _, _ = await self.owner_join("leaving")
+        self.state.merge_owner_hold = True
+        pending = a.request_merge_owner_async(live.MergeOwnerAction.VERIFY)
+        await self.until(lambda: len(self.state.merge_owner_requests) == 1)
+        self.assertFalse(pending.done())
+        self.assertEqual(await asyncio.to_thread(a.leave, 3000), live.Result.OK)
+        self.assertEqual(await pending, (live.Result.CANCELLED, None))
+
+    async def test_merge_owner_view_survives_into_the_terminal_delivery_failure_event(self):
+        self.state.merge_owner = True
+        entered, release = threading.Event(), threading.Event()
+        self.release_events.append(release)
+        events = []
+        def held(event):
+            events.append(event)
+            if len(events) == 1:
+                entered.set()
+                release.wait()
+        session = self.runtime.join_session(self.created.uri, "overflowing", held, max_events=1, max_bytes=4096,
+                                            merge_owner=True)
+        self.assertTrue(await asyncio.to_thread(entered.wait, 3))
+        identifier = events[0].connection_id
+        async with self.state.changed:
+            peer = self.state.sessions[self.created.session_id].peers[identifier]
+            LiveService.emit_to(peer, pb.JoinSessionResponse(merge_owner=pb.MergeOwnerState(
+                outcome=pb.MERGE_OWNER_OUTCOME_HELD_BY_OTHER, owner_connection_id="synthetic-holder",
+                owner_user_name="writer", epoch=3)))
+            LiveService.emit_to(peer, pb.JoinSessionResponse(peer_joined=pb.PeerJoined(
+                connection_id="synthetic-peer", user_name="", user_application="")))
+        await self.until(lambda: session.delivery_status == live.Result.RESOURCE_EXHAUSTED)
+        release.set()
+        await self.until(lambda: any(e.result == live.Result.RESOURCE_EXHAUSTED for e in events))
+        self.assertEqual([e.kind for e in events], [live.SessionEventKind.CONNECTION,
+                                                   live.SessionEventKind.MERGE_OWNER,
+                                                   live.SessionEventKind.CONNECTION])
+        terminal = events[-1]
+        self.assertEqual((terminal.merge_owner_supported, terminal.merge_owner_held, terminal.merge_owner_epoch),
+                         (True, False, 3))
+        self.assertEqual(await asyncio.to_thread(session.leave, 3000), live.Result.OK)
+
+    async def test_merge_owner_fails_open_on_a_service_without_it_and_sends_nothing(self):
+        self.assertFalse(self.state.merge_owner)
+        a, a_events, connected = await self.owner_join("asking")
+        self.assertFalse(connected.merge_owner_supported)
+        self.assertEqual(a.merge_owner, live.MergeOwner(False, False, False, 0))
+        self.assertEqual(await a.request_merge_owner_async(live.MergeOwnerAction.CLAIM), (live.Result.UNSUPPORTED, None))
+        self.assertEqual(await asyncio.to_thread(a.request_merge_owner, live.MergeOwnerAction.VERIFY),
+                         (live.Result.UNSUPPORTED, None))
+        self.assertEqual([(j["merge_owner_requested"], j["merge_owner"]) for j in self.state.joins], [(True, False)])
+        self.assertEqual(self.state.merge_owner_log, [])
+        self.assertEqual([e["kind"] for e in self.state.session_wire], ["header"])
+        self.assertEqual(live.get_session_status(a).state, live.State.READY)
+
+    async def test_merge_owner_frames_reach_only_joins_that_opt_in(self):
+        self.state.merge_owner = True
+        plain, plain_events, plain_connected = await self.owner_join("plain", merge_owner=False)
+        self.assertFalse(plain_connected.merge_owner_supported)
+        self.assertEqual(await plain.request_merge_owner_async(live.MergeOwnerAction.CLAIM), (live.Result.UNSUPPORTED, None))
+        opted, opted_events, _ = await self.owner_join("opted")
+        result, state = await opted.request_merge_owner_async(live.MergeOwnerAction.CLAIM)
+        self.assertEqual((result, state.outcome), (live.Result.OK, live.MergeOwnerOutcome.GRANTED))
+        self.assertEqual(await opted.send_message_async(b"after the grant"), live.Result.OK)
+        await self.until(lambda: any(e.kind == live.SessionEventKind.MESSAGE for e in plain_events))
+        self.assertEqual(self.owner_events(plain_events), [])
+        self.assertEqual([(j["merge_owner_requested"], j["merge_owner"]) for j in self.state.joins],
+                         [(False, False), (True, True)])
+        # An arm 5 frame the join never negotiated is a protocol violation that fails it MALFORMED_STREAM, while
+        # an opted-in join accepts the same frame.
+        frame = pb.JoinSessionResponse(merge_owner=pb.MergeOwnerState(
+            outcome=pb.MERGE_OWNER_OUTCOME_HELD_BY_OTHER, owner_connection_id=state.owner_connection_id,
+            owner_user_name="writer", epoch=1))
+        async with self.state.changed:
+            for peer in self.state.sessions[self.created.session_id].peers.values():
+                LiveService.emit_to(peer, frame)
+        await self.until(lambda: any(e.kind == live.SessionEventKind.CONNECTION and
+                                     e.result == live.Result.MALFORMED_STREAM for e in plain_events))
+        self.assertEqual(live.get_session_status(plain).state, live.State.FAILED)
+        await self.until(lambda: len(self.owner_events(opted_events)) == 2)
+        self.assertEqual(live.get_session_status(opted).state, live.State.READY)
+        self.assertEqual(await asyncio.to_thread(plain.leave, 3000), live.Result.OK)
 
     async def test_held_callback_leave_timeout_other_work_and_retry(self):
         entered, release, exited = threading.Event(), threading.Event(), threading.Event()
@@ -312,8 +595,12 @@ class PythonSessionTests(unittest.IsolatedAsyncioTestCase):
         identifier = event["connection_id"]
         del native
         gc.collect()
-        self.assertEqual(await asyncio.to_thread(self.runtime._native.cleanup, 3000), live.Result.OK)
+        # The executor thread that ran next_event can still hold the session until it drops its work item, so the
+        # abandonment can follow gc.collect(). The service sees the peer leave only after the orphan's stream ends,
+        # which follows its abandonment; the drain after that waits for the orphan's reap to finish, so the runtime
+        # closes with no session left.
         await self.until(lambda: identifier not in self.state.sessions[self.created.session_id].peers)
+        self.assertEqual(await asyncio.to_thread(self.runtime._native.cleanup, 3000), live.Result.OK)
 
     async def test_python_event_materialization_failure_is_terminal(self):
         events, callback = self.observer()

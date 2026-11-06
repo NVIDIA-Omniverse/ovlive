@@ -3550,7 +3550,7 @@ impl ClusterObserver {
 /// is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_session_cluster_peer_message_never_precedes_its_join_or_follows_its_leave() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -3667,7 +3667,7 @@ async fn publish_calls_on(tv: &TestValkey, node: &fred::types::config::Server) -
 /// is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn publish_presence_event_on_a_cluster_is_sent_from_the_sid_node_not_the_channel_node() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -4935,7 +4935,7 @@ async fn rejoin_and_teardown_are_announced_in_script_order() {
 /// is unset.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejoin_and_teardown_on_a_cluster_are_announced_in_script_order_on_another_node() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

@@ -16,8 +16,9 @@
 -- gc_leader_acquire.lua — acquire, refresh or take over the protocol-marked
 -- GC leader lock `le:gc:leader` (b.1jt).
 --
--- `le:gc:leader` is the one lease the GC sweep, the orphan sweep and the
--- reference-count reconciler share. This build writes a MARKED value,
+-- `le:gc:leader` is the one lease the GC sweep, the orphan sweep, the
+-- reference-count reconciler, the external-value backup repair and the
+-- checkpoint clean-up (`checkpoint::cleanup`) share. This build writes a MARKED value,
 -- `le-gc/<v>|<service_label>:<instance>` (`LeaderIdentity::gc_lock_value`);
 -- every build before the marker (0.1.0 through 0.2.0-rc.48) writes a bare
 -- value and runs a GC that acts on this build's state in shapes this build no
@@ -36,7 +37,8 @@
 -- ticker that runs beside its GC loop independent of any pass, stops with
 -- the loop, and pauses while the loop has made no progress for
 -- `GC_PROGRESS_STALL_AFTER` (20 s; `spawn_gc_task`), and again before each
--- GC, orphan-sweep, reconciler and backup-repair pass. So the leader refreshes the key
+-- GC, orphan-sweep, reconciler, backup-repair and checkpoint clean-up pass. So
+-- the leader refreshes the key
 -- mid-pass, however long a progressing pass runs, and a non-leader takes a
 -- same-version peer's lock over once its TTL is at or below
 -- `takeover_below_ms` (a third of the TTL: the holder has missed refreshes
@@ -57,8 +59,10 @@
 -- never a double decrement.
 --
 -- Two marked leaders can briefly overlap after an expiring takeover (a holder
--- whose refreshes were only stalled); every GC, orphan-sweep, reconciler and
--- backup-repair step is safe under two leaders by construction, so the lock only sheds load
+-- whose refreshes were only stalled); every GC, orphan-sweep, reconciler,
+-- backup-repair and checkpoint clean-up step is safe under two leaders by
+-- construction (the clean-up's deletes are each licensed by their own
+-- `{recon}` script), so the lock only sheds load
 -- between marked builds. A higher version is never taken over while it has a
 -- TTL, so this build does not lead across a newer GC protocol while the newer
 -- holder keeps refreshing; a newer holder that stops refreshing — every newer

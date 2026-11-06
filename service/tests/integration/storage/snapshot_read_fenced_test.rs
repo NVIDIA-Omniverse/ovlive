@@ -33,6 +33,7 @@
 //! | The proof | a pass that read another header `seq` is broken even when the release verifies; a header moved after the pass makes the release answer `BROKEN`; both retry and serve the next attempt's state |
 //! | Restore / cleanup under the read | a restore wipe the pass missed (release `BROKEN`) and a header the pass missed but the release found (`VERIFIED`) are broken reads, retried; a `DeleteLayer` under the read, and a header removed after a complete pass, are `NotFound` after one attempt; a failed release ends the read with the release's classified error, whether the pass found no header or completed (its state never served) |
 //! | Attempts | three broken reads are `Unavailable`, never an unverified state |
+//! | A round-1 index short of its count (b.o2i) | a proxy leaves one member out of a pass's round-1 page (`obj:secs`, `obj:dels` by `SSCAN`; `obj:flds` by `ZRANGE`): the pass ends after round 1 with one progress report and no round-2 command, its attempt is broken (`measured: None`) and retried, the retry is served equal to the atomic read, and a `VERIFIED` release with the pass at the cut logs one WARN naming the key and counts and ticks `live_edit_snapshot_read_index_incomplete_total` once; short on every attempt is `Unavailable` after three, one tick and WARN each; repeated members are no shortfall; a short pass a writer also broke (release `BROKEN`, or the pass at another `seq`) is retried with no WARN or tick, one whose release finds no header is `NotFound`, and one whose release fails ends with the release's error after one attempt (no WARN, no tick) |
 //! | The hook | the event order across a broken attempt and its retry, with the sizes each event carries; each `after_release`'s outcome — `Verified` exactly once, on the attempt whose snapshot is served, `Broken` on every retried attempt (one whose release answered `VERIFIED` included), `Ended` on a read's erroring last attempt; `before_attempt` and `on_retry_after` errors end the read as they are; `CappedFenceWait` sleeps a short `RETRY_AFTER`, refuses one past `reader_wait_max(L)`, and (on tokio's paused clock) refuses the attempt after a broken read once past the cap for that attempt's size; a read inside a live epoch's join window joins it |
 //! | Metrics | `live_edit_snapshot_read_total{path="fenced"}` per attempt (`fence_broken`, `ok`, `not_found`), the duration and size histograms, `live_edit_snapshot_fence_hold_seconds` and `live_edit_snapshot_fence_reader_wait_seconds` once per attempt, `live_edit_snapshot_fence_acquire_total{result}` per acquire reply |
 //! | Cancellation | dropping the read in its hook's `on_grant` or `before_release`, at its acquire or at its release leaves no live lease: a held lease is released in the background (its field gone, the epoch closed), a lease whose grant the read never saw lapses |
@@ -57,22 +58,30 @@
 //! pass — a window held past the lease, a lease lapsing — it compares
 //! deadlines the fence key stores with the store's own clock (a script reading
 //! `TIME` as the fence scripts do), never a wall-clock duration. The real
-//! waits are the read's own: a lease (~2 s at the test client's ceiling) where
-//! a test makes one lapse, the writer's fence sleep (~1 s), the gaps the
-//! fence scripts impose between epochs (the epoch's own length), two renewal
-//! periods (~1 s) where a test checks that no renewal follows, three where a
-//! test waits for the renewal after two failed ones, and the slow-window
-//! test's window, 1.5 of the ~8 s lease its estimate is given (~12 s). The
-//! `CappedFenceWait` cap test needs ~29 s to pass and takes it on tokio's
-//! paused clock, not the wall clock.
+//! waits are the read's own: a production lease (~2.0 s at the test client's
+//! ceiling) where a test makes one lapse, the writer's fence sleep (~1 s), the
+//! gaps the fence scripts impose between epochs (the epoch's own length), two
+//! renewal periods of the rule-(c) lease (~4 s) where the mid-window
+//! cancellation test checks that no renewal follows, two production periods
+//! (~1 s) where a test with a lost lease does, up to three rule-(c) periods
+//! (~6 s) where a test waits for the renewal after two failed ones, the first
+//! rule-(c) renewal (~2 s) where a test cancels during it, and the
+//! slow-window test's window, 1.5 of the ~8 s lease its estimate is given
+//! (~12 s). The `CappedFenceWait` cap test needs ~29 s to pass and takes it
+//! on tokio's paused clock, not the wall clock.
 //!
 //! A renewal is a store round trip, and on a loaded store it can land late —
-//! up to the client's 5 s command timeout. So the slow-window test, whose
-//! subject is renewals keeping a lease live, gives its lease a `0.75·lease`
-//! margin over that timeout; the failed-renewals test, whose subject is the
-//! timer calling again, stages its lease's deadline far ahead, out of the
-//! picture; and the mid-window cancellation test opens its absence window
-//! only once every connection a renewal could be queued on has drained.
+//! up to the client's 5 s command timeout. So every test that holds a
+//! window open while its lease must stay live — the slow window, the commit
+//! that waits, the mid-window and mid-renewal cancellations, the failed
+//! renewals — brings [`SLOW_WINDOW_ESTIMATE`], whose lease gives each renewal
+//! a `0.75·lease` margin over that timeout (test-writing-guide rule (c);
+//! asserted by [`assert_rule_c_lease`]): the hook here takes no capacity, so
+//! the estimate sizes nothing but the fresh fence key's limits. The
+//! failed-renewals test, whose subject is the timer calling again, also
+//! stages its lease's deadline far ahead, out of the picture; and the
+//! mid-window cancellation test opens its absence window only once every
+//! connection a renewal could be queued on has drained.
 //!
 //! # Hang budget
 //!
@@ -93,14 +102,14 @@
 //! | equality after commits (marked, unmarked) | 6 reads | 180 s | 90 s |
 //! | one-command, one-byte windows; not-found at acquire | 2 reads | 60 s | 60 s |
 //! | indices in several pages | tap + 1 read + 1 drain | 70 s | 70 s |
-//! | every other equality test, corrupt index, the proof, restore / cleanup (the failed releases included), attempts, hook order and errors, `CappedFenceWait` through a read, joined epoch, metrics | 1 read | 30 s | 30 s |
+//! | every other equality test, corrupt index, the proof, restore / cleanup (the failed releases included), attempts, hook order and errors, `CappedFenceWait` through a read, joined epoch, metrics, a round-1 index short of its count | 1 read | 30 s | 30 s |
 //! | `CappedFenceWait` on the paused clock | none (~29 s of virtual time) | 0 s | 0 s |
 //! | commits wait | tap + 1 read (one drain inside it) + 1 call | 70 s | 70 s |
 //! | cancel in `on_grant` / `before_release` | 1 signal + 1 join + 1 release poll | 30 s | 30 s |
 //! | cancel at acquire | warm-up read + tap + 1 drain + 1 join + 1 lapse poll | 95 s | 90 s |
 //! | cancel at release | warm-up read + tap + 1 signal + 1 drain + 1 join + 1 release poll | 100 s | 90 s |
 //! | seams: slow window, stalled renewals, `LOST`, failed renewals, `LOST` during a hook event (their lapse polls, renewal polls and renewal periods nested in the read) | 1 read | 30 s | 30 s |
-//! | seams: cancel mid-window | warm-up read + 2 taps + 2 drains + 1 join + 1 release poll + two renewal periods (~1 s) | 131 s | 90 s |
+//! | seams: cancel mid-window | warm-up read + 2 taps + 2 drains + 1 join + 1 release poll + two renewal periods (~4 s) | 134 s | 90 s |
 //! | seams: cancel during a renewal | warm-up read + tap + 1 drain + 1 join + 1 release poll | 90 s | 90 s |
 //! | seams: `next_read()` error; failed fan-out with a release that found no header | 1 read | 30 s | 30 s |
 //!
@@ -108,10 +117,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use fred::interfaces::{HashesInterface, KeysInterface, ListInterface, SetsInterface};
+use fred::interfaces::{
+    ClientLike, HashesInterface, KeysInterface, ListInterface, SetsInterface, SortedSetsInterface,
+};
 use fred::types::scripts::Script;
 use futures::future::BoxFuture;
 
@@ -128,21 +140,23 @@ use live_edit::storage::snapshot_fence::read::{
     FenceReleased, FenceRetry, FencedReadHook,
 };
 use live_edit::storage::snapshot_fence::{
-    self as fence, AcquireVerdict, GrantKind, LayerSize, ReleaseVerdict, RetryReason,
-    FENCE_READ_ATTEMPTS,
+    self as fence, ms_to_duration, AcquireVerdict, GrantKind, LayerSize, ReleaseVerdict,
+    RetryReason, FENCE_READ_ATTEMPTS,
 };
 use live_edit::storage::test_support::relay::RelayedUpdates;
 use live_edit::storage::test_support::TestValkey;
 
 use crate::common::owned_delta::delta_with_set_field_inline;
+use crate::grpc::log_capture::{assert_field, capture};
 use crate::storage::snapshot_read_atomic_test::{
-    commit, create, create_cmd, create_session, every_shape_state, indexed_parents, layer_store,
-    mock_ext_store, structural, unmark, CUBE, ROOT, SIBLING, WORLD,
+    commit, create, create_cmd, create_session, delete_cmd, every_shape_state, indexed_parents,
+    layer_store, mock_ext_store, structural, unmark, CUBE, ROOT, SIBLING, WORLD,
 };
 use crate::storage::snapshot_read_support::{
-    client_through, client_with_limits, error_reply_script, monitor_fence, read_atomic,
-    read_too_large, test_valkey_addr, view, MonitorTap, MonitoredCommand, ProxyAction, ProxyRule,
-    ScriptReplyProxy,
+    assert_index_shortfall_warning, client_through, client_with_limits, error_reply_script,
+    index_incomplete, index_shortfall_warnings, monitor_fence, read_atomic, read_too_large,
+    test_valkey_addr, view, IndexPage, IndexPageFault, MonitorTap, MonitoredCommand, PageMembers,
+    ProxyAction, ProxyRule, ScriptReplyProxy,
 };
 use crate::storage::snapshot_read_unfenced_test::{
     add_paged_bulk, assert_round_one_windows_within_the_bound, commit_steps, index_pages,
@@ -172,7 +186,8 @@ const CALL_BUDGET: Duration = Duration::from_secs(20);
 /// signal arriving. One script call each; unreachable on a healthy store.
 const SIGNAL_BUDGET: Duration = Duration::from_secs(10);
 
-/// Bound on a lease nobody releases lapsing: one lease (~2.2 s) plus slack.
+/// Bound on a production lease nobody releases lapsing: one lease (~2.0 s at
+/// the reading client's ceiling) plus slack. Never waited on for a [`SLOW_WINDOW_ESTIMATE`] lease (~8 s).
 const LAPSE_BUDGET: Duration = Duration::from_secs(15);
 
 /// The one deadline over a whole test. See the module's hang budget.
@@ -189,6 +204,59 @@ const PROXIED_ESTIMATE: LayerSize = LayerSize {
     items: 1_000,
     bytes: 12_000,
 };
+
+/// The per-command timeout `client`'s data pool runs with (fred's
+/// `PerformanceConfig::default_command_timeout`, set from
+/// `valkey_command_timeout_ms` at connect): the longest one renewal on that
+/// client can take to reach the store and answer.
+fn command_timeout(client: &ValkeyClient) -> Duration {
+    client.pool.next().perf_config().default_command_timeout
+}
+
+/// An estimate whose `lease(L)` on the reading client (about 8.1 s, its
+/// `hold(L)/4`) gives a renewal sent at `lease/4` `0.75·lease` (about 6 s)
+/// to land before the deadline it extends: more than the reader's
+/// [`command_timeout`] (5 s on the fixture) — test-writing-guide rule (c).
+/// Far larger than the object: a fresh object's grant, and so its lease, is
+/// sized from the estimate (the hook here takes no capacity, so nothing else
+/// is), while the fan-out reads the object as it is. Every test whose window
+/// is held open while its lease's liveness matters — the slow window, the
+/// commit that waits, the mid-window and mid-renewal cancellations, the
+/// failed renewals — brings it, and asserts [`assert_rule_c_lease`] first.
+const SLOW_WINDOW_ESTIMATE: LayerSize = LayerSize {
+    items: 8_500_000,
+    bytes: 102_000_000,
+};
+
+/// `lease(L)` at `size`, from the reading client's coefficients.
+fn lease(rx: &Rx, size: LayerSize) -> Duration {
+    ms_to_duration(fence::coefficients(&rx.reader).timing(size).lease_ms)
+}
+
+/// The lease renewal period at `size`, `lease(L)/4`, from the reading
+/// client's coefficients.
+#[cfg(feature = "test-fault-injection")]
+fn renew_period(rx: &Rx, size: LayerSize) -> Duration {
+    ms_to_duration(
+        fence::coefficients(&rx.reader)
+            .timing(size)
+            .renew_interval_ms(),
+    )
+}
+
+/// Fixture precondition, rule (c): a renewal sent at `lease/4` on the reading
+/// client has more than that client's command timeout to land before the
+/// deadline it extends, so the lease is lost only if the timer stops, never
+/// because a loaded store answered a renewal late.
+fn assert_rule_c_lease(rx: &Rx, estimate: LayerSize) {
+    let lease = lease(rx, estimate);
+    let command_timeout = command_timeout(&rx.reader);
+    assert!(
+        lease.mul_f64(0.75) > command_timeout,
+        "fixture precondition: a renewal sent at lease/4 has more than the reader's command \
+         timeout ({command_timeout:?}) to land before the deadline it extends (lease {lease:?})"
+    );
+}
 
 /// Run a test's body under [`TEST_BUDGET`], boxed so the body's future lives
 /// on the heap rather than in the test thread's stack frame.
@@ -299,11 +367,15 @@ fn no_reaction() -> Reaction {
 
 /// A [`FencedReadHook`] that logs every event, runs its [`Reaction`] on it,
 /// and on `RETRY_AFTER` sleeps the hint (as `CappedFenceWait` does, with no
-/// cap). It holds no capacity.
+/// cap). It holds no capacity. Its progress reports
+/// (`on_read_progress`, synchronous and not an event of the [`EventLog`]) are
+/// recorded apart, with the attempt each came in ([`TestHook::progress`]).
 struct TestHook {
     log: EventLog,
     attempt: u32,
     react: Reaction,
+    /// Every `on_read_progress` call: its attempt and the bytes it reported.
+    progress: Vec<(u32, u64)>,
 }
 
 impl TestHook {
@@ -314,9 +386,19 @@ impl TestHook {
                 log: Arc::clone(&log),
                 attempt: 0,
                 react,
+                progress: Vec::new(),
             },
             log,
         )
+    }
+
+    /// The bytes each progress report of `attempt` carried, in order.
+    fn progress(&self, attempt: u32) -> Vec<u64> {
+        self.progress
+            .iter()
+            .filter(|(a, _)| *a == attempt)
+            .map(|(_, bytes)| *bytes)
+            .collect()
     }
 
     async fn event(&mut self, event: HookEvent) -> Result<(), ServiceError> {
@@ -343,6 +425,10 @@ impl FencedReadHook for TestHook {
         self.event(HookEvent::Grant(grant))
             .await
             .expect("an on_grant reaction must not fail");
+    }
+
+    fn on_read_progress(&mut self, bytes_read: u64) {
+        self.progress.push((self.attempt, bytes_read));
     }
 
     async fn before_release(&mut self) {
@@ -1305,6 +1391,11 @@ fn fence_waits(rx: &Rx) -> u64 {
 /// One fast-path commit lands before the tap starts, so the fast-path script
 /// is loaded and the `EVALSHA` the tap waits for is the writer's real attempt,
 /// not a `NOSCRIPT` miss that never read the fence.
+///
+/// The read holds its window open in `on_grant` until the tap has seen the
+/// writer's attempt, so the lease's liveness is under test: the read brings
+/// [`SLOW_WINDOW_ESTIMATE`] (rule (c)), so a renewal landing late on a loaded
+/// store cannot lapse the lease and let the writer commit under the read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commit_during_a_fenced_read_waits_and_is_excluded_from_the_read_at_the_grants_seq() {
     within_test_budget(async {
@@ -1323,7 +1414,8 @@ async fn commit_during_a_fenced_read_waits_and_is_excluded_from_the_read_at_the_
             0,
             "fixture precondition: the warm-up commit met no fence"
         );
-        let estimate = rx.estimate().await;
+        let estimate = SLOW_WINDOW_ESTIMATE;
+        assert_rule_c_lease(&rx, estimate);
         let before = rx.atomic().await;
         let seq_before = rx.seq().await;
         let tap = Arc::new(tokio::sync::Mutex::new(
@@ -1403,6 +1495,11 @@ async fn commit_during_a_fenced_read_waits_and_is_excluded_from_the_read_at_the_
              before the release"
         );
         assert_eq!(names_without_retries(&log), held_attempts(1));
+        assert_eq!(
+            grants(&log)[0].size,
+            estimate,
+            "fixture precondition: the grant's lease is sized from the estimate"
+        );
         assert_eq!(
             (grants(&log)[0].cut, fenced.cut),
             (seq_before, seq_before),
@@ -2572,39 +2669,11 @@ mod seams {
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    use crate::storage::snapshot_read_support::{monitor_fence, ScriptCalls};
     use fred::error::{Error as FredError, ErrorKind as FredErrorKind};
-    use fred::interfaces::ClientLike;
     use live_edit::storage::diff_read::{
         ObjectSnapshotReadFaultInjector, ObjectSnapshotReadFaultTarget, ObjectSnapshotReader,
     };
-    use live_edit::storage::snapshot_fence::ms_to_duration;
-
-    use crate::storage::snapshot_read_support::monitor_fence;
-
-    /// The per-command timeout `client`'s data pool runs with (fred's
-    /// `PerformanceConfig::default_command_timeout`, set from
-    /// `valkey_command_timeout_ms` at connect): the longest one renewal on
-    /// that client can take to reach the store and answer.
-    fn command_timeout(client: &ValkeyClient) -> Duration {
-        client.pool.next().perf_config().default_command_timeout
-    }
-
-    /// An estimate whose `lease(L)` on the reading client (about 8.1 s, its
-    /// `hold(L)/4`) gives a renewal sent at `lease/4` `0.75·lease` (about
-    /// 6 s) to land before the deadline it extends: more than the reader's
-    /// [`command_timeout`] (5 s on the fixture).
-    /// Far larger than the object: a fresh object's grant, and so its lease,
-    /// is sized from the estimate, while the fan-out reads the object as it
-    /// is.
-    const SLOW_WINDOW_ESTIMATE: LayerSize = LayerSize {
-        items: 8_500_000,
-        bytes: 102_000_000,
-    };
-
-    /// `lease(L)` at `size`, from the reading client's coefficients.
-    fn lease(rx: &Rx, size: LayerSize) -> Duration {
-        ms_to_duration(fence::coefficients(&rx.reader).timing(size).lease_ms)
-    }
 
     fn injector(rx: &Rx) -> Arc<ObjectSnapshotReadFaultInjector> {
         let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
@@ -2613,27 +2682,42 @@ mod seams {
         injector
     }
 
+    /// Stages a held lease far ahead in one script call (`KEYS[1]` the fence
+    /// key, `ARGV[1]` [`FAR_MS`]): the one `r:*` field's deadline becomes the
+    /// store's clock plus `ARGV[1]`, and the key's expiry `ARGV[1]` (nothing
+    /// written unless the key holds exactly one reader field). Answers how
+    /// many reader fields it found.
+    static HOLD_THE_LEASE_SCRIPT: std::sync::LazyLock<Script> = std::sync::LazyLock::new(|| {
+        Script::from_lua(
+            "local fields = redis.call('HGETALL', KEYS[1]) \
+             local readers = {} \
+             for i = 1, #fields, 2 do \
+               if string.sub(fields[i], 1, 2) == 'r:' then readers[#readers + 1] = fields[i] end \
+             end \
+             if #readers ~= 1 then return #readers end \
+             local t = redis.call('TIME') \
+             local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) \
+             redis.call('HSET', KEYS[1], readers[1], tostring(now + tonumber(ARGV[1]))) \
+             redis.call('PEXPIRE', KEYS[1], ARGV[1]) \
+             return 1",
+        )
+    });
+
     /// Stage the one live reader field's deadline [`FAR_MS`] ahead of the
     /// store's clock, and the fence key's expiry with it: a lease that stays
     /// live whatever its renewals do (a renewal never moves a deadline back),
-    /// until it is released.
+    /// until it is released. One script call, so nothing the staging reads
+    /// can go stale before it writes.
     async fn hold_the_lease(stage: &Stage) {
-        let readers = readers_of(&key_fields(&stage.client, &stage.fence).await);
-        assert_eq!(readers.len(), 1, "one reader holds the fence: {readers:?}");
-        let field = readers.into_keys().next().expect("one reader field");
-        let far = store_now(&stage.client, &stage.fence).await + FAR_MS;
-        let _: () = stage
-            .client
-            .pool
-            .hset(&stage.fence, (field, far.to_string()))
+        let readers: i64 = HOLD_THE_LEASE_SCRIPT
+            .evalsha_with_reload(
+                stage.client.pool.next(),
+                vec![stage.fence.clone()],
+                vec![FAR_MS.to_string()],
+            )
             .await
             .expect("staging the lease deadline must succeed");
-        let _: i64 = stage
-            .client
-            .pool
-            .pexpire(&stage.fence, FAR_MS, None)
-            .await
-            .expect("staging the key expiry must succeed");
+        assert_eq!(readers, 1, "one reader holds the fence");
     }
 
     /// The one reader field's deadline, read on grant, and the store clock and
@@ -2860,12 +2944,18 @@ mod seams {
     /// the read — no renewal of this fence reaches the store afterwards, over
     /// two renewal periods watched only once every data-pool connection has
     /// drained what it held at the abort.
+    ///
+    /// The read brings [`SLOW_WINDOW_ESTIMATE`] (rule (c)): its renewals keep
+    /// the held window's lease live until the abort however late a loaded
+    /// store answers them, so no `LOST` can end the held attempt first and
+    /// let an unheld retry finish the read.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fenced_read_cancelled_mid_window_releases_its_lease_and_stops_renewing() {
         within_test_budget(async {
             let rx = Rx::new("srf-cancel-window").await;
             rx.warm_scripts().await;
-            let estimate = rx.estimate().await;
+            let estimate = SLOW_WINDOW_ESTIMATE;
+            assert_rule_c_lease(&rx, estimate);
             injector(&rx).push_delay_at(
                 ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 1),
                 Duration::from_secs(60),
@@ -2893,12 +2983,9 @@ mod seams {
                     .unwrap_or_else(|e| panic!("data-pool connection {i} must answer PING: {e}"));
             }
             // An absence check needs a window to be absent over: two renewal
-            // periods, after which a live timer would have renewed.
-            let period = ms_to_duration(
-                fence::coefficients(&rx.reader)
-                    .timing(estimate)
-                    .renew_interval_ms(),
-            );
+            // periods of the estimate's lease, after which a live timer
+            // would have renewed.
+            let period = renew_period(&rx, estimate);
             let mut quiet = MonitorTap::start(&test_valkey_addr()).await;
             tokio::time::sleep(period * 2).await;
             let marker = monitor_fence(rx.tv.prefix());
@@ -2917,13 +3004,17 @@ mod seams {
     }
 
     /// Cancelled while a renewal is in flight: the lease is released in the
-    /// background.
+    /// background. The renewal the abort lands in must find the lease live,
+    /// so the read brings [`SLOW_WINDOW_ESTIMATE`] (rule (c)): that first
+    /// renewal, sent at `lease/4`, has more than the command timeout to land
+    /// however loaded the store is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fenced_read_cancelled_during_a_renewal_releases_its_lease() {
         within_test_budget(async {
             let rx = Rx::new("srf-cancel-renew").await;
             rx.warm_scripts().await;
-            let estimate = rx.estimate().await;
+            let estimate = SLOW_WINDOW_ESTIMATE;
+            assert_rule_c_lease(&rx, estimate);
             injector(&rx).push_delay_at(
                 ObjectSnapshotReadFaultTarget::next_read(),
                 Duration::from_secs(60),
@@ -3048,26 +3139,20 @@ mod seams {
         .await;
     }
 
-    /// Load the renewal script on the store, so each renewal a proxy sees is
-    /// one `EVALSHA` — no `NOSCRIPT` miss and reload to count twice.
-    async fn load_renew_script(rx: &Rx) {
-        Script::from_lua(include_str!(
-            "../../../src/storage/scripts/snapshot_fence_renew.lua"
-        ))
-        .load(rx.tv.client().pool.next())
-        .await
-        .expect("SCRIPT LOAD of the renewal script must succeed");
-    }
-
     /// A renewal call that fails — an error, not a `LOST` answer — is retried
     /// at the next period, not taken as a lost lease. A proxy fails the read's
     /// first `FAILED_RENEWALS` renewals. The hook's `on_grant`, during which
     /// the renewal timer runs, first stages the granted lease's deadline far
-    /// ahead — so the lease's life is not what is under test, and no renewal
-    /// landing late on a loaded store can break the attempt — and then waits
-    /// for the proxy to see a renewal after the failed ones. A timer that took
-    /// a failure as a lost lease would have stopped, and that wait would end
-    /// unmet. The first attempt is served.
+    /// ahead in one script call — so the lease's life is not what is under
+    /// test, and no renewal landing late on a loaded store can break the
+    /// attempt — and then waits for the proxy to see a renewal after the
+    /// failed ones, at most `FAILED_RENEWALS + 1` periods with a command
+    /// timeout each. A timer that took a failure as a lost lease would have
+    /// stopped, and that wait would end unmet. The first attempt is served.
+    ///
+    /// The read brings [`SLOW_WINDOW_ESTIMATE`] (rule (c)), so the granted
+    /// lease is still live when the staging script runs, however late the
+    /// grant's own reply reached the hook.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fenced_read_retries_a_failed_renewal_at_the_next_period_instead_of_taking_the_lease_as_lost(
     ) {
@@ -3087,8 +3172,13 @@ mod seams {
             let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
             let tv = TestValkey::setup().await;
             let rx = Rx::with_reader(tv, client_through(&proxy).await, "srf-renew-fails").await;
-            load_renew_script(&rx).await;
-            let estimate = PROXIED_ESTIMATE;
+            let estimate = SLOW_WINDOW_ESTIMATE;
+            assert_rule_c_lease(&rx, estimate);
+            // The renewal after the failed ones: due FAILED_RENEWALS + 1
+            // periods after the grant, each renewal sent at most a command
+            // timeout late.
+            let renewal_bound = (renew_period(&rx, estimate) + command_timeout(&rx.reader))
+                * (FAILED_RENEWALS as u32 + 1);
             let renewed_after_failures = Arc::new(AtomicBool::new(false));
             let (stage, seen, renewed) = (
                 rx.stage(),
@@ -3107,7 +3197,7 @@ mod seams {
                             }
                         };
                         renewed.store(
-                            tokio::time::timeout(SIGNAL_BUDGET, next_renewal)
+                            tokio::time::timeout(renewal_bound, next_renewal)
                                 .await
                                 .is_ok(),
                             Ordering::SeqCst,
@@ -3122,7 +3212,7 @@ mod seams {
             assert!(
                 renewed_after_failures.load(Ordering::SeqCst),
                 "the timer must call again after its renewals failed: no renewal followed the \
-                 failed ones within {SIGNAL_BUDGET:?} (renewals seen: {}, failed: {})",
+                 failed ones within {renewal_bound:?} (renewals seen: {}, failed: {})",
                 renewals.load(Ordering::SeqCst),
                 proxy.hits()
             );
@@ -3149,27 +3239,24 @@ mod seams {
     ///
     /// Renewals start stalled. The hook, parked in `at`, waits for the lease
     /// to lapse on the store's clock, lets renewals resume, waits for the
-    /// next renewal to reach the store (counted at a proxy) — it answers
-    /// `LOST` — and stays parked two more renewal periods. No renewal follows,
-    /// so the timer has stopped: the read took the `LOST` while the hook was
-    /// parked. The hook then records that it finished. The attempt is broken
-    /// (the lapsed lease's release answers `BROKEN`; the pass did not run when
-    /// the `LOST` came during `on_grant`, and completed before
-    /// `before_release`), and the retry is served.
+    /// next renewal to reach the store (counted at a proxy, by calls: a
+    /// renewal answered `NOSCRIPT` and sent again after the reload is one) —
+    /// it answers `LOST` — and stays parked two more renewal periods. No
+    /// renewal follows, so the timer has stopped: the read took the `LOST`
+    /// while the hook was parked. The hook then records that it finished. The
+    /// attempt is broken (the lapsed lease's release answers `BROKEN`; the
+    /// pass did not run when the `LOST` came during `on_grant`, and completed
+    /// before `before_release`), and the retry is served.
     async fn lease_lost_during_a_hook_event(at: &'static str) {
-        let sha = renew_sha();
-        let renewals = Arc::new(AtomicUsize::new(0));
+        let renewals = Arc::new(ScriptCalls::new(renew_sha()));
         let counted = Arc::clone(&renewals);
         let rule: ProxyRule = Arc::new(move |args: &[Vec<u8>]| {
-            if is_evalsha_of(args, &sha) {
-                counted.fetch_add(1, Ordering::SeqCst);
-            }
+            counted.see(args);
             None
         });
         let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
         let tv = TestValkey::setup().await;
         let rx = Rx::with_reader(tv, client_through(&proxy).await, "srf-lost-in-hook").await;
-        load_renew_script(&rx).await;
         let estimate = PROXIED_ESTIMATE;
         let measured = rx.atomic().await.measured_size();
         let period = lease(&rx, estimate) / 4;
@@ -3208,10 +3295,10 @@ mod seams {
                     .unwrap_or_else(|_| {
                         panic!("{at}: the lease did not lapse in {LAPSE_BUDGET:?}")
                     });
-                let before = renewals.load(Ordering::SeqCst);
+                let before = renewals.calls();
                 seam.stall_fence_renewals(false);
                 let next_renewal = async {
-                    while renewals.load(Ordering::SeqCst) == before {
+                    while renewals.calls() == before {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 };
@@ -3223,7 +3310,7 @@ mod seams {
                 // An absence check needs a window to be absent over: two
                 // renewal periods, after which a live timer would have renewed.
                 tokio::time::sleep(period * 2).await;
-                *seen.lock().unwrap() = Some((before, renewals.load(Ordering::SeqCst)));
+                *seen.lock().unwrap() = Some((before, renewals.calls()));
                 done.store(true, Ordering::SeqCst);
                 Ok(())
             }
@@ -3267,4 +3354,618 @@ mod seams {
     async fn fenced_read_runs_before_release_to_its_end_when_the_lease_is_lost_during_it() {
         within_test_budget(lease_lost_during_a_hook_event("before_release")).await;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 11. A round-1 index short of its count (b.o2i; SDD §10.5)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The release proves that no writer changed the object, not that the pass
+// read all of it: an `SSCAN` cursor continued on another serving process can
+// skip members, which no fence sees. A proxy stands in for that store: it
+// rewrites the reader's round-1 page of one index into an `EVAL` that runs
+// the real command and leaves one member out (`IndexPageFault`). The pass
+// ends after round 1 on the shortfall, and its attempt is never served: it
+// is broken and retried. When its release proved that no writer changed the
+// object (`VERIFIED`, the pass at the cut) the attempt also logs one WARN and
+// ticks `live_edit_snapshot_read_index_incomplete_total` once; otherwise the
+// writer's cause stands and neither happens.
+
+/// An [`Rx`] whose reader connects through a proxy applying `members` to the
+/// first `pages` round-1 pages of one index, with what the proxy saw.
+struct ShortRx {
+    rx: Rx,
+    /// Kept alive for the reader's connections.
+    _proxy: ScriptReplyProxy,
+    /// The index key the proxy rewrites.
+    key: String,
+    /// Pages the proxy rewrote.
+    rewritten: Arc<AtomicUsize>,
+    /// The reader's commands on the object's section hashes: round 2's first
+    /// reads (round 1 reads none).
+    round_two: Arc<AtomicUsize>,
+}
+
+impl ShortRx {
+    async fn new(
+        layer: &str,
+        page: IndexPage,
+        index: fn(&KeySchema, &str) -> String,
+        members: PageMembers,
+        pages: usize,
+    ) -> Self {
+        Self::with_also(layer, page, index, members, pages, None).await
+    }
+
+    /// [`Self::new`] whose proxy first gives `also` each frame, and acts on
+    /// any frame `also` matches instead of the index fault.
+    async fn with_also(
+        layer: &str,
+        page: IndexPage,
+        index: fn(&KeySchema, &str) -> String,
+        members: PageMembers,
+        pages: usize,
+        also: Option<ProxyRule>,
+    ) -> Self {
+        let key_cell = Arc::new(OnceLock::new());
+        let (fault, rewritten) = IndexPageFault {
+            page,
+            key: Arc::clone(&key_cell),
+            members,
+            pages,
+            also: String::new(),
+        }
+        .rule();
+        let section_prefix: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let round_two = Arc::new(AtomicUsize::new(0));
+        let rule: ProxyRule = {
+            let (section_prefix, round_two) = (Arc::clone(&section_prefix), Arc::clone(&round_two));
+            Arc::new(move |args: &[Vec<u8>]| {
+                if let (Some(prefix), Some(key)) = (section_prefix.get(), args.get(1)) {
+                    if key.starts_with(prefix.as_bytes()) {
+                        round_two.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                also.as_ref()
+                    .and_then(|also| also(args))
+                    .or_else(|| fault(args))
+            })
+        };
+        let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+        let tv = TestValkey::setup().await;
+        let rx = Rx::with_reader(tv, client_through(&proxy).await, layer).await;
+        let key = index(rx.keys(), &rx.oid_str());
+        key_cell
+            .set(key.clone())
+            .expect("the index key is set once");
+        section_prefix
+            .set(rx.keys().obj_section(&rx.oid_str(), ""))
+            .expect("the section-hash prefix is set once");
+        ShortRx {
+            rx,
+            _proxy: proxy,
+            key,
+            rewritten,
+            round_two,
+        }
+    }
+
+    /// The index's count as its count window reads it (`card` is `SCARD`
+    /// or `ZCARD`), read on the fixture's own client.
+    async fn counted(&self, card: &str) -> u64 {
+        let pool = &self.rx.tv.client().pool;
+        let n: u64 = match card {
+            "SCARD" => pool.scard(&self.key).await,
+            _ => pool.zcard(&self.key).await,
+        }
+        .expect("the index count must answer");
+        assert!(n > 0, "fixture precondition: {} holds members", self.key);
+        n
+    }
+
+    fn rewritten(&self) -> usize {
+        self.rewritten.load(Ordering::SeqCst)
+    }
+}
+
+/// The read of `srx`'s object, whose first pass's round-1 page of the
+/// rewritten index came back one member short of the count `card` read: the
+/// first pass ends after round 1 — it reports its progress to the hook once,
+/// after round 1, and issues no command on a section hash — and the attempt
+/// is broken (its release `VERIFIED`, `measured: None`),
+/// logging one WARN naming the index and its counts and ticking the counter
+/// once; the second attempt reads the whole index and is served, equal to
+/// the atomic read. Without the count check the first attempt is served
+/// missing the member's row.
+async fn assert_short_first_pass_is_broken_and_retried(
+    srx: &ShortRx,
+    family: &str,
+    card: &str,
+    what: &str,
+) {
+    let rx = &srx.rx;
+    let counted = srx.counted(card).await;
+    let atomic = rx.atomic().await;
+    let round_two_at_release = Arc::new(StdMutex::new(None::<usize>));
+    let (seen, round_two) = (
+        Arc::clone(&round_two_at_release),
+        Arc::clone(&srx.round_two),
+    );
+    let (mut hook, log) = TestHook::new(react(move |attempt, event| {
+        let (seen, round_two) = (Arc::clone(&seen), Arc::clone(&round_two));
+        async move {
+            if (attempt, event.name()) == (1, "after_release") {
+                *seen.lock().unwrap() = Some(round_two.load(Ordering::SeqCst));
+            }
+            Ok(())
+        }
+    }));
+
+    let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+    assert_eq!(
+        srx.rewritten(),
+        1,
+        "{what}: fixture precondition: the proxy left a member out of one page"
+    );
+    assert_eq!(
+        releases(&log)[0],
+        FenceReleased {
+            verdict: Some(ReleaseVerdict::Verified),
+            outcome: FenceAttemptOutcome::Broken,
+            measured: None,
+        },
+        "{what}: no writer changed the object, but the pass did not read all of it: broken, \
+         and its size unmeasured (it read no more than round 1)"
+    );
+    assert_eq!(
+        *round_two_at_release.lock().unwrap(),
+        Some(0),
+        "{what}: the short pass ended after round 1, issuing no round-2 command"
+    );
+    assert!(
+        srx.round_two.load(Ordering::SeqCst) > 0,
+        "{what}: the served pass read the section hashes, so the count above could have been \
+         non-zero"
+    );
+    assert_eq!(
+        hook.progress(1).len(),
+        1,
+        "{what}: the short pass reports its progress once, after round 1 \
+         (`FencedReadHook::on_read_progress`); reports: {:?}",
+        hook.progress(1)
+    );
+    assert!(
+        hook.progress(2).len() >= 2,
+        "{what}: control: the whole pass reports after round 1 and after each later window, so \
+         the hook records every report; reports: {:?}",
+        hook.progress(2)
+    );
+    let fenced = verified(result, what);
+    assert_eq!(names_without_retries(&log), held_attempts(2));
+    assert_served_by_the_last_attempt(&log, &fenced, 2, what);
+    assert_same_read(&fenced, &atomic, what);
+    assert_eq!(
+        (
+            rx.reads("catchup", "fence_broken"),
+            rx.reads("catchup", "ok")
+        ),
+        (1, 1),
+        "{what}: fence_broken once, for the short attempt"
+    );
+    assert_eq!(index_incomplete(&rx.metrics), 1, "{what}: one proven skip");
+    let warnings = index_shortfall_warnings(&captured);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "{what}: one WARN for the one proven skip; capture:\n{}",
+        captured.text
+    );
+    assert_index_shortfall_warning(
+        warnings[0],
+        "catchup",
+        "fenced",
+        family,
+        &srx.key,
+        card,
+        counted,
+        counted - 1,
+    );
+    assert_field(warnings[0], "object_id", rx.oid_str().into());
+    assert_field(warnings[0], "attempt", 1.into());
+    assert_field(warnings[0], "max_attempts", FENCE_READ_ATTEMPTS.into());
+}
+
+/// A first pass whose `SSCAN` of `obj:secs` skipped a section (`CUBE`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_first_pass_skipped_a_sections_index_member_is_broken_and_retried() {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-short-secs",
+            IndexPage::Sscan,
+            KeySchema::obj_sections_index,
+            PageMembers::Drop(Some(CUBE.to_string())),
+            1,
+        )
+        .await;
+        assert_short_first_pass_is_broken_and_retried(
+            &srx,
+            "sections_index",
+            "SCARD",
+            "obj:secs member skipped",
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A first pass whose `SSCAN` of `obj:dels` skipped the deleted section a
+/// commit left there (`SIBLING`'s tombstone).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_first_pass_skipped_a_deleted_sections_index_member_is_broken_and_retried(
+) {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-short-dels",
+            IndexPage::Sscan,
+            KeySchema::obj_deleted_sections_index,
+            PageMembers::Drop(Some(SIBLING.to_string())),
+            1,
+        )
+        .await;
+        let rx = &srx.rx;
+        commit(
+            &rx.ls,
+            &rx.session_id,
+            &rx.layer,
+            rx.oid,
+            structural(vec![delete_cmd(ROOT, SIBLING)]),
+        )
+        .await;
+        let tombstoned: bool = rx
+            .tv
+            .client()
+            .pool
+            .sismember(&srx.key, SIBLING.to_string())
+            .await
+            .expect("SISMEMBER obj:dels must answer");
+        assert!(
+            tombstoned,
+            "fixture precondition: the deleted section is in obj:dels"
+        );
+        assert_short_first_pass_is_broken_and_retried(
+            &srx,
+            "deleted_sections_index",
+            "SCARD",
+            "obj:dels member skipped",
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A first pass whose `ZRANGE` page of `obj:flds` came back one member short
+/// (its first): a short rank page is a shortfall, not the end of the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_first_pass_got_a_short_fields_index_page_is_broken_and_retried() {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-short-flds",
+            IndexPage::Zrange,
+            KeySchema::obj_fields_index,
+            PageMembers::Drop(None),
+            1,
+        )
+        .await;
+        assert_short_first_pass_is_broken_and_retried(
+            &srx,
+            "fields_index",
+            "ZCARD",
+            "obj:flds page short",
+        )
+        .await;
+    })
+    .await;
+}
+
+/// Every pass's `SSCAN` of `obj:secs` skips a section: after
+/// `FENCE_READ_ATTEMPTS` broken attempts the read is `Unavailable`, never a
+/// state missing the section, with one WARN and one tick per attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_every_pass_skipped_a_member_is_unavailable_after_three_attempts() {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-short-every",
+            IndexPage::Sscan,
+            KeySchema::obj_sections_index,
+            PageMembers::Drop(Some(CUBE.to_string())),
+            usize::MAX,
+        )
+        .await;
+        let rx = &srx.rx;
+        let (mut hook, log) = TestHook::new(no_reaction());
+
+        let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+        assert_eq!(FENCE_READ_ATTEMPTS, 3);
+        let err = result.err();
+        assert!(
+            matches!(err, Some(ServiceError::Unavailable(_))),
+            "three short passes are a retryable Unavailable, never a served state; got {err:?}"
+        );
+        assert_eq!(srx.rewritten(), 3, "fixture: one short page per attempt");
+        assert_eq!(names_without_retries(&log), held_attempts(3));
+        assert_eq!(
+            releases(&log),
+            vec![
+                FenceReleased {
+                    verdict: Some(ReleaseVerdict::Verified),
+                    outcome: FenceAttemptOutcome::Broken,
+                    measured: None,
+                };
+                3
+            ]
+        );
+        assert_eq!(
+            (
+                rx.reads("catchup", "fence_broken"),
+                rx.reads("catchup", "ok")
+            ),
+            (3, 0)
+        );
+        assert_eq!(index_incomplete(&rx.metrics), 3, "one tick per proven skip");
+        let attempts: Vec<serde_json::Value> = index_shortfall_warnings(&captured)
+            .into_iter()
+            .map(|w| w["fields"]["attempt"].clone())
+            .collect();
+        assert_eq!(
+            attempts,
+            [1, 2, 3].map(serde_json::Value::from).to_vec(),
+            "one WARN per attempt, naming it; capture:\n{}",
+            captured.text
+        );
+        assert!(rx.readers().await.is_empty(), "every lease was released");
+    })
+    .await;
+}
+
+/// `SSCAN` steps that return every member twice skip none: the distinct
+/// members equal `SCARD`, so the first attempt is served, with no WARN and no
+/// tick — a repeat is never a shortfall.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_sscan_steps_repeat_members_is_served_on_its_first_attempt() {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-repeat-secs",
+            IndexPage::Sscan,
+            KeySchema::obj_sections_index,
+            PageMembers::Repeat,
+            usize::MAX,
+        )
+        .await;
+        let rx = &srx.rx;
+        let atomic = rx.atomic().await;
+        let (mut hook, log) = TestHook::new(no_reaction());
+
+        let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+        let fenced = verified(result, "repeated members");
+        assert!(
+            srx.rewritten() >= 1,
+            "fixture precondition: the proxy repeated the members of a step"
+        );
+        assert_eq!(names_without_retries(&log), held_attempts(1));
+        assert_same_read(&fenced, &atomic, "repeated members");
+        assert_eq!(index_incomplete(&rx.metrics), 0);
+        assert!(
+            index_shortfall_warnings(&captured).is_empty(),
+            "a repeat is no shortfall; capture:\n{}",
+            captured.text
+        );
+    })
+    .await;
+}
+
+/// What else a writer did to a short first pass's attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriterCause {
+    /// The header moved before the release: the release answers `BROKEN`.
+    ReleaseBroken,
+    /// The header moved after the grant and back before the release: the
+    /// release answers `VERIFIED`, but the pass read another `seq`.
+    PassAtAnotherSeq,
+}
+
+/// A short first pass whose attempt a writer also broke: the writer's cause
+/// stands — the attempt is broken (`measured: None`, the pass read no more
+/// than round 1) and retried, with no WARN and no tick, since nothing proved
+/// that the store, not a writer, lost the member.
+async fn short_pass_a_writer_also_broke(cause: WriterCause) {
+    let srx = ShortRx::new(
+        "srf-short-writer",
+        IndexPage::Sscan,
+        KeySchema::obj_sections_index,
+        PageMembers::Drop(Some(CUBE.to_string())),
+        1,
+    )
+    .await;
+    let rx = &srx.rx;
+    let cut = rx.seq().await;
+    let stage = rx.stage();
+    let (mut hook, log) = TestHook::new(react(move |attempt, event| {
+        let stage = stage.clone();
+        async move {
+            match (cause, attempt, event.name()) {
+                (WriterCause::PassAtAnotherSeq, 1, "on_grant") => stage.set_seq(cut + 1).await,
+                (WriterCause::PassAtAnotherSeq, 1, "before_release") => stage.set_seq(cut).await,
+                (WriterCause::ReleaseBroken, 1, "before_release") => stage.set_seq(cut + 1).await,
+                _ => {}
+            }
+            Ok(())
+        }
+    }));
+
+    let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+    let what = format!("{cause:?}");
+    assert_eq!(srx.rewritten(), 1, "{what}: fixture: one short page");
+    assert_eq!(
+        releases(&log)[0],
+        FenceReleased {
+            verdict: Some(match cause {
+                WriterCause::ReleaseBroken => ReleaseVerdict::Broken,
+                WriterCause::PassAtAnotherSeq => ReleaseVerdict::Verified,
+            }),
+            outcome: FenceAttemptOutcome::Broken,
+            measured: None,
+        },
+        "{what}: a broken attempt, unmeasured"
+    );
+    let fenced = verified(result, &what);
+    assert_served_by_the_last_attempt(&log, &fenced, 2, &what);
+    assert_same_read(&fenced, &rx.atomic().await, &what);
+    assert_eq!(rx.reads("catchup", "fence_broken"), 1);
+    assert_eq!(
+        index_incomplete(&rx.metrics),
+        0,
+        "{what}: a writer broke the attempt, so its shortfall is no proven skip"
+    );
+    assert!(
+        index_shortfall_warnings(&captured).is_empty(),
+        "{what}: no proven-skip WARN; capture:\n{}",
+        captured.text
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_short_pass_met_a_broken_release_is_retried_without_a_proven_skip() {
+    within_test_budget(short_pass_a_writer_also_broke(WriterCause::ReleaseBroken)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_short_pass_read_another_seq_is_retried_without_a_proven_skip() {
+    within_test_budget(short_pass_a_writer_also_broke(
+        WriterCause::PassAtAnotherSeq,
+    ))
+    .await;
+}
+
+/// A short first pass whose release finds the header gone: the read ends
+/// `NotFound` after that attempt, not retried, with no WARN and no tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_short_pass_meets_a_release_finding_no_header_is_not_found() {
+    within_test_budget(async {
+        let srx = ShortRx::new(
+            "srf-short-gone",
+            IndexPage::Sscan,
+            KeySchema::obj_sections_index,
+            PageMembers::Drop(Some(CUBE.to_string())),
+            1,
+        )
+        .await;
+        let rx = &srx.rx;
+        let stage = rx.stage();
+        let (mut hook, log) = TestHook::new(react(move |attempt, event| {
+            let stage = stage.clone();
+            async move {
+                if (attempt, event.name()) == (1, "before_release") {
+                    stage.take_header().await;
+                }
+                Ok(())
+            }
+        }));
+
+        let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+        let err = result.err();
+        assert!(
+            matches!(err, Some(ServiceError::NotFound(_))),
+            "a release that finds no header ends the read NotFound; got {err:?}"
+        );
+        assert_eq!(srx.rewritten(), 1, "fixture: one short page");
+        assert_eq!(
+            releases(&log),
+            vec![FenceReleased {
+                verdict: Some(ReleaseVerdict::NotFound),
+                outcome: FenceAttemptOutcome::Ended,
+                measured: None,
+            }]
+        );
+        assert_eq!(
+            (
+                rx.reads("catchup", "not_found"),
+                rx.reads("catchup", "fence_broken")
+            ),
+            (1, 0)
+        );
+        assert_eq!(index_incomplete(&rx.metrics), 0);
+        assert!(
+            index_shortfall_warnings(&captured).is_empty(),
+            "no proven-skip WARN; capture:\n{}",
+            captured.text
+        );
+    })
+    .await;
+}
+
+/// A short first pass whose release call fails (a proxy answers every release
+/// `EVALSHA` with an error reply, as `release_fails` does): nothing proved
+/// whether a writer changed the object, so the read ends with the release's
+/// classified error — a permanent one, `Internal`, naming the release script
+/// — after that one attempt: not broken and retried, unmeasured, with no WARN
+/// and no tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fenced_read_whose_short_pass_meets_a_failed_release_ends_with_the_release_error() {
+    within_test_budget(async {
+        let sha = release_sha();
+        let fail_release: ProxyRule = Arc::new(move |args: &[Vec<u8>]| {
+            is_evalsha_of(args, &sha)
+                .then(|| ProxyAction::Eval(error_reply_script("ERR injected release failure")))
+        });
+        let srx = ShortRx::with_also(
+            "srf-short-release-fails",
+            IndexPage::Sscan,
+            KeySchema::obj_sections_index,
+            PageMembers::Drop(Some(CUBE.to_string())),
+            1,
+            Some(fail_release),
+        )
+        .await;
+        let rx = &srx.rx;
+        let (mut hook, log) = TestHook::new(no_reaction());
+
+        let (result, captured) = capture(rx.read(PROXIED_ESTIMATE, &mut hook)).await;
+
+        assert_eq!(srx.rewritten(), 1, "fixture: one short page");
+        let err = result.err();
+        assert!(
+            matches!(&err, Some(ServiceError::Internal(m)) if m.contains("snapshot_fence_release")),
+            "the read ends with the release's classified error, never a retry; got {err:?}"
+        );
+        assert_eq!(
+            releases(&log),
+            vec![FenceReleased {
+                verdict: None,
+                outcome: FenceAttemptOutcome::Ended,
+                measured: None,
+            }],
+            "one attempt, whose release call failed"
+        );
+        assert_eq!(names_without_retries(&log), held_attempts(1));
+        assert_eq!(
+            (
+                rx.reads("catchup", "permanent_error"),
+                rx.reads("catchup", "fence_broken"),
+                rx.reads("catchup", "ok"),
+            ),
+            (1, 0, 0)
+        );
+        assert_eq!(index_incomplete(&rx.metrics), 0);
+        assert!(
+            index_shortfall_warnings(&captured).is_empty(),
+            "no proven-skip WARN; capture:\n{}",
+            captured.text
+        );
+    })
+    .await;
 }

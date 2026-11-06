@@ -1,0 +1,54 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/ -}}
+
+{{- /*
+  The disaster-recovery accept-loss Job: `live-edit dr accept-loss <incident>
+  --confirm discard-lost-data`, plus `--confirm discard-unconfirmed-data` when
+  dr.acceptLoss.confirmUnconfirmed is set, rendered only while
+  dr.acceptLoss.incident is set (live-edit-service.drJob in _helpers.tpl; the
+  checks in live-edit-service.drChecks run on every render, and refuse an
+  accept-loss without its confirmation). A plain batch/v1 Job, not a Helm
+  hook, so `helm upgrade --timeout` and `--atomic` do not bind its run time.
+
+  Its pod spec is the server's (live-edit-service.podSpec), without these
+  server fields:
+  - resizePolicy: Kubernetes refuses a memory resize policy of
+    RestartContainer in a pod whose restartPolicy is Never, as a Job's is,
+    and a Job's limit never changes during a run: a new limit is a new Job
+    (dr.acceptLoss.attempt).
+  - Probes: the Job serves no traffic, so readiness gates nothing, and a
+    liveness probe could kill a long run part way through.
+  - Pod affinity and anti-affinity: rules written for server pods (a required
+    anti-affinity against them, say) could leave the Job unschedulable on the
+    nodes that run the service. It keeps nodeAffinity, nodeSelector and
+    tolerations, so it reaches the same nodes and node-bound volumes.
+  - The checksum/config annotation: it is the Deployment's rollout trigger. A
+    Job's pod template cannot change once created, so a settings change would
+    fail the upgrade on the Job ("field is immutable") instead of rolling
+    anything; the Job reads the settings ConfigMap once, when it starts.
+  - shareProcessNamespace and terminationGracePeriodSeconds: the server's
+    grace covers draining its clients, which a Job has none of; Kubernetes'
+    default grace covers the Job's own exit on SIGTERM.
+  No activeDeadlineSeconds: accept-loss waits out the backup store's cache
+  (checkpoint.notFoundCacheSecs) before it discards anything it reads as
+  missing, then restores and discards for as long as the data takes.
+
+  Never write a literal comment-close sequence inside this comment — it
+  terminates the comment early and leaks text into the manifest.
+*/}}
+{{- include "live-edit-service.drChecks" . }}
+{{- include "live-edit-service.drJob" (dict "root" . "action" "acceptLoss") }}

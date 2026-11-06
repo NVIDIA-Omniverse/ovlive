@@ -3,9 +3,9 @@
 
 # Client notices and source attribution
 
-This document covers the ovlive client. NVIDIA-owned client code and documentation use Apache-2.0, including the Live Services implementation and the SpecTree-derived support code in `source/live/support`. The license text is in the repository root’s `LICENSE`, installed beside this file in a native package. [NOTICE](NOTICE) records the client license scope. Paths to source and provenance records below are relative to the repository’s `client/` directory; they identify source records, not native package members. `PROVENANCE.json` records the import snapshot and notice updates.
+This document covers the ovlive client. NVIDIA-owned client code and documentation use Apache-2.0, including the Live Services implementation and the SpecTree-derived support code in `source/live/support`. The license text is in the repository root’s `LICENSE`, installed beside this file in a native package. [NOTICE](NOTICE) records the client license scope. Paths to source and provenance records below are relative to the repository’s `client/` directory; they identify source records, not native package members.
 
-The LiveService protocol (`source/live/protos/PROVENANCE.md`) and OMPF schema (`source/live/wire/schema/README.md`) carry Apache-2.0 notices. The LiveService proto is copied unchanged from the live edit service and carries that file's own notice. The OMPF schema's provenance record identifies both original upstream and current repository hashes; only its license notices are adapted. NVIDIA owns both upstream sources and authorizes their Apache-2.0 licensing here.
+The LiveService protocol (`source/live/protos/README.md`) and OMPF schema (`source/live/wire/schema/README.md`) are NVIDIA's and carry Apache-2.0 notices. The LiveService proto is copied from the live edit service and carries that file's own notice.
 
 The FlatBuffers runtime headers (`source/live/wire/third_party/flatbuffers/README.md`) in `source/live/wire/third_party/flatbuffers` are unmodified Google FlatBuffers 1.12.0 files under Apache-2.0, with the package license beside them; they receive no NVIDIA grant.
 

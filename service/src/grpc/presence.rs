@@ -25,7 +25,8 @@
 //
 // The join task (`run_join_session`) runs the SDD SR-4 steps, in this order:
 //  1. enroll for this join's shutdown token and check it; an exit here has
-//     written nothing, skips teardown and ends `UNAVAILABLE`;
+//     written nothing, skips teardown and ends `UNAVAILABLE` by the token's
+//     cause (a shutdown, or a hold that ended the streams before it enrolled);
 //  2. add the session to the session index (`le:presence:active_sessions`),
 //     before the connection is a member;
 //  3. join the local presence router and go on only once this replica's
@@ -40,7 +41,10 @@
 //     own connection_id was published after the snapshot (see
 //     `ReplayDelivered`);
 //  5. add the session to the index again (the re-add the index-removal
-//     protocol relies on);
+//     protocol relies on). Each store call of steps 2, 4 and 5 races this
+//     join's shutdown token, token first, so the stream's ending drops the
+//     call in flight and the join ends by the token's cause; step 3, which
+//     sends only pub/sub commands, is not raced;
 //  6. acquire the session-cancel token, which can run a bounded session
 //     recovery pass, raced against shutdown;
 //  7. spawn the lease keeper, which renews the lease from here to teardown
@@ -55,8 +59,10 @@
 //     session token and a client disconnect. A completed replay hands the
 //     bidi loop the set of ids it delivered (`ReplayDelivered`, the SDD's D);
 // 11. observe join latency (only after a completed replay);
-// 12. bidirectional loop: publish the client's `PeerMessage`s (a keepalive or
-//     any other request type is ignored, never broadcast), forward presence
+// 12. bidirectional loop: publish the client's `PeerMessage`s, best effort
+//     (each publish races the shutdown token, so one the stream's ending cuts
+//     may not be sent; a keepalive or any other request type is ignored,
+//     never broadcast), forward presence
 //     events, and, for a join armed for the client keepalive, end it once its
 //     request stream has carried no bytes for three intervals, counted from
 //     the loop's start. Because step 3's router subscribe precedes step 4's
@@ -73,18 +79,24 @@
 //     self-filter discards), is counted and the loop goes on;
 // 14. teardown (every exit after step 1): stop the keeper, then
 //     `storage::presence::unregister_connection` (publishes `left` and arms
-//     the `:gone` marker that fences late writes), remove the session from
-//     the index if it is now empty, and release the router subscription.
+//     the `:gone` marker that fences late writes; cut at one command timeout,
+//     its `NOSCRIPT` reload included), remove the session from the index if
+//     it is now empty, and release the router subscription.
 //
 // The stream's ending is decided by its cause: graceful shutdown ends it
 // `UNAVAILABLE "server shutting down"`, which the client retries. The
 // handler's check reads the shutdown handle's `begun` token, cancelled when
 // the paced stream ending starts; step 1 enrolls for this join's own shutdown
-// token and checks it, and steps 6, 7, 10 and 12 read that token, which the
+// token and checks it, and steps 2, 4, 5, 6, 7, 10 and 12 read that token,
+// which the
 // paced ending cancels in this join's batch (born cancelled for a join that
 // enrolls after the ending started). This replica has stopped
 // accepting connections (readiness `NOT_SERVING`, GOAWAY sent), so where the
-// rejoin lands is the ingress's choice. A session deletion seen through the
+// rejoin lands is the ingress's choice. The hold ending (SDD SR-6.3) cancels
+// the same token with a cause, at once and without shutting anything down;
+// every place that reads the token then ends the join by that cause
+// (`end_on_shutdown`): `SERVICE_HELD` for a fleet hold, `UPSTREAM_UNAVAILABLE`
+// for a stale hold verdict, both retried. A session deletion seen through the
 // session token (steps 7, 10 and 12) ends it `OK` (a session found missing
 // from the store with `DeleteSession`'s deletion marker is cancelled as a
 // deletion). A client that went away is seen at the `SessionConnected` send
@@ -127,6 +139,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::auth_helpers::{check_read_permission, extract_token, BasePathSource};
+use super::graceful_shutdown::StreamShutdown;
 use super::proto::{
     JoinSessionRequest, JoinSessionResponse, PeerJoined, PeerLeft, PeerMessage, SessionConnected,
 };
@@ -147,7 +160,8 @@ use crate::presence::{
     ConnectedUser, LocalPresenceRouter, PresenceEvent, PresenceReceiver, PresenceRecvError,
 };
 use crate::storage::client::{
-    map_fred_err_for_grpc, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA, POOL_LABEL_PUBSUB,
+    cut_at_command_timeout, map_fred_err_for_grpc, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
+    POOL_LABEL_PUBSUB,
 };
 use crate::storage::keys::KeySchema;
 use crate::storage::presence::{
@@ -328,7 +342,8 @@ async fn join_session_inner(
     tail_log.at(RpcStage::Stream);
 
     // b.w29 item 4: spawn through `presence_cleanup_tracker` so the
-    // shutdown sequence in `main.rs` can `wait()` for every in-flight
+    // post-server shutdown sequence (`grpc::transport::run_post_server_sequence`)
+    // can `wait()` for every in-flight
     // `run_join_session` to finish its teardown — whose unregister script
     // publishes `left` to peers — before Valkey `quit()` tears down the
     // pools. The connection's lease keeper runs on the same tracker. Without
@@ -377,19 +392,20 @@ struct JoinCtx<'a> {
     /// ([`GracefulShutdown::enroll_stream`](super::graceful_shutdown::GracefulShutdown::enroll_stream)
     /// on [`LiveEditService::shutdown`]), taken at the task-start check (SDD
     /// SR-4.7). It is cancelled in its batch of the paced ending, or with the
-    /// service token.
+    /// service token, or by the hold ending with a cause (SDD SR-6.3).
     ///
     /// Every per-join shutdown check — the task-start check, the race around
     /// `acquire_session_cancel` (SR-4 step 6), the check after it (SR-4 step
     /// 7), the lease keeper's `select!`
     /// (the keeper holds a clone of this token), the membership replay's
     /// pipeline awaits and sends, and the bidi loop's arm and its event send —
-    /// reads this token, never a shared one. Polling a token locks that token's own mutex and
+    /// reads this token, never a shared one, and every one that ends the join
+    /// ends it by the token's cause ([`end_on_shutdown`]). Polling a token locks that token's own mutex and
     /// `Notify` waiter list. On a process-wide token those locks would be
     /// shared by every join on the replica, on every loop iteration; on the
     /// child they are this join's alone, and the parent is locked only when
     /// the child is created and dropped.
-    shutdown: CancellationToken,
+    shutdown: StreamShutdown,
     /// This join's client keepalive, `None` when the join is not armed: its
     /// header did not set `client_keepalive`, the keepalive is configured
     /// off, or the request carries no progress record. `SessionConnected`
@@ -449,7 +465,9 @@ impl JoinKeepalive {
 /// membership replay's pipeline awaits and sends, the bidirectional loop and
 /// its event send — so Kit, which never retries `OK`, rejoins; where the
 /// rejoin lands is the ingress's choice, since this replica has stopped
-/// accepting connections. The session token — observed at the check after
+/// accepting connections. The hold ending cancels the same token with a cause,
+/// and each of those places then ends the join by it ([`end_on_shutdown`]):
+/// `SERVICE_HELD` or `UPSTREAM_UNAVAILABLE`. The session token — observed at the check after
 /// registration, in the replay, in the loop and in its event send — ends it by
 /// the cancel's cause ([`end_on_session_cancel`]): an explicit `DeleteSession`
 /// ends it `OK` (PRD §3.1.2) — including one this replica learns of only from
@@ -473,7 +491,9 @@ impl JoinKeepalive {
 /// before teardown.** Teardown awaits Valkey, and the shutdown sequence bounds
 /// how long it waits for this task, so a line logged after teardown could be
 /// lost with the task. Every `Err` is a failure the client sees; a shutdown's
-/// is logged at INFO, because its arm marks `log` shutdown-caused, a keepalive
+/// is logged at INFO, because its arm marks `log` shutdown-caused, a fleet
+/// hold's at INFO, because its arm marks `log` hold-caused, a stale hold
+/// verdict's at WARN, a keepalive
 /// timeout's at INFO, because its ending marks `log` with the client-keepalive
 /// marker, and a missing session's at WARN.
 #[allow(clippy::too_many_arguments)]
@@ -493,16 +513,18 @@ async fn run_join_session(
     // Enroll for this join's shutdown token, then check it: closes the race
     // between the handler's check and this task starting. Once the paced
     // ending has started the token is born cancelled, so no start between the
-    // two checks is missed; an enrolled one is cancelled in its batch. The
-    // enrollment is held until this function returns, after teardown.
-    // Nothing has been written yet, so there is nothing to tear down
-    // (SR-4.1); the stream ends `UNAVAILABLE`, as a shutdown ends a join
+    // two checks is missed; an enrolled one is cancelled in its batch. Once the
+    // hold ending has run (SDD SR-6.3) it is born cancelled too, carrying the
+    // hold's cause, so a join that passed the hold gate just before it closed
+    // ends here. The enrollment is held until this function returns, after
+    // teardown. Nothing has been written yet, so there is nothing to tear down
+    // (SR-4.1) and a late join writes nothing; the stream ends by the token's
+    // cause ([`end_on_shutdown`]), as a shutdown or a hold ends a join
     // everywhere else, and the line is logged here because no teardown
     // follows to log it.
     let (shutdown, _shutdown_enrollment) = svc.shutdown.enroll_stream();
     if shutdown.is_cancelled() {
-        log.shutdown_caused();
-        let status = server_shutting_down();
+        let status = end_on_shutdown(&shutdown, log);
         rpc_log::log_rpc_failure(log, &status);
         return Err(status);
     }
@@ -561,9 +583,9 @@ struct KeeperHandle {
 /// Inner body of JoinSession — SR-4 steps 2 to 12. Records in `presence` what
 /// it did, for the teardown that follows it on every exit.
 ///
-/// `log` is the task's completion context; the shutdown arms mark it
-/// shutdown-caused before they return, so the caller logs their `UNAVAILABLE`
-/// at INFO.
+/// `log` is the task's completion context; the shutdown arms mark it by the
+/// token's cause before they return ([`end_on_shutdown`]), so the caller logs
+/// a shutdown's or a fleet hold's `UNAVAILABLE` at INFO.
 async fn run_join_session_inner(
     ctx: &JoinCtx<'_>,
     client_stream: &mut Streaming<JoinSessionRequest>,
@@ -585,10 +607,20 @@ async fn run_join_session_inner(
     // ── SR-4 step 2: Index the session, before the connection is a member ────
     // A crash after this leaves at most an index entry for a session with no
     // members, which the sweeper removes — never a member the sweeper cannot
-    // find.
-    add_session_to_index(valkey, mapped, keys, ctx.session_id)
-        .await
-        .map_err(|e| map_data_err("SADD presence active_sessions", e))?;
+    // find. Steps 2, 4 and 5's store calls race this join's shutdown token,
+    // token first, as step 6 does: the stream's ending (a shutdown, or the
+    // hold ending) drops the call in flight — a give-up, so fred sends no
+    // frame of it not yet sent — and the join ends by the token's cause,
+    // teardown following as for any failure after step 2.
+    tokio::select! {
+        biased;
+        () = ctx.shutdown.cancelled() => {
+            return Err(end_on_shutdown(&ctx.shutdown, log));
+        }
+        added = add_session_to_index(valkey, mapped, keys, ctx.session_id) => {
+            added.map_err(|e| map_data_err("SADD presence active_sessions", e))?;
+        }
+    }
 
     #[cfg(any(test, feature = "test-fault-injection"))]
     if let Some(seam) = ctx.svc.join_registration_seam_for_test.as_ref() {
@@ -611,7 +643,12 @@ async fn run_join_session_inner(
 
     // This join goes on only once the replica's Valkey subscription to the
     // session's channel is confirmed, so no announcement published from here
-    // on can miss it (see `LocalPresenceRouter`).
+    // on can miss it (see `LocalPresenceRouter`). Unlike steps 2, 4 and 5,
+    // this step is not raced against the shutdown token: it sends only
+    // pub/sub commands, which change no key (at most a prior leaver's
+    // `UNSUBSCRIBE` wait and one `SUBSCRIBE`, each within the command
+    // timeout), and dropping it mid-wait would break `ChannelUnsubscribe`'s
+    // contract (`presence::session_presence`).
     match channel {
         ChannelJoin::Subscribed => {}
         // Another local join's `SUBSCRIBE` is in flight: share its result. A
@@ -679,10 +716,17 @@ async fn run_join_session_inner(
     // started: teardown runs only after this function returns. That is the
     // obligation on `register_connection` that lets its teardown marker and
     // its deadline together refuse this register however late it reaches the
-    // store. A failed clock read leaves the register unissued.
-    let store_now_ms = store_time_ms(valkey, mapped, keys, ctx.session_id)
-        .await
-        .map_err(|e| map_data_err("TIME presence register deadline", e))?;
+    // store. A failed clock read leaves the register unissued. Raced against
+    // the shutdown token, as step 2.
+    let store_now_ms = tokio::select! {
+        biased;
+        () = ctx.shutdown.cancelled() => {
+            return Err(end_on_shutdown(&ctx.shutdown, log));
+        }
+        now = store_time_ms(valkey, mapped, keys, ctx.session_id) => {
+            now.map_err(|e| map_data_err("TIME presence register deadline", e))?
+        }
+    };
 
     // Inside the subscribe-to-snapshot window: subscribed (step 3), not yet
     // snapshotted, not a member.
@@ -698,16 +742,21 @@ async fn run_join_session_inner(
     // `joined` first — is published after the snapshot. That makes this
     // join's first own live event the point after which no announcement the
     // snapshot already reflects can still arrive, where the bidi loop ends
-    // its duplicate suppression (see `ReplayDelivered`). Not raced: it is one
-    // command, and a shutdown begun meanwhile is seen at step 6 or 7. A
-    // failure ends the join here, before `SessionConnected`, with the
-    // register never issued.
-    let mut member_ids: Vec<String> = valkey
-        .pool
-        .next()
-        .smembers(keys.presence_members(ctx.session_id))
-        .await
-        .map_err(|e| map_data_err("SMEMBERS presence", e))?;
+    // its duplicate suppression (see `ReplayDelivered`). Raced against the
+    // shutdown token, as step 2. A failure ends the join here, before
+    // `SessionConnected`, with the register never issued.
+    let mut member_ids: Vec<String> = tokio::select! {
+        biased;
+        () = ctx.shutdown.cancelled() => {
+            return Err(end_on_shutdown(&ctx.shutdown, log));
+        }
+        members = valkey
+            .pool
+            .next()
+            .smembers::<Vec<String>, _>(keys.presence_members(ctx.session_id)) => {
+            members.map_err(|e| map_data_err("SMEMBERS presence", e))?
+        }
+    };
     // Defensive only: this join is not yet a member, so the snapshot cannot
     // hold its own id (minted fresh by `join_session_inner`). Kept so that the
     // replay never sends a joiner its own `PeerJoined`, whatever the store
@@ -727,21 +776,28 @@ async fn run_join_session_inner(
         user_application: ctx.user_application.to_string(),
     })
     .encode();
+    // Set before the register is sent, so teardown unregisters whatever
+    // became of it: completed, failed, or dropped by the shutdown race below
+    // (whose frame, if already written, can still land).
     presence.register_issued = true;
-    let registered = register_connection(
-        valkey,
-        mapped,
-        keys,
-        ctx.session_id,
-        ctx.connection_id,
-        ctx.user_name,
-        ctx.user_application,
-        ctx.svc.presence_lease_ttl_secs,
-        not_after_ms,
-        &joined_payload,
-    )
-    .await
-    .map_err(|e| map_data_err("EVALSHA presence_register", e))?;
+    let registered = tokio::select! {
+        biased;
+        () = ctx.shutdown.cancelled() => {
+            return Err(end_on_shutdown(&ctx.shutdown, log));
+        }
+        registered = register_connection(
+            valkey,
+            mapped,
+            keys,
+            ctx.session_id,
+            ctx.connection_id,
+            ctx.user_name,
+            ctx.user_application,
+            ctx.svc.presence_lease_ttl_secs,
+            not_after_ms,
+            &joined_payload,
+        ) => registered.map_err(|e| map_data_err("EVALSHA presence_register", e))?,
+    };
     match registered {
         // `added: false` cannot come from a first register of a fresh
         // connection_id, but can from fred re-sending a register whose first
@@ -772,10 +828,17 @@ async fn run_join_session_inner(
     // Issued only after the register completed. An index removal racing this
     // join either finds the member when it rechecks the member set, or ran
     // before this re-add, which then restores the entry
-    // (`remove_session_from_index`).
-    add_session_to_index(valkey, mapped, keys, ctx.session_id)
-        .await
-        .map_err(|e| map_data_err("SADD presence active_sessions", e))?;
+    // (`remove_session_from_index`). Raced against the shutdown token, as
+    // step 2.
+    tokio::select! {
+        biased;
+        () = ctx.shutdown.cancelled() => {
+            return Err(end_on_shutdown(&ctx.shutdown, log));
+        }
+        added = add_session_to_index(valkey, mapped, keys, ctx.session_id) => {
+            added.map_err(|e| map_data_err("SADD presence active_sessions", e))?;
+        }
+    }
 
     #[cfg(any(test, feature = "test-fault-injection"))]
     if let Some(seam) = ctx.svc.join_registration_seam_for_test.as_ref() {
@@ -808,8 +871,7 @@ async fn run_join_session_inner(
     let session_cancel = tokio::select! {
         biased;
         () = ctx.shutdown.cancelled() => {
-            log.shutdown_caused();
-            return Err(server_shutting_down());
+            return Err(end_on_shutdown(&ctx.shutdown, log));
         }
         acquired = super::session::acquire_session_cancel(
             &ctx.svc.session_tokens,
@@ -858,7 +920,7 @@ async fn run_join_session_inner(
             refresh_interval: Duration::from_secs(ctx.svc.presence_refresh_interval_secs),
             teardown: keeper_teardown.clone(),
             session_cancel: join_session_cancel.token().clone(),
-            shutdown: ctx.shutdown.clone(),
+            shutdown: CancellationToken::clone(&ctx.shutdown),
             #[cfg(any(test, feature = "test-fault-injection"))]
             seam: ctx.svc.lease_keeper_seam_for_test.clone(),
         },
@@ -876,8 +938,7 @@ async fn run_join_session_inner(
     // here on the replay's pipeline awaits and sends and the bidi loop watch
     // both tokens.
     if ctx.shutdown.is_cancelled() {
-        log.shutdown_caused();
-        return Err(server_shutting_down());
+        return Err(end_on_shutdown(&ctx.shutdown, log));
     }
     if session_cancel.is_cancelled() {
         return end_on_session_cancel(&session_cancel);
@@ -904,8 +965,9 @@ async fn run_join_session_inner(
     // await and send races shutdown, the session
     // token and a client disconnect (SR-4.4). The keeper keeps the lease alive however
     // long it takes. A replay ended by a token skips steps 11–12 and ends the
-    // join as the bidi loop's arm for that token does: a shutdown marks `log`
-    // shutdown-caused and ends `UNAVAILABLE`, logged at INFO before teardown;
+    // join as the bidi loop's arm for that token does: the shutdown token ends
+    // it `UNAVAILABLE` by the token's cause, `log` marked to match
+    // (`end_on_shutdown`), logged before teardown;
     // a session cancel ends by its cause (a deletion `OK`, with no failure
     // line). A client disconnect or a store error returns its status, logged
     // once by `run_join_session`. Teardown follows every exit. Only a
@@ -914,8 +976,7 @@ async fn run_join_session_inner(
     let delivered = match replay_membership(ctx, member_ids, &join_session_cancel).await? {
         ReplayOutcome::Complete(delivered) => delivered,
         ReplayOutcome::ShuttingDown => {
-            log.shutdown_caused();
-            return Err(server_shutting_down());
+            return Err(end_on_shutdown(&ctx.shutdown, log));
         }
         ReplayOutcome::SessionCancelled => return end_on_session_cancel(&join_session_cancel),
     };
@@ -942,16 +1003,11 @@ async fn run_join_session_inner(
     .await
 }
 
-/// How long [`teardown`] waits for the lease keeper beyond one store command
-/// timeout. A keeper step already under way runs to completion, so the wait
-/// covers a step's refresh plus scheduling slack. A step that takes longer —
-/// a refresh retried by fred, a renewal's index re-add on top, or a rejoin's
-/// clock read, register and index re-add after the refresh — outlives the
-/// wait; teardown logs that and goes on. A late refresh or rejoin register is
-/// then fenced by the teardown marker and the register's deadline, and a late
-/// index re-add can leave only an index entry for an empty session, which the
-/// sweeper removes.
-const KEEPER_STOP_SLACK: Duration = Duration::from_secs(1);
+// How long `teardown` waits for the lease keeper beyond one store command
+// timeout. Defined in `crate::dr::hold`, beside the hold's write bounds,
+// because the restore Job's quiet period counts it; its doc has the
+// reasoning.
+use crate::dr::hold::KEEPER_STOP_SLACK;
 
 /// A connection's lease keeper (SDD SR-4.2): what it owns.
 ///
@@ -993,7 +1049,9 @@ struct LeaseKeeper {
     /// join's token alone, not the one every local join in the session shares.
     session_cancel: CancellationToken,
     /// The join's enrolled child of the service shutdown token
-    /// (`JoinCtx::shutdown`).
+    /// (`JoinCtx::shutdown`), cancelled by graceful shutdown or by the hold
+    /// ending. The keeper only stops on it, so it holds the bare token, not the
+    /// cause.
     shutdown: CancellationToken,
     #[cfg(any(test, feature = "test-fault-injection"))]
     seam: Option<std::sync::Arc<LeaseKeeperSeam>>,
@@ -1348,8 +1406,10 @@ enum ReplayOutcome {
     /// join goes on to observe its latency and run the bidi loop, which takes
     /// D over.
     Complete(ReplayDelivered),
-    /// The join's shutdown token was cancelled. The join ends `UNAVAILABLE
-    /// "server shutting down"` after teardown, as a shutdown in the loop does.
+    /// The join's shutdown token was cancelled. The join ends by the token's
+    /// cause after teardown ([`end_on_shutdown`]) — `UNAVAILABLE "server
+    /// shutting down"` for graceful shutdown, the hold's status for a hold —
+    /// as the shutdown arm in the loop does.
     ShuttingDown,
     /// The join's session token was cancelled. The join ends by the cancel's
     /// cause after teardown ([`end_on_session_cancel`]), as a session cancel in
@@ -1848,6 +1908,20 @@ fn end_on_session_cancel(session_cancel: &SessionCancel) -> Result<(), Status> {
     }
 }
 
+/// How a join ends once it has observed its enrolled shutdown token cancelled,
+/// by the token's cause ([`StreamShutdown::ending_status`]): `UNAVAILABLE
+/// "server shutting down"` for graceful shutdown, `SERVICE_HELD` for a fleet
+/// hold and `UPSTREAM_UNAVAILABLE` for a stale hold verdict (SDD SR-6.3), all
+/// retried. Marks `log` by the same cause
+/// ([`RpcLogContext::stream_shutdown_caused`]), so the one completion line is
+/// INFO for a shutdown or a fleet hold, and WARN for a stale verdict. Every arm
+/// that observes the join's shutdown token ends through here; teardown follows
+/// as for every exit after registration.
+fn end_on_shutdown(shutdown: &StreamShutdown, log: &mut RpcLogContext) -> Status {
+    log.stream_shutdown_caused(shutdown);
+    shutdown.ending_status()
+}
+
 /// The status a JoinSession stream ends with when it fell more than the
 /// per-session presence capacity behind and lost a participant's join or
 /// leave (the bidi loop's lag arm). `UNAVAILABLE`, so the client rejoins and
@@ -1982,19 +2056,27 @@ async fn handle_client_message(
             if let Some(super::proto::join_session_request::RequestType::Message(m)) =
                 msg.request_type
             {
-                // Publish PeerMessage to Valkey.
+                // Publish PeerMessage to Valkey, best effort. The publish
+                // races this join's shutdown token, token first: the
+                // stream's ending drops it (a give-up, so a publish fred has
+                // not sent is never sent), and the caller's loop, which
+                // checks the token first on its next pass, ends the join by
+                // the token's cause, as it would after a completed publish.
                 let event = PresenceEvent::PeerMessage {
                     connection_id: ctx.connection_id.to_string(),
                     data: m.data,
                 };
-                if let Err(e) = publish_presence_event(
-                    &ctx.svc.valkey.pool,
-                    &ctx.svc.key_schema,
-                    ctx.session_id,
-                    &event,
-                )
-                .await
-                {
+                let published = tokio::select! {
+                    biased;
+                    () = ctx.shutdown.cancelled() => Ok(()),
+                    published = publish_presence_event(
+                        &ctx.svc.valkey.pool,
+                        &ctx.svc.key_schema,
+                        ctx.session_id,
+                        &event,
+                    ) => published,
+                };
+                if let Err(e) = published {
                     FredErrOrigin::client(&ctx.svc.valkey, POOL_LABEL_DATA).observe_error(&e);
                     tracing::warn!(
                         session_id = %ctx.session_id,
@@ -2044,8 +2126,9 @@ async fn handle_client_message(
 /// sending while its responses are back-pressured is not. An unarmed join
 /// has neither.
 ///
-/// Returns `Err` for a shutdown — `UNAVAILABLE "server shutting down"`, after
-/// marking `log` shutdown-caused — for a session token cancelled because the
+/// Returns `Err` for a cancelled shutdown token — by its cause, `UNAVAILABLE
+/// "server shutting down"` for a shutdown or the hold's status for a hold,
+/// after marking `log` to match ([`end_on_shutdown`]) — for a session token cancelled because the
 /// session was found missing from the live store with no deletion marker
 /// ([`end_on_session_cancel`]), for a receiver lag that lost a peer's
 /// `PeerJoined` or `PeerLeft` ([`presence_resync_status`], counted on
@@ -2098,14 +2181,14 @@ async fn run_bidi_loop(
         tokio::select! {
             biased;
 
-            // Service shutdown (SDD §5.6, SR-4.7): teardown runs, then the
-            // stream ends `UNAVAILABLE`, so the client rejoins on another
-            // replica. First, so a join that sees a shutdown and a deletion
+            // Service shutdown (SDD §5.6, SR-4.7), or the hold ending (SR-6.3):
+            // teardown runs, then the stream ends `UNAVAILABLE` by the token's
+            // cause, so the client rejoins, on another replica after a
+            // shutdown. First, so a join that sees a shutdown and a deletion
             // together ends as a shutdown. Reads the join's enrolled child
             // token, never a shared one (see `JoinCtx::shutdown`).
             () = ctx.shutdown.cancelled() => {
-                log.shutdown_caused();
-                return Err(server_shutting_down());
+                return Err(end_on_shutdown(&ctx.shutdown, log));
             }
 
             // Session token cancelled (through the join's child): teardown
@@ -2231,8 +2314,7 @@ async fn run_bidi_loop(
                             tokio::select! {
                                 biased;
                                 () = ctx.shutdown.cancelled() => {
-                                    log.shutdown_caused();
-                                    return Err(server_shutting_down());
+                                    return Err(end_on_shutdown(&ctx.shutdown, log));
                                 }
                                 () = session_cancel.cancelled() => {
                                     return end_on_session_cancel(session_cancel);
@@ -2436,11 +2518,15 @@ fn presence_event_to_proto(event: &PresenceEvent) -> JoinSessionResponse {
 ///    timeout plus [`KEEPER_STOP_SLACK`]. On timeout it logs a WARN and goes
 ///    on; a keeper panic surfaces here as a `JoinError`, is logged, and
 ///    teardown goes on;
-/// 3. if the register was issued — even if it errored — unregister: one
-///    script arms the `:gone` marker, removes the member, deletes the info
-///    hash and lease, and publishes `left` iff it removed the member. A
-///    connection a sweep already removed (and announced) is therefore not
-///    announced again;
+/// 3. if the register was issued — even if it errored or the join's ending
+///    dropped it — unregister: one script arms the `:gone` marker, removes
+///    the member, deletes the info hash and lease, and publishes `left` iff
+///    it removed the member. A connection a sweep already removed (and
+///    announced) is therefore not announced again. The call is cut at one
+///    command timeout, its `NOSCRIPT` reload (`SCRIPT LOAD`, then the
+///    `EVALSHA` again) included, and a cut is handled like a failure: logged,
+///    the member left until its lease lapses and a sweep removes it, and the
+///    index left alone;
 /// 4. if the unregister left the session with no members, or the register
 ///    was never issued, remove the session from the index by
 ///    remove-then-recheck;
@@ -2457,6 +2543,11 @@ fn presence_event_to_proto(event: &PresenceEvent) -> JoinSessionResponse {
 /// has expired no member. Either writes nothing. Store
 /// errors are logged, and a timeout is counted once where received; nothing
 /// here fails the stream.
+///
+/// So the teardown gives up within `5 × command timeout + KEEPER_STOP_SLACK`
+/// of its start: the keeper stop, the cut unregister, then step 4's three
+/// commands — the bound the disaster-recovery hold counts
+/// (`dr::hold::join_teardown_write_bound`). Step 5 changes no key.
 async fn teardown(ctx: &JoinCtx<'_>, presence: JoinPresence) {
     let valkey = &ctx.svc.valkey;
     let keys = &ctx.svc.key_schema;
@@ -2496,23 +2587,39 @@ async fn teardown(ctx: &JoinCtx<'_>, presence: JoinPresence) {
             connection_id: ctx.connection_id.to_string(),
         }
         .encode();
-        match unregister_connection(
-            valkey,
-            origin,
-            keys,
-            ctx.session_id,
-            ctx.connection_id,
-            ctx.svc.presence_lease_ttl_secs,
-            &left_payload,
+        // Cut at one command timeout, its `NOSCRIPT` reload included, and
+        // handled like a failure: the member stays until its lease lapses and
+        // a sweep removes it, and the index is left alone.
+        let command_timeout = valkey.pool.last().perf_config().default_command_timeout;
+        match cut_at_command_timeout(
+            command_timeout,
+            unregister_connection(
+                valkey,
+                origin,
+                keys,
+                ctx.session_id,
+                ctx.connection_id,
+                ctx.svc.presence_lease_ttl_secs,
+                &left_payload,
+            ),
         )
         .await
         {
-            Ok(unregistered) => remove_from_index = unregistered.remaining == 0,
-            Err(e) => {
+            Some(Ok(unregistered)) => remove_from_index = unregistered.remaining == 0,
+            Some(Err(e)) => {
                 tracing::warn!(
                     session_id = %ctx.session_id,
                     connection_id = %ctx.connection_id,
                     error = %e,
+                    "failed to unregister presence on teardown"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    session_id = %ctx.session_id,
+                    connection_id = %ctx.connection_id,
+                    error = "cut at the Valkey command timeout \
+                             (LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS), its NOSCRIPT reload included",
                     "failed to unregister presence on teardown"
                 );
             }

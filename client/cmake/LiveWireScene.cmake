@@ -34,7 +34,7 @@ if(BUILD_TESTING)
 
     add_executable(live_scene_journal_test tests/native/scene/scene_journal.cpp tests/native/scene/field_edit_intent.cpp
         tests/native/scene/scene_namespace.cpp tests/native/scene/usd_publication.cpp tests/native/scene/scene_seed.cpp
-        tests/native/scene/footprint_work.cpp)
+        tests/native/scene/footprint_work.cpp tests/native/scene/work_budgets.cpp)
     live_link_stack_dump(live_scene_journal_test)
     target_link_libraries(live_scene_journal_test PRIVATE live_scene_journal)
     live_link_usd(live_scene_journal_test PRIVATE usd)

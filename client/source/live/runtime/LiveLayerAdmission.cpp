@@ -25,10 +25,24 @@ LayerAdmission::LayerAdmission(std::shared_ptr<State> state, EndpointLease endpo
     : state_(std::move(state)), endpoint_(std::move(endpoint)), session_(std::move(session)), layer_(std::move(layer)),
       uri_(std::move(uri)) {}
 LayerAdmission::~LayerAdmission() {
+    // The stream unit returns before a waiting reserve of the same resource
+    // wakes, so that reserve can take it.
+    returnStream();
     // The weak slot owner has already expired; the endpoint lease retires
     // after this body, outside the registry mutex.
     std::lock_guard<std::mutex> lock(state_->mutex);
     state_->released.notify_all();
+}
+std::shared_ptr<StreamReservation> LayerAdmission::stream() const noexcept {
+    std::lock_guard<std::mutex> lock(streamMutex_);
+    return stream_;
+}
+void LayerAdmission::returnStream() noexcept {
+    std::shared_ptr<StreamReservation> returned;
+    {
+        std::lock_guard<std::mutex> lock(streamMutex_);
+        returned = std::move(stream_);
+    }
 }
 void LayerAdmission::markRetiring() noexcept {
     std::lock_guard<std::mutex> lock(state_->mutex);
@@ -81,6 +95,11 @@ std::shared_ptr<LayerAdmission> LayerAdmissionRegistry::reserve(OmniUsdLiveEndpo
         }
     }
     if (available == state_->slots.size()) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+    // The layer's read holds a unit of the endpoint's stream share for the
+    // reservation's whole life, across every reconnect; a full share refuses
+    // the open before any RPC.
+    candidate->stream_ = candidate->endpoint_->calls->reserveStream(OMNI_USD_LIVE_OPERATION_OPEN);
+    if (!candidate->stream_) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
     auto& slot = state_->slots[available];
     slot.uri.swap(uri);
     slot.endpoint = endpoint;

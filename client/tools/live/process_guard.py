@@ -176,7 +176,10 @@ def remove_scratch(scratch):
 
 # Windows: the guard joins its workload to a Job Object. The structures and functions below are used only there.
 SYNCHRONIZE = 0x00100000
+PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
 WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 0x102
+ERROR_INVALID_PARAMETER = 87
 INFINITE = 0xFFFFFFFF
 CREATE_SUSPENDED = 0x00000004
 SEM_FAILCRITICALERRORS = 0x0001
@@ -184,7 +187,10 @@ SEM_NOGPFAULTERRORBOX = 0x0002
 JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x00000400
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION = 1
+JOB_OBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION = 7
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_MSG_NEW_PROCESS = 6
+INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
 class _BasicLimits(ctypes.Structure):
@@ -208,6 +214,10 @@ class _Accounting(ctypes.Structure):
                 ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
 
 
+class _CompletionPort(ctypes.Structure):
+    _fields_ = [("CompletionKey", ctypes.c_void_p), ("CompletionPort", wintypes.HANDLE)]
+
+
 class _Security(ctypes.Structure):
     _fields_ = [("nLength", wintypes.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p),
                 ("bInheritHandle", wintypes.BOOL)]
@@ -221,11 +231,15 @@ _SIGNATURES = (
      [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]),
     ("AssignProcessToJobObject", wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]),
     ("TerminateJobObject", wintypes.BOOL, [wintypes.HANDLE, wintypes.UINT]),
+    ("IsProcessInJob", wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]),
     ("OpenProcess", wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]),
     ("WaitForSingleObject", wintypes.DWORD, [wintypes.HANDLE, wintypes.DWORD]),
     ("WaitForMultipleObjects", wintypes.DWORD,
      [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD]),
     ("CloseHandle", wintypes.BOOL, [wintypes.HANDLE]),
+    ("CreateIoCompletionPort", wintypes.HANDLE, [wintypes.HANDLE, wintypes.HANDLE, ctypes.c_size_t, wintypes.DWORD]),
+    ("GetQueuedCompletionStatus", wintypes.BOOL,
+     [wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD]),
     ("CreateEventW", wintypes.HANDLE, [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]),
     ("SetEvent", wintypes.BOOL, [wintypes.HANDLE]),
     ("SetErrorMode", wintypes.UINT, [wintypes.UINT]),
@@ -260,28 +274,95 @@ def close_handle(handle):
 
 def _job():
     """A job whose last closed handle kills every member, and whose members die on an unhandled exception rather than
-    waiting on an error report dialog."""
+    waiting on an error report dialog, with the completion port that reports each process joining it."""
     job = _check(_kernel32.CreateJobObjectW(None, None))
     limits = _ExtendedLimits()
     limits.BasicLimitInformation.LimitFlags = (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
                                                | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
     _check(_kernel32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits),
                                              ctypes.sizeof(limits)))
-    return job
+    port = _check(_kernel32.CreateIoCompletionPort(INVALID_HANDLE_VALUE, None, 0, 1))
+    association = _CompletionPort(None, port)
+    _check(_kernel32.SetInformationJobObject(job, JOB_OBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION,
+                                             ctypes.byref(association), ctypes.sizeof(association)))
+    return job, port
 
 
-def _empty(job):
-    """Terminates every job member and waits at most 5 s for none to remain."""
-    _kernel32.TerminateJobObject(job, 1)
+def _accounting(job):
+    """The job's accounting: ActiveProcesses counts members, nested jobs' included, that have not reported their exit,
+    and TotalProcesses every process that has joined it."""
     accounting = _Accounting()
+    _check(_kernel32.QueryInformationJobObject(job, JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                                               ctypes.byref(accounting), ctypes.sizeof(accounting), None))
+    return accounting
+
+
+def _joined(port):
+    """Drains the job's completion port: the number of processes it reported joining and their process IDs."""
+    count, ids = 0, set()
+    message, key, pid = wintypes.DWORD(), ctypes.c_size_t(), ctypes.c_size_t()
+    while _kernel32.GetQueuedCompletionStatus(port, ctypes.byref(message), ctypes.byref(key), ctypes.byref(pid), 0):
+        if message.value == JOB_OBJECT_MSG_NEW_PROCESS:
+            count += 1
+            ids.add(pid.value)
+    if ctypes.get_last_error() != WAIT_TIMEOUT:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return count, ids
+
+
+def _open_member(job, pid):
+    """A waitable handle to job member `pid`, or None when no process has that ID or it names a process outside the
+    job; either way the member that joined with it is gone. Raises when the process cannot be checked."""
+    handle = _kernel32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        if ctypes.get_last_error() == ERROR_INVALID_PARAMETER:
+            return None
+        raise ctypes.WinError(ctypes.get_last_error())
+    member = wintypes.BOOL()
+    if not _kernel32.IsProcessInJob(handle, job, ctypes.byref(member)):
+        error = ctypes.get_last_error()
+        _kernel32.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    if member:
+        return handle
+    _kernel32.CloseHandle(handle)  # Another process reused the ID of a member that is gone.
+    return None
+
+
+def _empty(job, port):
+    """Terminates every job member and waits at most 5 s until each has exited; whether every member provably has.
+
+    A terminated member stops counting as active, and leaves the job's process list, before its handles, its working
+    directory among them, close; only its process handle's signal shows that they have. The job's completion port
+    reports each process that joins the job, through a nested job too, so once no member is active the guard waits on
+    every reported process that still exists, including one whose termination began before this cleanup. The port
+    does not guarantee delivery: cleanup is incomplete when it reported fewer joins than the job counted, or when a
+    reported process cannot be checked."""
     deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        _check(_kernel32.QueryInformationJobObject(job, JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
-                                                   ctypes.byref(accounting), ctypes.sizeof(accounting), None))
-        if accounting.ActiveProcesses == 0:
-            return True
+    _kernel32.TerminateJobObject(job, 1)
+    while _accounting(job).ActiveProcesses:
+        if time.monotonic() >= deadline:
+            return False
         time.sleep(0.005)
-    return False
+    members = []
+    try:
+        count, ids = _joined(port)
+        if count < _accounting(job).TotalProcesses:
+            return False
+        for pid in ids:
+            handle = _open_member(job, pid)
+            if handle:
+                members.append(handle)
+        for handle in members:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if _kernel32.WaitForSingleObject(handle, remaining_ms) != WAIT_OBJECT_0:
+                return False
+        return True
+    except OSError:
+        return False
+    finally:
+        for handle in members:
+            _kernel32.CloseHandle(handle)
 
 
 def _windows_environment(handle):
@@ -316,7 +397,10 @@ def _run_in_job(job, command, environment, stop, runner):
             return child.wait()
         return 1
     except BaseException:
-        _kernel32.TerminateJobObject(job, 1)
+        # A workload that may not have joined the job is ended and waited for here. The caller's cleanup terminates
+        # the job itself on every path.
+        child.kill()
+        child.wait()
         raise
 
 
@@ -338,14 +422,15 @@ def windows_main():
     if not runner or os.getppid() != expected_parent:
         return 125
     result = 125
-    job = _job()
+    job, port = _job()
     try:
         result = _run_in_job(job, sys.argv[6:], environment, stop, runner)
     except OSError:
         result = 125
     finally:
-        contained = _empty(job)
+        contained = _empty(job, port)
         _kernel32.CloseHandle(job)
+        _kernel32.CloseHandle(port)
         _kernel32.CloseHandle(runner)
         # The runner reads containment from the status handle, never from the exit status, which stays the workload's
         # own.

@@ -836,9 +836,9 @@ async fn subscribe_teardown_after_out_of_window_catch_up_logs_the_out_of_window_
     for n in 1..=3 {
         commit(&svc, &session_id, LAYER, object_id, n).await;
     }
-    // Trim away every entry the reconnector would replay in-window, so the
-    // first retained entry is not `{seen + 1}-0` and the handler falls through
-    // to the out-of-window regime.
+    // Trim away every entry the reconnector missed, so the first retained
+    // entry is not `{seen + 1}-0` and the handler falls through to the
+    // out-of-window regime.
     let latest = current_seq(&svc, object_id).await;
     let min_id = format!("{latest}-0");
     let cap = XCap::try_from(("MINID", "=", min_id.as_str())).expect("build MINID xcap");

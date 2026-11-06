@@ -250,7 +250,7 @@ pub fn replay_stream_record_into<R: ValueRows>(
     sink: &mut MutationSink,
 ) -> Result<(), ReplayError> {
     let record = decode_stream_record(state.sequence_num, ompf, seq)?;
-    apply_decoded_record_into(state, record, sink)
+    apply_decoded_record_into(state, record, sink).map(drop)
 }
 
 /// [`replay_stream_record_into`] on the structural cache's compact entry,
@@ -366,7 +366,10 @@ pub fn decode_stream_record(
 /// The apply half of [`replay_stream_record_into`]: apply a record
 /// [`decode_stream_record`] decoded to `state`, which must stand at
 /// `record.seq() - 1`, in [`ApplyMode::Replay`] with the caller's `sink`,
-/// then check that the state landed on `record.seq()`.
+/// then check that the state landed on `record.seq()`. Answers the engine's
+/// counters for the record ([`ApplyDeltaStats`]), as
+/// [`apply_decoded_record_indexed`] does: the structural cache's repair
+/// reads them on an entry without plan indexes too.
 ///
 /// # Errors
 ///
@@ -384,11 +387,10 @@ pub fn apply_decoded_record_into<R: ValueRows>(
     state: &mut ObjectStateOf<R>,
     record: DecodedRecord,
     sink: &mut MutationSink,
-) -> Result<(), ReplayError> {
+) -> Result<ApplyDeltaStats, ReplayError> {
     apply_decoded_with(state, record, |state, delta, stats| {
         apply_delta_into_mode(state, delta, sink, stats, ApplyMode::Replay)
     })
-    .map(drop)
 }
 
 /// [`apply_decoded_record_into`] on the structural cache's compact entry

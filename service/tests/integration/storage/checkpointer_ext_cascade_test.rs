@@ -77,8 +77,8 @@ use tokio_util::sync::CancellationToken;
 
 use live_edit::checkpoint::adapters::InMemoryCheckpointStore;
 use live_edit::checkpoint::{
-    spawn_checkpoint_loop, CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointLoopConfig,
-    CheckpointMeta, CheckpointStore, LayerArtifact, TailCaptureConfig,
+    CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointLoopConfig, CheckpointMeta,
+    CheckpointStore, LayerArtifact, TailCaptureConfig,
 };
 use live_edit::domain::types::ObjectState;
 use live_edit::storage::external_values::MockExternalValueStore;
@@ -199,6 +199,10 @@ impl CheckpointStore for RecordingCheckpointStore {
 
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         self.inner.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -594,12 +598,11 @@ async fn prune_tombstones_the_pruned_generations_hashes_and_deletes_no_blob_inli
     let delete_log = recording.delete_log();
     let store: Arc<dyn CheckpointStore> = recording;
     let cancel = CancellationToken::new();
-    let handle = spawn_checkpoint_loop(
+    let handle = crate::common::spawn_checkpoint_loop_and_cleanup(
         client,
         keys,
         Arc::clone(&store),
         loop_config("cascade-ac1-replica", 2),
-        None,
         cancel.clone(),
     );
 
@@ -733,12 +736,11 @@ async fn prune_tombstones_a_still_live_hash_without_deleting_it() {
     let delete_log = recording.delete_log();
     let store: Arc<dyn CheckpointStore> = recording;
     let cancel = CancellationToken::new();
-    let handle = spawn_checkpoint_loop(
+    let handle = crate::common::spawn_checkpoint_loop_and_cleanup(
         client,
         keys,
         Arc::clone(&store),
         loop_config("cascade-ac2-replica", 2),
-        None,
         cancel.clone(),
     );
 
@@ -848,12 +850,11 @@ async fn cross_object_hash_is_tombstoned_by_the_prune_and_deleted_by_nobody() {
     let delete_log = recording.delete_log();
     let store: Arc<dyn CheckpointStore> = recording;
     let cancel = CancellationToken::new();
-    let handle = spawn_checkpoint_loop(
+    let handle = crate::common::spawn_checkpoint_loop_and_cleanup(
         client,
         keys,
         Arc::clone(&store),
         loop_config("cascade-ac3-replica", 2),
-        None,
         cancel.clone(),
     );
 
@@ -989,12 +990,11 @@ async fn quiescent_ticks_neither_re_record_nor_delete() {
     let delete_log = recording.delete_log();
     let store: Arc<dyn CheckpointStore> = recording;
     let cancel = CancellationToken::new();
-    let handle = spawn_checkpoint_loop(
+    let handle = crate::common::spawn_checkpoint_loop_and_cleanup(
         client,
         keys,
         Arc::clone(&store),
         loop_config("cascade-ac4-replica", 2),
-        None,
         cancel.clone(),
     );
 

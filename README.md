@@ -7,7 +7,7 @@
 
 > **[Start with the client](client/README.md#quick-start)** or **[run the service](service/README.md#run-locally)** · Add shared, near-real-time OpenUSD editing to a USD host application, a Python tool or a Kit application. The host supplies the endpoint, the credentials and a serial USD dispatcher; the client owns transport, reconciliation, status and recovery for every live layer, and the service keeps the shared, ordered state.
 >
-> *Experimental prerelease: the client is version 0.1.0, and the service is published from its own releases. Zero-major releases do not promise a stable API or ABI, and the service's `v1alpha` RPC interface is experimental. The [client support boundary](client/docs/ovlive-support-boundary.md) states what is supported and tested, the open qualification gates and the known limitations; the [service API documentation](service/docs/api/docs/index.md) states the RPC contract.*
+> *The client is version 0.1.0, and the service is published from its own releases. Zero-major releases do not promise a stable API or ABI, and the service's `v1alpha` RPC interface may change between service releases. The [client support boundary](client/docs/ovlive-support-boundary.md) states what is supported and tested, the open qualification gates and the known limitations; the [service API documentation](service/docs/api/docs/index.md) states the RPC contract.*
 
 ---
 
@@ -181,7 +181,7 @@ The [support boundary](client/docs/ovlive-support-boundary.md) defines these tar
 | `kit-25.11` — Kit USD 25.11 ABI | Linux x86-64, Linux aarch64, Windows x86-64 | CPython 3.12 | Release target |
 | `stock-25.11` — stock OpenUSD 25.11 | Linux x86-64 | CPython 3.12 | Release target |
 
-- **macOS:** The ovlive client has been built and run on macOS arm64 as an experiment, against stock OpenUSD 25.11 and Python 3.12 built from pinned sources ([macOS source build](client/docs/ovlive-build.md#macos-source-sdks)), but this platform is unsupported. macOS has no release, packman package, Kit support or release qualification, and the reference-service test suites do not run there; successful local use does not establish compatibility.
+- **macOS:** The ovlive client has been built and run on macOS arm64 as an unsupported development build, against stock OpenUSD 25.11 and Python 3.12 built from pinned sources ([macOS source build](client/docs/ovlive-build.md#macos-source-sdks)). macOS has no release, packman package, Kit support or release qualification, and the reference-service test suites do not run there; successful local use does not establish compatibility.
 
 - **Build inputs:** CMake 3.20+, C and C++17 compilers, Make or Ninja, matching USD and Python SDKs, pybind11 and the pinned gRPC/protobuf dependencies. See the [prerequisites](client/docs/ovlive-build.md#prerequisites) and [SDK identities](client/deps/README.md#host-sdk-identities).
 - **Runtime integration:** a Live Edit service endpoint, or another compatible LiveService endpoint, credentials that service accepts and a host-owned serial USD dispatcher. The package uses the host's matching USD and Python shared libraries.
@@ -203,7 +203,7 @@ The client's automated service tests run against its independent reference servi
 - **Source:** NVIDIA-owned source and documentation are licensed under the [Apache License, Version 2.0](LICENSE).
 - **Third-party components:** preserve [NOTICE](NOTICE), [third-party notice index](THIRD_PARTY_NOTICES.md) and the bundled dependency licenses when redistributing. Client native packages contain statically linked and header-derived third-party code.
 - **Service:** licensed under Apache-2.0 ([service/LICENSE.txt](service/LICENSE.txt)), except two vendored upstream sources that keep their own notices; [service/ATTRIBUTIONS.md](service/ATTRIBUTIONS.md) holds the license texts of the crates compiled into it. Each service container image carries its notices under `/licenses/` and the third-party source under `/vendor.tar.gz`, as the [service README](service/README.md#open-source-notices-and-sources) describes.
-- **Distribution:** the client's public release scope is source only, through a reviewed projection to [NVIDIA-Omniverse/ovlive](https://github.com/NVIDIA-Omniverse/ovlive); its native binaries and packman packages are for internal NVIDIA use only. NVIDIA publishes service release images as `nvcr.io/nvidia/omniverse/live-edit-service` and its Helm chart with each service release.
+- **Distribution:** the client ships as source. NVIDIA publishes service release images as `nvcr.io/nvidia/omniverse/live-edit-service` and its Helm chart with each service release.
 - **Contributions and security:** This project is currently not accepting contributions. [CONTRIBUTING.md](CONTRIBUTING.md) states the contribution policy; report vulnerabilities through [SECURITY.md](SECURITY.md).
 
 ---

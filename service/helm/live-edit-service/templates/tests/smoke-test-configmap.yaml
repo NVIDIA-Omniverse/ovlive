@@ -15,7 +15,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */ -}}
 
-{{- if .Values.tests.enabled }}
+{{- /* Never while a disaster-recovery action is set: live-edit-service.drActionSet. */}}
+{{- if and .Values.tests.enabled (ne (include "live-edit-service.drActionSet" .) "true") }}
 apiVersion: v1
 kind: ConfigMap
 metadata:

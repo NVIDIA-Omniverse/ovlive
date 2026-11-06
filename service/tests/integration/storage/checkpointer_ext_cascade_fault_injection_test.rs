@@ -71,8 +71,8 @@ use tokio_util::sync::CancellationToken;
 
 use live_edit::checkpoint::adapters::{CheckpointFaultInjector, InMemoryCheckpointStore};
 use live_edit::checkpoint::{
-    spawn_checkpoint_loop, CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointLoopConfig,
-    CheckpointMeta, CheckpointStore, LayerArtifact, TailCaptureConfig,
+    CheckpointBlob, CheckpointError, CheckpointHandle, CheckpointLoopConfig, CheckpointMeta,
+    CheckpointStore, LayerArtifact, TailCaptureConfig,
 };
 use live_edit::domain::types::ObjectState;
 use live_edit::storage::external_values::MockExternalValueStore;
@@ -237,6 +237,10 @@ impl CheckpointStore for RecordingCheckpointStore {
 
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         self.inner.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -540,12 +544,11 @@ async fn retention_prune_records_tombstones_without_ever_reading_the_live_set() 
     let delete_log = recording.delete_log();
     let store: Arc<dyn CheckpointStore> = recording;
     let cancel = CancellationToken::new();
-    let handle = spawn_checkpoint_loop(
+    let handle = crate::common::spawn_checkpoint_loop_and_cleanup(
         client,
         keys,
         Arc::clone(&store),
         loop_config("cascade-fi-replica", 2),
-        None,
         cancel.clone(),
     );
 

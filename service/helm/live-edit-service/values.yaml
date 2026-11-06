@@ -83,11 +83,15 @@ serviceAccount:
 
 ## @param podAnnotations Annotations to add to the pod
 ## Type: object. Optional. Default: {}
+## Also added to the disaster-recovery Job pods (dr).
 podAnnotations: {}
 
 ## @param podLabels Labels to add to the pod
 ## Type: object. Optional. Default: {}
 ## Deployment selector labels and app.kubernetes.io/component=server are reserved.
+## Also added to the disaster-recovery Job pods (dr), without
+## app.kubernetes.io/name and with app.kubernetes.io/component=dr-job, so no
+## server selector matches them.
 podLabels: {}
 
 ## @param podSecurityContext Security context for the pod
@@ -103,6 +107,28 @@ podSecurityContext:
   runAsNonRoot: true
   seccompProfile:
     type: RuntimeDefault
+
+## @param shareProcessNamespace Share one process namespace between the server pod's containers
+## Type: boolean. Optional. Default: false (unset or null is false)
+## Without it the service is its container's PID 1, and the kernel drops every
+## signal but SIGKILL and SIGSTOP sent to a PID 1 that neither handles nor
+## blocks it; the service does neither for SIGABRT. With true the pod's pause
+## process is PID 1, so a SIGABRT sent from outside the pod reaches the
+## service. A node-level crash-dump agent that aborts a pod near its memory
+## limit, to get a core dump instead of an OOM kill, needs this. The core dump
+## is written only if the node's core pattern pipes it to a host handler: the
+## container's root filesystem is read-only.
+## The exposure: every container in the pod, sidecars included, sees all the
+## pod's processes and their command lines. One running as the same user or
+## as root can signal them and read their environment (the service's holds the
+## backing-store connection Secret), memory and files through /proc; one with
+## CAP_SYS_PTRACE can read them too.
+## No container is PID 1 then, so a signal a process does not handle takes its
+## default action, which for most signals ends it. The service handles SIGTERM
+## from start either way: once serving it drains, and before that it stops
+## within seconds.
+## A quoted "true" or "false" fails the render. Changing it rolls the pods.
+shareProcessNamespace: false
 
 ## @param securityContext Security context for the container
 ## Type: object. Optional.
@@ -425,7 +451,8 @@ valkey:
   ## @param valkey.commandTimeoutMs Per-command timeout for Valkey operations in ms
   ## Type: integer. Maps to LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS env var. Default: 5000
   ## How long the service waits for Valkey to answer one request before failing it.
-  ## Set to 0 to disable. Stops requests hanging while a connection is reconnecting.
+  ## Must be at least 1: 0 (no timeout) fails the chart render, and the service refuses it at
+  ## startup. Stops requests hanging while a connection is reconnecting.
   ## Large whole-layer writes get a longer deadline automatically.
   commandTimeoutMs: 5000
   ## @param valkey.reconnectMaxDelayMs Exponential reconnect backoff cap in ms
@@ -443,10 +470,8 @@ valkey:
   ## Non-clustered Valkey: sets read parallelism only; a small value (e.g. 8-32) serves any
   ## number of subscriptions and cuts the replica's connection count.
   ## Valkey Cluster (MemoryDB, AMR): a reader serves one hash slot — in practice one layer —
-  ## at a time, and connects only to the primary that owns that slot (one socket, plus a
-  ## backchannel socket opened only when a read that timed out on the service's side is
-  ## still blocked on the server), moving to
-  ## another primary when it binds a slot there. This is also the number of DISTINCT layers
+  ## at a time, and connects only to the primary that owns that slot (one socket), moving
+  ## to another primary when it binds a slot there. This is also the number of DISTINCT layers
   ## a replica can serve at once. A
   ## subscribe to one more layer waits for a reader within its capacity budget
   ## (subscriberAdmissionWaitMs); if none frees, its stream ends with a retryable
@@ -477,9 +502,8 @@ valkey:
   ## resources.limits.memory: raising this lowers the catch-up memory budget, and past
   ## what the limit can carry the service stops at startup naming the limit it needs. A slot
   ## covers only a catch-up's backing-store reads and its build: never a send, so a slow client
-  ## cannot hold one, and a subscriber that is already up to date takes none. (In rollback
-  ## mode, layer.catchupSnapshotEnabled=false, a same-object reconnect on Valkey Cluster
-  ## also holds its slot while it waits for a stream reader.) Past the limit a catch-up
+  ## cannot hold one, and a subscriber that is already up to date takes none. Past the
+  ## limit a catch-up
   ## waits its turn in arrival order within its capacity budget
   ## (subscriberAdmissionWaitMs), with the stream open and nothing delivered. The
   ## wait ends on client disconnect, session deletion or shutdown; when the budget runs out
@@ -490,24 +514,28 @@ valkey:
   subscriberMaxConcurrentCatchups: 8
   ## @param valkey.subscriberAdmissionWaitMs A subscribe's capacity budget: the total time it may wait for capacity
   ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_ADMISSION_WAIT_MS env var. Default: 20000
-  ## One budget covers the four waits for capacity a SubscribeReadLayer can make: admission
+  ## One budget covers the five waits for capacity a SubscribeReadLayer can make: admission
   ## past the subscription ceiling (derived from resources.limits.memory; see resources
   ## below), on Valkey Cluster a free stream reader
-  ## (subscriberPoolSize), each catch-up slot (subscriberMaxConcurrentCatchups), and
-  ## each snapshot read permit (catchupSnapshotReadConcurrency).
+  ## (subscriberPoolSize), each catch-up slot (subscriberMaxConcurrentCatchups),
+  ## each snapshot read permit (catchupSnapshotReadConcurrency), and each catch-up
+  ## payload's reservation of the replica's catch-up payload memory (also derived from
+  ## resources.limits.memory).
   ## Each wait is charged only for the time it spends waiting; reading, building and sending
-  ## are not charged, and a waiting subscription buffers nothing. An overwrite re-bootstrap
+  ## are not charged, and a waiting subscription buffers nothing, except while it waits for
+  ## its catch-up payload memory: that wait starts after the subscription begins receiving
+  ## live updates, so they queue for it meanwhile. An overwrite re-bootstrap
   ## (the layer replaced under the subscription, during its catch-up or after it) starts a
   ## fresh budget. So each overwrite that lands during a first open's catch-up adds one more
   ## budget of possible waiting before any content: 2 x the budget (40 s at the default) for
   ## one overwrite, already past the tightest client's 30 s first-open window, and since
   ## re-bootstraps can chain, (k+1) x the budget for k overwrites landing during successive
-  ## catch-ups. 0 = never wait for capacity: each wait takes a free slot, reader
-  ## or permit or is refused at once.
+  ## catch-ups. 0 = never wait for capacity: each wait takes a free slot, reader, permit
+  ## or payload memory or is refused at once.
   ## Every refusal is a retryable UNAVAILABLE. An admission refusal comes before the stream
-  ## opens (Trailers-Only); a reader, catch-up-slot or read-permit refusal (reason
-  ## reader_capacity, or catchup_capacity for the last two) comes in-stream, after the stream
-  ## opens and before any content. The one
+  ## opens (Trailers-Only); a reader, catch-up-slot, read-permit or payload-memory refusal
+  ## (reason reader_capacity, or catchup_capacity for the last three) comes in-stream, after
+  ## the stream opens and before any content. The one
   ## exception is a steady-state overwrite re-bootstrap, whose refusal comes after the
   ## caught-up ack. A subscribe refused at a full replica, or for want of a free reader, is
   ## refused only once its budget has run out (20 s at the default). Every wait ends early on
@@ -517,8 +545,9 @@ valkey:
   subscriberAdmissionWaitMs: 20000
   ## @param valkey.subscriberAdmissionMaxWaiters Cap on subscribes queued for admission at once
   ## Type: integer. Maps to LIVE_EDIT_SUBSCRIBER_ADMISSION_MAX_WAITERS env var.
-  ## Default: 0, for which the chart leaves the variable out so the binary applies its own
-  ## default — the subscription ceiling, which it derives from resources.limits.memory.
+  ## Default: 0. For 0, however written ("0", "00", "+0"), or an empty value, the chart leaves
+  ## the variable out so the binary applies its own default — the subscription ceiling,
+  ## which it derives from resources.limits.memory.
   ## Past the cap a subscribe is refused immediately
   ## instead of joining the admission queue. NOTE: the binary REJECTS an explicit 0 at startup (a zero cap next to a non-zero
   ## wait makes the wait dead code) — express fail-fast with subscriberAdmissionWaitMs: 0
@@ -571,11 +600,13 @@ valkey:
   ## Type: integer. Maps to LIVE_EDIT_MAINTENANCE_POOL_SIZE env var. Default: 1.
   ## Sizes a dedicated multiplexed Valkey pool used exclusively by the periodic
   ## maintenance loops so their SCAN / HGETALL / EVALSHA traffic cannot queue
-  ## behind hot-path readers and writers on the data pool. THREE consumers now
+  ## behind hot-path readers and writers on the data pool. FIVE consumers
   ## share it, on independent cadences: the external-value GC loop (a pass about
-  ## once a second), the orphan sweep (300 s) and the reference-count reconciler
-  ## (its own interval, with a per-pass budget of interval/2). All three are gated on the same
-  ## `le:gc:leader` lease, but one replica's three loops share that lease rather
+  ## once a second), the orphan sweep (300 s), the reference-count reconciler
+  ## (its own interval, with a per-pass budget of interval/2), the large-value
+  ## backup repair (300 s) and the checkpoint clean-up
+  ## (checkpoint.reconcileIntervalSecs). All five are gated on the same
+  ## `le:gc:leader` lease, but one replica's five loops share that lease rather
   ## than exclude each other, so on the leader replica they overlap freely.
   ## One connection is still sufficient: fred multiplexes concurrent commands over
   ## a single connection, and the reconciler is both leader-gated and
@@ -596,9 +627,7 @@ valkey:
   ## inside its catch-up slot (subscriberMaxConcurrentCatchups) and holds it across the
   ## read only. Waiting for a permit is charged to the subscribe's capacity budget
   ## (subscriberAdmissionWaitMs); when the budget runs out the stream ends with a
-  ## retryable UNAVAILABLE (reason catchup_capacity) before any content. A legacy
-  ## in-window replay (catchupSnapshotEnabled false) takes one permit per replayed
-  ## commit the same way, except for an empty commit, which it sends with no read. A live
+  ## retryable UNAVAILABLE (reason catchup_capacity) before any content. A live
   ## subscriber never reads layer state, so it takes no permit. The snapshot
   ## ceilings are derived at this value: raising it raises the writer delay a join wave can
   ## cause, so raise it only with your own measurement. Every replica runs this many, so
@@ -629,7 +658,7 @@ valkey:
   ## @param valkey.snapshotPoolSize Dedicated multiplexed pool for object-snapshot reads (the snapshot lane)
   ## Type: integer or null. Maps to LIVE_EDIT_SNAPSHOT_POOL_SIZE env var. Default: null
   ## (the variable is not rendered and the binary derives the size: 6 at the defaults).
-  ## Snapshot reads (catch-up, per-commit, checkpoint and structural reads of a layer's
+  ## Snapshot reads (catch-up, checkpoint and structural reads of a layer's
   ## whole state) carry replies of up to hundreds of KiB, so they get connections of their
   ## own and never queue in front of UpdateLayer commands on the data pool
   ## (valkey.poolSize). The clean-up of a deleted or replaced layer reads only the layer's
@@ -639,12 +668,11 @@ valkey:
   ## reads, and the structural reads of the WATCH path (an uncacheable layer, an edit too
   ## large for one script call, or the lua-watch-structural and txn backends, at every
   ## size), run on the lane too. The
-  ## catch-up, per-commit and checkpoint reads run on it at every size: over either
+  ## catch-up and checkpoint reads run on it at every size: over either
   ## ceiling a catch-up, a checkpoint or a structural cache cold start or audit reads
   ## through the fenced read, whose windows run
-  ## on the lane while its fence requests and renewals stay on the data pool (a per-commit
-  ## read never goes over a ceiling). The default is P_a + P_f + 4: one
-  ## connection for each atomic read (catch-up or per-commit; P_a =
+  ## on the lane while its fence requests and renewals stay on the data pool. The default
+  ## is P_a + P_f + 4: one connection for each catch-up atomic read (P_a =
   ## catchupSnapshotReadConcurrency, 1) and fenced read
   ## (P_f = catchupFencedReadConcurrency, 1) a replica runs at once, plus four for the
   ## structural and checkpoint reads and the clean-up's reference reads. Left null, the
@@ -663,7 +691,7 @@ valkey:
   ## A layer at or under both snapshot ceilings is read in one atomic server-side
   ## script, which blocks its Valkey shard while it runs; a layer over either ceiling
   ## takes the slower above-ceiling read instead, which is still correct and is never
-  ## refused. The catch-up, per-commit and checkpoint reads take the atomic read, and so do
+  ## refused. The catch-up and checkpoint reads take the atomic read, and so do
   ## the structural write-planning cache's cold starts, reloads and audits (backend lua,
   ## consumers structural_cache and structural_cache_audit; a cold start over either
   ## ceiling, or whose item count at 18 bytes per item would pass the byte ceiling, takes
@@ -686,7 +714,7 @@ valkey:
   ## The byte side of the same ceiling (see snapshotAtomicReadMaxItems): it bounds
   ## an atomic read's reply size and the server-side script's memory, and it is the
   ## bounded fan-out read's per-window reply-byte target (a target sized from the read's
-  ## average entry size, not a maximum). The catch-up, per-commit and checkpoint reads take
+  ## average entry size, not a maximum). The catch-up and checkpoint reads take
   ## the atomic read, and so do the structural write-planning cache's cold starts, reloads
   ## and audits within the ceilings (backend lua, consumers structural_cache and
   ## structural_cache_audit); the structural reads of the WATCH path (an uncacheable
@@ -778,17 +806,18 @@ valkey:
       ## one). It enforces NO practical upper limit beyond that, deliberately:
       ## an oversized lead withholds no credential, it only re-reads the token
       ## file over a wider window.
-      ## Leave it at the default unless the sizing note at the end of this
-      ## comment applies to your deployment.
+      ## Leave it at the default: below 180 it raises what the provisioner
+      ## sidecar's own refresh lead must be (see below).
       ##
       ## It is the *refresh lead* handed to the Redis-scoped token provider, and
-      ## it schedules re-reads only: once the cached token's `expires_on` is
-      ## within `refreshLeadSecs` + `pollIntervalSecs` of now, the provider
-      ## re-reads the token file every 250ms until a replacement lands (and for
-      ## 20s past the expiry if none does), instead of waiting for the steady
-      ## `checkpoint.credentials.accessTokenFile.pollIntervalSecs` tick
-      ## (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, default 15s) that the same
-      ## single provisioner sidecar's token file is otherwise polled on.
+      ## it schedules re-reads only: from the first steady re-read that finds
+      ## the cached token's `expires_on` within `refreshLeadSecs` +
+      ## `pollIntervalSecs` of now (so more than `refreshLeadSecs` before it),
+      ## the provider re-reads the token file every 250ms until a replacement
+      ## lands (and for 20s past the expiry if none does), instead of waiting
+      ## for the steady `checkpoint.credentials.accessTokenFile.pollIntervalSecs`
+      ## tick (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, default 15s) that
+      ## the same single provisioner sidecar's token file is otherwise polled on.
       ##
       ## It does NOT decide which credential is presented. The Valkey credential
       ## provider serves the cached token for its whole real lifetime and fails
@@ -799,38 +828,35 @@ valkey:
       ##
       ## Operator-override boundary: this knob tunes only the re-read lead and
       ## never which credential is presented (the re-AUTH cadence is a fixed
-      ## constant; since the rotation gate the periodic tick only re-sends a
-      ## credential after the token file actually rotated). Lowering it is
-      ## inert at best and gives up the head start on a late sidecar rotation.
-      ## Raising it is NOT inert: set it to at least the provisioner sidecar's
-      ## own refresh lead minus the token-file poll interval and the service is
-      ## already re-reading at 250ms when the replacement lands, so pickup
-      ## takes ~250ms instead of up to one poll — which removes the poll term
-      ## from the sidecar sizing recommendation below, tightening it from 195s
-      ## to ~180s. That is the only effect a higher value has; it cannot make
-      ## the recommendation worse.
+      ## constant, and the periodic tick only re-sends a credential after the
+      ## token file actually rotated). Lowering it below
+      ## 180 is NOT inert: the fast re-read then arms too late to catch a
+      ## replacement the sidecar writes just over 180s before expiry, so the
+      ## sidecar needs a refresh lead of at least 180s plus the token-file poll
+      ## interval. At or above 180 (the default), any sidecar lead at least one
+      ## second over 180s clears the floor, because a replacement written
+      ## before the fast re-read arms is picked up by the re-read that arms it,
+      ## more than `refreshLeadSecs` before expiry, and one written after it
+      ## within ~250ms. Raising it above 180 does not change that requirement.
       ##
       ## The setting that DOES need sizing is not this one — it is the
       ## provisioner sidecar's own refresh lead, i.e. how far ahead of expiry it
-      ## rewrites the token file. Recommend >= 180s PLUS the service's token-file
-      ## poll interval (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, 15s by
-      ## default) — 195s at the defaults — with margin above that (a sidecar
-      ## already sized against the pre-rotation-gate 375s recommendation is
-      ## fine). The 180s is the rotation-gated fan-out ceiling: after the file
-      ## rotates, the first periodic tick to observe it opens a fan-out window
-      ## and every connection re-AUTHs within one further tick (ticks are
-      ## jittered 60–90s, two serial stages worst-case ≈ 180s); the poll
-      ## interval is the pickup delay (a token written at expiry-lead is not
-      ## cached until up to one poll later). A sidecar lead clearing their sum
-      ## guarantees every connection re-AUTHs with the replacement token before
-      ## the old one expires and is prolonged in place. A shorter sidecar lead
-      ## is NOT an outage: below the threshold the fraction of connections
-      ## dropped by the backing store at expiry — reconnecting immediately with
-      ## the by-then-cached fresh token — grows roughly in proportion to the
-      ## shortfall, worst case one reconnect blip per pooled connection per token
-      ## lifetime. The service cannot check that sidecar lead at startup (it is
-      ## not a live-edit setting), so it measures the achieved headroom at every
-      ## token rotation instead: gauge
+      ## rewrites the token file. The docs recommend 7 minutes (420s). A
+      ## sidecar lead of 180s plus the service's token-file poll interval
+      ## (`LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS`, 15s by default), 195s
+      ## at the defaults, is enough whatever this value is; with this value at
+      ## 180 or above (the default), 181s is enough. A sidecar lead that is
+      ## enough lets every connection switch to the new token before the old one
+      ## expires, except in rare cases, such as a backing-store command
+      ## timeout (`valkey.commandTimeoutMs`) raised well past its default,
+      ## where some connections may reconnect once at that rotation. A
+      ## shorter sidecar lead is NOT an
+      ## outage: with headroom below the floor some connections may be dropped
+      ## by the backing store at expiry and reconnect immediately with the
+      ## by-then-cached fresh token, at worst one reconnect per connection per
+      ## token lifetime. The service cannot check that sidecar lead at startup
+      ## (it is not a live-edit setting), so it measures the achieved headroom
+      ## at every token rotation instead: gauge
       ## live_edit_service_token_refresh_headroom_seconds{role="valkey"} plus a
       ## WARN whenever a rotation lands under the 180s floor — once per rotation,
       ## typically once a day, since a healthy sidecar rotates once per token
@@ -996,6 +1022,9 @@ serviceIdentity:
     ## Type: object. Default: image unset, requests cpu=20m and memory=32Mi.
     ## Rendered into `spec.template.spec.containers[]` only when
     ## `serviceIdentity.accessTokenFile.enabled: true` and image is non-empty.
+    ## The disaster-recovery Jobs (dr) run it as a native sidecar, an init
+    ## container with `restartPolicy: Always`, so it never keeps a Job from
+    ## finishing; any `restartPolicy` set here is replaced there.
     ## The chart supplies a predefined container `name`
     ## (`<chart>-token-provisioner`) and the `token-exchange` volumeMount;
     ## operators supply the rest — `image`, `env` and `args` configuring every
@@ -1047,15 +1076,25 @@ layer:
   ## Type: integer or null. Maps to LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS env var. Default: null
   ## (unset: the service derives min(2000, rpc.deadlineMs / 2), so 2000 at the default deadline).
   ## Past it the upload is refused UNAVAILABLE with nothing applied. 0 means never wait. A
-  ## waiting upload leaves its unread content in its connection's flow-control window, so this
-  ## also bounds how long it can hold up other calls on that connection. A value set here must be
-  ## below rpc.deadlineMs; one at or above it is rejected at startup. Bounds admission only: an
+  ## waiting upload holds up to 1 MiB of its unread content and its client's deadline runs while
+  ## it waits, so the default is short. How waiting uploads share their connection with other
+  ## calls is described under uploadAdmissionMaxWaiters. A value set here must be below
+  ## rpc.deadlineMs; one at or above it is rejected at startup. Bounds admission only: an
   ## admitted upload's wait to be processed is bounded by rpc.deadlineMs.
   uploadAdmissionWaitMs: null
   ## @param layer.uploadAdmissionMaxWaiters Uploads that may wait for the upload budget at once
-  ## Type: integer. Maps to LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS env var. Default: 64
+  ## Type: integer, 1-2046. Maps to LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS env var. Default: 64
   ## One more is refused UNAVAILABLE at once. Zero is rejected at startup (set
-  ## uploadAdmissionWaitMs to 0 to never wait).
+  ## uploadAdmissionWaitMs to 0 to never wait). It also sizes each inbound connection's HTTP/2
+  ## receive window, (this + 1) x 1 MiB (65 MiB at the default), so waiting uploads cannot fill
+  ## their connection's window on their own. The one spare stream window is shared, not reserved:
+  ## the connection still stalls once its unread request content together (waiting uploads,
+  ## uploads not yet admitted, JoinSession messages the service has not read yet) fills the whole
+  ## window. That window is also how much unread request content one connection can hold. Beyond
+  ## the waiting uploads' own 1 MiB each, pod memory is not set aside for that content, and the
+  ## service limits neither connections nor concurrent streams per connection. To bound this,
+  ## optionally limit connections and concurrent streams per client at your ingress or proxy.
+  ## Above 2046 the window would exceed HTTP/2's largest, so it is rejected at startup.
   uploadAdmissionMaxWaiters: 64
   ## @param layer.updateRetryMaxAttempts Max UpdateLayer retry attempts
   ## Type: integer. Maps to LIVE_EDIT_UPDATE_LAYER_RETRY_MAX_ATTEMPTS env var. Default: 128
@@ -1102,12 +1141,6 @@ layer:
   ## (commit output is byte-for-byte identical between the "lua" and "txn" backends).
   ## Production default should stay "lua".
   updateLayerBackend: lua
-
-  ## @param layer.catchupSnapshotEnabled Corrected-snapshot late-join / rejoin catch-up
-  ## Type: boolean. Maps to LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED env var. Default: true.
-  ## true (default) serves the corrected faithful full-state snapshot on late-join / rejoin;
-  ## false falls back to the legacy catch-up reconstruction.
-  catchupSnapshotEnabled: true
 
   ## @param layer.structuralCacheAuditRate Probability a structural edit starts a sampled audit of the structural write-planning cache
   ## Type: number in [0, 1]. Maps to LIVE_EDIT_STRUCTURAL_CACHE_AUDIT_RATE env var. Default: 0.001.
@@ -1210,18 +1243,17 @@ presence:
 ##
 ## Constraint: `shutdown.overallBudgetSecs` must be at least
 ## `shutdown.timeoutSecs` + 15; the service refuses to start otherwise. The
-## 15 s covers closing the Valkey connections (`ValkeyClient::quit()`, whose
-## internal bounds sum to 11.5 s) plus slack for the shutdown steps with no
-## timeout of their own. The metrics-server abort and the final telemetry
-## flush run after the overall budget, outside it. The floor leaves room for
-## one full per-task wait plus 15 s; it is not the worst case, because the
-## shutdown sequence runs several per-task waits one after another (at least
-## four), so a shutdown in which each of them uses its whole budget can still
-## reach the overall cap, which then cuts the sequence short with a "shutdown
-## overall budget exceeded" warning. Raising `timeoutSecs` without also
-## raising `overallBudgetSecs` makes that warning more likely. The two
-## values are intentionally separate knobs so operators can tune
-## drain-vs-cleanup independently, but the floor above must hold.
+## last 15 s of `overallBudgetSecs` are always kept for closing the Valkey
+## connections. Stopping the metrics server and the final telemetry flush
+## run after the overall budget, outside it. After the server stops, the
+## shutdown runs up to three cleanup waits one after another, each bounded
+## by `timeoutSecs`. At `overallBudgetSecs` >= 3 x `timeoutSecs` + 15 (the
+## defaults sit exactly there) every wait gets its full `timeoutSecs`; below
+## that a slow cleanup can be cut short, and the service logs
+## "shutdown wait cut short to keep Valkey quit()'s headroom". Raise
+## `overallBudgetSecs` with `timeoutSecs` to avoid that. The two values are
+## intentionally separate knobs so operators can tune drain-vs-cleanup
+## independently, but the floor above must hold.
 shutdown:
   ## @param shutdown.timeoutSecs Graceful shutdown deadline in seconds
   ## Type: integer. Maps to LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS env var. Default: 5.
@@ -1229,15 +1261,14 @@ shutdown:
   ## streams keep serving through it; when it ends the listening socket
   ## closes, and just after the server's GOAWAY the streams start ending
   ## UNAVAILABLE, paced — see streamEndRate — which clients retry) and the
-  ## per-task budget for each background-task join and for the JoinSession
-  ## and SubscribeReadLayer cleanup waits during shutdown.
+  ## bound of each cleanup wait after the server stops (less when the overall
+  ## budget's last 15 s are near; see the constraint above).
   timeoutSecs: 5
   ## @param shutdown.overallBudgetSecs Overall cap on post-server shutdown in seconds
   ## Type: integer. Maps to LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS env var.
-  ## Default: 30. Wraps the whole post-server shutdown sequence (layer
-  ## cleanup + stream and session-checkpoint drains + background-task joins +
-  ## parallelised Valkey quit()) in a single tokio::time::timeout; the
-  ## metrics-server abort and the final telemetry flush run after it. A term
+  ## Default: 30. Bounds all cleanup after the server stops; its last 15 s
+  ## are always kept for closing the Valkey connections. Stopping the metrics
+  ## server and the final telemetry flush run after it. A term
   ## of the minimum terminationGracePeriodSeconds (see there). MUST be at
   ## least timeoutSecs + 15; see the constraint above.
   overallBudgetSecs: 30
@@ -1428,8 +1459,10 @@ checkpoint:
   ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_TICK_SECS env var. Default: 10.
   ## Cadence at which the checkpointer evaluates per-layer eligibility (combining
   ## `interval` + `quiesce` + last-write timestamps). MUST be strictly less than
-  ## `checkpoint.interval` — `Config::from_env` rejects `tick >= interval` at
-  ## startup. Zero rejected at startup.
+  ## `checkpoint.interval`; the service refuses to start otherwise. Maximum 19:
+  ## a longer tick lets backup leadership lapse and backup clean-up skip its
+  ## work. The chart refuses 20 or more, and so does the service at startup.
+  ## Zero rejected at startup.
   tick: 10
 
   ## @param checkpoint.retainGenerations Number of historical checkpoint generations to keep per layer
@@ -1624,6 +1657,23 @@ checkpoint:
   ## largest layer in the deployment. Zero rejected at startup.
   requestTimeoutMs: 30000
 
+  ## @param checkpoint.notFoundCacheSecs At least the longest cache lifetime set on the Storage service, in seconds (its default is 15 minutes)
+  ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS env var. Default: 900.
+  ## Read only by the disaster-recovery restore and accept-loss Jobs, and only
+  ## with `adapter: StorageApi`: a Job never acts on a backup it reads as
+  ## missing until this long after the hold's quiet period, and waits instead.
+  ## Any whole number of seconds; 0 is allowed.
+  notFoundCacheSecs: 900
+
+  ## @param checkpoint.restoreParallelism The most layers a disaster-recovery restore Job reads or writes at once
+  ## Type: integer. Maps to LIVE_EDIT_DR_RESTORE_PARALLELISM env var. Default: 8.
+  ## Read only by the disaster-recovery restore and accept-loss Jobs; the
+  ## service ignores it. Lower it if a restore Job runs out of memory, or raise
+  ## the Job's memory limit with `dr.resources`. Zero is rejected at startup.
+  ## Like any setting here, a change rolls the service's pods; setting a `dr.*`
+  ## value does not.
+  restoreParallelism: 8
+
   ## @param checkpoint.countersSyncInterval Periodic counter-sidecar write cadence (seconds)
   ## Type: integer. Maps to LIVE_EDIT_CHECKPOINT_COUNTERS_SYNC_SECS env var. Default: 60.
   ## Controls how often the checkpoint leader copies the object_id counter
@@ -1700,6 +1750,106 @@ checkpoint:
   ## `live_edit_checkpoint_config_reconcile_grace_seconds`.
   reconcileIntervalSecs: ""
 
+## Disaster recovery
+##
+## The restore and accept-loss Jobs, run while the service holds itself after
+## its backing store lost data. Setting dr.restore.incident or
+## dr.acceptLoss.incident renders that action's Job, a plain Kubernetes Job
+## named <fullname>-dr-restore-<incident> or <fullname>-dr-accept-loss-<incident>,
+## with -<attempt> appended when the action's attempt is set. A name over the
+## 63 characters Kubernetes allows keeps the incident and attempt whole and
+## shortens <fullname>, adding 8 characters of a hash of it so each release's
+## Job names stay distinct. One action at a time: setting both fails the render.
+## Setting or clearing a dr value changes neither the Deployment nor the
+## settings ConfigMap, so nothing restarts; change only dr values in that
+## upgrade. The smoke-test hooks (tests.enabled) do not render while an action
+## is set. The Jobs need Kubernetes 1.29 or later: the render fails below it
+## while an action is set. Clearing an action's values deletes its Job and
+## pod, and with them the Job's log; clear every dr value once the hold clears.
+## A Job runs with the service's image, ServiceAccount, podLabels,
+## podAnnotations, security contexts, volumes, volumeMounts, nodeSelector,
+## tolerations and affinity.nodeAffinity, its settings ConfigMap and its
+## backing-store and token wiring. It has no probes and no pod affinity, and
+## the token provisioner runs beside it as a native sidecar.
+## See docs/service/docs/durability.md § When the service is held.
+dr:
+  restore:
+    ## @param dr.restore.incident The incident id of the hold to restore; setting it runs the restore Job
+    ## Type: string. Default: "" (no restore Job).
+    ## The incident id the hold names: lowercase letters, digits and hyphens,
+    ## starting and ending with a letter or digit, such as 20261013t1708-a3f9.
+    ## Anything else fails the render naming the value.
+    ## See docs/service/docs/durability.md § Run the restore Job.
+    incident: ""
+    ## @param dr.restore.attempt A suffix that gives the restore Job a new name, to run it again
+    ## Type: string or integer. Default: "" (no suffix).
+    ## A Job runs once and its pod cannot change once created, so set a new
+    ## attempt to run a finished or failed Job again, or to run it with changed
+    ## dr.resources. Up to 8 lowercase letters, digits and hyphens, starting
+    ## and ending with a letter or digit, such as 2. Anything else fails the
+    ## render naming the value, as does an incident and attempt too long to fit
+    ## the 63-character Job name beside an 8-character hash.
+    attempt: ""
+  acceptLoss:
+    ## @param dr.acceptLoss.incident The incident id of the hold to accept a loss for; setting it runs the accept-loss Job
+    ## Type: string. Default: "" (no accept-loss Job).
+    ## Accept-loss restores everything a backup can supply, then permanently
+    ## discards what none can, and clears the hold. It runs only with
+    ## dr.acceptLoss.confirm. The same format as dr.restore.incident.
+    ## See docs/service/docs/durability.md § Accept a loss.
+    incident: ""
+    ## @param dr.acceptLoss.confirm Confirms that accept-loss may permanently discard lost data
+    ## Type: string. Default: "". The only accepted value is "discard-lost-data".
+    ## With dr.acceptLoss.incident set, the render fails while this is unset or
+    ## any other value. Set while dr.acceptLoss.incident is not, it also fails
+    ## the render, so a confirmation never carries over to the next incident.
+    confirm: ""
+    ## @param dr.acceptLoss.confirmUnconfirmed Also discards the data accept-loss cannot confirm is lost
+    ## Type: string. Default: "". The only accepted value is
+    ## "discard-unconfirmed-data", and only beside dr.acceptLoss.confirm; the
+    ## render fails otherwise, and while dr.acceptLoss.incident is unset.
+    ## The last resort, for items the backup store answered with an error rather
+    ## than an absence: without it accept-loss keeps the service held on such an
+    ## item; with it, the Job discards the item too, although a backup may still
+    ## hold it.
+    ## See docs/service/docs/durability.md § Accept a loss.
+    confirmUnconfirmed: ""
+    ## @param dr.acceptLoss.attempt A suffix that gives the accept-loss Job a new name, to run it again
+    ## Type: string or integer. Default: "" (no suffix). The rules of
+    ## dr.restore.attempt.
+    attempt: ""
+  ## @param dr.resources The Jobs' container resources, laid over resources
+  ## Type: object. Default: {} (the service's resources).
+  ## A key set here replaces the service's value (resources) for the Jobs;
+  ## requests and limits merge entry by entry, so `limits: {memory: 8Gi}` keeps
+  ## the service's CPU. The memory request follows the service's rule: unset,
+  ## 70 % of the limit, rounded down to whole Mi; set, at most the limit. A Job
+  ## sizes its memory from its limit as the service does, and exits 2 at start
+  ## below the smallest limit its configuration needs, naming dr.resources.
+  ## A change reaches a new Job only: set a new
+  ## attempt for a Job that already exists.
+  ## See docs/service/docs/durability.md § Resources for the restore Job.
+  resources: {}
+  ## @param dr.backoffLimit How many times a Job's failed pod is retried
+  ## Type: integer. Default: 6, Kubernetes' own default. Null renders nothing
+  ## (Kubernetes' default applies).
+  ## Exits 2 (a refused configuration or command line), 3 (the service stays
+  ## held) and 4 (the hold names another incident) fail the Job at once and are
+  ## never retried; exit 1 and a crash are. A pod lost to an eviction or a node
+  ## drain is retried without counting.
+  ## See docs/service/docs/durability.md § Read a Job's log.
+  backoffLimit: 6
+  ## @param dr.ttlSecondsAfterFinished How long a finished Job, its pod and its log are kept (seconds)
+  ## Type: integer. Default: 604800 (7 days). Null or 0 renders nothing: the Job
+  ## is kept until its dr values are cleared.
+  ## Kubernetes deletes the Job this long after it finishes. A later `helm
+  ## upgrade` with the same dr values still set creates it again; it acts only
+  ## on its own incident's hold, so with that hold cleared it exits 0. The
+  ## Job's log is accept-loss's only record of
+  ## what it discarded: save it before the Job is deleted.
+  ## See docs/service/docs/durability.md § After the hold clears.
+  ttlSecondsAfterFinished: 604800
+
 ## Memory allocator
 ##
 ## The service binary allocates through jemalloc with
@@ -1759,8 +1909,8 @@ allocator:
 ## valkey.catchupFencedReadConcurrency, the snapshot ceilings, layer.maxSize,
 ## layer.uploadAdmissionMaxWaiters) are counted against the limit: raising one lowers
 ## the catch-up memory budget. When the limit cannot carry the configuration (below
-## 2709Mi (2,709 MiB, about 2.65Gi) at this chart's defaults, on any CPU count, or
-## below 2809Mi (2,809 MiB) on any CPU count with a backup store) the service stops at
+## 2687Mi (2,687 MiB, about 2.62Gi) at this chart's defaults, on any CPU count, or
+## below 3282Mi (3,282 MiB) on any CPU count with a backup store) the service stops at
 ## startup with an error naming the smallest limit it needs, so a rolling upgrade
 ## keeps the old pods serving.
 ## A change of the memory limit restarts the container, because the budgets are sized
@@ -1790,6 +1940,7 @@ allocator:
 ## CPU target is a percentage of the request, so at the default 80 it adds replicas when
 ## they average about 0.8 cores; a smaller request scales out on load a replica handles
 ## well.
+## The disaster-recovery Jobs take these resources, with dr.resources laid over them.
 resources:
   requests:
     cpu: 1
@@ -1831,7 +1982,7 @@ startupProbe:
   ## Type: integer. Default: 2
   timeoutSeconds: 2
   ## @param startupProbe.failureThreshold Consecutive failures before the pod is restarted
-  ## Type: integer. Default: 57. periodSeconds × failureThreshold = 285 s of
+  ## Type: integer. Default: 62. periodSeconds × failureThreshold = 310 s of
   ## boot budget. A normal boot takes seconds; this budget only matters for a
   ## DEGRADED boot, where each Valkey connect phase runs to its full timeout.
   ## The worst-case boot terms are ADDITIVE, not alternative: the counter-seed
@@ -1843,10 +1994,19 @@ startupProbe:
   ## connected at startup, each connects when it first serves a subscription)
   ## + 5 s (the atomic snapshot-read self-test: one attempt, bounded by
   ##   LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS 5 s)
+  ## + 5 s (the durability check's CONFIG GET appendonly, when checkpoints
+  ##   are off: one command, bounded by the command timeout)
+  ## + 6 s (the disaster-recovery hold read: one read, bounded by the smaller
+  ##   of the command timeout and LIVE_EDIT_DR_HOLD_POLL_INTERVAL_MS, at most
+  ##   6 s)
+  ## + 10 s (the store-memory read: bounded as a whole by 2 × the command
+  ##   timeout)
   ## + 90 s (counter-seed bounded retry: 30 attempts × 3 s)
+  ## = 266 s
   ## + 40 s margin (scheduling jitter, image-layer decompression, probe
   ##   granularity, the 5 s bootstrap handoff budget)
-  ## = 285 s. A budget that covered each term individually would kill a boot
+  ## = 306 s, rounded up to whole 5 s periods: 310 s. A budget that covered
+  ## each term individually would kill a boot
   ## that was slow but healthy and progressing — precisely the failure mode
   ## the early-bind work exists to eliminate. If you raise
   ## LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS or LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS,
@@ -1857,7 +2017,7 @@ startupProbe:
   ## (any pods already replaced are rolled back too) without serving capacity
   ## ever dropping (strategy.rollingUpdate.maxUnavailable is 0), so it fails
   ## cleanly and is retried once the dependency recovers.
-  failureThreshold: 57
+  failureThreshold: 62
   ## @param startupProbe.successThreshold Successes required to pass
   ## Type: integer. Must be 1 for startup probes.
   successThreshold: 1
@@ -2371,6 +2531,15 @@ serviceMonitor:
   ## label expected by the local Prometheus instance)
   ## Type: object. Default: {}
   labels: {}
+  ## @param serviceMonitor.metricRelabelings Your own metric relabeling rules, applied after the chart's
+  ## Type: array of objects (Prometheus Operator RelabelConfig, camelCase fields). Optional. Default: []
+  ## The chart's ServiceMonitor always keeps the service's own `endpoint` (the
+  ## RPC name) and `service` (the pod name, or `serviceLabel`) labels, which the
+  ## Prometheus Operator would otherwise move to `exported_endpoint` and
+  ## `exported_service`. Rules
+  ## here run after the chart's, so they see those values. Null or an empty
+  ## string adds no rules; any other value that is not a list fails the render.
+  metricRelabelings: []
 
 ## @param revisionHistoryLimit Number of old ReplicaSets to retain
 ## Type: integer. Default: 3. Lower than k8s's default of 10 — three is enough
@@ -2403,6 +2572,8 @@ tolerations: []
 
 ## @param affinity Affinity rules for pod assignment
 ## Type: object. Optional. Default: {}
+## The disaster-recovery Jobs (dr) take nodeAffinity only: a pod affinity or
+## anti-affinity written for server pods could leave a Job unschedulable.
 affinity: {}
 
 ## Smoke-test image configuration
@@ -2444,6 +2615,9 @@ smokeTest:
 tests:
   ## @param tests.enabled Enable/disable the smoke test Job + ConfigMap.
   ## Type: boolean. Default: false.
+  ## The smoke-test hooks never render while a disaster-recovery action is set
+  ## (dr): the service is held then and cannot pass them, so they would fail
+  ## the upgrade that starts the Job.
   enabled: false
 
   ## Dedicated ServiceAccount for the smoke-test Job. Separate from the

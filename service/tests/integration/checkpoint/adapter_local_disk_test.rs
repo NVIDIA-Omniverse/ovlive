@@ -39,7 +39,7 @@
 //! are sequential and the multi-thread runtime would only add scheduler
 //! overhead without any signal.
 //!
-//! The wrapper drives cases `case_01_*` … `case_42_*`; Group J (#28–#37) is the
+//! The wrapper drives cases `case_01_*` … `case_44_*`; Group J (#28–#37) is the
 //! Epic-2 tail-generation block — a tail put through the shared
 //! `put_layer_checkpoint`, get-by-handle addressing off
 //! `(object_id, snap_seq, kind)`, and a listing that interleaves both kinds
@@ -523,6 +523,24 @@ async fn case_43_list_live_ext_set_counts_its_own_listing_and_projects_to_the_li
         setup,
     )
     .await;
+}
+
+// Case #44 — the DR Jobs' list-route canary (`verify_list_route`). Rides the
+// regular `setup`: this adapter answers it with no I/O.
+#[tokio::test]
+async fn case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed() {
+    conformance::case_44_verify_list_route_passes_on_a_working_store_and_leaves_nothing_listed(
+        setup,
+    )
+    .await;
+}
+
+// Case #45 — the DR restore Job's one listing, grouped per object. Rides the
+// artifact fixture, so an orphaned companion stem and a write temp sit in the
+// `layers/` directory beside the generations.
+#[tokio::test]
+async fn case_45_grouped_layer_artifacts_equal_each_objects_listing() {
+    conformance::case_45_grouped_layer_artifacts_equal_each_objects_listing(setup_artifacts).await;
 }
 
 #[cfg(feature = "test-checkpoint-fault-injection")]

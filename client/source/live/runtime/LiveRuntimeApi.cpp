@@ -113,9 +113,13 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveUnregisterCallback(OmniUsdLiveCa
     return resultBoundary([&]() -> OmniUsdLiveResult {
         auto runtime = getRuntime();
         if (!runtime) return OmniUsdLiveResult(OMNI_USD_LIVE_NOT_INITIALIZED);
-        if ((handle >> 56) == 8) return runtime->diagnostics->unsubscribe(handle, timeoutMs);
-        return (handle >> 56) == 5 ? runtime->statuses->unsubscribe(handle, timeoutMs) :
-                                     runtime->auth->unsubscribe(handle, timeoutMs);
+        const bool sink = (handle >> 56) == 8;
+        return observedCleanup(*runtime->diagnostics, CleanupCall::UnregisterCallback, handle, timeoutMs,
+            [&]() -> OmniUsdLiveResult {
+            if (sink) return runtime->diagnostics->unsubscribe(handle, timeoutMs);
+            return (handle >> 56) == 5 ? runtime->statuses->unsubscribe(handle, timeoutMs) :
+                                         runtime->auth->unsubscribe(handle, timeoutMs);
+        }, sink);
     });
 }
 
@@ -124,7 +128,15 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveWait(OmniUsdLiveRequest request,
 }
 
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveCancel(OmniUsdLiveRequest request, uint32_t timeoutMs) {
-    return withRequest(request, [&](Request& value) { return value.cancel(timeoutMs); });
+    return resultBoundary([&]() -> OmniUsdLiveResult {
+        auto runtime = getRuntime();
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        return observedCleanup(*runtime->diagnostics, CleanupCall::Cancel, request, timeoutMs,
+            [&]() -> OmniUsdLiveResult {
+            auto found = runtime->requests->find(request);
+            return found ? found->cancel(timeoutMs) : OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_HANDLE);
+        });
+    });
 }
 
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveGetRequestStatus(OmniUsdLiveRequest request,
@@ -140,7 +152,9 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveGetRequestError(OmniUsdLiveReque
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveReleaseRequest(OmniUsdLiveRequest request) {
     return resultBoundary([&]() -> OmniUsdLiveResult {
         auto runtime = getRuntime();
-        return runtime ? runtime->requests->release(request) : OmniUsdLiveResult(OMNI_USD_LIVE_NOT_INITIALIZED);
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        return observedCleanup(*runtime->diagnostics, CleanupCall::ReleaseRequest, request, 0,
+            [&] { return runtime->requests->release(request); });
     });
 }
 
@@ -192,11 +206,12 @@ OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveRegisterEndpoint(const OmniUsdLi
 OmniUsdLiveResult OMNI_USD_LIVE_CALL omniUsdLiveUnregisterEndpoint(OmniUsdLiveEndpoint endpoint, uint32_t timeoutMs) {
     // Dependents hold endpoint leases, so final release is BUSY at once while
     // any exists (Live.h); the endpoint owns no other internal work to drain,
-    // so timeout_ms has nothing to bound.
-    (void)timeoutMs;
+    // so timeout_ms has nothing to bound and the call never returns TIMEOUT.
     return resultBoundary([&]() -> OmniUsdLiveResult {
         auto runtime = getRuntime();
-        return runtime ? runtime->unregisterEndpoint(endpoint) : OmniUsdLiveResult(OMNI_USD_LIVE_NOT_INITIALIZED);
+        if (!runtime) return OMNI_USD_LIVE_NOT_INITIALIZED;
+        return observedCleanup(*runtime->diagnostics, CleanupCall::UnregisterEndpoint, endpoint, timeoutMs,
+            [&] { return runtime->unregisterEndpoint(endpoint); });
     });
 }
 

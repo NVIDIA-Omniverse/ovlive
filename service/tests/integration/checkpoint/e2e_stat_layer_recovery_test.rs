@@ -267,7 +267,6 @@ async fn stat_layer_returns_not_found_when_recovery_disabled() {
     let session_recovery = build_disabled_session_recovery_hook(&tv, Arc::clone(&metrics));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store: Arc::clone(&layer_store),
         ext_value_store: Arc::new(MockExternalValueStore::new()),

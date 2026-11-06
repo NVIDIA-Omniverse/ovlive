@@ -41,6 +41,8 @@
 //! | catch-up `T` | the residual, below | line (`T × (1 + P_f)`) | 744 MiB |
 //! | retirement `R_ref` | `L / 500` | margin | 10 MiB |
 //! | external-value mirror `M_ext` | `max(⌈floor⌉, L / 40)`, the floor one maximum-size value's mirror charge (`checkpoint::ext_mirror::item_charge_kib`), only while the mirror is wired | margin | 128 MiB |
+//! | live delivery `D_live` | `(L − floor) / 100` | line | 49 MiB |
+//! | catch-up payloads `D_c` | `3 (L − floor) / 100` | margin | 148 MiB |
 //!
 //! `M_ext` is present exactly when checkpointing is on with an adapter
 //! ([`Config::checkpoint_adapter_wired`]), and then `main.rs` builds the
@@ -74,6 +76,8 @@
 //! | catch-up `T × (1 + P_f)` | `s × (L − floor) × (1 + P_f)` |
 //! | retirement `R_ref` | `L ÷ 500` |
 //! | external-value mirror `M_ext` | `max(⌈floor⌉ MiB, L ÷ 40)` |
+//! | live delivery `D_live` | `(L − floor) ÷ 100` |
+//! | catch-up payloads `D_c` | `3 (L − floor) ÷ 100` |
 //! | the allowances | the line `4L ÷ 5`, the margin `L ÷ 5` |
 //!
 //! Every other term depends on settings and recorded constants only, and its
@@ -119,9 +123,13 @@
 //! lowering `LIVE_EDIT_MAX_LAYER_SIZE` or, while the base bootstraps are
 //! charged, turning off the tail, with its cost; it never offers turning off
 //! checkpointing or the adapter, which removes backups, and says so.
+//! Raising the limit names the chart setting that sets it
+//! ([`MemoryLimitSetting`]): `resources.limits.memory` for the service,
+//! `dr.resources.limits.memory` in a disaster-recovery Job, whose pod takes
+//! its limit from that setting rather than the service's.
 //! When no limit fits, it says so and names what to lower instead:
 //! `LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY`, with the largest value that
-//! can fit, when `T × (1 + P_f)` outgrows every limit (above 61 at the
+//! can fit, when `T × (1 + P_f)` outgrows every limit (above 60 at the
 //! chart's other settings), else the terms of the side, or sides, that do
 //! not close at 1 PiB.
 //!
@@ -178,8 +186,9 @@
 //!   min of such pieces all meet it; a share of `L − x` with `x` above the
 //!   floor, or anything that grows faster than its share, does not.
 //! - **C3, margin growth.** The margin terms' coefficients on `L` sum to at
-//!   most 1/5 (today `R_ref`'s 1/500 and `M_ext`'s 1/40, counted whether or
-//!   not `M_ext` is present, which only over-counts). A fixed minimum does not
+//!   most 1/5 (today `R_ref`'s 1/500, `M_ext`'s 1/40 and `D_c`'s 3/100, 57/1,000
+//!   in all, counted whether or not `M_ext` is present, which only
+//!   over-counts). A fixed minimum does not
 //!   change a coefficient: where it binds the term is constant, and above it
 //!   the term grows at its share's slope.
 //!
@@ -208,9 +217,13 @@
 //! Compiled at their records' full precision, in bytes:
 //!
 //! - the steady-state floor, 155 MiB (dev pods after load; SDD §21.2);
-//! - `m`, one established subscription, 49.8 KiB, and `e`, one queued entry
-//!   per subscription, 167.1 B
-//!   (`docs-internal/validation/stream-mux-hardening-2026-09-30/report.md`);
+//! - `m`, one established subscription, 49.8 KiB
+//!   (`docs-internal/validation/stream-mux-hardening-2026-09-30/report.md`),
+//!   and `e`, one queued entry per subscription, 267.9 B (its larger
+//!   measurement, 267.85 B, rounded up to the tenth it is held in), which no
+//!   term charges but `D_live`'s per-entry charge must cover
+//!   ([`QUEUED_ENTRY_BYTES_DECI`];
+//!   `docs-internal/validation/bounded-delivery-b-ntm-20261021/report.md`);
 //! - `X`, one fenced read stage's fan-out window transient, 149,987,424 B,
 //!   and the checkpoint reference read, 128.6796875 MiB on short-id reply
 //!   bytes, both scaled to real-id bytes by the byte ceiling, and both scaled
@@ -220,7 +233,9 @@
 //! - the cold-start ratios `r` and `b`
 //!   (`storage::structural_cache_cold_start`), the catch-up slot's 42 bytes per
 //!   ceiling byte (`storage::memory_budget`), the allocator's 55 MiB of slack
-//!   and the 20 % margin.
+//!   and the 20 % margin;
+//! - the tail capture's per-entry overhead, 1 KiB, an upper bound checked by
+//!   a test that measured about 263 B ([`TAIL_ENTRY_OVERHEAD_BYTES`]).
 
 use std::sync::OnceLock;
 
@@ -239,17 +254,29 @@ pub const POD_MEMORY_FLOOR_BYTES: u64 = 155 * MIB;
 pub const SUBSCRIPTION_BYTES_DECI: u64 = 509_952;
 
 /// `e`, the memory one queued stream entry holds per subscription, in tenths
-/// of a byte: 167.1 B, the allocation slope of 200 stalled subscriptions
-/// (SDD §16).
-pub const QUEUED_ENTRY_BYTES_DECI: u64 = 1_671;
+/// of a byte: 267.9 B, the larger of its measurements rounded up to a tenth.
+/// Each is the allocation slope of stalled subscriptions, by the 2026-09-30
+/// M3b method (`docs-internal/validation/stream-mux-hardening-2026-09-30/report.md`):
+/// on x86_64, 167.80 B on main and 267.85 B with the live-delivery ledger
+/// (b.ntm); on aarch64, 167.1 B on main, so 267.15 B with the ledger's
+/// 100.05 B added (`docs-internal/validation/bounded-delivery-b-ntm-20261021/report.md`).
+/// No plan term charges it: `D_live` is a share of the limit, and charges
+/// each queued entry at least this
+/// (`storage::stream_mux::delivery_ledger::RELAY_ENTRY_OVERHEAD_BYTES`, a
+/// compile-time assertion there).
+pub const QUEUED_ENTRY_BYTES_DECI: u64 = 2_679;
 
-/// The stream entries one catch-up slot's catch-up queues between its stream
-/// registration and its first poll, in hundredths: the design rate of 275
-/// commits/s × `t_post`, 0.73 s (SDD §16), each costing `e`.
-pub const PRE_POLL_ENTRIES_PER_SLOT_CENTI: u64 = 275 * 73;
-
-/// The payload the catch-ups before their first poll share, 1 MiB (SDD §16).
-pub const PRE_POLL_SHARED_PAYLOAD_BYTES: u64 = MIB;
+/// The memory one stream entry of a checkpoint tail capture holds beyond its
+/// relay bytes, 1 KiB: its stream id, payload field, record header and the
+/// page's per-entry structures, while the capture holds every entry it read
+/// and encodes its envelope. An upper bound: `tests/delivery_memory`'s
+/// `a_tail_capture_at_its_entry_cap_peaks_within_the_plans_per_entry_charge`
+/// measures the peak at the entry cap (about 263 B per entry) and fails if
+/// this charge falls below it. The tail capture's peak is
+/// `2 × LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES` (the entries read, and the
+/// envelope encoded at its exact size from them) plus this per entry plus one
+/// page's reply ([`tail_capture_peak_bytes`]).
+pub const TAIL_ENTRY_OVERHEAD_BYTES: u64 = 1024;
 
 /// Memory per catch-up slot per byte of the atomic-read byte ceiling: a
 /// snapshot plus one build (`storage::memory_budget`), 42.
@@ -280,8 +307,18 @@ pub const REFERENCE_READ_BYTES: u64 = (REFERENCE_READ_SHORT_ID_BYTES as u128
     .div_ceil(RECORD_SHORT_ID_BYTE_CEILING as u128) as u64;
 
 /// The unread content one queued upload waiter can hold: one HTTP/2 stream
-/// window at hyper's server default, 1 MiB (SDD §5.4).
-pub const UPLOAD_WAITER_WINDOW_BYTES: u64 = MIB;
+/// window, [`HTTP2_STREAM_WINDOW_BYTES`](crate::grpc::transport::HTTP2_STREAM_WINDOW_BYTES),
+/// 1 MiB (SDD §5.4).
+///
+/// The plan counts only the waiters' unread content. A connection's receive
+/// window, which bounds the unread request content of all its streams together,
+/// is larger: (`LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS` + 1) × this
+/// (`grpc::transport::http2_connection_window_bytes`), 65 MiB at the default.
+/// Across connections that content is connections × that window, and the
+/// service bounds neither connections nor streams per connection, so beyond
+/// the waiters' term it is outside the plan (SDD §21.2).
+pub const UPLOAD_WAITER_WINDOW_BYTES: u64 =
+    crate::grpc::transport::HTTP2_STREAM_WINDOW_BYTES as u64;
 
 /// The allocator's slack, a margin term: 55 MiB.
 pub const ALLOCATOR_SLACK_BYTES: u64 = 55 * MIB;
@@ -386,6 +423,23 @@ mod share {
             }
         }
 
+        /// `k / 10,000` of `base`, in bytes (unit 1), made at run time: the
+        /// restore Job's term ([`super::PodMemoryPlan::dr_restore_line`]).
+        /// Its denominator, 10,000, divides [`EXACT_DEN`] (checked below at
+        /// compile time), so its exact coefficient is `k × EXACT_DEN ÷
+        /// 10,000`, a whole number for every `k`: built `⌊k × L ÷ 10⁴⌋` B,
+        /// exact `k × L ÷ 10⁴`, so C1 holds by construction.
+        pub(crate) const fn of_ten_thousandths(k: u64, base: ShareBase) -> Self {
+            const PER_TEN_THOUSANDTH: u128 = whole_ratio(EXACT_DEN, 10_000);
+            Self {
+                num: k,
+                den: 10_000,
+                base,
+                unit: 1,
+                per_base_byte: k as u128 * PER_TEN_THOUSANDTH,
+            }
+        }
+
         /// The share's numerator.
         pub(crate) const fn num(&self) -> u64 {
             self.num
@@ -467,6 +521,29 @@ pub(crate) const EXT_MIRROR_SHARE: Share = Share::new::<1, 40, MIB>(ShareBase::L
 /// One hundredth of `L − floor`, in MiB: `T` at a step of `k` hundredths is
 /// this share times `k`.
 pub(crate) const CATCHUP_HUNDREDTH: Share = Share::new::<1, 100, MIB>(ShareBase::AboveFloor);
+
+/// `D_live`, the live-delivery budget: `(L − floor) / 100`, in MiB, a line
+/// term. It bounds the relay bytes the replica's subscriptions hold between
+/// the stream reader's copy-out and the response stream's take, each queued
+/// entry's per-subscription overhead included, less each layer's largest live
+/// entry (`storage::stream_mux::delivery_ledger`). When it is exceeded, the
+/// subscription holding the most of those bytes is ended `delivery_budget`
+/// and catches up on its retry; readers never wait for it. The line holds
+/// no separate term for a lagging layer's backlog or a catch-up's queued
+/// entries: this budget bounds both replica-wide (SDD §12.6, §16).
+pub(crate) const LIVE_DELIVERY_SHARE: Share = Share::new::<1, 100, MIB>(ShareBase::AboveFloor);
+
+/// `D_c`, the catch-up payload budget: `3 (L − floor) / 100`, in MiB, a margin
+/// term ([`MARGIN_SHARES`]). Every catch-up payload with its external values
+/// is reserved from it before its first external-value byte is read, and each
+/// 1 MiB page repays its share once its bytes are released after the send; the
+/// external values a catch-up restores from the backup store before that are
+/// reserved from it too, a batch at a time at the restore-only charge per byte
+/// (`storage::ompf_payload::EXT_RESTORE_CHARGE_CENTI`), each value's share
+/// repaid at its write-back. A catch-up
+/// that cannot be granted it within its capacity budget is refused before any
+/// content (`storage::client`'s `catchup_payload_budget`; SDD §12.3).
+pub(crate) const CATCHUP_PAYLOAD_SHARE: Share = Share::new::<3, 100, MIB>(ShareBase::AboveFloor);
 
 /// The line's allowance: 80 % of `L`, in bytes.
 pub(crate) const LINE_ALLOWANCE: Share = Share::new::<4, 5, 1>(ShareBase::Limit);
@@ -564,6 +641,18 @@ const EXT_MIRROR_MARGIN: MarginShare = MarginShare {
     settings: Some(EXT_MIRROR_SETTINGS),
 };
 
+/// `D_c`'s entry: always charged, no minimum, no setting, so a refusal never
+/// names it (lowering no setting lowers it). In the margin, not the line: a
+/// catch-up payload is a transient of a join, and charging it to the line
+/// would take it from `T`, which funds the same joins' snapshots.
+const CATCHUP_PAYLOAD_MARGIN: MarginShare = MarginShare {
+    name: "catch-up payloads",
+    share: CATCHUP_PAYLOAD_SHARE,
+    present: always_present,
+    minimum_units: no_minimum,
+    settings: None,
+};
+
 fn always_present(_: &PlanInputs) -> bool {
     true
 }
@@ -599,7 +688,8 @@ const EXT_MIRROR_SETTINGS: &str =
 /// of them that is present, and nothing else of `L`, and C3's compile-time
 /// sum below covers exactly these, so a margin share cannot be charged
 /// without entering it.
-pub(crate) const MARGIN_SHARES: [MarginShare; 2] = [RETIREMENT_MARGIN, EXT_MIRROR_MARGIN];
+pub(crate) const MARGIN_SHARES: [MarginShare; 3] =
+    [RETIREMENT_MARGIN, EXT_MIRROR_MARGIN, CATCHUP_PAYLOAD_MARGIN];
 
 /// C3: the margin's shares' coefficients on `L` sum to at most the margin's
 /// 1/5, each counted whether or not it is present for some inputs. And `T`'s
@@ -675,12 +765,18 @@ pub struct PlanInputs {
     pub max_layer_size: u64,
     /// Whether the checkpoint base bootstrap can run: checkpointing enabled,
     /// an adapter wired and the tail enabled
-    /// ([`Config::checkpoint_base_bootstrap_enabled`]).
+    /// ([`Config::checkpoint_base_bootstrap_enabled`]). The checkpoint tail
+    /// capture runs exactly then too, so it is also what charges the tail
+    /// capture's peak to the line's checkpoint term.
     pub base_bootstrap: bool,
     /// Whether the external-value mirror is wired: checkpointing enabled and
     /// an adapter wired ([`Config::checkpoint_adapter_wired`]), with or
     /// without the tail. `M_ext` is charged exactly then.
     pub ext_mirror: bool,
+    /// `LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES`.
+    pub tail_max_bytes: u64,
+    /// `LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES`.
+    pub tail_max_entries: u64,
 }
 
 impl PlanInputs {
@@ -695,13 +791,16 @@ impl PlanInputs {
             max_layer_size: u64::try_from(config.max_layer_size).unwrap_or(u64::MAX),
             base_bootstrap: config.checkpoint_base_bootstrap_enabled(),
             ext_mirror: config.checkpoint_adapter_wired(),
+            tail_max_bytes: u64::try_from(config.checkpoint_tail_max_bytes).unwrap_or(u64::MAX),
+            tail_max_entries: config.checkpoint_tail_max_entries,
         }
     }
 
     /// The Helm chart's configuration: pools 64 / 64 / 1 / 6 and 256 stream
     /// readers, 8 catch-up slots, `P_f` 1, 64 upload waiters, 100 MiB uploads,
-    /// the default byte ceiling, no checkpoint adapter. The inputs of
-    /// [`PodMemoryPlan::reference`].
+    /// the default byte ceiling, no checkpoint adapter, and the tail's caps at
+    /// the chart's `checkpoint.tail.maxBytes` (64 MiB) and `maxEntries`
+    /// (4,096). The inputs of [`PodMemoryPlan::reference`].
     pub const fn reference() -> Self {
         Self {
             pools: PoolSizes {
@@ -718,6 +817,8 @@ impl PlanInputs {
             max_layer_size: crate::grpc::upload_admission::MAX_LAYER_SIZE_DEFAULT_BYTES,
             base_bootstrap: false,
             ext_mirror: false,
+            tail_max_bytes: 64 * MIB,
+            tail_max_entries: 4_096,
         }
     }
 }
@@ -736,6 +837,10 @@ struct Budgets {
     retirement_mib: u64,
     /// `M_ext`, MiB, `None` when the mirror is not wired.
     ext_mirror_mib: Option<u64>,
+    /// `D_live`, MiB.
+    live_delivery_mib: u64,
+    /// `D_c`, MiB.
+    catchup_payload_mib: u64,
     /// The limit they were taken at, bytes: the terms' exact values are
     /// taken from their shares at it.
     limit: u64,
@@ -755,6 +860,10 @@ fn budgets_at(limit: u64, inputs: &PlanInputs) -> Budgets {
         upload_mib: UPLOAD_SHARE.built_units(limit, upload_floor_mib),
         retirement_mib: RETIREMENT_SHARE.built_units(limit, 0),
         ext_mirror_mib: EXT_MIRROR_MARGIN.built_units(limit, inputs),
+        live_delivery_mib: LIVE_DELIVERY_SHARE.built_units(limit, 0),
+        catchup_payload_mib: CATCHUP_PAYLOAD_MARGIN
+            .built_units(limit, inputs)
+            .unwrap_or(0),
         limit,
         upload_floor_mib,
     }
@@ -842,8 +951,7 @@ fn line_terms_without_t(
 /// The line's terms other than the catch-up budget's, at `budgets` for
 /// `inputs`, with the connection buffers on `topology`, built and exact.
 fn line_terms_at(budgets: &Budgets, inputs: &PlanInputs, topology: Topology) -> Vec<ExactTerm> {
-    use crate::storage::notifications::{CONSUMER_BACKLOG_BYTES, CONSUMER_CHANNEL_CAPACITY};
-    use crate::storage::stream_mux::{BACKLOG_HARD_CAP_FACTOR, XREAD_REPLY_TARGET_BYTES};
+    use crate::storage::stream_mux::XREAD_REPLY_TARGET_BYTES;
     use crate::storage::structural_cache::{
         max_entry_bytes_for, resident_budget_bytes, STRUCTURAL_COLD_START_READ_PERMITS,
     };
@@ -858,7 +966,6 @@ fn line_terms_at(budgets: &Budgets, inputs: &PlanInputs, topology: Topology) -> 
     // (unit 1), so each is a whole number of 1/EXACT_DEN byte by
     // construction.
     let exact_at = |share: Share| share.exact_units_scaled(budgets.limit, 0);
-    let hard_cap_entries = (CONSUMER_CHANNEL_CAPACITY * BACKLOG_HARD_CAP_FACTOR) as u64;
     let readers = inputs.pools.readers as u64;
     let as_built = |terms: Vec<PlanTerm>| terms.into_iter().map(ExactTerm::as_built);
     let mut terms = vec![
@@ -890,22 +997,16 @@ fn line_terms_at(budgets: &Budgets, inputs: &PlanInputs, topology: Topology) -> 
             readers.saturating_mul(XREAD_REPLY_TARGET_BYTES),
             "LIVE_EDIT_SUBSCRIBER_POOL_SIZE",
         ),
-        PlanTerm::fixed(
-            "one lagging layer",
-            (CONSUMER_BACKLOG_BYTES * BACKLOG_HARD_CAP_FACTOR as u64)
-                + scale_up(hard_cap_entries, QUEUED_ENTRY_BYTES_DECI, 10),
-        ),
-        PlanTerm::fixed(
-            "catch-ups before their first poll",
-            PRE_POLL_SHARED_PAYLOAD_BYTES.saturating_add(scale_up(
-                inputs
-                    .catchup_slots
-                    .saturating_mul(PRE_POLL_ENTRIES_PER_SLOT_CENTI),
-                QUEUED_ENTRY_BYTES_DECI,
-                1_000,
-            )),
-        ),
     ]));
+    // `D_live`, a share of `L − floor` with no setting: built, its whole MiB;
+    // exact, the share unrounded.
+    terms.push(ExactTerm::new(
+        PlanTerm::fixed(
+            LIVE_DELIVERY_TERM,
+            budgets.live_delivery_mib.saturating_mul(MIB),
+        ),
+        LIVE_DELIVERY_SHARE.exact_units_scaled(budgets.limit, 0) * u128::from(MIB),
+    ));
     // Built, `C × (1 + φ)` rounded up to a whole byte; exact, `C` unrounded
     // times `1 + φ`, one byte more for that rounding up.
     terms.push(ExactTerm::new(
@@ -943,9 +1044,9 @@ fn line_terms_at(budgets: &Budgets, inputs: &PlanInputs, topology: Topology) -> 
                 RECORD_BYTE_CEILING,
             ),
         ),
-        PlanTerm::fixed(
-            "checkpoint reference read",
+        checkpoint_term(
             scale_up(REFERENCE_READ_BYTES, scaled_ceiling, RECORD_BYTE_CEILING),
+            inputs,
         ),
     ]));
     terms.push(ExactTerm::new(
@@ -980,6 +1081,59 @@ fn line_terms_at(budgets: &Budgets, inputs: &PlanInputs, topology: Topology) -> 
         ),
     ]));
     terms
+}
+
+/// `D_live`'s term name in the line.
+const LIVE_DELIVERY_TERM: &str = "live delivery";
+
+/// The checkpoint term's name while the reference read is the larger piece.
+const CHECKPOINT_REFERENCE_READ_TERM: &str = "checkpoint reference read";
+
+/// The checkpoint term's name while the tail capture is the larger piece: the
+/// name a refusal gives it, with [`TAIL_CAPTURE_SETTINGS`].
+const CHECKPOINT_TAIL_CAPTURE_TERM: &str = "checkpoint tail capture";
+
+/// The settings that switch the tail capture on and size it.
+const TAIL_CAPTURE_SETTINGS: &str = "LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES, \
+    LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES, LIVE_EDIT_CHECKPOINT_TAIL_ENABLED";
+
+/// The checkpoint tail capture's peak for `inputs`, in bytes: the entries it
+/// read, up to `LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES`, held while the envelope
+/// encoded from them at its exact size (`checkpoint::tail_codec`) is built,
+/// so twice that cap, plus [`TAIL_ENTRY_OVERHEAD_BYTES`] per entry up to
+/// `LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES`, plus one page's reply at the
+/// stream readers' reply target. A constant in `L`, so C2 holds.
+pub(crate) fn tail_capture_peak_bytes(inputs: &PlanInputs) -> u64 {
+    inputs
+        .tail_max_bytes
+        .saturating_mul(2)
+        .saturating_add(
+            inputs
+                .tail_max_entries
+                .saturating_mul(TAIL_ENTRY_OVERHEAD_BYTES),
+        )
+        .saturating_add(crate::storage::stream_mux::XREAD_REPLY_TARGET_BYTES)
+}
+
+/// The line's checkpoint term: the larger of the checkpoint reference read,
+/// `reference_read` bytes, and, while the tail capture runs
+/// ([`PlanInputs::base_bootstrap`]), the tail capture's peak
+/// ([`tail_capture_peak_bytes`]). One term, a max, because the capture runs
+/// only after the assembler's read has returned, on the checkpoint loop that
+/// walks layers one at a time, so the two never hold memory at once (SDD
+/// §22.7). Fixed while the reference read is the larger; named with the tail
+/// settings, which size it, while the capture is.
+fn checkpoint_term(reference_read: u64, inputs: &PlanInputs) -> PlanTerm {
+    let tail = if inputs.base_bootstrap {
+        tail_capture_peak_bytes(inputs)
+    } else {
+        0
+    };
+    if tail > reference_read {
+        PlanTerm::set_by(CHECKPOINT_TAIL_CAPTURE_TERM, tail, TAIL_CAPTURE_SETTINGS)
+    } else {
+        PlanTerm::fixed(CHECKPOINT_REFERENCE_READ_TERM, reference_read)
+    }
 }
 
 /// The catch-up budget's term for `t_mib` and `P_f`: built.
@@ -1198,16 +1352,145 @@ fn mib_text(bytes: u64) -> String {
     grouped(bytes.saturating_add(MIB / 2) / MIB)
 }
 
+/// The restore Job's share of its own pod memory limit for the layers it
+/// holds in flight, in ten-thousandths: 5,000, half the limit. A code
+/// constant with no setting (SDD §16: a pod-memory budget is a fixed share,
+/// never a setting), on the Job's line alone ([`DrRestoreLine`]).
+pub const DR_RESTORE_SHARE_TEN_THOUSANDTHS: u64 = 5_000;
+
+/// The restore Job's memory line at one limit `L` (SDD §22.22, *Restore
+/// memory*): the steady-state floor `F`, the Valkey connections' buffers
+/// `C_conn` on a 10-primary cluster, and the restore budget `R = ⌊k × L ÷
+/// 10⁴⌋` bytes, which must fit 80 % of `L` at exact shares. The line is the
+/// Job's alone; the server's plan never carries the restore term.
+///
+/// The term meets the exact-share contract (module docs, *Adding a
+/// budget*): its share is made with [`Share::of_ten_thousandths`], so C1
+/// holds by construction; it is a non-negative multiple of `L`, so C2 holds;
+/// it is not a margin term, so C3 is unaffected. Closure, `F + C_conn + k × L
+/// ÷ 10⁴ ≤ 4L ÷ 5`, is linear in `L`, so it holds at every limit from
+/// [`Self::minimum_limit_mib`] up and at none below: there are no closure
+/// islands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrRestoreLine {
+    /// `L`, in bytes.
+    pub limit_bytes: u64,
+    /// `k`, in ten-thousandths of `L`.
+    pub share_ten_thousandths: u64,
+    /// `R`, the restore budget, built: `⌊k × L ÷ 10⁴⌋` bytes.
+    pub restore_budget_bytes: u64,
+    /// The line's terms, with their built and exact values: the floor, the
+    /// connection pools, the restore budget.
+    pub(crate) exact_terms: Vec<ExactTerm>,
+    /// Whether the line fits 80 % of `L` at exact shares.
+    pub closes: bool,
+    /// The smallest whole MiB at which the line closes for these inputs;
+    /// `None` when `k` is 8,000 or more and no limit closes.
+    pub minimum_limit_mib: Option<u64>,
+}
+
+impl DrRestoreLine {
+    /// The line's terms, built.
+    pub fn terms(&self) -> impl Iterator<Item = &PlanTerm> {
+        self.exact_terms.iter().map(|t| &t.term)
+    }
+
+    /// `L` in whole MiB, rounded down.
+    pub fn limit_mib(&self) -> u64 {
+        self.limit_bytes / MIB
+    }
+
+    /// The line's total, built, in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.terms()
+            .fold(0u64, |sum, t| sum.saturating_add(t.bytes))
+    }
+}
+
+/// The restore Job's line at a limit of `limit` bytes with a restore share of
+/// `k` ten-thousandths and `inputs`' connection pools ([`DrRestoreLine`]).
+pub(crate) fn dr_restore_line_at(limit: u64, k: u64, inputs: &PlanInputs) -> DrRestoreLine {
+    let share = Share::of_ten_thousandths(k, ShareBase::Limit);
+    let restore_budget_bytes = share.built_units(limit, 0);
+    let connections = at_rest_bound_bytes(inputs.pools, Topology::cluster(10));
+    let exact_terms = vec![
+        ExactTerm::as_built(PlanTerm::fixed(
+            "steady-state floor",
+            POD_MEMORY_FLOOR_BYTES,
+        )),
+        ExactTerm::as_built(PlanTerm::set_by(
+            "connection pools",
+            connections,
+            CONNECTION_POOL_SETTINGS,
+        )),
+        ExactTerm::new(
+            PlanTerm::fixed("layers in flight", restore_budget_bytes),
+            share.exact_units_scaled(limit, 0),
+        ),
+    ];
+    let closes = exact_sum(&exact_terms) <= LINE_ALLOWANCE.exact_units_scaled(limit, 0);
+    DrRestoreLine {
+        limit_bytes: limit,
+        share_ten_thousandths: k,
+        restore_budget_bytes,
+        exact_terms,
+        closes,
+        minimum_limit_mib: dr_restore_minimum_limit_bytes(k, connections)
+            .map(|bytes| bytes.div_ceil(MIB)),
+    }
+}
+
+/// The smallest limit, in bytes, at which the restore line closes:
+/// `⌈(F + C_conn) × 10⁴ ÷ (8,000 − k)⌉`, from `F + C_conn + k × L ÷ 10⁴ ≤
+/// 4L ÷ 5` solved for `L` in whole bytes; `None` at `k` ≥ 8,000.
+fn dr_restore_minimum_limit_bytes(k: u64, connections: u64) -> Option<u64> {
+    let room = 8_000u64.checked_sub(k).filter(|room| *room > 0)?;
+    let fixed = u128::from(POD_MEMORY_FLOOR_BYTES) + u128::from(connections);
+    u64::try_from((fixed * 10_000).div_ceil(u128::from(room))).ok()
+}
+
+/// The chart setting that sets this process's container memory limit: the
+/// one every memory-limit refusal ([`PodMemoryPlan::derive_naming`]) and
+/// no-limit WARN ([`PodMemoryPlan::log_startup`]) tells the operator to set
+/// or raise. A disaster-recovery Job's limit comes from its own setting, so
+/// naming the service's there would send the operator to a value that does
+/// not reach the Job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryLimitSetting {
+    /// The service's pods, and every mode other than `dr`:
+    /// `resources.limits.memory`.
+    #[default]
+    Server,
+    /// A disaster-recovery Job (`live-edit dr …`):
+    /// `dr.resources.limits.memory`, which the chart lays over the service's
+    /// `resources`.
+    DrJob,
+}
+
+impl MemoryLimitSetting {
+    /// The setting's chart values path.
+    pub const fn values_path(self) -> &'static str {
+        match self {
+            Self::Server => "resources.limits.memory",
+            Self::DrJob => "dr.resources.limits.memory",
+        }
+    }
+}
+
 /// The pod memory plan: the limit, the budgets derived from it and the term
 /// list they close (module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodMemoryPlan {
     limit: PodMemoryLimit,
+    /// The setting the plan's refusal and no-limit WARNs name.
+    limit_setting: MemoryLimitSetting,
     max_subscriptions: u64,
     structural_cache_mib: u64,
     upload_mib: u64,
     retirement_mib: u64,
     ext_mirror_mib: Option<u64>,
+    live_delivery_mib: u64,
+    catchup_payload_mib: u64,
     catchup_mib: u64,
     catchup_step_centi: u64,
     line_terms: Vec<PlanTerm>,
@@ -1220,35 +1503,49 @@ impl PodMemoryPlan {
     /// is below the configuration's minimum limit or no limit fits it (module
     /// docs, *Refusal*).
     pub fn derive(limit: PodMemoryLimit, inputs: &PlanInputs) -> Result<Self, String> {
-        Self::derive_against(limit, inputs, minimum_limit_mib(inputs))
+        Self::derive_naming(limit, inputs, MemoryLimitSetting::Server)
     }
 
-    /// [`Self::derive`] against `minimum_limit_mib`, the configuration's
-    /// minimum limit: the refusal when there is none or `limit` is below it,
-    /// before the plan is evaluated; else the plan at `limit`, which closes
-    /// there by the exact-share contract, or, if it does not, the defect
-    /// error ([`defect`]). `derive` passes the minimum
-    /// [`minimum_limit_mib`] finds; a test can pass a false one, as a term
-    /// breaking the contract would make it, to reach the defect error.
+    /// [`Self::derive`], with the refusal and the no-limit WARNs naming
+    /// `setting` as the memory limit to set or raise.
+    pub fn derive_naming(
+        limit: PodMemoryLimit,
+        inputs: &PlanInputs,
+        setting: MemoryLimitSetting,
+    ) -> Result<Self, String> {
+        Self::derive_against(limit, inputs, minimum_limit_mib(inputs), setting)
+    }
+
+    /// [`Self::derive_naming`] against `minimum_limit_mib`, the
+    /// configuration's minimum limit: the refusal when there is none or
+    /// `limit` is below it, before the plan is evaluated; else the plan at
+    /// `limit`, which closes there by the exact-share contract, or, if it
+    /// does not, the defect error ([`defect`]). `derive_naming` passes the
+    /// minimum [`minimum_limit_mib`] finds; a test can pass a false one, as a
+    /// term breaking the contract would make it, to reach the defect error.
     fn derive_against(
         limit: PodMemoryLimit,
         inputs: &PlanInputs,
         minimum_limit_mib: Option<u64>,
+        setting: MemoryLimitSetting,
     ) -> Result<Self, String> {
         let minimum = match minimum_limit_mib {
             Some(minimum) if limit.mib() >= minimum => minimum,
-            _ => return Err(refusal(&limit, inputs, minimum_limit_mib)),
+            _ => return Err(refusal(&limit, inputs, minimum_limit_mib, setting)),
         };
         let Some(eval) = Evaluation::new(limit.bytes, inputs) else {
             return Err(defect(&limit, minimum));
         };
         Ok(Self {
             limit,
+            limit_setting: setting,
             max_subscriptions: eval.budgets.max_subscriptions,
             structural_cache_mib: eval.budgets.structural_cache_mib,
             upload_mib: eval.budgets.upload_mib,
             retirement_mib: eval.budgets.retirement_mib,
             ext_mirror_mib: eval.budgets.ext_mirror_mib,
+            live_delivery_mib: eval.budgets.live_delivery_mib,
+            catchup_payload_mib: eval.budgets.catchup_payload_mib,
             catchup_mib: eval.catchup_mib,
             catchup_step_centi: eval.step_centi,
             line_terms: eval.line_terms,
@@ -1343,6 +1640,21 @@ impl PodMemoryPlan {
         self.ext_mirror_mib.map(|mib| mib.saturating_mul(MIB))
     }
 
+    /// `D_live`, the live-delivery budget the replica's relay bytes held for
+    /// its subscriptions are enforced against
+    /// (`storage::stream_mux::delivery_ledger`): `(L − floor) / 100`, a line
+    /// term, in bytes.
+    pub fn live_delivery_budget_bytes(&self) -> u64 {
+        self.live_delivery_mib.saturating_mul(MIB)
+    }
+
+    /// `D_c`, the catch-up payload budget every catch-up payload is reserved
+    /// from (`storage::client`'s catch-up payload budget): `3 (L − floor) /
+    /// 100`, a margin term, in bytes.
+    pub fn catchup_payload_budget_bytes(&self) -> u64 {
+        self.catchup_payload_mib.saturating_mul(MIB)
+    }
+
     /// The line's terms, the connection buffers on a 10-primary cluster.
     pub fn line_terms(&self) -> &[PlanTerm] {
         &self.line_terms
@@ -1387,19 +1699,29 @@ impl PodMemoryPlan {
         self.minimum_limit_mib
     }
 
+    /// The restore Job's memory line at this plan's limit, its restore share
+    /// `k` ten-thousandths of the limit ([`DR_RESTORE_SHARE_TEN_THOUSANDTHS`]
+    /// in production) and the connection pools `inputs` name
+    /// ([`dr_restore_line_at`]). A Job-only term: the server never builds it,
+    /// so the server's plan is unchanged.
+    pub fn dr_restore_line(&self, k: u64, inputs: &PlanInputs) -> DrRestoreLine {
+        dr_restore_line_at(self.limit.bytes, k, inputs)
+    }
+
     /// Log the plan once at startup: INFO, or WARN when the limit is the
     /// reference size on Linux, where a container is expected to have a
     /// readable limit (INFO elsewhere, as for a local run on macOS). The
-    /// WARN's remedy follows its reason: set a limit when none is set; make
-    /// the cgroup memory files visible when they are not found; fix the file
-    /// the reason names when a file the limit is read from cannot be read or
-    /// parsed. Every WARN starts with the same text, and every line carries
-    /// the same fields.
+    /// WARN's remedy follows its reason: set a limit when none is set, naming
+    /// the plan's [`MemoryLimitSetting`]; make the cgroup memory files
+    /// visible when they are not found; fix the file the reason names when a
+    /// file the limit is read from cannot be read or parsed. Every WARN
+    /// starts with the same text, and every line carries the same fields.
     pub fn log_startup(&self) {
         let limit = &self.limit;
         let reference = limit.source == PodMemoryLimitSource::Reference;
+        let setting = self.limit_setting.values_path();
         macro_rules! plan_line {
-            ($level:ident, $message:literal) => {
+            ($level:ident, $($message:tt)+) => {
                 tracing::$level!(
                     pod_memory_limit_bytes = limit.bytes,
                     source = limit.source.label(),
@@ -1411,13 +1733,15 @@ impl PodMemoryPlan {
                     max_subscriptions = self.max_subscriptions,
                     retirement_budget_bytes = self.retirement_budget_bytes(),
                     ext_mirror_budget_bytes = self.ext_mirror_bytes().unwrap_or(0),
+                    live_delivery_budget_bytes = self.live_delivery_budget_bytes(),
+                    catchup_payload_budget_bytes = self.catchup_payload_budget_bytes(),
                     line_total_bytes = self.line_total_bytes(),
                     line_limit_bytes = self.line_limit_bytes(),
                     line_headroom_bytes = self.line_headroom_bytes(),
                     margin_named_bytes = self.margin_named_bytes(),
                     margin_left_bytes = self.margin_left_bytes(),
                     minimum_limit_mib = self.minimum_limit_mib,
-                    $message
+                    $($message)+
                 )
             };
         }
@@ -1427,8 +1751,7 @@ impl PodMemoryPlan {
                     warn,
                     "no readable pod memory limit: every memory budget is sized for the 5,120 \
                      MiB reference pod (see reason). No memory limit is set on the container: \
-                     set resources.limits.memory so the budgets follow the memory the pod \
-                     really has"
+                     set {setting} so the budgets follow the memory the pod really has"
                 ),
                 Some(ReferenceReason::NotFound) => plan_line!(
                     warn,
@@ -1450,8 +1773,7 @@ impl PodMemoryPlan {
                     warn,
                     "no readable pod memory limit: every memory budget is sized for the 5,120 \
                      MiB reference pod (see reason). Set the container's memory limit \
-                     (resources.limits.memory) so the budgets follow the memory the pod really \
-                     has"
+                     ({setting}) so the budgets follow the memory the pod really has"
                 ),
             }
         } else {
@@ -1504,7 +1826,14 @@ const KEEP_BACKUPS: &str = "do not turn off LIVE_EDIT_CHECKPOINT_ENABLED or \
 /// limit fits; the margin's remedy is then lowering `LIVE_EDIT_MAX_LAYER_SIZE`
 /// or, while the base bootstraps are charged, turning off the tail, with its
 /// cost; and the message says not to turn off checkpointing or the adapter.
-fn refusal(limit: &PodMemoryLimit, inputs: &PlanInputs, minimum_mib: Option<u64>) -> String {
+/// Raising the limit names `setting`, the chart value that sets it.
+fn refusal(
+    limit: &PodMemoryLimit,
+    inputs: &PlanInputs,
+    minimum_mib: Option<u64>,
+    setting: MemoryLimitSetting,
+) -> String {
+    let setting = setting.values_path();
     let budgets = budgets_at(limit.bytes, inputs);
     let line = sized_terms_text(
         line_terms_without_t(&budgets, inputs, Topology::cluster(10)),
@@ -1550,7 +1879,7 @@ fn refusal(limit: &PodMemoryLimit, inputs: &PlanInputs, minimum_mib: Option<u64>
         // the minimum.
         Some(minimum) if !names_margin => format!(
             "{pod}, is below the {} MiB this configuration needs, {} MiB short; {named}; raise \
-             resources.limits.memory to at least {} MiB or lower those settings",
+             {setting} to at least {} MiB or lower those settings",
             grouped(minimum),
             grouped(minimum.saturating_sub(limit.mib())),
             grouped(minimum),
@@ -1559,7 +1888,7 @@ fn refusal(limit: &PodMemoryLimit, inputs: &PlanInputs, minimum_mib: Option<u64>
         // first, then the margin's remedy above.
         Some(minimum) => format!(
             "{pod}, is below the {} MiB this configuration needs, {} MiB short; {named}; raise \
-             resources.limits.memory to at least {} MiB, which costs nothing else; failing that, \
+             {setting} to at least {} MiB, which costs nothing else; failing that, \
              {lower}; {KEEP_BACKUPS}",
             grouped(minimum),
             grouped(minimum.saturating_sub(limit.mib())),
@@ -1685,55 +2014,55 @@ mod tests {
     /// (`valkey-tls` on;
     /// [`pod_memory_plan_minimums_for_the_binary_defaults_are_the_tables_in_the_shipped_build`])
     /// and as an upper bound in every shape. With an adapter the
-    /// margin sets the minimum (the base bootstraps' 400 MiB and the mirror's
-    /// 101 MiB floor), the same 2,809 MiB at 1 to 64 CPUs, the counts swept,
-    /// in every shape.
+    /// margin sets the minimum (the base bootstraps' 400 MiB, the mirror's
+    /// 101 MiB floor and the catch-up payload budget `D_c`), the same
+    /// 3,282 MiB at 1 to 64 CPUs, the counts swept, in every shape.
     /// 10 CPUs is the implementation changelog's 10-core host.
     ///
-    /// The 2-CPU entry is also a gap row: on budgets rounded down to whole
+    /// The 2-CPU entry was also a gap row: on budgets rounded down to whole
     /// MiB the plan closed at 2,154 MiB and refused at 2,155, where `T`'s
-    /// smallest step, rounded, grew from 19 to 20 MiB; at exact shares its
-    /// minimum is 2,158 MiB and every limit from it up closes.
+    /// smallest step, rounded, grew from 19 to 20 MiB; at exact shares every
+    /// limit from its minimum up closes, which the W4 sweep checks.
     const BINARY_DEFAULTS: [BinaryDefaults; 8] = [
         BinaryDefaults {
             cores: 1,
-            minimum_mib: 2_155,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_130,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 2,
-            minimum_mib: 2_158,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_134,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 4,
-            minimum_mib: 2_166,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_141,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 8,
-            minimum_mib: 2_194,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_170,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 10,
-            minimum_mib: 2_208,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_184,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 16,
-            minimum_mib: 2_250,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_227,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 32,
-            minimum_mib: 2_363,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_341,
+            minimum_with_adapter_mib: 3_282,
         },
         BinaryDefaults {
             cores: 64,
-            minimum_mib: 2_590,
-            minimum_with_adapter_mib: 2_809,
+            minimum_mib: 2_569,
+            minimum_with_adapter_mib: 3_282,
         },
     ];
 
@@ -1873,7 +2202,12 @@ mod tests {
     ///   none below it closes, every one from it up does, and the refusal one
     ///   MiB below it names it;
     /// - `T` never decreases as `L` grows, nor does its step; nor do `S`, `B`,
-    ///   `C`, `R_ref` and `M_ext`;
+    ///   `C`, `R_ref`, `M_ext`, `D_live` and `D_c`;
+    /// - `D_live` is `⌊(L − floor) / 100⌋` MiB and `D_c` `⌊3 (L − floor) /
+    ///   100⌋` MiB (restated from their rules, not read from the code), each
+    ///   charged as its term — `D_live` as the line's "live delivery" and `D_c`
+    ///   as the margin's "catch-up payloads" — present whatever the inputs,
+    ///   and named with no setting, so a refusal never offers to lower them;
     /// - `M_ext` and its margin term are charged exactly when the mirror is
     ///   wired, at `max(⌊L/40⌋, the floor)` MiB (the floor restated from its
     ///   rule, not read from the code); the term holds the charge the mirror
@@ -1966,6 +2300,40 @@ mod tests {
                 "{label}: at {mib} MiB M_ext and its margin term are charged exactly with the \
                  mirror, at max(L / 40, the floor)"
             );
+            let (d_live, d_c) = restated_delivery_budgets_mib(mib);
+            assert_eq!(
+                (
+                    eval.budgets.live_delivery_mib,
+                    named_term(&eval.line_terms, LIVE_DELIVERY_TERM).map(|t| t.bytes),
+                ),
+                (d_live, Some(d_live * MIB)),
+                "{label}: at {mib} MiB D_live and its line term are (L − floor) / 100"
+            );
+            assert_eq!(
+                (
+                    eval.budgets.catchup_payload_mib,
+                    named_term(&eval.margin_terms, CATCHUP_PAYLOAD_TERM).map(|t| t.bytes),
+                ),
+                (d_c, Some(d_c * MIB)),
+                "{label}: at {mib} MiB D_c and its margin term are 3 (L − floor) / 100"
+            );
+            for (name, term) in [
+                (
+                    LIVE_DELIVERY_TERM,
+                    named_term(&eval.line_terms, LIVE_DELIVERY_TERM),
+                ),
+                (
+                    CATCHUP_PAYLOAD_TERM,
+                    named_term(&eval.margin_terms, CATCHUP_PAYLOAD_TERM),
+                ),
+            ] {
+                let term = term.expect("checked present above");
+                assert_eq!(
+                    (term.setting, term.operator_sized),
+                    (None, false),
+                    "{label}: at {mib} MiB the {name:?} term has no setting a refusal could name"
+                );
+            }
             if let Some(term) = mirror_term(&eval.margin_terms) {
                 assert_eq!(
                     (term.setting, term.operator_sized),
@@ -2017,7 +2385,9 @@ mod tests {
                         && now.upload_mib >= was.upload_mib
                         && now.structural_cache_mib >= was.structural_cache_mib
                         && now.retirement_mib >= was.retirement_mib
-                        && now.ext_mirror_mib >= was.ext_mirror_mib,
+                        && now.ext_mirror_mib >= was.ext_mirror_mib
+                        && now.live_delivery_mib >= was.live_delivery_mib
+                        && now.catchup_payload_mib >= was.catchup_payload_mib,
                     "{label}: a budget fell from {} to {mib} MiB: {was:?} then {now:?}",
                     mib - 1
                 );
@@ -2042,14 +2412,15 @@ mod tests {
     }
 
     /// The chart's configuration with a checkpoint adapter: its minimum is
-    /// 2,809 MiB, above the 2,709 without one because the margin then sets
-    /// it, and the W4 sweep holds.
+    /// 3,282 MiB, above the 2,687 without one because the margin then sets
+    /// it (the base bootstraps, `M_ext`'s floor and `D_c`), and the W4 sweep
+    /// holds.
     #[test]
     fn pod_memory_plan_closes_and_grows_to_64_gib_for_the_chart_configuration_with_an_adapter() {
         assert_minimum_and_sweep(
             "chart, adapter on",
             &with_adapter(PlanInputs::reference()),
-            2_809,
+            3_282,
         );
     }
 
@@ -2163,13 +2534,13 @@ mod tests {
 
     /// The chart's configuration's minimum limit in the shipped build, MiB:
     /// the line sets it.
-    const CHART_MINIMUM_MIB: u64 = 2_709;
+    const CHART_MINIMUM_MIB: u64 = 2_687;
 
     /// The shipped build's minimum for the chart's configuration, which has
-    /// no adapter: [`CHART_MINIMUM_MIB`], 2,709 MiB, set by the line.
+    /// no adapter: [`CHART_MINIMUM_MIB`], 2,687 MiB, set by the line.
     #[cfg(feature = "valkey-tls")]
     #[test]
-    fn pod_memory_plan_minimum_for_the_chart_configuration_is_2709_mib_in_the_shipped_build() {
+    fn pod_memory_plan_minimum_for_the_chart_configuration_is_2687_mib_in_the_shipped_build() {
         assert_shipped_minimum_set_by_the_line(
             "chart",
             &PlanInputs::reference(),
@@ -2178,16 +2549,16 @@ mod tests {
     }
 
     /// Gap rows: the chart's configuration with fewer upload waiters, each of
-    /// which left a gap on rounded budgets (with 60, the plan closed at
-    /// 2,699 MiB and refused at 2,700, where `C` stepped from 134 to
-    /// 135 MiB), as `(waiters, the shipped build's minimum in MiB)`.
+    /// which left a gap on budgets rounded down to whole MiB (with 60, the
+    /// plan closed at 2,699 MiB and refused at 2,700, where `C` stepped from
+    /// 134 to 135 MiB), as `(waiters, the shipped build's minimum in MiB)`.
     const FEWER_UPLOAD_WAITERS: [(u64, u64); 6] = [
-        (60, 2_703),
-        (8, 2_623),
-        (21, 2_643),
-        (31, 2_658),
-        (33, 2_662),
-        (46, 2_681),
+        (60, 2_680),
+        (8, 2_600),
+        (21, 2_620),
+        (31, 2_636),
+        (33, 2_639),
+        (46, 2_659),
     ];
 
     /// The chart's configuration with `waiters` upload waiters.
@@ -2199,9 +2570,9 @@ mod tests {
     }
 
     /// [`FEWER_UPLOAD_WAITERS`]' gap rows: each closes exactly from its
-    /// minimum, which the line sets, at most the row's (2,703 MiB with 60
-    /// waiters, 2,623 with 8, 2,643 with 21, 2,658 with 31, 2,662 with 33,
-    /// 2,681 with 46); the row's figure exactly in the shipped build
+    /// minimum, which the line sets, at most the row's (2,680 MiB with 60
+    /// waiters, 2,600 with 8, 2,620 with 21, 2,636 with 31, 2,639 with 33,
+    /// 2,659 with 46); the row's figure exactly in the shipped build
     /// ([`pod_memory_plan_minimums_for_the_chart_with_fewer_upload_waiters_in_the_shipped_build`]).
     #[test]
     fn pod_memory_plan_for_the_chart_with_fewer_upload_waiters_closes_exactly_from_its_minimum() {
@@ -2230,13 +2601,13 @@ mod tests {
 
     /// Gap row: the binary's defaults at 2 CPUs with a checkpoint adapter and
     /// `LIVE_EDIT_MAX_LAYER_SIZE` = 141,400,000 B, whose minimum is
-    /// 3,684 MiB. The margin sets it: the base bootstraps' 539 MiB and
+    /// 4,314 MiB. The margin sets it: the base bootstraps' 539 MiB and
     /// `M_ext`'s 135 MiB floor, one such value's charge, beside `R_ref`,
-    /// which steps up a MiB every 500 MiB of limit, and the allocator slack.
-    /// Closure is decided at exact shares, so `R_ref`'s steps leave no gap
-    /// above the minimum.
+    /// which steps up a MiB every 500 MiB of limit, `D_c`, which steps up a
+    /// MiB every 33⅓ MiB, and the allocator slack. Closure is decided at
+    /// exact shares, so those steps leave no gap above the minimum.
     #[test]
-    fn pod_memory_plan_for_2_cpus_with_an_adapter_and_a_raised_size_cap_closes_exactly_from_3684_mib(
+    fn pod_memory_plan_for_2_cpus_with_an_adapter_and_a_raised_size_cap_closes_exactly_from_4314_mib(
     ) {
         assert_minimum_and_sweep(
             "binary defaults, 2 CPUs, adapter on, LIVE_EDIT_MAX_LAYER_SIZE=141400000",
@@ -2244,7 +2615,7 @@ mod tests {
                 max_layer_size: 141_400_000,
                 ..with_adapter(binary_default_inputs(2))
             },
-            3_684,
+            4_314,
         );
     }
 
@@ -2252,7 +2623,7 @@ mod tests {
     /// `LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY`, where `T`'s smallest step,
     /// rounded, jumped by `1 + P_f` MiB every 100 MiB of limit and left gaps
     /// of up to about 235 MiB, as `(P_f, the shipped build's minimum in MiB)`.
-    const HIGH_FENCED_READ_CONCURRENCY: [(u64, u64); 2] = [(20, 10_894), (46, 60_750)];
+    const HIGH_FENCED_READ_CONCURRENCY: [(u64, u64); 2] = [(20, 11_071), (46, 65_445)];
 
     /// The chart's configuration at `P_f` = `p_f`.
     fn with_fenced_read_concurrency(p_f: u64) -> PlanInputs {
@@ -2263,8 +2634,8 @@ mod tests {
     }
 
     /// [`HIGH_FENCED_READ_CONCURRENCY`]' gap rows: each closes exactly from
-    /// its minimum, which the line sets, at most the row's (10,894 MiB at
-    /// `P_f` 20, 60,750 at 46); the row's figure exactly in the shipped build
+    /// its minimum, which the line sets, at most the row's (11,071 MiB at
+    /// `P_f` 20, 65,445 at 46); the row's figure exactly in the shipped build
     /// ([`pod_memory_plan_minimums_for_the_chart_at_a_high_fenced_read_concurrency_in_the_shipped_build`]).
     #[test]
     fn pod_memory_plan_for_the_chart_at_a_high_fenced_read_concurrency_closes_exactly_from_its_minimum(
@@ -2355,8 +2726,13 @@ mod tests {
             Evaluation::new(2_000 * MIB, &inputs).is_none(),
             "fixture self-check: the plan does not close at 2,000 MiB"
         );
-        let err = PodMemoryPlan::derive_against(limit_of(2_000), &inputs, Some(1_000))
-            .expect_err("a plan that does not close never starts");
+        let err = PodMemoryPlan::derive_against(
+            limit_of(2_000),
+            &inputs,
+            Some(1_000),
+            MemoryLimitSetting::Server,
+        )
+        .expect_err("a plan that does not close never starts");
         for part in [
             "pod memory plan defect: the plan does not close at this pod's memory limit, \
              2,000 MiB (cgroup v2), at or above the 1,000 MiB minimum it reports",
@@ -2397,7 +2773,7 @@ mod tests {
     /// every byte from the minimum up, not only at whole MiB. For the chart's
     /// configuration (at the build's own minimum: at most
     /// [`CHART_MINIMUM_MIB`], exactly that in the shipped build, as
-    /// [`pod_memory_plan_minimum_for_the_chart_configuration_is_2709_mib_in_the_shipped_build`]
+    /// [`pod_memory_plan_minimum_for_the_chart_configuration_is_2687_mib_in_the_shipped_build`]
     /// pins): one byte below the minimum refuses,
     /// naming it, and is not the defect error; half a MiB above closes; so
     /// does `3G` (3,000,000,000 B); and at every 4 KiB page from one MiB below
@@ -2514,9 +2890,9 @@ mod tests {
 
     /// W5's figures, in the shipped build (`valkey-tls` on): at 4,096 MiB
     /// the chart configuration's `T` is 433 MiB, at a step of 0.11: there
-    /// the exact line, `T × (1 + P_f)` included, leaves 23.4 MiB of 80 % of
-    /// the limit; at the next step (0.12, `T` 472 MiB) it is 55.5 MiB over.
-    /// The 0.05 rule's largest step there, 0.10, gives 394.
+    /// the exact line, `T × (1 + P_f)` and `D_live` included, leaves 23.8 MiB
+    /// of 80 % of the limit; at the next step (0.12, `T` 472 MiB) it is
+    /// 55.0 MiB over. The 0.05 rule's largest step there, 0.10, gives 394.
     #[cfg(feature = "valkey-tls")]
     #[test]
     fn catchup_budget_at_4096_mib_is_433_mib_at_the_0_11_step_in_the_shipped_build() {
@@ -2537,13 +2913,13 @@ mod tests {
         let room = allowance
             .checked_sub(fits)
             .expect("0.11 fits the line's allowance");
-        assert_eq!(mib_1dp(room), 23.4, "the room 0.11 leaves");
+        assert_eq!(mib_1dp(room), 23.8, "the room 0.11 leaves");
         let (over, next_t) = chart_line_at_4096_mib(12);
         assert_eq!(next_t, 472, "T at 0.12");
         let excess = over
             .checked_sub(allowance)
             .expect("0.12 is over the line's allowance");
-        assert_eq!(mib_1dp(excess), 55.5, "what 0.12 is over by");
+        assert_eq!(mib_1dp(excess), 55.0, "what 0.12 is over by");
     }
 
     /// W6: below the minimum the refusal names the limit and its source, the
@@ -2754,24 +3130,25 @@ mod tests {
 
     /// W6, the configuration no limit can fit: `T × (1 + P_f)` at its
     /// smallest step grows with the limit faster than the line leaves room
-    /// for it once `P_f` passes 61 at the chart's other settings. The refusal
-    /// says no limit fits, names the setting and the largest value that does,
-    /// and names no minimum limit; 61 itself closes.
+    /// for it once `P_f` passes 60 at the chart's other settings (61 before
+    /// `D_live` took its hundredth of `L − floor`). The refusal says no limit
+    /// fits, names the setting and the largest value that does, and names no
+    /// minimum limit; 60 itself closes.
     #[test]
     fn fenced_read_concurrency_no_limit_can_fit_names_the_largest_that_fits_and_no_minimum() {
         let at = |p_f: u64| PlanInputs {
             fenced_read_concurrency: p_f,
             ..PlanInputs::reference()
         };
-        let fits = minimum_limit_mib(&at(61)).expect("P_f = 61 closes at some limit");
-        derive_at(fits, &at(61)).expect("and at its minimum");
-        for p_f in [62, 1_000] {
+        let fits = minimum_limit_mib(&at(60)).expect("P_f = 60 closes at some limit");
+        derive_at(fits, &at(60)).expect("and at its minimum");
+        for p_f in [61, 1_000] {
             assert_eq!(minimum_limit_mib(&at(p_f)), None, "P_f = {p_f}");
             let err = derive_at(5_120, &at(p_f)).expect_err("no limit fits");
             for part in [
                 "no pod memory limit can fit this configuration".to_owned(),
                 format!("LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY={p_f}"),
-                "lower LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY to at most 61".to_owned(),
+                "lower LIVE_EDIT_CATCHUP_FENCED_READ_CONCURRENCY to at most 60".to_owned(),
             ] {
                 assert!(err.contains(&part), "P_f = {p_f}: {part:?} in {err}");
             }
@@ -2845,7 +3222,266 @@ mod tests {
 
     /// `M_ext`'s term among a plan's margin `terms`, if it charges one.
     fn mirror_term(terms: &[PlanTerm]) -> Option<&PlanTerm> {
-        terms.iter().find(|t| t.name == MIRROR_TERM)
+        named_term(terms, MIRROR_TERM)
+    }
+
+    // ── The live-delivery and catch-up payload budgets, `D_live` and `D_c` (b.ntm) ──
+
+    /// `D_c`'s margin term, by name.
+    const CATCHUP_PAYLOAD_TERM: &str = "catch-up payloads";
+
+    /// The term of `terms` named `name`, if there is one.
+    fn named_term<'a>(terms: &'a [PlanTerm], name: &str) -> Option<&'a PlanTerm> {
+        terms.iter().find(|t| t.name == name)
+    }
+
+    /// `D_live` and `D_c` at a limit of `mib` MiB, in whole MiB, restated from
+    /// their rules rather than read from the code: a hundredth and three
+    /// hundredths of the limit above the 155 MiB floor, rounded down.
+    fn restated_delivery_budgets_mib(mib: u64) -> (u64, u64) {
+        let above = mib.saturating_sub(155);
+        (above / 100, 3 * above / 100)
+    }
+
+    /// T12: `D_live` and `D_c` at the 4, 5, 6 and 8 GiB pods are 39 / 49 / 59
+    /// / 80 MiB and 118 / 148 / 179 / 241 MiB, `T` there is 433 / 744 / 1,018
+    /// / 1,607 MiB — the live-delivery budget joined the line without moving
+    /// `T` at any of them — and the plan's accessors give them in bytes. Both
+    /// budgets are the chart configuration's whatever the backup store: `D_c`
+    /// is charged with or without it, and neither depends on a setting. The
+    /// sweep ([`assert_closes_and_grows_from_its_minimum`]) checks the rule at
+    /// every MiB; this pins the figures SDD §16 and §21.2 state.
+    #[test]
+    fn delivery_budgets_and_t_at_the_4_5_6_and_8_gib_pods_are_the_stated_figures() {
+        assert_eq!(
+            POD_MEMORY_FLOOR_BYTES,
+            155 * MIB,
+            "fixture self-check: the floor the budgets are restated above"
+        );
+        for (mib, d_live, d_c, t) in [
+            (4_096, 39, 118, 433),
+            (5_120, 49, 148, 744),
+            (6_144, 59, 179, 1_018),
+            (8_192, 80, 241, 1_607),
+        ] {
+            assert_eq!(
+                restated_delivery_budgets_mib(mib),
+                (d_live, d_c),
+                "fixture self-check: the rules give the stated figures at {mib} MiB"
+            );
+            for inputs in [
+                PlanInputs::reference(),
+                with_adapter(PlanInputs::reference()),
+            ] {
+                let plan = derive_at(mib, &inputs)
+                    .unwrap_or_else(|e| panic!("{mib} MiB closes for {inputs:?}: {e}"));
+                assert_eq!(
+                    (
+                        plan.live_delivery_budget_bytes(),
+                        plan.catchup_payload_budget_bytes(),
+                    ),
+                    (d_live * MIB, d_c * MIB),
+                    "D_live and D_c at {mib} MiB, base_bootstrap={}",
+                    inputs.base_bootstrap
+                );
+            }
+            #[cfg(feature = "valkey-tls")]
+            assert_eq!(
+                derive_at(mib, &PlanInputs::reference())
+                    .expect("closes")
+                    .catchup_budget_mib(),
+                t,
+                "T at {mib} MiB in the shipped build"
+            );
+            #[cfg(not(feature = "valkey-tls"))]
+            let _ = t;
+        }
+    }
+
+    // ── The checkpoint term's tail capture piece (b.ntm, decider ruling P1′) ──
+
+    /// The checkpoint term's name while the tail capture is its larger piece.
+    const TAIL_CAPTURE_TERM: &str = "checkpoint tail capture";
+
+    /// The checkpoint term's name while the reference read is its larger
+    /// piece.
+    const REFERENCE_READ_TERM: &str = "checkpoint reference read";
+
+    /// The settings a tail-capture term is named with.
+    const TAIL_CAPTURE_TERM_SETTINGS: &str = "LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES, \
+         LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES, LIVE_EDIT_CHECKPOINT_TAIL_ENABLED";
+
+    /// The tail capture's peak, restated from its rule rather than read from
+    /// the code: the entries read, up to the byte cap, beside the envelope
+    /// encoded from them at its exact size (twice the cap), about 1 KiB per
+    /// entry up to the entry cap, and one 1 MiB page reply.
+    fn restated_tail_peak_bytes(max_bytes: u64, max_entries: u64) -> u64 {
+        2 * max_bytes + max_entries * 1024 + MIB
+    }
+
+    /// `inputs` with the tail's byte cap at `max_bytes`.
+    fn with_tail_max_bytes(inputs: PlanInputs, max_bytes: u64) -> PlanInputs {
+        PlanInputs {
+            tail_max_bytes: max_bytes,
+            ..inputs
+        }
+    }
+
+    /// T16, the plan's half: the line's checkpoint term is the larger of the
+    /// checkpoint reference read and, while the tail capture runs (a backup
+    /// store with the tail on), the capture's peak. At the chart's caps (64
+    /// MiB, 4,096 entries) the peak, 133 MiB, is below the reference read's
+    /// 172.9 MiB, so the term is the reference read, fixed, and the cap costs
+    /// nothing; the cap sets the term from 84 MiB (83 MiB still does not), and
+    /// at 128 MiB the term is the capture's 261 MiB, named with the tail's
+    /// settings and the line larger by exactly the difference. Without a
+    /// backup store the capture never runs, so a raised cap changes nothing.
+    #[test]
+    fn checkpoint_term_is_the_reference_read_at_the_charts_tail_caps_and_the_capture_from_84_mib() {
+        let term = |inputs: &PlanInputs| -> PlanTerm {
+            derive_at(8_192, inputs)
+                .unwrap_or_else(|e| panic!("8 GiB closes for {inputs:?}: {e}"))
+                .line_terms()
+                .iter()
+                .find(|t| t.name == REFERENCE_READ_TERM || t.name == TAIL_CAPTURE_TERM)
+                .unwrap_or_else(|| panic!("the line carries a checkpoint term for {inputs:?}"))
+                .clone()
+        };
+        let chart = with_adapter(PlanInputs::reference());
+        assert_eq!(
+            (chart.tail_max_bytes, chart.tail_max_entries),
+            (64 * MIB, 4_096),
+            "fixture self-check: the chart's tail caps"
+        );
+        assert_eq!(
+            tail_capture_peak_bytes(&chart),
+            restated_tail_peak_bytes(64 * MIB, 4_096),
+            "the tail capture's peak at the chart's caps"
+        );
+        let reference_read = term(&chart);
+        assert_eq!(
+            (
+                reference_read.name,
+                reference_read.bytes,
+                reference_read.operator_sized
+            ),
+            (REFERENCE_READ_TERM, 181_317_211, false),
+            "at the chart's caps the reference read is the larger piece, and fixed"
+        );
+        assert!(restated_tail_peak_bytes(83 * MIB, 4_096) < reference_read.bytes);
+        assert!(restated_tail_peak_bytes(84 * MIB, 4_096) > reference_read.bytes);
+        assert_eq!(
+            term(&with_tail_max_bytes(chart, 83 * MIB)).name,
+            REFERENCE_READ_TERM,
+            "an 83 MiB cap still costs nothing"
+        );
+        assert_eq!(
+            term(&with_tail_max_bytes(chart, 84 * MIB)).name,
+            TAIL_CAPTURE_TERM,
+            "an 84 MiB cap sets the term"
+        );
+
+        let raised = with_tail_max_bytes(chart, 128 * MIB);
+        let capture = term(&raised);
+        assert_eq!(
+            (
+                capture.name,
+                capture.bytes,
+                capture.setting,
+                capture.operator_sized
+            ),
+            (
+                TAIL_CAPTURE_TERM,
+                restated_tail_peak_bytes(128 * MIB, 4_096),
+                Some(TAIL_CAPTURE_TERM_SETTINGS),
+                true
+            ),
+            "at a 128 MiB cap the term is the capture's peak, named with the tail's settings"
+        );
+        let line_total = |inputs: &PlanInputs| {
+            let budgets = budgets_at(8_192 * MIB, inputs);
+            sum(&line_terms_without_t(
+                &budgets,
+                inputs,
+                Topology::cluster(10),
+            ))
+        };
+        assert_eq!(
+            line_total(&raised) - line_total(&chart),
+            u128::from(capture.bytes - reference_read.bytes),
+            "the raised cap adds exactly the capture's excess over the reference read to the line"
+        );
+        assert_eq!(
+            term(&with_tail_max_bytes(PlanInputs::reference(), 128 * MIB)).name,
+            REFERENCE_READ_TERM,
+            "without a backup store the tail capture never runs, so its cap costs nothing"
+        );
+    }
+
+    /// T16, the plan's half: when a raised tail cap makes the line set the
+    /// minimum of a configuration with a backup store, the refusal one MiB
+    /// below it names the tail capture's term, with its size and the tail's
+    /// settings, among the line's largest fixed terms, and the line's remedy.
+    #[test]
+    fn refusal_when_a_raised_tail_cap_sets_the_minimum_names_the_tail_capture_with_its_settings() {
+        let inputs = with_tail_max_bytes(with_adapter(PlanInputs::reference()), 512 * MIB);
+        let minimum = minimum_limit_mib(&inputs).expect("closes at some limit");
+        assert_eq!(
+            sides_not_closing((minimum - 1) * MIB, &inputs),
+            (false, true),
+            "fixture self-check: with a 512 MiB tail cap the line alone sets the minimum"
+        );
+        let err = derive_at(minimum - 1, &inputs).expect_err("one MiB below the minimum");
+        let named = format!(
+            "{TAIL_CAPTURE_TERM} {} MiB ({TAIL_CAPTURE_TERM_SETTINGS})",
+            grouped(restated_tail_peak_bytes(512 * MIB, 4_096) / MIB)
+        );
+        assert!(
+            err.contains(&format!("; the largest fixed terms: {named}")),
+            "the tail capture, the line's largest operator-sized term, is named first with its \
+             settings: {err}"
+        );
+        assert!(
+            err.ends_with(&format!(
+                "raise resources.limits.memory to at least {} MiB or lower those settings",
+                grouped(minimum)
+            )),
+            "the line's remedy: {err}"
+        );
+    }
+
+    /// T12: `D_live` replaced the line's two load terms for a lagging layer's
+    /// backlog and the catch-ups' entries before their first poll, so neither
+    /// is in the line at any configuration, and the line carries exactly one
+    /// "live delivery" term. `D_c` is a margin term only.
+    #[test]
+    fn live_delivery_replaces_the_lagging_layer_and_pre_poll_line_terms() {
+        for inputs in [
+            PlanInputs::reference(),
+            with_adapter(PlanInputs::reference()),
+        ] {
+            let plan = derive_at(5_120, &inputs).expect("closes at 5 GiB");
+            let names: Vec<&str> = plan.line_terms().iter().map(|t| t.name).collect();
+            for gone in ["one lagging layer", "catch-ups before their first poll"] {
+                assert!(
+                    !names.contains(&gone),
+                    "{gone:?} is no longer a line term: {names:?}"
+                );
+            }
+            assert_eq!(
+                names.iter().filter(|n| **n == LIVE_DELIVERY_TERM).count(),
+                1,
+                "one live-delivery term: {names:?}"
+            );
+            assert!(
+                named_term(plan.line_terms(), CATCHUP_PAYLOAD_TERM).is_none(),
+                "D_c is charged to the margin, not the line"
+            );
+            assert!(
+                named_term(plan.margin_terms(), LIVE_DELIVERY_TERM).is_none(),
+                "D_live is charged to the line, not the margin"
+            );
+        }
     }
 
     /// T12 (a) and (b): with a backup store, `M_ext` is `max(⌊L/40⌋, the
@@ -2858,9 +3494,10 @@ mod tests {
     /// ([`assert_closes_and_grows_from_its_minimum`]) for the chart's
     /// configuration and the binary's defaults with an adapter; here it runs
     /// with the size cap raised to 150 MiB, whose floor (151 MiB) is past the
-    /// default cap's, with its minimum, 4,071 MiB, which the margin sets. At
+    /// default cap's, with its minimum, 4,770 MiB, which the margin sets. At
     /// 4, 5 and 8 GiB `M_ext` is 102, 128 and 204 MiB; from the chart's
-    /// minimum, 2,809 MiB, to 4,079 MiB it is the 101 MiB floor.
+    /// minimum with a backup store, 3,282 MiB, to 4,079 MiB it is the 101 MiB
+    /// floor.
     #[test]
     fn ext_mirror_budget_is_a_fortieth_of_the_limit_floored_at_one_maximum_size_values_charge() {
         let raised_cap = PlanInputs {
@@ -2868,7 +3505,7 @@ mod tests {
             ..with_adapter(PlanInputs::reference())
         };
         assert_eq!(restated_mirror_floor_mib(&raised_cap), 151);
-        assert_minimum_and_sweep("chart, adapter on, 150 MiB size cap", &raised_cap, 4_071);
+        assert_minimum_and_sweep("chart, adapter on, 150 MiB size cap", &raised_cap, 4_770);
 
         let chart = with_adapter(PlanInputs::reference());
         assert_eq!(
@@ -2877,7 +3514,7 @@ mod tests {
             "the floor at the default 100 MiB size cap"
         );
         for (mib, m_ext) in [
-            (2_809, 101),
+            (3_282, 101),
             (4_079, 101),
             (4_080, 102),
             (4_096, 102),
@@ -2990,41 +3627,49 @@ mod tests {
     ];
 
     /// Decider ruling 1 and T12 (d): with a backup store on at the chart's
-    /// configuration the margin sets the minimum, 2,809 MiB: the line
-    /// still closes one MiB below it and the margin does not. 2,808 MiB is
+    /// configuration the margin sets the minimum, 3,282 MiB: the line
+    /// still closes one MiB below it and the margin does not. 3,281 MiB is
     /// refused naming the margin's operator-sized terms — the base
     /// bootstraps and the mirror's `M_ext`, each with the settings that
     /// switch it on and size it — and the margin's remedy, raising the limit
     /// first and never turning off checkpointing or the adapter, and names
-    /// no line term, as lowering a line setting
-    /// would not lower the minimum. The same limit closes with the backup
-    /// store off.
+    /// no line term, as lowering a line setting would not lower the minimum,
+    /// nor `D_c`, the catch-up payload budget, which no setting sizes (b.ntm).
+    /// The same limit closes with the backup store off.
     #[test]
     fn refusal_when_the_margin_sets_the_minimum_names_its_checkpoint_terms_and_no_line_term() {
         let inputs = with_adapter(PlanInputs::reference());
-        assert_eq!(minimum_limit_mib(&inputs), Some(2_809));
+        assert_eq!(minimum_limit_mib(&inputs), Some(3_282));
         assert_eq!(
-            sides_not_closing(2_808 * MIB, &inputs),
+            sides_not_closing(3_281 * MIB, &inputs),
             (true, false),
             "fixture self-check: one MiB below the minimum only the margin does not close"
         );
-        let err = derive_at(2_808, &inputs).expect_err("one MiB below the minimum");
+        let err = derive_at(3_281, &inputs).expect_err("one MiB below the minimum");
         assert_eq!(
             err,
             format!(
-                "this pod's memory limit, 2,808 MiB (cgroup v2), is below the 2,809 MiB this \
+                "this pod's memory limit, 3,281 MiB (cgroup v2), is below the 3,282 MiB this \
                  configuration needs, 1 MiB short; {MARGIN_TERMS_AT_THE_DEFAULT_CAP}raise \
-                 resources.limits.memory to at least 2,809 MiB{MARGIN_REMEDY_TAIL}{MARGIN_REMEDY}"
+                 resources.limits.memory to at least 3,282 MiB{MARGIN_REMEDY_TAIL}{MARGIN_REMEDY}"
             ),
             "the margin-bound refusal"
         );
-        for line_term in LINE_TERM_NAMES {
-            assert!(
-                !err.contains(line_term),
-                "{line_term:?} is not named: {err}"
-            );
+        for unnamed in LINE_TERM_NAMES.into_iter().chain([CATCHUP_PAYLOAD_TERM]) {
+            assert!(!err.contains(unnamed), "{unnamed:?} is not named: {err}");
         }
-        derive_at(2_808, &PlanInputs::reference())
+        assert!(
+            named_term(
+                derive_at(3_282, &inputs)
+                    .expect("closes at its minimum")
+                    .margin_terms(),
+                CATCHUP_PAYLOAD_TERM
+            )
+            .is_some_and(|t| t.bytes > 0),
+            "fixture self-check: D_c is in the margin the refusal is about, so its absence from \
+             the refusal is the rule, not a term that was never charged"
+        );
+        derive_at(3_281, &PlanInputs::reference())
             .expect("the same limit closes with the backup store off");
     }
 
@@ -3060,6 +3705,89 @@ mod tests {
             )),
             "raising the limit, then both sides' remedy, the margin's keeping backups: {err}"
         );
+    }
+
+    /// In a disaster-recovery Job the memory limit to raise or set is
+    /// `dr.resources.limits.memory`, the chart value the Job's limit comes
+    /// from. Every text that names the limit's setting — the refusal when the
+    /// line sets the minimum, the refusal when the margin does (alone or with
+    /// the line), and the two no-limit WARNs that tell the operator to set a
+    /// limit — names it in DR mode, and is otherwise the service's text
+    /// byte for byte, which still names `resources.limits.memory` (the
+    /// service's texts are pinned in full by the tests above and
+    /// `log_startup_warns_for_the_reference_size_on_linux_and_informs_for_a_read_limit`).
+    #[test]
+    fn every_memory_limit_text_names_dr_resources_in_a_dr_job_and_resources_otherwise() {
+        const SERVER: &str = "resources.limits.memory";
+        const DR_JOB: &str = "dr.resources.limits.memory";
+        assert_eq!(MemoryLimitSetting::Server.values_path(), SERVER);
+        assert_eq!(MemoryLimitSetting::DrJob.values_path(), DR_JOB);
+        assert_eq!(MemoryLimitSetting::default(), MemoryLimitSetting::Server);
+        let check = |case: &str, server: &str, dr_job: &str| {
+            assert!(
+                server.contains(SERVER),
+                "{case}: the service names {SERVER}: {server}"
+            );
+            assert!(
+                !server.contains(DR_JOB),
+                "{case}: the service names no DR value: {server}"
+            );
+            assert_eq!(
+                dr_job,
+                server.replace(SERVER, DR_JOB),
+                "{case}: the DR text is the service's with the setting renamed"
+            );
+            assert!(
+                !dr_job.replace(DR_JOB, "").contains(SERVER),
+                "{case}: the DR text never names the service's setting: {dr_job}"
+            );
+        };
+
+        let refusals = [
+            ("line-bound refusal", PlanInputs::reference()),
+            (
+                "margin-bound refusal",
+                with_adapter(PlanInputs::reference()),
+            ),
+            ("both-sides refusal", both_sides_set_the_minimum().0),
+        ];
+        for (case, inputs) in &refusals {
+            let below = minimum_limit_mib(inputs).expect("a limit fits") - 1;
+            let refuse = |setting| {
+                PodMemoryPlan::derive_naming(limit_of(below), inputs, setting)
+                    .expect_err("one MiB below the minimum")
+            };
+            let server = refuse(MemoryLimitSetting::Server);
+            assert_eq!(
+                server,
+                derive_at(below, inputs).expect_err("one MiB below the minimum"),
+                "{case}: `derive` names the service's setting"
+            );
+            check(case, &server, &refuse(MemoryLimitSetting::DrJob));
+        }
+
+        for reason in [Some(ReferenceReason::Unlimited), None] {
+            let message = |setting| {
+                let plan = PodMemoryPlan::derive_naming(
+                    PodMemoryLimit::reference(reason.clone()),
+                    &PlanInputs::reference(),
+                    setting,
+                )
+                .expect("the reference pod closes");
+                startup_record(&plan)["fields"]["message"]
+                    .as_str()
+                    .expect("a message")
+                    .to_owned()
+            };
+            let server = message(MemoryLimitSetting::Server);
+            let dr_job = message(MemoryLimitSetting::DrJob);
+            if cfg!(target_os = "linux") {
+                check(&format!("no-limit WARN {reason:?}"), &server, &dr_job);
+            } else {
+                // Off Linux the line is the INFO one, which names no setting.
+                assert_eq!(dr_job, server, "{reason:?}");
+            }
+        }
     }
 
     /// The inputs of the refusal test above, with their minimum, MiB: the
@@ -3105,17 +3833,32 @@ mod tests {
         (inputs, minimum)
     }
 
+    /// The upload waiters at which the chart's configuration with a backup
+    /// store needs more of the line than of the margin, so the line sets its
+    /// minimum; the queued uploads' term, 1,000 MiB, is then the line's
+    /// largest. (200 waiters did this before b.ntm raised the margin's
+    /// minimum to 3,282 MiB with `D_c`; 400 no longer do.)
+    const LINE_BOUND_UPLOAD_WAITERS: u64 = 1_000;
+
+    /// The chart's configuration with a backup store and
+    /// [`LINE_BOUND_UPLOAD_WAITERS`] upload waiters: the line sets its
+    /// minimum.
+    fn line_bound_with_a_backup_store() -> PlanInputs {
+        PlanInputs {
+            upload_waiters: LINE_BOUND_UPLOAD_WAITERS,
+            ..with_adapter(PlanInputs::reference())
+        }
+    }
+
     /// Decider ruling 1: with a backup store on, a configuration whose line
-    /// needs more than the margin — the chart's with 200 upload waiters —
-    /// is refused one MiB below its minimum naming only the line's largest
-    /// terms, with the line's remedy: the margin closes there, so its
-    /// checkpoint terms do not set the minimum and are not named.
+    /// needs more than the margin — the chart's with
+    /// [`LINE_BOUND_UPLOAD_WAITERS`] upload waiters — is refused one MiB
+    /// below its minimum naming only the line's largest terms, with the
+    /// line's remedy: the margin closes there, so its checkpoint terms do not
+    /// set the minimum and are not named.
     #[test]
     fn refusal_when_the_line_sets_the_minimum_with_a_backup_store_names_only_the_line() {
-        let inputs = PlanInputs {
-            upload_waiters: 200,
-            ..with_adapter(PlanInputs::reference())
-        };
+        let inputs = line_bound_with_a_backup_store();
         let minimum = minimum_limit_mib(&inputs).expect("closes");
         assert_eq!(
             sides_not_closing((minimum - 1) * MIB, &inputs),
@@ -3123,15 +3866,15 @@ mod tests {
             "fixture self-check: one MiB below the minimum only the line does not close"
         );
         let err = derive_at(minimum - 1, &inputs).expect_err("one MiB below the minimum");
-        for part in [
-            "; the largest fixed terms: one maximum-size upload ",
-            ", queued uploads 200 MiB (LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS), ",
-        ] {
-            assert!(
-                err.contains(part),
-                "the line's largest terms: {part:?} in {err}"
-            );
-        }
+        let queued = format!(
+            "; the largest fixed terms: queued uploads {} MiB \
+             (LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS), one maximum-size upload ",
+            grouped(LINE_BOUND_UPLOAD_WAITERS)
+        );
+        assert!(
+            err.contains(&queued),
+            "the line's largest terms: {queued:?} in {err}"
+        );
         assert!(
             err.ends_with(&format!(
                 "raise resources.limits.memory to at least {} MiB or lower those settings",
@@ -3288,10 +4031,7 @@ mod tests {
     #[test]
     fn refusal_remedies_never_suggest_turning_off_checkpointing_or_the_backup_store() {
         let (both, both_minimum) = both_sides_set_the_minimum();
-        let line_with_a_store = PlanInputs {
-            upload_waiters: 200,
-            ..with_adapter(PlanInputs::reference())
-        };
+        let line_with_a_store = line_bound_with_a_backup_store();
         let line_with_a_store_minimum = minimum_limit_mib(&line_with_a_store).expect("closes");
         let cases = [
             ("the line, no backup store", PlanInputs::reference(), 2_048),
@@ -3303,7 +4043,7 @@ mod tests {
             (
                 "the margin, the tail on",
                 with_adapter(PlanInputs::reference()),
-                2_808,
+                3_281,
             ),
             ("both sides", both, both_minimum - 1),
             (
@@ -3531,6 +4271,14 @@ mod tests {
             ("retirement_budget_bytes", read.retirement_budget_bytes()),
             // No backup store: the plan funds no mirror.
             ("ext_mirror_budget_bytes", 0),
+            (
+                "live_delivery_budget_bytes",
+                read.live_delivery_budget_bytes(),
+            ),
+            (
+                "catchup_payload_budget_bytes",
+                read.catchup_payload_budget_bytes(),
+            ),
             ("line_total_bytes", read.line_total_bytes()),
             ("line_limit_bytes", read.line_limit_bytes()),
             ("line_headroom_bytes", read.line_headroom_bytes()),
@@ -3549,6 +4297,14 @@ mod tests {
             (6_553, 1_607),
             "the 8 GiB pod's own budgets, not the reference pod's"
         );
+        assert_eq!(
+            (
+                read.live_delivery_budget_bytes(),
+                read.catchup_payload_budget_bytes()
+            ),
+            (80 * MIB, 241 * MIB),
+            "the 8 GiB pod's own D_live and D_c, not the reference pod's 49 and 148 MiB"
+        );
 
         // With a backup store the startup line carries the mirror's budget,
         // M_ext.
@@ -3558,5 +4314,117 @@ mod tests {
             204 * MIB,
             "the mirror's budget at 8 GiB"
         );
+    }
+
+    // ── U6: the restore Job's line (`dr_restore_line_at`) ───────────────────
+
+    /// C1 for the restore term at every MiB from 1 MiB to 64 GiB: its built
+    /// budget is `⌊k × L ÷ 10⁴⌋` bytes, its exact value is `k × L ÷ 10⁴`
+    /// exactly (in 1/`EXACT_DEN` byte, since 10⁴ divides `EXACT_DEN`), and
+    /// the exact value is at or above the built one by under one byte. At
+    /// the production share every MiB is swept; three other shares, built
+    /// with the same constructor, every 97th MiB.
+    #[test]
+    fn dr_restore_line_budget_is_the_exact_share_rounded_down_to_a_byte() {
+        let inputs = PlanInputs::reference();
+        for (k, step) in [
+            (DR_RESTORE_SHARE_TEN_THOUSANDTHS, 1),
+            (1, 97),
+            (2_500, 97),
+            (7_999, 97),
+        ] {
+            for mib in (1..=SWEEP_TOP_MIB).step_by(step) {
+                let limit = mib * MIB;
+                let line = dr_restore_line_at(limit, k, &inputs);
+                let product = u128::from(k) * u128::from(limit);
+                let built = u64::try_from(product / 10_000).expect("fits");
+                assert_eq!(
+                    line.restore_budget_bytes, built,
+                    "k {k} at {mib} MiB: built"
+                );
+                let term = &line.exact_terms[2];
+                assert_eq!(term.term.name, "layers in flight");
+                assert_eq!(
+                    term.term.bytes, built,
+                    "k {k} at {mib} MiB: the term's bytes"
+                );
+                assert_eq!(
+                    term.exact,
+                    product * (EXACT_DEN / 10_000),
+                    "k {k} at {mib} MiB: the exact value"
+                );
+                let built_scaled = u128::from(built) * EXACT_DEN;
+                assert!(
+                    term.exact >= built_scaled && term.exact - built_scaled < EXACT_DEN,
+                    "k {k} at {mib} MiB: exact {} against built {built} B",
+                    term.exact
+                );
+            }
+        }
+    }
+
+    /// The line closes exactly where its exact terms fit 80 % of `L`,
+    /// re-derived here from the floor and the connection term, and that set
+    /// is every limit from the line's minimum up, with no gap (no closure
+    /// islands), at every MiB from 1 MiB to 64 GiB, for the reference inputs
+    /// and the binary's defaults at 10 CPUs with a backup store.
+    #[test]
+    fn dr_restore_line_closes_at_every_limit_from_its_minimum_and_at_none_below() {
+        for (label, inputs) in [
+            ("reference", PlanInputs::reference()),
+            ("10 CPUs, adapter", with_adapter(binary_default_inputs(10))),
+        ] {
+            let k = DR_RESTORE_SHARE_TEN_THOUSANDTHS;
+            let minimum = dr_restore_line_at(MIB, k, &inputs)
+                .minimum_limit_mib
+                .expect("a share under 8,000 has a minimum");
+            assert!(
+                (1..SWEEP_TOP_MIB).contains(&minimum),
+                "{label}: the minimum, {minimum} MiB, is inside the sweep"
+            );
+            for mib in 1..=SWEEP_TOP_MIB {
+                let limit = mib * MIB;
+                let line = dr_restore_line_at(limit, k, &inputs);
+                assert_eq!(
+                    line.minimum_limit_mib,
+                    Some(minimum),
+                    "{label}: one minimum"
+                );
+                let fixed = u128::from(line.exact_terms[0].term.bytes)
+                    + u128::from(line.exact_terms[1].term.bytes);
+                assert_eq!(line.exact_terms[0].term.bytes, POD_MEMORY_FLOOR_BYTES);
+                let fits = fixed * EXACT_DEN + line.exact_terms[2].exact
+                    <= u128::from(limit) * EXACT_DEN * 4 / 5;
+                assert_eq!(line.closes, fits, "{label} at {mib} MiB: closure");
+                assert_eq!(
+                    line.closes,
+                    mib >= minimum,
+                    "{label} at {mib} MiB: closes from {minimum} MiB up, never below"
+                );
+            }
+        }
+    }
+
+    /// The restore term is the Job's alone: the server's plan, at any limit,
+    /// carries no restore term on its line or its margin, and the Job's line
+    /// is derived at the plan's own limit. (That deriving the Job's line
+    /// leaves the plan's budgets as they were needs no assertion:
+    /// `dr_restore_line` takes the plan by shared reference.)
+    #[test]
+    fn the_servers_plan_carries_no_restore_term() {
+        for mib in [3_282, 5_120, 16_384] {
+            let plan =
+                derive_at(mib, &with_adapter(PlanInputs::reference())).expect("the plan closes");
+            let line =
+                plan.dr_restore_line(DR_RESTORE_SHARE_TEN_THOUSANDTHS, &PlanInputs::reference());
+            assert_eq!(line.limit_bytes, mib * MIB);
+            assert!(
+                plan.line_terms()
+                    .iter()
+                    .chain(plan.margin_terms())
+                    .all(|t| t.name != "layers in flight"),
+                "{mib} MiB: the server's plan names no restore term"
+            );
+        }
     }
 }

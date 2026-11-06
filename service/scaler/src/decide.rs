@@ -83,6 +83,16 @@
 //! clears it, so a scale-down always rests on a full window of polls that
 //! each observed demand. A poll held as unsettled still observed demand and
 //! keeps the run.
+//!
+//! **The disaster-recovery freeze** (SDD SR-7a). While any polled pod's
+//! snapshot reports `held`, in the fleet or not, the count is frozen: the
+//! poll holds, with [`BlockReason::Held`], before any scale-up or scale-down
+//! is considered. A held pod refuses every request and carries no
+//! subscriptions, so the terms would shrink the fleet just before every
+//! client reconnects when the hold clears. A frozen poll's demand is not
+//! recorded and clears the window, so normal scaling resumes once no pod
+//! reports `held`, and the first scale-down after the hold rests on a full
+//! window of polls taken after it.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -243,9 +253,14 @@ impl UpReason {
     }
 }
 
-/// Why a scale-down the desired count asked for did not happen this poll.
+/// Why a scale-down the desired count asked for did not happen this poll, or,
+/// for [`BlockReason::Held`], why the count was frozen in both directions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
+    /// A polled server pod reports it is held for disaster recovery
+    /// (`ScalingSnapshot::held`), whether or not it is in the fleet: the
+    /// count is frozen, neither raised nor lowered, until none does.
+    Held,
     /// The scaler has not yet observed a full window since it started.
     Startup,
     /// A desired count in the window is not below the current count, or the
@@ -263,7 +278,8 @@ pub enum BlockReason {
 }
 
 impl BlockReason {
-    pub const ALL: [BlockReason; 5] = [
+    pub const ALL: [BlockReason; 6] = [
+        BlockReason::Held,
         BlockReason::Startup,
         BlockReason::Window,
         BlockReason::Unsettled,
@@ -273,6 +289,7 @@ impl BlockReason {
 
     pub fn label(self) -> &'static str {
         match self {
+            BlockReason::Held => "held",
             BlockReason::Startup => "startup",
             BlockReason::Window => "window",
             BlockReason::Unsettled => "unsettled",
@@ -317,7 +334,9 @@ pub struct Decision {
     pub pods: PodCounts,
     pub terms: Terms,
     /// The bounded desired count. Equal to the current count on
-    /// [`Action::NoData`].
+    /// [`Action::NoData`], and on a [`BlockReason::Held`] freeze with no pod
+    /// in the fleet; on a freeze with one, what the terms asked for, which
+    /// the freeze did not act on.
     pub desired: u32,
     pub action: Action,
     pub scale_down_blocked: Option<BlockReason>,
@@ -419,10 +438,28 @@ impl Engine {
             })
             .collect();
         let read_budget_exceeded = self.check_read_budget(obs);
+        // Any polled pod, in the fleet or not: a held pod stays Ready, but
+        // one whose hold verdict also went stale reports NOT_SERVING.
+        let held = obs
+            .pods
+            .iter()
+            .any(|p| p.report.snapshot().is_some_and(|s| s.held));
 
         if fleet.is_empty() {
             // Nothing observed: the window's run of observations breaks here.
             self.window.clear();
+            if held {
+                return Decision {
+                    pods,
+                    terms: Terms::default(),
+                    desired: obs.replicas,
+                    action: Action::Hold,
+                    scale_down_blocked: Some(BlockReason::Held),
+                    catchup_rate,
+                    pod_catchup_rates,
+                    read_budget_exceeded,
+                };
+            }
             return Decision {
                 pods,
                 terms: Terms::default(),
@@ -443,6 +480,26 @@ impl Engine {
             occupancy: self.occupancy_term(snapshots()),
         };
         let (desired, up_reason) = self.bounded(terms);
+
+        if held {
+            // The freeze (SDD SR-7a): held pods carry no subscriptions, so
+            // every term reads low, and the fleet would shrink just before
+            // every client reconnects when the hold clears. Their demand is
+            // not recorded, and the window's run restarts, so the first
+            // scale-down after the hold rests on a full window of polls
+            // taken after it.
+            self.window.clear();
+            return Decision {
+                pods,
+                terms,
+                desired,
+                action: Action::Hold,
+                scale_down_blocked: Some(BlockReason::Held),
+                catchup_rate,
+                pod_catchup_rates,
+                read_budget_exceeded,
+            };
+        }
 
         self.record_window(obs.now, desired);
 

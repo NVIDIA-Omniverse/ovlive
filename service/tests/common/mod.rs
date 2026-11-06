@@ -49,6 +49,39 @@ pub fn test_leader(service_label: &str) -> LeaderIdentity {
     LeaderIdentity::new(service_label, TEST_LEADER_INSTANCE)
 }
 
+// ── Checkpoint loop plus clean-up ────────────────────────────────────────────
+
+/// Spawn the checkpoint loop and, beside it, the checkpoint clean-up task
+/// (b.g65), as `main.rs` does: the clean-up is not a timer of the loop, so a
+/// test that relied on the loop running a clean-up pass spawns both. Both run
+/// with `config` (its `leader` and `reconcile_interval`) until `cancel`; the
+/// returned handle joins both. No heal is wired (`main.rs` wires the ext
+/// mirror's), and no metrics.
+pub fn spawn_checkpoint_loop_and_cleanup(
+    client: live_edit::storage::client::ValkeyClient,
+    keys: live_edit::storage::keys::KeySchema,
+    store: std::sync::Arc<dyn live_edit::checkpoint::CheckpointStore>,
+    config: live_edit::checkpoint::CheckpointLoopConfig,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let cleanup = live_edit::checkpoint::spawn_checkpoint_cleanup(
+        client.clone(),
+        keys.clone(),
+        std::sync::Arc::clone(&store),
+        config.clone(),
+        None,
+        None,
+        cancel.clone(),
+    );
+    let checkpoint_loop =
+        live_edit::checkpoint::spawn_checkpoint_loop(client, keys, store, config, None, cancel);
+    tokio::spawn(async move {
+        let (loop_result, cleanup_result) = tokio::join!(checkpoint_loop, cleanup);
+        loop_result.expect("the checkpoint loop task must not panic");
+        cleanup_result.expect("the checkpoint clean-up task must not panic");
+    })
+}
+
 // ── SR-2.x verbatim error wording ────────────────────────────────────────────
 //
 // These constants pin the user-facing wording of the SR-2.x JwtUserinfoClient
@@ -148,9 +181,8 @@ pub fn make_jwt(claims: &serde_json::Value) -> String {
 /// Canonical `Config` used by integration tests (b.ohv item 8).
 ///
 /// Returns a fully-populated [`Config`] with values that are sane for
-/// integration tests: a fast Valkey URL (read from `TEST_VALKEY_URL`, with
-/// `LIVE_EDIT_VALKEY_ADDR` as legacy fallback, defaulting to
-/// `redis://127.0.0.1:6379`), small pools, tight timeouts, `authz_enabled =
+/// integration tests: a fast Valkey URL (read from `TEST_VALKEY_URL`,
+/// defaulting to `redis://127.0.0.1:6379`), small pools, tight timeouts, `authz_enabled =
 /// false`, `userinfo_service_enabled = true` (preserves the pre-b.g3z
 /// "external userinfo backend assumed" semantics so tests that exercise
 /// REST/gRPC userinfo dispatch keep working without rewrites), the Lua
@@ -170,12 +202,10 @@ pub fn make_jwt(claims: &serde_json::Value) -> String {
 /// `Default::default()` semantics that may not match what the field
 /// actually means in production.
 pub fn test_config() -> Config {
-    let valkey_url = std::env::var("TEST_VALKEY_URL")
-        .or_else(|_| std::env::var("LIVE_EDIT_VALKEY_ADDR"))
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let valkey_url =
+        std::env::var("TEST_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -260,6 +290,10 @@ pub fn test_config() -> Config {
         // semantics. Tests that need a faster sweep override this field
         // directly.
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,

@@ -67,16 +67,25 @@
 //!
 //! The spawned task is owned by a [`TaskTracker`] so graceful shutdown can
 //! `wait().await` for in-flight session-checkpoint writes inside the existing
-//! `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` budget. The tracker is plumbed in by the
+//! `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` budget (less when the shutdown sequence's
+//! shared deadline before Valkey `quit()` is nearer). The tracker is plumbed in by the
 //! parent Task's wire-up Subtask (`t2.fgj.7v.p9.6f` / Subtask E); this module
 //! is concerned only with spawning into it.
 //!
 //! **The dispatch task drains its pending work in an internal loop rather than
-//! re-spawning, and that is load-bearing for shutdown.** `main.rs` calls
+//! re-spawning, and that is load-bearing for shutdown.** The post-server
+//! shutdown sequence (`grpc::transport::run_post_server_sequence`) calls
 //! `close()` and then `wait()` on the tracker; a task spawned after `close()`
 //! is not covered by a `wait()` that has already returned, so a re-spawn shape
 //! could drop a queued write on the floor at shutdown. Looping inside the
 //! already-tracked task keeps every coalesced operation inside the drain.
+//!
+//! **The tracker cannot abort, so it has an abort token**
+//! ([`SessionCheckpointWriter::with_abort_token`], shared with the base
+//! bootstraps on the same tracker). A disaster-recovery hold cancels it so
+//! nothing writes to the store or the backup store any more (SDD SR-6.2), and
+//! shutdown cancels it after the drain above. Every dispatch task selects on
+//! it, and an enqueue after it does nothing.
 //!
 //! ## Disabled adapters short-circuit at the enqueue
 //!
@@ -144,6 +153,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use fred::types::scripts::Script;
 use fred::types::Value;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::checkpoint::now_unix_ms;
@@ -464,6 +474,12 @@ pub struct SessionCheckpointWriter {
     /// shutdown's `wait().await` drains every in-flight session-checkpoint
     /// write inside the configured budget.
     tracker: TaskTracker,
+    /// The tracker's abort token (SDD SR-6.2, "Abort token for trackers"),
+    /// shared with the base bootstraps on the same tracker
+    /// ([`Self::with_abort_token`]). Every dispatch task selects on it, and
+    /// once it is cancelled the enqueue entry points do nothing. A fresh,
+    /// never-cancelled token unless one is set.
+    abort: CancellationToken,
     /// Metrics handle for `inc_checkpoint_write(outcome, "session")`.
     metrics: Arc<crate::observability::metrics::Metrics>,
     /// Service / replica identifier persisted as `CheckpointMeta::creator_replica_id`.
@@ -507,11 +523,25 @@ impl SessionCheckpointWriter {
             client,
             keys,
             tracker,
+            abort: CancellationToken::new(),
             metrics,
             creator_replica_id,
             enabled,
             slots: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Set the tracker's abort token: `main.rs` passes the one the base
+    /// bootstraps on the same tracker take; it is cancelled at hold entry, and
+    /// by the post-server shutdown sequence
+    /// (`grpc::transport::run_post_server_sequence`) after its drain of the
+    /// tracker. Once it is cancelled every
+    /// dispatch task ends at its next await — an adapter call or a publish in
+    /// flight is dropped, and the coalesced operation is lost — and every
+    /// later enqueue records nothing and spawns nothing.
+    pub fn with_abort_token(mut self, abort: CancellationToken) -> Self {
+        self.abort = abort;
+        self
     }
 
     /// Enqueue a session-checkpoint write for `session_id`.
@@ -564,6 +594,11 @@ impl SessionCheckpointWriter {
             // Disabled adapter: no build, no Valkey traffic, no slot entry.
             return;
         }
+        if self.abort.is_cancelled() {
+            // Aborted (a hold, or shutdown after its drain): nothing may
+            // write any more, so record nothing either.
+            return;
+        }
 
         // Scope the DashMap guard tightly: it is a shard write-lock, and the
         // spawn below can start the task on another worker thread
@@ -593,7 +628,19 @@ impl SessionCheckpointWriter {
             creator_replica_id: self.creator_replica_id.clone(),
             slots: Arc::clone(&self.slots),
         };
-        self.tracker.spawn(dispatch_loop(ctx, session_id));
+        let abort = self.abort.clone();
+        self.tracker.spawn(async move {
+            // The abort first, so a task whose token was cancelled before its
+            // first poll never starts; its session's claim then stays taken,
+            // which is harmless because an enqueue does nothing once the
+            // token is cancelled. Dropping the loop mid-way runs its slot
+            // guard's armed drop, which releases the session's claim.
+            tokio::select! {
+                biased;
+                () = abort.cancelled() => {}
+                () = dispatch_loop(ctx, session_id, abort.clone()) => {}
+            }
+        });
     }
 }
 
@@ -601,7 +648,9 @@ impl SessionCheckpointWriter {
 ///
 /// The dispatch task retires its slot itself on the normal path and
 /// [`disarm`](Self::disarm)s this guard. An armed drop therefore means the
-/// task unwound — a panic anywhere in the loop, the adapter, or a decoder.
+/// task unwound — a panic anywhere in the loop, the adapter, or a decoder —
+/// or was dropped by the tracker's abort token (`abort` is then cancelled),
+/// which is logged as an abort, not as an unwind.
 /// Without the guard that unwind would leave `in_flight = true` with no task
 /// running, and EVERY subsequent enqueue for that session would silently
 /// record a pending op that nobody ever services: permanent per-session
@@ -617,6 +666,8 @@ struct SlotGuard {
     slots: Arc<DashMap<String, SessionWriteSlot>>,
     session_id: String,
     armed: bool,
+    /// The tracker's abort token, read only to tell an abort from an unwind.
+    abort: CancellationToken,
 }
 
 impl SlotGuard {
@@ -644,6 +695,14 @@ impl Drop for SlotGuard {
                 slot.in_flight = false;
             }
         }
+        if self.abort.is_cancelled() {
+            tracing::info!(
+                session_id = %self.session_id,
+                "session-checkpoint dispatch task aborted (a hold, or shutdown after its drain); \
+                 the operation in flight and any queued behind it are dropped"
+            );
+            return;
+        }
         tracing::error!(
             session_id = %self.session_id,
             "session-checkpoint dispatch task unwound; released its per-session claim so a \
@@ -654,15 +713,18 @@ impl Drop for SlotGuard {
 }
 
 /// Drain every operation queued for `session_id`, one at a time, then retire
-/// the slot.
+/// the slot. `abort` is the tracker's abort token, which ends the task from
+/// outside; it is passed in only so the slot guard can tell that ending from
+/// an unwind.
 ///
 /// Looping here rather than re-spawning per operation is load-bearing for
 /// graceful shutdown — see the module-level `TaskTracker` note.
-async fn dispatch_loop(ctx: DispatchCtx, session_id: String) {
+async fn dispatch_loop(ctx: DispatchCtx, session_id: String, abort: CancellationToken) {
     let mut guard = SlotGuard {
         slots: Arc::clone(&ctx.slots),
         session_id: session_id.clone(),
         armed: true,
+        abort,
     };
     let mut repairs_remaining = MAX_PUBLISH_REPAIRS;
 
@@ -1602,7 +1664,8 @@ mod tests {
     /// in flight still runs after the tracker is closed.
     ///
     /// This is why the dispatch task drains its pending work in an internal
-    /// loop instead of re-spawning per operation: `main.rs` calls `close()`
+    /// loop instead of re-spawning per operation: the post-server shutdown
+    /// sequence (`grpc::transport::run_post_server_sequence`) calls `close()`
     /// then `wait()`, and a task spawned after `close()` is not covered by a
     /// `wait()` that has already returned. A re-spawn shape would drop the
     /// queued write on the floor at shutdown — silently, and precisely when
@@ -1633,6 +1696,66 @@ mod tests {
              dispatcher re-spawns per operation and the post-`close()` spawn was dropped — the \
              queued session checkpoint is lost exactly at shutdown"
         );
+    }
+
+    /// **The abort token ends a dispatch task mid-call, and every later
+    /// enqueue does nothing** (SDD SR-6.2, "Abort token for trackers").
+    ///
+    /// A dispatch task parked inside its adapter `PUT` — a long tracked task,
+    /// the shape a disaster-recovery hold finds — ends at the token's cancel
+    /// without the `PUT` ever being released: the tracker drains, nothing
+    /// lands, and the session's claim is released rather than left set. An
+    /// enqueue after the cancel records nothing and spawns nothing, so nothing
+    /// is left to write after a hold's entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_token_ends_an_in_flight_dispatch_and_every_later_enqueue_does_nothing() {
+        let tv = TestValkey::setup().await;
+        let (gate_store, gate) = GateStore::new(1);
+        let (session_id, writer, tracker) =
+            slot_harness(&tv, Arc::clone(&gate_store) as Arc<dyn CheckpointStore>).await;
+        let abort = CancellationToken::new();
+        let writer = writer.with_abort_token(abort.clone());
+
+        writer.enqueue_session_checkpoint_write(session_id.clone());
+        await_gate(gate.reached).await;
+        // Queued behind the parked call: dropped with it.
+        writer.enqueue_session_checkpoint_write(session_id.clone());
+
+        abort.cancel();
+        // The parked PUT is never released: only the abort can end the task.
+        let _parked = gate.release;
+        drain(&tracker).await;
+
+        assert_eq!(
+            gate_store.put_calls(),
+            1,
+            "the queued write must not run after the abort; only the parked call was ever made"
+        );
+        assert!(
+            gate_store
+                .inner
+                .get_session_checkpoint(&session_id)
+                .await
+                .expect("in-memory read")
+                .is_none(),
+            "the aborted PUT never reached the store"
+        );
+        assert!(
+            writer
+                .slots
+                .get(&session_id)
+                .is_none_or(|slot| !slot.in_flight),
+            "the aborted task must release the session's claim"
+        );
+
+        writer.enqueue_session_checkpoint_write(session_id.clone());
+        writer.enqueue_session_checkpoint_delete(session_id.clone());
+        assert!(
+            tracker.is_empty(),
+            "an enqueue after the abort spawns nothing"
+        );
+        assert_eq!(gate_store.put_calls(), 1);
+        assert_eq!(gate_store.delete_calls(), 0);
     }
 
     /// Poll until the tracker owns no live tasks, or fail.

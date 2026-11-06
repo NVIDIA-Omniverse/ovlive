@@ -32,13 +32,12 @@
 //!   asserted on what the service recorded (`CapacityBudgetSeam`, checked by
 //!   `assert_budget_chain`): what each wait was charged, what it started
 //!   from, and the deadline it was handed — exact values, not a held slot
-//!   raced against a deadline. In every regime and both catch-up modes, every
-//!   read-permit wait comes before the first content message.
+//!   raced against a deadline. In every regime, every read-permit wait comes
+//!   before the first content message.
 //! * **The slot covers reads and the build only; the permit, the atomic read
-//!   only.** An up-to-date subscribe takes neither; a paused client holds
-//!   neither; a re-bootstrap nested inside a catch-up never waits for a slot
-//!   while holding one; the rollback-mode replay computes every diff under ONE
-//!   slot and only then sends. A read permit is taken only inside the slot, so
+//!   only.** An up-to-date subscribe takes neither; a re-bootstrap nested
+//!   inside a catch-up never waits for a slot while holding one. A read permit
+//!   is taken only inside the slot, so
 //!   a catch-up waiting for its slot holds no permit and one in its atomic
 //!   read holds both; it is returned as the read returns, so the concurrent
 //!   builds are bounded by the slot count, not the permits. It comes back to
@@ -47,30 +46,11 @@
 //!   `LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY` permits, and
 //!   `ValkeyClient::quit` closes it, ending a catch-up waiting at it
 //!   `shutdown` before content.
-//! * **Legacy per-commit reads take read permits too** (Spec SDD SR-3.4,
-//!   SR-7.1). The rollback-mode replay reads each commit atomically under a
-//!   permit of its own, inside its one slot: each permit wait is charged to
-//!   its budget, refused `catchup_capacity` before content when the budget
-//!   runs out, and comes before its first content message — it sends nothing,
-//!   not even a commit it has read, while it waits — and an ending at one
-//!   takes nothing. A per-commit atomic read's `NotFound` (the OLD object's
-//!   cleanup) re-bootstraps; any other failure ends it `UNAVAILABLE` before
-//!   content. Above the atomic-read limits, at its first
-//!   per-commit `TOO_LARGE` — mid-replay too — the replay drops what it built
-//!   and hands over to the out-of-window route, which gives its slot back and
-//!   attaches to the layer's shared fenced-read flight: one coalesced diff
-//!   based at `have_version`, registered once at the flight's cut, nothing
-//!   sent before it, no second slot wait by the replay itself. A
-//!   per-commit read whose cut is below the commit it rebuilds (a sequence
-//!   regression) ends the replay `UNAVAILABLE` before any content, a diff it
-//!   already built included. Per-commit waits and reads are observed under
-//!   `consumer="catchup_legacy_per_commit"`.
 //! * **An empty commit takes no read.** An entry without relay bytes above
 //!   sequence 1 is an empty commit (SDD §12.2), sent as the empty delta at its
-//!   sequence, based at the one before, with no read and no read permit: by a
+//!   sequence, based at the one before, with no read and no read permit by a
 //!   caught-up subscriber, while a catch-up holds the replica's only permit and
-//!   at any layer size, and inside a rollback replay, which still reads the
-//!   `CreateLayer` seed (sequence 1) for its content.
+//!   at any layer size.
 //! * **Reserve, then register at the cut.** A catch-up reserves its stream
 //!   reader before its capacity waits and registers its stream only at its
 //!   proven read's cut — the cut it acks: at or below the atomic-read limits,
@@ -82,7 +62,7 @@
 //!   it. On a cluster the reservation keeps the reader bound to the layer's
 //!   hash slot through the waits, and every ending while reserved — shutdown,
 //!   session deletion, disconnect, a `catchup_capacity` refusal, the
-//!   snapshot-mode `Deleted` scan, a `NotFound` re-bootstrap at the atomic
+//!   in-window `Deleted` scan, a `NotFound` re-bootstrap at the atomic
 //!   read — releases the reader (and unbinds its slot) and leaves the read
 //!   gate full. A registration the multiplexer refuses because it shut down
 //!   meanwhile ends `shutdown` before content.
@@ -99,8 +79,10 @@
 //!   endings are pinned in `subscribe_fenced_catch_up_test.rs`.)
 //! * **The ending check.** A catch-up whose own stream registration ended
 //!   after it registered — here, killed by the backlog hard cap while its
-//!   build is held — ends with that ending before its first message, after
-//!   its slot is released.
+//!   build is held, or while it waits for the catch-up payload budget —
+//!   ends with that ending before its first message: after its slot is
+//!   released, or as soon as its payload-budget wait's periodic check sees
+//!   it, never at that wait's capacity-budget deadline.
 //!
 //! The concurrent-catch-up and admission basics (FIFO order, endings of a
 //! queued wait, the reserved trailer slot) live in
@@ -115,17 +97,11 @@
 //! There is no seam between a catch-up's registration and its build, nor
 //! inside its atomic read. Two test-side stand-ins hold it there instead, with
 //! no production hook: [`ParkingExtStore`], an external-value store whose
-//! `read_batch*` parks while armed — a catch-up's build resolves its layer's
+//! ranged reads park while armed — a catch-up's build reads its layer's
 //! external values through it, after the registration, holding its slot — and
 //! `test_support::stall_pool` over the snapshot lane, which parks a catch-up
 //! inside its atomic read (behind a `BLPOP` on the lane's one connection),
 //! holding its slot and its read permit.
-//!
-//! Nor is there a seam at a per-commit read's permit wait. The test learns a
-//! subscription is queued there from the gate itself
-//! ([`pass_the_permit_through`]): it queues a probe behind the permit it
-//! holds and drops that permit, and the probe is granted only after everything
-//! queued ahead of it has read and given its permit back.
 //!
 //! # A second, silent activation condition
 //!
@@ -155,9 +131,7 @@
 //! `REACQUIRE_REFUSAL_BUDGET_MS` (3 s, less the promptly-released waits
 //! before it) for the refused re-acquire after a `Restored` recovery, and
 //! `CLUSTER_SHORT_BUDGET_MS` (500 ms) for a cluster reader refusal (by the
-//! budget, or by the deadline a storage-level subscription is given). So is
-//! one window, once: `NOTHING_SENT_WINDOW` (300 ms), in which a replay
-//! waiting for a read permit must send nothing. The
+//! budget, or by the deadline a storage-level subscription is given). The
 //! two budget-charge tests also
 //! pay their spends, which exist to spend budget and are never
 //! synchronisation: 1 s standalone (`ADMISSION_SPEND` + `FIRST_SLOT_SPEND`)
@@ -166,28 +140,20 @@
 //! on a spend racing a deadline. `PARKED_BUDGET_MS` (60 s) is never paid: it
 //! only keeps a queued wait from refusing itself before the event under test,
 //! and every await on such a wait is bounded by `SETTLE`. The heaviest tests —
-//! the paused rollback replay, the steady-state overwrite refusal, the layer
-//! lost under a shared fenced read and the refused re-acquire after a restored
-//! recovery — each sum to ≈ 90 s at every budget's full value (the paused
-//! replay: one header-and-body message 20 s + one polled condition 10 s + one
-//! park 10 s + one release 10 s + two drains 40 s; the layer lost under a
-//! shared read: five polled conditions or slot waits at `SETTLE` + two drains;
-//! the refused re-acquire: nine `SETTLE`s, the budget running out inside one
-//! of them). The fenced catch-up whose reads are all broken sums to ≈ 70 s
+//! the steady-state overwrite refusal, the layer lost under a shared fenced
+//! read and the refused re-acquire after a restored recovery — each sum to
+//! ≈ 90 s at every budget's full value (the layer lost under a shared read:
+//! five polled conditions or slot waits at `SETTLE` + two drains; the refused
+//! re-acquire: nine `SETTLE`s, the budget running out inside one of them).
+//! The fenced catch-up whose reads are all broken sums to ≈ 70 s
 //! (seven `SETTLE`-bounded waits). The slot-and-permit wait sums to ≈ 60 s (three `SETTLE`s, one drain
 //! and the polled conditions after it, plus its twelve commits); the
 //! concurrent-builds test to ≈ 70 s (five polled conditions and one drain over
 //! all five joiners); the stalled-read cancellation and every permit-wait
 //! ending to ≤ 60 s (at most six `SETTLE`-bounded waits each); the standalone
 //! budget-charge test to ≈ 81 s (six `SETTLE`s, one drain and 1 s of spends).
-//! Of the per-commit and empty-commit tests, the replay's per-commit permits
-//! sum to ≈ 70 s (two polled conditions, one pass-through of the permit — its
-//! own `SETTLE` plus one last probe's — one message and one drain), the empty
-//! commits delivered to three caught-up subscribers to ≈ 70 s (three acks and
-//! two drains), the regression at a replay's second read to ≈ 60 s (six
-//! `SETTLE`-bounded waits), the empty commits racing an overwrite to ≈ 100 s
-//! (a park, the cleanup wait, a release and one polled condition at `SETTLE`,
-//! one header-and-body message 20 s, plus two drains). Of the `/scaling/v1`
+//! Of the empty-commit tests, the empty commits delivered to three caught-up
+//! subscribers sum to ≈ 70 s (three acks and two drains). Of the `/scaling/v1`
 //! counter tests, the re-bootstrap before the first ack sums to ≈ 60 s (a
 //! park, the cleanup wait and a release at `SETTLE`, one drain, one polled
 //! condition) and the steady-state re-bootstrap after it to ≈ 70 s (two
@@ -308,23 +274,7 @@ enum Ceiling {
     /// [`FORCED_LOW_ITEMS`]: every catch-up reads through its layer's shared
     /// fenced-read flight.
     ForcedLow,
-    /// [`CROSSING_ITEMS`]: above a small layer's item bound and below a large
-    /// one's, so a layer that grows past it during a replay crosses it.
-    #[cfg(feature = "test-fault-injection")]
-    Crossing,
 }
-
-/// `LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS` for [`Ceiling::Crossing`]. The
-/// atomic read's early-out bounds a layer at 8 items per live section (the
-/// section row's 6 columns, its index member and its children-list element)
-/// plus its other families: a few sections (under 50) stay below it, the
-/// [`CROSSING_SECTIONS`] more of one large commit (over 400) go above it.
-#[cfg(feature = "test-fault-injection")]
-const CROSSING_ITEMS: u64 = 200;
-
-/// Sections the crossing commit adds in one go.
-#[cfg(feature = "test-fault-injection")]
-const CROSSING_SECTIONS: u64 = 50;
 
 impl CapacityFixture {
     /// Single-node Valkey, two stream readers, unlimited subscriptions, one
@@ -413,8 +363,6 @@ impl CapacityFixture {
         match ceiling {
             Ceiling::Shipped => {}
             Ceiling::ForcedLow => config.snapshot_atomic_read_max_items = FORCED_LOW_ITEMS,
-            #[cfg(feature = "test-fault-injection")]
-            Ceiling::Crossing => config.snapshot_atomic_read_max_items = CROSSING_ITEMS,
         }
         config.valkey_connect_timeout_secs = 30;
         config
@@ -476,13 +424,9 @@ impl Drop for CapacityFixture {
     }
 }
 
-/// A service over `fx` in the given catch-up mode, with no seam installed.
-/// Tests install the seams they drive on the returned value.
-fn build_service(
-    fx: &CapacityFixture,
-    catchup_snapshot_enabled: bool,
-    maxlen: u64,
-) -> LiveEditService {
+/// A service over `fx`, with no seam installed. Tests install the seams they
+/// drive on the returned value.
+fn build_service(fx: &CapacityFixture, maxlen: u64) -> LiveEditService {
     let layer_store = Arc::new(LayerStore::new(
         fx.client.clone(),
         fx.key_schema.clone(),
@@ -503,7 +447,6 @@ fn build_service(
         Arc::clone(&metrics),
     ));
     LiveEditService {
-        catchup_snapshot_enabled,
         session_store: Arc::new(SessionStore::new(fx.client.clone(), fx.key_schema.clone())),
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),
@@ -1103,34 +1046,12 @@ fn catchup_snapshot_reads(metrics: &Metrics, path: &str, outcome: &str) -> u64 {
     .unwrap_or(0.0) as u64
 }
 
-/// The `consumer` label of a legacy per-commit snapshot read: one commit of a
-/// rollback-mode in-window replay. An empty commit takes none, and the steady
-/// state never reads.
-const PER_COMMIT: &str = "catchup_legacy_per_commit";
-
-/// `live_edit_snapshot_read_total{consumer="catchup_legacy_per_commit", path,
-/// outcome}`; `0` while absent.
-fn per_commit_snapshot_reads(metrics: &Metrics, path: &str, outcome: &str) -> u64 {
-    sample_value(
-        &render(metrics),
-        "live_edit_snapshot_read_total",
-        &[
-            ("consumer", PER_COMMIT),
-            ("path", path),
-            ("outcome", outcome),
-        ],
-    )
-    .unwrap_or(0.0) as u64
-}
-
-/// Every legacy per-commit snapshot read, on any path, however it ended.
-fn all_per_commit_snapshot_reads(metrics: &Metrics) -> u64 {
+/// The sum of every sample of the counter family `metric` (a `_total` or a
+/// histogram's `_count`), over all its label sets; `0` while none is present.
+fn sum_of_samples(metrics: &Metrics, metric: &str) -> u64 {
     render(metrics)
         .lines()
-        .filter(|line| {
-            line.starts_with("live_edit_snapshot_read_total{")
-                && line.contains(&format!("consumer=\"{PER_COMMIT}\""))
-        })
+        .filter(|line| line.starts_with(&format!("{metric}{{")))
         .filter_map(|line| line.rsplit_once(' '))
         .map(|(_, value)| {
             value
@@ -1141,35 +1062,20 @@ fn all_per_commit_snapshot_reads(metrics: &Metrics) -> u64 {
         .sum()
 }
 
-/// Every catch-up proven read (`consumer="catchup"`) on the atomic path,
-/// served or answered `TOO_LARGE`.
-#[cfg(feature = "test-fault-injection")]
-fn catchup_atomic_reads(metrics: &Metrics) -> u64 {
-    catchup_snapshot_reads(metrics, "atomic", "ok")
-        + catchup_snapshot_reads(metrics, "atomic", "too_large")
+/// Every snapshot read (`live_edit_snapshot_read_total`), by any consumer, on
+/// any path, however it ended.
+fn all_snapshot_reads(metrics: &Metrics) -> u64 {
+    sum_of_samples(metrics, "live_edit_snapshot_read_total")
 }
 
-/// `live_edit_catchup_snapshot_read_wait_seconds_count{consumer=
-/// "catchup_legacy_per_commit", class="atomic"}`: legacy per-commit
-/// read-permit acquisitions that ended, however they ended; `0` while absent.
-fn per_commit_read_permit_waits(metrics: &Metrics) -> u64 {
-    sample_value(
-        &render(metrics),
+/// Every catch-up read-permit acquisition that ended
+/// (`live_edit_catchup_snapshot_read_wait_seconds_count`), by any consumer,
+/// in any class, however it ended (the test's own included).
+fn all_read_permit_waits(metrics: &Metrics) -> u64 {
+    sum_of_samples(
+        metrics,
         "live_edit_catchup_snapshot_read_wait_seconds_count",
-        &[("consumer", PER_COMMIT), ("class", "atomic")],
     )
-    .unwrap_or(0.0) as u64
-}
-
-/// `live_subscribe_regime_total{regime, service}`: catch-ups served under
-/// `regime`; `0` while absent.
-fn regimes_served(metrics: &Metrics, regime: &str) -> u64 {
-    sample_value(
-        &render(metrics),
-        "live_subscribe_regime_total",
-        &[("regime", regime), ("service", SERVICE)],
-    )
-    .unwrap_or(0.0) as u64
 }
 
 /// `live_edit_catchup_snapshot_flight_total{role}` (`leader` | `joined_read`):
@@ -1261,16 +1167,19 @@ async fn assert_flights_idle(svc: &LiveEditService, what: &str) {
 
 // ── A catch-up held inside its build ────────────────────────────────────────
 
-/// An external-value store that, while armed, parks every `probe_values`,
-/// `read_batch` and `read_batch_with_recovery_counter` call until the test
-/// releases it, and otherwise is [`MockExternalValueStore`].
+/// An external-value store that, while armed, parks every `read_value_range`
+/// call until the test releases it, and otherwise is
+/// [`MockExternalValueStore`] (whose length probe, restore and ranged read are
+/// the trait's defaults, over its `probe_values` and `read_batch`).
 ///
-/// A catch-up's build resolves its layer's external values through the probe
-/// (and through `read_batch*` only for a hash still missing when it re-reads
-/// under the read hold), after its stream registration and holding its
-/// catch-up slot, so
-/// a layer carrying one ([`commit_with_external_value`]) holds a catch-up at a
-/// point no production seam reaches.
+/// A catch-up's build lays its payload out from its external values' probed
+/// lengths, reserves its catch-up payload memory, then reads each value in
+/// ranges (b.ntm), after its stream registration and holding its catch-up
+/// slot, so a layer carrying one small value
+/// ([`commit_with_external_value`], one range) holds a catch-up at a point no
+/// production seam reaches, once per build. (It parks the ranged read only:
+/// the build probes its values' lengths twice, before the layout and at its
+/// closing check, so parking the probe would park each build twice.)
 ///
 /// It counts the calls parked at once and the most ever parked at once, which
 /// is the number of catch-up builds running together.
@@ -1372,19 +1281,7 @@ impl live_edit::storage::external_values::ExternalValueStore for ParkingExtStore
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, live_edit::error::ServiceError> {
-        self.park().await?;
         self.inner.read_batch(hashes).await
-    }
-
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, live_edit::error::ServiceError> {
-        self.park().await?;
-        self.inner
-            .read_batch_with_recovery_counter(hashes, recovery_counter)
-            .await
     }
 
     async fn probe_values(
@@ -1392,8 +1289,17 @@ impl live_edit::storage::external_values::ExternalValueStore for ParkingExtStore
         hashes: &[[u8; 32]],
     ) -> Result<live_edit::storage::external_values::ExtValueProbe, live_edit::error::ServiceError>
     {
-        self.park().await?;
         self.inner.probe_values(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, live_edit::error::ServiceError> {
+        self.park().await?;
+        self.inner.read_value_range(hash, start, len).await
     }
 
     async fn enqueue_retirement_attempt(
@@ -1439,16 +1345,12 @@ fn install_parking_ext_store(svc: &mut LiveEditService) -> Arc<ParkingExtStore> 
 // The budget bounds the slot wait; the refusal comes before content
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Which catch-up a slot-timeout test refuses.
+/// Which catch-up a slot-timeout test refuses. Each reserves its stream
+/// reader, then waits for the slot.
 #[derive(Clone, Copy, Debug)]
 enum RefusedCatchUp {
-    /// Reserves its stream reader, then waits for the slot.
     BrandNew,
-    /// Rollback mode: waits for the slot before its `XRANGE` and before it
-    /// takes a reader.
-    InWindowRollback,
-    /// Snapshot mode: reserves its stream reader, then waits.
-    InWindowSnapshot,
+    InWindow,
 }
 
 /// A catch-up whose slot wait outlasts the capacity budget ends in-stream
@@ -1458,7 +1360,7 @@ enum RefusedCatchUp {
 /// any reader reservation it held while waiting.
 async fn a_slot_wait_that_outlasts_the_budget_is_refused_before_content(case: RefusedCatchUp) {
     let fx = CapacityFixture::setup(1, SHORT_BUDGET_MS).await;
-    let svc = build_service(&fx, matches!(case, RefusedCatchUp::InWindowSnapshot), 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "slot-timeout";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 11).await;
@@ -1524,19 +1426,8 @@ async fn a_brand_new_slot_wait_that_outlasts_the_budget_is_refused_catchup_capac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_reconnect_slot_wait_that_outlasts_the_budget_is_refused_before_content() {
-    a_slot_wait_that_outlasts_the_budget_is_refused_before_content(
-        RefusedCatchUp::InWindowRollback,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_snapshot_reconnect_slot_wait_that_outlasts_the_budget_is_refused_before_content() {
-    a_slot_wait_that_outlasts_the_budget_is_refused_before_content(
-        RefusedCatchUp::InWindowSnapshot,
-    )
-    .await;
+async fn a_reconnect_slot_wait_that_outlasts_the_budget_is_refused_before_content() {
+    a_slot_wait_that_outlasts_the_budget_is_refused_before_content(RefusedCatchUp::InWindow).await;
 }
 
 /// An up-to-date subscribe takes no catch-up slot: with the only slot held and
@@ -1546,7 +1437,7 @@ async fn a_snapshot_reconnect_slot_wait_that_outlasts_the_budget_is_refused_befo
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_up_to_date_subscribe_takes_no_catch_up_slot() {
     let fx = CapacityFixture::setup(1, SHORT_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "up-to-date";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 21).await;
@@ -1568,35 +1459,6 @@ async fn an_up_to_date_subscribe_takes_no_catch_up_slot() {
     assert_eq!(live.sequence_num, 3);
     assert_eq!(exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY), 0);
     drop(held);
-}
-
-/// A rollback-mode in-window catch-up takes its slot ONCE, for every read and
-/// build of its replay: one `catchup_wait` observation for a K-commit replay,
-/// where per-commit acquisition would record K + 1.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_in_window_catch_up_records_exactly_one_slot_wait() {
-    const K: u64 = 4;
-    let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "one-wait";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    for section_id in 0..K {
-        commit(&svc, &session_id, layer, object_id, 31 + section_id).await;
-    }
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, "one-wait").await;
-    let (contents, ack) = recv_catch_up(&mut stream).await;
-    assert_eq!(
-        contents.iter().map(|h| h.sequence_num).collect::<Vec<_>>(),
-        (2..=K + 1).collect::<Vec<_>>(),
-        "fixture self-check: the reconnect is served the per-commit replay of all {K} commits"
-    );
-    assert_eq!(ack.sequence_num, K + 1);
-    assert_eq!(
-        catchup_waits(&fx.metrics, CATCHUP_WAIT_RESULT_ACQUIRED),
-        1,
-        "the whole {K}-commit replay runs under one slot: exactly one slot wait"
-    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1638,10 +1500,9 @@ impl WaitedRegime {
 ///
 /// The test holds the only slot itself, so the subject's wait is certain, and
 /// lands the commits once the subject is queued (`catchups_waiting` = 1),
-/// which is after its pre-wait header read in every mode.
+/// which is after its pre-wait header read in every regime.
 async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
     regime: WaitedRegime,
-    catchup_snapshot_enabled: bool,
     ceiling: Ceiling,
 ) {
     const K: u64 = 3;
@@ -1650,8 +1511,8 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::OutOfWindow => 4,
         _ => 4096,
     };
-    let svc = build_service(&fx, catchup_snapshot_enabled, maxlen);
-    let layer = format!("waited-{}-{catchup_snapshot_enabled}", regime.label());
+    let svc = build_service(&fx, maxlen);
+    let layer = format!("waited-{}-{ceiling:?}", regime.label());
     // The header sequence before the waits (P).
     let (session_id, object_id, first_read) = match regime {
         WaitedRegime::OutOfWindow => {
@@ -1685,15 +1546,11 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         "the subject queues for the only slot",
     )
     .await;
-    let reserves_before_the_wait =
-        matches!(regime, WaitedRegime::BrandNew) || catchup_snapshot_enabled;
-    if reserves_before_the_wait {
-        assert_eq!(
-            svc.valkey.stream_mux.snapshot().subscriptions(),
-            1,
-            "fixture self-check: this catch-up holds a reader reservation through its slot wait"
-        );
-    }
+    assert_eq!(
+        svc.valkey.stream_mux.snapshot().subscriptions(),
+        1,
+        "fixture self-check: the catch-up holds a reader reservation through its slot wait"
+    );
     let wait_sections: Vec<u64> = (0..K).map(|i| 500 + i).collect();
     for &section_id in &wait_sections {
         commit(&svc, &session_id, &layer, object_id, section_id).await;
@@ -1705,8 +1562,7 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
     assert_eq!(
         (content.object_id, content.sequence_num),
         (object_id, last),
-        "[{} / snapshot={catchup_snapshot_enabled}] the content must carry the last commit made \
-         during the wait",
+        "[{} / {ceiling:?}] the content must carry the last commit made during the wait",
         regime.label()
     );
     let carried = section_ids(&body);
@@ -1729,7 +1585,7 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
     );
 
     let label = regime.label();
-    let case = format!("[{label} / snapshot={catchup_snapshot_enabled} / {ceiling:?}]");
+    let case = format!("[{label} / {ceiling:?}]");
     assert_eq!(stable_cuts(&fx.metrics, "verified", label), 1, "{case}");
     assert_eq!(stable_cuts(&fx.metrics, "unverified", label), 0, "{case}");
     assert_eq!(
@@ -1741,8 +1597,6 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
     let (atomic, too_large, fenced) = match ceiling {
         Ceiling::Shipped => (1, 0, 0),
         Ceiling::ForcedLow => (0, 1, 1),
-        #[cfg(feature = "test-fault-injection")]
-        Ceiling::Crossing => unreachable!("no waited-catch-up case runs the crossing ceiling"),
     };
     assert_eq!(
         (
@@ -1758,50 +1612,27 @@ async fn a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_brand_new_catch_up_verifies_on_the_first_attempt_snapshot_mode() {
+async fn a_waited_brand_new_catch_up_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::BrandNew,
-        true,
         Ceiling::Shipped,
     )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_brand_new_catch_up_verifies_on_the_first_attempt_rollback_mode() {
-    a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
-        WaitedRegime::BrandNew,
-        false,
-        Ceiling::Shipped,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_in_window_snapshot_catch_up_verifies_on_the_first_attempt() {
+async fn a_waited_in_window_catch_up_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::InWindow,
-        true,
         Ceiling::Shipped,
     )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_out_of_window_catch_up_verifies_on_the_first_attempt_snapshot_mode() {
+async fn a_waited_out_of_window_catch_up_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::OutOfWindow,
-        true,
-        Ceiling::Shipped,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_out_of_window_catch_up_verifies_on_the_first_attempt_rollback_mode() {
-    a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
-        WaitedRegime::OutOfWindow,
-        false,
         Ceiling::Shipped,
     )
     .await;
@@ -1811,28 +1642,24 @@ async fn a_waited_out_of_window_catch_up_verifies_on_the_first_attempt_rollback_
 async fn a_waited_brand_new_catch_up_on_the_fenced_path_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::BrandNew,
-        true,
         Ceiling::ForcedLow,
     )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_in_window_snapshot_catch_up_on_the_fenced_path_verifies_on_the_first_attempt() {
+async fn a_waited_in_window_catch_up_on_the_fenced_path_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::InWindow,
-        true,
         Ceiling::ForcedLow,
     )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_waited_out_of_window_rollback_catch_up_on_the_fenced_path_verifies_on_the_first_attempt()
-{
+async fn a_waited_out_of_window_catch_up_on_the_fenced_path_verifies_on_the_first_attempt() {
     a_waited_catch_up_verifies_its_stable_cut_on_the_first_attempt(
         WaitedRegime::OutOfWindow,
-        false,
         Ceiling::ForcedLow,
     )
     .await;
@@ -1844,7 +1671,7 @@ async fn a_waited_out_of_window_rollback_catch_up_on_the_fenced_path_verifies_on
 /// (The interim path this replaced acked its re-read pin after a slot wait and
 /// served a state its quiescence loop could not prove.)
 ///
-/// The subject (brand new, snapshot mode) waits for the only slot while K
+/// The subject (brand new) waits for the only slot while K
 /// commits land, then parks at its pre-full-state point, holding its slot (no
 /// flight is registered yet), before its atomic attempt. A hammer then moves
 /// the header sequence with no commit — which the fence does not hold off — so
@@ -1863,7 +1690,7 @@ async fn a_fenced_catch_up_whose_every_read_is_broken_ends_unavailable_before_co
 
     const K: u64 = 3;
     let fx = CapacityFixture::setup_above_ceiling(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_full_state());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let layer = "broken-after-wait";
@@ -1944,80 +1771,6 @@ async fn a_fenced_catch_up_whose_every_read_is_broken_ends_unavailable_before_co
 // The slot covers reads and the build only
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A rollback-mode replay whose client pauses holds no slot, and is never
-/// refused for one: with one slot and a 300 ms budget, a replay deeper than
-/// the response channel blocks in delivery while a brand-new subscriber takes
-/// the only slot and parks with it; resumed, the replay delivers every commit
-/// and its ack.
-///
-/// Per-commit slot acquisition would make the resumed replay wait behind the
-/// parked holder and be refused `catchup_capacity` after content.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_paused_rollback_replay_holds_no_slot_and_is_never_refused() {
-    use live_edit::observability::metrics::STREAM_EXIT_SLOW_READER_DEADLINE;
-
-    /// Two messages per replayed commit: 80 messages against 32 delivery
-    /// slots, so the replay blocks mid-delivery while the client pauses.
-    const BACKLOG: u64 = 40;
-    let fx = CapacityFixture::setup(1, SHORT_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    // Keeps the slow-reader deadline out of the pause.
-    svc.outer_send_deadline_for_test = Some(Duration::from_secs(20));
-    let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_full_state());
-    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    let (session_id, object_id) = create_layer(&fx, &svc, "paused-replay").await;
-    for section_id in 0..BACKLOG {
-        commit(
-            &svc,
-            &session_id,
-            "paused-replay",
-            object_id,
-            1_000 + section_id,
-        )
-        .await;
-    }
-    let (holder_session, _) = create_layer(&fx, &svc, "paused-holder").await;
-
-    let mut replay = subscribe(&svc, &session_id, "paused-replay", object_id, 1, "paused").await;
-    let (first, _) = recv_message(&mut replay, "the replay's first commit").await;
-    assert_eq!(
-        first.sequence_num, 2,
-        "fixture self-check: the per-commit replay"
-    );
-    // The client now pauses. The replay released its slot before its first send.
-    await_condition(
-        || series(&fx.metrics, INFLIGHT) == 0,
-        "the paused replay holds no slot",
-    )
-    .await;
-
-    let mut holder = subscribe(&svc, &holder_session, "paused-holder", 0, 0, "holder").await;
-    tokio::time::timeout(SETTLE, seam.wait_until_parked_pre_full_state())
-        .await
-        .expect("the brand-new subscriber takes the only slot and parks with it");
-    assert_eq!(series(&fx.metrics, INFLIGHT), 1);
-
-    // The client resumes.
-    let (rest, ack) = recv_catch_up(&mut replay).await;
-    let mut sequences = vec![first.sequence_num];
-    sequences.extend(rest.iter().map(|h| h.sequence_num));
-    assert_eq!(
-        sequences,
-        (2..=BACKLOG + 1).collect::<Vec<_>>(),
-        "every commit of the replay is delivered, in order"
-    );
-    assert_eq!(ack.sequence_num, BACKLOG + 1);
-    assert_eq!(exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY), 0);
-    assert_eq!(exits(&fx.metrics, STREAM_EXIT_SLOW_READER_DEADLINE), 0);
-
-    tokio::time::timeout(SETTLE, seam.arrive_at_pre_full_state())
-        .await
-        .expect("release the holder");
-    let (_, holder_ack) = recv_catch_up(&mut holder).await;
-    assert_eq!(holder_ack.sequence_num, 1);
-}
-
 /// At a limit of one, a re-bootstrap nested inside a catch-up completes: the
 /// in-window catch-up that finds its layer overwritten (a `deleted` sentinel
 /// in its retained window) releases its slot before the re-bootstrap takes
@@ -2027,9 +1780,10 @@ async fn a_paused_rollback_replay_holds_no_slot_and_is_never_refused() {
 /// The XRANGE seam parks the reconnect after its header read, holding the
 /// slot, while the test overwrites the layer.
 #[cfg(feature = "test-fault-injection")]
-async fn a_nested_rebootstrap_completes_at_a_limit_of_one(catchup_snapshot_enabled: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_nested_overwrite_rebootstrap_completes_at_a_limit_of_one() {
     let fx = CapacityFixture::setup(1, SHORT_BUDGET_MS).await;
-    let mut svc = build_service(&fx, catchup_snapshot_enabled, 4096);
+    let mut svc = build_service(&fx, 4096);
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&seam));
     let layer = "nested-rebootstrap";
@@ -2050,8 +1804,7 @@ async fn a_nested_rebootstrap_completes_at_a_limit_of_one(catchup_snapshot_enabl
     assert_eq!(
         (content.object_id, content.sequence_num),
         (new_object_id, 1),
-        "[snapshot={catchup_snapshot_enabled}] the nested re-bootstrap must serve the NEW \
-         object's full state first"
+        "the nested re-bootstrap must serve the NEW object's full state first"
     );
     recv_ack(&mut stream, new_object_id, 1).await;
     assert_eq!(
@@ -2065,264 +1818,6 @@ async fn a_nested_rebootstrap_completes_at_a_limit_of_one(catchup_snapshot_enabl
         "one slot for the reconnect's catch-up, one for its re-bootstrap"
     );
     await_condition(|| series(&fx.metrics, INFLIGHT) == 0, "both slots are back").await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_nested_overwrite_rebootstrap_completes_at_a_limit_of_one_rollback_mode() {
-    a_nested_rebootstrap_completes_at_a_limit_of_one(false).await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_nested_overwrite_rebootstrap_completes_at_a_limit_of_one_snapshot_mode() {
-    a_nested_rebootstrap_completes_at_a_limit_of_one(true).await;
-}
-
-/// A rollback-mode replay whose OLD object is cleaned up between two of its
-/// per-commit computes — the b.jvx Site A shape, with no `deleted` sentinel in
-/// its slice — re-bootstraps onto the NEW object before sending anything: its
-/// first message is the NEW object's full state, and no OLD commit is ever
-/// sent. With `slot_held_elsewhere`, the test takes the slot the replay
-/// releases, so the re-bootstrap's own slot wait runs out the (refilled) 300 ms
-/// budget and the stream's first item is `UNAVAILABLE catchup_capacity`.
-///
-/// Each per-commit read is the replay's own atomic read (Spec SDD SR-3.4): the
-/// first is served, and the second — after the cleanup UNLINKed the OLD
-/// object's header — answers `NotFound`, which is what routes the replay into
-/// the re-bootstrap. Both read permits are back afterwards.
-///
-/// Computing and sending commit by commit, the replay would have sent the OLD
-/// object's first commit before it met the `NotFound`.
-#[cfg(feature = "test-fault-injection")]
-async fn an_in_window_replay_cleaned_up_between_computes(slot_held_elsewhere: bool) {
-    let budget = if slot_held_elsewhere {
-        SHORT_BUDGET_MS
-    } else {
-        PARKED_BUDGET_MS
-    };
-    let fx = CapacityFixture::setup(1, budget).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let seam =
-        Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_between_replay_computes());
-    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    let layer = "site-a";
-    let (session_id, old_object_id) = create_layer(&fx, &svc, layer).await;
-    for section_id in 71..=73 {
-        commit(&svc, &session_id, layer, old_object_id, section_id).await;
-    }
-
-    let mut stream = subscribe(&svc, &session_id, layer, old_object_id, 1, "site-a").await;
-    tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
-        .await
-        .expect("the replay parks after its first per-commit compute");
-    assert_eq!(
-        series(&fx.metrics, INFLIGHT),
-        1,
-        "fixture self-check: the parked replay holds the only slot"
-    );
-    let mut queued = std::pin::pin!(svc
-        .valkey
-        .catchup_gate
-        .acquire(tokio::time::Instant::now() + Duration::from_secs(3_600)));
-    if slot_held_elsewhere {
-        assert!(
-            futures::poll!(queued.as_mut()).is_pending(),
-            "the test queues behind the replay for its slot"
-        );
-    }
-
-    let new_object_id = overwrite(&svc, &session_id, layer).await;
-    svc.layer_store.wait_for_cleanup(SETTLE).await;
-    tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
-        .await
-        .expect("release the replay");
-
-    if slot_held_elsewhere {
-        let permit = tokio::time::timeout(SETTLE, queued)
-            .await
-            .expect("the replay releases its slot before its re-bootstrap")
-            .expect("the test takes the released slot");
-        let status = first_status(&mut stream, "the re-bootstrap's capacity refusal").await;
-        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
-        assert_eq!(status.message(), CATCHUP_CAPACITY_MSG);
-        crate::common::refusal_detail::assert_catchup_slot_refusal(&status);
-        await_condition(
-            || exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY) == 1,
-            "the refusal is counted under catchup_capacity",
-        )
-        .await;
-        assert_replay_met_not_found_at_its_second_atomic_read(&fx.metrics);
-        assert!(
-            read_gate_is_full(&svc),
-            "the replay's read permits are back"
-        );
-        drop(permit);
-        return;
-    }
-
-    let (content, _) = recv_message(&mut stream, "the first message").await;
-    assert_eq!(
-        (content.object_id, content.sequence_num),
-        (new_object_id, 1),
-        "the first message must be the NEW object's full state; the OLD object ({old_object_id}) \
-         sent first means the replay sent a commit before it met the NotFound"
-    );
-    recv_ack(&mut stream, new_object_id, 1).await;
-    commit(&svc, &session_id, layer, new_object_id, 74).await;
-    let (next, _) = recv_message(&mut stream, "the first live commit").await;
-    assert_eq!(
-        (next.object_id, next.sequence_num),
-        (new_object_id, 2),
-        "nothing from the OLD object follows the NEW object's catch-up"
-    );
-    assert_replay_met_not_found_at_its_second_atomic_read(&fx.metrics);
-    assert!(
-        read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0,
-        "the replay's read permits and the re-bootstrap's are back"
-    );
-}
-
-/// [`an_in_window_replay_cleaned_up_between_computes`]'s replay read its
-/// commits atomically: the first per-commit read was served, and the second,
-/// after the OLD object's cleanup, answered `NotFound` — the re-bootstrap's
-/// cause. Each took its own read permit.
-#[cfg(feature = "test-fault-injection")]
-fn assert_replay_met_not_found_at_its_second_atomic_read(metrics: &Metrics) {
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(metrics, "atomic", "ok"),
-            per_commit_snapshot_reads(metrics, "atomic", "not_found"),
-            all_per_commit_snapshot_reads(metrics),
-        ),
-        (1, 1, 2),
-        "the replay's first per-commit atomic read is served and its second, after the \
-         cleanup, answers NotFound; no other per-commit read runs"
-    );
-    assert_eq!(
-        per_commit_read_permit_waits(metrics),
-        2,
-        "one read permit per per-commit read"
-    );
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_in_window_replay_whose_state_is_cleaned_up_between_computes_rebootstraps_before_content(
-) {
-    an_in_window_replay_cleaned_up_between_computes(false).await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_in_window_replay_cleaned_up_between_computes_is_refused_its_rebootstrap_slot_first() {
-    an_in_window_replay_cleaned_up_between_computes(true).await;
-}
-
-/// Empty commits take no read, so a rollback replay's empty commits cannot
-/// detect the OLD object's cleanup (b.jvx Site A): a replay whose layer is
-/// overwritten after its last per-commit read sends its slice for the OLD
-/// object — the empty deltas included — and its ack, and the `deleted` entry
-/// then re-bootstraps it in steady state onto the NEW object's full state. No
-/// content for the OLD object follows the NEW object's.
-///
-/// The slice is `[2, 3 empty, 4 empty]`, reconnecting at 1. The replay reads
-/// commit 2 and parks (`CatchUpStateReadSeam::new_between_replay_computes`);
-/// the test overwrites the layer and waits for the OLD object's cleanup, then
-/// releases it. Commits 3 and 4 take no read, so the replay meets no
-/// `NotFound`. One per-commit read in all.
-///
-/// A slice of ONLY empty commits behaves the same way but cannot be held at
-/// this point: it takes no read, so it never reaches the seam, and nothing else
-/// parks a standalone replay between its `XRANGE` and its sends. This test pins
-/// the same mechanism: the empty commits that end the slice.
-///
-/// Reading its empty commits, the replay would meet `NotFound` at commit 3 and
-/// re-bootstrap before any content: its first message would be the NEW
-/// object's full state.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_whose_empty_commits_race_an_overwrite_sends_them_then_rebootstraps_in_steady_state(
-) {
-    let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let seam =
-        Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_between_replay_computes());
-    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    let layer = "empty-commits-overwritten";
-    let (session_id, old_object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, old_object_id, 381).await;
-    empty_commit(&svc, &session_id, layer, old_object_id).await;
-    empty_commit(&svc, &session_id, layer, old_object_id).await;
-
-    let mut stream = subscribe(
-        &svc,
-        &session_id,
-        layer,
-        old_object_id,
-        1,
-        "empty-overwritten",
-    )
-    .await;
-    tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
-        .await
-        .expect("the replay parks after its one per-commit read, commit 2's");
-    let new_object_id = overwrite(&svc, &session_id, layer).await;
-    svc.layer_store.wait_for_cleanup(SETTLE).await;
-    tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
-        .await
-        .expect("release the replay");
-
-    tokio::time::timeout(DRAIN, async {
-        let (first, body) = recv_message(&mut stream, "the replay's first commit").await;
-        assert_eq!(
-            (first.object_id, first.sequence_num),
-            (old_object_id, 2),
-            "the replay sends its OLD slice: a NEW object first means it met the cleanup at an \
-             empty commit"
-        );
-        assert_eq!(section_ids(&body), HashSet::from([381]));
-        for seq in 3..=4 {
-            let (empty, body) = recv_message(&mut stream, "an empty commit of the slice").await;
-            assert_eq!((empty.object_id, empty.sequence_num), (old_object_id, seq));
-            assert_eq!(delta_of(&body), the_empty_delta(seq - 1));
-        }
-        recv_ack(&mut stream, old_object_id, 4).await;
-    })
-    .await
-    .unwrap_or_else(|_| panic!("the replay did not finish within {DRAIN:?}"));
-
-    tokio::time::timeout(DRAIN, async {
-        let (rebootstrap, _) = recv_message(&mut stream, "the steady-state re-bootstrap").await;
-        assert_eq!(
-            (rebootstrap.object_id, rebootstrap.sequence_num),
-            (new_object_id, 1),
-            "the `deleted` entry re-bootstraps the subscription onto the NEW object's full state"
-        );
-        recv_ack(&mut stream, new_object_id, 1).await;
-    })
-    .await
-    .unwrap_or_else(|_| panic!("the re-bootstrap did not finish within {DRAIN:?}"));
-    commit(&svc, &session_id, layer, new_object_id, 382).await;
-    let (next, _) = recv_message(&mut stream, "the first live commit").await;
-    assert_eq!(
-        (next.object_id, next.sequence_num),
-        (new_object_id, 2),
-        "nothing from the OLD object follows the NEW object's state"
-    );
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-        ),
-        (1, 1),
-        "one per-commit read, commit 2's; the empty commits read nothing and met no NotFound"
-    );
-    await_condition(
-        || series(&fx.metrics, INFLIGHT) == 0 && read_gate_is_full(&svc),
-        "every slot and read permit is back",
-    )
-    .await;
 }
 
 /// The one capacity refusal that may come after content: a caught-up
@@ -2341,7 +1836,7 @@ async fn a_rollback_replay_whose_empty_commits_race_an_overwrite_sends_them_then
 async fn a_steady_state_overwrite_refused_its_slot_ends_after_the_ack_and_its_reconnect_is_refused_first(
 ) {
     let fx = CapacityFixture::setup(1, SHORT_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
+    let mut svc = build_service(&fx, 4096);
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_full_state());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
@@ -2497,40 +1992,21 @@ async fn assert_serves_every_commit_once(served: Served<'_>, stream: &mut SubStr
     .unwrap_or_else(|_| panic!("the catch-up and three live commits took over {DRAIN:?}"));
 }
 
-/// Which catch-up a capacity-waiting case drives: every regime and mode that
-/// takes the atomic read.
+/// Which catch-up a capacity-waiting case drives: every regime that takes the
+/// atomic read.
 #[derive(Clone, Copy, Debug)]
 enum WaitingCatchUp {
-    BrandNew {
-        snapshot: bool,
-    },
-    /// A snapshot-mode in-window reconnect.
-    InWindowSnapshot,
-    OutOfWindow {
-        snapshot: bool,
-    },
+    BrandNew,
+    InWindow,
+    OutOfWindow,
 }
 
 impl WaitingCatchUp {
-    fn snapshot_mode(self) -> bool {
-        match self {
-            Self::BrandNew { snapshot } | Self::OutOfWindow { snapshot } => snapshot,
-            Self::InWindowSnapshot => true,
-        }
-    }
-
-    /// Whether the catch-up reserves its stream reader before its slot wait.
-    /// The rollback-mode out-of-window reconnect reserves it under the slot.
-    #[cfg(feature = "test-fault-injection")]
-    fn reserves_before_the_slot(self) -> bool {
-        !matches!(self, Self::OutOfWindow { snapshot: false })
-    }
-
     /// The service's `layer_stream_maxlen`: small for the out-of-window layer
     /// ([`out_of_window_layer`]), roomy otherwise.
     fn stream_maxlen(self) -> u64 {
         match self {
-            Self::OutOfWindow { .. } => 4,
+            Self::OutOfWindow => 4,
             _ => 4096,
         }
     }
@@ -2549,17 +2025,17 @@ impl PrePermitPark {
     fn install(svc: &mut LiveEditService, case: WaitingCatchUp) -> Self {
         use live_edit::grpc::subscribe::{CatchUpOutOfWindowSeam, CatchUpStateReadSeam};
         match case {
-            WaitingCatchUp::BrandNew { .. } => {
+            WaitingCatchUp::BrandNew => {
                 let seam = Arc::new(CatchUpStateReadSeam::new_before_full_state());
                 svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
                 Self::State(seam)
             }
-            WaitingCatchUp::InWindowSnapshot => {
+            WaitingCatchUp::InWindow => {
                 let seam = Arc::new(CatchUpStateReadSeam::new_before_coalesced());
                 svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
                 Self::State(seam)
             }
-            WaitingCatchUp::OutOfWindow { .. } => {
+            WaitingCatchUp::OutOfWindow => {
                 let seam = Arc::new(CatchUpOutOfWindowSeam::new_before_compute_diff());
                 svc.catch_up_out_of_window_seam_for_test = Some(Arc::clone(&seam));
                 Self::OutOfWindow(seam)
@@ -2570,7 +2046,7 @@ impl PrePermitPark {
     async fn wait_until_parked(&self, case: WaitingCatchUp) {
         let parked = async {
             match (self, case) {
-                (Self::State(seam), WaitingCatchUp::InWindowSnapshot) => {
+                (Self::State(seam), WaitingCatchUp::InWindow) => {
                     seam.wait_until_parked_pre_coalesced().await
                 }
                 (Self::State(seam), _) => seam.wait_until_parked_pre_full_state().await,
@@ -2585,7 +2061,7 @@ impl PrePermitPark {
     async fn release(&self, case: WaitingCatchUp) {
         let release = async {
             match (self, case) {
-                (Self::State(seam), WaitingCatchUp::InWindowSnapshot) => {
+                (Self::State(seam), WaitingCatchUp::InWindow) => {
                     seam.arrive_at_pre_coalesced().await
                 }
                 (Self::State(seam), _) => seam.arrive_at_pre_full_state().await,
@@ -2609,7 +2085,7 @@ async fn waiting_catch_up_layer(
     case: WaitingCatchUp,
 ) -> (String, u64, u64, u64, u64) {
     match case {
-        WaitingCatchUp::OutOfWindow { .. } => {
+        WaitingCatchUp::OutOfWindow => {
             let (sid, oid) = out_of_window_layer(fx, svc, layer).await;
             (sid, oid, oid, 1, 6)
         }
@@ -2618,7 +2094,7 @@ async fn waiting_catch_up_layer(
             commit(svc, &sid, layer, oid, 81).await;
             commit(svc, &sid, layer, oid, 82).await;
             let (have_object, have_version) = match case {
-                WaitingCatchUp::BrandNew { .. } => (0, 0),
+                WaitingCatchUp::BrandNew => (0, 0),
                 _ => (oid, 1),
             };
             (sid, oid, have_object, have_version, 3)
@@ -2653,7 +2129,7 @@ async fn a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_ev
     use live_edit::observability::metrics::STREAM_EXIT_INNER_WATCHDOG;
 
     let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, case.snapshot_mode(), case.stream_maxlen());
+    let mut svc = build_service(&fx, case.stream_maxlen());
     let park = PrePermitPark::install(&mut svc, case);
     install_tiny_hard_cap(&svc);
     let layer = "waiting-slot-and-permit";
@@ -2670,13 +2146,12 @@ async fn a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_ev
         "waiting",
     )
     .await;
-    let reserved_while_waiting = usize::from(case.reserves_before_the_slot());
     await_condition(
         || {
             series(&fx.metrics, WAITING) == 1
-                && svc.valkey.stream_mux.snapshot().subscriptions() == reserved_while_waiting
+                && svc.valkey.stream_mux.snapshot().subscriptions() == 1
         },
-        "the subject queues for the only slot (reserved, unless rollback out of window)",
+        "the subject reserves its reader and queues for the only slot",
     )
     .await;
     assert_eq!(
@@ -2740,45 +2215,27 @@ async fn a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_ev
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_brand_new_catch_up_waiting_for_its_slot_and_permit_queues_nothing_snapshot_mode() {
+async fn a_brand_new_catch_up_waiting_for_its_slot_and_permit_queues_nothing() {
     a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_every_commit_once(
-        WaitingCatchUp::BrandNew { snapshot: true },
+        WaitingCatchUp::BrandNew,
     )
     .await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_brand_new_catch_up_waiting_for_its_slot_and_permit_queues_nothing_rollback_mode() {
+async fn an_in_window_catch_up_waiting_for_its_slot_and_permit_queues_nothing() {
     a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_every_commit_once(
-        WaitingCatchUp::BrandNew { snapshot: false },
+        WaitingCatchUp::InWindow,
     )
     .await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_snapshot_reconnect_waiting_for_its_slot_and_permit_queues_nothing() {
+async fn an_out_of_window_catch_up_waiting_for_its_slot_and_permit_queues_nothing() {
     a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_every_commit_once(
-        WaitingCatchUp::InWindowSnapshot,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_catch_up_waiting_for_its_slot_and_permit_queues_nothing_snapshot_mode() {
-    a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_every_commit_once(
-        WaitingCatchUp::OutOfWindow { snapshot: true },
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_catch_up_waiting_for_its_slot_and_permit_queues_nothing_rollback_mode() {
-    a_catch_up_waiting_for_its_slot_and_permit_queues_nothing_and_serves_every_commit_once(
-        WaitingCatchUp::OutOfWindow { snapshot: false },
+        WaitingCatchUp::OutOfWindow,
     )
     .await;
 }
@@ -2796,7 +2253,7 @@ enum ReservedEnding {
     ClientDisconnect,
     /// The capacity budget runs out during the slot wait.
     CatchUpCapacity,
-    /// A snapshot-mode in-window reconnect's point read finds a `deleted`
+    /// An in-window reconnect's point read finds a `deleted`
     /// sentinel as the stream's last entry, and the reconnect re-bootstraps
     /// onto the layer's new object.
     DeletedScan,
@@ -2827,7 +2284,7 @@ async fn an_ending_while_reserved_releases_the_reader(fx: CapacityFixture, endin
     use live_edit::storage::stream_mux::router::Routing;
 
     let deleted_scan = matches!(ending, ReservedEnding::DeletedScan);
-    let mut svc = build_service(&fx, deleted_scan, 4096);
+    let mut svc = build_service(&fx, 4096);
     let xrange = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     if deleted_scan {
         svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&xrange));
@@ -3064,7 +2521,7 @@ async fn a_registration_refused_by_a_multiplexer_that_shut_down_while_reserved_e
     use live_edit::observability::metrics::STREAM_EXIT_SHUTDOWN;
 
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4);
+    let mut svc = build_service(&fx, 4);
     let seam =
         Arc::new(live_edit::grpc::subscribe::CatchUpOutOfWindowSeam::new_before_header_read());
     svc.catch_up_out_of_window_seam_for_test = Some(Arc::clone(&seam));
@@ -3111,23 +2568,18 @@ async fn a_registration_refused_by_a_multiplexer_that_shut_down_while_reserved_e
 // The ending check: a registration that ended ends the catch-up before content
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Where a registration-killed-while-held case holds its catch-up: under its
-/// slot, with its stream registered, before the check that follows its slot
-/// release.
+/// Which catch-up a registration-killed-while-held case holds, and where: each
+/// inside its build from the atomic read, under its slot, with its stream
+/// registered, before the check that follows its slot release.
 #[cfg(feature = "test-fault-injection")]
 #[derive(Clone, Copy, Debug)]
 enum KilledWhileHeld {
-    /// Brand new, inside its build from the atomic read.
-    BrandNewInBuild,
-    /// Rollback-mode out-of-window reconnect, inside its build from the
-    /// atomic read.
-    OutOfWindowRollbackInBuild,
-    /// Rollback-mode in-window replay, between its first two computes (the
-    /// state-read seam: this regime takes no atomic read).
-    RollbackBetweenReplayComputes,
-    /// Snapshot-mode (the shipped default) in-window reconnect, inside its
-    /// build from the atomic read.
-    InWindowSnapshotInBuild,
+    /// Brand new.
+    BrandNew,
+    /// Out-of-window reconnect.
+    OutOfWindow,
+    /// In-window reconnect.
+    InWindow,
 }
 
 /// A catch-up whose stream registration is killed by the backlog hard cap
@@ -3137,30 +2589,25 @@ enum KilledWhileHeld {
 /// post-release check it would send its content and ack first, and only its
 /// steady state would see the ending.
 ///
-/// The atomic-path cases are held inside their build by [`ParkingExtStore`]:
-/// the layer carries an external value the build resolves, after the
-/// registration at the cut. The rollback in-window replay is held by its seam.
+/// Each case is held inside its build by [`ParkingExtStore`]: the layer
+/// carries an external value the build resolves, after the registration at
+/// the cut.
 #[cfg(feature = "test-fault-injection")]
 async fn a_registration_killed_while_held_ends_the_catch_up_before_content(case: KilledWhileHeld) {
-    use live_edit::grpc::subscribe::CatchUpStateReadSeam;
     use live_edit::observability::metrics::STREAM_EXIT_INNER_WATCHDOG;
 
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
     let maxlen = match case {
-        KilledWhileHeld::OutOfWindowRollbackInBuild => 4,
+        KilledWhileHeld::OutOfWindow => 4,
         _ => 4096,
     };
-    let snapshot = matches!(case, KilledWhileHeld::InWindowSnapshotInBuild);
-    let mut svc = build_service(&fx, snapshot, maxlen);
-    let replay_seam = matches!(case, KilledWhileHeld::RollbackBetweenReplayComputes)
-        .then(|| Arc::new(CatchUpStateReadSeam::new_between_replay_computes()));
-    svc.catch_up_state_read_seam_for_test = replay_seam.clone();
+    let mut svc = build_service(&fx, maxlen);
     let ext = install_parking_ext_store(&mut svc);
     install_tiny_hard_cap(&svc);
 
     let layer = "killed-held";
     let (session_id, object_id) = match case {
-        KilledWhileHeld::OutOfWindowRollbackInBuild => {
+        KilledWhileHeld::OutOfWindow => {
             let (sid, oid) = out_of_window_layer(&fx, &svc, layer).await;
             commit_with_external_value(&svc, &sid, layer, oid, 93).await;
             (sid, oid)
@@ -3173,12 +2620,10 @@ async fn a_registration_killed_while_held_ends_the_catch_up_before_content(case:
         }
     };
     let (have_object, have_version) = match case {
-        KilledWhileHeld::BrandNewInBuild => (0, 0),
+        KilledWhileHeld::BrandNew => (0, 0),
         _ => (object_id, 1),
     };
-    if replay_seam.is_none() {
-        ext.arm();
-    }
+    ext.arm();
     let mut stream = subscribe(
         &svc,
         &session_id,
@@ -3188,14 +2633,7 @@ async fn a_registration_killed_while_held_ends_the_catch_up_before_content(case:
         "killed",
     )
     .await;
-    match &replay_seam {
-        Some(seam) => {
-            tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
-                .await
-                .expect("the replay parks between its computes, holding its slot")
-        }
-        None => ext.wait_until_parked(1).await,
-    }
+    ext.wait_until_parked(1).await;
     assert_eq!(
         (series(&fx.metrics, STREAMS), series(&fx.metrics, INFLIGHT)),
         (1, 1),
@@ -3211,15 +2649,8 @@ async fn a_registration_killed_while_held_ends_the_catch_up_before_content(case:
     )
     .await;
 
-    match &replay_seam {
-        Some(seam) => tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
-            .await
-            .expect("the held catch-up must accept its release"),
-        None => {
-            ext.disarm();
-            ext.release_one();
-        }
-    }
+    ext.disarm();
+    ext.release_one();
 
     let status = first_status(&mut stream, "the registration's ending").await;
     assert_eq!(status.code(), Code::Unavailable, "{case:?}: {status:?}");
@@ -3244,37 +2675,102 @@ async fn a_registration_killed_while_held_ends_the_catch_up_before_content(case:
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_brand_new_registration_killed_during_the_build_ends_before_content() {
-    a_registration_killed_while_held_ends_the_catch_up_before_content(
-        KilledWhileHeld::BrandNewInBuild,
-    )
-    .await;
+    a_registration_killed_while_held_ends_the_catch_up_before_content(KilledWhileHeld::BrandNew)
+        .await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_rollback_registration_killed_during_the_build_ends_before_content() {
-    a_registration_killed_while_held_ends_the_catch_up_before_content(
-        KilledWhileHeld::OutOfWindowRollbackInBuild,
-    )
-    .await;
+async fn an_out_of_window_registration_killed_during_the_build_ends_before_content() {
+    a_registration_killed_while_held_ends_the_catch_up_before_content(KilledWhileHeld::OutOfWindow)
+        .await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_registration_killed_between_computes_ends_before_content() {
-    a_registration_killed_while_held_ends_the_catch_up_before_content(
-        KilledWhileHeld::RollbackBetweenReplayComputes,
-    )
-    .await;
+async fn an_in_window_registration_killed_during_the_build_ends_before_content() {
+    a_registration_killed_while_held_ends_the_catch_up_before_content(KilledWhileHeld::InWindow)
+        .await;
 }
 
+/// A catch-up waiting for the catch-up payload budget (`D_c`) — under its
+/// slot, with its stream registered — whose registration is killed by the
+/// backlog hard cap meanwhile ends with that ending, before its first
+/// message, as soon as the wait's periodic stream check sees it: not with
+/// `catchup_capacity` when its capacity budget runs out, which
+/// [`PARKED_BUDGET_MS`] puts out of reach. It leaves the budget's queue and
+/// reserves nothing.
+///
+/// Fails without the wait's stream check (in-place perturbation): the
+/// catch-up waits on for `D_c`, and no first item arrives within `SETTLE`.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_snapshot_in_window_registration_killed_during_the_build_ends_before_content() {
-    a_registration_killed_while_held_ends_the_catch_up_before_content(
-        KilledWhileHeld::InWindowSnapshotInBuild,
+async fn a_registration_killed_while_waiting_for_payload_memory_ends_the_catch_up_before_content() {
+    use live_edit::observability::metrics::STREAM_EXIT_INNER_WATCHDOG;
+
+    let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
+    let svc = build_service(&fx, 4096);
+    install_tiny_hard_cap(&svc);
+    let layer = "killed-waiting-for-payload";
+    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
+    commit(&svc, &session_id, layer, object_id, 91).await;
+    let budget = Arc::clone(&svc.valkey.catchup_payload_budget);
+    let held = budget
+        .reserve(budget.total_bytes(), None)
+        .await
+        .expect("the whole payload budget is free");
+
+    let mut stream = subscribe(&svc, &session_id, layer, 0, 0, "killed-waiting").await;
+    await_condition(
+        || budget.waiters() == 1,
+        "the catch-up waits for payload memory",
     )
     .await;
+    assert_eq!(
+        (series(&fx.metrics, STREAMS), series(&fx.metrics, INFLIGHT)),
+        (1, 1),
+        "it waits under its slot, with its stream registered"
+    );
+
+    for section_id in 0..OVERFLOW_COMMITS {
+        commit(&svc, &session_id, layer, object_id, 900 + section_id).await;
+    }
+    await_condition(
+        || overflow_kills(&fx.metrics, "entries") == 1,
+        "the waiting catch-up's backlog hits the hard cap",
+    )
+    .await;
+
+    let status = first_status(&mut stream, "the registration's ending").await;
+    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains("fell behind its delivery watchdog"),
+        "the registration's ending, not the capacity refusal: got {status:?}"
+    );
+    await_condition(
+        || exits(&fx.metrics, STREAM_EXIT_INNER_WATCHDOG) == 1,
+        "the ending is counted under inner_watchdog",
+    )
+    .await;
+    assert_eq!(exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY), 0);
+    await_condition(
+        || {
+            budget.waiters() == 0
+                && series(&fx.metrics, ADMITTED) == 0
+                && series(&fx.metrics, INFLIGHT) == 0
+        },
+        "the ended catch-up leaves the budget's queue and returns its admission and slot",
+    )
+    .await;
+    assert_eq!(
+        budget.reserved_bytes(),
+        budget.total_bytes(),
+        "it reserved nothing: only the test's grant is held"
+    );
+    drop(held);
+    assert_eq!(budget.reserved_bytes(), 0);
 }
 
 // ── Across a `Restored` recovery ─────────────────────────────────────────────
@@ -3322,7 +2818,7 @@ async fn lose_state_keep_stream(fx: &CapacityFixture, object_id: u64) {
 
 /// A layer lost under a shared fenced read — its state removed while the read
 /// holds its fence, as a keyspace loss leaves it — is recovered by each catch-up
-/// attached to the read, on its own (one regime: brand new, snapshot mode):
+/// attached to the read, on its own (one regime: brand new):
 /// the shared `NotFound` reaches each as its own copy, each runs the recovery
 /// hook (two attempts, both `restored`: the first restores, the second finds
 /// the layer back), and each retries by attaching again, with no slot of its
@@ -3341,32 +2837,37 @@ async fn lose_state_keep_stream(fx: &CapacityFixture, object_id: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_layer_lost_under_a_shared_fenced_read_is_recovered_by_each_catch_up_which_attaches_again_with_no_slot(
 ) {
+    use crate::storage::snapshot_read_support::HeldCommand;
     use live_edit::observability::metrics::STREAM_EXIT_INNER_WATCHDOG;
     use live_edit::storage::diff_read::{
         ObjectSnapshotReadFaultInjector, ObjectSnapshotReadFaultTarget, ObjectSnapshotReader,
     };
 
-    /// How long the delay seam holds the first flight's read open, under its
-    /// fence: the test loses the layer's state inside it.
-    const HOLD: Duration = Duration::from_secs(2);
-
     let fx = CapacityFixture::setup_above_ceiling(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     install_tiny_hard_cap(&svc);
     let layer = "lost-under-read";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 141).await;
     commit(&svc, &session_id, layer, object_id, 142).await;
     enable_recovery(&mut svc, object_id, &session_id, layer).await;
+    // The first flight's read is held under its fence, its lease
+    // lengthened so no late renewal can end the held attempt, until the
+    // test has lost the layer's state under it.
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
+    injector.lengthen_fence_leases(true);
     fx.client
         .install_object_snapshot_read_fault_injector_for_test(Arc::clone(&injector));
-    injector.push_delay_at(
-        ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-        HOLD,
+    let hold = HeldCommand::new(
+        injector.push_hold_at(ObjectSnapshotReadFaultTarget::nth_command(
+            ObjectSnapshotReader::FencedFanout,
+            0,
+        )),
     );
 
     let mut first = subscribe(&svc, &session_id, layer, 0, 0, "lost-first").await;
+    hold.parked_within(SETTLE, "the first catch-up's flight's read")
+        .await;
     await_condition(
         || {
             svc.snapshot_flights
@@ -3393,7 +2894,15 @@ async fn a_layer_lost_under_a_shared_fenced_read_is_recovered_by_each_catch_up_w
         futures::poll!(taken.as_mut()).is_pending(),
         "the test queues behind the reading flight for the slot"
     );
+    live_edit::storage::test_support::assert_fence_lease_lengthened(
+        &fx.client,
+        &fx.key_schema,
+        object_id,
+        &fx.client,
+    )
+    .await;
     lose_state_keep_stream(&fx, object_id).await;
+    hold.release();
     let permit = tokio::time::timeout(SETTLE, taken)
         .await
         .expect("the failed flight gives its slot back")
@@ -3492,7 +3001,7 @@ async fn a_catch_up_restored_while_reserved_queues_nothing_through_its_reacquire
     use live_edit::observability::metrics::STREAM_EXIT_INNER_WATCHDOG;
 
     let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let xrange = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&xrange));
     install_tiny_hard_cap(&svc);
@@ -3685,7 +3194,7 @@ fn assert_budget_chain(
 /// ([`assert_budget_chain`]) rather than by racing a held slot against the
 /// re-acquire's deadline.
 ///
-/// The subject (a snapshot-mode in-window reconnect) waits for admission
+/// The subject (an in-window reconnect) waits for admission
 /// while the test holds the only admission, waits for its first slot while
 /// the test holds the only slot, parks at its `XRANGE`, finds its state gone
 /// at its atomic read, gives its slot up for the recovery attempt, and,
@@ -3716,7 +3225,7 @@ fn assert_budget_chain(
 async fn waits_are_charged_to_the_one_budget_and_a_later_slot_wait_gets_only_what_they_left() {
     const SUBJECT: &str = "charged";
     let fx = CapacityFixture::setup_with(None, 2, 1, 1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let xrange = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&xrange));
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
@@ -3817,6 +3326,9 @@ async fn waits_are_charged_to_the_one_budget_and_a_later_slot_wait_gets_only_wha
             BudgetWait::ReadPermit,
             BudgetWait::CatchUpSlot,
             BudgetWait::ReadPermit,
+            // The built payload's reservation of the catch-up payload budget
+            // (b.ntm), inside the re-acquired slot, before any content.
+            BudgetWait::CatchUpPayload,
         ],
         &[],
     );
@@ -3877,7 +3389,7 @@ async fn a_reacquire_after_a_restored_recovery_that_outlasts_the_budget_is_refus
 {
     const SUBJECT: &str = "reacquire-refused";
     let fx = CapacityFixture::setup_with(None, 2, 1, 1, REACQUIRE_REFUSAL_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let xrange = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&xrange));
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
@@ -4013,7 +3525,7 @@ async fn a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
     case: WaitingCatchUp,
 ) {
     let fx = CapacityFixture::setup(64, SHORT_BUDGET_MS).await;
-    let svc = build_service(&fx, case.snapshot_mode(), case.stream_maxlen());
+    let svc = build_service(&fx, case.stream_maxlen());
     let layer = "permit-timeout";
     let (session_id, _object_id, have_object, have_version, _) =
         waiting_catch_up_layer(&fx, &svc, layer, case).await;
@@ -4073,26 +3585,20 @@ async fn a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_brand_new_read_permit_wait_that_outlasts_the_budget_is_refused_catchup_capacity_before_content(
 ) {
-    a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
-        WaitingCatchUp::BrandNew { snapshot: true },
-    )
-    .await;
+    a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(WaitingCatchUp::BrandNew)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_snapshot_reconnect_read_permit_wait_that_outlasts_the_budget_is_refused_before_content()
-{
-    a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
-        WaitingCatchUp::InWindowSnapshot,
-    )
-    .await;
+async fn an_in_window_read_permit_wait_that_outlasts_the_budget_is_refused_before_content() {
+    a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(WaitingCatchUp::InWindow)
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_rollback_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
-) {
+async fn an_out_of_window_read_permit_wait_that_outlasts_the_budget_is_refused_before_content() {
     a_read_permit_wait_that_outlasts_the_budget_is_refused_before_content(
-        WaitingCatchUp::OutOfWindow { snapshot: false },
+        WaitingCatchUp::OutOfWindow,
     )
     .await;
 }
@@ -4108,7 +3614,7 @@ async fn an_out_of_window_rollback_read_permit_wait_that_outlasts_the_budget_is_
 async fn a_zero_budget_catch_up_takes_a_free_read_permit_and_is_otherwise_refused_at_once() {
     const SUBJECT: &str = "zero-budget-refused";
     let fx = CapacityFixture::setup(64, 0).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
     svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
     let layer = "zero-budget";
@@ -4161,7 +3667,7 @@ async fn a_zero_budget_catch_up_takes_a_free_read_permit_and_is_otherwise_refuse
 async fn the_read_permit_count_is_the_configured_catch_up_snapshot_read_concurrency() {
     const READ_CONCURRENCY: u32 = 2;
     let fx = CapacityFixture::setup_read_concurrency(64, SHORT_BUDGET_MS, READ_CONCURRENCY).await;
-    let svc = build_service(&fx, true, 4096);
+    let svc = build_service(&fx, 4096);
     assert_eq!(
         (
             svc.valkey.catchup_read_gate.limit(),
@@ -4211,7 +3717,7 @@ async fn the_read_gate_returns_to_full_capacity_after_an_injected_read_failure()
     use live_edit::storage::diff_read::ObjectSnapshotReadFaultInjector;
 
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, true, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "permit-after-failure";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 191).await;
@@ -4284,7 +3790,7 @@ async fn a_catch_up_ended_at_its_read_permit_wait_leaves_the_read_gate_full(
     const SUBJECT: &str = "ended-at-permit";
 
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_full_state());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
@@ -4407,7 +3913,7 @@ async fn a_catch_up_waiting_for_its_read_permit_when_the_client_quits_ends_shutd
     use live_edit::storage::subscriber_admission::CatchUpRefusal;
 
     let mut fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, true, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "permit-wait-at-quit";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 206).await;
@@ -4479,7 +3985,7 @@ async fn a_read_permit_is_taken_only_inside_the_slot_and_returned_by_a_catch_up_
     use live_edit::storage::test_support::{release_all, stall_pool};
 
     let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, true, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "cancelled-in-read";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 211).await;
@@ -4553,7 +4059,7 @@ async fn concurrent_catch_up_builds_never_exceed_the_slot_count() {
     const SLOTS: usize = 2;
     const JOINERS: usize = 5;
     let fx = CapacityFixture::setup(SLOTS, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, true, 4096);
+    let mut svc = build_service(&fx, 4096);
     let ext = install_parking_ext_store(&mut svc);
     let layer = "concurrent-builds";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
@@ -4596,51 +4102,27 @@ async fn concurrent_catch_up_builds_never_exceed_the_slot_count() {
     .unwrap_or_else(|_| panic!("the joiners' catch-ups did not all finish within {DRAIN:?}"));
 }
 
-/// Which catch-up [`every_read_permit_wait_comes_before_the_first_content_message`]
-/// drives: every atomic-path regime and mode, and the rollback-mode in-window
-/// replay.
-#[cfg(feature = "test-fault-injection")]
-#[derive(Clone, Copy, Debug)]
-enum ChargedCatchUp {
-    Atomic(WaitingCatchUp),
-    InWindowRollback,
-}
-
-/// In every regime, in both catch-up modes, every read-permit wait a catch-up
-/// makes comes before its first content message (the Epic's "no capacity
-/// refusal after the first content message"; Spec SDD SR-7.3): every charge
-/// the service recorded for the subscription — read permits included — was
-/// recorded by the time its first content message arrived, and none after,
-/// through the rest of its catch-up and two live commits.
+/// In every regime, every read-permit wait a catch-up makes comes before its
+/// first content message (the Epic's "no capacity refusal after the first
+/// content message"; Spec SDD SR-7.3): every charge the service recorded for
+/// the subscription — read permits included — was recorded by the time its
+/// first content message arrived, and none after, through the rest of its
+/// catch-up and two live commits.
 ///
-/// The atomic-path regimes record exactly one permit wait, after the slot
-/// wait and the reader reservation (which a rollback-mode out-of-window
-/// reconnect takes under its slot): the charge order pins the nesting. The
-/// rollback-mode in-window replay records one permit wait per replayed commit
-/// (Spec SDD SR-3.4), every one after its slot wait and its reader
-/// reservation — taken under the slot, at the slice's last entry — and
-/// observed under `consumer="catchup_legacy_per_commit"`, never `catchup`.
+/// Each regime records exactly one permit wait, after the reader reservation
+/// and the slot wait, and then its payload's reservation of the catch-up
+/// payload budget (b.ntm), still before content: the charge order pins the
+/// nesting.
 #[cfg(feature = "test-fault-injection")]
-async fn every_read_permit_wait_comes_before_the_first_content_message(case: ChargedCatchUp) {
+async fn every_read_permit_wait_comes_before_the_first_content_message(case: WaitingCatchUp) {
     const SUBJECT: &str = "charged-before-content";
-    let (snapshot, maxlen) = match case {
-        ChargedCatchUp::Atomic(c) => (c.snapshot_mode(), c.stream_maxlen()),
-        ChargedCatchUp::InWindowRollback => (false, 4096),
-    };
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, snapshot, maxlen);
+    let mut svc = build_service(&fx, case.stream_maxlen());
     let budget_seam = Arc::new(CapacityBudgetSeam::new());
     svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
     let layer = "charged-before-content";
-    let (session_id, object_id, have_object, have_version, _) = match case {
-        ChargedCatchUp::Atomic(c) => waiting_catch_up_layer(&fx, &svc, layer, c).await,
-        ChargedCatchUp::InWindowRollback => {
-            let (sid, oid) = create_layer(&fx, &svc, layer).await;
-            commit(&svc, &sid, layer, oid, 231).await;
-            commit(&svc, &sid, layer, oid, 232).await;
-            (sid, oid, oid, 1, 3)
-        }
-    };
+    let (session_id, object_id, have_object, have_version, _) =
+        waiting_catch_up_layer(&fx, &svc, layer, case).await;
 
     let mut stream = subscribe(&svc, &session_id, layer, have_object, have_version, SUBJECT).await;
     let (first, _) = recv_message(&mut stream, "the first content message").await;
@@ -4668,51 +4150,14 @@ async fn every_read_permit_wait_comes_before_the_first_content_message(case: Cha
          {at_end:#?}"
     );
 
-    match case {
-        ChargedCatchUp::Atomic(c) => {
-            let reserve_then_slot = [BudgetWait::StreamReader, BudgetWait::CatchUpSlot];
-            let slot_then_reserve = [BudgetWait::CatchUpSlot, BudgetWait::StreamReader];
-            let middle = if c.reserves_before_the_slot() {
-                reserve_then_slot
-            } else {
-                slot_then_reserve
-            };
-            let chain = [
-                BudgetWait::Admission,
-                middle[0],
-                middle[1],
-                BudgetWait::ReadPermit,
-            ];
-            assert_budget_chain(&budget_seam, SUBJECT, PARKED_BUDGET_MS, &chain, &[]);
-        }
-        ChargedCatchUp::InWindowRollback => {
-            // Two replayed commits (231, 232): one permit wait each.
-            let chain = [
-                BudgetWait::Admission,
-                BudgetWait::CatchUpSlot,
-                BudgetWait::StreamReader,
-                BudgetWait::ReadPermit,
-                BudgetWait::ReadPermit,
-            ];
-            assert_budget_chain(&budget_seam, SUBJECT, PARKED_BUDGET_MS, &chain, &[]);
-            assert_eq!(
-                (
-                    per_commit_read_permit_waits(&fx.metrics),
-                    read_permit_waits(&fx.metrics),
-                ),
-                (2, 0),
-                "the replay's permit waits are observed as per-commit reads, not catch-up reads"
-            );
-            assert_eq!(
-                (
-                    per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-                    catchup_atomic_reads(&fx.metrics),
-                ),
-                (2, 0),
-                "each replayed commit is served by its own atomic read; no catch-up read runs"
-            );
-        }
-    }
+    let chain = [
+        BudgetWait::Admission,
+        BudgetWait::StreamReader,
+        BudgetWait::CatchUpSlot,
+        BudgetWait::ReadPermit,
+        BudgetWait::CatchUpPayload,
+    ];
+    assert_budget_chain(&budget_seam, SUBJECT, PARKED_BUDGET_MS, &chain, &[]);
     assert!(
         read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0,
         "{case:?}: every read permit is back"
@@ -4725,1132 +4170,31 @@ async fn every_read_permit_wait_comes_before_the_first_content_message(case: Cha
 /// debug build's `block_on` frames on std's default 2 MiB test thread, which the
 /// out-of-window cases already overflowed; boxing puts it on the heap.
 #[cfg(feature = "test-fault-injection")]
-fn charged_before_content(case: ChargedCatchUp) -> Pin<Box<impl std::future::Future<Output = ()>>> {
+fn charged_before_content(case: WaitingCatchUp) -> Pin<Box<impl std::future::Future<Output = ()>>> {
     Box::pin(every_read_permit_wait_comes_before_the_first_content_message(case))
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_brand_new_catch_up_waits_for_its_read_permit_only_before_content_snapshot_mode() {
-    charged_before_content(ChargedCatchUp::Atomic(WaitingCatchUp::BrandNew {
-        snapshot: true,
-    }))
-    .await;
+async fn a_brand_new_catch_up_waits_for_its_read_permit_only_before_content() {
+    charged_before_content(WaitingCatchUp::BrandNew).await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_brand_new_catch_up_waits_for_its_read_permit_only_before_content_rollback_mode() {
-    charged_before_content(ChargedCatchUp::Atomic(WaitingCatchUp::BrandNew {
-        snapshot: false,
-    }))
-    .await;
+async fn an_in_window_catch_up_waits_for_its_read_permit_only_before_content() {
+    charged_before_content(WaitingCatchUp::InWindow).await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_in_window_catch_up_waits_for_its_read_permit_only_before_content_snapshot_mode() {
-    charged_before_content(ChargedCatchUp::Atomic(WaitingCatchUp::InWindowSnapshot)).await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_in_window_catch_up_waits_for_capacity_only_before_content_rollback_mode() {
-    charged_before_content(ChargedCatchUp::InWindowRollback).await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_catch_up_waits_for_its_read_permit_only_before_content_snapshot_mode() {
-    charged_before_content(ChargedCatchUp::Atomic(WaitingCatchUp::OutOfWindow {
-        snapshot: true,
-    }))
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_out_of_window_catch_up_waits_for_its_read_permit_only_before_content_rollback_mode() {
-    charged_before_content(ChargedCatchUp::Atomic(WaitingCatchUp::OutOfWindow {
-        snapshot: false,
-    }))
-    .await;
+async fn an_out_of_window_catch_up_waits_for_its_read_permit_only_before_content() {
+    charged_before_content(WaitingCatchUp::OutOfWindow).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Legacy per-commit reads (the rollback-mode replay) and empty commits, which
-// take none
+// Empty commits, which take no read
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// How long a negative check watches a stream for an item that must not come
-/// (a replay waiting for a read permit sends nothing). Paid once by each test
-/// that makes the check.
-#[cfg(feature = "test-fault-injection")]
-const NOTHING_SENT_WINDOW: Duration = Duration::from_millis(300);
-
-/// Hand the read permit the test holds to whatever queued for it first, and
-/// take one back behind that: a probe queues for a permit, the held one is
-/// dropped, and the probe's permit — granted once everything ahead of it in
-/// the gate's FIFO queue has taken a permit and given it back — is returned.
-///
-/// Whatever was queued before the probe has therefore run with the permit by
-/// the time this returns. That is how a test learns, with no seam, that a
-/// subscription it cannot see was waiting at the gate: its read was counted.
-/// The probe is a `catchup`-consumer acquisition, observed as one, with a
-/// deadline it never reaches: the [`SETTLE`] bound below fails first.
-#[cfg(feature = "test-fault-injection")]
-async fn pass_the_permit_through(
-    svc: &LiveEditService,
-    held: CatchUpReadPermit,
-) -> CatchUpReadPermit {
-    let mut probe = std::pin::pin!(svc.valkey.catchup_read_gate.acquire(
-        tokio::time::Instant::now() + Duration::from_secs(3_600),
-        SnapshotReadConsumer::Catchup,
-    ));
-    assert!(
-        futures::poll!(probe.as_mut()).is_pending(),
-        "fixture self-check: the probe queues behind the permit the test holds"
-    );
-    drop(held);
-    tokio::time::timeout(SETTLE, probe)
-        .await
-        .expect("the probe is granted a permit")
-        .expect("the read gate is open")
-}
-
-/// [`pass_the_permit_through`] until the legacy per-commit atomic reads served
-/// reach `reads`, bounded by [`SETTLE`], and return the permit the test then
-/// holds. A pass that finds the subscription not yet queued just takes the
-/// permit back; the loop's sleep is the probe interval.
-#[cfg(feature = "test-fault-injection")]
-async fn pass_the_permit_until_per_commit_reads(
-    svc: &LiveEditService,
-    metrics: &Metrics,
-    mut held: CatchUpReadPermit,
-    reads: u64,
-) -> CatchUpReadPermit {
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    loop {
-        held = pass_the_permit_through(svc, held).await;
-        if per_commit_snapshot_reads(metrics, "atomic", "ok") >= reads {
-            return held;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{reads} per-commit atomic read(s) were not served within {SETTLE:?} of the permit \
-             being passed through: the subscription never queued for it"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-/// A rollback-mode in-window replay reads each commit atomically under a read
-/// permit of its own, taken inside its one catch-up slot, and waits for every
-/// one before its first content message (Spec SDD SR-3.4, SR-7.1, SR-7.5).
-///
-/// The test holds the replica's only permit. The replay — holding its slot,
-/// its stream registered at the slice's last entry — waits for it; the test
-/// passes the permit through to it once ([`pass_the_permit_until_per_commit_reads`]),
-/// so the replay reads its first commit and then waits for its second commit's
-/// permit behind the test. Having read a commit, it still sends nothing.
-/// Freed, it reads the rest and sends every commit in order, then its ack.
-///
-/// The charges the service recorded: one slot wait, the reservation, and one
-/// permit wait per commit, each drawing on what the earlier ones left, every
-/// one recorded by the first content message and none after; the second
-/// commit's permit wait ended only once the test freed its permit. Each read
-/// is observed under `consumer="catchup_legacy_per_commit"`.
-///
-/// Reading and sending commit by commit, the replay would send its first
-/// commit while it waits for the second commit's permit.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_waits_for_a_read_permit_per_commit_inside_its_slot_before_any_content() {
-    const SUBJECT: &str = "replay-permits";
-    const K: u64 = 3;
-    let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let budget_seam = Arc::new(CapacityBudgetSeam::new());
-    svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
-    let layer = "replay-permits";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    for i in 0..K {
-        commit(&svc, &session_id, layer, object_id, 251 + i).await;
-    }
-    let held = hold_read_permit(&svc).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, SUBJECT).await;
-    await_condition(
-        || series(&fx.metrics, INFLIGHT) == 1 && series(&fx.metrics, STREAMS) == 1,
-        "the replay takes its slot and registers its stream at the slice's last entry",
-    )
-    .await;
-    let held = pass_the_permit_until_per_commit_reads(&svc, &fx.metrics, held, 1).await;
-    assert_eq!(
-        all_per_commit_snapshot_reads(&fx.metrics),
-        1,
-        "the replay read its first commit and waits for its second commit's permit"
-    );
-    assert_eq!(
-        series(&fx.metrics, INFLIGHT),
-        1,
-        "the replay still holds its slot"
-    );
-    assert!(
-        tokio::time::timeout(NOTHING_SENT_WINDOW, stream.next())
-            .await
-            .is_err(),
-        "waiting for a read permit, the replay sends nothing — not even the commit it has read"
-    );
-
-    let released_at = tokio::time::Instant::now();
-    drop(held);
-    let (first, _) = recv_message(&mut stream, "the replay's first commit").await;
-    let at_first_content = budget_seam.charges_for(SUBJECT);
-    let (rest, ack) = recv_catch_up(&mut stream).await;
-    let mut sequences = vec![first.sequence_num];
-    sequences.extend(rest.iter().map(|h| h.sequence_num));
-    assert_eq!(
-        sequences,
-        (2..=K + 1).collect::<Vec<_>>(),
-        "every commit of the replay is sent, in order"
-    );
-    assert_eq!(ack.sequence_num, K + 1);
-
-    let charges = assert_budget_chain(
-        &budget_seam,
-        SUBJECT,
-        PARKED_BUDGET_MS,
-        &[
-            BudgetWait::Admission,
-            BudgetWait::CatchUpSlot,
-            BudgetWait::StreamReader,
-            BudgetWait::ReadPermit,
-            BudgetWait::ReadPermit,
-            BudgetWait::ReadPermit,
-        ],
-        &[],
-    );
-    assert_eq!(
-        at_first_content.len(),
-        charges.len(),
-        "every capacity wait — each commit's read permit included — was charged before the \
-         first content message: {charges:#?}"
-    );
-    let second_permit = &charges[4];
-    assert!(
-        second_permit.started + second_permit.charged >= released_at,
-        "the second commit's permit wait ended only once the test freed its permit: \
-         {second_permit:?}"
-    );
-    assert_eq!(
-        (
-            per_commit_read_permit_waits(&fx.metrics),
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            catchup_atomic_reads(&fx.metrics),
-        ),
-        (K, K, 0),
-        "one per-commit permit wait and one per-commit atomic read per replayed commit; no \
-         catch-up read"
-    );
-    assert_eq!(
-        catchup_waits(&fx.metrics, CATCHUP_WAIT_RESULT_ACQUIRED),
-        1,
-        "every per-commit read ran under the one slot"
-    );
-    assert_eq!(exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY), 0);
-    await_condition(
-        || {
-            read_gate_is_full(&svc)
-                && reads_in_flight(&fx.metrics) == 0
-                && series(&fx.metrics, INFLIGHT) == 0
-        },
-        "every read permit and the slot are back",
-    )
-    .await;
-}
-
-/// A rollback-mode replay's read-permit wait is a capacity wait like any
-/// catch-up's (Spec SDD SR-7.3): with the replica's only permit held, it ends
-/// at the capacity budget in-stream `UNAVAILABLE` naming
-/// `LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY`, under
-/// `reason="catchup_capacity"`, as the stream's FIRST item. Its slot was free,
-/// so the refusal is the permit's; the refused wait is observed once as a
-/// per-commit wait and no per-commit read ran; the replay gives back its slot,
-/// its admission and the stream it registered at the slice's last entry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_read_permit_wait_that_outlasts_the_budget_is_refused_before_content() {
-    let fx = CapacityFixture::setup(64, SHORT_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "replay-permit-timeout";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, object_id, 261).await;
-    commit(&svc, &session_id, layer, object_id, 262).await;
-    let held = hold_read_permit(&svc).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, "replay-refused").await;
-    let status = first_status(&mut stream, "the replay's read-permit capacity refusal").await;
-    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
-    assert_eq!(status.message(), CATCHUP_READ_CAPACITY_MSG);
-    crate::common::refusal_detail::assert_catchup_read_permit_refusal(&status);
-    await_condition(
-        || exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY) == 1,
-        "the refusal is counted under catchup_capacity",
-    )
-    .await;
-    assert_eq!(
-        (
-            catchup_waits(&fx.metrics, CATCHUP_WAIT_RESULT_ACQUIRED),
-            catchup_waits(&fx.metrics, CATCHUP_WAIT_RESULT_TIMED_OUT),
-        ),
-        (1, 0),
-        "the slot was taken at once, so the budget ran out on the permit"
-    );
-    assert_eq!(
-        (
-            per_commit_read_permit_waits(&fx.metrics),
-            all_per_commit_snapshot_reads(&fx.metrics),
-        ),
-        (1, 0),
-        "the refused per-commit permit wait is observed once, and no per-commit read ran"
-    );
-    await_condition(
-        || {
-            series(&fx.metrics, INFLIGHT) == 0
-                && series(&fx.metrics, ADMITTED) == 0
-                && series(&fx.metrics, STREAMS) == 0
-                && svc.valkey.stream_mux.snapshot().subscriptions() == 0
-        },
-        "the refused replay gives back its slot, its admission and its stream",
-    )
-    .await;
-    assert_eq!(
-        reads_in_flight(&fx.metrics),
-        1,
-        "only the test's own permit"
-    );
-    drop(held);
-    assert!(read_gate_is_full(&svc));
-}
-
-/// A rollback-mode replay whose per-commit atomic read fails with anything
-/// but `NotFound` ends: an injected transient failure (a fred `Timeout` in
-/// place of the read's `EVALSHA` result) on its first commit's read ends the
-/// stream `UNAVAILABLE`, naming the read, as its FIRST item — no commit is
-/// skipped, sent or read another way first — counted under `error`, and the
-/// replay gives back its read permit, its slot, its stream and its admission.
-///
-/// Skipping the failed commit (or handing over) would send the replay's other
-/// commits instead: a silent gap in what the client is sent.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_whose_per_commit_read_fails_ends_unavailable_before_content() {
-    use fred::error::{Error as FredError, ErrorKind as FredErrorKind};
-    use live_edit::observability::metrics::STREAM_EXIT_ERROR;
-    use live_edit::storage::diff_read::ObjectSnapshotReadFaultInjector;
-
-    let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "replay-read-failure";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, object_id, 268).await;
-    commit(&svc, &session_id, layer, object_id, 269).await;
-    // No checkpoint loop runs on this fixture, so only the replay's first
-    // per-commit read can consume the queued error.
-    let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
-    injector.push(FredError::new(
-        FredErrorKind::Timeout,
-        "injected per-commit atomic snapshot read timeout",
-    ));
-    fx.client
-        .install_object_snapshot_read_fault_injector_for_test(Arc::clone(&injector));
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, "replay-failed").await;
-    let status = first_status(&mut stream, "the failed per-commit read's ending").await;
-    assert_eq!(status.code(), Code::Unavailable, "{status:?}");
-    assert!(
-        status.message().contains("EVALSHA object_snapshot_read"),
-        "the ending came from the per-commit atomic read; got {status:?}"
-    );
-    assert_eq!(injector.remaining(), 0, "the injected error was consumed");
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "transient_error"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-        ),
-        (1, 1),
-        "the replay's first per-commit read failed, and it read nothing after it"
-    );
-    await_condition(
-        || exits(&fx.metrics, STREAM_EXIT_ERROR) == 1,
-        "the failure is counted under error",
-    )
-    .await;
-    await_condition(
-        || {
-            read_gate_is_full(&svc)
-                && reads_in_flight(&fx.metrics) == 0
-                && series(&fx.metrics, INFLIGHT) == 0
-                && series(&fx.metrics, STREAMS) == 0
-                && series(&fx.metrics, ADMITTED) == 0
-        },
-        "the failed replay gave back its permit, its slot, its stream and its admission",
-    )
-    .await;
-}
-
-/// A rollback-mode replay waiting for a commit's read permit is ended by its
-/// cause — graceful shutdown, session deletion or the client leaving — before
-/// any content, and its dropped wait takes nothing: once the test frees its
-/// own permit the gate is full. It runs no per-commit read and is charged no
-/// permit wait, and it gives back its slot, its stream and its admission.
-///
-/// The replay holds its slot and has registered its stream at the slice's
-/// last entry when the test fires the ending; its next await is the first
-/// commit's permit wait, which observes its endings first. That the ending
-/// found it queued there, rather than before it reached the wait, is checked
-/// after: its permit wait was observed once.
-#[cfg(feature = "test-fault-injection")]
-async fn a_rollback_replay_ended_at_its_read_permit_wait_leaves_the_read_gate_full(
-    ending: PermitWaitEnding,
-) {
-    use live_edit::observability::metrics::{
-        STREAM_EXIT_CLIENT_DISCONNECT, STREAM_EXIT_SESSION_CANCEL, STREAM_EXIT_SHUTDOWN,
-    };
-    const SUBJECT: &str = "replay-ended-at-permit";
-
-    let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let budget_seam = Arc::new(CapacityBudgetSeam::new());
-    svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
-    let layer = "replay-ended-at-permit";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, object_id, 266).await;
-    commit(&svc, &session_id, layer, object_id, 267).await;
-    let held = hold_read_permit(&svc).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, SUBJECT).await;
-    await_condition(
-        || series(&fx.metrics, INFLIGHT) == 1 && series(&fx.metrics, STREAMS) == 1,
-        "the replay takes its slot, registers its stream and goes on to its first permit wait",
-    )
-    .await;
-
-    let reason = match ending {
-        PermitWaitEnding::Shutdown => {
-            svc.shutdown.cancel();
-            let status = first_status(&mut stream, "the shutdown ending").await;
-            assert_eq!(status.code(), Code::Unavailable, "{status:?}");
-            assert_eq!(status.message(), "server shutting down");
-            STREAM_EXIT_SHUTDOWN
-        }
-        PermitWaitEnding::SessionDeletion => {
-            svc.session_tokens
-                .get(&session_id)
-                .expect("the subscribe registered its session token")
-                .cancel_deleted();
-            let status = first_status(&mut stream, "the deletion ending").await;
-            assert_eq!(status.code(), Code::NotFound, "{status:?}");
-            assert_eq!(status.message(), "session was deleted");
-            STREAM_EXIT_SESSION_CANCEL
-        }
-        PermitWaitEnding::ClientDisconnect => {
-            drop(stream);
-            STREAM_EXIT_CLIENT_DISCONNECT
-        }
-    };
-    await_condition(
-        || exits(&fx.metrics, reason) == 1,
-        "the ending is counted under its cause's reason",
-    )
-    .await;
-    assert_eq!(
-        exits(&fx.metrics, STREAM_EXIT_CATCHUP_CAPACITY),
-        0,
-        "{ending:?}"
-    );
-    assert_eq!(
-        (
-            per_commit_read_permit_waits(&fx.metrics),
-            all_per_commit_snapshot_reads(&fx.metrics),
-        ),
-        (1, 0),
-        "{ending:?}: the ending found the replay queued at its first permit wait (observed \
-         once) and before any per-commit read"
-    );
-    assert!(
-        budget_seam
-            .charges_for(SUBJECT)
-            .iter()
-            .all(|c| c.wait != BudgetWait::ReadPermit),
-        "{ending:?}: a permit wait ended by its cause is not charged"
-    );
-    await_condition(
-        || {
-            series(&fx.metrics, INFLIGHT) == 0
-                && series(&fx.metrics, ADMITTED) == 0
-                && series(&fx.metrics, STREAMS) == 0
-                && svc.valkey.stream_mux.snapshot().subscriptions() == 0
-        },
-        "the ended replay gives back its slot, its admission and its stream",
-    )
-    .await;
-    assert_eq!(
-        reads_in_flight(&fx.metrics),
-        1,
-        "{ending:?}: only the test's own permit is held"
-    );
-    drop(held);
-    assert!(
-        read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0,
-        "{ending:?}: the dropped wait took nothing"
-    );
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_ended_by_shutdown_at_its_read_permit_wait_leaves_the_read_gate_full() {
-    a_rollback_replay_ended_at_its_read_permit_wait_leaves_the_read_gate_full(
-        PermitWaitEnding::Shutdown,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_ended_by_session_deletion_at_its_read_permit_wait_leaves_the_read_gate_full(
-) {
-    a_rollback_replay_ended_at_its_read_permit_wait_leaves_the_read_gate_full(
-        PermitWaitEnding::SessionDeletion,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_ended_by_client_disconnect_at_its_read_permit_wait_leaves_the_read_gate_full(
-) {
-    a_rollback_replay_ended_at_its_read_permit_wait_leaves_the_read_gate_full(
-        PermitWaitEnding::ClientDisconnect,
-    )
-    .await;
-}
-
-/// What a rollback-mode replay that switched to the out-of-window route
-/// delivered, for [`assert_one_coalesced_diff_then_every_commit_once`].
-#[cfg(feature = "test-fault-injection")]
-struct HandedOver<'a> {
-    svc: &'a LiveEditService,
-    session_id: &'a str,
-    layer: &'a str,
-    object_id: u64,
-    /// The subscriber's `have_version`, the coalesced diff's base.
-    have_version: u64,
-    /// The cut of the shared fenced read the route attached to — on the
-    /// quiescent layer, the header sequence at the hand-over: the content's
-    /// and the ack's version, and where the route's stream starts.
-    cut: u64,
-    /// Every section committed after `have_version`.
-    sections: &'a [u64],
-    /// The section the first live commit adds.
-    next_section: u64,
-}
-
-/// A rollback-mode replay that switched to the out-of-window route delivers
-/// ONE coalesced diff and nothing before it: its first item is a content
-/// message at the cut, a diff based at the subscriber's `have_version` that
-/// folds in every commit since, then its ack at the cut; the next live commit
-/// is the cut's successor, exactly once. Afterwards one stream is registered —
-/// the route's — and the consumer the replay opened at the slice's last entry
-/// is gone.
-#[cfg(feature = "test-fault-injection")]
-async fn assert_one_coalesced_diff_then_every_commit_once(
-    handed_over: HandedOver<'_>,
-    stream: &mut SubStream,
-) {
-    let HandedOver {
-        svc,
-        session_id,
-        layer,
-        object_id,
-        have_version,
-        cut,
-        sections,
-        next_section,
-    } = handed_over;
-    let (content, body) = recv_message(stream, "the first message").await;
-    assert_eq!(
-        (content.object_id, content.sequence_num),
-        (object_id, cut),
-        "the first message is the one coalesced diff, at the cut — a replayed commit sent first \
-         would carry sequence {}",
-        have_version + 1
-    );
-    let delta = delta_of(&body);
-    assert_eq!(
-        (delta.is_diff, delta.base_version),
-        (true, have_version),
-        "the coalesced diff is based at the subscriber's have_version"
-    );
-    let carried = section_ids(&body);
-    for section_id in sections {
-        assert!(
-            carried.contains(section_id),
-            "the coalesced diff folds in section {section_id}"
-        );
-    }
-    recv_ack(stream, object_id, cut).await;
-    commit(svc, session_id, layer, object_id, next_section).await;
-    let (next, _) = recv_message(stream, "the first live commit").await;
-    assert_eq!(
-        next.sequence_num,
-        cut + 1,
-        "the next item after the ack is the next commit, delivered once"
-    );
-    assert_eq!(
-        (
-            series(&svc.metrics, STREAMS),
-            svc.valkey.stream_mux.snapshot().subscriptions(),
-        ),
-        (1, 1),
-        "one stream is registered, the route's; the replay's own consumer was released"
-    );
-}
-
-/// A rollback-mode in-window replay of a layer above the atomic-read limits (a
-/// forced-low ceiling) switches to the legacy out-of-window route on its first
-/// `TOO_LARGE` (Spec SDD SR-3.4): one coalesced diff, read through the layer's
-/// shared fenced-read flight with no second atomic read.
-///
-/// The replay has its slot (the only one) and its stream at the slice's last
-/// entry and waits for its first commit's read permit, which the test holds,
-/// while one more commit lands — past the slice, so above the header sequence
-/// it read before its waits (P). Freed, its atomic read answers `TOO_LARGE`; it
-/// reserves a reader under its slot, gives the slot back and attaches to the
-/// object's flight, which takes that slot for its fenced read; it registers
-/// once, at the flight's cut, verified. The replay itself never waits for a
-/// slot again — one slot wait, which a wait on its own slot would turn into a
-/// hang — and its share of the flight's waits is one `FlightRead` charge, the
-/// last before content. It is recorded as an in-window catch-up whose stable
-/// cut is the out-of-window route's.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_above_the_atomic_read_limits_hands_over_to_one_coalesced_diff() {
-    const SUBJECT: &str = "replay-hand-over";
-    let fx = CapacityFixture::setup_above_ceiling(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let budget_seam = Arc::new(CapacityBudgetSeam::new());
-    svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
-    let layer = "replay-hand-over";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    let in_slice = [271, 272, 273];
-    for &section_id in &in_slice {
-        commit(&svc, &session_id, layer, object_id, section_id).await;
-    }
-    // The header sequence before the waits (P).
-    let first_read = 4;
-    let held = hold_read_permit(&svc).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, SUBJECT).await;
-    await_condition(
-        || series(&fx.metrics, INFLIGHT) == 1 && series(&fx.metrics, STREAMS) == 1,
-        "the replay takes the only slot and registers its stream at the slice's last entry",
-    )
-    .await;
-    commit(&svc, &session_id, layer, object_id, 274).await;
-    drop(held);
-
-    assert_one_coalesced_diff_then_every_commit_once(
-        HandedOver {
-            svc: &svc,
-            session_id: &session_id,
-            layer,
-            object_id,
-            have_version: 1,
-            cut: first_read + 1,
-            sections: &[271, 272, 273, 274],
-            next_section: 275,
-        },
-        &mut stream,
-    )
-    .await;
-
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "too_large"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-            catchup_atomic_reads(&fx.metrics),
-        ),
-        (1, 1, 0),
-        "one per-commit atomic read answered TOO_LARGE, and the route read the layer through its \
-         flight with no second atomic read"
-    );
-    assert_eq!(
-        catchup_snapshot_reads(&fx.metrics, "fenced", "ok"),
-        1,
-        "the route's one read is its flight's fenced read"
-    );
-    assert_eq!(
-        (
-            stable_cuts(&fx.metrics, "verified", "out_of_window"),
-            stable_cuts(&fx.metrics, "unverified", "out_of_window"),
-            catchup_snapshot_reads(&fx.metrics, "fenced", "fence_broken"),
-        ),
-        (1, 0, 0),
-        "one fenced read, its cut served and verified, with no broken attempt"
-    );
-    assert_eq!(
-        (
-            regimes_served(&fx.metrics, "in_window"),
-            regimes_served(&fx.metrics, "out_of_window"),
-        ),
-        (1, 0),
-        "the catch-up is still recorded as the in-window regime it entered"
-    );
-    assert_budget_chain(
-        &budget_seam,
-        SUBJECT,
-        PARKED_BUDGET_MS,
-        &[
-            BudgetWait::Admission,
-            BudgetWait::CatchUpSlot,
-            BudgetWait::StreamReader,
-            BudgetWait::ReadPermit,
-            BudgetWait::StreamReader,
-            BudgetWait::FlightRead,
-        ],
-        &[],
-    );
-    assert_eq!(
-        catchup_waits(&fx.metrics, CATCHUP_WAIT_RESULT_ACQUIRED),
-        2,
-        "two slot acquires: the replay's own, and the flight's for its read once the replay gave \
-         its slot back; the replay never waited for a slot again"
-    );
-    assert!(read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0);
-    assert_flights_idle(&svc, "after the hand-over").await;
-}
-
-/// A rollback-mode in-window replay that finds its layer's shared fenced-read
-/// flight registered before a commit's read hands over at once (Spec SDD
-/// SR-7.5): no per-commit atomic read, so no `TOO_LARGE` answer is waited for
-/// — the registered flight says the layer is above the atomic-read limits.
-/// The out-of-window route attaches to that flight and delivers one coalesced
-/// diff based at `have_version`, at the flight's cut.
-///
-/// The test registers the flight itself (a waiter it never drives) before the
-/// reconnect subscribes; the replay drives the flight's read once attached.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_finding_its_layers_flight_registered_hands_over_with_no_per_commit_read()
-{
-    let fx = CapacityFixture::setup_above_ceiling(2, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "replay-flight-registered";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    for section_id in [291, 292, 293] {
-        commit(&svc, &session_id, layer, object_id, section_id).await;
-    }
-    let held = svc.snapshot_flights.attach_or_create(
-        object_id,
-        live_edit::storage::snapshot_fence::LayerSize {
-            items: 1_000,
-            bytes: 12_000,
-        },
-    );
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, "replay-registered").await;
-    assert_one_coalesced_diff_then_every_commit_once(
-        HandedOver {
-            svc: &svc,
-            session_id: &session_id,
-            layer,
-            object_id,
-            have_version: 1,
-            cut: 4,
-            sections: &[291, 292, 293],
-            next_section: 294,
-        },
-        &mut stream,
-    )
-    .await;
-    assert_eq!(
-        (
-            all_per_commit_snapshot_reads(&fx.metrics),
-            per_commit_read_permit_waits(&fx.metrics),
-            catchup_atomic_reads(&fx.metrics),
-        ),
-        (0, 0, 0),
-        "a registered flight hands the replay over before any per-commit read or read permit, \
-         and the route makes no atomic attempt either"
-    );
-    assert_eq!(
-        (
-            flight_roles(&fx.metrics, "joined_read"),
-            catchup_snapshot_reads(&fx.metrics, "fenced", "ok"),
-        ),
-        (1, 1),
-        "the route joined the registered flight and its one fenced read"
-    );
-    assert_eq!(regimes_served(&fx.metrics, "in_window"), 1);
-    drop((stream, held));
-    assert_flights_idle(&svc, "after the hand-over").await;
-}
-
-/// A rollback-mode replay whose layer grows past the atomic-read limits
-/// between two of its per-commit reads drops the diff it already built and
-/// delivers one coalesced diff instead (Spec SDD SR-3.4): nothing of the
-/// replay is sent before it.
-///
-/// The ceiling is [`CROSSING_ITEMS`]. The replay reads its first commit
-/// atomically and parks (`CatchUpStateReadSeam::new_between_replay_computes`),
-/// holding its slot, with that commit's diff built and stored; the test lands
-/// one commit of [`CROSSING_SECTIONS`] sections, which takes the layer above
-/// the limit, and releases it. Its second read answers `TOO_LARGE`, and it
-/// switches to the out-of-window route. Sent first, its stored diff would be
-/// the first message, at sequence 2.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_that_crosses_the_atomic_read_limits_drops_its_built_diffs_and_sends_one_coalesced_diff(
-) {
-    let fx = CapacityFixture::setup_full(None, 2, 0, 1, PARKED_BUDGET_MS, Ceiling::Crossing).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let seam =
-        Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_between_replay_computes());
-    svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    let layer = "replay-crossing";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    let in_slice = [281, 282, 283];
-    for &section_id in &in_slice {
-        commit(&svc, &session_id, layer, object_id, section_id).await;
-    }
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 1, "replay-crossing").await;
-    tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
-        .await
-        .expect("the replay parks after its first per-commit read and build");
-    assert_eq!(
-        per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-        1,
-        "fixture self-check: below the ceiling, the replay's first commit was read atomically"
-    );
-    let crossing: Vec<u64> = (0..CROSSING_SECTIONS).map(|i| 2_000 + i).collect();
-    commit_sections(&svc, &session_id, layer, object_id, &crossing).await;
-    tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
-        .await
-        .expect("release the replay");
-
-    let mut sections: Vec<u64> = in_slice.to_vec();
-    sections.extend(&crossing);
-    assert_one_coalesced_diff_then_every_commit_once(
-        HandedOver {
-            svc: &svc,
-            session_id: &session_id,
-            layer,
-            object_id,
-            have_version: 1,
-            cut: 5,
-            sections: &sections,
-            next_section: 284,
-        },
-        &mut stream,
-    )
-    .await;
-
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "too_large"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-            catchup_atomic_reads(&fx.metrics),
-        ),
-        (1, 1, 2, 0),
-        "the second per-commit read answered TOO_LARGE once the layer crossed the limit, and \
-         nothing more was read atomically"
-    );
-    assert_eq!(
-        (
-            stable_cuts(&fx.metrics, "verified", "out_of_window"),
-            catchup_snapshot_reads(&fx.metrics, "fenced", "ok"),
-        ),
-        (1, 1),
-        "the route read the layer once, through its flight's fenced read"
-    );
-    assert_eq!(regimes_served(&fx.metrics, "in_window"), 1);
-    assert!(read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0);
-    assert_flights_idle(&svc, "after the crossing hand-over").await;
-}
-
-/// The in-stream status of a catch-up whose read's cut shows the layer's
-/// sequence moved backwards.
-const SEQUENCE_REGRESSED_MSG: &str = "the layer's sequence moved backwards while this \
-     subscription caught up (the layer was restored); retry";
-
-/// Rewind the layer header's `seq` column to `seq`, as a restore from a
-/// checkpoint taken earlier, with an undersized sequence band, leaves it. The
-/// next atomic read's cut is `seq`, below commits the layer has already
-/// streamed.
-async fn rewind_header_sequence(fx: &CapacityFixture, object_id: u64, seq: u64) {
-    use fred::interfaces::HashesInterface;
-    let _: () = fx
-        .client
-        .pool
-        .hset(
-            fx.key_schema.obj_header(&object_id.to_string()),
-            ("seq", seq.to_string()),
-        )
-        .await
-        .expect("rewinding the header sequence must succeed");
-}
-
-/// Which per-commit read of a two-commit rollback replay (commits 2 and 3,
-/// reconnect at 1) finds the layer's sequence regressed, in
-/// [`a_rollback_replay_whose_per_commit_read_regressed_ends_unavailable_before_content`].
-#[derive(Clone, Copy, Debug)]
-enum RegressedReplayRead {
-    /// The first, of commit 2: the test holds the replica's only read permit
-    /// while the replay waits for it and rewinds the header to 1. No seam.
-    First,
-    /// The second, of commit 3: the replay parks after its first read and
-    /// build (`CatchUpStateReadSeam::new_between_replay_computes`), commit 2's
-    /// diff built and stored, and the test rewinds the header to 2.
-    #[cfg(feature = "test-fault-injection")]
-    Second,
-}
-
-/// A rollback-mode in-window replay whose per-commit atomic read's cut is
-/// below the commit it rebuilds — the layer's sequence regressed, as a
-/// restore with an undersized sequence band does — ends the subscription
-/// `UNAVAILABLE` with the sequence-regression status as its FIRST item, before
-/// any content and before any ack, wherever in the replay the read is: a diff
-/// it already built is dropped, not sent (Spec SDD SR-3.2, applied to a
-/// per-commit read). It records one `unverified` stable cut under
-/// `regime="in_window"` and no regime observation, is counted under exit
-/// reason `error`, and gives back its read permit, its slot, its stream and
-/// its admission.
-///
-/// Building from that read anyway, the replay sends something before any
-/// ending, as checked by disabling the source's check. With the first read
-/// regressed (cut 1 against the subscriber's 1), it plans nothing for either
-/// commit and sends a bare caught-up ack at 3: both commits are skipped
-/// silently. With the second regressed, it sends commit 2's content, built
-/// before the rewind.
-async fn a_rollback_replay_whose_per_commit_read_regressed_ends_unavailable_before_content(
-    at: RegressedReplayRead,
-) {
-    use live_edit::observability::metrics::STREAM_EXIT_ERROR;
-
-    let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    #[cfg_attr(not(feature = "test-fault-injection"), allow(unused_mut))]
-    let mut svc = build_service(&fx, false, 4096);
-    #[cfg(feature = "test-fault-injection")]
-    let seam =
-        Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_between_replay_computes());
-    #[cfg(feature = "test-fault-injection")]
-    if matches!(at, RegressedReplayRead::Second) {
-        svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
-    }
-    let layer = "replay-regressed";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, object_id, 371).await;
-    commit(&svc, &session_id, layer, object_id, 372).await;
-
-    let (mut stream, reads) = match at {
-        RegressedReplayRead::First => {
-            let held = hold_read_permit(&svc).await;
-            let stream =
-                subscribe(&svc, &session_id, layer, object_id, 1, "replay-regressed").await;
-            await_condition(
-                || series(&fx.metrics, INFLIGHT) == 1 && series(&fx.metrics, STREAMS) == 1,
-                "the replay takes the only slot and registers its stream at the slice's last \
-                 entry, before its first read",
-            )
-            .await;
-            rewind_header_sequence(&fx, object_id, 1).await;
-            drop(held);
-            (stream, 1)
-        }
-        #[cfg(feature = "test-fault-injection")]
-        RegressedReplayRead::Second => {
-            let stream =
-                subscribe(&svc, &session_id, layer, object_id, 1, "replay-regressed").await;
-            tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
-                .await
-                .expect("the replay parks after its first per-commit read and build");
-            assert_eq!(
-                per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-                1,
-                "fixture self-check: the first commit was read before the rewind"
-            );
-            rewind_header_sequence(&fx, object_id, 2).await;
-            tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
-                .await
-                .expect("release the replay");
-            (stream, 2)
-        }
-    };
-
-    let status = first_status(&mut stream, "the regressed replay's ending").await;
-    assert_eq!(status.code(), Code::Unavailable, "{at:?}: {status:?}");
-    assert_eq!(status.message(), SEQUENCE_REGRESSED_MSG, "{at:?}");
-    assert!(
-        tokio::time::timeout(SETTLE, stream.next())
-            .await
-            .expect("the stream ends after its status")
-            .is_none(),
-        "{at:?}: the status is the stream's terminal item"
-    );
-    await_condition(
-        || exits(&fx.metrics, STREAM_EXIT_ERROR) == 1,
-        "the regression ending is counted once under error",
-    )
-    .await;
-    assert_eq!(
-        (
-            stable_cuts(&fx.metrics, "unverified", "in_window"),
-            stable_cuts(&fx.metrics, "verified", "in_window"),
-            regimes_served(&fx.metrics, "in_window"),
-        ),
-        (1, 0, 0),
-        "{at:?}: one unverified in-window cut, nothing verified, and no regime served"
-    );
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-        ),
-        (reads, reads),
-        "{at:?}: the replay read up to the regressed commit and no further"
-    );
-    await_condition(
-        || {
-            read_gate_is_full(&svc)
-                && reads_in_flight(&fx.metrics) == 0
-                && series(&fx.metrics, INFLIGHT) == 0
-                && series(&fx.metrics, STREAMS) == 0
-                && series(&fx.metrics, ADMITTED) == 0
-        },
-        "the ended replay gave back its read permit, its slot, its stream and its admission",
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_whose_first_per_commit_read_regressed_ends_unavailable_before_content() {
-    a_rollback_replay_whose_per_commit_read_regressed_ends_unavailable_before_content(
-        RegressedReplayRead::First,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_whose_second_per_commit_read_regressed_drops_its_built_diff_and_ends_unavailable(
-) {
-    a_rollback_replay_whose_per_commit_read_regressed_ends_unavailable_before_content(
-        RegressedReplayRead::Second,
-    )
-    .await;
-}
-
-/// A rollback-mode in-window replay sends an empty commit in its slice as the
-/// empty delta, built with no read and no read permit, and reads only the
-/// commits that owe content (SDD §12.2): a reconnect at sequence 2 over
-/// `[3 empty, 4]` receives the empty delta at 3, based at 2; then commit 4's
-/// diff, based at 3 and carrying its section; then its ack at 4. One
-/// per-commit read, under one permit, and the catch-up is served in window.
-///
-/// Reading the empty commit too, the replay would make two.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_sends_an_empty_commit_as_the_empty_delta_with_no_read() {
-    let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "replay-empty-commit";
-    let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
-    commit(&svc, &session_id, layer, object_id, 361).await;
-    empty_commit(&svc, &session_id, layer, object_id).await;
-    commit(&svc, &session_id, layer, object_id, 362).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 2, "replay-empty").await;
-    let (empty, body) = recv_message(&mut stream, "the empty commit").await;
-    assert_eq!((empty.object_id, empty.sequence_num), (object_id, 3));
-    assert_eq!(
-        delta_of(&body),
-        the_empty_delta(2),
-        "the empty commit is the empty delta, based at the sequence before it"
-    );
-    let (next, body) = recv_message(&mut stream, "the commit after it").await;
-    assert_eq!((next.object_id, next.sequence_num), (object_id, 4));
-    let delta = delta_of(&body);
-    assert_eq!(
-        (delta.is_diff, delta.base_version),
-        (true, 3),
-        "the commit after the empty one is based at the empty commit's sequence"
-    );
-    assert_eq!(section_ids(&body), HashSet::from([362]));
-    recv_ack(&mut stream, object_id, 4).await;
-
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-            per_commit_read_permit_waits(&fx.metrics),
-        ),
-        (1, 1, 1),
-        "one per-commit read, under one permit: commit 4's; the empty commit read nothing"
-    );
-    assert_eq!(regimes_served(&fx.metrics, "in_window"), 1);
-    assert!(read_gate_is_full(&svc) && reads_in_flight(&fx.metrics) == 0);
-}
-
-/// A same-object reconnect at sequence 0 replays the layer's slice from its
-/// `CreateLayer` seed entry, which carries no relay bytes either but is not an
-/// empty commit: the seed (sequence 1) keeps its read and delivers the
-/// layer's created content, based at 0, and only the empty commit after it
-/// (sequence 2) is sent as the empty delta, based at 1, with no read. One
-/// per-commit read in all.
-///
-/// Treating every entry without relay bytes as an empty commit, the seed
-/// would arrive as an empty delta and the created section would never reach
-/// the client.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_from_sequence_0_reads_the_seed_and_sends_the_empty_commit_after_it_with_no_read(
-) {
-    let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
-    let layer = "replay-seed-then-empty";
-    let (session_id, object_id) =
-        create_layer_carrying(&fx, &svc, layer, &sections_delta(&[363])).await;
-    empty_commit(&svc, &session_id, layer, object_id).await;
-
-    let mut stream = subscribe(&svc, &session_id, layer, object_id, 0, "replay-seed").await;
-    let (seed, body) = recv_message(&mut stream, "the seed commit").await;
-    assert_eq!((seed.object_id, seed.sequence_num), (object_id, 1));
-    assert_eq!(
-        delta_of(&body).base_version,
-        0,
-        "the seed is the layer's created content, based at 0"
-    );
-    assert_eq!(
-        section_ids(&body),
-        HashSet::from([363]),
-        "the seed carries the section the layer was created with"
-    );
-    let (empty, body) = recv_message(&mut stream, "the empty commit").await;
-    assert_eq!((empty.object_id, empty.sequence_num), (object_id, 2));
-    assert_eq!(delta_of(&body), the_empty_delta(1));
-    recv_ack(&mut stream, object_id, 2).await;
-
-    assert_eq!(
-        (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "ok"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-            per_commit_read_permit_waits(&fx.metrics),
-        ),
-        (1, 1, 1),
-        "one per-commit read, under one permit: the seed's"
-    );
-}
 
 /// How many caught-up subscribers
 /// [`caught_up_subscribers_receive_empty_commits_as_empty_deltas_while_the_read_permit_is_held`]
@@ -5877,7 +4221,7 @@ const EMPTY_COMMITS: u64 = 3;
 async fn caught_up_subscribers_receive_empty_commits_as_empty_deltas_while_the_read_permit_is_held()
 {
     let fx = CapacityFixture::setup(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "steady-empty-commits";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 341).await;
@@ -5898,6 +4242,10 @@ async fn caught_up_subscribers_receive_empty_commits_as_empty_deltas_while_the_r
         streams.push(stream);
     }
     let held = hold_read_permit(&svc).await;
+    let (waits_before, reads_before) = (
+        all_read_permit_waits(&fx.metrics),
+        all_snapshot_reads(&fx.metrics),
+    );
 
     for _ in 0..EMPTY_COMMITS {
         empty_commit(&svc, &session_id, layer, object_id).await;
@@ -5925,8 +4273,8 @@ async fn caught_up_subscribers_receive_empty_commits_as_empty_deltas_while_the_r
     .unwrap_or_else(|_| panic!("the empty commits were not all delivered within {DRAIN:?}"));
     assert_eq!(
         (
-            per_commit_read_permit_waits(&fx.metrics),
-            all_per_commit_snapshot_reads(&fx.metrics),
+            all_read_permit_waits(&fx.metrics) - waits_before,
+            all_snapshot_reads(&fx.metrics) - reads_before,
             reads_in_flight(&fx.metrics),
         ),
         (0, 0, 1),
@@ -5949,21 +4297,24 @@ async fn caught_up_subscribers_receive_empty_commits_as_empty_deltas_while_the_r
 
 /// An empty commit on a layer above the atomic-read limits (a forced-low
 /// ceiling) is delivered the same way: the empty delta at its sequence, with
-/// no read at all — no per-commit atomic read, so none answers `TOO_LARGE`
-/// (the answer that sent a rebuild above the limits on to read the data
-/// pool), no read permit, and no diff build. The subscriber then goes on
-/// relaying.
+/// no read at all — no atomic read, so none answers `TOO_LARGE` (the answer
+/// that sends a read above the limits on to read the data pool), no read
+/// permit, and no diff build. The subscriber then goes on relaying.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_empty_commit_above_the_atomic_read_limits_is_delivered_with_no_read() {
     let fx = CapacityFixture::setup_above_ceiling(64, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "steady-empty-above-ceiling";
     let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, object_id, 351).await;
     let mut stream = subscribe(&svc, &session_id, layer, object_id, 2, "steady-empty-large").await;
     recv_ack(&mut stream, object_id, 2).await;
-    let builds_before = diff_builds(&fx.metrics);
+    let (builds_before, reads_before, waits_before) = (
+        diff_builds(&fx.metrics),
+        all_snapshot_reads(&fx.metrics),
+        all_read_permit_waits(&fx.metrics),
+    );
 
     empty_commit(&svc, &session_id, layer, object_id).await;
     let (content, body) = recv_message(&mut stream, "the empty commit").await;
@@ -5971,13 +4322,12 @@ async fn an_empty_commit_above_the_atomic_read_limits_is_delivered_with_no_read(
     assert_eq!(delta_of(&body), the_empty_delta(2));
     assert_eq!(
         (
-            per_commit_snapshot_reads(&fx.metrics, "atomic", "too_large"),
-            all_per_commit_snapshot_reads(&fx.metrics),
-            per_commit_read_permit_waits(&fx.metrics),
+            all_snapshot_reads(&fx.metrics) - reads_before,
+            all_read_permit_waits(&fx.metrics) - waits_before,
             diff_builds(&fx.metrics) - builds_before,
         ),
-        (0, 0, 0, 0),
-        "the empty commit took no atomic read, no read permit and no diff build"
+        (0, 0, 0),
+        "the empty commit took no snapshot read, no read permit and no diff build"
     );
 
     commit(&svc, &session_id, layer, object_id, 352).await;
@@ -6020,7 +4370,7 @@ mod cluster {
     /// A one-reader cluster fixture with `max_catchups` catch-up slots, or
     /// `None` (with a `SKIP:` line) when no cluster is configured.
     async fn one_reader_cluster(max_catchups: usize, budget_ms: u64) -> Option<CapacityFixture> {
-        let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+        let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
             eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
             return None;
         };
@@ -6066,21 +4416,20 @@ mod cluster {
     /// slot during the reader wait (`catchups_inflight` 0, no slot-wait
     /// observation at all), and its admission is returned.
     ///
-    /// Brand new, and a snapshot-mode same-object reconnect: both reserve
-    /// their stream reader before their slot wait. (A rollback-mode
-    /// same-object reconnect takes its slot first, by design.)
-    async fn a_reader_wait_that_outlasts_the_budget_is_refused(snapshot: bool) {
+    /// Brand new, and a same-object reconnect: both reserve their stream
+    /// reader before their slot wait.
+    async fn a_reader_wait_that_outlasts_the_budget_is_refused(reconnect: bool) {
         let Some(fx) = one_reader_cluster(64, CLUSTER_SHORT_BUDGET_MS).await else {
             return;
         };
-        let svc = build_service(&fx, snapshot, 4096);
+        let svc = build_service(&fx, 4096);
         let layer = "reader-capacity";
         let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
         commit(&svc, &session_id, layer, object_id, 121).await;
         let holder = bind_the_reader_elsewhere(&fx, object_id).await;
         let capture = ThreadCapture::start();
 
-        let (have_object, have_version) = if snapshot { (object_id, 1) } else { (0, 0) };
+        let (have_object, have_version) = if reconnect { (object_id, 1) } else { (0, 0) };
         let mut stream = subscribe(
             &svc,
             &session_id,
@@ -6133,8 +4482,7 @@ mod cluster {
     }
 
     #[tokio::test]
-    async fn a_snapshot_reconnect_reader_wait_that_outlasts_the_budget_is_refused_reader_capacity()
-    {
+    async fn a_reconnect_reader_wait_that_outlasts_the_budget_is_refused_reader_capacity() {
         a_reader_wait_that_outlasts_the_budget_is_refused(true).await;
     }
 
@@ -6156,7 +4504,7 @@ mod cluster {
         let Some(fx) = one_reader_cluster(64, PARKED_BUDGET_MS).await else {
             return;
         };
-        let svc = build_service(&fx, false, 4096);
+        let svc = build_service(&fx, 4096);
         let layer = "reader-wait-ending";
         let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
         let holder = bind_the_reader_elsewhere(&fx, object_id).await;
@@ -6284,7 +4632,7 @@ mod cluster {
         let Some(fx) = one_reader_cluster(1, PARKED_BUDGET_MS).await else {
             return;
         };
-        let mut svc = build_service(&fx, false, 4096);
+        let mut svc = build_service(&fx, 4096);
         let budget_seam = Arc::new(CapacityBudgetSeam::new());
         svc.capacity_budget_seam_for_test = Some(Arc::clone(&budget_seam));
         let layer = "reader-charged";
@@ -6328,6 +4676,7 @@ mod cluster {
                 BudgetWait::StreamReader,
                 BudgetWait::CatchUpSlot,
                 BudgetWait::ReadPermit,
+                BudgetWait::CatchUpPayload,
             ],
             &[],
         );
@@ -6368,7 +4717,7 @@ mod cluster {
         let Some(fx) = one_reader_cluster(1, PARKED_BUDGET_MS).await else {
             return;
         };
-        let svc = build_service(&fx, false, 4096);
+        let svc = build_service(&fx, 4096);
         let layer = "reserved-binds";
         let (session_id, object_id) = create_layer(&fx, &svc, layer).await;
         commit(&svc, &session_id, layer, object_id, 171).await;
@@ -6506,9 +4855,9 @@ fn scaling_counts(metrics: &Metrics) -> (u64, u64, u64) {
 }
 
 /// A catch-up that re-bootstraps before its first ack is still ONE first
-/// catch-up. A rollback in-window replay is counted pending when it starts;
-/// parked between its per-commit reads, the layer is overwritten and cleaned
-/// up, so its next read answers `NotFound` and it re-bootstraps through
+/// catch-up. An in-window reconnect is counted pending when it starts;
+/// parked under its slot before its atomic read, the layer is overwritten and
+/// cleaned up, so its read answers `NotFound` and it re-bootstraps through
 /// `catch_up_brand_new`, which counts a first catch-up too — a no-op here.
 /// Once the NEW object's state and its ack arrive: one admitted, none
 /// pending, one completed.
@@ -6516,9 +4865,8 @@ fn scaling_counts(metrics: &Metrics) -> (u64, u64, u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_up_that_rebootstraps_before_its_first_ack_completes_one_first_catch_up() {
     let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let mut svc = build_service(&fx, false, 4096);
-    let seam =
-        Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_between_replay_computes());
+    let mut svc = build_service(&fx, 4096);
+    let seam = Arc::new(live_edit::grpc::subscribe::CatchUpStateReadSeam::new_before_coalesced());
     svc.catch_up_state_read_seam_for_test = Some(Arc::clone(&seam));
     let layer = "scaling-rebootstrap-in-catch-up";
     let (session_id, old_object_id) = create_layer(&fx, &svc, layer).await;
@@ -6527,20 +4875,20 @@ async fn a_catch_up_that_rebootstraps_before_its_first_ack_completes_one_first_c
     }
 
     let mut stream = subscribe(&svc, &session_id, layer, old_object_id, 1, "scaling-a").await;
-    tokio::time::timeout(SETTLE, seam.wait_until_parked_between_replay_computes())
+    tokio::time::timeout(SETTLE, seam.wait_until_parked_pre_coalesced())
         .await
-        .expect("the replay parks after its first per-commit compute");
+        .expect("the reconnect parks under its slot, before its atomic read");
     assert_eq!(
         scaling_counts(&fx.metrics),
         (1, 1, 0),
-        "the in-window replay is pending from its start"
+        "the in-window catch-up is pending from its start"
     );
 
     let new_object_id = overwrite(&svc, &session_id, layer).await;
     svc.layer_store.wait_for_cleanup(SETTLE).await;
-    tokio::time::timeout(SETTLE, seam.release_between_replay_computes())
+    tokio::time::timeout(SETTLE, seam.arrive_at_pre_coalesced())
         .await
-        .expect("release the replay");
+        .expect("release the reconnect");
 
     let (contents, ack) = recv_catch_up(&mut stream).await;
     assert_eq!(
@@ -6549,7 +4897,7 @@ async fn a_catch_up_that_rebootstraps_before_its_first_ack_completes_one_first_c
             .map(|h| (h.object_id, h.sequence_num))
             .collect::<Vec<_>>(),
         vec![(new_object_id, 1)],
-        "fixture self-check: the replay re-bootstrapped onto the NEW object before any content"
+        "fixture self-check: the reconnect re-bootstrapped onto the NEW object before any content"
     );
     assert_eq!((ack.object_id, ack.sequence_num), (new_object_id, 1));
     await_condition(
@@ -6567,7 +4915,7 @@ async fn a_catch_up_that_rebootstraps_before_its_first_ack_completes_one_first_c
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steady_state_rebootstrap_after_the_first_ack_is_not_counted() {
     let fx = CapacityFixture::setup(1, PARKED_BUDGET_MS).await;
-    let svc = build_service(&fx, false, 4096);
+    let svc = build_service(&fx, 4096);
     let layer = "scaling-rebootstrap-steady";
     let (session_id, old_object_id) = create_layer(&fx, &svc, layer).await;
     commit(&svc, &session_id, layer, old_object_id, 95).await;

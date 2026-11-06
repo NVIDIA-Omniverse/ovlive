@@ -98,7 +98,7 @@ use live_edit::storage::test_support::TestValkey;
 use live_edit::storage::time_sample_merge::{merge_signed_zero_rows, negative_zero_sections};
 
 use crate::common::owned_delta::{
-    build_delta_with_negative_zero_times, reset_delta, NEGATIVE_ZERO_SENTINEL,
+    build_delta_with_negative_zero_times, delta_with_diff_change_section, NEGATIVE_ZERO_SENTINEL,
 };
 use crate::storage::snapshot_read_atomic_test::{
     create, create_cmd, create_session, delete_cmd, every_shape_state, structural, CUBE, ROOT,
@@ -744,9 +744,23 @@ enum Deletion {
 impl Deletion {
     fn delta(self) -> oodf_ffi::OwnedDelta {
         match self {
-            Deletion::Reset => reset_delta("usda"),
+            Deletion::Reset => clearing_reset(),
             Deletion::Cascade => structural(vec![delete_cmd(WORLD, CUBE)]),
         }
+    }
+}
+
+/// The one top-level section [`clearing_reset`] restates: an id the seeded
+/// tree leaves free.
+const RESET_TOP: u64 = 80;
+
+/// A whole-layer reset that drains every row the object holds and restates
+/// only a fresh top-level section, [`RESET_TOP`]: a reset leaving the layer no
+/// top-level section is refused (SDD §9.7).
+fn clearing_reset() -> oodf_ffi::OwnedDelta {
+    oodf_ffi::OwnedDelta {
+        source_format: "usda".to_owned(),
+        ..delta_with_diff_change_section(ROOT, RESET_TOP, "ResetTop", 1, 0)
     }
 }
 
@@ -1022,7 +1036,7 @@ async fn reset_after_a_lone_older_build_negative_zero_commit_and_a_this_build_wr
     );
     let (divergences, reloads) = (fx.divergences(), fx.diverged_reloads());
 
-    fx.update(reset_delta("usda"))
+    fx.update(clearing_reset())
         .await
         .unwrap_or_else(|e| panic!("the reset commits after one reload; got {e:?}"));
 

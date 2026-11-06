@@ -42,15 +42,16 @@ Use the Balanced tier:
 
 | SKU | Memory | Use for | Max `autoscaling.maxReplicas` |
 |---|---|---|---|
-| `Balanced_B0` | 0.5 GB | evaluation | 7 |
-| `Balanced_B1` | 1 GB | development | 7 |
-| `Balanced_B3` | 3 GB | small workloads | 7 |
-| `Balanced_B5` | 6 GB | small workloads | 7 |
+| `Balanced_B0` | 0.5 GB | evaluation | 9 |
+| `Balanced_B1` | 1 GB | development | 9 |
+| `Balanced_B3` | 3 GB | small workloads | 9 |
+| `Balanced_B5` | 6 GB | small workloads | 9 |
 | `Balanced_B10` | 12 GB | production starting point | 10 |
 | `Balanced_B20` | 24 GB | larger production | 10 |
 
 1. Pick the smallest size whose memory is at least twice your expected peak.
-2. Set `autoscaling.maxReplicas` to 7 on `Balanced_B0` to `Balanced_B5`; larger sizes take the chart default of 10.
+2. Set `autoscaling.maxReplicas` to 9 on `Balanced_B0` to `Balanced_B5`; larger sizes take the chart default of 10.
+   If you change a connection pool, check your size's limit as {ref}`Connections <live-edit-backing-store-connections>` shows.
 3. Set `valkey.memoryBytes` to your SKU's memory in bytes, for example `12000000000` for `Balanced_B10`.
    The cache does not report its memory to Live Edit; the service works out each shard's share itself.
    After resizing the cache, update `valkey.memoryBytes` to the new total.
@@ -178,7 +179,7 @@ valkey:
       enabled: true
       username: "{OBJECT_ID}"
 autoscaling:
-  maxReplicas: 10             # 7 on Balanced_B0 to Balanced_B5
+  maxReplicas: 10             # 9 on Balanced_B0 to Balanced_B5
 ```
 
 Set `serviceAccount.annotations."azure.workload.identity/client-id"` to `$CLIENT_ID`.
@@ -191,7 +192,7 @@ After installing, check that the pods are ready and that `live_edit_store_memory
 
 Configure your token provisioner to request the scope `https://redis.azure.com/.default` and to replace the Redis token at least 7 minutes (420 s) before it expires, in the {ref}`token file format <live-edit-authentication-token-file-format>`.
 
-If the lead is too short, each token rotation (typically daily) logs a warning naming the refresh headroom, and live updates pause briefly while connections reconnect.
+If the lead is too short, each token rotation (typically daily) logs a warning naming the refresh headroom, and live updates may pause briefly while connections reconnect.
 A replica with no valid token reports `NOT_SERVING` until the provisioner writes one.
 
 (live-edit-backing-store-azure-durability)=
@@ -210,6 +211,7 @@ To tell when the cache is filling up, see {ref}`Store memory <live-edit-monitori
 
 During Azure maintenance and token rotation the cache can drop or silently stall connections; Live Edit detects and rebuilds them.
 Expect occasional increases of `live_edit_valkey_consumer_forced_reconnects_total` around those events, and at most a brief pause in live updates.
+Maintenance that fails over a shard or moves data can also refuse a few writes per replica with the retryable `UNAVAILABLE`, which clients retry, and briefly raise `live_edit_valkey_reconnects_total{pool="txn"}`.
 These should stay at zero: `live_edit_valkey_consumer_permanent_exits_total` and `live_edit_stream_mux_reauths_total{result="failed"}`.
 
 (live-edit-backing-store-azure-wrongpass)=

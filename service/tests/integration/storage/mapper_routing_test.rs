@@ -413,20 +413,23 @@ const ALLOWLIST: &[(&str, &str)] = &[
     //   session.rs         "SMEMBERS names failed" (list)     -> map_fred_err_for_grpc
     //   session.rs         "HGETALL failed" (list)            -> map_fred_err_for_grpc
     //   session.rs         "HGETALL failed" (get_session_meta) -> map_fred_err_for_grpc
-    //   session.rs         "HSET failed" (finish_create)      -> undo_create_attempt
-    //   session.rs         "SMEMBERS names failed" (re-scan)  -> undo_create_attempt
+    //   session.rs         "HSET failed" (finish_create)      -> settle_failed_meta_write
+    //                      (since b.2tu the write is `EVALSHA session_meta_write`)
+    //   session.rs         "SMEMBERS names failed" (re-scan)  -> release_in_doubt_attempt
     //   layer.rs           "GET layer mapping failed"         -> map_fred_err_for_grpc
     //   layer.rs           "SET layer mapping failed"         -> map_fred_err_for_grpc
     //   layer.rs           "XADD deleted on old stream failed" -> map_fred_err_for_grpc
     //                      (since b.ua9 a WARN in the overwrite tail, answered OK)
     //   external_values.rs "GET ext_data failed"              -> map_fred_err_for_grpc
     //
-    // The two `undo_create_attempt` sites (and the in-doubt `SISMEMBER`, which
-    // used to return a bare `Aborted`) run AFTER `create_once`'s commit was
-    // sent, so they fail through the undo rather than straight through a
-    // mapper; the undo picks the mapper by whether it released the name (see
-    // `undo_create_attempt` / SDD §7.10). Their shape is pinned by
-    // `create_session_post_commit_failures_route_through_undo_create_attempt`.
+    // Those two sites (and the in-doubt `SISMEMBER`, which used to return a
+    // bare `Aborted`) run AFTER `create_once`'s commit was sent, so they fail
+    // through a clean-up rather than straight through a mapper: the metadata
+    // write through `settle_failed_meta_write`, which picks the mapper by the
+    // veto's verdict, and the in-doubt reads through `release_in_doubt_attempt`,
+    // which picks it by whether its release succeeded (SDD §7.10). Their shape
+    // is pinned by
+    // `create_session_post_commit_failures_route_through_the_settle_and_the_release`.
     //
     // b.bhb REMOVED SIX ROWS FROM THIS CLUSTER — do not restore them.
     // The txn pool now writes each command exactly once
@@ -504,7 +507,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // separately from the call — so both wraps are gone from the source and
     // both rows would have failed the allowlist-liveness fence below.
     //
-    // external_values.rs `read_batch_with_recovery_counter`'s two pipeline
+    // external_values.rs `ValkeyExternalValueStore::read_batch`'s two pipeline
     // queue pushes (`GET ext_data`, `HEXISTS ext_meta ref_count`) — local
     // buffer pushes into a fred `Pipeline`. The `pipeline.all()` round trip
     // beside them is NOT allowlisted: it routes through
@@ -662,6 +665,29 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // already route through `map_snapshot_load_err`. The attempt ends
     // `Internal`, which by design never runs the lost-reply lookup.
     ("src/storage/layer.rs", "HMGET commit release ring answered"),
+    // `DeleteLayer`'s conditional unmap: the `EVALSHA` of `layer_unmap.lua`
+    // in `send_layer_unmap_once` returned `Ok` (every fred error routes
+    // through `map_transient_fred_err`), but the reply is not one the delete
+    // can act on. `decode_layer_unmap_reply` answers a shape the script never
+    // gives, or an `OTHER` whose stored mapping value is not an object id;
+    // `send_layer_unmap` answers a second `OTHER` spelling this very object
+    // non-canonically (an out-of-band write): the first such reply is
+    // answered by one re-send expecting the stored text, and only a
+    // non-canonical reply to that re-send ends here, since there is no third
+    // send. Corrupt data or a protocol fault, not a fred error; no retry
+    // changes it.
+    (
+        "src/storage/layer.rs",
+        "layer mapping holds a non-canonical spelling of this",
+    ),
+    (
+        "src/storage/layer.rs",
+        "{LAYER_UNMAP_OP}: the layer mapping names {current:?}, which is not an",
+    ),
+    (
+        "src/storage/layer.rs",
+        "layer_unmap.lua returned an unexpected reply",
+    ),
     // `parse_commit_token_record`: a commit-token record that carries this
     // call's token but whose `<seq>:<server_ts>` tail does not parse. Corrupt
     // data written out of band — neither backend writes that shape — and a
@@ -829,8 +855,8 @@ const ALLOWLIST: &[(&str, &str)] = &[
     // `delete` step 3's two `DEL`s and deletion-marker `SET` into a fred
     // `Transaction` (one `{session_id}` tag). Every session.rs round trip — the `WATCH`, the
     // duplicate scan, the `EXEC`s, and the post-commit and `delete` / `list`
-    // data-pool commands — routes through a mapper or `undo_create_attempt`
-    // and has no row here.
+    // data-pool commands — routes through a mapper, `settle_failed_meta_write`
+    // or `release_in_doubt_attempt`, and has no row here.
     ("src/storage/session.rs", "SADD path_index queue failed"),
     ("src/storage/session.rs", "SADD path_names queue failed"),
     ("src/storage/session.rs", "DEL session meta queue failed"),
@@ -922,6 +948,31 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "src/storage/diff_read.rs",
         "stopped for its upload charge, which only the",
     ),
+    // b.o2i, three more answers of the snapshot read its consumer can never
+    // receive, each a round-1 index shortfall (`IndexShortfall`) reaching an
+    // arm its read path never routes one to. The fan-out's round trips
+    // already succeeded, and their fred errors route through
+    // `classify_snapshot_read_err`; these wrap no fred call (logic
+    // invariants), and a retry would see the same answer.
+    //
+    // `uncharged`: a read that carried no `FanoutAllowance` handed on its
+    // completed read with a shortfall (`ChargedEnd::Incomplete`), which only
+    // the charged read hands on; an uncharged read refuses a shortfall itself
+    // (`Aborted`) in `read_snapshot_with_ceilings`.
+    ("src/storage/diff_read.rs", "handed on a round-1 shortfall"),
+    // `read_snapshot_with_ceilings`: an unfenced read ended right after round
+    // 1 on a shortfall (`FanoutOutcome::Incomplete`), which only the fenced
+    // pass does (`FanoutRead::ends_on_shortfall`); the unfenced read carries
+    // its shortfall to its end on `FanoutOutcome::Read`.
+    (
+        "src/storage/diff_read.rs",
+        "which only the fenced pass ends on",
+    ),
+    // `read_object_snapshot_fenced_pass`: the fenced pass read past a
+    // round-1 shortfall to a whole read (`FanoutOutcome::Read` carrying one),
+    // which `fanout_snapshot_read` never answers for the fenced pass: it ends
+    // the pass right after round 1 (`FanoutOutcome::Incomplete`).
+    ("src/storage/diff_read.rs", "read past a round-1 shortfall"),
     // `shape_read_into_full_state`: a value row read by its shape (the
     // bounded-reply fan-out) decoded into the full state. Unreachable while
     // only the structural update's read, whose state is compact, reads rows
@@ -930,8 +981,8 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "src/storage/diff_read.rs",
         "a value row read by its shape cannot be decoded",
     ),
-    // `proven_cut`: a catch-up or per-commit build handed a snapshot read on
-    // a path whose cut is not proven (Spec SDD SR-3.1: no snapshot is served
+    // `proven_cut`: a faithful catch-up build (from-empty or coalesced)
+    // handed a snapshot read on a path whose cut is not proven (Spec SDD SR-3.1: no snapshot is served
     // unverified). A caller-side invariant over a value already read; no
     // Valkey call is wrapped, and a retry would hand over the same path.
     (
@@ -1014,7 +1065,8 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ),
     // ── subscribe.rs: establishment invariant ─────────────────────────────
     //
-    // The catch-up `XRANGE in-window slice` read is NOT allowlisted: it is a
+    // The catch-up's in-window point read (`read_in_window_point`, its
+    // `XRANGE` + `XREVRANGE` pipeline) is NOT allowlisted: it is a
     // single-attempt read on the SubscribeReadLayer path and routes through
     // `map_fred_err_for_grpc`, so a transient blip answers retriable
     // `UNAVAILABLE` and only a permanent one `INTERNAL`. Not being an
@@ -1879,8 +1931,10 @@ fn workspace_wide_allowlist_rows_each_excuse_exactly_their_declared_sites() {
 /// the canonical b.fd9 acceptance scope and the workspace-wide scan
 /// above generalises the same contract. b.62m added the `SessionStore`
 /// functions whose round trips it moved off the allowlist (`list`,
-/// `get_session_meta`, `finish_create`, `reconcile_in_doubt_create`) and
-/// the `undo_create_attempt` helper they now fail through. This narrower per-function
+/// `get_session_meta`, `finish_create`, `reconcile_in_doubt_create`); b.2tu
+/// added the clean-ups they now fail through (`settle_failed_meta_write`,
+/// `release_in_doubt_attempt`) and the ListSessions walk's
+/// `retire_ghost_member` and `reconcile_path_index`. This narrower per-function
 /// scan catches a regression that re-introduces a wrap inside one of
 /// the originally-scoped functions but happens to type a message
 /// string that escapes the workspace-wide allowlist via a coincidental
@@ -1938,7 +1992,22 @@ fn original_b_fd9_functions_remain_free_of_direct_internal_fred_wraps() {
         ),
         (
             "src/storage/session.rs",
-            "async fn undo_create_attempt",
+            "async fn settle_failed_meta_write",
+            session_src,
+        ),
+        (
+            "src/storage/session.rs",
+            "async fn release_in_doubt_attempt",
+            session_src,
+        ),
+        (
+            "src/storage/session.rs",
+            "pub async fn retire_ghost_member",
+            session_src,
+        ),
+        (
+            "src/storage/session.rs",
+            "pub async fn reconcile_path_index",
             session_src,
         ),
         (
@@ -2009,7 +2078,8 @@ fn original_b_fd9_functions_remain_free_of_direct_internal_fred_wraps() {
             "Found `ServiceError::Internal(format!` wraps inside the b.fd9 / b.62m-scoped \
              functions — these must route through `map_fred_err_for_grpc` (single-shot read) \
              or `map_transient_fred_err` (retry-loop-wrapped), or, after `create_once`'s \
-             commit was sent, through `undo_create_attempt`:\n\n",
+             commit was sent, through `settle_failed_meta_write` / \
+             `release_in_doubt_attempt`:\n\n",
         );
         for (file, func, lineno, text) in &violations {
             report.push_str(&format!(
@@ -2020,24 +2090,27 @@ fn original_b_fd9_functions_remain_free_of_direct_internal_fred_wraps() {
     }
 }
 
-/// b.62m — `create_once`'s post-commit round trips must fail through
-/// `undo_create_attempt`, never straight through a mapper.
+/// b.62m, b.2tu — `create_once`'s post-commit round trips must fail through
+/// their clean-up, never straight through a mapper.
 ///
-/// Once the commit has been sent, the attempt's own names member may already be
-/// in the index, so a failure must remove the attempt's entries before an
-/// error is chosen, and a bare `map_transient_fred_err` or
-/// `map_fred_err_for_grpc` removes nothing (why each is wrong here: see
-/// `undo_create_attempt` / SDD §7.10). The workspace-wide scan cannot see that
-/// regression: both are the canonical mappers it exists to steer sites onto.
-/// So this pins the shape directly:
+/// Once the commit has been sent, the attempt's own members may already be in
+/// the index, so a failure must settle or release the attempt before an error
+/// is chosen, and a bare `map_transient_fred_err` or `map_fred_err_for_grpc`
+/// settles nothing (why each is wrong here: see `settle_failed_meta_write` /
+/// SDD §7.10). The workspace-wide scan cannot see that regression: both are
+/// the canonical mappers it exists to steer sites onto. So this pins the shape
+/// directly:
 ///
 /// * neither `finish_create` nor `reconcile_in_doubt_create` calls a mapper in
 ///   its own body (exact today — all their classification happens inside
-///   `undo_create_attempt`);
-/// * each `undo_create_attempt` call carries the op of the round trip it
-///   answers for, in source order — one per post-commit round trip. A dropped
+///   `settle_failed_meta_write` and `release_in_doubt_attempt`);
+/// * `finish_create` sends its metadata through one `write_session_meta` call
+///   and answers its failure through one `settle_failed_meta_write` call, and a
+///   write the walk vetoed through one `release_abandoned_attempt` call;
+/// * each `release_in_doubt_attempt` call carries the op of the round trip it
+///   answers for, in source order — one per in-doubt round trip. A dropped
 ///   call or a swapped label fails here, and the label is what reaches the
-///   client's `UNAVAILABLE` message and the undo's WARN line;
+///   client's `UNAVAILABLE` message and the release's WARN line;
 /// * both duplicate-name scans — `create_once`'s under the `WATCH` and the
 ///   in-doubt re-scan in `reconcile_in_doubt_create` — decide a competing
 ///   holder through exactly one `names_a_competing_holder` call each, so the
@@ -2045,44 +2118,23 @@ fn original_b_fd9_functions_remain_free_of_direct_internal_fred_wraps() {
 ///   attempt's member, so an inline `sid != session_id` there would pass every
 ///   one of them; this count is its only guard.
 ///
-/// The behaviour behind each call is driven for real in `b_62m_tests.rs`; this
-/// is the per-site guard that survives a refactor no stall happens to hit.
+/// How each clean-up picks its mapper is pinned by
+/// [`create_session_clean_ups_pick_the_mapper_by_their_verdict`]. The behaviour
+/// behind each call is driven for real in `b_62m_tests.rs`; this is the
+/// per-site guard that survives a refactor no stall happens to hit.
 #[test]
-fn create_session_post_commit_failures_route_through_undo_create_attempt() {
+fn create_session_post_commit_failures_route_through_the_settle_and_the_release() {
     let session_src = SOURCES
         .iter()
         .find(|e| e.file == "src/storage/session.rs")
         .expect("session.rs must be in SOURCES")
         .source;
 
-    let cases: &[(&str, &[&str])] = &[
-        ("async fn finish_create", &["HSET session meta (create)"]),
-        (
-            "async fn reconcile_in_doubt_create",
-            &[
-                "SISMEMBER path names index (in-doubt reconcile)",
-                "SMEMBERS path names index (in-doubt re-scan)",
-            ],
-        ),
-    ];
-
-    for (signature_prefix, want_ops) in cases {
-        let body = extract_function_body(session_src, signature_prefix).unwrap_or_else(|| {
-            panic!(
-                "function `{signature_prefix}` not found in `src/storage/session.rs` — signature \
-                 changed? Update this test."
-            )
-        });
-        // Code only: a comment explaining why a mapper is NOT called here must
-        // not read as a call.
-        let code: Vec<&str> = body
-            .lines()
-            .map(|line| match line.find("//") {
-                Some(pos) => &line[..pos],
-                None => line,
-            })
-            .collect();
-
+    for signature_prefix in [
+        "async fn finish_create",
+        "async fn reconcile_in_doubt_create",
+    ] {
+        let code = code_of(session_src, signature_prefix);
         for mapper in ["map_transient_fred_err(", "map_fred_err_for_grpc("] {
             let calls: Vec<&str> = code
                 .iter()
@@ -2092,19 +2144,45 @@ fn create_session_post_commit_failures_route_through_undo_create_attempt() {
             assert!(
                 calls.is_empty(),
                 "`{signature_prefix}` calls `{mapper}` directly. A round trip after \
-                 `create_once`'s commit was sent must fail through `undo_create_attempt`, \
-                 which removes the attempt's entries before choosing the error (see its \
-                 rustdoc / SDD §7.10). Offending lines: {calls:?}"
+                 `create_once`'s commit was sent must fail through `settle_failed_meta_write` \
+                 or `release_in_doubt_attempt`, which settle or release the attempt before \
+                 choosing the error (see their rustdoc / SDD §7.10). Offending lines: {calls:?}"
             );
         }
+    }
 
+    let finish = code_of(session_src, "async fn finish_create");
+    for (callee, why) in [
+        (
+            "write_session_meta(",
+            "the metadata goes through one `session_meta_write.lua` run",
+        ),
+        (
+            "settle_failed_meta_write(",
+            "a failed metadata write is answered by the settle",
+        ),
+        (
+            "release_abandoned_attempt(",
+            "a write the ListSessions walk vetoed releases the attempt's members",
+        ),
+    ] {
         assert_eq!(
-            undo_call_ops(&code),
-            want_ops.to_vec(),
-            "`{signature_prefix}` must fail each post-commit round trip through its own \
-             `undo_create_attempt` call, labelled with that round trip's op"
+            call_count(&finish, callee),
+            1,
+            "`finish_create` must call `{callee}` exactly once: {why}"
         );
     }
+
+    let in_doubt = code_of(session_src, "async fn reconcile_in_doubt_create");
+    assert_eq!(
+        call_ops(&in_doubt, "release_in_doubt_attempt("),
+        vec![
+            "SISMEMBER path names index (in-doubt reconcile)".to_owned(),
+            "SMEMBERS path names index (in-doubt re-scan)".to_owned(),
+        ],
+        "`reconcile_in_doubt_create` must fail each in-doubt round trip through its own \
+         `release_in_doubt_attempt` call, labelled with that round trip's op"
+    );
 
     for signature_prefix in [
         "async fn create_once(",
@@ -2130,16 +2208,141 @@ fn create_session_post_commit_failures_route_through_undo_create_attempt() {
     }
 }
 
-/// The string literals passed to each `undo_create_attempt(` call in `code`, in
-/// source order. A call's argument list is taken to run from the line naming
-/// the method to the line carrying its `.await`, which is how every call site
-/// in `session.rs` is formatted; a literal-free call contributes nothing, so a
-/// call that lost its label is caught by the count.
-fn undo_call_ops(code: &[&str]) -> Vec<String> {
+/// b.2tu — each CreateSession clean-up picks its mapper by its verdict, and
+/// only the verdicts that make a retry safe answer `Aborted`.
+///
+/// * `settle_failed_meta_write` (SDD §7.10): one `veto_session_meta` call; its
+///   arms in the order `Ok(MetaVeto::Present)` (completes the create, no
+///   mapper), `Ok(MetaVeto::Deleted)` (answers `Ok` with the id: no mapper, no
+///   release, and no `complete_create`, so no checkpoint enqueued),
+///   `Ok(MetaVeto::Vetoed)` (releases the attempt, then
+///   `map_transient_fred_err` — the only arm that can answer `Aborted`), and
+///   the settle's own failure (`map_fred_err_for_grpc`, never `Aborted`). Its
+///   op is the metadata write's, `EVALSHA session_meta_write (create)`.
+/// * `release_in_doubt_attempt`: one `release_index_members` call; a released
+///   attempt answers through `map_transient_fred_err`, a failed release
+///   through `map_fred_err_for_grpc`.
+///
+/// A swapped mapper — a failed settle retried, say — would let a late
+/// metadata write complete an id beside the retry's session: the uniqueness
+/// break b.62m closed and b.2tu keeps closed.
+#[test]
+fn create_session_clean_ups_pick_the_mapper_by_their_verdict() {
+    let session_src = SOURCES
+        .iter()
+        .find(|e| e.file == "src/storage/session.rs")
+        .expect("session.rs must be in SOURCES")
+        .source;
+
+    let settle = code_of(session_src, "async fn settle_failed_meta_write");
+    assert!(
+        settle
+            .iter()
+            .any(|line| line.contains("const OP: &str = \"EVALSHA session_meta_write (create)\";")),
+        "the settle must answer under the metadata write's op label"
+    );
+    assert_eq!(call_count(&settle, "veto_session_meta("), 1, "one settle");
+    let present = line_of(&settle, "Ok(MetaVeto::Present)");
+    let deleted = line_of(&settle, "Ok(MetaVeto::Deleted)");
+    let vetoed = line_of(&settle, "Ok(MetaVeto::Vetoed)");
+    let failed = line_of(&settle, "Err(settle_err)");
+    assert!(
+        present < deleted && deleted < vetoed && vetoed < failed,
+        "the settle's arms must read PRESENT, DELETED, VETOED, then the settle's own failure"
+    );
+    let complete = lines_with(&settle, "complete_create(");
+    assert!(
+        complete.len() == 1 && present < complete[0] && complete[0] < deleted,
+        "only the PRESENT arm completes the create, with the attempt's own id: the DELETED arm \
+         answers the id without enqueuing a checkpoint for a deleted session"
+    );
+    let transient = lines_with(&settle, "map_transient_fred_err(");
+    assert!(
+        transient.len() == 1 && vetoed < transient[0] && transient[0] < failed,
+        "only the VETOED arm may answer through `map_transient_fred_err` (the one mapper that \
+         can answer `Aborted`): the id can no longer complete, so a retry cannot make a second \
+         session with the name"
+    );
+    let release = lines_with(&settle, "release_abandoned_attempt(");
+    assert!(
+        release.len() == 1 && vetoed < release[0] && release[0] < failed,
+        "only the VETOED arm releases the attempt's members"
+    );
+    let for_grpc = lines_with(&settle, "map_fred_err_for_grpc(");
+    assert!(
+        for_grpc.len() == 1 && failed < for_grpc[0],
+        "a failed settle answers through `map_fred_err_for_grpc`, never `Aborted`: the write may \
+         still land"
+    );
+
+    let release_in_doubt = code_of(session_src, "async fn release_in_doubt_attempt");
+    assert_eq!(
+        call_count(&release_in_doubt, "release_index_members("),
+        1,
+        "the in-doubt clean-up releases both members in one script run"
+    );
+    let released = line_of(&release_in_doubt, "Ok(()) =>");
+    let not_released = line_of(&release_in_doubt, "Err(release_error)");
+    let transient = lines_with(&release_in_doubt, "map_transient_fred_err(");
+    assert!(
+        transient.len() == 1 && released <= transient[0] && transient[0] < not_released,
+        "only a released in-doubt attempt may answer through `map_transient_fred_err`"
+    );
+    let for_grpc = lines_with(&release_in_doubt, "map_fred_err_for_grpc(");
+    assert!(
+        for_grpc.len() == 1 && not_released < for_grpc[0],
+        "a failed in-doubt release answers through `map_fred_err_for_grpc`, never `Aborted`"
+    );
+}
+
+/// The code lines (line comments stripped) of the function whose signature
+/// starts with `signature_prefix` in `source`.
+fn code_of<'a>(source: &'a str, signature_prefix: &str) -> Vec<&'a str> {
+    extract_function_body(source, signature_prefix)
+        .unwrap_or_else(|| {
+            panic!(
+                "function `{signature_prefix}` not found in `src/storage/session.rs` — signature \
+                 changed? Update this test."
+            )
+        })
+        .lines()
+        .map(strip_line_comment)
+        .collect()
+}
+
+/// How many times `callee` is called in `code`.
+fn call_count(code: &[&str], callee: &str) -> usize {
+    code.iter().map(|line| line.matches(callee).count()).sum()
+}
+
+/// The indices of the lines of `code` containing `needle`.
+fn lines_with(code: &[&str], needle: &str) -> Vec<usize> {
+    code.iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(needle))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The index of the one line of `code` containing `needle`.
+fn line_of(code: &[&str], needle: &str) -> usize {
+    match lines_with(code, needle).as_slice() {
+        [one] => *one,
+        other => panic!("expected exactly one line with `{needle}`; found {other:?}"),
+    }
+}
+
+/// The string literals passed to each `callee` call in `code` (`callee`
+/// includes its `(`), in source order. A call's argument list is taken to run
+/// from the line naming the method to the line carrying its `.await`, which is
+/// how every call site in `session.rs` is formatted; a literal-free call
+/// contributes nothing, so a call that lost its label is caught by the
+/// comparison.
+fn call_ops(code: &[&str], callee: &str) -> Vec<String> {
     let mut ops = Vec::new();
     let mut idx = 0;
     while idx < code.len() {
-        if code[idx].contains("undo_create_attempt(") {
+        if code[idx].contains(callee) {
             loop {
                 ops.extend(code[idx].split('"').skip(1).step_by(2).map(str::to_owned));
                 if code[idx].contains(".await") || idx + 1 == code.len() {
@@ -2379,8 +2582,11 @@ fn b_62m_no_loop_round_trips_each_route_through_the_grpc_mapper() {
 /// `SREM`s, `list`'s per-session `HGETALL`, `create_layer_with_operation`'s
 /// mapping `GET` / `MGET`, and the handler's operation-record `GET`) are
 /// pinned only here. `finish_create` and `reconcile_in_doubt_create` hand
-/// their failure to `undo_create_attempt`, which counts it. None of these
-/// functions has any other reason to count, so the whole body is checked.
+/// their failure to `settle_failed_meta_write` / `release_in_doubt_attempt`,
+/// which count it. b.2tu's ListSessions round trips — `retire_ghost_member`'s
+/// veto and release, `reconcile_path_index`'s script — route through
+/// `map_fred_err_for_grpc` too. None of these functions has any other reason
+/// to count, so the whole body is checked.
 ///
 /// `create_layer_with_operation`'s commit `EVALSHA` is counted elsewhere: by
 /// `dispatch_create_layer_commit`, which receives every run's error, while
@@ -2402,6 +2608,16 @@ fn b_62m_mapped_functions_leave_timeout_counting_to_the_mapper() {
             "src/storage/session.rs",
             None,
             "async fn reconcile_in_doubt_create(",
+        ),
+        (
+            "src/storage/session.rs",
+            None,
+            "pub async fn retire_ghost_member(",
+        ),
+        (
+            "src/storage/session.rs",
+            None,
+            "pub async fn reconcile_path_index(",
         ),
         (
             "src/storage/layer.rs",
@@ -2439,7 +2655,8 @@ fn b_62m_mapped_functions_leave_timeout_counting_to_the_mapper() {
     }
     assert!(
         problems.is_empty(),
-        "these functions route every fred error through a mapper (or `undo_create_attempt`), \
+        "these functions route every fred error through a mapper (or `settle_failed_meta_write` / \
+         `release_in_doubt_attempt`), \
          which counts the timeout itself; an `observe_error(` beside it counts every timeout \
          twice:\n\n  {}",
         problems.join("\n  ")

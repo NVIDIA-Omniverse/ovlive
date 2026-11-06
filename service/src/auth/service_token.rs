@@ -75,11 +75,12 @@
 //!   and recorded as `live_edit_service_token_refresh_headroom_seconds{role}`.
 //!   An instance constructed with a `prolongation_floor` (the Valkey one, whose
 //!   floor is the rotation fan-out ceiling — twice the maximum re-AUTH tick
-//!   interval its credential consumer schedules, 180 s) additionally WARNs once
-//!   per rotation that lands under it. This is the
-//!   runtime substitute for a startup check that cannot exist: the term the
-//!   deployment recommendation constrains is the *sidecar's* refresh lead, which
-//!   is not a live-edit config value (b.is1).
+//!   interval its credential consumer schedules, one interval of fan-out plus
+//!   one of slack, 180 s) additionally WARNs once per rotation that lands under
+//!   it: a connection the rotation misses may then be dropped at the old
+//!   token's expiry. This is the runtime substitute for a startup check that
+//!   cannot exist: the term the deployment recommendation constrains is the
+//!   *sidecar's* refresh lead, which is not a live-edit config value (b.is1).
 //!
 //! ## Bearer-bytes-never-logged invariant (SR-6.2)
 //!
@@ -167,8 +168,10 @@ const DEFAULT_REFRESH_LEAD: chrono::Duration = chrono::Duration::seconds(60);
 ///   to one `poll_interval` of no usable credential once the cached token has
 ///   actually expired — correct fail-closed behavior, but a needless ~15 s hole
 ///   in outbound auth and in Valkey `AUTH` refresh. Re-reading at this cadence
-///   over exactly the window
-///   SDD §15.4's invariant covers shrinks that to ~250 ms. Bounded by the
+///   from the steady tick that first finds the token within
+///   `refresh_lead + poll_interval` of expiry shrinks that to ~250 ms, and
+///   picks up a rotation the sidecar writes after that tick within ~250 ms
+///   too. Bounded by the
 ///   cached token's own expiry, plus [`STARTUP_FAST_POLL_WINDOW`] past it
 ///   (b.d6b: recovery from a token that *has* expired is the most urgent case,
 ///   not the least) — see [`StalePhase`].
@@ -224,9 +227,19 @@ const STARTUP_FAST_POLL_WINDOW: Duration = Duration::from_secs(20);
 ///   steady tick *before* the lead window opens; without it, entry and the next
 ///   steady read coincide whenever the sidecar's refresh lead falls between
 ///   `refresh_lead` and `refresh_lead + poll_interval`, and the phase is a
-///   no-op on exactly the deployments that need it. The sum is SDD §15.4's
-///   left-hand side, so the phase is active over precisely the window that
-///   invariant says the sidecar lead must dominate.
+///   no-op on exactly the deployments that need it. The predicate is checked
+///   only at loop heads, which in `Idle` run at steady ticks (and after a
+///   `force_refresh()`, which no Valkey consumer calls), so the phase arms at
+///   the first steady tick inside the sum — more than `refresh_lead` before
+///   expiry. Fast (~250 ms) pickup is therefore guaranteed only for a
+///   sidecar lead at or under `refresh_lead`. A longer lead is picked up
+///   within one `poll_interval` of the write, or about 250 ms after it once
+///   the phase is armed: a write before the arming tick is picked up no later
+///   than that tick, more than `refresh_lead` before expiry, and one after it
+///   about 250 ms later. So the realized headroom is at least the smaller of
+///   `refresh_lead` and the sidecar lead less ~250 ms. That is why the
+///   service-side lever on the Valkey instance's headroom is `refresh_lead` at
+///   or above its prolongation floor — the default (SDD §15.4).
 /// - **`refresh_lead` is per-instance** (the [`run_polling_task`] parameter,
 ///   chosen by the constructor the wiring layer picked), never the
 ///   [`DEFAULT_REFRESH_LEAD`] constant: the Valkey credential instance runs a ≥ 3 min
@@ -1242,18 +1255,23 @@ async fn read_and_update(inner: &Inner, caller: ReadCaller<'_>) -> Result<(), Se
 /// instance, or `None` when the instance has no such recommendation (b.is1).
 ///
 /// Headroom is measured per observed rotation as `old_expiry − pickup_instant`
-/// (see the loop head below). When it falls below this floor, one WARN naming
-/// the two operator levers is emitted. When it is `None` the headroom is still
-/// recorded as a gauge; only the WARN is suppressed.
+/// (see the loop head below). When it falls below this floor, one WARN is
+/// emitted naming the sidecar lead, this instance's `refresh_lead` and the
+/// poll interval that together set the headroom. When it is `None` the headroom
+/// is still recorded as a gauge; only the WARN is suppressed.
 ///
 /// **Set by the wiring layer, not derived here.** The floor is a property of
 /// what consumes the credential, and `auth` must not gain a dependency edge on
 /// `storage` to learn it: the Valkey instance's floor is the rotation fan-out
-/// ceiling (`VALKEY_TOKEN_ROTATION_FANOUT_CEILING`), passed in from `main.rs`,
-/// because a re-AUTH firing later than the headroom cannot carry the fresh
-/// credential onto a live connection. The storage-api instance passes
-/// `None`: its consumer re-reads on an upstream 401 and holds no long-lived
-/// credentialed connection, so there is no band to stay ahead of.
+/// ceiling (`VALKEY_TOKEN_ROTATION_FANOUT_CEILING`, 180 s), passed in from
+/// `main.rs`. That is one re-AUTH tick interval in which every client ticks
+/// after the pickup, plus one of slack that covers a busy stream reader's
+/// `AUTH` landing after its tick (and a reader's tick running late by the
+/// inline step it is waiting out); a re-AUTH landing after the outgoing token
+/// expires cannot carry the fresh credential onto a live connection. The
+/// storage-api instance passes `None`: its consumer re-reads on an upstream 401
+/// and holds no long-lived credentialed connection, so there is no band to stay
+/// ahead of.
 ///
 /// Both are task parameters rather than [`Inner`] fields for the same reason
 /// `role` is (see [`ServiceTokenProvider::spawn`]): their only readers are
@@ -1314,7 +1332,7 @@ async fn run_polling_task(
     let mut fast_poll_active = true;
 
     // Entry lead for the stale-token phase (see `StalePhase`):
-    // `refresh_lead + poll_interval`, i.e. SDD §15.4's left-hand sum. The
+    // `refresh_lead + poll_interval` (SDD §15.4's pickup regimes). The
     // per-instance lead is used, never the `DEFAULT_REFRESH_LEAD` constant. A
     // `poll_interval` beyond chrono's representable range is not reachable
     // from `Config` (u64 seconds parsed into a `Duration`, but the process
@@ -1466,20 +1484,33 @@ async fn run_polling_task(
                             // only where it is the right one and stay generic
                             // otherwise rather than sending an operator to a
                             // variable that does not drive this instance.
-                            let lead_lever = if role == ServiceTokenProvider::ROLE_VALKEY {
-                                "LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS"
-                            } else {
-                                "this instance's refresh lead"
-                            };
-                            // The target is stated as the value already in this
-                            // line, not as "the sidecar's lead minus one poll
-                            // interval": the operator cannot read the sidecar's
-                            // lead from anywhere, whereas
-                            // `observed_headroom_secs >= sidecar_lead − poll`
-                            // always holds (pickup lags the sidecar's write by
-                            // at most one steady poll), so the printed value is
-                            // a self-sufficient — and never over-stated —
-                            // stand-in for that target.
+                            // "As it is by default" holds for the Valkey
+                            // instance only: its default lead (180 s) equals
+                            // its floor.
+                            let (lead_lever, default_note) =
+                                if role == ServiceTokenProvider::ROLE_VALKEY {
+                                    (
+                                        "LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS",
+                                        ", as it is by default,",
+                                    )
+                                } else {
+                                    ("this instance's refresh lead", "")
+                                };
+                            // Both targets clear the floor whatever the pickup
+                            // regime (see `StalePhase`). Pickup lags the
+                            // sidecar's write by at most one steady poll, so a
+                            // sidecar lead of the floor plus `poll_interval`
+                            // always clears it. And while `refresh_lead` is at
+                            // or above the floor, the stale-token phase arms
+                            // more than `refresh_lead` before expiry, so the
+                            // headroom is at least the smaller of `refresh_lead`
+                            // and the sidecar lead less ~250 ms; one second over
+                            // the floor covers those 250 ms and the exact
+                            // `headroom < floor` comparison above.
+                            // `observed_headroom_secs` is a reading, never a
+                            // target: at the Valkey defaults `refresh_lead`
+                            // already exceeds every reading that warns, so
+                            // raising it to one changes nothing.
                             tracing::warn!(
                                 role,
                                 path = %inner.path.display(),
@@ -1488,14 +1519,18 @@ async fn run_polling_task(
                                 refresh_lead_secs = refresh_lead.num_seconds(),
                                 "replacement service token was picked up with less headroom \
                                  before the previous token's expiry than the periodic re-AUTH \
-                                 interval needs to prolong a live connection across the \
-                                 rotation; connections AUTHed with the old token will be \
-                                 dropped at its expiry and immediately re-established. Either \
-                                 raise the sidecar's own refresh lead, or raise {} to at least \
-                                 the observed_headroom_secs value in this line so pickup rides \
-                                 the fast-poll phase and the poll term drops out (token \
-                                 bytes are never logged)",
-                                lead_lever
+                                 interval needs to be sure of prolonging every live connection \
+                                 across the rotation; connections AUTHed with the old token may \
+                                 be dropped at its expiry and immediately re-established. Raise \
+                                 the sidecar's own refresh lead to at least \
+                                 recommended_floor_secs plus \
+                                 LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS; or keep {} \
+                                 (refresh_lead_secs in this line) at or above \
+                                 recommended_floor_secs{} and give the sidecar a refresh lead \
+                                 at least one second over recommended_floor_secs (token bytes \
+                                 are never logged)",
+                                lead_lever,
+                                default_note
                             );
                         }
                     }
@@ -1679,24 +1714,22 @@ async fn run_polling_task(
                     // rotation can tell "the replacement was late enough that we
                     // went hunting for it" from "the rotation was picked up on an
                     // ordinary tick". Entry alone is NOT a misconfiguration
-                    // signal, even though post-b.7td the two thresholds now
-                    // coincide. Entry fires whenever the sidecar's lead is under
-                    // `refresh_lead + poll_interval` — 195 s at defaults — and
-                    // the operator-facing sidecar-lead recommendation is now
-                    // that same 195 s, because b.7td's rotation gate cut the
-                    // prolongation floor to `VALKEY_TOKEN_ROTATION_FANOUT_CEILING`
-                    // (180 s) plus one token-file poll. (Pre-b.7td the
-                    // recommendation was ~375 s and entry sat well inside it.)
-                    // The coincidence is a defaults-only artifact — it breaks as
-                    // soon as `LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS` or
-                    // `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` moves — and
-                    // the two still measure different things: this line fires on
-                    // the *observation* that no replacement had landed yet, on
-                    // every rotation at or under the sum, whether or not the
-                    // replacement then arrived with plenty of headroom. The
-                    // prolongation signal remains the per-rotation headroom WARN
-                    // at the loop head (b.is1), which measures the realized
-                    // headroom against the floor.
+                    // signal. It fires when no replacement has landed by the
+                    // first steady tick inside `refresh_lead + poll_interval`:
+                    // always for a sidecar lead at or under `refresh_lead`, and
+                    // for a longer lead up to the sum depending on where that
+                    // tick falls. At the defaults the sum is 195 s, the same as
+                    // SDD §15.4's minimum sidecar lead (the prolongation floor,
+                    // `VALKEY_TOKEN_ROTATION_FANOUT_CEILING`, 180 s, plus one
+                    // token-file poll) — a defaults-only coincidence that
+                    // breaks as soon as `LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS`
+                    // or `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` moves. The
+                    // two measure different things: this line reports the
+                    // *observation* that no replacement had landed yet, whether
+                    // or not the replacement then arrived with plenty of
+                    // headroom. The prolongation signal remains the per-rotation
+                    // headroom WARN at the loop head (b.is1), which measures the
+                    // realized headroom against the floor.
                     //
                     // SR-6.2: derived durations only, never the `expires_on`
                     // timestamp.
@@ -1899,7 +1932,7 @@ mod tests {
     //!   after the outgoing token had already died records a negative headroom;
     //! - the WARN is gated on the instance carrying a prolongation floor, fires
     //!   once per rotation rather than once per loop head, names the floor and
-    //!   the operator lever, and carries no token bytes; an instance built
+    //!   the operator levers, and carries no token bytes; an instance built
     //!   without a floor (`new_with_role`, the storage-api shape) records the
     //!   gauge under its own role label and never warns;
     //! - neither a first token load nor a failed parse is a rotation — both
@@ -1910,11 +1943,13 @@ mod tests {
     //!   Every other test here sees at most one rotation, so this is the only
     //!   one an implementation that latches after the first — the steady state
     //!   of any pod that outlives one token lifetime — cannot pass;
-    //! - and the WARN's operator lever is keyed on the role: it names
-    //!   `LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS` only on the instance that
-    //!   variable actually drives, and stays generic on any other. Production
-    //!   wires no non-Valkey instance with a floor today, which is precisely why
-    //!   that branch needs a test — nothing else reaches it.
+    //! - and the WARN's refresh-lead lever is keyed on the role: it names
+    //!   `LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS` (and that it is at the floor
+    //!   by default) only on the instance that variable actually drives, and
+    //!   stays generic on any other, while every role's line names
+    //!   `LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS` in the sidecar target.
+    //!   Production wires no non-Valkey instance with a floor today, which is
+    //!   precisely why that branch needs a test — nothing else reaches it.
     //!
     //! Unrepresentable refresh leads (b.is1), under `── Unrepresentable refresh
     //! leads`: the provider's one surviving `Utc::now() + lead` site — the
@@ -5235,8 +5270,8 @@ mod tests {
     // `live_edit_service_token_refresh_headroom_seconds{role}`, and WARNs once
     // when that headroom lands under the instance's prolongation floor. The
     // floor is per-instance and optional: the Valkey instance carries the
-    // maximum re-AUTH interval its credential consumer schedules, the
-    // storage-api instance carries `None`.
+    // rotation fan-out ceiling (twice the maximum re-AUTH interval its
+    // credential consumer schedules), the storage-api instance carries `None`.
     //
     // Every test here asserts the gauge **value** in a bounded range, not just
     // its presence, and every fixture pairs an outgoing token with a
@@ -5257,18 +5292,19 @@ mod tests {
     /// read from its single definition site rather than restated.
     ///
     /// [`crate::storage::client::VALKEY_TOKEN_ROTATION_FANOUT_CEILING`] is the
-    /// worst-case latency from a rotation being cached to every pooled
-    /// connection having re-AUTHed with it, and is exactly what `main.rs`
-    /// passes to the Redis-scoped instance. Sourcing it here means a change to
+    /// headroom a rotation needs to reach every live connection before the
+    /// outgoing token expires, and is exactly what `main.rs` passes to the
+    /// Redis-scoped instance. Sourcing it here means a change to
     /// the shipped ceiling moves these fixtures with it; a literal would leave
     /// them asserting a band production had stopped using, which is the failure
     /// mode where the tests stay green and the WARN threshold is wrong.
     ///
     /// It is deliberately **not** `VALKEY_TOKEN_REAUTH_MAX_INTERVAL`: b.7td
-    /// split the two apart, since under the rotation gate a tick only sends an
-    /// `AUTH` when the gate opens, so the fan-out takes two tick intervals, not
-    /// one. Reading the tick ceiling here would put the fixtures a factor of two
-    /// below the threshold production actually WARNs at.
+    /// split the two apart, and the floor is two tick intervals — one interval
+    /// of fan-out plus one of slack, which a busy stream reader spends landing
+    /// its `AUTH` after its tick. Reading the tick ceiling here would put the
+    /// fixtures a factor of two below the threshold production actually WARNs
+    /// at.
     ///
     /// This is a `#[cfg(test)]` module of the *same crate*, so the `use` is not
     /// the dependency edge the design avoids: what `auth` must not do is read
@@ -5382,13 +5418,10 @@ mod tests {
             "the WARN must name the floor the observed headroom fell short of, otherwise the \
              operator cannot tell how far short: {output}"
         );
-        // The other half of "how far short", and the number the message's own
-        // remediation sentence points the operator at ("raise … to at least the
-        // observed_headroom_secs value in this line") — so the line is unusable
-        // without it. Pinned against `secs`, the value the gauge took, rather
-        // than against a range: both come from the one `headroom` computed at
-        // the observation site, so any divergence means the WARN and the metric
-        // have started reporting different rotations.
+        // The other half of "how far short". Pinned against `secs`, the value
+        // the gauge took, rather than against a range: both come from the one
+        // `headroom` computed at the observation site, so any divergence means
+        // the WARN and the metric have started reporting different rotations.
         assert!(
             output.contains(&format!("observed_headroom_secs={}", secs as i64)),
             "the WARN must report the headroom it actually observed, and it must be the same \
@@ -5402,11 +5435,27 @@ mod tests {
             "the WARN must carry the role label so the line names which provider rotated late: \
              {output}"
         );
+        // The two live-edit settings that, with the sidecar's own lead (not a
+        // live-edit config value), set the headroom: the poll interval bounds
+        // pickup lag for a sidecar lead over `refresh_lead`, so the sidecar
+        // target is the floor plus it; `refresh_lead` at or above the floor is
+        // the service-side lever, and on the Valkey instance it is there by
+        // default.
         assert!(
             output.contains("LIVE_EDIT_VALKEY_TOKEN_REFRESH_LEAD_SECS"),
-            "the WARN must name the operator lever on this side of the deployment — the sidecar's \
-             own lead is not a live-edit config value, so this is the only knob the message can \
-             point at concretely: {output}"
+            "the WARN must name the Valkey instance's refresh-lead variable, the service-side \
+             lever on this side of the deployment: {output}"
+        );
+        assert!(
+            output.contains("LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS"),
+            "the WARN must name the token-file poll interval: the sidecar's refresh lead must \
+             clear the floor plus that interval, so a target without it under-states what the \
+             sidecar needs: {output}"
+        );
+        assert!(
+            output.contains(", as it is by default,"),
+            "on the Valkey instance the WARN must say the refresh lead is at the floor by \
+             default (its 180 s default equals the floor): {output}"
         );
         // SR-6.2 for the new log line: neither the retired token nor the one
         // that replaced it may appear in the output that reports the rotation.
@@ -5820,6 +5869,16 @@ mod tests {
             output.contains("this instance's refresh lead"),
             "…and must still name the lever generically, so the operator knows there are two \
              terms to raise rather than only the sidecar's: {output}"
+        );
+        assert!(
+            !output.contains("as it is by default"),
+            "only the Valkey instance's default lead equals its floor; a non-Valkey WARN must not \
+             tell the operator its lead is already at the floor by default: {output}"
+        );
+        assert!(
+            output.contains("LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS"),
+            "the poll interval is shared by every instance, so every role's WARN names it in the \
+             sidecar target: {output}"
         );
 
         cancel.cancel();

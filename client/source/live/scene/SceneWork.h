@@ -19,4 +19,12 @@ inline uint64_t total() noexcept { return counted; }
 inline thread_local uint64_t compared = 0;
 inline void compare() noexcept { ++compared; }
 inline uint64_t comparisons() noexcept { return compared; }
+// The atomic read-modify-write updates of the owner pins and reentry-depth
+// guards that host storage and its projection have taken on the calling
+// thread: each counts its increment and its decrement when it is taken, and a
+// compare-exchange that retries under contention counts once. Reference
+// counts of values a read copies out are not counted.
+inline thread_local uint64_t synchronized = 0;
+inline void synchronize(size_t updates) noexcept { synchronized += updates; }
+inline uint64_t atomics() noexcept { return synchronized; }
 } // namespace omni::usd::live::sceneWork

@@ -388,6 +388,28 @@ void emptyPositions()
     assert(later.snapshot().result == OMNI_USD_LIVE_OK && later.snapshot().covered == 13 && later.snapshot().applied == 11);
 }
 
+// A service that commits a later write of the window after definitively rejecting an earlier one violates commit
+// order (design section 13). Applying the later write stops the layer MALFORMED_STREAM with nothing retired.
+void rejectedWriteBeforeLaterCommit()
+{
+    LayerProgress state(key(), 10, value(), 8, 100);
+    open(state, 10);
+    const auto a = state.admit(value(1)), b = state.admit(value(2)), c = state.admit(value(3));
+    assert(state.takeWrite(8).id == a && state.takeWrite(8).id == b && state.takeWrite(8).id == c);
+    state.completeWrite(a, OMNI_USD_LIVE_OK, 11);
+    state.completeWrite(b, OMNI_USD_LIVE_INVALID_ARGUMENT);
+    state.completeWrite(c, OMNI_USD_LIVE_OK, 12);
+    state.applied(a);
+    const auto before = state.snapshot();
+    assert(before.applied == 11 && before.localRetired == 1);
+    error(OMNI_USD_LIVE_MALFORMED_STREAM, [&] { state.applied(c); });
+    // The rejection stays the first cause; the violation closes the read that continued after it.
+    const auto after = state.snapshot();
+    assert(after.gate == Gate::Failed && after.result == OMNI_USD_LIVE_INVALID_ARGUMENT);
+    assert(!after.readingAfterFailure && !after.readStarted);
+    assert(after.applied == 11 && after.localRetired == 1 && after.retained == before.retained);
+}
+
 // The ordered run of unapplied work starts at the applied frontier and follows each work across the empty
 // commits after it; it stops at the first position no work holds and at the requested count.
 void applicableRun()
@@ -2492,6 +2514,7 @@ void testLayerProgress()
     malformedAndBounds();
     emptyPositions();
     applicableRun();
+    rejectedWriteBeforeLaterCommit();
     snapshotBootstrap();
     acknowledgementOrder();
     concurrentAdmissionAndReentrantRetirement();

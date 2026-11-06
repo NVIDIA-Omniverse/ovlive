@@ -51,7 +51,18 @@
 //!   marks ([`spawn_ext_mirror_workers`]) records the copy on the value's meta
 //!   (`backed_up_in`, `storage::ext_backup`), guarded by the store stamp the
 //!   item carries: a store of the same hash since the copy was made declines
-//!   it. A confirmation that fails is counted and ignored. When a put returns
+//!   it, and so does a delete of the backup copy by the checkpoint collect at
+//!   or after that stamp (b.g65). A confirmation that fails is counted and
+//!   ignored.
+//! - **The clean-up fence (b.g65).** With the marks, a worker runs the
+//!   checkpoint clean-up's writer re-arm for the hash immediately before each
+//!   `put_ext_blob` (`ExtBackupMarks::collect_fenced`): when the collect
+//!   deleted the hash's backup copy within the item's reliance window (since
+//!   its store stamp, plus the upload limit), the put would resurrect a
+//!   collected copy, so it is skipped and counted
+//!   `checkpoint_ext_mirror_dropped_total{reason="collect_fenced"}`. A fence
+//!   error does not stop the put; it ticks
+//!   `checkpoint_ext_mirror_errors_total`. When a put returns
 //!   `Err`, the worker logs a WARN with the classified-error kind and the
 //!   first 16 hex chars of the hash (never the blob bytes), ticks
 //!   `checkpoint_ext_mirror_errors_total`, and **continues** — no retry, no
@@ -79,6 +90,7 @@
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -86,14 +98,16 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::checkpoint::store::{CheckpointError, CheckpointStore};
+use crate::checkpoint::ext_backup_repair::EXT_BACKUP_MIN_AGE;
+use crate::checkpoint::store::{reconcile_grace, CheckpointError, CheckpointStore};
 use crate::config::PodMemoryPlan;
 use crate::observability::metrics::{
-    SharedMetrics, EXT_MIRROR_DROP_BUDGET_FULL, EXT_MIRROR_DROP_OVERSIZED,
-    EXT_MIRROR_DROP_QUEUE_FULL, EXT_MIRROR_DROP_SHUTDOWN, EXT_MIRROR_STATE_IN_FLIGHT,
-    EXT_MIRROR_STATE_QUEUED,
+    SharedMetrics, EXT_MIRROR_DROP_BUDGET_FULL, EXT_MIRROR_DROP_COLLECT_FENCED,
+    EXT_MIRROR_DROP_OVERSIZED, EXT_MIRROR_DROP_QUEUE_FULL, EXT_MIRROR_DROP_SHUTDOWN,
+    EXT_MIRROR_STATE_IN_FLIGHT, EXT_MIRROR_STATE_QUEUED,
 };
 use crate::storage::ext_backup::ExtBackupMarks;
+use crate::storage::recon_fence::RECON_FENCE_HORIZON;
 
 /// Maximum number of queued items each worker will drain after the cancel
 /// signal fires before returning.
@@ -110,9 +124,11 @@ use crate::storage::ext_backup::ExtBackupMarks;
 /// has a worst case measured in hours, and no item count would fix that: at a
 /// 180 s per-item ceiling even `DRAIN_BUDGET = 2` overshoots a 5 s budget.
 ///
-/// The drain is bounded, but not by this number. `main.rs` joins each worker
-/// handle under a `tokio::time::timeout` of `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`,
-/// inside a shutdown sequence itself wrapped in one
+/// The drain is bounded, but not by this number. The post-server shutdown
+/// sequence (`grpc::transport::run_post_server_sequence`) joins every worker
+/// handle, concurrently with the other background tasks, under a
+/// `tokio::time::timeout` of `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS` (less when the
+/// sequence's shared deadline before Valkey `quit()` is nearer), inside one
 /// `LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS` timeout, so a worker still waiting
 /// on a slow adapter is abandoned there rather than held to. Read this
 /// constant for what it actually is: a cap on how much *queued* work a worker
@@ -502,7 +518,8 @@ impl ExtMirrorSender {
              is stored, but the backup store has no copy of it until the backup repair re-sends \
              it (for oversized, only after LIVE_EDIT_MAX_LAYER_SIZE is raised to at least its \
              bytes_len, or resources.limits.memory is raised until budget_bytes exceeds it), so a \
-             restore after the main store loses it before then cannot bring it back"
+             restore after the main store loses it before then cannot bring it back; the restore \
+             Job's coverage check names the layer and attribute that reference such a value"
         );
     }
 }
@@ -552,7 +569,8 @@ impl Drop for ExtMirrorReceiver {
                 bytes,
                 "checkpoint ext-mirror discarded external values still waiting for their backup \
                  copy at shutdown; they are stored, but the backup store has no copy of them until \
-                 the backup repair re-sends them"
+                 the backup repair re-sends them; the restore Job's coverage check names the layer \
+                 and attribute that reference such a value"
             );
         }
     }
@@ -708,13 +726,66 @@ async fn process_item(
     // The copy's owner holds the charge for as long as `bytes` live; this
     // handle on the slot is not needed past here.
     drop(slot);
-    // No clean-up fence here yet: this PUT can land after the checkpoint
-    // collect deleted the hash's copy, leaving an orphaned blob (a leak, never
-    // a loss). b.g65's fence lands after this change and adds its check here.
+    // The item's reliance start: the store stamp it was sent with, in Valkey
+    // ms. An unparseable stamp is treated as the earliest start, which only
+    // makes the fence and the confirmation stricter.
+    let reliance_start_ms = last_store_ms.parse::<u64>().ok();
+    // The clean-up fence (b.g65), immediately before the PUT, when Valkey is
+    // reachable (`marks`): the re-arm records that this hash is referenced
+    // again, so a collect that commits afterwards refuses to delete it, and
+    // answers whether the collect deleted the copy within the item's reliance
+    // window — since the item's store stamp, plus the upload limit (the age
+    // gate the backup repair leaves to the mirror,
+    // `max(publish_worst_case, 60 s)`). Then the PUT would resurrect a
+    // collected copy: it is skipped and counted
+    // `dropped{reason="collect_fenced"}`, and the backup repair re-sends a
+    // value Valkey still holds once the window has passed. A fence error does
+    // not stop the PUT (the copy is the item's whole purpose); it is counted
+    // as a mirror error. The time since the stamp is read off this process's
+    // wall clock, so cluster clock skew shifts the window by that skew (the
+    // deployment's time-synchronisation requirement bounds it). A LocalDisk
+    // write that lands after its caller stopped waiting (at shutdown) lands
+    // outside the window: an orphaned copy, a leak and never a loss.
+    if let Some(marks) = marks {
+        let since_stamp = reliance_start_ms
+            .map(|start| {
+                Duration::from_millis(crate::checkpoint::now_unix_ms().saturating_sub(start))
+            })
+            .unwrap_or(RECON_FENCE_HORIZON);
+        let lookback = since_stamp + store.publish_worst_case().max(EXT_BACKUP_MIN_AGE);
+        let grace = reconcile_grace(store.publish_worst_case());
+        match marks.collect_fenced(&hash_hex, lookback, grace).await {
+            Ok(true) => {
+                metrics.add_checkpoint_ext_mirror_dropped(EXT_MIRROR_DROP_COLLECT_FENCED, 1);
+                let prefix_end = hash_hex.len().min(16);
+                tracing::debug!(
+                    hash_prefix = &hash_hex[..prefix_end],
+                    "checkpoint ext-mirror did not upload a value whose backup copy the \
+                     checkpoint clean-up deleted within the upload's reliance window; the backup \
+                     repair re-sends it if the store still holds it"
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                metrics.inc_checkpoint_ext_mirror_error();
+                let prefix_end = hash_hex.len().min(16);
+                tracing::warn!(
+                    reason = "fence_error",
+                    hash_prefix = &hash_hex[..prefix_end],
+                    error = %e,
+                    "checkpoint ext-mirror could not check the checkpoint clean-up's record before \
+                     an upload; uploading anyway"
+                );
+            }
+        }
+    }
     match store.put_ext_blob(&hash_hex, bytes).await {
         Ok(()) => {
             if let Some(marks) = marks {
-                marks.confirm(&hash_hex, &last_store_ms).await;
+                marks
+                    .confirm(&hash_hex, &last_store_ms, reliance_start_ms.unwrap_or(0))
+                    .await;
             }
         }
         Err(err) => {
@@ -727,7 +798,9 @@ async fn process_item(
                 error = %err,
                 "checkpoint ext-mirror put_ext_blob failed and is not retried; the value is \
                  stored, but the backup store has no copy of it until the backup repair re-sends \
-                 it, so a restore after the main store loses it before then cannot bring it back"
+                 it, so a restore after the main store loses it before then cannot bring it back; \
+                 the restore Job's coverage check names the layer and attribute that reference \
+                 such a value"
             );
         }
     }
@@ -1347,8 +1420,10 @@ mod tests {
     ///   `put_ext_blob` with the same error-handling posture as
     ///   steady-state — successful drains leave the metrics surface
     ///   silent.
-    /// - Workers return cleanly inside a tight timeout budget so the
-    ///   service-level shutdown stays inside `LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS`.
+    /// - Against a store that answers at once, as a healthy adapter does,
+    ///   the workers drain and return well inside a tight timeout. That is
+    ///   the case the drain is sized for; on a slow adapter nothing here
+    ///   bounds it, and the shutdown join's budget does ([`DRAIN_BUDGET`]).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn worker_drains_queued_items_after_cancel_then_returns() {
         let store = RecordingStore::new();
@@ -1406,8 +1481,8 @@ mod tests {
             timeout(Duration::from_secs(5), h)
                 .await
                 .expect(
-                    "worker join must complete inside 5s — the drain budget \
-                     must keep shutdown inside LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS",
+                    "worker join must complete inside 5s — against a store that \
+                     answers at once, the drain of DRAIN_BUDGET items is prompt",
                 )
                 .expect("worker must not panic during drain");
         }

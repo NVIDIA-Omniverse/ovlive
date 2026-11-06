@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["macros", "net", "rt", "signal", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 
@@ -54,6 +54,6 @@ tracing = "0.1"
 # file the API-client tests rotate, and `tracing-subscriber` captures the
 # scaler's WARN lines in the poll-loop tests.
 tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1.53.3", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["json"] }
 wiremock = "0.6"

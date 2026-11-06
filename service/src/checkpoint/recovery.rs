@@ -186,15 +186,15 @@
 //! `SemaphoreMapGuard` pattern in `src/storage/layer.rs` (b.xet).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use fred::interfaces::KeysInterface;
-use fred::types::scripts::Script;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::apply::{
     apply_restore, is_over_entry_limit_base, live_mapping_resolves_blob_identity,
@@ -225,33 +225,17 @@ use crate::storage::client::{map_snapshot_load_err, FredErrOrigin, POOL_LABEL_DA
 use crate::storage::external_values::ExternalValueStore;
 use crate::storage::layer::LayerStore;
 use crate::storage::retry::{retry_aborted_with_jitter, RetryConfig};
+use crate::storage::stream_high_water::{
+    classify, key_type_once, probe_once, ProbeReading, StreamKeyType, MAX_PLAUSIBLE_HIGH_WATER_GAP,
+};
 
-/// Compiled Lua script backing
-/// [`RecoveryHook::probe_stream_high_water`] (b.8y5).
-///
-/// Projects `XINFO STREAM ... FULL COUNT 1`'s `last-generated-id`
-/// server-side, returning that ID string alone (or `nil` for a missing or
-/// wrong-type key), so the probe's reply is O(1) in layer size rather than
-/// carrying a full stream entry. The plausibility gate that interprets the
-/// ID lives on the Rust side — see the script's own header, and the
-/// "Why `XINFO STREAM`, and why server-side" section on the probe, for the
-/// cost argument and the server-side-work caveat.
-///
-/// The script lives alongside its siblings in `src/storage/scripts/` (repo
-/// convention: that directory is the home for every Lua script, regardless
-/// of which module owns the call site), while the `Script` handle is
-/// declared here next to its only caller — mirroring how
-/// `src/storage/lua.rs` and `src/storage/external_values.rs` each declare
-/// the handles they use.
-///
-/// `Script::from_lua` is infallible — it just hashes the source. The first
-/// `evalsha_with_reload` call sends `SCRIPT LOAD` on `NOSCRIPT` before
-/// retrying.
-static STREAM_HIGH_WATER_PROBE_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
-    Script::from_lua(include_str!(
-        "../storage/scripts/stream_high_water_probe.lua"
-    ))
-});
+// The stream high-water probe's pieces — the `stream_high_water_probe.lua`
+// handle (b.8y5), its `EVALSHA` and `TYPE` round-trips, the id parser and
+// the plausibility gate — live in `storage::stream_high_water`, shared with
+// the restore Job. This hook keeps its seams, its retry wrappers, its
+// adjudication and its verified stale-stream `UNLINK`; see
+// [`RecoveryHook::probe_stream_high_water`] for the cost argument ("Why
+// `XINFO STREAM`, and why server-side") and the arm table.
 
 /// Outcome of a single [`RecoveryHook::try_restore_layer`] attempt.
 ///
@@ -387,13 +371,20 @@ fn refuse_over_limit_base_on_access(object_id: u64, head_seq: u64) -> Checkpoint
 ///
 /// # Why this is one function and not two copies
 ///
-/// There are exactly two producers of a composed-lineage meta and they must not
-/// drift:
+/// There are exactly three producers of a composed-lineage meta and they must
+/// not drift:
 ///
 /// - [`RecoveryHook::select_restore_source`], which stamps the restored
 ///   `obj:hdr`;
 /// - [`crate::checkpoint::rebase::rebase_layer_lineage`] (SR-4.1), which stamps
-///   the **new base** it PUTs at the collapsed head.
+///   the **new base** it PUTs at the collapsed head;
+/// - the DR restore Job's planner (`dr::job::plan::lineage`), which records
+///   it as the planned lineage's restore meta, derived exactly as the
+///   recovery hook derives it (the head tail's envelope span and write time).
+///
+/// The planner is a third caller in a module the on-access recovery path
+/// does not own: when that path is removed, this function moves with the
+/// planner rather than going with it.
 ///
 /// The rule they share is the load-bearing one, and it is a MUST:
 /// **identity is base-sourced.** `session_id` / `layer_name` / `created_by` /
@@ -504,6 +495,11 @@ pub struct RecoveryHook {
     /// `test-fault-injection` seam on `LayerStore`).
     #[cfg(any(test, feature = "test-checkpoint-fault-injection"))]
     force_post_restore_notfound_for_test: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The hold write fence (`checkpoint::hold_fence`), cancelled at a
+    /// disaster-recovery hold's entry and at a stale hold verdict's; `None` unless
+    /// [`Self::with_hold_fence`] set it. Read only through
+    /// [`Self::hold_fence`].
+    hold_fence: Option<CancellationToken>,
 }
 
 /// A single per-`object_id` admission entry: the K=1 mutex itself plus a
@@ -608,7 +604,64 @@ impl RecoveryHook {
             restore_fault_injector: None,
             #[cfg(any(test, feature = "test-checkpoint-fault-injection"))]
             force_post_restore_notfound_for_test: None,
+            hold_fence: None,
         }
+    }
+
+    /// Set the hold write fence (SDD SR-6.2): `main.rs` passes the token the
+    /// hold and stale-verdict entry routines cancel. Once it is cancelled a restore sends no new
+    /// store write: its restore-source selection (a pure read) is raced
+    /// against the token, and the token is checked again before the
+    /// high-water probe, immediately before each `UNLINK` attempt of a stale
+    /// stream, and inside the apply (`checkpoint::apply::apply_restore`)
+    /// immediately before the residue wipe's `EXEC`, before each external-value
+    /// pre-store chunk and each value's script, immediately before the
+    /// materialisation's `EXEC` and, once that commits, before each attempt of
+    /// its release enqueue and immediately before the enqueue's script (a
+    /// closed fence skips the enqueue, leaking the releases' references,
+    /// counted on `ext_ref_release_enqueue_failed_total`). Every re-send is
+    /// checked the same way: each `UNLINK` retry, the enqueue's retry, and a
+    /// `NOSCRIPT` reload's `SCRIPT LOAD` and re-sent `EVALSHA` of a pre-store
+    /// value or the enqueue. The token does not stop a write already handed
+    /// to fred when it is cancelled — one `UNLINK`, a pre-store value's
+    /// `EVALSHA`, the enqueue's script, or a residue wipe's or
+    /// materialisation's `MULTI … EXEC`: fred writes it only while its caller
+    /// still waits, so within the Valkey command timeout
+    /// (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`, assumed > 0) or never, and
+    /// discards a cut `MULTI`. A frame fred had already written is not
+    /// recalled, a residual (`checkpoint::hold_fence`; SDD §15.3 *Vendored
+    /// fred* change 9). A refused restore ends
+    /// [`RecoveryOutcome::Error`] with a `Transient` error, which the callers
+    /// already answer `UNAVAILABLE`, and ticks the `error` recovery-attempt
+    /// cell.
+    pub fn with_hold_fence(mut self, fence: CancellationToken) -> Self {
+        self.hold_fence = Some(fence);
+        self
+    }
+
+    /// The hold write fence, the one site every fence check of a layer restore
+    /// reads — the selection race, the check before the probe, the check
+    /// before each stale-stream `UNLINK` and, passed in, the apply's checks
+    /// before its residue-wipe `EXEC`, each pre-store chunk and value (and its
+    /// `NOSCRIPT` reload), its materialisation `EXEC` and that
+    /// materialisation's release enqueue (its attempts and reload).
+    fn hold_fence(&self) -> Option<&CancellationToken> {
+        self.hold_fence.as_ref()
+    }
+
+    /// End a restore refused by the hold write fence: tick the `error`
+    /// recovery-attempt cell and answer `Error(Transient)`.
+    fn refuse_for_hold(&self, object_id: u64) -> RecoveryOutcome {
+        tracing::info!(
+            object_id,
+            "checkpoint recovery stopped before writing: this replica entered a \
+             disaster-recovery hold or lost contact with the store's hold state"
+        );
+        self.metrics
+            .inc_checkpoint_recovery_attempt("error", "layer", &self.service_label);
+        RecoveryOutcome::Error(CheckpointError::Transient {
+            source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+        })
     }
 
     /// Attach the [`ExternalValueStore`] the SR-3.4 pre-store writes
@@ -1072,7 +1125,10 @@ impl RecoveryHook {
         // `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`, and the work is proportional to
         // the bytes the restore must write to be correct — capping it would mean
         // abandoning a restore mid-way, which the single `write_restored_object`
-        // MULTI/EXEC exists precisely to avoid.
+        // MULTI/EXEC exists precisely to avoid. A disaster-recovery hold is the
+        // one exception: the hold write fence stops the pre-store between its
+        // chunks (`apply_restore`), leaving the leak-only shape a pre-store
+        // that fails partway leaves.
         let fetch_budget = self.config.checkpoint_recovery_fetch_budget();
         let deadline = Instant::now() + fetch_budget;
         let reserve = Duration::from_millis(self.config.checkpoint_request_timeout_ms);
@@ -1082,11 +1138,20 @@ impl RecoveryHook {
         // work unbounded while the per-`object_id` admission mutex acquired above
         // is held — reintroducing precisely the head-of-line stall b.gg7 added
         // this budget to cap.
-        let fetch = tokio::time::timeout(
-            fetch_budget,
-            self.select_restore_source(object_id, deadline, reserve),
-        )
-        .await;
+        //
+        // The hold write fence races the whole selection: it is a pure read,
+        // so a hold that begins during it drops it and the restore writes
+        // nothing.
+        let fetch = tokio::select! {
+            biased;
+            () = crate::checkpoint::hold_fence::closed(self.hold_fence()) => {
+                return self.refuse_for_hold(object_id);
+            }
+            fetch = tokio::time::timeout(
+                fetch_budget,
+                self.select_restore_source(object_id, deadline, reserve),
+            ) => fetch,
+        };
         let fetch = match fetch {
             Ok(result) => result,
             Err(_elapsed) => {
@@ -1261,6 +1326,11 @@ impl RecoveryHook {
         // already logged loudly at the read that raised it — see the note on
         // `probe_stream_high_water`) is deliberately terminal: it propagates
         // verbatim through this arm to `INTERNAL`.
+        //
+        // The hold write fence first: the probe can clear a surviving stream.
+        if crate::checkpoint::hold_fence::is_closed(self.hold_fence()) {
+            return self.refuse_for_hold(object_id);
+        }
         let max_seq_observed = match self
             .probe_stream_high_water(object_id, snap_seq, &meta)
             .await
@@ -1329,6 +1399,11 @@ impl RecoveryHook {
         // the slots. The product margin is measured in a release build by the
         // release stack guard's subscribe layer-recovery case
         // (`tests/release_stack_guard/`).
+        //
+        // The hold write fence goes in with it: the apply checks it again
+        // immediately before each store write its three write steps send (the
+        // two `EXEC`s and each pre-store chunk), and a refusal there comes back
+        // as `Err(Transient)`, the `error` arm below.
         match Box::pin(apply_restore(
             &self.layer_store,
             object_id,
@@ -1338,6 +1413,7 @@ impl RecoveryHook {
             max_seq_observed,
             &self.config,
             ext,
+            self.hold_fence(),
         ))
         .await
         {
@@ -1621,9 +1697,10 @@ impl RecoveryHook {
     /// The construction lives in [`adjudicate_composed_meta`], shared with the
     /// SR-4.1 chain-collapse re-base
     /// ([`rebase_layer_lineage`](crate::checkpoint::rebase::rebase_layer_lineage))
-    /// so the base-sourced-identity MUST has one home; `observed_commit_span` is an argument there precisely because the
-    /// two callers derive it differently, and that helper's doc records both
-    /// derivations side by side.
+    /// and the DR restore Job's planner, so the base-sourced-identity MUST has
+    /// one home; `observed_commit_span` is an argument there precisely because
+    /// restore and re-base derive it differently, and that helper's doc records
+    /// both derivations side by side.
     ///
     /// # Base-only keeps today's `snap_seq` expression
     ///
@@ -1975,9 +2052,10 @@ impl RecoveryHook {
             // generation. See this function's `# The composed meta` block for
             // why each is sourced where it is, and
             // [`adjudicate_composed_meta`] for why the rule is shared with the
-            // SR-4.1 chain-collapse re-base rather than restated here — including the one
-            // column the two callers genuinely derive differently
-            // (`observed_commit_span`, which is why it is an argument).
+            // SR-4.1 chain-collapse re-base (and the DR restore Job's planner)
+            // rather than restated here — including the one column restore and
+            // re-base genuinely derive differently (`observed_commit_span`,
+            // which is why it is an argument).
             let meta = adjudicate_composed_meta(base_meta, head_span, head_written_at);
 
             tracing::debug!(
@@ -2204,7 +2282,8 @@ impl RecoveryHook {
     /// therefore under-report the floor in exactly the case that produces
     /// the wedged-writer failure.
     ///
-    /// The `XINFO` call runs inside [`STREAM_HIGH_WATER_PROBE_SCRIPT`]
+    /// The `XINFO` call runs inside
+    /// [`STREAM_HIGH_WATER_PROBE_SCRIPT`](crate::storage::stream_high_water::STREAM_HIGH_WATER_PROBE_SCRIPT)
     /// rather than from the client, because no `XINFO STREAM` form is
     /// metadata-only — every form embeds at least one entry, and
     /// layer-stream entries carry the writer's raw OMPF bounded only by
@@ -2369,27 +2448,27 @@ impl RecoveryHook {
         // which flavour of unreadable we hit. The cause rides along so the
         // WARN names it.
         let unreadable_cause = match probed {
-            Ok(Some(raw_id)) => match parse_stream_id_seq(&raw_id) {
-                Some(seq) => {
-                    // Plausibility gate. Cause-agnostic by design: the two
-                    // populations it separates are a genuine sequence number
-                    // (bounded by the commit volume one object can accumulate
-                    // between checkpoints) and anything else — overwhelmingly
-                    // an auto-ID wall-clock timestamp from a `deleted`
-                    // tombstone, whether or not that tombstone is still
-                    // present in the stream.
+            // Plausibility gate (`storage::stream_high_water::classify`).
+            // Cause-agnostic by design: the two populations it separates are
+            // a genuine sequence number (bounded by the commit volume one
+            // object can accumulate between checkpoints) and anything else —
+            // overwhelmingly an auto-ID wall-clock timestamp from a `deleted`
+            // tombstone, whether or not that tombstone is still present in
+            // the stream.
+            Ok(Some(raw_id)) => match classify(&raw_id, snap_seq) {
+                ProbeReading::Plausible(seq) => {
+                    tracing::debug!(
+                        object_id,
+                        snap_seq,
+                        last_generated_id = %raw_id,
+                        high_water = seq,
+                        "recovery: per-object stream survived state loss; \
+                         folding its last-generated-id into the restore floor"
+                    );
+                    return Ok(Some(seq));
+                }
+                ProbeReading::Implausible(seq) => {
                     let ceiling = snap_seq.saturating_add(MAX_PLAUSIBLE_HIGH_WATER_GAP);
-                    if seq <= ceiling {
-                        tracing::debug!(
-                            object_id,
-                            snap_seq,
-                            last_generated_id = %raw_id,
-                            high_water = seq,
-                            "recovery: per-object stream survived state loss; \
-                             folding its last-generated-id into the restore floor"
-                        );
-                        return Ok(Some(seq));
-                    }
                     tracing::warn!(
                         object_id,
                         snap_seq,
@@ -2409,7 +2488,7 @@ impl RecoveryHook {
                     );
                     return self.remove_stale_stream(object_id, &stream_key, meta).await;
                 }
-                None => format!("unparseable last-generated-id `{raw_id}`"),
+                ProbeReading::Unparseable => format!("unparseable last-generated-id `{raw_id}`"),
             },
             Ok(None) => {
                 "the probe script returned nil (no key, a non-stream key, or a reply carrying no \
@@ -2438,24 +2517,11 @@ impl RecoveryHook {
         #[cfg(feature = "test-checkpoint-fault-injection")]
         self.inject_recovery_seam(RECOVERY_SEAM_STREAM_HIGH_WATER_PROBE)?;
 
-        // Single-key EVALSHA. The script returns `nil` for a missing key, a
-        // wrong-type key, or a reply without `last-generated-id`; otherwise
-        // the ID string. `evalsha_with_reload` handles `NOSCRIPT`
-        // transparently.
-        STREAM_HIGH_WATER_PROBE_SCRIPT
-            .evalsha_with_reload(
-                self.layer_store.client().pool.next(),
-                vec![stream_key.to_string()],
-                Vec::<String>::new(),
-            )
-            .await
-            .map_err(|e| {
-                map_snapshot_load_err(
-                    FredErrOrigin::client(self.layer_store.client(), POOL_LABEL_DATA),
-                    "EVALSHA stream_high_water_probe",
-                    e,
-                )
-            })
+        // Single-key EVALSHA (`storage::stream_high_water::probe_once`). The
+        // script returns `nil` for a missing key, a wrong-type key, or a
+        // reply without `last-generated-id`; otherwise the ID string.
+        // `evalsha_with_reload` handles `NOSCRIPT` transparently.
+        probe_once(self.layer_store.client(), stream_key).await
     }
 
     /// Decide what a probe that could not produce a plausible sequence means,
@@ -2808,24 +2874,9 @@ impl RecoveryHook {
         #[cfg(feature = "test-checkpoint-fault-injection")]
         self.inject_recovery_seam(RECOVERY_SEAM_STREAM_KEY_TYPE)?;
 
-        let ty: String = self
-            .layer_store
-            .client()
-            .pool
-            .r#type(stream_key)
-            .await
-            .map_err(|e| {
-                map_snapshot_load_err(
-                    FredErrOrigin::client(self.layer_store.client(), POOL_LABEL_DATA),
-                    "TYPE obj:stream",
-                    e,
-                )
-            })?;
-        Ok(match ty.as_str() {
-            "none" => StreamKeyType::Absent,
-            "stream" => StreamKeyType::Stream,
-            other => StreamKeyType::Foreign(other.to_string()),
-        })
+        // `storage::stream_high_water::key_type_once`: one `TYPE` on the
+        // data pool, `none` / `stream` / anything else.
+        key_type_once(self.layer_store.client(), stream_key).await
     }
 
     /// The plausibility-refusal branch: authorize, then verifiably remove the
@@ -2839,8 +2890,9 @@ impl RecoveryHook {
     /// the guard was about to refuse. That is not hypothetical: "header
     /// absent, stream present" is the *normal* state for up to
     /// `STREAM_DELETE_GRACE_MS` (30 s) on every `DeleteLayer`, whose
-    /// retirement order is DEL mapping → XADD `deleted` → UNLINK header →
-    /// PEXPIRE stream (`src/storage/layer.rs`). A recovery racing a delete
+    /// retirement order is unmap (the mapping and its layers-index member) →
+    /// XADD `deleted` → PEXPIRE stream → UNLINK header
+    /// (`src/storage/layer.rs`). A recovery racing a delete
     /// would therefore blow away the graced stream — the very thing that lets
     /// a parked subscriber see the `deleted` sentinel and exit cleanly —
     /// for a restore that then returns `NotFound` anyway.
@@ -3122,11 +3174,27 @@ impl RecoveryHook {
             }
         }
 
+        // `unlink_stale_stream` checks the hold write fence immediately before
+        // each `UNLINK` it sends (the adjudication above can take tens of
+        // seconds). A refusal by the fence — or any failure once the fence is
+        // closed — is the hold's, not an unverified unlink: answer the hold
+        // refusal rather than the `unlink_unverified` restore refusal.
         match self.unlink_stale_stream(object_id, stream_key).await {
             Ok(()) => {
                 self.metrics
                     .inc_checkpoint_recovery_stream_refused(&self.service_label);
                 Ok(None)
+            }
+            Err(_) if crate::checkpoint::hold_fence::is_closed(self.hold_fence()) => {
+                tracing::info!(
+                    object_id,
+                    "checkpoint recovery stopped before removing a stale stream: this replica \
+                     entered a disaster-recovery hold or lost contact with the store's hold \
+                     state"
+                );
+                Err(CheckpointError::Transient {
+                    source: crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.into(),
+                })
             }
             Err(err) => {
                 self.refuse_restore(object_id, "unlink_unverified", format!("{err}"))
@@ -3252,6 +3320,10 @@ impl RecoveryHook {
         object_id: u64,
         stream_key: &str,
     ) -> Result<(), CheckpointError> {
+        // The hold write fence before every attempt, not only before the
+        // first: each retry sends a fresh `UNLINK`, so each attempt checks it
+        // first (`unlink_stale_stream_once`). A closed fence ends the loop at
+        // once (`Unavailable` is not retried) with nothing sent.
         let verified = retry_aborted_with_jitter(
             RECOVERY_SEAM_STALE_STREAM_UNLINK,
             RECOVERY_STREAM_PROBE_RETRY,
@@ -3512,7 +3584,16 @@ impl RecoveryHook {
 
     /// One `UNLINK` attempt plus, when it deleted nothing, the `TYPE`
     /// confirmation. Returns whether the key is verifiably gone.
+    ///
+    /// The hold write fence first, so no attempt sends its `UNLINK` once the
+    /// fence is closed: the attempt answers `Unavailable` with nothing sent,
+    /// which the retry driver does not retry ([`Self::unlink_stale_stream`]).
     async fn unlink_stale_stream_once(&self, stream_key: &str) -> Result<bool, ServiceError> {
+        if crate::checkpoint::hold_fence::is_closed(self.hold_fence()) {
+            return Err(ServiceError::Unavailable(
+                crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.to_owned(),
+            ));
+        }
         #[cfg(feature = "test-checkpoint-fault-injection")]
         self.inject_recovery_seam(RECOVERY_SEAM_STALE_STREAM_UNLINK)?;
 
@@ -3565,25 +3646,6 @@ impl RecoveryHook {
             ))),
         }
     }
-}
-
-/// What a `TYPE le:{oid}:obj:stream` round-trip says about the key the
-/// high-water probe could not read a usable sequence out of (b.4et).
-///
-/// The three arms are the whole point: the probe script's single `nil` covers
-/// all of them, and they demand opposite actions. Folding any two back
-/// together reintroduces the defect.
-#[derive(Debug)]
-enum StreamKeyType {
-    /// `"none"` — no key at all. The stream did not survive the state loss;
-    /// the restore floor is `snap_seq` alone. The dominant production shape.
-    Absent,
-    /// `"stream"` — the key is there and is ours, and we could not read its
-    /// top. Evidence unknown; the restore must not proceed.
-    Stream,
-    /// Any other Valkey type — a foreign value on the `le:` keyspace. Carries
-    /// the reported type so the WARN can name it.
-    Foreign(String),
 }
 
 /// Hard ceiling on the b.4et stream adjudication as a whole — probe,
@@ -3738,40 +3800,6 @@ const RECOVERY_STREAM_PROBE_RETRY: RetryConfig = RetryConfig {
     cap_delay_ms: 50,
 };
 
-/// Largest gap above a checkpoint's `snap_seq` that
-/// [`RecoveryHook::probe_stream_high_water`] will accept as a genuine
-/// sequence number rather than a foreign ID.
-///
-/// A legitimate gap is the commit count that landed between the last
-/// checkpoint and the crash, on **one object**. Even at a wildly generous
-/// 10,000 commits/sec sustained for a full 24 hours of checkpointer outage
-/// — orders of magnitude beyond what a per-object serialized OMPF-parse +
-/// Lua-EVAL pipeline can do — that is under 9e8. One billion is therefore
-/// generous for the true signal.
-///
-/// It is also unreachable by the noise it exists to reject. Valkey mints an
-/// auto-ID (`*`) from unix-milliseconds, which has been above 1e12 since
-/// 2001 and only rises, so a timestamp-shaped ID clears this bound by three
-/// orders of magnitude and always will. The two populations do not overlap
-/// and cannot start overlapping with time.
-const MAX_PLAUSIBLE_HIGH_WATER_GAP: u64 = 1_000_000_000;
-
-/// Parse the sequence component (the `ms` field, which this service uses as
-/// the commit sequence number) out of a Valkey Stream entry ID.
-///
-/// Entry IDs are `<ms>-<seq>`; both commit paths `XADD` at `{sequence_num}-0`,
-/// so the leading component IS the layer's sequence number. Returns `None`
-/// for any ID that does not parse as `<u64>-<...>`, including a bare `<u64>`
-/// with no separator (server replies always carry both components, so a
-/// missing separator means the reply shape is not what we assumed).
-///
-/// Local to the checkpoint module by design: `src/storage/notifications.rs`
-/// owns the subscriber-side cursor handling and its internals are not part
-/// of this module's contract surface.
-fn parse_stream_id_seq(entry_id: &str) -> Option<u64> {
-    entry_id.split_once('-')?.0.parse::<u64>().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -3795,7 +3823,6 @@ mod tests {
     /// consult, defaulted otherwise. Mirrors `apply.rs`'s `test_config`.
     fn test_config(enabled: bool) -> Config {
         Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -3877,6 +3904,10 @@ mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: enabled,
@@ -4273,6 +4304,10 @@ mod tests {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -4929,6 +4964,10 @@ mod tests {
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.record("ext_blob_exists");
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -6256,6 +6295,10 @@ mod tests {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -8168,102 +8211,5 @@ mod tests {
              so the wording is the only thing that distinguishes them at the type level. \
              Got: {rendered}"
         );
-    }
-}
-
-/// Unit tests for [`parse_stream_id_seq`], the one piece of reply decoding
-/// the high-water probe still does on the client side.
-///
-/// # Why only this function
-///
-/// The probe used to walk a client-side `XINFO STREAM` reply with three
-/// helpers (`find_member` / `last_generated_id` / `last_entry_payload`),
-/// each with RESP2, RESP3 and malformed-reply arms that no integration test
-/// could reach — hence a large unit-test block here. That walking now
-/// happens **server-side** inside [`STREAM_HIGH_WATER_PROBE_SCRIPT`], which
-/// projects the reply down to `nil` or the bare `last-generated-id` string
-/// before it crosses the wire. Wire-shape decoding is no longer this
-/// module's concern at all: scripts run in RESP2 conversion mode regardless
-/// of the connection's negotiated protocol, so the RESP3 divergence the old
-/// tests existed to pin cannot occur, and fred decodes the scalar reply into
-/// `Option<String>` directly.
-///
-/// The behaviour those tests covered is now pinned end-to-end by the gate
-/// tests in `tests/integration/checkpoint/e2e_object_id_preservation_test.rs`
-/// (`seq_floor_folds_in_surviving_stream_high_water`,
-/// `seq_floor_ignores_tombstoned_stream_with_auto_id`,
-/// `seq_floor_ignores_implausible_stream_high_water`), which drive a real
-/// Valkey and therefore exercise the script's own extraction rather than a
-/// hand-built reply value.
-///
-/// # One decode nuance deliberately left untested
-///
-/// fred maps **both** `Value::Null` and a zero-length bulk string to `None`
-/// when decoding into `Option<String>`, so the probe cannot distinguish "the
-/// script returned `nil`" from "the script returned an empty string". That is
-/// inert: the script's only non-`nil` return is a server-minted
-/// `last-generated-id`, which is never empty, and both fold to the same caller
-/// behaviour anyway — since b.4et that is "hand the case to
-/// `classify_unreadable_stream`", whose `TYPE` round-trip then decides between
-/// falling the restore floor back to `snap_seq` (`none` / a foreign type) and
-/// refusing the restore outright (`stream`); the ambiguity is invisible either
-/// way, because the verdict turns on the key's state and not on which flavour
-/// of unreadable produced it. Pinning
-/// it would test fred rather than this module. Noted here so a future script
-/// edit that can return an empty value knows the ambiguity exists.
-#[cfg(test)]
-mod stream_id_parsing_tests {
-    use super::*;
-
-    #[test]
-    fn parse_stream_id_seq_well_formed_id_returns_ms_component() {
-        assert_eq!(parse_stream_id_seq("42-0"), Some(42));
-        assert_eq!(parse_stream_id_seq("42-7"), Some(42));
-        // Both commit paths XADD at `{seq}-0`, so the ms component IS the
-        // sequence number — including at the f64 ceiling apply guards on.
-        assert_eq!(
-            parse_stream_id_seq("9007199254740991-0"),
-            Some(9_007_199_254_740_991)
-        );
-        // The wall-clock auto-ID shape the plausibility gate exists to
-        // reject still parses — rejection is the gate's job, not the
-        // parser's.
-        assert_eq!(
-            parse_stream_id_seq("1790000000000-0"),
-            Some(1_790_000_000_000)
-        );
-    }
-
-    #[test]
-    fn parse_stream_id_seq_bare_id_without_separator_returns_none() {
-        // Server replies always carry both components, so a missing
-        // separator means the reply shape is not what the probe assumed —
-        // treat it as unparseable rather than guessing.
-        assert_eq!(parse_stream_id_seq("42"), None);
-    }
-
-    #[test]
-    fn parse_stream_id_seq_non_numeric_ms_returns_none() {
-        assert_eq!(parse_stream_id_seq("abc-0"), None);
-        assert_eq!(parse_stream_id_seq("4 2-0"), None);
-        // A leading `-` splits into an empty ms component.
-        assert_eq!(parse_stream_id_seq("-1-0"), None);
-    }
-
-    #[test]
-    fn parse_stream_id_seq_accepts_rusts_leading_plus_sign() {
-        // Not a shape any server emits, pinned because it is the one
-        // "obviously malformed" input the parser does NOT reject:
-        // `u64::from_str` accepts a leading `+`. The parser is therefore not
-        // the defense against a weird-looking ID — the plausibility gate in
-        // `probe_stream_high_water` is, and it runs on the parsed value
-        // regardless of how it was spelled.
-        assert_eq!(parse_stream_id_seq("+42-0"), Some(42));
-    }
-
-    #[test]
-    fn parse_stream_id_seq_empty_string_returns_none() {
-        assert_eq!(parse_stream_id_seq(""), None);
-        assert_eq!(parse_stream_id_seq("-"), None);
     }
 }

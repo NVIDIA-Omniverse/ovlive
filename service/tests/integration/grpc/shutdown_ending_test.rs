@@ -55,7 +55,7 @@
 //! `grpc::transport` and `grpc::graceful_shutdown`.
 //!
 //! The per-phase endings (admission, mid-catch-up, mid-delivery, mid in-window
-//! replay) and their deletion twins live in `subscribe_admission_test.rs`; the
+//! catch-up) and their deletion twins live in `subscribe_admission_test.rs`; the
 //! completion lines in `stream_completion_log_test.rs`; the join's own shutdown
 //! arms in `join_session_cleanup_test.rs` and `join_lifecycle_test.rs`.
 //!
@@ -419,9 +419,10 @@ fn replica_over(tv: &TestValkey, valkey: ValkeyClient, maxlen: u64) -> LiveEditS
     }
 }
 
-/// Drain `svc`'s streaming tasks as `main.rs` does — `drain_stream_tasks`
-/// over both trackers, each bounded by `SETTLE` — and require both to have
-/// drained inside that bound.
+/// Drain `svc`'s streaming tasks as the post-server shutdown sequence
+/// (`run_post_server_sequence`) does — `drain_stream_tasks` over both
+/// trackers, each bounded here by `SETTLE` — and require both to have drained
+/// inside that bound.
 async fn drain_streams(svc: &LiveEditService) {
     drain_stream_tasks(
         &svc.presence_cleanup_tracker,
@@ -950,8 +951,11 @@ mod real_server {
             let svc = svc.clone();
             let service_shutdown = svc.shutdown.clone();
             tokio::spawn(async move {
-                production_server_builder()
-                    .add_service(live_service_server(svc))
+                production_server_builder(svc.upload_admission.max_waiters())
+                    .add_service(live_service_server(
+                        svc,
+                        live_edit::grpc::hold::HoldGate::always_open(),
+                    ))
                     .serve_with_incoming_shutdown(
                         tokio_stream::wrappers::TcpListenerStream::new(listener),
                         end_streams_after_drain(
@@ -1074,7 +1078,8 @@ mod real_server {
             "the server must shut down cleanly: {served:?}"
         );
 
-        // The post-server step `main.rs` runs next, through the same helper.
+        // The post-server step the shutdown sequence runs next, through the
+        // same helper.
         drain_streams(&svc).await;
     }
 
@@ -1124,8 +1129,11 @@ mod real_server {
                 let drain_listener = listener.clone();
                 let count_listener = listener.clone();
                 tokio::spawn(async move {
-                    let serve = production_server_builder()
-                        .add_service(live_service_server(svc))
+                    let serve = production_server_builder(svc.upload_admission.max_waiters())
+                        .add_service(live_service_server(
+                            svc,
+                            live_edit::grpc::hold::HoldGate::always_open(),
+                        ))
                         .serve_with_incoming_shutdown(
                             incoming,
                             end_streams_after_drain(
@@ -1626,7 +1634,7 @@ mod real_server {
             "the shutdown handle is cancelled once the bound has fired"
         );
 
-        // The post-server drain, as `main.rs` runs it next.
+        // The post-server drain, as the shutdown sequence runs it next.
         drain_streams(&svc).await;
 
         // The stalled connection was left to its own task, not torn down:
@@ -1658,9 +1666,10 @@ mod real_server {
 /// `end_streams_after_drain`, as `main.rs` does. The client must see a
 /// retryable ending — or it would stop there — and, before it reconnects, N
 /// commits land through B. Re-subscribing on B with the last `(object_id,
-/// sequence_num)` it holds, it must receive all N, in order, then its
-/// caught-up ack, then the next live update; and the state it has mirrored
-/// from everything it received must equal the server's.
+/// sequence_num)` it holds, it must receive all N in one coalesced diff at the
+/// last of them, then its caught-up ack, then the next live update; and the
+/// state it has mirrored from everything it received must hold the server's
+/// sections in the server's sibling order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_subscriber_reconnecting_in_window_after_shutdown_receives_every_missed_update() {
     /// Commits made while the client is between replicas.
@@ -1715,42 +1724,77 @@ async fn a_subscriber_reconnecting_in_window_after_shutdown_receives_every_misse
         .await
         .unwrap_or_else(|s| panic!("the retry on B must be admitted: {s:?}"))
         .into_inner();
-        let mut received = Vec::new();
-        for _ in 0..MISSED {
-            let (header, body) = next_message(&mut on_b, "a missed update on B").await;
-            assert!(header.total_size > 0, "a missed update must carry content");
-            received.push(header.sequence_num);
-            apply_ompf(&mut mirror, &body);
-        }
+        let last_missed = *missed.last().expect("MISSED > 0");
+        // The in-window catch-up is ONE coalesced diff, based at the client's
+        // position and at the last missed commit, carrying all of them.
+        let (header, body) = next_message(&mut on_b, "the coalesced catch-up on B").await;
         assert_eq!(
-            received, missed,
-            "the reconnect must deliver every update made while the client was away, in order"
+            (header.object_id, header.sequence_num),
+            (held.0, last_missed),
+            "the reconnect's catch-up is one diff at the last update made while the client was \
+             away"
         );
+        assert!(header.total_size > 0, "the catch-up must carry content");
+        apply_ompf(&mut mirror, &body);
         let (caught_up, _) = next_message(&mut on_b, "the caught-up ack on B").await;
         assert_eq!(
             caught_up.total_size, 0,
-            "the replay ends with the caught-up ack"
+            "the catch-up ends with the caught-up ack"
         );
-        assert_eq!(caught_up.sequence_num, *missed.last().expect("MISSED > 0"));
+        assert_eq!(caught_up.sequence_num, last_missed);
+        assert_eq!(
+            regime_count(&svc_b, "in_window"),
+            1,
+            "the retry must be served by the in-window catch-up"
+        );
 
+        // Caught up, the client holds every section the server holds, under
+        // its parent and in the server's sibling order. The catch-up sends
+        // each section at its position among its parent's children (the walked
+        // position, SDD §12.9), not at the stored `section_order` these commits
+        // all author as 0, so the comparison leaves the stored key out.
+        let read_server = || async {
+            live_edit::storage::diff_read::snapshot_to_object_state(
+                &live_edit::storage::test_support::read_object_state_for_test(
+                    &svc_b.valkey,
+                    &svc_b.key_schema,
+                    &object_id.to_string(),
+                )
+                .await
+                .expect("load the server's snapshot"),
+            )
+        };
+        let placement = |state: &ObjectState| -> BTreeMap<u64, (u64, String, u8)> {
+            structure(state)
+                .into_iter()
+                .map(|(id, (parent, name, kind, _))| (id, (parent, name, kind)))
+                .collect()
+        };
+        let caught_up_server = read_server().await;
+        assert_eq!(
+            placement(&mirror),
+            placement(&caught_up_server),
+            "the caught-up client's reconstruction must hold the server's sections"
+        );
+        assert_eq!(
+            mirror.children.get(&0),
+            caught_up_server.children.get(&0),
+            "the caught-up client must hold the server's sibling order"
+        );
+
+        // The next live update still arrives, and the client holds every
+        // section after it. (Where the relayed section lands among its
+        // siblings is the client's apply of the writer's own `section_order`,
+        // which these fixture commits all author as 0, so only placement is
+        // compared here.)
         let next = commit(&svc_b, &session_id, object_id, 300).await;
         let (live, body) = next_message(&mut on_b, "a live update on B after the reconnect").await;
         assert_eq!(live.sequence_num, next);
         apply_ompf(&mut mirror, &body);
-
-        let server = live_edit::storage::diff_read::snapshot_to_object_state(
-            &live_edit::storage::test_support::read_object_state_for_test(
-                &svc_b.valkey,
-                &svc_b.key_schema,
-                &object_id.to_string(),
-            )
-            .await
-            .expect("load the server's snapshot"),
-        );
         assert_eq!(
-            structure(&mirror),
-            structure(&server),
-            "the reconnected client's reconstruction must equal the server's state"
+            placement(&mirror),
+            placement(&read_server().await),
+            "the reconnected client's reconstruction must hold the server's sections"
         );
 
         drop(on_b);
@@ -1872,10 +1916,13 @@ async fn a_subscriber_reconnecting_out_of_window_after_shutdown_converges_to_a_f
             structure(&fresh_state),
             "after an out-of-window reconnect the client must hold what a fresh subscriber holds"
         );
+        // The layer's root section, which its empty CreateLayer holds (SDD
+        // §9.7), and every missed section.
         assert_eq!(
             structure(&mirror).len(),
-            MISSED as usize,
-            "fixture self-check: every missed section is in the reconstruction"
+            MISSED as usize + 1,
+            "fixture self-check: the layer's root and every missed section are in the \
+             reconstruction"
         );
 
         let next = commit(&svc_b, &session_id, object_id, 300).await;
@@ -1995,9 +2042,11 @@ async fn a_join_shut_down_on_one_replica_rejoins_on_another_with_the_replay_and_
 /// `SUBSCRIPTIONS` idle, caught-up subscribers on layers in distinct hash
 /// slots, so in cluster mode each is read by its own slot-bound stream reader
 /// parked in `XREAD BLOCK`, with those streams on at least two different
-/// shards. The test runs the shutdown sequence's last three steps as `main.rs`
-/// does — cancel the service shutdown token, `drain_stream_tasks`,
-/// `ValkeyClient::quit` — with nothing in between. The drain ends every
+/// shards. The test runs the three shutdown steps that matter here in their
+/// production order — cancel the service shutdown token, `drain_stream_tasks`,
+/// `ValkeyClient::quit` — with nothing in between (production runs the
+/// session-checkpoint drain and the background-task join between the last
+/// two, `run_post_server_sequence`). The drain ends every
 /// subscription, but removals do not wake a reader, so each reader's
 /// `XREAD BLOCK` stays blocked on its own shard, and a `QUIT` queued behind one
 /// would overrun the 2 s `QUIT_TIMEOUT` and log the reader pool's quit-timeout
@@ -2024,7 +2073,7 @@ async fn on_a_cluster_the_pool_quit_after_the_drain_is_not_held_by_blocked_reads
     /// streams on different shards.
     const LAYER_CANDIDATES: usize = 64;
 
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

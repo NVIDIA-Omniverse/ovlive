@@ -14,7 +14,6 @@
 # Vendored upstream copies keep their exact, hash-pinned bytes (including CRLF).
 client/source/live/wire/third_party/** -text -whitespace
 client/source/live/wire/schema/** -text -whitespace
-client/tools/packman/** -text -whitespace
 # The generated third-party license bundle reproduces upstream license texts byte for byte (including CRLF).
 THIRD_PARTY_LICENSES.txt -text -whitespace
 # Contributor Covenant license text retains its upstream formatting.

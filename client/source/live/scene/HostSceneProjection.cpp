@@ -198,13 +198,23 @@ HostSceneProjection::Reseat HostSceneProjection::prepareReseat(WireScenePtr next
     const auto& source = *prepared.scene->data();
     for (const auto& path : difference.erased)
         if (storage.HasSpec(path)) storage.EraseSpec(path);
+    // Each spec is written in one record edit, so a wide spec costs its
+    // fields rather than their square.
+    std::vector<std::pair<TfToken, VtValue>> fields;
     for (const auto& path : difference.written) {
         if (storage.HasSpec(path)) storage.EraseSpec(path);
-        storage.CreateSpec(path, source.GetSpecType(path));
-        for (const auto& field : source.List(path)) storage.Set(path, field, source.Get(path, field));
+        fields.clear();
+        for (const auto& field : source.List(path)) fields.emplace_back(field, source.Get(path, field));
+        storage.OverlaySpec(path, source.GetSpecType(path), fields);
     }
-    for (const auto& field : difference.fields)
-        if (!field.rewritten) storage.Set(field.path, field.field, field.after);
+    // The changed fields come in section order, so each spec's are adjacent.
+    for (auto it = difference.fields.begin(); it != difference.fields.end();) {
+        const auto& path = it->path;
+        fields.clear();
+        for (; it != difference.fields.end() && it->path == path; ++it)
+            if (!it->rewritten) fields.emplace_back(it->field, it->after);
+        if (!fields.empty()) storage.OverlaySpec(path, storage.GetSpecType(path), fields);
+    }
     return prepared;
 }
 bool HostSceneProjection::keepsBaseline(const WireScenePtr& next, const WireSceneDifference& difference) const {

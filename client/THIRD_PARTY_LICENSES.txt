@@ -1,7 +1,7 @@
 License texts of the third-party components compiled into the omni_usd_live package.
 BOM.json lists each component with its version, license, upstream project and linkage.
 
-==== grpc 1.65.4-1 (Apache-2.0 AND BSD-3-Clause AND MPL-2.0) ====
+==== grpc 1.83.1-21 (Apache-2.0 AND BSD-3-Clause AND MPL-2.0) ====
 
 
                                  Apache License
@@ -208,6 +208,16 @@ BOM.json lists each component with its version, license, upstream project and li
 
 -----------------------------------------------------------
 
+Following applies to:
+./src/objective-c/!ProtoCompiler-gRPCCppPlugin.podspec
+./src/objective-c/!ProtoCompiler-gRPCPlugin.podspec
+./src/objective-c/!ProtoCompiler.podspec
+./src/objective-c/BoringSSL-GRPC.podspec
+./templates/src/objective-c/!ProtoCompiler-gRPCCppPlugin.podspec.inja
+./templates/src/objective-c/!ProtoCompiler-gRPCPlugin.podspec.inja
+./templates/src/objective-c/!ProtoCompiler.podspec.inja
+./templates/src/objective-c/BoringSSL-GRPC.podspec.template
+
 BSD 3-Clause License
 
 Copyright 2016, Google Inc.
@@ -239,6 +249,9 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 THE POSSIBILITY OF SUCH DAMAGE.
 
 -----------------------------------------------------------
+
+Following applies to:
+./etc/roots.pem
 
 Mozilla Public License Version 2.0
 ==================================
@@ -614,7 +627,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
   This Source Code Form is "Incompatible With Secondary Licenses", as
   defined by the Mozilla Public License, v. 2.0.
 
-==== protobuf 5.26.0-2 (BSD-3-Clause) ====
+==== protobuf 5.29.5-6 (BSD-3-Clause) ====
 
 Copyright 2008 Google Inc.  All rights reserved.
 
@@ -649,7 +662,7 @@ of the input file used when generating it.  This code is not
 standalone and requires a support library to be linked with it.  This
 support library is itself covered by the above license.
 
-==== abseil 20240116.1-1 (Apache-2.0) ====
+==== abseil 20250127.0-0 (Apache-2.0) ====
 
 
                                  Apache License
@@ -855,7 +868,7 @@ support library is itself covered by the above license.
    limitations under the License.
 
 
-==== re2 20230301-1 (BSD-3-Clause) ====
+==== re2 20250722-4 (BSD-3-Clause) ====
 
 // Copyright (c) 2009 The RE2 Authors. All rights reserved.
 //
@@ -885,7 +898,7 @@ support library is itself covered by the above license.
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-==== c-ares 1.34.8-0 (MIT) ====
+==== c-ares 1.34.9-0 (MIT) ====
 
 MIT License
 

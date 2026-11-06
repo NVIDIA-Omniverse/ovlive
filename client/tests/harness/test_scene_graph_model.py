@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Independent graph-contract examples and reproducible identity histories."""
+from functools import partialmethod
 from pathlib import Path
 import random
 import sys
@@ -20,11 +21,31 @@ def by_id(model):
     return {node['id']: node for node in model.state}
 
 
+class VerbatimModel(graph.Model):
+    """The model committing every Reorder as Live Edit 0.1.x stores it."""
+    apply = partialmethod(graph.Model.apply, verbatim=True)
+
+
+def list_ordering(items, order):
+    """USD's SdfApplyListOrdering by the service's run cutting (delta.rs apply_list_ordering), independent of
+    the model's splice walk: each named item heads a run of the unnamed items after it, the unnamed items before
+    the first named one stay in front, and the runs follow in the order's sequence."""
+    named, front, runs, owner = set(order), [], {}, None
+    for item in items:
+        if item in named:
+            owner = item
+        (front if owner is None else runs.setdefault(owner, [])).append(item)
+    result = front
+    for item in order:
+        result += runs.pop(item, [])
+    return result
+
+
 class GraphModelTests(unittest.TestCase):
-    def assertRejected(self, model, delta, kind='unsupported'):
+    def assertRejected(self, model, delta, kind='unsupported', **rules):
         before, history, sequence, source_format = model.state, model.history, model.sequence, model.source_format
         with self.assertRaises(graph.GraphError) as caught:
-            model.apply(encode(delta), 999)
+            model.apply(encode(delta), 999, **rules)
         self.assertEqual(caught.exception.kind, kind)
         self.assertEqual((model.state, model.history, model.sequence, model.source_format),
                          (before, history, sequence, source_format))
@@ -71,8 +92,69 @@ class GraphModelTests(unittest.TestCase):
         apply(model, [C(2, 3, 1), C(1, 3, 1, 'P', 6)])
         self.assertEqual(by_id(model)[3]['fields'], {})
 
-    def test_reorder_stores_entire_children_list_verbatim(self):
+    def test_reorder_orders_each_child_list_as_sdf_apply_list_ordering(self):
+        # The service's own examples (delta.rs apply_list_ordering).
+        self.assertEqual(graph.apply_list_ordering([0, 2, 4, 1, 5, 3], [1, 2, 3]), [0, 1, 5, 2, 4, 3])
+        self.assertEqual(graph.apply_list_ordering(list('ABCD'), list('DB')), list('ADBC'))
         model = graph.Model()
+        apply(model, [C(1, 2, 1, 'P', 6), C(1, 3, 2, 'A', 6), C(1, 4, 2, 'x', 1), C(1, 5, 2, 'B', 6),
+                      C(1, 6, 2, 'y', 8), C(1, 7, 2, 'C', 6), C(1, 8, 2, 'v', 11), C(1, 9, 1, 'Q', 6)], [F(7, 'v', 1)])
+        apply(model, [C(3, 3, 9, 'A', old_parent=2)])
+        # A moved-away child, an unknown ID, the parent itself and repeats are ignored; each child list is ordered
+        # within the positions it holds, and the unnamed property x keeps its place before the first named one.
+        apply(model, [C(4, 2, children=(3, 99, 2, 7, 5, 7, 6))])
+        state = by_id(model)
+        self.assertEqual(state[2]['fields'], {'primChildren': ('C', 'B'), 'properties': ('x', 'y'),
+                                              'variantSetChildren': ('v',)})
+        self.assertEqual(sorted((4, 5, 6, 7, 8), key=lambda i: state[i]['order']), [4, 7, 6, 5, 8])
+        # A partial order leaves no child unlisted; childrenListId is ignored.
+        apply(model, [C(4, 2, child_list=0, children=(6,)), C(4, 2, child_list=2, children=(3, 5))])
+        self.assertEqual((by_id(model)[2]['fields']['properties'], model.detached), (('x', 'y'), {}))
+        apply(model, [C(4, 2, child_list=2, children=(6, 4))])
+        self.assertEqual(by_id(model)[2]['fields']['properties'], ('y', 'x'))
+        self.assertEqual(by_id(model)[7]['fields'], {'v': 1})
+        # A Reorder that names no current child changes nothing.
+        before = model.state
+        for children in ((), (3,), (99, 2)):
+            apply(model, [C(4, 2, children=children)])
+            self.assertEqual(model.state, before)
+
+    def test_seeded_reorders_against_the_service_list_ordering(self):
+        seed = 36211
+        rng = random.Random(seed)
+        model, order, kinds, next_id = graph.Model(), [], {}, 3
+        apply(model, [C(1, 2, 1, 'P', 6)])
+        for step in range(200):
+            action = rng.choice(('create', 'create', 'erase', 'reorder', 'reorder')) if order else 'create'
+            if action == 'create':
+                identity, next_id = next_id, next_id + 1
+                kinds[identity] = rng.choice((6, 1, 11))
+                apply(model, [C(1, identity, 2, f'n{identity}', kinds[identity])])
+                order.append(identity)
+            elif action == 'erase':
+                identity = rng.choice(order)
+                apply(model, [C(2, identity, 2)])
+                order.remove(identity)
+            else:
+                # Any subset in any order, with repeats, unknown IDs and erased IDs.
+                listed = [rng.choice(order + [99999, 1, 2] + list(range(3, next_id)))
+                          for _ in range(rng.randint(0, len(order) + 3))]
+                apply(model, [C(4, 2, children=tuple(listed))])
+                placed = list(order)
+                for kind in (6, 1, 11):
+                    positions = [i for i, identity in enumerate(order) if kinds[identity] == kind]
+                    named = [identity for identity in listed if identity in order and kinds[identity] == kind]
+                    members = list_ordering([order[i] for i in positions], list(dict.fromkeys(named)))
+                    for position, identity in zip(positions, members):
+                        placed[position] = identity
+                order = placed
+            state = by_id(model)
+            children = sorted((node for node in state.values() if node['parent'] == 2), key=lambda node: node['order'])
+            self.assertEqual([node['id'] for node in children], order, f'seed={seed} step={step}')
+            self.assertEqual(model.detached, {}, f'seed={seed} step={step}')
+
+    def test_verbatim_reorder_stores_entire_children_list(self):
+        model = VerbatimModel()
         apply(model, [C(1, i + 2, 1, name, 6) for i, name in enumerate('ABCD')] + [C(1, 6, 4, 'child', 6)],
               [F(4, 'v', 3)])
         apply(model, [C(4, 1, children=(5, 3, 2, 4))])
@@ -82,6 +164,9 @@ class GraphModelTests(unittest.TestCase):
         self.assertEqual(by_id(model)[1]['fields']['primChildren'], ('D', 'B'))
         self.assertEqual(set(by_id(model)), {1, 3, 5})
         self.assertEqual(set(model.detached), {2, 4, 6})
+        # A per-list Reorder ignores an unlisted child, as the service ignores a row its list lost.
+        graph.Model.apply(model, encode(Delta(commands=(C(4, 1, children=(4, 3, 5)),))))
+        self.assertEqual((by_id(model)[1]['fields']['primChildren'], set(model.detached)), (('B', 'D'), {2, 4, 6}))
         # Edits to an unlisted section are stored on it, not as orphans.
         apply(model, fields=[F(4, 'v', 8)])
         self.assertEqual((model.detached[4]['fields']['v'], model.orphans), (8, {}))
@@ -95,8 +180,8 @@ class GraphModelTests(unittest.TestCase):
         apply(model, [C(1, 8, 1, 'A', 6)])
         self.assertEqual((model.detached, by_id(model)[1]['fields']['primChildren']), ({}, ('C', 'D', 'B', 'E', 'A')))
 
-    def test_delete_keeps_unlisted_descendants_as_unreachable_rows(self):
-        model = graph.Model()
+    def test_delete_keeps_unlisted_descendants_of_a_verbatim_reorder_as_unreachable_rows(self):
+        model = VerbatimModel()
         apply(model, [C(1, 2, 1, 'P', 6), C(1, 3, 2, 'A', 6), C(1, 4, 2, 'B', 6), C(1, 5, 4, 'Child', 6),
                       C(1, 6, 1, 'Q', 6)], [F(4, 'v', 4)])
         apply(model, [C(4, 2, children=(3,))])
@@ -121,8 +206,8 @@ class GraphModelTests(unittest.TestCase):
         apply(model, [C(5, 12, 10, 'attr', 1, 0)], is_diff=True, base_version=1)
         state = by_id(model)
         self.assertEqual((state[12]['order'], state[11]['order']), (0, 1))
-    def test_reorder_naming_absent_or_moved_members_is_invalid_argument(self):
-        model = graph.Model()
+    def test_verbatim_reorder_naming_absent_or_moved_members_is_invalid_argument(self):
+        model = VerbatimModel()
         apply(model, [C(1, 2, 1, 'P', 6), C(1, 7, 1, 'Q', 6)] +
               [C(1, i, 2, name, 6) for i, name in zip(range(3, 7), 'ABCD')] + [C(1, 8, 2, 'attr', 1)])
         apply(model, [C(3, 4, 7, 'B', old_parent=2), C(2, 5, 2), C(1, 9, 2, 'E', 6)])
@@ -202,7 +287,7 @@ class GraphModelTests(unittest.TestCase):
             (Delta(commands=(C(1, 4, 1, 'valid', 6), C(1, 5, 1, 'A', 6), C(1, 3, 1, 'other', 6)),
                    fields=(F(2, 'v', 42), F(99, 'v', 1))), 'malformed'),
             (Delta(commands=(C(3, 2, 2, 'cycle', old_parent=1),)), 'malformed'),
-            (Delta(commands=(C(1, 4, 99, 'missingParent', 6), C(4, 99, children=(3,)))), 'malformed'),
+            (Delta(commands=(C(1, 4, 99, 'missingParent', 6), C(1, 5, 1, 'C', 6), C(1, 5, 1, 'D', 6))), 'malformed'),
             (Delta(True, 1, (C(5, 2, 1, 'A', 6, 0), C(6, 2))), 'unsupported'),
         )
         for delta, kind in failures:
@@ -270,7 +355,7 @@ class GraphModelTests(unittest.TestCase):
         apply(model, [C(5, 9, 4, 'last', 11, 1)], is_diff=True, base_version=1)
         self.assertEqual([by_id(model)[i]['order'] for i in (5, 9, 6, 8, 7)], [0, 1, 2, 3, 4])
         self.assertRejected(model, Delta(fields=(F(4, 'variantSetChildren', ('first',)),)))
-        self.assertRejected(model, Delta(commands=(C(4, 4, child_list=2, children=(3,)),)), 'malformed')
+        self.assertRejected(model, Delta(commands=(C(4, 4, child_list=2, children=(3,)),)), 'malformed', verbatim=True)
         self.assertRejected(model, Delta(commands=(C(1, 10, 7, '', 10),)), 'malformed')
         self.assertRejected(model, Delta(commands=(C(1, 10, 7, 'Child', 6),)), 'malformed')
         self.assertRejected(model, Delta(fields=(F(7, 'primChildren', ()),)), 'malformed')
@@ -351,10 +436,10 @@ class GraphModelTests(unittest.TestCase):
         self.assertEqual(counter.calls, 1)
         self.assertIn(2, by_id(model))
 
-    def test_seeded_identity_histories_against_direct_list_oracle(self):
+    def test_seeded_verbatim_identity_histories_against_direct_list_oracle(self):
         seed = 82731
         rng = random.Random(seed)
-        model, expected, order, unlisted, next_id = graph.Model(), {}, [], {}, 2
+        model, expected, order, unlisted, next_id = VerbatimModel(), {}, [], {}, 2
         for step in range(180):
             actions = ('create', 'erase', 'rename', 'reorder', 'field') + (('relist',) if unlisted else ())
             action = rng.choice(actions) if order else 'create'
@@ -406,18 +491,20 @@ class ServiceConflictRuleTests(unittest.TestCase):
     """The Live Edit service's rules for commands that meet a changed graph.
 
     Missing targets are skipped and orphan field data is stored but never
-    projected; a Create at an occupied (parent, name) slot replaces the
-    occupant; Move edge cases delete a subtree. Each update is all-or-nothing.
+    projected; a Create at an occupied slot (parent, spec-type child
+    list, name) replaces the occupant; Move edge cases delete a subtree. Each update is all-or-nothing.
     """
     def setUp(self):
         self.model = graph.Model()
+        self.rules = {}
         # /A{2} with child /A/Child{3} and attribute /A/Child.x{4}; /B{5}.
         self.model.apply(encode(Delta(commands=(C(1, 2, 1, 'A', 6), C(1, 3, 2, 'Child', 6), C(1, 4, 3, 'x', 1),
                                                 C(1, 5, 1, 'B', 6)), fields=(F(4, 'default', 1),))), 1)
 
-    def commit(self, commands=(), fields=(), samples=(), sequence=None):
+    def commit(self, commands=(), fields=(), samples=(), sequence=None, **rules):
         sequence = sequence or len(self.model.history) + 1
-        self.model.apply(encode(Delta(commands=tuple(commands), fields=tuple(fields), samples=tuple(samples))), sequence)
+        self.model.apply(encode(Delta(commands=tuple(commands), fields=tuple(fields), samples=tuple(samples))), sequence,
+                         **dict(self.rules, **rules))
         self.assertEqual(self.model.history[-1][0], sequence)
         return by_id(self.model)
 
@@ -448,7 +535,17 @@ class ServiceConflictRuleTests(unittest.TestCase):
         self.assertEqual(set(state), {1, 2, 5})
         self.assertNotIn('primChildren', state[2]['fields'])
 
-    def test_same_parent_rename_onto_occupied_name_keeps_duplicate_siblings(self):
+    def test_same_parent_rename_onto_occupied_name_replaces_the_occupant(self):
+        state = self.commit([C(3, 5, 1, 'A', old_parent=1)], [F(5, 'marker', 1)])
+        self.assertEqual(set(state), {1, 5})
+        self.assertEqual((state[5]['path'], state[5]['fields'], state[1]['fields']['primChildren']),
+                         ('/A', {'marker': 1}, ('A',)))
+        # The replaced attribute's later field is orphan data.
+        self.commit(fields=[F(4, 'default', 2)])
+        self.assertEqual(self.model.orphans, {4: {'default': 2}})
+
+    def test_same_parent_rename_onto_occupied_name_keeps_duplicate_siblings_without_rename_cascade(self):
+        self.rules = dict(rename_cascade=False)
         state = self.commit([C(3, 5, 1, 'A', old_parent=1)], [F(5, 'marker', 1)])
         self.assertEqual((state[2]['path'], state[5]['path']), ('/A', '/A'))
         self.assertEqual(state[1]['fields']['primChildren'], ('A', 'A'))
@@ -461,11 +558,152 @@ class ServiceConflictRuleTests(unittest.TestCase):
         rebuilt = graph.Model()
         rebuilt.apply(projection.snapshot(self.model.state))
         self.assertEqual(graph.ranked(rebuilt.state), graph.ranked(self.model.state))
+        # With the cascade, a rename onto the shared name replaces the lower of the two.
+        self.rules = {}
+        state = self.commit([C(1, 7, 1, 'C', 6)])
+        state = self.commit([C(3, 7, 1, 'A', old_parent=1)])
+        self.assertEqual(set(state), {1, 6, 7})
+        self.assertEqual(state[1]['fields']['primChildren'], ('A', 'A'))
 
-    def test_reorder_listing_members_of_a_missing_parent_is_invalid_argument(self):
+    def test_same_parent_rename_cascade_holds_under_each_reorder_and_orphan_rule(self):
+        for rules in ({}, dict(verbatim=True), dict(adopt_orphans=True), dict(verbatim=True, adopt_orphans=True)):
+            with self.subTest(**rules):
+                self.setUp()
+                self.rules = rules
+                state = self.commit([C(3, 5, 1, 'A', old_parent=1)], [F(5, 'marker', 1)])
+                self.assertEqual((set(state), state[1]['fields']['primChildren']), ({1, 5}, ('A',)))
+                # The replaced attribute's later field is orphan data, which a later Create of its ID takes only
+                # under adopt_orphans.
+                self.commit(fields=[F(4, 'default', 2)])
+                state = self.commit([C(1, 4, 5, 'y', 1)])
+                self.assertEqual(state[4]['fields'], {'default': 2} if rules.get('adopt_orphans') else {})
+                # A Reorder after the cascade orders the surviving list under either Reorder rule.
+                state = self.commit([C(1, 6, 1, 'Z', 6), C(4, 1, children=(6, 5))])
+                self.assertEqual(state[1]['fields']['primChildren'], ('Z', 'A'))
+
+    def test_verbatim_unlisted_occupant_meets_a_rename_as_it_meets_a_create(self):
+        # A verbatim Reorder leaves /B{5} unlisted; a rename onto B and a Create at B both delete it.
+        outcomes = []
+        for command in (C(3, 2, 1, 'B', old_parent=1), C(1, 6, 1, 'B', 6)):
+            self.setUp()
+            self.rules = dict(verbatim=True)
+            self.commit([C(4, 1, children=(2,))])
+            self.assertEqual(set(self.model.detached), {5})
+            self.commit([command])
+            outcomes.append(set(self.model.detached))
+        self.assertEqual(outcomes, [set(), set()])
+
+    def test_same_parent_rename_onto_the_other_kinds_name_keeps_both(self):
+        # Prim /A/Child{3} renamed to x and attribute /A.x{6} hold different slots.
+        self.commit([C(1, 6, 2, 'x', 1)])
+        state = self.commit([C(3, 3, 2, 'x', old_parent=2)])
+        self.assertEqual((state[3]['path'], state[6]['path']), ('/A/x', '/A.x'))
+        # An attribute renamed onto an attribute's name replaces it.
+        state = self.commit([C(1, 7, 2, 'y', 1), C(3, 7, 2, 'x', old_parent=2)])
+        self.assertNotIn(6, state)
+        self.assertEqual((state[7]['path'], state[3]['path']), ('/A.x', '/A/x'))
+
+    def test_same_parent_rename_to_its_own_name_changes_nothing(self):
+        # Two siblings share /A on a service without the rename cascade; renaming either to /A again is a no-op.
+        self.rules = dict(rename_cascade=False)
+        self.commit([C(3, 5, 1, 'A', old_parent=1)])
+        self.rules = {}
+        before = self.model.state
+        for identity in (2, 5):
+            self.commit([C(3, identity, 1, 'A', old_parent=1)])
+            self.assertEqual(self.model.state, before)
+        self.commit([C(3, 3, 2, 'Child', old_parent=2)])
+        self.assertEqual(self.model.state, before)
+
+    def stale_child_at_root(self):
+        """/A/Child{3}, moved to /B{5} by a peer, then to the root by a Move carrying the stale old parent /A{2}: it
+        is stored under the root while /B's list still names it."""
+        state = self.commit([C(3, 3, 5, 'Child', old_parent=2), C(3, 3, 1, 'Child', old_parent=2)])
+        self.assertEqual((state[3]['path'], state[1]['fields']['primChildren']), ('/Child', ('A', 'B', 'Child')))
+
+    def test_rename_onto_an_occupant_whose_listed_subtree_holds_the_section_deletes_both(self):
+        self.stale_child_at_root()
+        state = self.commit([C(3, 3, 1, 'B', old_parent=1)])
+        self.assertEqual((set(state), state[1]['fields']['primChildren']), ({1, 2}, ('A',)))
+        # A service without the rename cascade keeps both.
+        self.setUp()
+        self.rules = dict(rename_cascade=False)
+        self.stale_child_at_root()
+        state = self.commit([C(3, 3, 1, 'B', old_parent=1)])
+        self.assertEqual((state[3]['path'], state[5]['path']), ('/B', '/B'))
+
+    def test_cross_parent_move_onto_an_occupant_whose_listed_subtree_holds_the_section_deletes_both(self):
+        # The Move names /A{2} as Child's old parent, so it takes the cross-parent path into the root's slot B.
+        self.stale_child_at_root()
+        state = self.commit([C(3, 3, 1, 'B', old_parent=2)])
+        self.assertEqual((set(state), state[1]['fields']['primChildren']), ({1, 2}, ('A',)))
+
+    def test_cross_parent_move_onto_an_occupant_whose_listed_subtree_holds_the_new_parent_deletes_the_section(self):
+        # /B{5} is stored at the root while /C{6}'s list still names it, and C is stored under B.
+        state = self.commit([C(1, 6, 1, 'C', 6), C(3, 5, 6, 'B', old_parent=1), C(3, 5, 1, 'B', old_parent=2),
+                             C(3, 6, 5, 'C', old_parent=1)])
+        self.assertEqual((state[5]['path'], state[6]['path']), ('/B', '/B/C'))
+        # Moving /A/Child{3} into B as C deletes C's listed subtree, which holds B, so the Move's new parent is
+        # missing and Child is deleted with its subtree, as a Move to a missing parent is.
+        state = self.commit([C(3, 3, 5, 'C', old_parent=2)])
+        self.assertEqual((set(state), state[1]['fields']['primChildren']), ({1, 2}, ('A',)))
+        self.assertEqual(self.model.detached, {})
+
+    def test_rename_onto_an_occupant_in_the_sections_listed_subtree_deletes_only_the_occupant(self):
+        self.stale_child_at_root()
+        state = self.commit([C(3, 5, 1, 'Child', old_parent=1)])
+        self.assertEqual(set(state), {1, 2, 5})
+        self.assertEqual((state[5]['path'], state[1]['fields']['primChildren']), ('/Child', ('A', 'Child')))
+        # The occupant's stale listing left with it, so a later Delete of the renamed section deletes nothing else.
+        state = self.commit([C(1, 6, 1, 'Other', 6), C(2, 5, 1)])
+        self.assertEqual(set(state), {1, 2, 6})
+
+    def test_reorder_of_a_missing_parent_changes_nothing_and_verbatim_rejects_its_members(self):
+        before = self.model.state
+        self.commit([C(4, 99, children=(3,))])
+        self.assertEqual(self.model.state, before)
         with self.assertRaises(graph.GraphError) as caught:
-            self.commit([C(4, 99, children=(3,))])
+            self.commit([C(4, 99, children=(3,))], verbatim=True)
         self.assertEqual(caught.exception.kind, 'malformed')
+
+    def test_orphan_data_is_never_adopted_by_default(self):
+        # Field and sample data for a missing identity, then a Create of that identity.
+        self.commit(fields=[F(6, 'default', 7)], samples=[Sample(6, 1.0, 8)])
+        state = self.commit([C(1, 6, 1, 'C', 6)])
+        self.assertEqual(state[6]['fields'], {})
+        self.assertEqual(self.model.orphans, {6: {'default': 7, 'timeSamples': TimeSamples(((1.0, 8),))}})
+
+    def test_adopt_orphans_gives_a_born_section_the_data_committed_for_its_missing_identity(self):
+        # The deployed service keys field and sample rows by section ID alone (delta.rs apply_set_field,
+        # apply_time_sample), so a later Create of the ID owns them and catch-up carries them.
+        self.commit(fields=[F(6, 'default', 7), F(6, 'gone', 1), F(6, 'gone', None)], samples=[Sample(6, 1.0, 8)])
+        # A Create under a missing parent is skipped and leaves the orphan data as it is.
+        self.commit([C(1, 6, 99, 'C', 6)], adopt_orphans=True)
+        self.assertEqual(set(self.model.orphans), {6})
+        state = self.commit([C(1, 6, 1, 'C', 6)], [F(6, 'other', 2)], adopt_orphans=True)
+        self.assertEqual(state[6]['fields'], {'default': 7, 'other': 2, 'timeSamples': TimeSamples(((1.0, 8),))})
+        self.assertEqual(self.model.orphans, {})
+        # A late joiner's snapshot carries the adopted data and rebuilds the same state.
+        import scene_graph_snapshot as projection
+        self.assertEqual(graph.ranked(graph.Model().apply(projection.snapshot(self.model.state))),
+                         graph.ranked(self.model.state))
+        # A diff that births the identity adopts it too, as the service's new-row branch does.
+        self.commit(fields=[F(7, 'default', 3)])
+        self.model.apply(encode(Delta(True, 1, (C(5, 7, 1, 'D', 6, 9),))), adopt_orphans=True)
+        self.assertEqual((by_id(self.model)[7]['fields'], self.model.orphans), ({'default': 3}, {}))
+
+    def test_adopt_orphans_does_not_apply_to_a_delivered_update_or_a_child_list_field(self):
+        # A reader drops orphan data, so a delivered Create starts with no fields.
+        self.commit(fields=[F(6, 'default', 7)])
+        self.model.apply(encode(Delta(commands=(C(1, 6, 1, 'C', 6),))), delivered=True, adopt_orphans=True)
+        self.assertEqual(by_id(self.model)[6]['fields'], {})
+        # An adopted child-list field is outside the profile.
+        self.commit(fields=[F(8, 'primChildren', ('ghost',))])
+        before = self.model.state, self.model.orphans
+        with self.assertRaises(graph.GraphError) as caught:
+            self.commit([C(1, 8, 1, 'E', 6)], adopt_orphans=True)
+        self.assertEqual(caught.exception.kind, 'unsupported')
+        self.assertEqual((self.model.state, self.model.orphans), before)
 
     def test_update_is_all_or_nothing(self):
         before = (self.model.state, self.model.history, self.model.sequence, self.model.orphans)
@@ -481,10 +719,37 @@ class ServiceConflictRuleTests(unittest.TestCase):
         self.assertEqual(state[1]['fields']['primChildren'], ('B', 'A'))
         # The replaced attribute's later field is orphan data, not a new node.
         self.assertEqual(self.model.orphans, {4: {'default': 3}})
-        # The slot is (parent, name), not the derived path: a prim replaces a same-named attribute.
+        # A slot is a name within one child list, so it matches one derived path: a prim and an attribute of one
+        # name coexist.
         state = self.commit([C(1, 8, 6, 'x', 6)])
-        self.assertEqual(set(state), {1, 5, 6, 8})
-        self.assertEqual((state[8]['path'], state[6]['fields']), ('/A/x', {'primChildren': ('x',)}))
+        self.assertEqual(set(state), {1, 5, 6, 7, 8})
+        self.assertEqual((state[8]['path'], state[7]['path']), ('/A/x', '/A.x'))
+        self.assertEqual((state[6]['fields']['primChildren'], state[6]['fields']['properties']), (('x',), ('x',)))
+
+    def test_prim_and_property_of_one_name_hold_distinct_slots(self):
+        # /B.p{6} beside /B{5}; /A/Child{3} beside /A/Child.x{4}.
+        self.commit([C(1, 6, 5, 'p', 1)], [F(6, 'default', 6)])
+        # Create into the other kind's slot keeps both: a prim where a property is named, and the reverse.
+        state = self.commit([C(1, 7, 3, 'x', 6), C(1, 8, 2, 'Child', 1)])
+        self.assertEqual((state[7]['path'], state[4]['path'], state[8]['path'], state[3]['path']),
+                         ('/A/Child/x', '/A/Child.x', '/A.Child', '/A/Child'))
+        # Move into the other kind's slot keeps both.
+        state = self.commit([C(3, 7, 5, 'p', old_parent=3), C(3, 4, 5, 'Q', old_parent=3), C(1, 9, 5, 'Q', 6)])
+        self.assertEqual({i: state[i]['path'] for i in (4, 6, 7, 9)},
+                         {4: '/B.Q', 6: '/B.p', 7: '/B/p', 9: '/B/Q'})
+        # Same-kind collisions still replace the occupant, last writer wins; attributes and relationships share
+        # the property list.
+        state = self.commit([C(3, 8, 5, 'p', old_parent=2), C(1, 10, 5, 'Q', 8)])
+        self.assertEqual(set(state), {1, 2, 3, 5, 7, 8, 9, 10})
+        self.assertEqual({i: state[i]['path'] for i in (7, 8, 9, 10)}, {7: '/B/p', 8: '/B.p', 9: '/B/Q', 10: '/B.Q'})
+        state = self.commit([C(3, 3, 5, 'p', old_parent=2)])
+        self.assertEqual(set(state), {1, 2, 3, 5, 8, 9, 10})
+        self.assertEqual((state[3]['path'], state[8]['path']), ('/B/p', '/B.p'))
+        # A late joiner's snapshot carries both kinds of sibling and rebuilds the same state.
+        import scene_graph_snapshot as projection
+        rebuilt = graph.Model()
+        rebuilt.apply(projection.snapshot(self.model.state))
+        self.assertEqual(graph.ranked(rebuilt.state), graph.ranked(self.model.state))
 
     def test_create_with_live_identity_is_invalid_argument_with_service_message(self):
         before = self.model.state
@@ -533,12 +798,12 @@ class ServiceConflictRuleTests(unittest.TestCase):
     def test_captured_move_after_peer_move_follows_command_parents(self):
         # A peer moved /A/Child{3} to /B{5}; a captured Move naming the old parent /A{2} replays.
         peer = [C(3, 3, 5, 'Child', old_parent=2)]
-        # Equal command parents rename under the stored parent, without a sibling-name check.
+        # Equal command parents rename under the stored parent, replacing the occupant there.
         self.commit(peer + [C(1, 6, 5, 'Taken', 6)])
         state = self.commit([C(3, 3, 2, 'N2', old_parent=2)])
         self.assertEqual((state[3]['parent'], state[3]['path']), (5, '/B/N2'))
         state = self.commit([C(3, 3, 2, 'Taken', old_parent=2)])
-        self.assertEqual((state[3]['path'], state[6]['path']), ('/B/Taken', '/B/Taken'))
+        self.assertEqual((set(state), state[3]['path']), ({1, 2, 3, 4, 5}, '/B/Taken'))
         # Differing command parents take the move path: occupancy applies at the new parent.
         self.setUp()
         self.commit(peer + [C(1, 6, 5, 'Taken', 6)])
@@ -563,9 +828,18 @@ class ServiceConflictRuleTests(unittest.TestCase):
                      C(1, 7, 5, 'Other', 6)])
         state = self.commit([C(2, 7, 5)])
         self.assertEqual(state[3]['path'], '/R/Child')
-        # A Reorder of B replaces its list, so deleting B afterwards keeps the section.
-        state = self.commit([C(4, 5, children=()), C(2, 5, 1)])
+        # A verbatim Reorder of B replaces its list, so deleting B afterwards keeps the section.
+        state = self.commit([C(4, 5, children=()), C(2, 5, 1)], verbatim=True)
         self.assertEqual((set(state), state[3]['path']), ({1, 2, 3, 4, 6}, '/R/Child'))
+        # A Reorder that names none of B's children changes nothing, so deleting B deletes the section; one that
+        # names a child rebuilds B's list from B's children, which drops the stale listing.
+        for children, survivors in (((), {1, 2, 6}), ((3, 4, 99), {1, 2, 6}), ((8,), {1, 2, 3, 4, 6})):
+            with self.subTest(children=children):
+                self.setUp()
+                self.commit([C(3, 3, 5, 'Child', old_parent=2), C(1, 6, 1, 'R', 6), C(3, 3, 6, 'Child', old_parent=2),
+                             C(1, 8, 5, 'Kept', 6)])
+                state = self.commit([C(4, 5, children=children), C(3, 8, 6, 'Kept', old_parent=5), C(2, 5, 1)])
+                self.assertEqual(set(state) - {8}, survivors)
         # A Move carrying the current old parent leaves no stale listing.
         self.setUp()
         self.commit([C(3, 3, 5, 'Child', old_parent=2), C(1, 6, 1, 'R', 6), C(3, 3, 6, 'Child', old_parent=5)])

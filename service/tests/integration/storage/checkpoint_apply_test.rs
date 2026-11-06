@@ -272,7 +272,6 @@ fn divergent_seed_object_state() -> ObjectState {
 /// runtime env coupling.
 fn test_config(safety_margin: u64) -> Config {
     Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url: String::new(),
@@ -354,6 +353,10 @@ fn test_config(safety_margin: u64) -> Config {
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -510,6 +513,9 @@ pub(crate) async fn build_checkpoint_ompf(
         ),
         AssemblyDecision::LeaseLost => {
             panic!("the assembler was handed a keeper that never loses its lease; got LeaseLost")
+        }
+        AssemblyDecision::DeferredCleanup => {
+            panic!("the clean-up fence deferred the PUT, but no clean-up runs in this fixture")
         }
         AssemblyDecision::ShuttingDown => {
             panic!("the assembler was handed a keeper that never shuts down; got ShuttingDown")

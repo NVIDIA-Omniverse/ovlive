@@ -59,7 +59,7 @@
 //! | [`create_layer_commit_script_claims_the_object_committed_with_its_flip`] | 8 | `COMMITTED` writes the mapping, the index member and the `committed` claim with its TTL |
 //! | [`create_layer_veto_script_vetoes_only_an_unclaimed_unmapped_object`] | 8 | the veto writes `vetoed` with its TTL; `MAPPED` and `CLAIMED` write nothing |
 //! | [`create_layer_commit_script_never_maps_an_object_a_run_already_mapped`] | 19 | a second run of a landed commit answers `COMMITTED_EARLIER <current>` and writes nothing |
-//! | [`orphan_sweep_retires_a_committed_unmapped_object_and_keeps_its_committed_claim`] | 21, 10 (storage half) | a `DeleteLayer` that stopped after its mapping `DEL`: one pass wakes and retires the object, the veto keeps the `committed` claim, a later run answers `COMMITTED_EARLIER` |
+//! | [`orphan_sweep_retires_a_committed_unmapped_object_and_keeps_its_committed_claim`] | 21, 10 (storage half) | a `DeleteLayer` that stopped after its unmap: one pass wakes and retires the object, the veto keeps the `committed` claim, a later run answers `COMMITTED_EARLIER` |
 //! | [`orphan_sweep_retires_an_orphan_whose_wake_up_the_store_refused_out_of_memory`] | 11, b.pa1 | the sweep's wake-up refused `-OOM` still deletes the orphan, and requests the GC's out-of-memory collection |
 //! | [`orphan_sweep_whose_veto_the_store_refused_out_of_memory_leaves_the_object_and_requests_an_oom_collection`] | b.pa1 | the sweep's veto refused `-OOM`: the object kept, no claim, the collection requested |
 //! | [`create_layer_overwrite_of_a_non_numeric_mapping_answers_ok_and_writes_no_ghost_header`] | 13 | a corrupt mapping value is overwritten, unfenced |
@@ -456,6 +456,7 @@ async fn create_op_within(
             &base_state(),
             fx.ext.clone(),
             operation,
+            &live_edit::storage::layer::CreateCommitMarker::new(),
         ),
     )
     .await
@@ -1346,6 +1347,74 @@ async fn orphan_sweep_whose_veto_the_store_refused_out_of_memory_leaves_the_obje
         oom_request_label(&fx).await,
         OOM_REQUESTER,
         "the refused veto requests the GC's out-of-memory collection, naming the sweep's replica"
+    );
+}
+
+/// b.g65 (D) T6: a `DeleteLayer` whose dead-object registration right after
+/// its unmap is refused out of memory (a full store refusing the write
+/// before the teardown freed any) still leaves the object registered: the
+/// success exit registers once more when the in-loop registration did not
+/// land.
+///
+/// The refusal is staged on the FIRST `EVALSHA` of `recon_claim_expired.lua` —
+/// the script `recon_register` runs, so the in-loop registration — and every
+/// later run passes through. The delete's client is the only client through
+/// the proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_layer_whose_dead_registration_is_refused_out_of_memory_registers_at_its_success_exit(
+) {
+    use fred::interfaces::SortedSetsInterface;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fx = fixture("bua9-dead-reg-oom").await;
+    let sha = live_edit::storage::external_values::RECON_CLAIM_EXPIRED_SCRIPT
+        .sha1()
+        .to_string();
+    let fired = Arc::new(AtomicBool::new(false));
+    let rule: ProxyRule = {
+        let fired = Arc::clone(&fired);
+        Arc::new(move |args: &[Vec<u8>]| {
+            let first_run = args.first()?.eq_ignore_ascii_case(b"EVALSHA")
+                && args.get(1).is_some_and(|a| a.as_slice() == sha.as_bytes())
+                && !fired.swap(true, Ordering::SeqCst);
+            first_run.then(|| {
+                ProxyAction::Eval(error_reply_script(
+                    "OOM command not allowed when used memory > 'maxmemory'.",
+                ))
+            })
+        })
+    };
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+    let through = client_through(&proxy).await;
+    let store = LayerStore::new(through.clone(), fx.tv.key_schema().clone(), 4096)
+        .with_dead_object_registration(true);
+
+    tokio::time::timeout(
+        CALL_BUDGET,
+        store.delete_layer(&fx.session_id, fx.layer, fx.ext.clone()),
+    )
+    .await
+    .expect("the delete settles within its budget")
+    .expect("DeleteLayer succeeds although its first registration was refused");
+
+    assert_eq!(
+        proxy.hits(),
+        1,
+        "precondition: exactly the first registration run met the staged refusal"
+    );
+    let registered: Option<f64> = fx
+        .tv
+        .client()
+        .pool
+        .zscore(
+            fx.tv.key_schema().checkpoint_reconcile_dead(),
+            fx.object_id.to_string(),
+        )
+        .await
+        .expect("ZSCORE must succeed");
+    assert!(
+        registered.is_some(),
+        "the success exit's fallback registered the object the refused in-loop write did not"
     );
 }
 

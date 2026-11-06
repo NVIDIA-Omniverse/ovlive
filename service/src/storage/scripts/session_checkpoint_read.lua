@@ -191,10 +191,15 @@
 -- sparse array would silently drop every member after the first hole.
 -- Filtering keeps [4] and [5] aligned by construction and preserves the
 -- pre-existing skip-the-member behaviour, which is still reachable — NOT
--- as a torn read (atomicity rules that out) but as a genuine keyspace
--- state: `LayerStore::delete_layer` DELs the mapping several steps before
--- it SREMs the index member, so a concurrent build legitimately observes
--- an index member whose mapping is already gone. The count in [6] lets
+-- as a torn read (atomicity rules that out), and not from any current
+-- write path in a live session's index (`CreateLayer` writes the mapping
+-- and the member in one step, and `DeleteLayer`'s unmap removes both in
+-- one step), but from leftovers: a delete an older build interrupted
+-- between its mapping `DEL` and its index `SREM`, or an out-of-band write.
+-- The orphan sweep's clean-up of a session whose metadata is gone still
+-- sends its mapping `DEL` and its `SREM` separately and can be interrupted
+-- between them, but that session's metadata is absent, so this script
+-- returns early below and never reads its index. The count in [6] lets
 -- the caller log that without guessing.
 
 local ckpt_key   = KEYS[1]

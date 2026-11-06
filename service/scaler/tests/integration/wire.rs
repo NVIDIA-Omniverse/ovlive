@@ -88,6 +88,7 @@ fn a_snapshot_round_trips_under_its_wire_names() {
         cpu_seconds_total: Some(7.5),
         catchup_read_concurrency: 8,
         max_concurrent_catchups: 9,
+        held: true,
     };
     let json = serde_json::to_value(&written).expect("serializes");
     let names: BTreeSet<&str> = json
@@ -111,11 +112,28 @@ fn a_snapshot_round_trips_under_its_wire_names() {
             "cpu_seconds_total",
             "catchup_read_concurrency",
             "max_concurrent_catchups",
+            "held",
         ]),
         "the v1 field names are a contract between builds: additive only"
     );
     let read: ScalingSnapshot = serde_json::from_value(json).expect("parses back");
     assert_eq!(read, written);
+}
+
+/// `held` (SDD SR-7a) is add-only under v1: a body from an older pod, which
+/// has no hold and sends no `held`, reads as not held, so it never freezes
+/// the count; a body that sends it reads it.
+#[test]
+fn a_snapshot_without_held_reads_as_not_held() {
+    let older: ScalingSnapshot =
+        serde_json::from_str(r#"{ "version": 1, "ready": true, "catchups_pending": 3 }"#)
+            .expect("an older body must parse");
+    assert!(!older.held, "a pod that sends no `held` is not held");
+    let empty: ScalingSnapshot = serde_json::from_str("{}").expect("even an empty object");
+    assert!(!empty.held);
+    let held: ScalingSnapshot = serde_json::from_str(r#"{ "version": 1, "held": true }"#)
+        .expect("a body with `held` must parse");
+    assert!(held.held);
 }
 
 // ── LIVE_EDIT_SCALER_* ─────────────────────────────────────────────────────
@@ -276,7 +294,14 @@ fn parse_cpu_quantity_reads_cores_and_millicores_and_refuses_the_rest() {
 /// constants, so a rename shows up here as an operator-facing change.
 #[test]
 fn scaler_metric_vocabularies_are_pre_registered_at_zero_and_exactly_the_documented_ones() {
-    const REASONS: [&str; 5] = ["startup", "window", "unsettled", "interval", "feasibility"];
+    const REASONS: [&str; 6] = [
+        "held",
+        "startup",
+        "window",
+        "unsettled",
+        "interval",
+        "feasibility",
+    ];
     const STAGES: [&str; 5] = [
         "endpoints",
         "scale",
@@ -330,6 +355,7 @@ fn scaler_metric_vocabularies_are_pre_registered_at_zero_and_exactly_the_documen
         ("none", "at_target"),
         ("none", "scale_down_blocked"),
         ("none", "no_data"),
+        ("none", "held"),
     ] {
         assert_eq!(
             sample(

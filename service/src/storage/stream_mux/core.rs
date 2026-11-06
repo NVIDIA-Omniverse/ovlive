@@ -22,6 +22,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::observability::metrics::{
     OVERFLOW_BOUND_BYTES, OVERFLOW_BOUND_ENTRIES, STREAM_EXIT_INNER_WATCHDOG,
@@ -112,8 +113,10 @@ impl OverflowBound {
 
 /// Where one subscription's entries go.
 pub trait SubSink<P> {
-    /// Offers one entry of `bytes` bytes ([`Entry::bytes`]).
-    fn offer(&mut self, id: &str, payload: &P, bytes: u64) -> Offer;
+    /// Offers one entry of `bytes` bytes ([`Entry::bytes`]), with the tag the
+    /// reader gave its payload ([`Entry::relay_copy`]).
+    fn offer(&mut self, id: &str, payload: &P, bytes: u64, relay_copy: Option<NonZeroU64>)
+        -> Offer;
     /// Offers a trim marker, queued ahead of the entries the same reply then
     /// offers. `resumes_at` is the id of the key's first entry in that reply,
     /// whether or not it can be delivered (an entry that cannot be converted
@@ -142,6 +145,10 @@ pub struct Entry<P> {
     /// next read ([`ReaderCore::plan_read`]) and is what each subscription's
     /// byte backlog counts for the entry ([`SubSink::offer`]).
     pub bytes: u64,
+    /// The serial of the relay copy the payload carries, when the reader made
+    /// one (`storage::stream_mux::delivery_ledger::RelayCopy`): handed to
+    /// every sink offered the entry, and never read here.
+    pub relay_copy: Option<NonZeroU64>,
 }
 
 /// How [`ReaderCore::plan_read`] sizes a read's `COUNT` so that one reply
@@ -547,7 +554,7 @@ impl<P, S: SubSink<P>> ReaderCore<P, S> {
                         continue;
                     }
                     if let Some(p) = &e.payload {
-                        match st.sink.offer(&e.id_str, p, e.bytes) {
+                        match st.sink.offer(&e.id_str, p, e.bytes, e.relay_copy) {
                             Offer::Accepted => out.delivered += 1,
                             Offer::Closed => {
                                 dead.push((*sub_id, None));
@@ -649,7 +656,7 @@ mod tests {
     }
 
     impl SubSink<u32> for TestSink {
-        fn offer(&mut self, id: &str, _p: &u32, bytes: u64) -> Offer {
+        fn offer(&mut self, id: &str, _p: &u32, bytes: u64, _: Option<NonZeroU64>) -> Offer {
             if self.closed {
                 return Offer::Closed;
             }
@@ -700,6 +707,7 @@ mod tests {
                 id_str: format!("{ms}-0"),
                 payload: Some(ms as u32),
                 bytes: 0,
+                relay_copy: None,
             })
             .collect()
     }
@@ -713,6 +721,7 @@ mod tests {
                 id_str: format!("{ms}-0"),
                 payload: Some(ms as u32),
                 bytes,
+                relay_copy: None,
             })
             .collect()
     }

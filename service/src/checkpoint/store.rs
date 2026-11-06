@@ -153,12 +153,7 @@ impl CheckpointError {
     }
 
     /// True iff this is the listed-sidecar-absent `Transient` built by
-    /// [`Self::listed_sidecar_absent`].
-    ///
-    /// This is what lets the reconciliation collect phase
-    /// (`checkpointer::run_reconcile_collect`) qualify this one live-set
-    /// failure by who holds the checkpoint lease, while every other live-set
-    /// failure still counts unconditionally. Same reason as
+    /// [`Self::listed_sidecar_absent`]. Same reason as
     /// [`Self::is_missing_meta_companion`]: code must not branch on
     /// operator-facing wording.
     pub fn is_listed_sidecar_absent(&self) -> bool {
@@ -169,19 +164,120 @@ impl CheckpointError {
             _ => false,
         }
     }
+
+    /// Build the [`Transient`](CheckpointError::Transient) the pre-PUT
+    /// clean-up fence (`checkpoint::put_guard`) returns when a layer publish
+    /// must not PUT now. See [`CleanupInFlight`].
+    pub fn cleanup_in_flight(marker: CleanupInFlight) -> Self {
+        CheckpointError::Transient {
+            source: Box::new(marker),
+        }
+    }
+
+    /// True iff this is the clean-up deferral built by
+    /// [`Self::cleanup_in_flight`]. Every layer producer routes it to its own
+    /// non-error deferral instead of an adapter failure; code must not branch
+    /// on the operator-facing wording.
+    pub fn is_cleanup_in_flight(&self) -> bool {
+        match self {
+            CheckpointError::Transient { source } => {
+                source.downcast_ref::<CleanupInFlight>().is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// Build the [`Permanent`](CheckpointError::Permanent) every adapter
+    /// returns when an ext-refs sidecar's bytes do not parse. See
+    /// [`MalformedExtRefsSidecar`].
+    pub fn malformed_ext_refs_sidecar(artifact: String, source: serde_json::Error) -> Self {
+        CheckpointError::Permanent {
+            source: Box::new(MalformedExtRefsSidecar { artifact, source }),
+        }
+    }
 }
 
-/// What [`CheckpointStore::list_live_ext_set`] returns: the live ext-hash set
-/// and the evidence, from the same enumeration, that licenses deleting
-/// against it (b.oya).
+/// Typed marker carried as the `source` of the [`CheckpointError::Transient`]
+/// the pre-PUT clean-up fence (`checkpoint::put_guard`) returns when a layer
+/// publish must not PUT now (b.g65, SDD §22.17.5).
+///
+/// Three causes, named in `reason`: the checkpoint clean-up deleted the
+/// backup copy of a large value the generation names within the producer's
+/// reliance window, so the generation would name a copy that no longer exists;
+/// the clean-up is deleting an earlier copy of the same generation (its stem is
+/// announced on `le:ckpt:{recon}:deleting`), so a PUT now could be deleted
+/// under it; or the re-arm that must precede the PUT could not be recorded in
+/// Valkey, so the PUT would be unprotected (fail closed). Nothing was written.
+/// The producer defers without an error and retries on a later tick, when
+/// its own re-arm finds the window passed.
+///
+/// A type, not just a message, so each producer recognises it with
+/// [`CheckpointError::is_cleanup_in_flight`] and routes it to its own deferral
+/// outcome. `checkpointer::checkpoint_error_kind` still reports it as
+/// `transient`.
+#[derive(Debug, Clone)]
+pub struct CleanupInFlight {
+    /// Why the publish was deferred, for the operator log.
+    pub reason: String,
+}
+
+impl fmt::Display for CleanupInFlight {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "layer backup deferred while the checkpoint clean-up works on something it depends \
+             on: {}; nothing was written and a later tick retries",
+            self.reason
+        )
+    }
+}
+
+impl Error for CleanupInFlight {}
+
+/// Typed source of the [`CheckpointError::Permanent`] an adapter returns
+/// when an ext-refs sidecar's bytes do not parse, naming the sidecar (b.g65).
+///
+/// The artifact is the adapter-native address: the sidecar's URL on
+/// StorageApi, its path on LocalDisk, and its persisted name
+/// `<object_id>.<snap_seq>.ext-refs.json` on InMemory. The serde error is its
+/// [`Error::source`]. `Permanent` because the bytes are durable: a retry reads
+/// the same bytes.
+#[derive(Debug)]
+pub struct MalformedExtRefsSidecar {
+    /// Adapter-native address of the malformed sidecar.
+    pub artifact: String,
+    /// What the JSON parse said.
+    pub source: serde_json::Error,
+}
+
+impl fmt::Display for MalformedExtRefsSidecar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ext-refs sidecar {} is malformed: {}",
+            self.artifact, self.source
+        )
+    }
+}
+
+impl Error for MalformedExtRefsSidecar {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// What [`CheckpointStore::list_live_ext_set`] returns: the live ext-hash set,
+/// the evidence, from the same enumeration, that licenses deleting against it
+/// (b.oya), and the sidecars that enumeration listed but could not read
+/// (b.g65).
 ///
 /// Built only by the adapters' live-set walks and the trait's fail-closed
 /// default, read only by the reconciliation collect phase, never mutated,
 /// never persisted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LiveExtSet {
-    /// Every hash a stored base's ext-refs sidecar names — exactly what
-    /// [`CheckpointStore::list_referenced_ext_hashes`] returns.
+    /// Every hash a stored base's ext-refs sidecar names, of every listed
+    /// sidecar the walk could read.
     pub hashes: HashSet<String>,
     /// Layer artifacts (names [`parse_layer_artifact_filename`] accepts, any
     /// kind) that this walk's OWN enumeration named — the same request
@@ -189,40 +285,70 @@ pub struct LiveExtSet {
     /// cannot vouch for one (the trait default). An empty `hashes` licenses a
     /// delete only when this is non-zero.
     pub listed_layer_artifacts: usize,
+    /// The ext-refs sidecars this walk's own enumeration named and that then
+    /// read absent by address (a not-found), in no particular order. Their
+    /// hashes are missing from `hashes`, so the set is complete only when
+    /// this is empty: the collect skips an absent sidecar only on evidence
+    /// that skipping drops no reference a retained backup needs, and
+    /// otherwise deletes nothing that pass. Every other read failure aborts
+    /// the walk instead. Always empty from an adapter that reads under one
+    /// atomic view (InMemory).
+    pub absent: Vec<AbsentSidecar>,
+}
+
+/// One ext-refs sidecar a live-set walk listed and then read absent (b.g65).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsentSidecar {
+    /// The generation's object id.
+    pub object_id: u64,
+    /// The generation's sequence.
+    pub snap_seq: u64,
+    /// The same enumeration named that generation's `.ompf` too. When it did
+    /// not, the generation's publish was unfinished when the walk listed it.
+    pub base_listed: bool,
+    /// Adapter-native address of the sidecar, for the operator log — a
+    /// filesystem path on LocalDisk, an absolute URL on StorageApi.
+    pub artifact: String,
+}
+
+impl LiveExtSet {
+    /// The hashes, only when the walk read every sidecar it listed: the
+    /// [`CheckpointStore::list_referenced_ext_hashes`] answer, which is never
+    /// a partial set. An absent sidecar is the typed
+    /// [`CheckpointError::listed_sidecar_absent`] naming the first one.
+    pub fn into_complete_hashes(self) -> Result<HashSet<String>, CheckpointError> {
+        match self.absent.into_iter().next() {
+            None => Ok(self.hashes),
+            Some(absent) => Err(CheckpointError::listed_sidecar_absent(
+                ListedSidecarAbsent {
+                    artifact: absent.artifact,
+                },
+            )),
+        }
+    }
 }
 
 /// Typed marker carried as the `source` of the
 /// [`CheckpointError::Transient`] that
-/// [`CheckpointStore::list_referenced_ext_hashes`] and
-/// [`CheckpointStore::list_live_ext_set`] (one walk) return when an ext-refs
+/// [`CheckpointStore::list_referenced_ext_hashes`] returns when an ext-refs
 /// sidecar its own enumeration named reads absent by address.
 ///
 /// # Why an error, and why `Transient`
 ///
-/// Skipping the sidecar would drop its hashes from the live set, and an
-/// under-counted live set is an over-delete: the reconciliation collect phase
-/// deletes every tombstoned blob the set does not name. So the walk returns an
-/// error and never a partial set. It is `Transient` because the next pass
-/// lists again and reads a consistent store.
-///
-/// # What explains it
-///
-/// While another replica holds the checkpoint lease, that replica's
-/// lease-gated retention prune deletes sidecars as a matter of course, so a
-/// sidecar listed and then pruned under the walk is routine. While this
-/// replica still holds the lease, the absence is explained only by a deleter
-/// outside the lease (the base bootstrap's reap on a create/delete race, or
-/// `rollback_partial_publish`), a peer that led during the walk and then
-/// stopped refreshing the lock, or the store answering inconsistently (a stale
-/// not-found answer, or a listing that lags deletes).
+/// Skipping the sidecar would drop its hashes from the set, and that method
+/// never returns a partial set: an under-counted live set is an over-delete.
+/// It is `Transient` because the next read lists again. The live-set walk the
+/// reconciliation collect reads, [`CheckpointStore::list_live_ext_set`],
+/// reports such a sidecar in [`LiveExtSet::absent`] instead (b.g65), and the
+/// collect decides on evidence whether it may skip it;
+/// [`LiveExtSet::into_complete_hashes`] turns a report back into this error.
 ///
 /// # Why it is a type and not just a message
 ///
-/// [`CheckpointError::is_listed_sidecar_absent`] downcasts to this, which is
-/// how the collect phase tells this failure apart from every other live-set
-/// failure and qualifies it by lease ownership, without string-matching an
-/// operator-facing message. `checkpointer::checkpoint_error_kind` still reports
-/// it as `transient`.
+/// [`CheckpointError::is_listed_sidecar_absent`] downcasts to this, so a
+/// caller can tell this failure apart from every other one without
+/// string-matching an operator-facing message.
+/// `checkpointer::checkpoint_error_kind` still reports it as `transient`.
 #[derive(Debug, Clone)]
 pub struct ListedSidecarAbsent {
     /// Adapter-native address of the sidecar that was listed and then read
@@ -1153,12 +1279,13 @@ impl FromStr for CheckpointAdapter {
 ///   answers *every* method with it, so a caller that drives a checkpoint path
 ///   while checkpointing is switched off surfaces a classified error rather
 ///   than a silent success or a fabricated `Ok(None)`.
-/// - **Three trait defaults:** [`CheckpointStore::get_layer_checkpoint`],
-///   [`CheckpointStore::list_session_checkpoint_ids`] and
-///   [`CheckpointStore::ext_blob_exists`]. They exist only to keep non-adapter
-///   impls compiling across each method's introduction. Every real adapter and
-///   every forwarding decorator overrides all three; inheriting one is a bug,
-///   and this variant is what makes that bug loud.
+/// - **Four trait defaults:** [`CheckpointStore::get_layer_checkpoint`],
+///   [`CheckpointStore::list_session_checkpoint_ids`],
+///   [`CheckpointStore::ext_blob_exists`] and
+///   [`CheckpointStore::verify_list_route`]. They exist only to keep
+///   non-adapter impls compiling across each method's introduction. Every
+///   real adapter and every forwarding decorator overrides all four;
+///   inheriting one is a bug, and this variant is what makes that bug loud.
 ///
 /// A real adapter MUST NOT return it from any other method — the
 /// session-checkpoint methods **included**. All three adapters implement
@@ -1694,7 +1821,12 @@ pub trait CheckpointStore: Send + Sync + 'static {
     ///
     /// # The answer — MUST
     ///
-    /// - `Ok(true)` only when the bytes are stored.
+    /// - `Ok(true)` only when the store answered that the bytes are stored.
+    ///   That answer can be stale too: the storage-api backend can serve a
+    ///   cached present answer for bytes deleted since, for up to the same
+    ///   cache TTL as below (`Config::checkpoint_storage_api_not_found_cache_secs`
+    ///   covers both directions; SDD §22.16 states what each reader is left
+    ///   with).
     /// - `Ok(false)` only when the store answered that they are not (no such
     ///   key, file or object). That answer is not proof of absence:
     ///   `Ok(false)` may be stale for up to the storage cache TTL. The
@@ -1705,9 +1837,11 @@ pub trait CheckpointStore: Send + Sync + 'static {
     ///   read absent on another pod. Callers therefore never act on absence
     ///   alone in a way a wrong answer would make lossy: the backup repair
     ///   answers it with an upload of the same bytes, which at worst repeats
-    ///   one already stored; the DR restore Job that will call it carries the
-    ///   rule as t1.tv3.s9 defer-6(d) (the sidecar reads, as t1.tv3.gk
-    ///   defer-12).
+    ///   one already stored; the DR restore Job's coverage check
+    ///   (`dr::job::plan::coverage`) counts a `false` as uncovered only when
+    ///   it was answered at or after `T_safe`, and checks one answered
+    ///   earlier once more then (t1.tv3.s9 defer-6(d); the sidecar reads, as
+    ///   t1.tv3.gk defer-12).
     /// - An error in every other case. The Job counts an error as "unknown",
     ///   never as "absent", so an adapter MUST NOT fold an indeterminate
     ///   backend answer into `Ok(false)` — that would let the Job strip a
@@ -1782,6 +1916,11 @@ pub trait CheckpointStore: Send + Sync + 'static {
     /// carried as t1.tv3.gk defer-12, beside t1.tv3.s9 defer-6(d) for the DR
     /// restore Job.
     ///
+    /// A returned body can be stale the same way: the backend can serve the
+    /// sidecar's earlier body for up to the same cache TTL after a later write
+    /// (`Config::checkpoint_storage_api_not_found_cache_secs` covers both
+    /// directions; SDD §22.16).
+    ///
     /// Errors:
     /// - [`CheckpointError::Transient`] / [`CheckpointError::Permanent`] —
     ///   classified per the trait-level error contract.
@@ -1853,27 +1992,32 @@ pub trait CheckpointStore: Send + Sync + 'static {
     /// [`Self::put_layer_checkpoint`]'s sidecar-first obligation, sidecar-driven
     /// enumeration is what shrinks that window to the publish gap.
     ///
-    /// # A listed sidecar that reads absent is an error — MUST
+    /// # A listed sidecar that reads absent is never skipped silently — MUST
     ///
     /// An adapter that reads a sidecar its own enumeration named, and then
-    /// finds it absent, **MUST** return the typed error
-    /// [`CheckpointError::listed_sidecar_absent`] (a `Transient` carrying a
-    /// [`ListedSidecarAbsent`] naming the artifact) and **MUST NOT** skip it.
-    /// Skipping drops that sidecar's hashes from the live set, and an
-    /// under-counted live set is an over-delete: the reconciliation collect
-    /// phase deletes every tombstoned blob the set does not name, which can be
-    /// a blob a retained backup still references. A partial set is never
-    /// returned. The marker must be the typed one, not just an equivalent
-    /// message: the collect phase recognises it with
-    /// [`CheckpointError::is_listed_sidecar_absent`] and qualifies it by who
-    /// holds the checkpoint lease. It always deletes nothing that pass; it
-    /// counts the abort as a live-set failure only while this replica still
-    /// holds the lease, because while a peer holds it that peer's lease-gated
-    /// retention prune explains the absence routinely. The next pass re-lists.
-    /// The rule binds [`Self::list_live_ext_set`] equally — it is the same
-    /// walk. Forwarding decorators pass the error through untouched. An adapter
-    /// that enumerates and reads under one atomic view (InMemory's single
-    /// lock) cannot observe the condition and needs no arm for it. This is not
+    /// finds it absent, **MUST NOT** drop it silently: skipping drops that
+    /// sidecar's hashes from the live set, and an under-counted live set is an
+    /// over-delete — the reconciliation collect deletes every tombstoned blob
+    /// the set does not name, which can be a blob a retained backup still
+    /// references.
+    ///
+    /// - [`Self::list_live_ext_set`] **MUST** report it in
+    ///   [`LiveExtSet::absent`] — naming the generation, the sidecar's
+    ///   address, and whether the same enumeration named that generation's
+    ///   `.ompf` — and continue the walk (b.g65). The collect skips such a
+    ///   sidecar only on evidence: the listing named no `.ompf` for it (its
+    ///   publish was unfinished when listed), or a deleter announced the
+    ///   generation's deletion on `le:ckpt:{recon}:deleting` before deleting
+    ///   it. Any other absence deletes nothing that pass. Every other read
+    ///   failure still aborts the walk: a partial set is never returned.
+    /// - [`Self::list_referenced_ext_hashes`] **MUST** return the typed
+    ///   error [`CheckpointError::listed_sidecar_absent`] (a `Transient`
+    ///   carrying a [`ListedSidecarAbsent`] naming the artifact) instead:
+    ///   [`LiveExtSet::into_complete_hashes`].
+    ///
+    /// Forwarding decorators pass both through untouched. An adapter that
+    /// enumerates and reads under one atomic view (InMemory's single lock)
+    /// cannot observe the condition and reports none. This is not
     /// [`Self::read_ext_refs_sidecar`]'s rule: that per-handle read is not
     /// driven by a listing, so an absent sidecar there is `Ok` and empty.
     ///
@@ -1938,12 +2082,16 @@ pub trait CheckpointStore: Send + Sync + 'static {
 
     /// The live ext-hash set together with the evidence that licenses
     /// deleting against it: how many layer artifacts the walk's **own**
-    /// enumeration named (b.oya, SDD §22.17.3 obligation 5, §22.17.5).
+    /// enumeration named (b.oya, SDD §22.17.3 obligation 5, §22.17.5), and
+    /// which listed sidecars read absent (b.g65).
     ///
-    /// `hashes` is exactly what [`Self::list_referenced_ext_hashes`] returns,
-    /// and every obligation on that method — sidecar-driven, a listed sidecar
-    /// that reads absent is the typed [`ListedSidecarAbsent`] error, tails
-    /// structurally invisible, never a partial set — binds this one equally.
+    /// Every obligation on [`Self::list_referenced_ext_hashes`] —
+    /// sidecar-driven, tails structurally invisible, never a partial set —
+    /// binds this one equally, except that a listed sidecar that reads absent
+    /// is reported in [`LiveExtSet::absent`] rather than returned as an error
+    /// (see that method's "never skipped silently" rule). `hashes` together
+    /// with an empty `absent` is exactly what
+    /// [`Self::list_referenced_ext_hashes`] returns.
     /// `listed_layer_artifacts` is the number of names in that same
     /// enumeration that [`parse_layer_artifact_filename`] accepts, of any
     /// kind.
@@ -1964,7 +2112,8 @@ pub trait CheckpointStore: Send + Sync + 'static {
     /// An adapter that overrides [`Self::list_referenced_ext_hashes`] **MUST**
     /// override this method too, producing both fields from **one**
     /// enumeration, and its `list_referenced_ext_hashes` then becomes
-    /// `Ok(self.list_live_ext_set().await?.hashes)`. The count is positive
+    /// `self.list_live_ext_set().await?.into_complete_hashes()`. The count is
+    /// positive
     /// evidence: a path that cannot produce it from the actual listing MUST
     /// report 0.
     ///
@@ -1987,6 +2136,7 @@ pub trait CheckpointStore: Send + Sync + 'static {
         Ok(LiveExtSet {
             hashes: self.list_referenced_ext_hashes().await?,
             listed_layer_artifacts: 0,
+            absent: Vec::new(),
         })
     }
 
@@ -2185,6 +2335,50 @@ pub trait CheckpointStore: Send + Sync + 'static {
     ) -> Result<usize, CheckpointError> {
         let _ = (object_id, snap_seq);
         Ok(0)
+    }
+
+    // ---- DR list-route canary ------------------------------------------------
+
+    /// Prove, with this call's own requests, that the backend's listing route
+    /// works: that an object written now is listed back (b.oya S2, SDD
+    /// SR-9.3).
+    ///
+    /// The disaster recovery Jobs (`crate::dr::job`) call it once per run,
+    /// after their write permit opens and before they trust any empty or short
+    /// listing. A backend whose by-address route answers while its listing
+    /// route does not — a 404 on every listing, read as "empty" — would
+    /// otherwise turn every backup into an absence, while the counters
+    /// sidecar, read by address, still reads present.
+    ///
+    /// # The answer — MUST
+    ///
+    /// - `Ok(())` only when an object this call wrote was listed back by
+    ///   every listing route the adapter's own listings use.
+    /// - An error otherwise. A `Transient` error is a backend fault worth
+    ///   retrying; any other error means the listing route is not proven,
+    ///   and the Jobs treat it as a failed canary.
+    /// - It may write: an adapter whose listing is a separate route writes a
+    ///   small object under `<base>/.live-edit/dr-canary/`, never under
+    ///   `layers/`, `sessions/` or `ext/`, and deletes it best-effort. An
+    ///   adapter whose listing has no separate route (a directory read, an
+    ///   in-process map) answers `Ok(())` without any I/O.
+    ///
+    /// # Default impl — treat inheriting it as a bug in any real adapter
+    ///
+    /// The default returns [`CheckpointError::NotImplemented`] with
+    /// `method: "verify_list_route"`. Every shipped adapter overrides it, and
+    /// **any decorator / wrapper `CheckpointStore` MUST forward this method to
+    /// its inner store** wherever it forwards the listing methods. `Ok(())`
+    /// would be the wrong default: a decorator that forgot to forward would
+    /// vouch for a listing route nobody checked.
+    ///
+    /// Errors:
+    /// - [`CheckpointError::Transient`] / [`CheckpointError::Permanent`] —
+    ///   classified per the trait-level error contract.
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        Err(CheckpointError::NotImplemented {
+            method: "verify_list_route",
+        })
     }
 
     /// This adapter's own upper bound on the wall-clock cost of publishing

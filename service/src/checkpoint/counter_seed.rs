@@ -60,22 +60,26 @@
 //! every exit path **except** the [`SeedError::Store`] arm — the adapter
 //! fetch itself failed and the operator signal is the readiness gate (the
 //! main.rs-wiring Subtask) or the repair's own outcome counter, not a
-//! histogram sample. Observation is gated by an inline `impl Drop` guard so
-//! the metric still fires on the `ParseFailed` error path (where the
-//! duration is operationally meaningful: an operator can correlate the
-//! elapsed time against an oversized / malformed sidecar) and on the
-//! [`SeedError::Seed`] arm (where the EVAL round-trip actually happened).
+//! histogram sample — and the [`SeedError::Held`] arm, where the hold write
+//! fence stopped the routine before any write and the repair's outcome
+//! counter and its INFO line are the record. Observation is gated by an
+//! inline `impl Drop` guard so the metric still fires on the `ParseFailed`
+//! error path (where the duration is operationally meaningful: an operator
+//! can correlate the elapsed time against an oversized / malformed sidecar)
+//! and on the [`SeedError::Seed`] arm (where the EVAL round-trip actually
+//! happened).
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::checkpoint::counters::CountersSidecar;
 use crate::checkpoint::store::{CheckpointError, CheckpointStore};
 use crate::config::Config;
-use crate::error::ServiceError;
+use crate::error::{RefusalDetail, ServiceError};
 use crate::observability::metrics::SharedMetrics;
 use crate::storage::counters::{CounterStore, ObjectIdCounterRepair};
 
@@ -123,6 +127,14 @@ impl SeedTrigger {
 /// was already at-or-above `seed` (a previous replica's writes survived,
 /// or some other replica won the startup race first). The counter is
 /// unchanged; `existing` is its observed value.
+///
+/// A present answer can be stale too: the sidecar body the seed reads can be
+/// a cached earlier, lower one, for up to
+/// `Config::checkpoint_storage_api_not_found_cache_secs` after a later write.
+/// `Seeded` and `NoOp` are then judged against that lower floor, so the seed
+/// can leave the counter below the true floor, bounded only by the safety
+/// margin. The seed takes it at its word: the residual SDD §22.16 states for
+/// the on-access readers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedOutcome {
     /// The configured checkpoint adapter reported no counters-sidecar blob.
@@ -159,6 +171,13 @@ pub enum SeedOutcome {
 ///
 /// `Seed` — the [`CounterStore::seed_object_id_if_below`] EVAL itself
 /// failed (Valkey transport / Lua reply parse).
+///
+/// `Held` — the hold write fence (`checkpoint::hold_fence`) was closed: it
+/// closed during the sidecar fetch, or was found closed immediately before
+/// the conditional seed or the establish-at-zero `SET NX`, or before a
+/// re-send of either. Nothing more was sent. Reached only by the runtime
+/// repair, which passes a fence; the startup routine passes none. Histogram
+/// is NOT observed.
 #[derive(Debug, thiserror::Error)]
 pub enum SeedError {
     /// Adapter-side bytes fetch failed.
@@ -172,12 +191,16 @@ pub enum SeedError {
     /// `CounterStore::seed_object_id_if_below` EVAL failed.
     #[error("counter store error while seeding: {0}")]
     Seed(#[from] ServiceError),
+    /// The hold write fence refused the seed; nothing was written. See the
+    /// enum doc.
+    #[error("{}", crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL)]
+    Held,
 }
 
 /// RAII guard that observes the `live_edit_checkpoint_counter_seed_secs`
 /// histogram on drop iff `armed` is `true`. Set `armed = false` on the
-/// [`SeedError::Store`] exit path; every other exit path leaves the guard
-/// armed and the histogram fires on scope exit.
+/// [`SeedError::Store`] and [`SeedError::Held`] exit paths; every other exit
+/// path leaves the guard armed and the histogram fires on scope exit.
 ///
 /// `phase` is [`SeedTrigger::label`] — the label that keeps startup samples
 /// and runtime-repair samples in separate series.
@@ -210,7 +233,8 @@ impl Drop for ObserveOnDrop<'_> {
 ///
 /// The routine observes `live_edit_checkpoint_counter_seed_secs` on every
 /// exit path except [`SeedError::Store`] (the fetch itself failed; the
-/// duration is not meaningful).
+/// duration is not meaningful). [`SeedError::Held`], also unobserved, cannot
+/// arise here: startup passes no hold write fence.
 ///
 /// See the module-level docstring for the rationale on every design
 /// choice — error variants, histogram-observation discipline, the
@@ -232,6 +256,9 @@ pub async fn seed_object_id_counter(
         // owns the startup budget (attempt-shaped, see
         // `COUNTER_SEED_RETRY_MAX_ATTEMPTS`), and nothing is waiting on an RPC
         // clock here.
+        None,
+        // No hold write fence at startup: it runs before the serving point,
+        // where a hold exits the process instead.
         None,
     )
     .await
@@ -255,6 +282,17 @@ pub async fn seed_object_id_counter(
 /// report a failed repair against a counter that in fact got seeded. An elapse
 /// lands on [`SeedError::Store`], the same arm a genuinely unreachable adapter
 /// takes, so no caller needs a third error shape.
+///
+/// `hold_fence` is the repair's hold write fence (`checkpoint::hold_fence`;
+/// `None` at startup): the fetch is raced against it, and it is checked again
+/// immediately before each counter write — the conditional seed and the
+/// establish-at-zero `SET NX` — and before every re-send of either: each
+/// attempt of `CounterStore`'s transient retry, and the seed's `NOSCRIPT`
+/// reload (`SCRIPT LOAD` and the re-sent `EVALSHA`). A closed fence refuses
+/// with [`SeedError::Held`], nothing more is sent, and the histogram is not
+/// observed. A counter write already sent when the fence closes is a single
+/// command and runs to its end within the Valkey command timeout
+/// (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`, assumed > 0).
 pub(crate) async fn seed_object_id_counter_inner(
     store: Arc<dyn CheckpointStore>,
     counters: Arc<CounterStore>,
@@ -262,6 +300,7 @@ pub(crate) async fn seed_object_id_counter_inner(
     metrics: SharedMetrics,
     trigger: SeedTrigger,
     fetch_budget: Option<Duration>,
+    hold_fence: Option<&CancellationToken>,
 ) -> Result<SeedOutcome, SeedError> {
     let mut observer = ObserveOnDrop {
         metrics: &metrics,
@@ -270,27 +309,38 @@ pub(crate) async fn seed_object_id_counter_inner(
         armed: true,
     };
 
-    let fetch = match fetch_budget {
-        None => store.get_counters_sidecar().await,
-        Some(budget) => match tokio::time::timeout(budget, store.get_counters_sidecar()).await {
-            Ok(result) => result,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    phase = trigger.label(),
-                    budget_ms = budget.as_millis() as u64,
-                    "counter-seed abandoned its counters-sidecar fetch at the configured fetch \
-                     budget; the adapter's own per-call ceiling is far longer than any caller \
-                     waits"
-                );
-                Err(CheckpointError::Transient {
-                    source: format!(
-                        "get_counters_sidecar exceeded the {}ms counter-seed fetch budget",
-                        budget.as_millis()
-                    )
-                    .into(),
-                })
+    let fetch = tokio::select! {
+        biased;
+        () = crate::checkpoint::hold_fence::closed(hold_fence) => {
+            // The hold write fence closed during the fetch: nothing was
+            // written, and the duration would describe an abandoned fetch,
+            // not seeding.
+            observer.armed = false;
+            return Err(SeedError::Held);
+        }
+        fetch = async {
+            match fetch_budget {
+                None => store.get_counters_sidecar().await,
+                Some(budget) => tokio::time::timeout(budget, store.get_counters_sidecar())
+                    .await
+                    .unwrap_or_else(|_elapsed| {
+                        tracing::warn!(
+                            phase = trigger.label(),
+                            budget_ms = budget.as_millis() as u64,
+                            "counter-seed abandoned its counters-sidecar fetch at the configured \
+                             fetch budget; the adapter's own per-call ceiling is far longer than \
+                             any caller waits"
+                        );
+                        Err(CheckpointError::Transient {
+                            source: format!(
+                                "get_counters_sidecar exceeded the {}ms counter-seed fetch budget",
+                                budget.as_millis()
+                            )
+                            .into(),
+                        })
+                    }),
             }
-        },
+        } => fetch,
     };
 
     let bytes = match fetch {
@@ -316,6 +366,12 @@ pub(crate) async fn seed_object_id_counter_inner(
         if trigger == SeedTrigger::Startup {
             tracing::warn!("counters sidecar absent; assuming AOF is providing durability");
         }
+        // The hold write fence, before the `SET NX` below: a held replica
+        // establishes nothing.
+        if crate::checkpoint::hold_fence::is_closed(hold_fence) {
+            observer.armed = false;
+            return Err(SeedError::Held);
+        }
         // b.b2j: establish `le:counter:object_id` at 0 so the key exists from
         // first boot. `next_object_id` fails closed on an absent counter, and
         // that verdict is only unambiguous ("the keyspace was lost") if the
@@ -336,7 +392,18 @@ pub(crate) async fn seed_object_id_counter_inner(
         // the caller re-runs the same `SET NX` and DOES propagate a failure,
         // because "the counter key exists" is that path's postcondition rather
         // than a deferrable nicety.
-        if let Err(e) = counters.initialize_object_id_counter_if_absent().await {
+        //
+        // Under the hold write fence, each attempt of the write's transient
+        // retry is checked again before it is sent; the fence's refusal is
+        // the hold's, never a swallowed store failure.
+        if let Err(e) = counters
+            .initialize_object_id_counter_if_absent_unless_held(hold_fence)
+            .await
+        {
+            if crate::storage::client::is_hold_fence_refusal(&e) {
+                observer.armed = false;
+                return Err(SeedError::Held);
+            }
             tracing::error!(
                 error = %e,
                 "counters sidecar absent and establishing le:counter:object_id at 0 failed; \
@@ -362,7 +429,26 @@ pub(crate) async fn seed_object_id_counter_inner(
     // and producing a tiny seed that would collide with the live counter.
     let seed = sidecar.max_object_id_observed.saturating_add(safety_margin);
 
-    let new_counter = counters.seed_object_id_if_below(seed).await?;
+    // The hold write fence, before the conditional seed below.
+    if crate::checkpoint::hold_fence::is_closed(hold_fence) {
+        observer.armed = false;
+        return Err(SeedError::Held);
+    }
+    // Under the fence, the seed's re-sends — its transient-retry attempts and
+    // a `NOSCRIPT` reload — are each checked again before they are sent. The
+    // fence's own refusal (nothing more sent) is the hold's; a failure of a
+    // copy already sent stays a seed failure.
+    let new_counter = match counters
+        .seed_object_id_if_below_unless_held(seed, hold_fence)
+        .await
+    {
+        Ok(new_counter) => new_counter,
+        Err(e) if crate::storage::client::is_hold_fence_refusal(&e) => {
+            observer.armed = false;
+            return Err(SeedError::Held);
+        }
+        Err(e) => return Err(SeedError::Seed(e)),
+    };
 
     // The Lua script returns `seed` iff it advanced (current was strictly
     // below seed); otherwise it returns the unchanged current value. The
@@ -487,27 +573,54 @@ type AttemptVerdict = Result<(), AttemptFailure>;
 
 /// A failed repair attempt, as each waiter answers it.
 ///
-/// Clonable (a message rather than a `ServiceError`) because every waiter on
-/// the same attempt receives its own copy through a `watch` channel. It
-/// carries no retry hint: the repair runs at a `CreateLayer`'s commit stage,
-/// where no refusal carries one — a store write refusal of a repair write
-/// answers the plain `create_commit` `UNAVAILABLE`
-/// (`storage::client::store_write_refusal`), so this message is all there is
-/// to keep.
+/// Clonable (a message and a detail rather than a `ServiceError`) because
+/// every waiter on the same attempt receives its own copy through a `watch`
+/// channel.
+///
+/// The repair runs before `CreateLayer`'s commit marker, so what a waiter
+/// answers is decided by the failure's own detail:
+/// - a store write refusal of a repair write (`CounterStore`'s `SET NX` or
+///   seed script) already answers `STORE_WRITE_REFUSED` with its `condition`
+///   and retry hint (`storage::client::refuse_store_write_hinted`); `detail`
+///   keeps it, and the handler's pre-commit choke point passes it through;
+/// - every other failure — a counter read, the checkpoint store, a sidecar
+///   parse, a transient write error — carries no detail, so the waiter
+///   answers a plain `UNAVAILABLE`, which the choke point answers carrying
+///   `UPSTREAM_UNAVAILABLE`.
 #[derive(Debug, Clone)]
 struct AttemptFailure {
     /// The operator-facing message of the `UNAVAILABLE`.
     message: String,
+    /// The refusal detail of the error the attempt failed on, when it carried
+    /// one (a store write refusal); `None` otherwise.
+    detail: Option<RefusalDetail>,
 }
 
 impl AttemptFailure {
+    /// A failure with no refusal detail.
     fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            detail: None,
+        }
     }
 
-    /// The `UNAVAILABLE` a waiter on this attempt answers.
+    /// A failure on `error`, keeping its refusal detail when it carries one.
+    fn from_error(message: String, error: &ServiceError) -> Self {
+        let detail = match error {
+            ServiceError::UnavailableWithDetail { detail, .. } => Some((**detail).clone()),
+            _ => None,
+        };
+        Self { message, detail }
+    }
+
+    /// The `UNAVAILABLE` a waiter on this attempt answers: carrying the
+    /// failure's refusal detail when it had one, plain otherwise.
     fn into_service_error(self) -> ServiceError {
-        ServiceError::Unavailable(self.message)
+        match self.detail {
+            Some(detail) => detail.into_unavailable_error(self.message),
+            None => ServiceError::Unavailable(self.message),
+        }
     }
 }
 
@@ -679,6 +792,11 @@ pub struct CheckpointObjectIdCounterRepair {
     /// `tokio::spawn`, and a caller cancelled while acquiring an async mutex
     /// would be one more way for a dropped `CreateLayer` future to matter.
     inflight: StdMutex<Option<watch::Receiver<Option<AttemptVerdict>>>>,
+    /// The hold write fence (`checkpoint::hold_fence`), cancelled at a
+    /// disaster-recovery hold's entry and at a stale hold verdict's; `None` unless
+    /// [`Self::with_hold_fence`] set it. Read only through
+    /// [`Self::hold_fence`].
+    hold_fence: Option<CancellationToken>,
 }
 
 impl CheckpointObjectIdCounterRepair {
@@ -698,7 +816,32 @@ impl CheckpointObjectIdCounterRepair {
             fetch_budget,
             wait_budget: WaitBudget::Fixed(wait_budget),
             inflight: StdMutex::new(None),
+            hold_fence: None,
         }
+    }
+
+    /// Set the hold write fence (SDD SR-6.2): `main.rs` passes the token the
+    /// hold and stale-verdict entry routines cancel. Once it is cancelled no attempt is spawned,
+    /// and a running attempt sends no counter write it has not sent already:
+    /// its sidecar fetch is raced against the token, and the token is checked
+    /// again immediately before the conditional seed and before each
+    /// `SET NX`, and before every re-send of either (a transient-retry
+    /// attempt, or the seed's `NOSCRIPT` reload). A counter write already
+    /// sent when it is cancelled is one command and runs to its end within
+    /// the Valkey command timeout (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`,
+    /// assumed > 0). A
+    /// refused caller or attempt answers the `UNAVAILABLE` a failed repair
+    /// already answers, ticks `failed` and logs one INFO line.
+    pub fn with_hold_fence(mut self, fence: CancellationToken) -> Self {
+        self.hold_fence = Some(fence);
+        self
+    }
+
+    /// The hold write fence, the one site every fence check of this repair
+    /// reads — the spawn check, the fetch race and the checks before each
+    /// counter write.
+    fn hold_fence(&self) -> Option<&CancellationToken> {
+        self.hold_fence.as_ref()
     }
 
     /// Re-derive the caller-side wait budget on every call from what is
@@ -798,6 +941,23 @@ impl CheckpointObjectIdCounterRepair {
             }
         }
 
+        // The hold write fence: once a hold or a stale verdict has closed
+        // it, no new attempt. The caller gets a finished verdict at once — the
+        // failure every caller of a failed attempt gets — counted as one
+        // `failed` repair, since no attempt runs to count it.
+        if crate::checkpoint::hold_fence::is_closed(self.hold_fence()) {
+            self.metrics.inc_object_id_counter_repair("failed");
+            tracing::info!(
+                "object-id counter repair not started: this replica entered a disaster-recovery \
+                 hold or lost contact with the store's hold state; CreateLayer fails with \
+                 UNAVAILABLE"
+            );
+            let (_tx, rx) = watch::channel(Some(Err(AttemptFailure::new(
+                crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.to_owned(),
+            ))));
+            return rx;
+        }
+
         let (tx, rx) = watch::channel(None);
         *slot = Some(rx.clone());
 
@@ -806,9 +966,17 @@ impl CheckpointObjectIdCounterRepair {
         let metrics = Arc::clone(&self.metrics);
         let safety_margin = self.safety_margin;
         let fetch_budget = self.fetch_budget;
+        let hold_fence = self.hold_fence().cloned();
         tokio::spawn(async move {
-            let verdict =
-                run_repair_attempt(store, counters, safety_margin, metrics, fetch_budget).await;
+            let verdict = run_repair_attempt(
+                store,
+                counters,
+                safety_margin,
+                metrics,
+                fetch_budget,
+                hold_fence,
+            )
+            .await;
             // Send failure means every waiter went away — the attempt still
             // ran and still recorded its outcome, which is the point.
             let _ = tx.send(Some(verdict));
@@ -825,12 +993,19 @@ impl CheckpointObjectIdCounterRepair {
 /// level that outcome's evidence earns. That total accounting is the reason
 /// this body is off the RPC clock: an attempt that is merely *abandoned* by its
 /// caller still lands here.
+///
+/// `hold_fence` is the repair's hold write fence
+/// ([`CheckpointObjectIdCounterRepair::with_hold_fence`]): a closed fence ends
+/// the attempt as `failed` before any counter write it has not sent yet,
+/// logged at INFO rather than ERROR — a refusal by the fence, not a repair
+/// failure.
 async fn run_repair_attempt(
     store: Arc<dyn CheckpointStore>,
     counters: Arc<CounterStore>,
     safety_margin: u64,
     metrics: SharedMetrics,
     fetch_budget: Duration,
+    hold_fence: Option<CancellationToken>,
 ) -> AttemptVerdict {
     // Re-check. A peer task — or a peer *replica* — that repaired while this
     // attempt was being scheduled has already re-seeded, so the counter is back
@@ -898,6 +1073,7 @@ async fn run_repair_attempt(
         metrics.clone(),
         SeedTrigger::Repair,
         Some(fetch_budget),
+        hold_fence.as_ref(),
     )
     .await;
 
@@ -942,7 +1118,37 @@ async fn run_repair_attempt(
             // `SET NX 0` best-effort; repeat it here so this attempt's
             // postcondition ("the counter key exists on Ok") does not depend on
             // that arm's swallowed error handling.
-            if let Err(e) = counters.initialize_object_id_counter_if_absent().await {
+            //
+            // The hold write fence first: a hold or stale-verdict entry since
+            // the inner arm's check stops this write too.
+            if crate::checkpoint::hold_fence::is_closed(hold_fence.as_ref()) {
+                metrics.inc_object_id_counter_repair("failed");
+                tracing::info!(
+                    "object-id counter repair stopped before establishing the counter: this \
+                     replica entered a disaster-recovery hold or lost contact with the store's \
+                     hold state; CreateLayer fails with UNAVAILABLE"
+                );
+                return Err(AttemptFailure::new(
+                    crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.to_owned(),
+                ));
+            }
+            // Each attempt of the write's transient retry is checked against
+            // the fence again before it is sent.
+            if let Err(e) = counters
+                .initialize_object_id_counter_if_absent_unless_held(hold_fence.as_ref())
+                .await
+            {
+                if crate::storage::client::is_hold_fence_refusal(&e) {
+                    metrics.inc_object_id_counter_repair("failed");
+                    tracing::info!(
+                        "object-id counter repair stopped before establishing the counter: this \
+                         replica entered a disaster-recovery hold or lost contact with the \
+                         store's hold state; CreateLayer fails with UNAVAILABLE"
+                    );
+                    return Err(AttemptFailure::new(
+                        crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.to_owned(),
+                    ));
+                }
                 // Same accounting argument as the `current_object_id` arm
                 // above: an attempt that returns without leaving a counter
                 // behind is a failed repair and must be booked as one, even
@@ -954,9 +1160,10 @@ async fn run_repair_attempt(
                      le:counter:object_id at 0; CreateLayer will fail with UNAVAILABLE rather \
                      than allocate a possibly-colliding id"
                 );
-                return Err(AttemptFailure::new(format!(
-                    "object-id counter repair could not establish the counter: {e}"
-                )));
+                return Err(AttemptFailure::from_error(
+                    format!("object-id counter repair could not establish the counter: {e}"),
+                    &e,
+                ));
             }
             metrics.inc_object_id_counter_repair("repaired_initialized");
             // WARN, not ERROR — and deliberately NOT a keyspace-loss claim.
@@ -979,6 +1186,22 @@ async fn run_repair_attempt(
             );
             Ok(())
         }
+        Err(SeedError::Held) => {
+            // The hold write fence stopped the seed — during the sidecar fetch
+            // or before a counter write — and nothing was written. Not a
+            // repair failure to triage: INFO, like the no-spawn refusal and
+            // the `Absent` arm's refusal, still booked `failed` because the
+            // attempt left no usable counter behind.
+            metrics.inc_object_id_counter_repair("failed");
+            tracing::info!(
+                "object-id counter repair stopped before writing the counter: this replica \
+                 entered a disaster-recovery hold or lost contact with the store's hold state; \
+                 CreateLayer fails with UNAVAILABLE"
+            );
+            Err(AttemptFailure::new(
+                crate::checkpoint::hold_fence::HOLD_FENCE_REFUSAL.to_owned(),
+            ))
+        }
         Err(e) => {
             metrics.inc_object_id_counter_repair("failed");
             tracing::error!(
@@ -986,9 +1209,14 @@ async fn run_repair_attempt(
                 "object-id counter repair failed; CreateLayer will fail with UNAVAILABLE \
                  rather than allocate a possibly-colliding id"
             );
-            Err(AttemptFailure::new(format!(
-                "object-id counter repair failed: {e}"
-            )))
+            let message = format!("object-id counter repair failed: {e}");
+            // Only the seed script's own error can be a store write refusal
+            // (`SeedError::Seed`); the checkpoint store's and the parse's
+            // carry no refusal detail.
+            Err(match &e {
+                SeedError::Seed(seed_error) => AttemptFailure::from_error(message, seed_error),
+                _ => AttemptFailure::new(message),
+            })
         }
     }
 }

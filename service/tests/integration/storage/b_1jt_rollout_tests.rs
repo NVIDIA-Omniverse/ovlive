@@ -922,6 +922,33 @@ impl ExternalValueStore for GcTaskStore {
         self.inner.probe_values(hashes).await
     }
 
+    // The catch-up payload's reads are defaulted on the trait: an omitted arm
+    // would substitute the default (a whole-value read) for the real store's
+    // own, so they delegate too.
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<live_edit::storage::external_values::ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
+    }
+
     async fn enqueue_retirement_attempt(
         &self,
         object_id: &str,

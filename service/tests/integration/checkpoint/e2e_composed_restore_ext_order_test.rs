@@ -312,13 +312,10 @@ struct StoreValuesProbe {
 /// `store_values` call together with an `EXISTS le:{oid}:obj:hdr` probe taken
 /// immediately before the delegation.
 ///
-/// **Every trait method is forwarded, including the defaulted
-/// `read_batch_with_recovery_counter`.** The warning on
-/// `helpers::DelegatingCheckpointStore` applies in spirit and in letter: an
-/// omitted arm on a *defaulted* method is not a missing pass-through, it is a
-/// silent behaviour substitution — `read_batch_with_recovery_counter`'s default
-/// body drops the SR-3.2 recovery counter on the floor, so a decorator that
-/// forgot it would quietly disable the counter for every caller under test.
+/// **Every trait method is forwarded.** The warning on
+/// `helpers::DelegatingCheckpointStore` applies here too: should the trait
+/// gain a *defaulted* method, an omitted arm for it is not a missing
+/// pass-through but a silent behaviour substitution, so forward it as well.
 struct RecordingExtValueStore {
     inner: Arc<dyn ExternalValueStore>,
     client: ValkeyClient,
@@ -399,24 +396,35 @@ impl ExternalValueStore for RecordingExtValueStore {
         self.inner.read_batch(hashes).await
     }
 
-    // Forwarded per the type's doc comment: this method has a TRAIT DEFAULT that
-    // drops the recovery counter, so omitting the arm would substitute
-    // behaviour rather than pass through.
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-    ) -> Result<HashMap<[u8; 32], Vec<u8>>, ServiceError> {
-        self.inner
-            .read_batch_with_recovery_counter(hashes, recovery_counter)
-            .await
-    }
-
     async fn probe_values(
         &self,
         hashes: &[[u8; 32]],
     ) -> Result<live_edit::storage::external_values::ExtValueProbe, ServiceError> {
         self.inner.probe_values(hashes).await
+    }
+
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<live_edit::storage::external_values::ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
     }
 
     async fn enqueue_retirement_attempt(

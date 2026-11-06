@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.venv*/
+# Reports a container run copies out (scripts/run-conformance-container.sh).
 reports/
-dist/
+# Left behind in existing checkouts by the retired Python suite's local environments.
+.venv*/
 .pytest_cache/
 .ruff_cache/
-__pycache__/

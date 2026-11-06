@@ -3,17 +3,27 @@
 """Bounded HTTP/2 fault proxy for local reference-service tests.
 
 Opaque frames stay byte-for-byte intact, including HPACK state; an ingress
-rejection answers from the static table and forwards the rejected header block
-before resetting it. A rejected client-streaming request, such as UpdateLayer,
-therefore starts its backend handler, which counts an attempt and is then
-cancelled; an authenticating ingress such as Envoy ext_authz forwards nothing.
-A rejected unary request never starts its handler, because its message never
-arrives. Injection occurs between complete header blocks; no headers or
-payload content enters evidence.
+rejection answers from the static table and forwards the rejected header block,
+which the backend's HPACK decoder must consume, with the INGRESS_REJECTED field
+appended in a final CONTINUATION, then resets the stream. The reference service parks a call that carries
+that field without running its handler until the reset cancels it, so a
+rejected request never reaches the service, as with an authenticating ingress
+such as Envoy ext_authz, which forwards nothing. Injection occurs between
+complete header blocks; no headers or payload content enters evidence.
 RFC 9113 sections 4.3, 6.4 and 6.8 define the boundaries/control frames:
 https://www.rfc-editor.org/rfc/rfc9113.html
 It terminates TLS when given a server context and forwards plaintext HTTP/2 to
 the backend; it is not an HPACK decoder or a general HTTP/2 implementation.
+
+With max_stream_age_ms it also limits stream age as an ingress does: each
+client stream records the stream clock when its HEADERS pass, and
+advance_stream_clock resets, in both directions, every stream that has reached
+the limit, on its own connection, which stays open. Frames of a reset stream
+that were in flight are dropped and their DATA's connection window returned to
+the sender, as an ingress that tracks stream state does, except header blocks,
+which still pass because the receiver's HPACK decoder must consume them. The stream clock moves only
+when a test advances it, so hours of stream age pass in one call and a stream
+ends exactly when the test chooses.
 """
 import asyncio
 from dataclasses import dataclass
@@ -72,6 +82,11 @@ INGRESS_RESPONSES = {
     'envoy': b'\x88' + _literal('content-type', 'application/grpc') + _literal('grpc-status', '16'),
 }
 
+# Ends each rejected header block the proxy forwards. A literal without indexing leaves the HPACK dynamic tables
+# unchanged; service.IngressRejected keys on the name.
+INGRESS_REJECTED = 'ovlive-test-ingress-rejected'
+INGRESS_REJECTED_FIELD = _literal(INGRESS_REJECTED, '1')
+
 
 async def read_frame(reader):
     try:
@@ -122,6 +137,10 @@ class Connection:
         self.server = None
         self.to_client, self.to_server = asyncio.Lock(), asyncio.Lock()
         self.active = set()
+        # Stream clock reading when each active stream's HEADERS passed.
+        self.opened = {}
+        # Streams the proxy reset at the stream-age limit.
+        self.aged = set()
         self.response_bytes = {}
         self.highest = 0
         self.draining = False
@@ -131,8 +150,15 @@ class Connection:
 
 
 class Http2Proxy:
-    def __init__(self, target, *, ssl_context=None):
+    def __init__(self, target, *, ssl_context=None, max_stream_age_ms=None, stream_age_code=8, record_frames=True):
+        """max_stream_age_ms limits stream age on the stream clock, ending each aged stream with
+        RST_STREAM(stream_age_code); record_frames false keeps only injected actions in the events, so a
+        long run stays within the evidence bound."""
+        if max_stream_age_ms is not None and (type(max_stream_age_ms) is not int or max_stream_age_ms < 1):
+            raise ValueError('invalid maximum stream age')
         self.target, self.ssl_context, self.connections, self.tasks = target, ssl_context, [], set()
+        self.max_stream_age_ms, self.stream_age_code, self.record_frames = max_stream_age_ms, stream_age_code, record_frames
+        self.stream_clock_ms = 0
         self.events, self.errors = [], []
         self.errors_dropped = 0
         self.ingress, self.rejected = [], {}
@@ -191,13 +217,23 @@ class Http2Proxy:
             self.changed.set()
         task.add_done_callback(retired)
 
+    @staticmethod
+    def forward_rejected(writer, frame):
+        """Forwards one frame of a rejected header block and ends the block with a CONTINUATION that carries the
+        INGRESS_REJECTED field; the reset that follows the block cancels the stream."""
+        if not frame.flags & 4:
+            writer.write(frame.encode())
+            return
+        writer.write(Frame(frame.kind, frame.flags & ~4, frame.stream, frame.payload).encode())
+        writer.write(Frame(9, 4, frame.stream, INGRESS_REJECTED_FIELD).encode())
+
     async def pump(self, connection, reader, writer, to_client):
         lock = connection.to_client if to_client else connection.to_server
         direction = 'client' if to_client else 'server'
         while group := await read_group(reader):
             # Streams this group opens and the proxy answers as the ingress, and
-            # the connection window of the DATA it drops on rejected streams,
-            # which returns to the sender: the client or the backend.
+            # the connection window of the DATA it drops on rejected and age-reset
+            # streams, which returns to the sender: the client or the backend.
             injected, refund = [], 0
             async with lock:
                 response_counts = []
@@ -209,11 +245,16 @@ class Http2Proxy:
                         connection.highest = frame.stream
                         self.rejected[(connection.id, frame.stream)] = self.ingress.pop(0)
                         injected.append(frame.stream)
-                        # The backend's HPACK decoder consumes the block; the reset cancels the stream.
-                        writer.write(frame.encode())
+                        self.forward_rejected(writer, frame)
                         continue
                     if not to_client and frame.kind == 9 and frame.stream in injected:
-                        writer.write(frame.encode())
+                        self.forward_rejected(writer, frame)
+                        continue
+                    if frame.stream in connection.aged and frame.kind not in (1, 9):
+                        if frame.kind == 0:
+                            refund += len(frame.payload)
+                        self.record(action='stream-age-drop', connection=connection.id, direction=direction,
+                                    kind=frame.kind, stream=frame.stream)
                         continue
                     if rejected:
                         if frame.kind == 0:
@@ -228,6 +269,7 @@ class Http2Proxy:
                             raise ValueError('invalid or over-capacity client stream')
                         connection.highest = frame.stream
                         connection.active.add(frame.stream)
+                        connection.opened[frame.stream] = self.stream_clock_ms
                         connection.response_bytes[frame.stream] = 0
                     if to_client and frame.kind == 0 and frame.stream in connection.active:
                         if frame.flags & 8:
@@ -235,6 +277,7 @@ class Http2Proxy:
                         response_counts.append((frame.stream, len(frame.payload)))
                     if frame.kind == 3 or to_client and frame.kind in (0, 1) and frame.flags & 1:
                         connection.active.discard(frame.stream)
+                        connection.opened.pop(frame.stream, None)
                         connection.response_bytes.pop(frame.stream, None)
                     if (not to_client and connection.draining and frame.kind == 6 and frame.stream == 0 and
                             frame.flags == 1 and frame.payload == connection.drain_ping):
@@ -242,8 +285,9 @@ class Http2Proxy:
                         # This PING was originated by the proxy, not the backend.
                         continue
                     writer.write(frame.encode())
-                    self.record(connection=connection.id, direction=direction,
-                                kind=frame.kind, flags=frame.flags, stream=frame.stream, size=len(frame.payload))
+                    if self.record_frames:
+                        self.record(connection=connection.id, direction=direction,
+                                    kind=frame.kind, flags=frame.flags, stream=frame.stream, size=len(frame.payload))
                 for stream in injected:
                     writer.write(reset(stream, 8).encode())
                 await writer.drain()
@@ -334,6 +378,7 @@ class Http2Proxy:
                     self.record(**record)
                     injected.append(record)
                 connection.active.clear()
+                connection.opened.clear()
                 connection.response_bytes.clear()
                 await connection.client.drain()
                 await connection.server.drain()
@@ -341,6 +386,41 @@ class Http2Proxy:
         if not injected:
             raise AssertionError('HTTP/2 reset fault had no live stream')
         return injected
+
+    async def advance_stream_clock(self, milliseconds):
+        """Moves the stream clock and ends every stream that reached max_stream_age_ms, as an ingress does.
+
+        Each aged stream is reset toward both the client and the backend; its
+        connection and every younger stream stay open. Returns the ended
+        streams, each with its age, in connection and stream order.
+        """
+        if self.max_stream_age_ms is None or type(milliseconds) is not int or milliseconds < 0:
+            raise ValueError('stream clock needs a maximum stream age and a nonnegative step')
+        self.stream_clock_ms += milliseconds
+        ended = []
+        for connection in tuple(self.connections):
+            if connection.closed or connection.server is None:
+                continue
+            async with connection.to_server, connection.to_client:
+                # Selected and marked under both locks, so pump drops each later frame of a reset stream.
+                aged = sorted(stream for stream in connection.active
+                              if self.stream_clock_ms - connection.opened[stream] >= self.max_stream_age_ms)
+                for stream in aged:
+                    raw = reset(stream, self.stream_age_code).encode()
+                    connection.client.write(raw)
+                    connection.server.write(raw)
+                    record = dict(action='stream-age', connection=connection.id, stream=stream,
+                                  code=self.stream_age_code, age_ms=self.stream_clock_ms - connection.opened.pop(stream))
+                    connection.active.discard(stream)
+                    connection.aged.add(stream)
+                    connection.response_bytes.pop(stream, None)
+                    self.record(**record)
+                    ended.append(record)
+                if aged:
+                    await connection.client.drain()
+                    await connection.server.drain()
+            self.changed.set()
+        return ended
 
     async def drain_to(self, target):
         """Announce graceful drain; existing RPCs stay on their original backend."""
@@ -360,6 +440,7 @@ class Http2Proxy:
 
     def snapshot(self):
         return dict(events=list(self.events), errors=list(self.errors), errors_dropped=self.errors_dropped,
+                    stream_clock_ms=self.stream_clock_ms, max_stream_age_ms=self.max_stream_age_ms,
                     connections=[dict(id=c.id, target=c.target, highest=c.highest, active=sorted(c.active),
                                       response_bytes=dict(c.response_bytes),
                                       draining=c.draining, closed=c.closed) for c in self.connections])

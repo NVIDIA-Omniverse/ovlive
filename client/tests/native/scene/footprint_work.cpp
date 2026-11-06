@@ -6,12 +6,9 @@
 // acknowledgment's application and the publication's comparison and reseat)
 // on layers that differ only in unedited prims, and compares the scene work
 // meter, not wall time.
+#include "footprint_work.h"
 #include "PersistentMap.h"
-#include "SceneJournal.h"
-#include "SceneWork.h"
 #include "SdfSceneData.h"
-#include "captured_log.h"
-#include <SHA256.h>
 #include <pxr/usd/sdf/data.h>
 #include <pxr/usd/sdf/schema.h>
 #include <algorithm>
@@ -24,15 +21,13 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 PXR_NAMESPACE_USING_DIRECTIVE
 using namespace omni::usd::live;
 using namespace omni::usd::live::wire;
 using namespace omni::usd::live::test;
-namespace {
-void require(bool condition, const std::string& message) {
-    if (!condition) throw std::runtime_error("footprint work: " + message);
-}
+namespace omni::usd::live::test::footprint {
 // Seeded edits of copies of one map agree with independent std::map copies and
 // never change another copy; the difference of two copies reports exactly the
 // keys one side lacks or whose values differ, each with both sides' values.
@@ -130,15 +125,6 @@ void persistentMapSeeds(uint64_t seed) {
     Map::difference(large, copy, [&](int, const int*, const int*) { ++changed; });
     require(changed == 3 && sceneWork::total() - start < 400, "the difference of two copies visited shared subtrees");
 }
-Command create(uint64_t id, uint64_t parent, const std::string& name, SdfSpecType type) {
-    Command result{};
-    result.kind = Command::Kind::Create;
-    result.section = id;
-    result.parent = parent;
-    result.name = name;
-    result.sectionType = uint8_t(type);
-    return result;
-}
 // Upper bounds of a field write's index comparisons per level of the layer's
 // index, through capture, compile, admission, acknowledgment and publication:
 // a turn that writes each attribute once, and one that rewrites them.
@@ -196,12 +182,6 @@ void specFieldSeeds(uint64_t seed) {
         agree(*data, oracle);
     }
 }
-// Building and copying a spec with `count` fields: a full wire build, an
-// update that adds the fields to an existing section, and a copy from
-// foreign data.
-struct FieldWork {
-    uint64_t build = 0, update = 0, copy = 0;
-};
 FieldWork fieldWork(size_t count) {
     EnvelopeInput structure;
     structure.commands.push_back(create(2, 1, "P", SdfSpecTypePrim));
@@ -214,14 +194,11 @@ FieldWork fieldWork(size_t count) {
     WireSceneLimits limits;
     limits.maxWork = size_t(1) << 40;
     FieldWork result;
-    auto start = sceneWork::total();
-    const auto built = buildSceneCandidate({}, encodeUsdEnvelope(metadata, values), limits);
-    result.build = sceneWork::total() - start;
+    WireScenePtr built, updated;
+    result.build = metered([&] { built = buildSceneCandidate({}, encodeUsdEnvelope(metadata, values), limits); });
     const auto empty = buildSceneCandidate({}, encodeUsdEnvelope(structure, {}), limits);
     metadata.commands.clear();
-    start = sceneWork::total();
-    const auto updated = buildSceneCandidate(empty, encodeUsdEnvelope(metadata, values), limits);
-    result.update = sceneWork::total() - start;
+    result.update = metered([&] { updated = buildSceneCandidate(empty, encodeUsdEnvelope(metadata, values), limits); });
     const SdfPath path("/P");
     require(built->data()->List(path).size() == count && updated->data()->List(path).size() == count &&
             updated->data()->Get(path, TfToken("f" + std::to_string(count - 1))) == VtValue(int(count - 1)),
@@ -229,9 +206,7 @@ FieldWork fieldWork(size_t count) {
     auto foreign = TfCreateRefPtr(new SdfData);
     foreign->CopyFrom(built->data());
     auto copy = TfCreateRefPtr(new SdfSceneData);
-    start = sceneWork::total();
-    copy->CopyFrom(foreign);
-    result.copy = sceneWork::total() - start;
+    result.copy = metered([&] { copy->CopyFrom(foreign); });
     require(copy->List(path).size() == count, "a copy of a spec with many fields lost some");
     return result;
 }
@@ -241,134 +216,18 @@ FieldWork fieldWork(size_t count) {
 void fieldsOfOneSpec() {
     const size_t small = 512, large = 8192;
     const auto a = fieldWork(small), b = fieldWork(large);
-    std::cout << "footprint_work fields=" << small << " build=" << a.build << " update=" << a.update
-              << " copy=" << a.copy << "; fields=" << large << " build=" << b.build << " update=" << b.update
-              << " copy=" << b.copy << std::endl;
+    std::cout << "footprint_work fields=" << small << " build=" << a.build.work << " update=" << a.update.work
+              << " copy=" << a.copy.work << "; fields=" << large << " build=" << b.build.work
+              << " update=" << b.update.work << " copy=" << b.copy.work << std::endl;
     const auto linear = [&](uint64_t x, uint64_t y, const char* what) {
         require(y <= 2 * (large / small) * x + 1024,
             std::string(what) + " work grows faster than its spec's field count: " + std::to_string(x) + " at " +
                 std::to_string(small) + " fields, " + std::to_string(y) + " at " + std::to_string(large) + " fields");
     };
-    linear(a.build, b.build, "a wire build of one spec's fields");
-    linear(a.update, b.update, "an update of one section's fields");
-    linear(a.copy, b.copy, "a foreign copy of one spec's fields");
+    linear(a.build.work, b.build.work, "a wire build of one spec's fields");
+    linear(a.update.work, b.update.work, "an update of one section's fields");
+    linear(a.copy.work, b.copy.work, "a foreign copy of one spec's fields");
 }
-// Children of /R, the parent whose order a structural turn changes.
-constexpr size_t kReorderChildren = 64;
-// `prims` unedited prims /U<i>, each with attributes a, b and c holding a
-// default and two time samples, beside the edited prim /E with attributes x
-// and y and the prim /R with kReorderChildren child prims /R/K<i>:
-// 4 * prims + kReorderChildren + 5 specs.
-WireScenePtr scene(size_t prims) {
-    EnvelopeInput metadata;
-    DecodedValues values;
-    uint64_t next = 2;
-    const auto prim = [&](const std::string& name, const std::array<const char*, 3>& attributes) {
-        const auto id = next++;
-        metadata.commands.push_back(create(id, 1, name, SdfSpecTypePrim));
-        for (const auto* attribute : attributes) {
-            if (!attribute) continue;
-            const auto child = next++;
-            metadata.commands.push_back(create(child, id, attribute, SdfSpecTypeAttribute));
-            metadata.fields.push_back({child, 0, "default", {}});
-            values.fields.push_back(VtValue(double(child)));
-            metadata.samples.push_back({child, 0.0, {}});
-            values.samples.push_back(VtValue(1.0));
-            metadata.samples.push_back({child, 1.0, {}});
-            values.samples.push_back(VtValue(2.0));
-        }
-    };
-    prim("E", {"x", "y", nullptr});
-    const auto reordered = next++;
-    metadata.commands.push_back(create(reordered, 1, "R", SdfSpecTypePrim));
-    for (size_t i = 0; i < kReorderChildren; ++i)
-        metadata.commands.push_back(create(next++, reordered, "K" + std::to_string(i), SdfSpecTypePrim));
-    for (size_t i = 0; i < prims; ++i) prim("U" + std::to_string(i), {"a", "b", "c"});
-    WireSceneLimits limits;
-    limits.maxWork = size_t(1) << 40;
-    return buildSceneCandidate({}, encodeUsdEnvelope(metadata, values), limits);
-}
-struct Effect {
-    std::shared_ptr<const SceneJournal::Intent> intent;
-};
-// One layer's journal, actor progress and host projection, as a live layer
-// holds them.
-struct Layer {
-    WireScenePtr initial;
-    SceneJournal journal;
-    LayerProgress progress;
-    LayerProgress::ReadCursor read;
-    PXR_NS::TfRefPtr<HostSceneProjection> projection;
-    uint64_t sequence = 10;
-    explicit Layer(WireScenePtr scene)
-        : initial(std::move(scene)), journal(initial, 10, {}), progress({1, "session", "layer", "writer", 1}, 10, initial, 128, 1000),
-          projection(recordingBacking(initial)) {
-        read = progress.startRead();
-        require(progress.caughtUp(read.generation, read.object, 10).accepted, "progress did not become ready");
-    }
-    SceneJournal::Submit submitter() {
-        return [this](std::string_view, std::shared_ptr<const SceneJournal::Intent> intent,
-                   LayerProgress::Publication publication) {
-            const auto retainedBytes = intent->retainedBytes;
-            return progress.admit(std::make_shared<const Effect>(Effect{std::move(intent)}), publication, retainedBytes);
-        };
-    }
-    LayerProgress::Work retained(uint64_t id) const {
-        for (const auto& work : progress.retained())
-            if (work.id == id) return work;
-        throw std::runtime_error("footprint work: missing retained progress work");
-    }
-    // The publication job: compare the visible scene with the host's baseline
-    // and reseat the projection when they differ.
-    void publish() {
-        const auto visible = journal.snapshot()->visible;
-        const auto& baseline = projection->baseline();
-        const auto difference =
-            baseline == visible ? WireSceneDifference{} : diffProjectedScenes(*baseline, *visible);
-        if (projection->keepsBaseline(visible, difference)) return;
-        projection->reseat(projection->prepareReseat(visible, difference));
-    }
-    // One host turn that authors `author` and publishes its acknowledgment.
-    void turn(const std::function<void(SdfAbstractData&)>& author) {
-        author(*projection);
-        const auto edits = projection->pendingLocalEdits();
-        const auto sealed = std::make_shared<const SdfOperationLog>(SdfOperationLog{edits.data, edits.operations});
-        WireScenePtr applied;
-        const auto id = journal.submitCaptured(edits.base, sealed, submitter(), &applied);
-        require(id != 0 && applied, "the turn admitted nothing");
-        projection->acceptLocalEdits(edits.operations->size(), applied);
-        require(progress.takeWrite().id == id, "the turn was not issued");
-        progress.completeWrite(id, OMNI_USD_LIVE_OK, ++sequence);
-        const auto work = retained(id);
-        const auto intent = std::static_pointer_cast<const Effect>(work.owner)->intent;
-        journal.apply(work, intent->bytes, intent);
-        progress.applied(id);
-        publish();
-    }
-    // A peer's field update to `path`'s default, applied and published.
-    void peer(uint64_t section, double value) {
-        EnvelopeInput metadata;
-        metadata.fields = {{section, 0, "default", {}}};
-        peer(encodeUsdEnvelope(metadata, DecodedValues{{VtValue(value)}, {}}));
-    }
-    // A peer's update, applied and published.
-    void peer(const std::string& bytes) {
-        auto owner = std::make_shared<const std::string>(bytes);
-        LayerProgress::ContentHash hash{};
-        computeSHA256(bytes.data(), bytes.size(), hash.data());
-        const auto id = progress.acceptCoverage(read.generation, read.object, sequence + 1, sequence + 1, {owner, hash});
-        require(id != 0, "peer coverage was not retained");
-        ++sequence;
-        journal.apply(retained(id), bytes);
-        progress.applied(id);
-        publish();
-    }
-};
-struct Work {
-    uint64_t field = 0, samples = 0, peer = 0, structure = 0;
-    // Host structural turns.
-    uint64_t create = 0, rename = 0, reparent = 0, reorder = 0, erase = 0;
-};
 // The prim children `parent` lists.
 std::vector<TfToken> primChildren(const SdfAbstractData& data, const SdfPath& parent) {
     const auto value = data.Get(parent, SdfChildrenKeys->PrimChildren);
@@ -430,20 +289,18 @@ Work measure(size_t prims) {
     // every later turn of a live layer finds it.
     layer.turn([&](SdfAbstractData& data) { data.Set(x, SdfFieldKeys->Default, VtValue(-1.0)); });
     Work result;
-    auto start = sceneWork::total();
-    for (int i = 0; i < 4; ++i)
-        layer.turn([&](SdfAbstractData& data) { data.Set(x, SdfFieldKeys->Default, VtValue(double(i))); });
-    result.field = sceneWork::total() - start;
-    start = sceneWork::total();
-    layer.turn([&](SdfAbstractData& data) {
-        data.SetTimeSample(x, 2.0, VtValue(3.0));
-        data.EraseTimeSample(x, 0.0);
-        data.Set(SdfPath("/E"), SdfFieldKeys->Documentation, VtValue(std::string("edited")));
+    result.field = metered([&] {
+        for (int i = 0; i < 4; ++i)
+            layer.turn([&](SdfAbstractData& data) { data.Set(x, SdfFieldKeys->Default, VtValue(double(i))); });
     });
-    result.samples = sceneWork::total() - start;
-    start = sceneWork::total();
-    layer.peer(4, 9.0); // /E.y
-    result.peer = sceneWork::total() - start;
+    result.samples = metered([&] {
+        layer.turn([&](SdfAbstractData& data) {
+            data.SetTimeSample(x, 2.0, VtValue(3.0));
+            data.EraseTimeSample(x, 0.0);
+            data.Set(SdfPath("/E"), SdfFieldKeys->Documentation, VtValue(std::string("edited")));
+        });
+    });
+    result.peer = metered([&] { layer.peer(4, 9.0); }); // /E.y
     // A peer creates a child of /E with an attribute, renames it and deletes
     // it: each publishes its namespace change. The peer's IDs follow the
     // fixture's, so every layer size measures the same three changes, and the
@@ -455,9 +312,7 @@ Work measure(size_t prims) {
         EnvelopeInput metadata;
         metadata.commands = std::move(commands);
         const auto bytes = encodeEnvelope(metadata);
-        const auto begin = sceneWork::total();
-        layer.peer(bytes);
-        result.structure += sceneWork::total() - begin;
+        result.structure += metered([&] { layer.peer(bytes); });
     };
     const auto has = [&](const char* path) { return layer.projection->HasSpec(SdfPath(path)); };
     structure({command(Command::Kind::Create, child, 2, "Child", SdfSpecTypePrim),
@@ -472,10 +327,8 @@ Work measure(size_t prims) {
     // /E/D, reparent it to /R/D, reverse /R's children and delete /R/D's
     // subtree. Each is one turn through capture, compile, admission,
     // acknowledgment and publication.
-    const auto structural = [&](uint64_t& slot, const std::function<void(SdfAbstractData&)>& author) {
-        const auto before = sceneWork::total();
-        layer.turn(author);
-        slot = sceneWork::total() - before;
+    const auto structural = [&](Cost& slot, const std::function<void(SdfAbstractData&)>& author) {
+        slot = metered([&] { layer.turn(author); });
     };
     structural(result.create, [](SdfAbstractData& data) {
         const SdfPath child("/E/C"), attribute("/E/C.z");
@@ -519,34 +372,30 @@ Work measure(size_t prims) {
         "the host content differs from the journal's visible scene");
     return result;
 }
-// The key comparisons of index lookups and edits per field write: one host
-// turn that sets the default of attributes a, b and c of `prims` unedited prims
-// /U<i>, as one Kit frame of a multi-prim edit authors them, through capture,
-// compile, admission, acknowledgment and publication, `repeats` times over in
-// the turn.
-double comparisonsPerWrite(size_t layerPrims, size_t prims, size_t repeats) {
+Cost multiPrimTurn(size_t layerPrims, size_t prims, size_t repeats) {
     Layer layer(scene(layerPrims));
     // A warm-up turn rebaselines the projection on a compiled candidate.
     layer.turn([&](SdfAbstractData& data) { data.Set(SdfPath("/E.x"), SdfFieldKeys->Default, VtValue(-1.0)); });
-    const auto start = sceneWork::comparisons();
-    layer.turn([&](SdfAbstractData& data) {
-        for (size_t repeat = 0; repeat < repeats; ++repeat)
-            for (size_t i = 0; i < prims; ++i)
-                for (const char* attribute : {"a", "b", "c"})
-                    data.Set(SdfPath("/U" + std::to_string(i) + "." + attribute), SdfFieldKeys->Default,
-                        VtValue(double(repeat)));
+    const auto cost = metered([&] {
+        layer.turn([&](SdfAbstractData& data) {
+            for (size_t repeat = 0; repeat < repeats; ++repeat)
+                for (size_t i = 0; i < prims; ++i)
+                    for (const char* attribute : {"a", "b", "c"})
+                        data.Set(SdfPath("/U" + std::to_string(i) + "." + attribute), SdfFieldKeys->Default,
+                            VtValue(double(repeat)));
+        });
     });
-    const auto writes = double(prims * 3 * repeats);
     require(layer.projection->Get(SdfPath("/U0.a"), SdfFieldKeys->Default) == VtValue(double(repeats - 1)) &&
             !layer.projection->hasPendingLocalEdits(),
         "the multi-prim turn was not published");
-    return double(sceneWork::comparisons() - start) / writes;
+    return cost;
 }
-// The scene work of one host turn that writes one field of the prim /P, which
-// holds `count` fields, through capture, compile and its verification of /P
-// against the replay and the captured storage, admission, acknowledgment and
-// publication.
-uint64_t wideSpecTurn(size_t count) {
+// The key comparisons of index lookups and edits per field write of a
+// multiPrimTurn.
+double comparisonsPerWrite(size_t layerPrims, size_t prims, size_t repeats) {
+    return double(multiPrimTurn(layerPrims, prims, repeats).comparisons) / double(prims * 3 * repeats);
+}
+Cost wideSpecTurn(size_t count) {
     EnvelopeInput metadata;
     DecodedValues values;
     metadata.commands.push_back(create(2, 1, "P", SdfSpecTypePrim));
@@ -561,9 +410,7 @@ uint64_t wideSpecTurn(size_t count) {
     const TfToken last("f" + std::to_string(count - 1));
     // A warm-up turn rebaselines the projection on a compiled candidate.
     layer.turn([&](SdfAbstractData& data) { data.Set(path, last, VtValue(-1)); });
-    const auto start = sceneWork::total();
-    layer.turn([&](SdfAbstractData& data) { data.Set(path, last, VtValue(-2)); });
-    const auto work = sceneWork::total() - start;
+    const auto work = metered([&] { layer.turn([&](SdfAbstractData& data) { data.Set(path, last, VtValue(-2)); }); });
     require(layer.projection->Get(path, last) == VtValue(-2) && layer.projection->List(path).size() == count &&
             !layer.projection->hasPendingLocalEdits(),
         "the wide spec's turn was not published");
@@ -573,14 +420,79 @@ uint64_t wideSpecTurn(size_t count) {
 // with work linear in F, however many fields it carries.
 void wideSpecVerification() {
     const size_t small = 512, large = 8192;
-    const auto a = wideSpecTurn(small), b = wideSpecTurn(large);
+    const auto a = wideSpecTurn(small).work, b = wideSpecTurn(large).work;
     std::cout << "footprint_work wide spec turn fields=" << small << " work=" << a << "; fields=" << large
               << " work=" << b << std::endl;
     require(b <= 2 * (large / small) * a + 1024,
         "a wide spec's turn work grows faster than its field count: " + std::to_string(a) + " at " +
             std::to_string(small) + " fields, " + std::to_string(b) + " at " + std::to_string(large) + " fields");
 }
-} // namespace
+std::pair<Cost, Cost> widePeerUpdates(size_t count) {
+    EnvelopeInput metadata;
+    metadata.commands.push_back(create(2, 1, "P", SdfSpecTypePrim));
+    Layer layer(buildSceneCandidate({}, encodeEnvelope(metadata)));
+    const auto update = [&](bool created, int offset) {
+        EnvelopeInput fields;
+        DecodedValues values;
+        if (created) fields.commands.push_back(create(3, 1, "Q", SdfSpecTypePrim));
+        for (size_t i = 0; i < count; ++i) {
+            fields.fields.push_back({3, 0, "f" + std::to_string(i), {}});
+            values.fields.push_back(VtValue(int(i) + offset));
+        }
+        return encodeUsdEnvelope(fields, values);
+    };
+    const auto created = update(true, 0), changed = update(false, 1);
+    const auto write = metered([&] { layer.peer(created); });
+    const auto change = metered([&] { layer.peer(changed); });
+    const SdfPath path("/Q");
+    require(layer.projection->List(path).size() == count &&
+            layer.projection->Get(path, TfToken("f" + std::to_string(count - 1))) == VtValue(int(count)),
+        "the wide peer updates were not published");
+    return {write, change};
+}
+std::pair<Cost, Cost> wideInstall(size_t count) {
+    EnvelopeInput metadata;
+    DecodedValues values;
+    metadata.commands.push_back(create(2, 1, "Q", SdfSpecTypePrim));
+    for (size_t i = 0; i < count; ++i) {
+        metadata.fields.push_back({2, 0, "f" + std::to_string(i), {}});
+        values.fields.push_back(VtValue(int(i)));
+    }
+    WireSceneLimits limits;
+    limits.maxWork = size_t(1) << 40;
+    const auto scene = buildSceneCandidate({}, encodeUsdEnvelope(metadata, values), limits);
+    const auto storage = PXR_NS::TfCreateRefPtr(new HostSceneStorage);
+    const auto empty = metered([&] { storage->CopyFrom(scene->data()); });
+    for (size_t i = 0; i < count; i += 2)
+        storage->Set(SdfPath("/Q"), TfToken("f" + std::to_string(i)), VtValue(-1));
+    const auto over = metered([&] { storage->CopyFrom(scene->data()); });
+    require(storage->List(SdfPath("/Q")).size() == count &&
+            storage->Get(SdfPath("/Q"), TfToken("f0")) == VtValue(0),
+        "the wide install was not copied");
+    return {empty, over};
+}
+// Publishing a peer update that writes or changes the F fields of one spec,
+// and installing a scene with such a spec, cost work linear in F.
+void widePeerPublication() {
+    const size_t small = 512, large = 8192;
+    const auto works = [](const std::pair<Cost, Cost>& costs) {
+        return std::pair{costs.first.work, costs.second.work};
+    };
+    const auto a = works(widePeerUpdates(small)), b = works(widePeerUpdates(large));
+    std::cout << "footprint_work wide peer update fields=" << small << " write=" << a.first << " change=" << a.second
+              << "; fields=" << large << " write=" << b.first << " change=" << b.second << std::endl;
+    const auto c = works(wideInstall(small)), d = works(wideInstall(large));
+    std::cout << "footprint_work wide install fields=" << small << " empty=" << c.first << " over=" << c.second
+              << "; fields=" << large << " empty=" << d.first << " over=" << d.second << std::endl;
+    for (const auto& [x, y, name] : {std::tuple{a.first, b.first, "write"}, std::tuple{a.second, b.second, "change"},
+             std::tuple{c.first, d.first, "install"}, std::tuple{c.second, d.second, "install over"}})
+        require(y <= 2 * (large / small) * x + 1024,
+            std::string("a wide spec's peer ") + name + " work grows faster than its field count: " +
+                std::to_string(x) + " at " + std::to_string(small) + " fields, " + std::to_string(y) + " at " +
+                std::to_string(large) + " fields");
+}
+} // namespace omni::usd::live::test::footprint
+using namespace omni::usd::live::test::footprint;
 // The work of field, sample and structural host turns and of a peer's field
 // and namespace publications on a 4,000-prim layer stays within twice that on
 // a 50-prim layer: the unedited specs contribute at most a logarithmic factor.
@@ -592,17 +504,19 @@ void footprintWorkTests(uint64_t seed) {
     setWireSceneDerivationCheck(false);
     setFieldEditCompileCheck(false);
     wideSpecVerification();
+    widePeerPublication();
     const std::array<size_t, 3> sizes{50, 1000, 4000};
     std::array<Work, 3> work;
     for (size_t i = 0; i < sizes.size(); ++i) {
         work[i] = measure(sizes[i]);
-        std::cout << "footprint_work prims=" << sizes[i] << " field_turns=" << work[i].field
-                  << " sample_turn=" << work[i].samples << " peer_publication=" << work[i].peer
-                  << " peer_structure=" << work[i].structure << " create=" << work[i].create
-                  << " rename=" << work[i].rename << " reparent=" << work[i].reparent
-                  << " reorder=" << work[i].reorder << " delete=" << work[i].erase << std::endl;
+        std::cout << "footprint_work prims=" << sizes[i] << " field_turns=" << work[i].field.work
+                  << " sample_turn=" << work[i].samples.work << " peer_publication=" << work[i].peer.work
+                  << " peer_structure=" << work[i].structure.work << " create=" << work[i].create.work
+                  << " rename=" << work[i].rename.work << " reparent=" << work[i].reparent.work
+                  << " reorder=" << work[i].reorder.work << " delete=" << work[i].erase.work << std::endl;
     }
-    const auto bounded = [&](uint64_t small, uint64_t large, const char* what) {
+    const auto bounded = [&](const Cost& smallCost, const Cost& largeCost, const char* what) {
+        const auto small = smallCost.work, large = largeCost.work;
         require(large <= 2 * small + 64,
             std::string(what) + " work grows with unedited layer size: " + std::to_string(small) + " at " +
                 std::to_string(sizes.front()) + " prims, " + std::to_string(large) + " at " +

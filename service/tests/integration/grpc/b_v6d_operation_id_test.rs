@@ -35,6 +35,8 @@
 //! | [`create_layer_resend_answered_by_the_handlers_record_read_spawns_the_recorded_objects_base`] | Amendment 1b | a re-send answered by the handler's record read spawns the creation base of an object whose original create spawned none |
 //! | [`lost_post_commit_reply::create_layer_dropped_after_its_commit_point_is_rooted_once_by_its_resend`] | T20, Amendment 1b | the dropped original spawns no creation base; the re-send's spawn runs once and persists one (`persisted`, `skipped_generation_present` and `writes_total{success,layer}` cells) |
 //! | [`lost_post_commit_reply::create_layer_duplicate_answered_by_the_commit_script_spawns_the_recorded_objects_base`] | T15, Amendment 1b | a duplicate that loses the race at the commit script spawns the creation base for the RECORDED (winning) object |
+//! | [`create_layer_resend_of_an_empty_create_skips_its_base_respawn`] / [`create_layer_resend_of_a_rooted_create_still_respawns_its_base`] | the supplied-root re-send rule (SDD §9.7) | a re-send whose rebuild supplied the layer's root skips the creation-base re-spawn and logs it at INFO; one whose content kept its own root still re-spawns |
+//! | [`create_layer_resend_of_empty_content_writes_no_base_for_a_rootless_recorded_object`] / [`lost_post_commit_reply::create_layer_empty_duplicate_answered_by_the_commit_script_spawns_no_base`] | the supplied-root re-send rule, both `ALREADY_COMMITTED` arms | a recorded object committed with the layer empty (as by a replica that predates the rule) gets no creation base from a rebuild that supplied a root: the handler's record-read answer and the commit script's race answer alike |
 //! | [`failed_start_record_read::update_layer_unauthorized_write_is_permission_denied_before_its_start_record_read_starts`] | G1 | the start-record read starts after authorization (and the body), so an unauthorized write is `PERMISSION_DENIED` and never starts it — never `UNAVAILABLE` |
 //! | [`failed_start_record_read::update_layer_authorized_write_whose_start_record_read_failed_is_unavailable_and_applies_nothing`] | G1, T28 through the handler | an authorized write whose read failed is `UNAVAILABLE` with nothing committed or recorded; its re-send is `APPLIED` as the first commit |
 //! | [`overwrite_second_try::create_layer_overwrite_with_an_operation_id_commits_on_its_second_try`] / [`overwrite_second_try::create_layer_overwrite_without_an_operation_id_commits_on_its_second_try`] | Amendment R4-1 | an overwrite whose first commit try fails before its script runs answers OK with the new `object_id` (`APPLIED` / `UNSPECIFIED`), the mapping names it, an `UpdateLayer` of it commits, and one of the old object is `FAILED_PRECONDITION` |
@@ -85,10 +87,13 @@ use super::helpers::{
     build_service_with_size_cap, make_create_data, make_request, make_update_data,
     streaming_create, streaming_update, AllowAllPermissions, SMALL_SIZE_CAP,
 };
+use super::log_capture::{assert_field, capture, Captured};
 use crate::checkpoint::helpers::{
     gather_base_bootstrap_cells, read_layer_writes_counter, wait_for_writer_idle,
 };
-use crate::common::owned_delta::{delta_to_ompf_bytes, delta_with_set_field_inline, empty_delta};
+use crate::common::owned_delta::{
+    delta_to_ompf_bytes, delta_with_set_field_inline, empty_delta, with_root,
+};
 
 /// The operation id the scenarios send: a UUIDv4 in canonical text, the shape
 /// the proto comment recommends.
@@ -165,10 +170,21 @@ fn create_header(session_id: &str, layer_name: &str, operation_id: &str) -> Crea
     }
 }
 
-/// An OMPF payload setting field `color` to `value`.
+/// An OMPF payload setting field `color` of section 1 to `value`: an
+/// `UpdateLayer` body.
 fn field_payload(value: u8) -> Vec<u8> {
     delta_to_ompf_bytes(
         &delta_with_set_field_inline(1, "color", vec![value], 0),
+        &[],
+    )
+}
+
+/// A `CreateLayer` payload creating the layer's root section and setting its
+/// field `color` to `value`. Content that sets the field with no top-level
+/// section is refused (SDD §9.7).
+fn create_payload(value: u8) -> Vec<u8> {
+    delta_to_ompf_bytes(
+        &with_root(delta_with_set_field_inline(1, "color", vec![value], 0)),
         &[],
     )
 }
@@ -783,19 +799,19 @@ async fn create_layer_resend_is_answered_already_committed_with_the_original_obj
         &session_id,
         "bv6d-grpc-t13-plain",
         "",
-        field_payload(4),
+        create_payload(4),
     )
     .await
     .expect("an id-less create must commit");
     assert_eq!(unspecified, OperationOutcome::Unspecified);
 
-    let (original, applied) = create(&svc, &session_id, LAYER, OPERATION_ID, field_payload(4))
+    let (original, applied) = create(&svc, &session_id, LAYER, OPERATION_ID, create_payload(4))
         .await
         .expect("the original create must commit");
     assert_eq!(applied, OperationOutcome::Applied);
     let counter = object_id_counter(&tv).await;
 
-    let resent = create(&svc, &session_id, LAYER, OPERATION_ID, field_payload(4))
+    let resent = create(&svc, &session_id, LAYER, OPERATION_ID, create_payload(4))
         .await
         .expect("the re-send must be answered OK");
     assert_eq!(
@@ -822,12 +838,12 @@ async fn create_layer_resend_with_different_bytes_is_refused_already_exists() {
     let svc = build_service(&tv, Arc::new(AllowAllPermissions));
     let session_id = new_session(&tv, "bv6d-grpc-t5-create").await;
 
-    let (original, _) = create(&svc, &session_id, LAYER, OPERATION_ID, field_payload(5))
+    let (original, _) = create(&svc, &session_id, LAYER, OPERATION_ID, create_payload(5))
         .await
         .expect("the original create must commit");
     let counter = object_id_counter(&tv).await;
 
-    let refused = create(&svc, &session_id, LAYER, OPERATION_ID, field_payload(6))
+    let refused = create(&svc, &session_id, LAYER, OPERATION_ID, create_payload(6))
         .await
         .expect_err("a different request under a recorded id must be refused");
     assert_eq!(refused.code(), Code::AlreadyExists);
@@ -958,7 +974,7 @@ async fn create_layer_resend_answered_by_the_handlers_record_read_spawns_the_rec
 {
     const LAYER: &str = "bv6d-grpc-step2b";
     let fx = fixture("bv6d-grpc-step2b", |store| store).await;
-    let payload = field_payload(10);
+    let payload = create_payload(10);
 
     let original = LayerStore::new(fx.tv.client().clone(), fx.tv.key_schema().clone(), 4096)
         .create_layer_with_operation(
@@ -976,6 +992,7 @@ async fn create_layer_resend_answered_by_the_handlers_record_read_spawns_the_rec
                 OPERATION_ID,
                 operation_request_digest(LAYER, &payload),
             )),
+            &live_edit::storage::layer::CreateCommitMarker::new(),
         )
         .await
         .expect("the original create must commit at the storage layer")
@@ -1010,6 +1027,211 @@ async fn create_layer_resend_answered_by_the_handlers_record_read_spawns_the_rec
         (1, 0, 1),
         "exactly one creation-base run, which persisted: (persisted, \
          skipped_generation_present, writes_total{{success,layer}})"
+    );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The re-send rule for a supplied root (SDD §9.7)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The opening words of the INFO line the handler logs when an
+/// `ALREADY_COMMITTED` answer skips the creation-base spawn because its rebuild
+/// supplied the layer's root section. Matched as a prefix, so the line's
+/// explanation can be reworded without breaking the test.
+const SUPPLIED_ROOT_SKIP_MSG: &str =
+    "CreateLayer answered ALREADY_COMMITTED with a supplied root section";
+
+/// The one supplied-root skip line in `log`, asserting there is exactly one,
+/// at INFO, naming `object_id` and the operation id.
+fn assert_one_supplied_root_skip(log: &Captured, object_id: u64) {
+    let skips: Vec<_> = log
+        .events
+        .iter()
+        .filter(|e| {
+            e["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with(SUPPLIED_ROOT_SKIP_MSG))
+        })
+        .collect();
+    assert_eq!(
+        skips.len(),
+        1,
+        "expected exactly one supplied-root skip line; full capture:\n{}",
+        log.text
+    );
+    let skip = skips[0];
+    assert_eq!(skip["level"], "INFO", "the skip line's level: {skip}");
+    assert_field(skip, "object_id", object_id.into());
+    assert_field(skip, "operation_id", OPERATION_ID.into());
+}
+
+/// Assert `log` holds no supplied-root skip line.
+fn assert_no_supplied_root_skip(log: &Captured, why: &str) {
+    assert!(
+        !log.text.contains(SUPPLIED_ROOT_SKIP_MSG),
+        "{why}: no supplied-root skip line expected; full capture:\n{}",
+        log.text
+    );
+}
+
+/// An empty `CreateLayer` carrying an operation id, then its re-send. The
+/// original's creation base persists (with the supplied root). The re-send is
+/// answered `ALREADY_COMMITTED`, and its rebuild supplies the root too, so the
+/// handler skips the re-spawn and logs the skip at INFO: no second
+/// creation-base run (a second run would tick `skipped_generation_present`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_resend_of_an_empty_create_skips_its_base_respawn() {
+    const LAYER: &str = "bv6d-grpc-root-skip";
+    let fx = fixture("bv6d-grpc-root-skip", |store| store).await;
+    let payload = delta_to_ompf_bytes(&empty_delta(), &[]);
+
+    let (original, applied) = create(
+        &fx.svc,
+        &fx.session_id,
+        LAYER,
+        OPERATION_ID,
+        payload.clone(),
+    )
+    .await
+    .expect("the original create must commit");
+    assert_eq!(applied, OperationOutcome::Applied);
+    fx.drain().await;
+    assert_eq!(
+        fx.creation_base_cells(),
+        (1, 0, 1),
+        "precondition: the original's creation base persisted, as (persisted, \
+         skipped_generation_present, writes_total{{success,layer}})"
+    );
+
+    let (resent, log) = capture(create(
+        &fx.svc,
+        &fx.session_id,
+        LAYER,
+        OPERATION_ID,
+        payload,
+    ))
+    .await;
+    assert_eq!(
+        resent.expect("the re-send must be answered OK"),
+        (original, OperationOutcome::AlreadyCommitted)
+    );
+    assert_one_supplied_root_skip(&log, original);
+    fx.drain().await;
+
+    assert_eq!(
+        fx.creation_base_cells(),
+        (1, 0, 1),
+        "the re-send must spawn no creation-base run: (1, 1, 1) is a re-spawn that took the \
+         generation-present guard"
+    );
+}
+
+/// The control for [`create_layer_resend_of_an_empty_create_skips_its_base_respawn`]:
+/// a create whose content keeps its own root still re-spawns on its re-send —
+/// the second run takes the generation-present guard — and logs no skip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_resend_of_a_rooted_create_still_respawns_its_base() {
+    const LAYER: &str = "bv6d-grpc-root-kept";
+    let fx = fixture("bv6d-grpc-root-kept", |store| store).await;
+    let payload = create_payload(11);
+
+    let (original, _) = create(
+        &fx.svc,
+        &fx.session_id,
+        LAYER,
+        OPERATION_ID,
+        payload.clone(),
+    )
+    .await
+    .expect("the original create must commit");
+    fx.drain().await;
+    assert_eq!(
+        fx.creation_base_cells(),
+        (1, 0, 1),
+        "precondition: the original's creation base persisted"
+    );
+
+    let (resent, log) = capture(create(
+        &fx.svc,
+        &fx.session_id,
+        LAYER,
+        OPERATION_ID,
+        payload,
+    ))
+    .await;
+    assert_eq!(
+        resent.expect("the re-send must be answered OK"),
+        (original, OperationOutcome::AlreadyCommitted)
+    );
+    assert_no_supplied_root_skip(&log, "the content kept its own root");
+    fx.drain().await;
+
+    assert_eq!(
+        fx.creation_base_cells(),
+        (1, 1, 1),
+        "the re-send must re-spawn the creation base, which finds the original's generation"
+    );
+}
+
+/// What the skip protects: the recorded object was committed with the layer
+/// empty — as a replica that predates the layer-root rule commits a
+/// header-only create (staged at the storage layer, which spawns no base). The
+/// re-send of that empty content is answered `ALREADY_COMMITTED`, and its
+/// rebuild supplies a root the recorded object does not hold; the handler
+/// spawns nothing from it, so no first base describing a rooted layer is
+/// written for a root-less object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_layer_resend_of_empty_content_writes_no_base_for_a_rootless_recorded_object() {
+    const LAYER: &str = "bv6d-grpc-rootless";
+    let fx = fixture("bv6d-grpc-rootless", |store| store).await;
+    let payload = delta_to_ompf_bytes(&empty_delta(), &[]);
+
+    let original = LayerStore::new(fx.tv.client().clone(), fx.tv.key_schema().clone(), 4096)
+        .create_layer_with_operation(
+            &fx.session_id,
+            LAYER,
+            "test-user",
+            &ObjectState {
+                sequence_num: 1,
+                first_version: 1,
+                ..Default::default()
+            },
+            Arc::new(MockExternalValueStore::new()),
+            Some(CreateOperation::new(
+                OPERATION_ID,
+                operation_request_digest(LAYER, &payload),
+            )),
+            &live_edit::storage::layer::CreateCommitMarker::new(),
+        )
+        .await
+        .expect("the root-less original must commit at the storage layer")
+        .object_id;
+    fx.drain().await;
+
+    let (resent, log) = capture(create(
+        &fx.svc,
+        &fx.session_id,
+        LAYER,
+        OPERATION_ID,
+        payload,
+    ))
+    .await;
+    assert_eq!(
+        resent.expect("the re-send must be answered OK"),
+        (original, OperationOutcome::AlreadyCommitted)
+    );
+    assert_one_supplied_root_skip(&log, original);
+    fx.drain().await;
+
+    assert!(
+        fx.generations(original).await.is_empty(),
+        "no creation base may be written for the root-less recorded object from a rebuild \
+         that supplied a root"
+    );
+    assert_eq!(
+        fx.creation_base_cells(),
+        (0, 0, 0),
+        "no creation-base run at all"
     );
 }
 
@@ -1096,7 +1318,7 @@ mod lost_post_commit_reply {
                 .with_create_layer_post_failed_run_hook_for_test(park)
         })
         .await;
-        let (original, _) = create(&fx.svc, &fx.session_id, layer, "", field_payload(7))
+        let (original, _) = create(&fx.svc, &fx.session_id, layer, "", create_payload(7))
             .await
             .expect("setup CreateLayer must succeed");
         fx.drain().await;
@@ -1113,7 +1335,7 @@ mod lost_post_commit_reply {
             ),
             script_ran: true,
         });
-        let payload = field_payload(8);
+        let payload = create_payload(8);
         let call = create(
             &fx.svc,
             &fx.session_id,
@@ -1263,7 +1485,7 @@ mod lost_post_commit_reply {
                         .expect("the competing store is installed before the call");
                     let digest = live_edit::storage::layer::operation_request_digest(
                         LAYER,
-                        &field_payload(9),
+                        &create_payload(9),
                     );
                     let commit = store
                         .create_layer_with_operation(
@@ -1278,6 +1500,7 @@ mod lost_post_commit_reply {
                             },
                             Arc::new(MockExternalValueStore::new()),
                             Some(CreateOperation::new(OPERATION_ID, digest)),
+                            &live_edit::storage::layer::CreateCommitMarker::new(),
                         )
                         .await
                         .expect("the competing duplicate must commit — it is uncontended");
@@ -1300,7 +1523,7 @@ mod lost_post_commit_reply {
             &fx.session_id,
             LAYER,
             OPERATION_ID,
-            field_payload(9),
+            create_payload(9),
         )
         .await
         .expect("the duplicate that lost the race must be answered OK");
@@ -1319,6 +1542,92 @@ mod lost_post_commit_reply {
                 .collect::<Vec<_>>(),
             [(1, CheckpointKind::Base)],
             "the duplicate's answer must spawn the creation base for the RECORDED object"
+        );
+    }
+
+    /// The race arm of the supplied-root re-send rule (SDD §9.7): T15's race,
+    /// with empty content. The winner committed the layer empty, as a replica
+    /// that predates the layer-root rule does (staged at the storage layer).
+    /// The duplicate that loses at the commit script built a state holding a
+    /// supplied root, which need not be the winner's, so its
+    /// `ALREADY_COMMITTED` answer spawns no creation base for the winner and
+    /// logs the skip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_empty_duplicate_answered_by_the_commit_script_spawns_no_base() {
+        const LAYER: &str = "bv6d-grpc-root-race";
+        let payload = delta_to_ompf_bytes(&empty_delta(), &[]);
+        let winner_slot: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let tv_for_hook: Arc<Mutex<Option<(LayerStore, String)>>> = Arc::new(Mutex::new(None));
+        let hook: WatchWindowHook = {
+            let (winner_slot, tv_for_hook) = (winner_slot.clone(), tv_for_hook.clone());
+            let digest = operation_request_digest(LAYER, &payload);
+            Arc::new(move |_client: &Client| {
+                let (winner_slot, tv_for_hook) = (winner_slot.clone(), tv_for_hook.clone());
+                let digest = digest.clone();
+                async move {
+                    let (store, session_id) = tv_for_hook
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("the competing store is installed before the call");
+                    let commit = store
+                        .create_layer_with_operation(
+                            &session_id,
+                            LAYER,
+                            "test-user",
+                            &ObjectState {
+                                sequence_num: 1,
+                                first_version: 1,
+                                ..Default::default()
+                            },
+                            Arc::new(MockExternalValueStore::new()),
+                            Some(CreateOperation::new(OPERATION_ID, digest)),
+                            &live_edit::storage::layer::CreateCommitMarker::new(),
+                        )
+                        .await
+                        .expect("the competing duplicate must commit — it is uncontended");
+                    *winner_slot.lock().unwrap() = Some(commit.object_id);
+                }
+                .boxed()
+            })
+        };
+        let fx = fixture("bv6d-grpc-root-race", |store| {
+            store.with_create_layer_pre_commit_hook_for_test(hook)
+        })
+        .await;
+        *tv_for_hook.lock().unwrap() = Some((
+            LayerStore::new(fx.tv.client().clone(), fx.tv.key_schema().clone(), 4096),
+            fx.session_id.clone(),
+        ));
+
+        let (answered, log) = capture(create(
+            &fx.svc,
+            &fx.session_id,
+            LAYER,
+            OPERATION_ID,
+            payload,
+        ))
+        .await;
+        let winner = winner_slot
+            .lock()
+            .unwrap()
+            .expect("precondition: the hook ran and the competing duplicate committed");
+        assert_eq!(
+            answered.expect("the duplicate that lost the race must be answered OK"),
+            (winner, OperationOutcome::AlreadyCommitted)
+        );
+        assert_one_supplied_root_skip(&log, winner);
+        fx.drain().await;
+
+        assert!(
+            fx.generations(winner).await.is_empty(),
+            "the duplicate's answer must spawn no creation base from a state holding a \
+             supplied root"
+        );
+        assert_eq!(
+            fx.creation_base_cells(),
+            (0, 0, 0),
+            "no creation-base run at all"
         );
     }
 }
@@ -1541,7 +1850,7 @@ mod overwrite_second_try {
             store.with_create_layer_commit_fault_injector_for_test(Arc::clone(&faults))
         })
         .await;
-        let (original, _) = create(&fx.svc, &fx.session_id, LAYER, "", field_payload(1))
+        let (original, _) = create(&fx.svc, &fx.session_id, LAYER, "", create_payload(1))
             .await
             .expect("setup CreateLayer must succeed");
         faults.lock().unwrap().push_back(CreateCommitFault {
@@ -1554,7 +1863,7 @@ mod overwrite_second_try {
             &fx.session_id,
             LAYER,
             operation_id,
-            field_payload(2),
+            create_payload(2),
         )
         .await
         .expect("the overwrite must commit on its second try");

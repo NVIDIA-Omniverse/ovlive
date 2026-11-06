@@ -29,7 +29,7 @@ use live_edit::storage::{consume_layer_stream, LayerStreamConsumer, StreamCursor
 use super::mux_test_helpers::{await_mux, await_readers_parked, recv_seqs, xadd_update};
 
 async fn cluster(readers: u32) -> Option<TestValkey> {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
         return None;
     };

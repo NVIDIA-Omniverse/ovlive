@@ -167,6 +167,15 @@ def main():
             until(lambda: live.get_layer_status(uri).pending_write_count >= expected or
                   live.get_layer_status(uri).state == live.State.FAILED)
             result = report('state')
+        elif command == 'wait-buffered':
+            # The buffered count a `set` leaves reaches status asynchronously: on a
+            # READY layer the actor publishes it after waking for it, and on a
+            # FAILED layer whose host fault is not yet latched the flush job the
+            # record schedules publishes it. A FAILED layer still buffers its edits,
+            # so this waits on the count alone; failure-only deadline.
+            expected = int(args[1])
+            until(lambda: live.get_layer_status(uri).buffered_edit_count == expected)
+            result = report('state')
         elif command == 'observed-failure':
             assert observer is not None and observed_event.wait(5), 'operational status callback did not report failure'
             with observed_lock:

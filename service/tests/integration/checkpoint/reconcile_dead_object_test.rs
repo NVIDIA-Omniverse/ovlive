@@ -15,7 +15,10 @@
 
 //! b.vn6 — the **producer** side of `le:ckpt:{recon}:dead`: the delete paths
 //! record positive evidence that an `object_id` will never be live again, so the
-//! reconciliation pass can reap the checkpoint generations it leaves behind.
+//! checkpoint clean-up's dead-object phase can reap the checkpoint generations
+//! it leaves behind. Since b.g65 each records it at the act that kills the
+//! object — `DeleteLayer` right after its unmap, the overwrite cleanup
+//! at its start — with one more attempt later if that one did not land.
 //!
 //! ## What is under test
 //!
@@ -306,10 +309,11 @@ impl DeadRegistrationFixture {
 
 /// `DeleteLayer` registers the retired `object_id` as dead.
 ///
-/// The registration sits at `delete_layer_inner`'s success-only exit, beside the
-/// ext-GC obligation the same path already discharges, and for the same reason:
-/// that is the moment — and the only moment — at which the service knows for
-/// certain this `object_id` will never be live again.
+/// The registration sits right after the delete's unmap, its commit
+/// point: from that moment the service knows for certain this `object_id` will
+/// never be live again, and every later exit — success or not — leaves it
+/// registered. The success exit registers once more only if that attempt did
+/// not land.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_layer_registers_the_retired_object_on_the_dead_zset() {
     let fx = fixture(true).await;
@@ -360,15 +364,19 @@ async fn delete_layer_registers_the_retired_object_on_the_dead_zset() {
     //
     // Bracketed by two `TIME` reads around the delete, so the assertion is
     // against the same server-side clock the script samples rather than this
-    // process's `SystemTime`.
+    // process's `SystemTime`. The scripts score in whole milliseconds (`TIME`'s
+    // microseconds floored), while `valkey_now_ms` keeps the fraction, so the
+    // lower bound is floored too: a delete in the same millisecond as the first
+    // read scores that millisecond, below the unfloored reading.
     let score = fx
         .dead_score(oid)
         .await
         .expect("the member was just asserted present, so it carries a score");
+    let lower_ms = before_ms.floor();
     assert!(
-        score >= before_ms && score <= after_ms,
+        score >= lower_ms && score <= after_ms,
         "the first-observation score must be Valkey's own clock, sampled during the delete: got \
-         {score}, expected within [{before_ms}, {after_ms}]. A zero would make the member \
+         {score}, expected within [{lower_ms}, {after_ms}]. A zero would make the member \
          claimable before an in-flight checkpoint PUT could become enumerable; a future value \
          would make it claimable on no pass at all"
     );
@@ -513,8 +521,8 @@ async fn a_registration_over_an_already_registered_dead_object_does_not_refresh_
 /// checkpointing — the delete paths write nothing at all.
 ///
 /// This is not a cosmetic gate. `le:ckpt:{recon}:dead` has exactly one consumer,
-/// the checkpoint loop's reconciliation tick, and that loop is spawned only when
-/// `LIVE_EDIT_CHECKPOINT_ENABLED=true` against a real adapter. Registering
+/// the checkpoint clean-up task's dead-object phase, and that task is spawned
+/// only when `LIVE_EDIT_CHECKPOINT_ENABLED=true` against a real adapter. Registering
 /// without it would add one member per DeleteLayer, forever, to a ZSET that is
 /// deliberately TTL-less, against a Valkey configured `noeviction` — an
 /// unbounded leak introduced by a leak fix.
@@ -537,7 +545,7 @@ async fn a_layer_store_without_dead_object_registration_writes_no_member() {
     assert!(
         fx.dead_members().await.is_empty(),
         "neither the superseded {old_oid} nor the deleted {new_oid} may be registered when the \
-         gate is off: with no checkpoint loop there is nothing to drain the ZSET, so every member \
+         gate is off: with no checkpoint clean-up there is nothing to drain the ZSET, so every member \
          written is a permanent one"
     );
 }

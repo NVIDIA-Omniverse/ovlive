@@ -9,6 +9,6 @@ This repository distributes client and service source under the licenses recorde
 
 Build the client with the [build guide](ovlive-build.md) and run the service using its [README](../../service/README.md). Supply compatible SDKs and dependencies yourself. The dependency manifests record the exact SDK identities used for NVIDIA qualification; they do not grant public access to NVIDIA package storage. The macOS source SDK scripts fetch from their named public upstream projects. A separately built SDK still needs ABI and host validation.
 
-## Provision release controls
+## Qualification
 
-Qualification of this source projection is separate from native package qualification. The [support boundary](ovlive-support-boundary.md) describes supported profiles and outstanding integration gates. Repository automation, release credentials and internal governance checks are outside this source distribution.
+Qualification of this source distribution is separate from native package qualification. The [support boundary](ovlive-support-boundary.md) describes supported profiles and outstanding integration gates. Repository automation, release credentials and internal governance checks are outside this source distribution.

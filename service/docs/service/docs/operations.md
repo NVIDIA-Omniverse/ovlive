@@ -52,8 +52,12 @@ Then repeat the {ref}`smoke tests <live-edit-deployment-smoke-tests>`.
 2. If your values file sets `image.tag`, update it to the new version or remove it (the chart defaults to its own version).
    Compare the old and new charts' `values.yaml` for changed defaults.
    Remove any value listed under {ref}`Removed settings <live-edit-operations-removed-settings>`, rename every other chart setting whose name holds an underscore to its camelCase name ({ref}`Renamed settings <live-edit-operations-renamed-settings>`), and check that `resources.limits.memory` is set and at least the minimum for your settings ({ref}`Starting size <live-edit-scaling-starting-size>`).
+   If you set `valkey.commandTimeoutMs: 0`, set a timeout in milliseconds instead, such as the default `5000`: the chart refuses to render `0`.
    If `observability.tracing.endpoint.grpc` or `observability.metrics.endpoint.grpc` is set, check that it starts `http://` or `https://`; change `grpc://` to `http://`, or the new pods stop at startup.
+   Keep `checkpoint.tick` at 19 or less and below `checkpoint.interval`; at 20 or more, `helm upgrade` fails before any pod changes, naming the setting.
+   Write every whole-number value as plain digits ({ref}`Value syntax <live-edit-configuration-value-syntax>`); a negative or fractional number or text, including one carried over by `--reuse-values`, makes `helm upgrade` fail before any pod changes, naming the value.
 3. Confirm the namespace has {ref}`rollout headroom <live-edit-scaling-rollout-headroom>`, and that the identity applying the chart can create Roles and RoleBindings there in the default `scaler` autoscaling mode (otherwise see {ref}`Autoscaling <live-edit-scaling-autoscaling>`).
+   Check that no `dr` value is set: a disaster-recovery Job left in place fails the upgrade with `field is immutable`, and an action must never be set in the same upgrade ({ref}`After the hold clears <live-edit-durability-after-hold>`).
 4. Upgrade and verify:
 
    ```bash
@@ -79,8 +83,8 @@ While your values use an old name, the chart refuses to render, so `helm upgrade
 (live-edit-operations-removed-settings)=
 ### Removed settings
 
-These settings no longer exist; the service derives each amount from `resources.limits.memory`.
-A pod whose environment still sets one stops at startup with a `configuration error:` naming it, and the chart refuses to render one set to anything but its old default.
+These settings no longer exist.
+Unless its row says otherwise, a pod whose environment still sets one stops at startup with a `configuration error:` naming it, and the chart refuses to render one set to anything but its old default.
 
 | Environment variable | Former Helm value | What to do |
 |---|---|---|
@@ -88,13 +92,58 @@ A pod whose environment still sets one stops at startup with a `configuration er
 | `LIVE_EDIT_CATCHUP_BUILD_MEMORY_BUDGET_MIB` | `valkey.catchup_build_memory_budget_mib` | Remove it. To change the memory for catching up large layers, change `resources.limits.memory`. |
 | `LIVE_EDIT_UPLOAD_MEMORY_BUDGET_MIB` | `layer.upload_memory_budget_mib` | Remove it. To change upload memory, change `resources.limits.memory`. |
 | `LIVE_EDIT_STRUCTURAL_CACHE_MAX_MIB` | `layer.structural_cache_max_mib` | Remove it. To change the structural-edit cache, change `resources.limits.memory`; to stop using the cache, set `layer.updateLayerBackend: lua-watch-structural`. |
+| `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` | `layer.catchupSnapshotEnabled` (`layer.catchup_snapshot_enabled` in 0.1.x) | Remove it. No setting replaces it; to get the behaviour `false` selected, roll back to an earlier release. |
+| `LIVE_EDIT_GC_POLL_INTERVAL_SECS` | `gc.poll_interval_secs` | Remove it. It is ignored rather than refused, and nothing replaces it. |
+
+(live-edit-operations-upgrade-from-0-2-0)=
+## Upgrading from 0.2.0 or earlier
+
+0.2.0 and earlier releases handle a spec that is created, renamed or moved onto a name a sibling already uses in different ways from this release.
+While pods of both versions run side by side, during an upgrade or a rollback, a rare edit can be lost even though the service accepted it.
+
+To avoid that, upgrade without the two versions overlapping, at the cost of a short outage: clients cannot connect while no pod runs, and reconnect once the new pods are ready.
+
+1. Scale the service to zero with the chart you installed your current release from:
+
+   ```bash
+   helm upgrade live-edit-service {CURRENT_CHART_DIR}/live-edit-service \
+     --namespace storage-apis -f live-edit-values.yaml \
+     --set autoscaling.enabled=false --set replicaCount=0 --wait
+   kubectl get pods -n storage-apis -l app.kubernetes.io/instance=live-edit-service,app.kubernetes.io/component=server
+   ```
+
+   Repeat the second command until it reports `No resources found`: a stopping pod can take up to `terminationGracePeriodSeconds` to exit.
+2. Upgrade to the new chart with your usual values files, as in {ref}`Upgrade <live-edit-operations-upgrade>`.
+   Run the upgrade with your values files, not `--reuse-values`, or the service stays at zero pods with autoscaling off.
+
+A rolling rollback to 0.2.0 or earlier carries the same risk.
+To roll back without it, first run step 1 with this release's chart, then roll back with `helm rollback` to the revision that ran your earlier release before the upgrade, not one that scaled it to zero ({ref}`Roll back <live-edit-operations-rollback>`).
+
+After a rolling rollback, restart the pods once more when the rollback completes:
+
+```bash
+kubectl rollout restart deployment/live-edit-service -n storage-apis
+kubectl rollout status deployment/live-edit-service -n storage-apis
+```
+
+If the two versions overlap, these self-checks can increase and fire the `LiveEditSelfCheckFired` warning while both versions run, and afterwards at most once more per layer on each pod:
+
+- `live_edit_structural_cache_divergence_total`;
+- `live_edit_structural_cache_audit_total{outcome="diverged"}`.
+
+These increases need no support case.
+
+Not expected, so follow {ref}`Self-check fired <live-edit-monitoring-self-check>`:
+
+- an increase of any other metric in the {ref}`self-check table <live-edit-metrics-reference-self-checks>`;
+- once the versions no longer overlap, more than one increase for the same layer on the same pod.
 
 (live-edit-operations-upgrade-time-zero)=
 ## Upgrading from a release that stores time samples at `-0.0` as written
 
 Every earlier release (0.1.0 and 0.1.1) and every earlier 0.2.0 pre-release stores time samples at `-0.0` as written, so it can keep a sample at `-0.0` beside one at `0.0`.
 This release keeps one sample, at `0.0`, and needs no action from you.
-The reference-count reconciler merges such samples on every pass and counts them on `live_edit_time_sample_signed_zero_merge_total`.
+The service merges such samples by itself and counts them on `live_edit_time_sample_signed_zero_merge_total`.
 Samples that old pods write during a rollout are merged within about one `gc.extReconcileIntervalSecs` (an hour by default) after the last old pod stops.
 With `gc.extReconcileIntervalSecs: 0` nothing is merged, but reads stay correct.
 Rolling back needs no step: merged samples stay merged, and earlier releases read them correctly.
@@ -105,11 +154,10 @@ During such an upgrade or a rollback to such a release, these self-checks can in
 - `live_edit_structural_cache_audit_total{outcome="diverged"}`;
 - rarely, `live_edit_update_layer_structural_fallbacks_total{reason="repeat_divergence"}`.
 
-On an upgrade, expect any number of them until the merge counter's `merged` and `rekeyed` cells stop rising after the rollout.
+On an upgrade, expect any number of them until the `merged` and `rekeyed` outcomes of `live_edit_time_sample_signed_zero_merge_total` stop rising after the rollout.
 After that, each affected layer can add at most one more increase on each replica.
 On a rollback, expect them while old and new pods run side by side.
 After the rollback completes, each affected layer can still add at most one increase on each replica.
-Each late increase comes at the replica's next reset of the layer or deletion of the affected attributes or their prims, or at a sampled self-check of its cached copy.
 These increases need no support case; the `WARN` line with each identifies the layer by its `object_id`.
 
 Not expected, so follow {ref}`Self-check fired <live-edit-monitoring-self-check>`:
@@ -117,9 +165,9 @@ Not expected, so follow {ref}`Self-check fired <live-edit-monitoring-self-check>
 - an increase of any other metric in the {ref}`self-check table <live-edit-metrics-reference-self-checks>`, `live_edit_ext_index_drift_total{direction="under"}` included;
 - after a rollback completes, more than one increase for the same layer on the same replica.
 
-After an upgrade, also not expected (an earlier release has no merge counter, so these checks apply to upgrades only):
+After an upgrade, also not expected:
 
-- any increase after the first reconciler pass that follows the rollout, if the merge counter's `merged` and `rekeyed` cells have not risen since the rollout began;
+- any increase more than about one `gc.extReconcileIntervalSecs` after the last old pod stops, if `merged` and `rekeyed` have not risen since the rollout began;
 - once `merged` and `rekeyed` stop rising, more than one further increase for the same layer on the same replica.
 
 (live-edit-operations-rollouts)=
@@ -151,23 +199,39 @@ The chart configures three gRPC health probes on port 50001; keep them.
 
 | Probe | Health service | Acts after |
 |---|---|---|
-| `startupProbe` | `nvidia.omniverse.live.v1alpha.LiveService` | 57 failures 5 seconds apart (285 seconds): restarts the pod |
+| `startupProbe` | `nvidia.omniverse.live.v1alpha.LiveService` | 62 failures 5 seconds apart (310 seconds): restarts the pod |
 | `livenessProbe` | `""` (the process) | 3 failures 10 seconds apart: restarts the pod |
 | `readinessProbe` | `nvidia.omniverse.live.v1alpha.LiveService` | 3 failures 5 seconds apart: removes the pod from the Service |
 
 The gRPC port and `/metrics` answer within moments of start, and a normal start takes seconds.
+A pod stopped while it is still starting, by a rollback or a scale-down, logs `received SIGTERM during startup; stopping before serving` and exits within about 11 seconds, without serving.
 What readiness checks: {ref}`Health checks <live-edit-monitoring-health>`.
 
-The 285-second allowance covers a degraded start: slow backing-store connections, a slow backup store, or a token provider that has not yet written its first token.
+While the service is held for disaster recovery, readiness and liveness stay `SERVING`, so the probes neither restart held pods nor remove them from the Service ({ref}`Held for disaster recovery <live-edit-monitoring-held>`).
+A pod that starts while the service is held, such as one Kubernetes reschedules, starts held and becomes ready.
+It refuses every call `UNAVAILABLE` naming the incident, and still answers health checks, the capabilities service, `/metrics` and the autoscaler.
+When the hold clears, each held pod exits within seconds and Kubernetes restarts it into normal service, so expect one restart on every pod.
+
+If a pod, held or not, cannot read the backing store for 30 seconds, it reports not ready, so the readiness probe removes it from the Service.
+A pod that is not held also refuses calls and ends its clients' streams, which reconnect to other pods.
+Such a pod does not exit while the store stays unreachable: it keeps trying, and the liveness probe does not restart it.
+When a read succeeds again, a pod that is not held exits within seconds and Kubernetes restarts it, so expect one restart per affected pod.
+So a backing-store outage longer than 30 seconds takes every pod out of the Service until the store returns.
+Pods that were running serve again about a minute at most after it returns (longer for a pod that already restarted in the last 10 minutes).
+If one pod stays not ready while the others serve, a fault inside that pod keeps it from reading the store.
+Delete that pod, and Kubernetes replaces it.
+A starting pod reads once whether the service is held before it serves; if that read fails, the pod exits with an error and Kubernetes restarts it, under its usual backoff.
+
+The 310-second allowance covers a degraded start: slow backing-store connections, a slow backup store, or a token provider that has not yet written its first token.
 Do not lower `startupProbe.failureThreshold`, or pods that are still starting are restarted.
 If you raise the backing-store timeouts, raise it to match:
 
 | `valkey.connectTimeoutSecs` | `valkey.commandTimeoutMs` | `startupProbe.failureThreshold` |
 |---|---|---|
-| `30` (default) | `5000` (default) | `57` (default) |
-| `45` | `5000` | `72` |
-| `60` | `5000` | `87` |
-| `60` | `10000` | `88` |
+| `30` (default) | `5000` (default) | `62` (default) |
+| `45` | `5000` | `77` |
+| `60` | `5000` | `92` |
+| `60` | `10000` | `96` |
 
 (live-edit-operations-rollback)=
 ## Roll back
@@ -182,6 +246,7 @@ kubectl rollout status deployment/live-edit-service -n storage-apis
 
 The rollback succeeds when every pod is ready; then repeat the smoke tests.
 Do not roll back with `kubectl rollout undo`: it restores the pod template but not the configuration.
+Do not roll back while a disaster-recovery Job runs: a rollback to a revision before its `dr` values deletes the Job; the service stays held, and a later run continues from what it wrote.
 
 (live-edit-operations-credentials)=
 ## Rotate credentials

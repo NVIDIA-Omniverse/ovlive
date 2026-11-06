@@ -29,8 +29,10 @@
 --
 -- KEYS:
 --   [1]  lock key — `le:checkpoint:leader`
---        (KeySchema::checkpoint_leader_lock) or `le:presence:sweeper:leader`
---        (KeySchema::presence_sweeper_leader_lock). Builds before the GC
+--        (KeySchema::checkpoint_leader_lock), `le:presence:sweeper:leader`
+--        (KeySchema::presence_sweeper_leader_lock) or the DR Job lease
+--        (KeySchema::dr_job_lease, released by
+--        `leader_release_if_held.lua`). Builds before the GC
 --        protocol marker (up to and including 0.2.0-rc.48) also took
 --        `le:gc:leader` with this script; this build takes that lock only
 --        through `gc_leader_acquire.lua`, which writes a marked value this

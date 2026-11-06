@@ -788,8 +788,9 @@ async fn layer_store_semaphore_map_bounded_under_straggler_race_retirement() {
 // The b.3gx leak tests (3 & 4) cover the *happy-path* retirement: every
 // step of `delete_layer` / `create_layer` succeeds, and the post-commit
 // `.remove(&oid)` calls fire. b.xet observed that if ANY Valkey step of
-// `delete_layer` (steps 2-6: DEL mapping, XADD deleted, ext-GC schedule,
-// UNLINK object keys, SREM layers index) fails with `ServiceError::Internal`,
+// `delete_layer` (then steps 2-6: DEL mapping, XADD deleted, ext-GC
+// schedule, UNLINK object keys, SREM layers index; today steps 2-5, the
+// first the unmap) fails with `ServiceError::Internal`,
 // the pre-fix code returned via `?` BEFORE reaching step 7's
 // `.remove(&object_id)`. The entry was orphaned in the map forever —
 // object_ids are monotonic so no future caller revisits it, making it a
@@ -871,7 +872,7 @@ async fn delete_layer_mid_op_internal_error_retires_semaphore_entry() {
         ),
         Ok(()) => panic!(
             "delete_layer must not succeed when an Internal error is queued on the \
-             fault injector — the injector short-circuits before step 2 (DEL mapping)"
+             fault injector — the injector short-circuits before step 2 (the unmap)"
         ),
     }
 
@@ -1297,10 +1298,22 @@ mod structural_admission {
     }
 
     /// A whole-object reset (`is_diff` with `base_version` 0): the reset class.
+    /// It restates one top-level section (an id no [`structural_delta`] here
+    /// uses), so it commits in any order among the other calls: a reset
+    /// leaving the layer no top-level section is refused (SDD §9.7).
     fn reset_delta() -> OwnedDelta {
         OwnedDelta {
             is_diff: true,
             base_version: 0,
+            struct_commands: vec![StructCommand::DiffChangeSection(
+                oodf_ffi::CommandDiffChangeSection {
+                    parent_id: 0,
+                    section_id: 99,
+                    section_name: "admission-reset".to_owned(),
+                    section_type: 1,
+                    section_order: 0,
+                },
+            )],
             source_format: "usd".to_owned(),
             ..Default::default()
         }

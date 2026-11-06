@@ -40,22 +40,29 @@
 //! * `CreateSection`, and a `MoveSection` onto a new parent, **append**: the
 //!   child takes the largest key among its new siblings + 1 and lands last. A
 //!   create under a missing non-root parent is ignored.
+//! * Siblings collide in a slot ([`collision_slot`]): the same parent, the
+//!   same name, and an attribute or relationship both, or else the same
+//!   `SdfSpecType`. The slot's occupant is its lowest-id holder, as on the
+//!   server.
 //! * `MoveSection` classifies against the parent the client holds the section
 //!   under, never the carried `old_parent_id` — except that a carried parent
-//!   equal to the destination is a rename. A missing destination, a
-//!   destination under the section, or an ancestor holding the name there
-//!   deletes the section; another holder of the name is deleted instead. A
-//!   section already under the destination keeps its key and position.
+//!   equal to the destination is a rename under the held parent: to the held
+//!   name it changes nothing; to another, the occupant of the new name is
+//!   deleted first, with its subtree. A missing destination, a destination
+//!   under the section, or an ancestor occupying the slot there deletes the
+//!   section; another occupant is deleted instead, and the section too if
+//!   that deletion took the destination. A section already under the
+//!   destination keeps its key and position.
 //! * `DeleteSection`, and a catch-up's `DiffDeleteSection`, remove the subtree.
-//!   A name conflict on a create deletes the lowest-id holder, as on the
-//!   server. A `DiffChangeSection` row deletes no holder: neither client does.
-//! * A row whose parent has no row — an *orphan*, which a create or a move
-//!   whose name-conflict cascade deletes the parent it names makes (the
-//!   holder's subtree loops back to it) — is listed nowhere. When its parent is
-//!   born by a create, every row naming it joins its list in `(key, id)` order
-//!   before the next command. No real client holds orphan rows: this is the
-//!   server's SDD §10.4 rule, modelled so the parity checks extend to histories
-//!   that hold them.
+//!   A create deletes its slot's occupant. A `DiffChangeSection` row deletes no
+//!   holder: neither client does.
+//! * A row whose parent has no row — an *orphan*, which a create whose
+//!   collision cascade deletes the parent it names makes (the holder's subtree
+//!   loops back to it) — is listed nowhere. When its parent is born by a
+//!   create, every row naming it joins its list in `(key, id)` order before
+//!   the next command. No real client holds orphan rows: this is the server's
+//!   SDD §10.4 rule, modelled so the parity checks extend to histories that
+//!   hold them.
 //!
 //! Where they differ:
 //!
@@ -93,6 +100,24 @@
 //! several sections under it.
 //!
 //! Callers feed only deltas the server accepted.
+//!
+//! A model applies the collision rules above ([`CollisionRule::Slot`]) unless
+//! switched to [`CollisionRule::NameOnly`], the server's earlier rule, which
+//! no client applies: an oracle for what a server build that kept it would
+//! have committed.
+//!
+//! A model built [`SiblingModel::applying_changes_as_the_server`] applies a
+//! `DiffChangeSection` by the **server's** rule for one in a client upload, not
+//! by its reader's catch-up rule above (a client applies a service-produced
+//! diff as stated, with no collision handling, and refuses one in an ordinary
+//! delta). The server looks the slot's occupant up first, under the model's
+//! [`CollisionRule`]: a change of an existing row into an occupied slot is
+//! refused (`DuplicateSiblingName`, [`SiblingModel::refused`]); a new row
+//! deletes the occupant with its subtree, as a create does. Then the row
+//! takes the command's parent, name, type and `sectionOrder` as its key,
+//! listed under a parent with a row (or the root) and an orphan otherwise —
+//! a new row even under a missing parent, which a create would ignore — and
+//! a new row adopts the orphans naming it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -113,6 +138,25 @@ pub enum Reader {
 
 /// Both readers, for tests that run each.
 pub const READERS: [Reader; 2] = [Reader::KitV1, Reader::Ovlive];
+
+/// Which sibling-collision rule a [`SiblingModel`] applies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollisionRule {
+    /// The clients' rule, and the server's (module doc): siblings collide in
+    /// a slot ([`collision_slot`]), a same-parent rename to another name
+    /// deletes the occupant of the new name first, and a move whose occupant
+    /// took the destination deletes the section.
+    Slot,
+    /// The rule the server applied before it converged on the clients'
+    /// (b.z16), kept as an oracle for the server's cross-build replay guard:
+    /// siblings collide on the name alone, whatever their kinds; a
+    /// same-parent rename never looks for an occupant; and a move whose
+    /// occupant took the destination stores the section as an orphan under
+    /// it. A move whose occupant took the section itself was refused by that
+    /// rule's server ([`SiblingModel::refused`]), as was a server-rule
+    /// `DiffChangeSection` of an existing row onto a name any sibling holds.
+    NameOnly,
+}
 
 /// One section as a client holds it; `ty` is its `SdfSpecType`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -164,6 +208,20 @@ fn sdf_apply_list_ordering(list: &[u64], order: &[u64]) -> Vec<u64> {
     let mut front: Vec<u64> = scratch.into_iter().flatten().collect();
     front.extend(result);
     front
+}
+
+/// A child's collision slot under its parent, written from the C++ client
+/// library's `slotOf` (the revision recorded in
+/// `docs-internal/cross-repo-debugging.md` § Sibling order and move rules): a
+/// Relationship (8) takes the Attribute (1) slot, and every other
+/// `SdfSpecType` is a slot of its own. Two siblings collide only in one slot
+/// under one name.
+pub fn collision_slot(ty: u8) -> u8 {
+    if ty == 8 {
+        1
+    } else {
+        ty
+    }
 }
 
 /// Which child list of its parent a child belongs to, from the two sections'
@@ -257,6 +315,13 @@ pub fn server_child_lists(state: &ObjectState) -> BTreeMap<ChildListKey, Vec<u64
 #[derive(Clone, Debug)]
 pub struct SiblingModel {
     reader: Reader,
+    rule: CollisionRule,
+    /// Whether a `DiffChangeSection` applies by the server's upload rule
+    /// rather than the reader's catch-up rule (module doc).
+    server_changes: bool,
+    /// Set once a command the server refuses under the model's rule has been
+    /// applied; the model's state is then meaningless.
+    refused: bool,
     rows: BTreeMap<u64, ModelRow>,
     /// Each parent's sequence of children, in the reader's order (ascending
     /// key; keys are unique per parent between deltas).
@@ -264,13 +329,30 @@ pub struct SiblingModel {
 }
 
 impl SiblingModel {
-    /// An empty scene read by `reader`.
+    /// An empty scene read by `reader`, under [`CollisionRule::Slot`].
     pub fn new(reader: Reader) -> Self {
         Self {
             reader,
+            rule: CollisionRule::Slot,
+            server_changes: false,
+            refused: false,
             rows: BTreeMap::new(),
             lists: BTreeMap::new(),
         }
+    }
+
+    /// This model, applying `rule` to the commands it applies from now on.
+    pub fn with_collision_rule(mut self, rule: CollisionRule) -> Self {
+        self.rule = rule;
+        self
+    }
+
+    /// This model, applying every `DiffChangeSection` from now on by the
+    /// server's rule for one in a client upload rather than by its reader's
+    /// catch-up rule (module doc). No client does: this mirrors the server.
+    pub fn applying_changes_as_the_server(mut self) -> Self {
+        self.server_changes = true;
+        self
     }
 
     /// The reader this model follows.
@@ -278,13 +360,36 @@ impl SiblingModel {
         self.reader
     }
 
+    /// Whether a command the server refuses under the model's
+    /// [`CollisionRule`] — refusing the whole delta — has been applied: under
+    /// [`CollisionRule::NameOnly`], a move whose occupant took the section
+    /// (`InconsistentState`); under either rule, a server-rule
+    /// `DiffChangeSection` of an existing row into an occupied slot
+    /// (`DuplicateSiblingName`).
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// Every section the model holds, by id: its parent and its name.
+    pub fn parents_and_names(&self) -> BTreeMap<u64, (u64, String)> {
+        self.rows
+            .iter()
+            .map(|(id, r)| (*id, (r.parent, r.name.clone())))
+            .collect()
+    }
+
     /// Apply one delta: a reset (`is_diff` with `base_version` 0) clears the
     /// model first, then the structural commands apply in order, each by the
-    /// reader's rule (module doc). Fields and time samples carry no sibling
-    /// order and are ignored.
+    /// reader's rule, or a `DiffChangeSection` by the server's upload rule
+    /// when built [`applying_changes_as_the_server`](Self::applying_changes_as_the_server)
+    /// (module doc). Fields and time samples carry no sibling order and are
+    /// ignored.
     pub fn apply(&mut self, delta: &OwnedDelta) {
         if delta.is_diff && delta.base_version == 0 {
-            *self = Self::new(self.reader);
+            *self = Self {
+                server_changes: self.server_changes,
+                ..Self::new(self.reader).with_collision_rule(self.rule)
+            };
         }
         // Kit: changes whose parent is missing, with their command index.
         let mut deferred: Vec<(usize, CommandDiffChangeSection)> = Vec::new();
@@ -297,6 +402,9 @@ impl SiblingModel {
             match cmd {
                 StructCommand::CreateSection(c) => {
                     self.create(c.parent_id, c.section_id, &c.section_name, c.section_type);
+                }
+                StructCommand::DiffChangeSection(c) if self.server_changes => {
+                    self.server_change(c);
                 }
                 StructCommand::DiffChangeSection(c) => match self.reader {
                     Reader::KitV1 => {
@@ -328,9 +436,10 @@ impl SiblingModel {
 
     /// Place a section as a client already holds it: last in its parent's
     /// sequence, of type `ty`, at `key`. The caller passes the sequence in
-    /// order with increasing keys. Unlike a create there is no name-conflict
-    /// cascade — a scene a client holds can carry duplicate names under one
-    /// parent, which a same-parent rename produces.
+    /// order with increasing keys. Unlike a create there is no collision
+    /// cascade — a scene a client holds can carry siblings of different
+    /// kinds under one name, and two of one kind where the server's stored
+    /// state an earlier build wrote holds such a pair.
     pub fn hold(&mut self, parent: u64, id: u64, name: &str, ty: u8, key: u32) {
         self.rows.insert(
             id,
@@ -384,11 +493,21 @@ impl SiblingModel {
         })
     }
 
-    /// The lowest-id section named `name` under `parent`, other than `except`.
-    fn holder(&self, parent: u64, name: &str, except: u64) -> Option<u64> {
+    /// The occupant of the slot a `ty` child named `name` takes under
+    /// `parent`: the lowest-id section there, other than `except`, whose
+    /// [`collision_slot`] is `ty`'s (the C++ client library's `occupant`).
+    /// Under [`CollisionRule::NameOnly`], the lowest-id section of that name
+    /// there, of any kind.
+    fn holder(&self, parent: u64, ty: u8, name: &str, except: u64) -> Option<u64> {
         self.rows
             .iter()
-            .find(|(id, r)| **id != except && r.parent == parent && r.name == name)
+            .find(|(id, r)| {
+                **id != except
+                    && r.parent == parent
+                    && r.name == name
+                    && (self.rule == CollisionRule::NameOnly
+                        || collision_slot(r.ty) == collision_slot(ty))
+            })
             .map(|(id, _)| *id)
     }
 
@@ -472,7 +591,7 @@ impl SiblingModel {
         if self.rows.contains_key(&id) || (parent != 0 && !self.rows.contains_key(&parent)) {
             return;
         }
-        if let Some(holder) = self.holder(parent, name, id) {
+        if let Some(holder) = self.holder(parent, ty, name, id) {
             self.delete(holder);
         }
         let key = self.append_key(parent);
@@ -657,6 +776,36 @@ impl SiblingModel {
         }
     }
 
+    /// The server's `DiffChangeSection` in a client upload, under the model's
+    /// [`CollisionRule`] (module doc).
+    fn server_change(&mut self, c: &CommandDiffChangeSection) {
+        let (parent, id) = (c.parent_id, c.section_id);
+        let holder = self.holder(parent, c.section_type, &c.section_name, id);
+        let previous_parent = self.rows.get(&id).map(|r| r.parent);
+        if let Some(old_parent) = previous_parent {
+            if holder.is_some() {
+                self.refused = true;
+                return;
+            }
+            self.unlink(old_parent, id);
+        } else if let Some(holder) = holder {
+            self.delete(holder);
+        }
+        self.rows.insert(
+            id,
+            ModelRow {
+                parent,
+                name: c.section_name.clone(),
+                ty: c.section_type,
+                key: c.section_order,
+            },
+        );
+        self.insert_by_key(parent, id);
+        if previous_parent.is_none() {
+            self.adopt(id);
+        }
+    }
+
     fn delete(&mut self, id: u64) {
         let Some(parent) = self.rows.get(&id).map(|r| r.parent) else {
             return;
@@ -676,10 +825,29 @@ impl SiblingModel {
     }
 
     fn move_section(&mut self, id: u64, carried: u64, dest: u64, name: &str) {
-        let Some(current) = self.rows.get(&id).map(|r| r.parent) else {
+        let Some((current, ty, held_name)) =
+            self.rows.get(&id).map(|r| (r.parent, r.ty, r.name.clone()))
+        else {
             return;
         };
         if carried == dest {
+            // A rename under the held parent: to the held name it changes
+            // nothing; to another, the occupant of the new name goes first,
+            // with its subtree, which can take the section too. The
+            // name-only rule renamed with no lookup.
+            if self.rule == CollisionRule::NameOnly {
+                self.rows.get_mut(&id).expect("checked above").name = name.to_string();
+                return;
+            }
+            if held_name == name {
+                return;
+            }
+            if let Some(holder) = self.holder(current, ty, name, id) {
+                self.delete(holder);
+                if !self.rows.contains_key(&id) {
+                    return;
+                }
+            }
             self.rows.get_mut(&id).expect("checked above").name = name.to_string();
             return;
         }
@@ -691,12 +859,27 @@ impl SiblingModel {
             self.delete(id);
             return;
         }
-        if let Some(holder) = self.holder(dest, name, id) {
+        if let Some(holder) = self.holder(dest, ty, name, id) {
             if self.is_descendant(id, holder) {
                 self.delete(id);
                 return;
             }
             self.delete(holder);
+            // The holder's subtree can hold the section, which then left
+            // with it, or the destination, which deletes the section as a
+            // move to a missing parent does. The name-only rule's server
+            // refused the first, and moved the section under the missing
+            // destination on the second (an orphan, listed nowhere, below).
+            if !self.rows.contains_key(&id) {
+                if self.rule == CollisionRule::NameOnly {
+                    self.refused = true;
+                }
+                return;
+            }
+            if self.rule == CollisionRule::Slot && dest != 0 && !self.rows.contains_key(&dest) {
+                self.delete(id);
+                return;
+            }
         }
         if dest == current {
             self.rows.get_mut(&id).expect("checked above").name = name.to_string();
@@ -708,9 +891,8 @@ impl SiblingModel {
         row.parent = dest;
         row.name = name.to_string();
         row.key = key;
-        // The holder's cascade can take the destination with it (a holder
-        // whose subtree loops back to the destination); the section then
-        // sits under a parent with no row, an orphan listed nowhere.
+        // Under the name-only rule the destination may be gone (above): the
+        // section is then an orphan, listed nowhere.
         if dest == 0 || self.rows.contains_key(&dest) {
             self.lists.entry(dest).or_default().push(id);
         }

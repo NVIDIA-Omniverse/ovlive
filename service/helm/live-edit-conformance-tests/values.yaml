@@ -20,11 +20,13 @@ image:
   pullSecrets: []
 service:
   endpoint: "http://live-edit-service:50001"
-  # Existing base layer for which the supplied principal has read/write access.
+  # Existing base layer for which the supplied principal has read/write access,
+  # or, with storageEndpoint, a writable directory.
   basePath: ""
   peerEndpoint: ""
   deniedPath: ""
-  # Optional deployment adapter: provision a UUID-named base file under basePath.
+  # Optional Storage API URL: the run creates a UUID-named base layer under
+  # basePath and deletes it afterward.
   storageEndpoint: ""
 auth:
   existingSecret: ""

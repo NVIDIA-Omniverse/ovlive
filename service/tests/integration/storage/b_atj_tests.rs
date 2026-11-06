@@ -20,26 +20,24 @@
 //! b.zvd converted a silent heal into a loud refusal: the snapshot loader of
 //! the time (`load_object_snapshot`, since deleted) began failing closed when
 //! any key it read held a foreign Valkey type, and every snapshot read since
-//! does the same. Today FOUR snapshot consumers wedge on such a
+//! does the same. Today THREE snapshot consumers wedge on such a
 //! key, all through `read_object_snapshot`'s key set, which classifies the same
 //! way: the structural `UpdateLayer` WATCH path through its unfenced fan-out at
 //! every size; the subscribe
 //! catch-up at every size — at or below the atomic-read limits through its
 //! atomic read, above them through the fenced read's fan-out its layer's
-//! shared flight runs (a legacy in-window replay of such a layer takes the
-//! catch-up's coalesced route there); the checkpoint assembler at every size —
+//! shared flight runs; and the checkpoint assembler at every size —
 //! atomically at or below the limits, through a fenced read of its own above
-//! them; and per-commit reconstruction (a legacy in-window replay) at or below
-//! the limits through its atomic read. A live commit is never reconstructed:
-//! one without relay bytes is an empty commit, sent with no read. But before
-//! b.atj *no counter moved* on any of these reads. Four is the exhaustive
-//! snapshot-consumer count, not a sample. A fifth reader counts on the same
+//! them. A live commit is never reconstructed: one without relay bytes is an
+//! empty commit, sent with no read. But before b.atj *no counter moved* on
+//! any of these reads. Three is the exhaustive snapshot-consumer count, not a
+//! sample. A fourth reader counts on the same
 //! counter without reading a snapshot: external-value clean-up of a deleted or
 //! replaced layer (`storage::retirement`, b.fsz MR-D4), whose size read and
 //! reference walk read only the header, `obj:flds`, `obj:tss`, their rows and
 //! `obj:ext` (`key_family="ext_index"`). The authoritative list, and the key
 //! split on an object carrying the `chs_complete` marker (a wrong-typed
-//! `obj:chs` stops all four at every size, because the atomic read's size
+//! `obj:chs` stops all three at every size, because the atomic read's size
 //! check reads it before it can answer `TOO_LARGE`, while a wrong-typed list
 //! `obj:chs` does not name stops none of them), lives on the
 //! `snapshot_read_type_error_total` field doc in `src/observability/metrics.rs`.

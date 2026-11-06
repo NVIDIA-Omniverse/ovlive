@@ -17,8 +17,9 @@
 // failure handling, and pool-size configuration.
 //
 // Requires a running Valkey instance. Address is read from TEST_VALKEY_URL,
-// falling back to LIVE_EDIT_VALKEY_ADDR, then defaulting to redis://127.0.0.1:6379.
-// Tests skip gracefully if Valkey is unreachable.
+// defaulting to redis://127.0.0.1:6379. Tests connect through
+// `connect_test_client_or_skip`: with TEST_VALKEY_URL set an unreachable store
+// fails them, and they skip only when it is unset outside CI.
 
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use uuid::Uuid;
 
 use live_edit::config::Config;
 use live_edit::storage::client::{ConnectError, ValkeyClient};
-use live_edit::storage::test_support::TestValkey;
+use live_edit::storage::test_support::{connect_test_client_or_skip, TestValkey};
 
 /// Build a minimal Config pointing at the local test Valkey instance.
 ///
@@ -49,26 +50,11 @@ fn test_prefix() -> String {
     format!("le:test:{}:", Uuid::new_v4())
 }
 
-/// Connect to Valkey; return None (and skip) if the instance is not reachable.
-async fn maybe_connect(pool_size: u32) -> Option<ValkeyClient> {
-    let cfg = test_config(pool_size);
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(client)) => Some(client),
-        _ => None,
-    }
-}
-
 // ── t3.1it.ra.in.2c ──────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn valkey_client_ping_data_pool_succeeds() {
-    let Some(client) = maybe_connect(1).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(1)).await else {
         return;
     };
 
@@ -81,8 +67,7 @@ async fn valkey_client_ping_data_pool_succeeds() {
 
 #[tokio::test]
 async fn valkey_client_set_and_get_round_trip_returns_stored_value() {
-    let Some(client) = maybe_connect(1).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(1)).await else {
         return;
     };
 
@@ -109,8 +94,7 @@ async fn valkey_client_set_and_get_round_trip_returns_stored_value() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn valkey_client_pubsub_does_not_block_concurrent_data_commands() {
-    let Some(client) = maybe_connect(2).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(2)).await else {
         return;
     };
 
@@ -205,8 +189,7 @@ async fn valkey_client_unreachable_address_returns_err_not_panic() {
 async fn valkey_client_pool_size_configuration_respected() {
     const POOL_SIZE: u32 = 3;
 
-    let Some(client) = maybe_connect(POOL_SIZE).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(POOL_SIZE)).await else {
         return;
     };
 
@@ -245,13 +228,7 @@ async fn connect_builds_the_snapshot_lane_with_its_own_configured_connections() 
 
     let mut cfg = test_config(2);
     cfg.snapshot_pool_size = SNAPSHOT_POOL_SIZE;
-    let Ok(Ok(client)) = tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&cfg).await else {
         return;
     };
 
@@ -284,17 +261,14 @@ async fn quit_closes_every_snapshot_lane_connection() {
 
     let mut cfg = test_config(1);
     cfg.snapshot_pool_size = 2;
-    let Ok(Ok(client)) = tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(observer_client) = maybe_connect(1).await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The lane's client and the observer connect concurrently: one hang
+    // guard, not two.
+    let observer_cfg = test_config(1);
+    let (client, observer_client) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&observer_cfg)
+    );
+    let (Some(client), Some(observer_client)) = (client, observer_client) else {
         return;
     };
     let observer = observer_client.pool.next().clone();
@@ -340,35 +314,31 @@ async fn quit_closes_every_snapshot_lane_connection() {
     observer_client.quit().await;
 }
 
-/// `Blocking::Interrupt` is enabled on the stream readers' clients and on
-/// NOTHING else. (A reader's client exists once the reader has first served a
-/// subscription: readers connect lazily.)
+/// Every client `connect` builds keeps fred's default `Blocking::Block`: each
+/// member of the data / txn / maintenance / snapshot pools, the pub/sub
+/// connection, and every stream reader's client. (A reader's client exists
+/// once the reader has first served a subscription: readers connect lazily.)
 ///
-/// Why the readers need it: each is parked in `XREAD BLOCK`. Since b.19i a
-/// reader sends its other commands, its credential re-AUTH included, only
-/// between reads, and fred runs no credential refresh on it, so what is left is
-/// the residual case: the reader's next command after a client-side `XREAD`
-/// timeout that did not force a reconnect would queue behind up to 30 s of
-/// that still-blocked read. `Interrupt` makes fred clear the block with
-/// `CLIENT UNBLOCK` first; the `-UNBLOCKED` goes to the timed-out read's
-/// already-dropped caller, so nothing is re-planned or counted.
-///
-/// Why it must not spread: the data / txn / maintenance / snapshot pools and the
-/// pub/sub connection are MULTIPLEXED. A command queued behind another there is
-/// ordinary pipelining, so `Interrupt` would have fred fire `CLIENT UNBLOCK`
-/// against healthy traffic.
+/// Why the readers too (b.9sh): under `Blocking::Interrupt`, the readers'
+/// setting until then, fred sends `CLIENT UNBLOCK` over a backchannel
+/// connection before a command queued behind a blocked read, so a reader that
+/// ever hit that case held a second connection for the life of its client.
+/// The one case left was a reader's next command after a client-side `XREAD`
+/// timeout that did not force a reconnect; under `Block` it waits for the
+/// abandoned read's BLOCK to end, bounded by its own timeout. On the
+/// multiplexed pools a command queued behind another is ordinary pipelining,
+/// where `Interrupt` would `CLIENT UNBLOCK` healthy traffic.
 ///
 /// Read back through fred's `ClientLike::client_config()`, i.e. off the live
-/// clients each pool actually built. The source-level single-mutation-site
-/// guard lives in `src/storage/client.rs`
-/// (`connect_sets_blocking_interrupt_exactly_once_on_the_subscriber_pool_config`);
+/// clients each pool actually built. The source-level guard that no code
+/// writes the field lives in `src/storage/client.rs`
+/// (`connect_writes_no_blocking_policy_so_every_client_keeps_freds_default`);
 /// neither subsumes the other.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connect_enables_blocking_interrupt_on_the_subscriber_pool_only() {
+async fn connect_keeps_blocking_block_on_every_pool_and_every_reader() {
     use fred::types::config::Blocking;
 
-    let Some(client) = maybe_connect(2).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(2)).await else {
         return;
     };
 
@@ -382,9 +352,9 @@ async fn connect_enables_blocking_interrupt_on_the_subscriber_pool_only() {
     for reader in readers {
         assert_eq!(
             reader.client_config().blocking,
-            Blocking::Interrupt,
-            "every stream reader must carry Blocking::Interrupt so a command queued behind \
-             its XREAD BLOCK clears it with CLIENT UNBLOCK instead of waiting out the block"
+            Blocking::Block,
+            "every stream reader must keep fred's default Blocking::Block, so no reader opens \
+             a CLIENT UNBLOCK backchannel connection (b.9sh)"
         );
     }
 
@@ -416,16 +386,15 @@ async fn connect_enables_blocking_interrupt_on_the_subscriber_pool_only() {
     }
     drop(txn_slot);
 
-    // Guard the premise: every pool above is built from the same
-    // `build_fred_config` output, so `Blocking::Block` on five of them only
-    // proves scoping while it is still fred's default. If a fred bump flipped
-    // the default, the five assertions above would be asserting the mutation
-    // rather than its absence.
+    // Guard the premise: every client above is built from the same
+    // `build_fred_config` output with no `blocking` write, so `Block` on all of
+    // them is fred's default. If a fred bump flipped the default, every
+    // assertion above would fail at once, and the service would need an
+    // explicit `Block` rather than a silent change of policy.
     assert_eq!(
         Blocking::default(),
         Blocking::Block,
-        "precondition: fred's Blocking default must be Block — if it ever changes, the \
-         five non-subscriber assertions above stop meaning \"undiverged\""
+        "precondition: fred's Blocking default must be Block — every client relies on it"
     );
 
     client.quit().await;
@@ -450,8 +419,7 @@ async fn connect_sets_the_connection_buffer_limits_of_its_class_on_every_client(
         GENERAL_LIMITS, READER_LIMITS,
         "precondition: the two classes differ, so a client given the other class's limits fails"
     );
-    let Some(client) = maybe_connect(2).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(2)).await else {
         return;
     };
 
@@ -562,8 +530,7 @@ async fn a_member_replacements_fresh_client_carries_the_general_connection_buffe
     /// Bound on each replacement's swap and on the replacements' end.
     const SETTLE: Duration = Duration::from_secs(10);
 
-    let Some(client) = maybe_connect(2).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(2)).await else {
         return;
     };
     client.set_member_replacement_knobs_for_test(ReplaceKnobs {
@@ -697,8 +664,7 @@ async fn valkey_client_rediss_url_against_plaintext_server_fails_to_connect() {
     // Plaintext control first: a `rediss://` failure is meaningless if Valkey
     // is simply down (the test would pass vacuously). Prove the plaintext path
     // connects, then drop the client immediately.
-    let Some(control) = maybe_connect(1).await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(control) = connect_test_client_or_skip(&test_config(1)).await else {
         return;
     };
     drop(control);
@@ -796,7 +762,7 @@ async fn valkey_client_rediss_url_against_plaintext_server_fails_to_connect() {
 /// `ConnectError::Timeout`.
 #[tokio::test]
 async fn valkey_client_rediss_cluster_url_against_plaintext_cluster_fails_to_connect() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -874,7 +840,7 @@ async fn valkey_client_rediss_cluster_url_against_plaintext_cluster_fails_to_con
 /// non-regression criterion, rather than a claim resting on unrelated tests.
 #[tokio::test]
 async fn valkey_client_plaintext_cluster_url_round_trips_after_tls_host_mapping_change() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -913,4 +879,120 @@ async fn valkey_client_plaintext_cluster_url_round_trips_after_tls_host_mapping_
     );
 
     // TestValkey's Drop does the cluster-safe SCAN+UNLINK cleanup.
+}
+
+/// b.9sh (vendored fred change 11), on a real cluster: a clustered client
+/// holds exactly one connection per primary — after its connect, and again
+/// after a forced cluster sync (`sync_cluster`) — as the store's own
+/// `CLIENT LIST` on every primary shows. Stock fred kept the connection each
+/// sync opens for `CLUSTER SLOTS` as the client's backchannel, so the store
+/// listed n + 1: one more idle socket per clustered client, P₀ = 136 of them
+/// per replica at the chart's pools. The facade-level test of every exit of a
+/// sync is `b_9sh_sync_connection_test`.
+///
+/// The client is a raw fred cluster client on `LIVE_EDIT_TEST_CLUSTER_URL`
+/// with `auto_client_setname` on, so fred names every connection it sets up —
+/// its router's and the sync's — with the client's id, and only that client's
+/// connections carry the name on the shared cluster. The service's pooled
+/// clients run the same vendored sync, but name no connection, so on a shared
+/// cluster their sync connection could not be told from a sibling test's.
+/// The sync's connection is closed when the sync ends, and the store notices
+/// the close a moment later, so each count is polled (for one `SETTLE`) until
+/// it reads n; a client that kept the connection never gets there.
+///
+/// Cluster-gated (`LIVE_EDIT_TEST_CLUSTER_URL`, CI's `test-cluster:` job). It
+/// has not run against stock fred: no cluster is reachable where it was
+/// written, so its fail-on-old is by reading (n + 1 named connections listed
+/// for good), and the facade test above is the executed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_client_holds_one_connection_per_primary_after_connect_and_after_a_sync() {
+    use fred::interfaces::{ClientInterface, ClusterInterface};
+    use fred::prelude::Builder;
+    use fred::types::config::{Config as FredConfig, Options};
+
+    /// Bound on the client's connect.
+    const CONNECT_BUDGET: Duration = Duration::from_secs(30);
+    /// Bound on the sync, on each poll of the count, and on `quit`.
+    const SETTLE: Duration = Duration::from_secs(10);
+
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
+        eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
+        return;
+    };
+    let mut builder = Builder::from_config(
+        FredConfig::from_url(&cluster_url).expect("LIVE_EDIT_TEST_CLUSTER_URL must parse"),
+    );
+    builder.with_connection_config(|c| c.auto_client_setname = true);
+    let client = builder.build().expect("the raw cluster client builds");
+    let _router = client.connect();
+    tokio::time::timeout(CONNECT_BUDGET, client.wait_for_connect())
+        .await
+        .expect("the raw cluster client must connect within its budget")
+        .expect("the raw cluster client connects");
+    assert!(
+        client.is_clustered(),
+        "LIVE_EDIT_TEST_CLUSTER_URL must point at a clustered deployment"
+    );
+    let name = client.id().to_owned();
+    let primaries = client
+        .cached_cluster_state()
+        .expect("a connected cluster client has its routing")
+        .unique_primary_nodes();
+    assert!(
+        primaries.len() >= 2,
+        "fixture self-check: a multi-primary cluster; got {primaries:?}"
+    );
+
+    // Connections named `name`, summed over every primary's CLIENT LIST.
+    let named = || async {
+        let mut total = 0;
+        for primary in &primaries {
+            let listing: String = client
+                .with_options(&Options {
+                    cluster_node: Some(primary.clone()),
+                    max_attempts: Some(1),
+                    ..Default::default()
+                })
+                .client_list::<String, String>(None, None)
+                .await
+                .unwrap_or_else(|e| panic!("CLIENT LIST on {primary} must succeed: {e}"));
+            total += listing
+                .lines()
+                .filter(|line| {
+                    line.split_whitespace()
+                        .any(|kv| kv == format!("name={name}"))
+                })
+                .count();
+        }
+        total
+    };
+    let await_named = |when: &'static str| {
+        let named = &named;
+        let want = primaries.len();
+        async move {
+            let deadline = tokio::time::Instant::now() + SETTLE;
+            loop {
+                let got = named().await;
+                if got == want {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{when}: the store lists {got} connections of the client, want one per \
+                     primary ({want}); one more is the sync's CLUSTER SLOTS connection kept as \
+                     a backchannel"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+
+    await_named("after the connect").await;
+    tokio::time::timeout(SETTLE, client.sync_cluster())
+        .await
+        .expect("the sync must end within its budget")
+        .expect("the sync succeeds");
+    await_named("after a forced sync").await;
+
+    let _ = tokio::time::timeout(SETTLE, client.quit()).await;
 }

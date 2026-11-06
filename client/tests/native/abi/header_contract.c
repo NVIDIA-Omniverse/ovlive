@@ -28,10 +28,27 @@ STATIC_ASSERT(offsetof(OmniUsdLiveRuntimeOptions, reconnect_initial_ms) == 144,
               "the reconnect options append after apply_lag_warning_threshold");
 STATIC_ASSERT(offsetof(OmniUsdLiveRuntimeOptions, reconnect_maximum_ms) == 148, "reconnect_maximum_ms follows");
 STATIC_ASSERT(offsetof(OmniUsdLiveRuntimeOptions, reconnect_max_attempts) == 152, "reconnect_max_attempts follows");
-STATIC_ASSERT(sizeof(OmniUsdLiveRuntimeOptions) == 160, "runtime options end after reconnect_max_attempts");
+STATIC_ASSERT(offsetof(OmniUsdLiveRuntimeOptions, max_calls_per_endpoint) == 160,
+              "max_calls_per_endpoint appends after the reconnect options, 8-byte aligned");
+STATIC_ASSERT(sizeof(OmniUsdLiveRuntimeOptions) == 168, "runtime options end after max_calls_per_endpoint");
 STATIC_ASSERT(offsetof(OmniUsdLiveCapabilities, autonomous_progress) == 16, "capabilities carry no recovery schema field");
 STATIC_ASSERT(sizeof(OmniUsdLiveCapabilities) == 20, "capabilities layout ends after autonomous_progress");
 STATIC_ASSERT(offsetof(OmniUsdLiveJoinOptions, app_name) == 8, "join ABI prefix");
+STATIC_ASSERT(offsetof(OmniUsdLiveJoinOptions, flags) == 16, "flags appends to the 1.0 join options");
+STATIC_ASSERT(sizeof(OmniUsdLiveJoinOptions) == 24, "join options end after flags");
+STATIC_ASSERT(offsetof(OmniUsdLiveSessionEvent, size) == 48, "session event 1.0 prefix ends with size");
+STATIC_ASSERT(offsetof(OmniUsdLiveSessionEvent, merge_owner_supported) == 56,
+              "merge_owner_supported appends to the 1.0 session event");
+STATIC_ASSERT(offsetof(OmniUsdLiveSessionEvent, merge_owner_held) == 60, "merge_owner_held follows");
+STATIC_ASSERT(offsetof(OmniUsdLiveSessionEvent, merge_owner_outcome) == 64, "merge_owner_outcome follows");
+STATIC_ASSERT(offsetof(OmniUsdLiveSessionEvent, merge_owner_epoch) == 72, "merge_owner_epoch follows, 8-byte aligned");
+STATIC_ASSERT(sizeof(OmniUsdLiveSessionEvent) == 80, "session event ends after merge_owner_epoch");
+STATIC_ASSERT(offsetof(OmniUsdLiveMergeOwner, supported) == 8, "merge owner view prefix");
+STATIC_ASSERT(offsetof(OmniUsdLiveMergeOwner, held) == 12, "merge owner held follows supported");
+STATIC_ASSERT(offsetof(OmniUsdLiveMergeOwner, owned) == 16, "merge owner owned follows held");
+STATIC_ASSERT(offsetof(OmniUsdLiveMergeOwner, epoch) == 24, "merge owner epoch is 8-byte aligned");
+STATIC_ASSERT(sizeof(OmniUsdLiveMergeOwner) == 32, "merge owner view ends after epoch");
+STATIC_ASSERT(OMNI_USD_LIVE_EVENT_MERGE_OWNER == 5 && OMNI_USD_LIVE_JOIN_MERGE_OWNER == 1, "merge owner values");
 STATIC_ASSERT(offsetof(OmniUsdLiveAuthRequired, grpc_status) == 40, "auth challenge ends with grpc_status");
 STATIC_ASSERT(sizeof(OmniUsdLiveAuthRequired) == 48, "auth challenge size is padded to 8 bytes");
 /* Retired values stay reserved gaps: result 17, state 6, operation 15 and record 23.
@@ -43,7 +60,8 @@ STATIC_ASSERT(OMNI_USD_LIVE_STATE_CLOSED == 9, "last state");
 STATIC_ASSERT(OMNI_USD_LIVE_OPERATION_SHUTDOWN == 14, "operation 15 is reserved");
 STATIC_ASSERT(OMNI_USD_LIVE_RECORD_RECORDS_SUPPRESSED == 22 && OMNI_USD_LIVE_RECORD_MESSAGE_ACCEPTED == 24,
               "record 23 is reserved");
-STATIC_ASSERT(OMNI_USD_LIVE_RECORD_APPLY_LAG_EXITED == 35, "last record");
+STATIC_ASSERT(OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED == 37 && OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT == 38,
+              "last record");
 
 /* Model a later same-major provider extending each record independently.
  * Consumer sees the old prefix; pointer arrays preserve element addressing. */

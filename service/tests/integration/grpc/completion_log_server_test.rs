@@ -146,7 +146,10 @@ impl FullStackServer {
             let _ = ready_tx.send(());
             Server::builder()
                 .layer(metrics_layer)
-                .add_service(live_service_server(svc))
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .add_service(health_service)
                 .add_service(reflection_service)
                 .add_service(CapabilitiesServiceServer::new(CapabilitiesServiceImpl))

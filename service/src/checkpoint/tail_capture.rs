@@ -185,6 +185,15 @@ pub enum TailCaptureRefusal {
     },
     /// Task 2's classifier found no sound prefix.
     Classified(TailRefusal),
+    /// The pre-PUT clean-up fence (`checkpoint::put_guard`, b.g65) refused the
+    /// PUT: the checkpoint clean-up is deleting an earlier copy of this same
+    /// tail generation (its stem is announced on `le:ckpt:{recon}:deleting`),
+    /// or the re-arm that must precede the PUT could not be recorded in
+    /// Valkey. A tail names no large value, so only its stem can refuse it.
+    /// Nothing was persisted; a later tick re-attempts. Its own cell,
+    /// `refused_cleanup_in_flight`: the remediation is to wait, not to touch
+    /// the chain or the store.
+    CleanupInFlight,
 }
 
 impl TailCaptureDecision {
@@ -241,6 +250,9 @@ impl TailCaptureDecision {
             }
             TailCaptureDecision::Refused(TailCaptureRefusal::Classified(refusal)) => {
                 refusal.outcome_label()
+            }
+            TailCaptureDecision::Refused(TailCaptureRefusal::CleanupInFlight) => {
+                "refused_cleanup_in_flight"
             }
         }
     }
@@ -666,6 +678,9 @@ async fn capture_inner(
     chain_bound: ChainBound,
     probe: Option<ObjectLivenessProbe<'_>>,
 ) -> Result<TailCaptureDecision, CheckpointError> {
+    // The clean-up fence's reliance start (`checkpoint::put_guard`): every
+    // read this capture publishes from happens after it.
+    let reliance_start = std::time::Instant::now();
     // ── 1. Lineage addressing: one listing, no blob fetch ───────────────────
     // Taken here, at the moment the tail is addressed, never handed in: a
     // listing taken earlier in the tick would be one proven snapshot read old
@@ -1088,17 +1103,29 @@ async fn capture_inner(
     // feeds the fossil guard and the tail meta's identity columns and happens
     // before the encode; this one asks a single question immediately before the
     // write. `crate::checkpoint::put_guard` carries the residual.
-    let Some(handle) = crate::checkpoint::put_guard::put_layer_checkpoint_if_live(
+    //
+    // The same call runs the clean-up fence (b.g65): a refusal persisted
+    // nothing and becomes `TailCaptureRefusal::CleanupInFlight`.
+    let put = crate::checkpoint::put_guard::put_layer_checkpoint_if_live(
         probe,
         store,
         object_id,
         to_seq,
         envelope,
         meta,
+        reliance_start,
         "tail capture",
     )
-    .await?
-    else {
+    .await;
+    let put = match put {
+        Err(e) if e.is_cleanup_in_flight() => {
+            return Ok(TailCaptureDecision::Refused(
+                TailCaptureRefusal::CleanupInFlight,
+            ));
+        }
+        other => other,
+    };
+    let Some(handle) = put? else {
         return Err(CheckpointError::NotFound);
     };
 
@@ -1617,6 +1644,10 @@ mod tests {
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.record("ext_blob_exists");
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {

@@ -38,7 +38,7 @@ class RecoverySurfaceDeletedTests(unittest.TestCase):
         for name in ('source/live/runtime/Live.exports', 'source/live/scene/plugin/LivePlugin.exports'):
             text = (ROOT / name).read_text(encoding='utf-8')
             self.assertNotIn('ExportLayerRecovery', text, name)
-            self.assertEqual(len(re.findall(r'omniUsdLive\w+;', text)), 40, name)
+            self.assertEqual(len(re.findall(r'omniUsdLive\w+;', text)), 42, name)
         absent(self, PYTHON / '__init__.py', (r'\brecovery_schema_version\b',))
 
     def test_retired_values_have_no_names(self):

@@ -20,7 +20,8 @@
 //!
 //! Epic AC #4 pairs with AC #3: Task 5's session-recovery applier
 //! ([`apply_session_checkpoint`](live_edit::checkpoint::session)) splits the
-//! restore into two independently-atomic MULTI/EXEC transactions because
+//! restore into two independently-atomic steps (Step A a MULTI/EXEC; Step B,
+//! in on-access recovery, one `session_record_restore.lua` script) because
 //! the path-index keys (`le:path:{hex(base_path)}*`, hashed on
 //! `{hex(base_path)}`) and the session-scoped keys (`le:{sid}:sess`,
 //! `le:{sid}:layers`, `le:{sid}:layer:{hex(name)}`, hashed on
@@ -48,9 +49,16 @@
 //!    the path-index populated AND demonstrates SR-2.7's self-healing
 //!    contract.** A subsequent `ListSessions` walk surfaces the ghost
 //!    path-name member (Step A wrote it) and `reconcile_ghost_members`
-//!    SREMs it once the corresponding session-checkpoint blob is gone.
+//!    vetoes its id and releases it once the corresponding
+//!    session-checkpoint blob is gone.
+//! 4. **The veto does not block a later recovery** (b.2tu). A walk run with
+//!    no recovery (a disabled hook, as on a `checkpoint_enabled=false` peer)
+//!    vetoes a Step-A-only ghost and releases its members while its blob
+//!    still exists; a retried recovery then restores the session in full —
+//!    Step A re-adds the members, Step B writes the metadata without reading
+//!    the veto — and ListSessions lists it.
 //!
-//! All three scenarios consume the per-step fault-injection seam exposed
+//! All four scenarios consume the per-step fault-injection seam exposed
 //! by `live_edit::checkpoint::session::{ApplyStep,
 //! set_apply_step_fault_injector_for_test, clear_apply_step_fault_injectors_for_test}`
 //! under the `test-checkpoint-fault-injection` cargo feature. Each
@@ -86,7 +94,7 @@
 
 use std::collections::VecDeque;
 
-use fred::interfaces::{KeysInterface, SetsInterface};
+use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
 use tonic::Code;
 
 use live_edit::checkpoint::session::{
@@ -212,15 +220,15 @@ async fn create_session_layer_and_wipe(
 // ── Fault-injection error constructor ────────────────────────────────────────
 //
 // `CheckpointError::Transient` is the natural classification for a Step
-// A/B EXEC failure — it matches what real Valkey-side failures would
-// surface as in production, and it is the variant that the cache funnel
-// maps to `ServiceError::Unavailable` (vs. `Internal` for Permanent /
-// Conflict). The scenarios in this file all want the failure to surface
-// as `Unavailable` to the gRPC caller (`Code::Unavailable`), so the
+// A `EXEC` or Step B script failure — it matches what real Valkey-side
+// failures would surface as in production, and it is the variant that the
+// cache funnel maps to `ServiceError::Unavailable` (vs. `Internal` for
+// Permanent / Conflict). The scenarios in this file all want the failure to
+// surface as `Unavailable` to the gRPC caller (`Code::Unavailable`), so the
 // queued error MUST be `Transient`. A regression that flipped Step A's
 // classification to `Permanent` would surface here as the RPC returning
-// `Internal` and the scenarios in this file would fail at the status-
-// code assertion — exactly the wiring contract we want pinned.
+// `Internal` and the scenarios in this file would fail at the status-code
+// assertion — exactly the wiring contract we want pinned.
 
 fn make_step_a_fault(label: &str) -> CheckpointError {
     CheckpointError::Transient {
@@ -444,8 +452,8 @@ async fn step_a_path_index_failure_leaves_no_partial_state() {
 
     // (d) Layers-index: defense-in-depth assertion that Step B's SADDs
     // also did not partially leak. `layers_index` is in the {sid} slot
-    // alongside session_meta in Step B's MULTI block, so this is the
-    // same MULTI as session-meta — but pinning both surfaces would
+    // alongside session_meta in Step B's one atomic step, so this is the
+    // same step as session-meta — but pinning both surfaces would
     // catch a regression that split Step B internally.
     let layers_index_key = harness.tv.key_schema().layers_index(&session_id);
     let layers_index_exists: bool = harness
@@ -668,11 +676,12 @@ async fn step_a_atomicity_under_partial_member_failure() {
 /// contract: when Step A succeeds + Step B fails on the FIRST recovery
 /// attempt, the resulting Step-A-only state (path-index members present,
 /// session_meta absent) is reconciled by the next `ListSessions` walk's
-/// `reconcile_ghost_members`. The Subtask body asserts the
-/// opportunistic-cleanup branch SREMs the ghost path-name member; the
-/// load-bearing SREM arm is `SessionRecoveryOutcome::NoCheckpoint` per
-/// `reconcile_ghost_members`'s match (the `Error` arm conservatively
-/// skips SREM, and `Recovered + Ok(Some(meta))` appends to the response).
+/// `reconcile_ghost_members`. The Subtask body asserts the clean-up
+/// removes the ghost path-name member; the load-bearing arm is
+/// `SessionRecoveryOutcome::NoCheckpoint` per `reconcile_ghost_members`'s
+/// match, which retires the ghost (veto, then release of both members;
+/// the `Error` arm conservatively keeps them, and
+/// `Recovered + Ok(Some(meta))` appends to the response).
 ///
 /// To drive `NoCheckpoint`, we delete the session-checkpoint blob AFTER
 /// the first (Step-B-failed) recovery — modelling the realistic scenario
@@ -682,7 +691,8 @@ async fn step_a_atomicity_under_partial_member_failure() {
 /// world; a peer replica may have completed the recovery, then deleted
 /// the session and its blob, leaving this replica's stale path-index
 /// member). The `ListSessions` walk then sees the ghost, recovery
-/// reports `NoCheckpoint`, and the opportunistic-cleanup branch SREMs.
+/// reports `NoCheckpoint`, and the walk vetoes the id and releases both
+/// members.
 ///
 /// ## One-composite shape — load-bearing detail
 ///
@@ -697,7 +707,7 @@ async fn step_a_atomicity_under_partial_member_failure() {
 /// sid), so `reconcile_ghost_members` invokes `try_recover_session`
 /// once. That single call hits the `NoCheckpoint` arm (the blob was
 /// deleted between RPCs), so `not_recoverable` ticks by EXACTLY 1 and
-/// the composite is SREM'd.
+/// the composite is released.
 ///
 /// Why each step is load-bearing:
 ///
@@ -719,16 +729,17 @@ async fn step_a_atomicity_under_partial_member_failure() {
 /// - Between the two RPCs we delete the LocalDisk-backed checkpoint
 ///   blob — this is what flips the `try_recover_session` outcome from
 ///   `Recovered` (the second ListSessions walk would otherwise restore
-///   the session) to `NoCheckpoint` (SREM arm). Modelling the
+///   the session) to `NoCheckpoint` (the retiring arm). Modelling the
 ///   peer-replica-deleted-the-blob race; in production a path-index
 ///   ghost can outlive its checkpoint blob if a peer replica completes
 ///   the lifecycle (DeleteSession → blob delete) before this replica
 ///   notices the ghost.
 /// - `ListSessions` walks the path-index, finds the single ghost,
 ///   `reconcile_ghost_members` invokes `try_recover_session` once, it
-///   returns `NoCheckpoint` (the blob is gone), and `srem_ghost_member`
-///   SREMs from BOTH `path_names_index` AND legacy `path_index`. We
-///   assert post-state cardinality == 0 on both sets.
+///   returns `NoCheckpoint` (the blob is gone), and
+///   `SessionStore::retire_ghost_member` vetoes the id, then releases it
+///   from BOTH `path_names_index` AND legacy `path_index` in one script.
+///   We assert post-state cardinality == 0 on both sets.
 /// - The post-ListSessions assertions pin SR-2.7's self-healing:
 ///   neither set carries the stale members anymore; the response is
 ///   empty (no recovered session); the `not_recoverable` cell ticks
@@ -865,7 +876,7 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
         .expect("EXISTS session_meta post-first-RPC probe must succeed");
     assert!(
         !session_meta_after_step_b_fail,
-        "after Step B fault, session_meta MUST be absent — the Step B MULTI block \
+        "after Step B fault, session_meta MUST be absent — Step B's one atomic step \
          contains all session-scoped writes (HSET session_meta, SET layer_mapping, \
          SADD layers_index) and short-circuits atomically. A surviving session_meta \
          indicates Step B wrote it before consulting the injector — Task 5 step- \
@@ -922,8 +933,8 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
 
     // Delete the session-checkpoint blob. This flips the SECOND
     // recovery attempt from `Recovered` (would restore the session,
-    // reconciler appends to response) to `NoCheckpoint` (SREM arm).
-    // Models the realistic peer-replica race described in the test
+    // reconciler appends to response) to `NoCheckpoint` (the retiring
+    // arm). Models the realistic peer-replica race described in the test
     // docstring above.
     harness
         .store
@@ -934,7 +945,8 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     // Second RPC: ListSessions walks the path-index, finds the ghost
     // (HGETALL session_meta is empty), invokes try_recover_session,
     // which sees no checkpoint blob and returns NoCheckpoint. The
-    // reconciler's NoCheckpoint arm SREMs from both path-index sets.
+    // reconciler's NoCheckpoint arm vetoes the id and releases both
+    // path-index members.
     let list_response = handle_list_sessions(
         &harness.svc,
         make_unary_token_request(ListSessionsRequest {
@@ -944,26 +956,25 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     .await
     .expect(
         "ListSessions MUST succeed against the ghost-only base_path — the \
-         opportunistic-cleanup is silent and recovery's NoCheckpoint arm cleanly \
-         sweeps the orphan.",
+         clean-up is silent and recovery's NoCheckpoint arm cleanly retires \
+         the orphan.",
     );
     let proto_sessions = list_response.into_inner().sessions;
 
     // The response carries NO recovered session — the blob was
-    // deleted, so the ghost was SREM'd via the NoCheckpoint arm rather
+    // deleted, so the ghost was retired via the NoCheckpoint arm rather
     // than appended via the Recovered arm.
     assert!(
         proto_sessions.is_empty(),
         "ListSessions response MUST be empty — the ghost has no checkpoint blob, \
-         so the NoCheckpoint arm SREMs and excludes. A non-empty response means \
-         either the blob deletion failed (the second recovery succeeded via \
-         Recovered) or the reconciler's NoCheckpoint arm appended to the response \
-         (a regression that would break the SREM contract)."
+         so the NoCheckpoint arm retires and excludes it. A non-empty response \
+         means either the blob deletion failed (the second recovery succeeded via \
+         Recovered) or the reconciler's NoCheckpoint arm appended to the response."
     );
 
-    // The Subtask body pins the SREM assertion explicitly: "Assert the
-    // existing opportunistic-cleanup branch SREMs the ghost path-name
-    // member." The single composite ghost results in one SREM call via
+    // The Subtask body pins the clean-up assertion explicitly: "Assert the
+    // existing clean-up branch removes the ghost path-name member." The
+    // single composite ghost is retired by one veto and one release via
     // reconcile_ghost_members.
     let session_composite_after_list: bool = harness
         .tv
@@ -975,9 +986,10 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     assert!(
         !session_composite_after_list,
         "post-ListSessions SISMEMBER MUST be 0 for the session-name composite — \
-         reconcile_ghost_members's NoCheckpoint arm calls srem_ghost_member, \
-         which SREMs from path_names_index. A surviving member means the SREM \
-         never fired (regression in the NoCheckpoint arm)."
+         reconcile_ghost_members's NoCheckpoint arm retires the ghost through \
+         SessionStore::retire_ghost_member, which vetoes the id and releases it \
+         from path_names_index. A surviving member means the release never ran \
+         (regression in the NoCheckpoint arm)."
     );
     let path_names_cardinality_after: u64 = harness
         .tv
@@ -989,9 +1001,9 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     assert_eq!(
         path_names_cardinality_after, 0,
         "post-ListSessions path_names_index MUST be empty — the single composite \
-         ghost SREM'd via the NoCheckpoint arm. A nonzero cardinality means \
-         a second composite leaked from somewhere unexpected, or the SREM failed \
-         silently. Got cardinality {}.",
+         ghost released via the NoCheckpoint arm. A nonzero cardinality means \
+         a second composite leaked from somewhere unexpected, or the release \
+         failed silently. Got cardinality {}.",
         path_names_cardinality_after
     );
     let legacy_after_list: bool = harness
@@ -1004,7 +1016,7 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     assert!(
         !legacy_after_list,
         "post-ListSessions SISMEMBER MUST be 0 for the legacy path_index member — \
-         srem_ghost_member SREMs from both sets symmetrically."
+         the release removes both members at once."
     );
 
     // Metric assertions:
@@ -1052,9 +1064,168 @@ async fn step_a_alone_is_self_healing_via_list_sessions_cleanup() {
     let _ = harness.loop_handle.await;
 }
 
+// =============================================================================
+// Scenario 4 — a vetoed Step-A-only ghost is still restored by a retried
+// recovery (b.2tu).
+// =============================================================================
+
+/// The ListSessions walk vetoes a ghost's id (`le:{sid}:sess:veto`) before it
+/// releases the ghost's members, so no `CreateSession` metadata write can
+/// complete the id. The veto must not stop a recovery: a session whose
+/// checkpoint still exists is restored by the next session-resolving RPC,
+/// vetoed or not — Step A re-adds both members, and Step B writes the
+/// metadata in a transaction that does not read the veto.
+///
+/// Staged as scenario 3 up to the Step-A-only state (Step B made to fail
+/// with `ApplyStep::StepB`), but the blob is kept. The walk runs on a
+/// service whose recovery hook is disabled (`build_service`, as on a
+/// `checkpoint_enabled=false` peer), so it answers `NoCheckpoint` without
+/// looking and retires the ghost: veto, then both members released. Then a
+/// `CreateLayer` on the checkpoint-enabled service retries the recovery,
+/// which must restore the session in full, and ListSessions lists it.
+// See `step_a_path_index_failure_leaves_no_partial_state` for the
+// rationale on `clippy::await_holding_lock`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_vetoed_step_a_only_ghost_is_still_fully_restored_by_a_retried_recovery() {
+    const BASE_PATH: &str = "/stage/path-index-atomicity-veto-then-recover";
+    const SESSION_NAME: &str = "path-index-atomicity-veto-then-recover";
+
+    let _serial = lock_fault_injector_serial();
+    clear_apply_step_fault_injectors_for_test();
+
+    let harness = setup_checkpoint_harness(1).await;
+    let session_id =
+        create_session_layer_and_wipe(&harness, BASE_PATH, SESSION_NAME, "trigger-layer").await;
+    let keys = harness.tv.key_schema();
+    let path_index_key = keys.path_index(BASE_PATH);
+    let path_names_key = keys.path_names_index(BASE_PATH);
+    let composite = KeySchema::path_name_member(SESSION_NAME, &session_id);
+    let pool = &harness.tv.client().pool;
+
+    // First recovery: Step A lands, Step B fails.
+    set_apply_step_fault_injector_for_test(
+        ApplyStep::StepB,
+        VecDeque::from([make_step_b_fault("scenario_4_first_recovery_attempt")]),
+    );
+    let stream = streaming_create(vec![
+        make_create_header(&session_id, "post-veto-layer-1"),
+        make_create_data(delta_to_ompf_bytes(&empty_delta(), &[])),
+    ]);
+    let err = handle_create_layer(&harness.svc, make_streaming_token_request(stream))
+        .await
+        .expect_err("the first recovery's Step B fault must fail the CreateLayer");
+    assert_eq!(err.code(), Code::Unavailable, "got {err:?}");
+    clear_apply_step_fault_injectors_for_test();
+    let meta_after_first: bool = pool
+        .exists(keys.session_meta(&session_id))
+        .await
+        .expect("EXISTS session_meta");
+    assert!(!meta_after_first, "Step B failed, so no metadata");
+    let index_after_first: bool = pool
+        .sismember(&path_index_key, &session_id)
+        .await
+        .expect("SISMEMBER path_index");
+    let names_after_first: bool = pool
+        .sismember(&path_names_key, composite.clone())
+        .await
+        .expect("SISMEMBER path_names_index");
+    assert!(
+        index_after_first && names_after_first,
+        "Step A landed both members: the Step-A-only ghost"
+    );
+
+    // A walk that runs no recovery retires the ghost: veto, then release.
+    let walker = crate::grpc::helpers::build_service(
+        &harness.tv,
+        std::sync::Arc::new(crate::grpc::helpers::AllowAllPermissions),
+    );
+    let walked = handle_list_sessions(
+        &walker,
+        make_unary_token_request(ListSessionsRequest {
+            path: BASE_PATH.to_owned(),
+        }),
+    )
+    .await
+    .expect("the walk's ListSessions must succeed")
+    .into_inner()
+    .sessions;
+    assert!(walked.is_empty(), "the walk retired the ghost: {walked:?}");
+    let vetoed: bool = pool
+        .exists(keys.session_meta_veto(&session_id))
+        .await
+        .expect("EXISTS veto");
+    assert!(vetoed, "the walk vetoed the ghost's id");
+    let index_after_walk: bool = pool
+        .sismember(&path_index_key, &session_id)
+        .await
+        .expect("SISMEMBER path_index");
+    let names_after_walk: bool = pool
+        .sismember(&path_names_key, composite.clone())
+        .await
+        .expect("SISMEMBER path_names_index");
+    assert!(
+        !index_after_walk && !names_after_walk,
+        "the walk released both members"
+    );
+
+    // The retried recovery, driven by the next session-resolving RPC.
+    let stream = streaming_create(vec![
+        make_create_header(&session_id, "post-veto-layer-2"),
+        make_create_data(delta_to_ompf_bytes(&empty_delta(), &[])),
+    ]);
+    handle_create_layer(&harness.svc, make_streaming_token_request(stream))
+        .await
+        .expect("the retried recovery must restore the vetoed session, so CreateLayer succeeds");
+
+    let meta: std::collections::HashMap<String, String> = pool
+        .hgetall(keys.session_meta(&session_id))
+        .await
+        .expect("HGETALL session_meta");
+    assert_eq!(
+        meta.get("name").map(String::as_str),
+        Some(SESSION_NAME),
+        "Step B wrote the metadata despite the veto: {meta:?}"
+    );
+    let index_restored: bool = pool
+        .sismember(&path_index_key, &session_id)
+        .await
+        .expect("SISMEMBER path_index");
+    let names_restored: bool = pool
+        .sismember(&path_names_key, composite.clone())
+        .await
+        .expect("SISMEMBER path_names_index");
+    assert!(
+        index_restored && names_restored,
+        "Step A re-added both members"
+    );
+    let listed = handle_list_sessions(
+        &harness.svc,
+        make_unary_token_request(ListSessionsRequest {
+            path: BASE_PATH.to_owned(),
+        }),
+    )
+    .await
+    .expect("ListSessions must succeed")
+    .into_inner()
+    .sessions;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(session_id.as_str(), SESSION_NAME)],
+        "the restored session is listed"
+    );
+
+    clear_apply_step_fault_injectors_for_test();
+    harness.cancel.cancel();
+    let _ = harness.loop_handle.await;
+}
+
 // ── Cross-test bleed safeguard ───────────────────────────────────────────────
 //
-// All three scenarios call `clear_apply_step_fault_injectors_for_test()`
+// All four scenarios call `clear_apply_step_fault_injectors_for_test()`
 // at the top and the bottom of their bodies. The seam's queues are
 // process-global state per its docstring contract — explicit drain at
 // both ends gives a clean handoff regardless of test execution order or

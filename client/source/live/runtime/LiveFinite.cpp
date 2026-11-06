@@ -191,6 +191,7 @@ template<class View> class Finite final : public ScheduledOperation, public std:
         bool issued = false, observed = false; // Scheduler-owned, never callback state.
         std::atomic<bool> done{false};
         bool ok = false;
+        CallSlot slot; // Held from before preparation until completion.
     };
     struct Tag final : CompletionTag {
         std::shared_ptr<Finite> owner;
@@ -201,6 +202,7 @@ template<class View> class Finite final : public ScheduledOperation, public std:
             call->completed = received;
             call->ok = ok;
             if (ok) owner->runtime_.auth->completed(*owner->endpoint_, call->generation, call->status.error_code());
+            call->slot.reset(); // The attempt is closed: its unit goes to a waiter.
             call->done.store(true, std::memory_order_release);
             owner->runtime_.auth->wake(*owner);
         }
@@ -212,7 +214,7 @@ public:
           delivery_(std::make_shared<Delivery>()),
           deadline_(
               std::min(deadline, Clock::now() + std::chrono::milliseconds(runtime.options.values.request_timeout_ms))),
-          retire_(retire), authObservation_(*runtime.diagnostics, AuthWaitKind::Finite) {
+          callerDeadline_(deadline), retire_(retire), authObservation_(*runtime.diagnostics, AuthWaitKind::Finite) {
         delivery_->view = std::move(view);
         callback_ = [delivery = delivery_] { delivery->view.deliver(delivery->result); };
         std::lock_guard<std::mutex> lock(endpoint_->mutex);
@@ -226,6 +228,17 @@ public:
     bool credentialStarved() {
         std::lock_guard<std::mutex> lock(mutex_);
         return waitingAuth_;
+    }
+    // For a synchronous caller whose own wait on this request ended at its
+    // deadline: whether the request was then still waiting for a unit of its
+    // endpoint's call budget, so that nothing of its current attempt issued,
+    // or had already ended because that wait outlasted the deadline. The
+    // expiry is sticky, so the answer does not depend on how late the
+    // request's callback retires, and is recorded once. The caller reports
+    // RESOURCE_EXHAUSTED when true.
+    bool expireCallWait() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return expireCallWaitLocked();
     }
     void cancel() {
         // The caller's cancellation deadline includes this hook. Never wait
@@ -254,6 +267,27 @@ private:
     std::mutex mutex_;
     std::shared_ptr<Call> call_;
     Clock::time_point deadline_, nextAttempt_{}, authDeadline_{};
+    // The deadline a synchronous caller imposes; no wait for a call unit
+    // extends the request past it.
+    const Clock::time_point callerDeadline_;
+    // The request's queue position for a call unit, and when its current wait began.
+    std::shared_ptr<CallWaiter> callWaiter_;
+    Clock::time_point callWaitStarted_{};
+    bool waitingCall_ = false, callExpired_ = false;
+    // mutex_ held. Latches and records the expiry of a wait for a call unit.
+    bool expireCallWaitLocked() noexcept {
+        if (callExpired_) return true;
+        if (!waitingCall_) return false;
+        callExpired_ = true;
+        endpoint_->calls->report(View::operation, CallBudget::kWaitExpired);
+        return true;
+    }
+    // Ends the current wait for a call unit: the time it took extends the
+    // deadline, up to a synchronous caller's.
+    void endCallWait(Clock::time_point now) noexcept {
+        if (std::exchange(waitingCall_, false))
+            deadline_ = std::min(callerDeadline_, deadline_ + (now - callWaitStarted_));
+    }
     OmniUsdLiveRequestError last_{};
     uint64_t authFailure_ = 0, attempts_ = 0;
     bool waitingAuth_ = false;
@@ -279,6 +313,8 @@ private:
         delivery_->result = error.result;
         delivery_.reset(); // Transfer all callback state to the executor before publishing.
         call_.reset();
+        callWaiter_.reset(); // Leaves the queue and returns a unit handed over but not taken.
+        waitingCall_ = false;
         // The endpoint's last use is above, and a finished step never reads it.
         // The request's own lease covers the dependency until handle release.
         // Callers never hold the endpoint mutex here: releasing takes it.
@@ -361,6 +397,13 @@ private:
                     {DiagnosticKey::Attempt, attempts_ + 1}, {DiagnosticKey::AuthGeneration, failedGeneration},
                     {DiagnosticKey::Reason, last_.result}, {DiagnosticKey::DelayMs, delay}});
         }
+        if ((waitingCall_ && now >= deadline_) || callExpired_) {
+            // The endpoint's call budget had no unit for the whole deadline,
+            // here or by a synchronous caller's account: nothing of this
+            // attempt issued, so a mutation applied nothing.
+            expireCallWaitLocked();
+            return finishLocal(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+        }
         if (cancelled_) return finishLocal(OMNI_USD_LIVE_CANCELLED);
         if (now >= deadline_) return finishLocal(expiredWait(now, deadline_, waitingAuth_));
         if (now < nextAttempt_) return {false, std::min(deadline_, nextAttempt_)};
@@ -379,6 +422,11 @@ private:
                 }
                 if (now < authDeadline_) {
                     authObservation_.start(Clock::now());
+                    // A unit handed over while credentials are missing serves
+                    // another call meanwhile, and the credential wait is not a
+                    // wait for a call: its deadline classifies as one.
+                    if (callWaiter_) endpoint_->calls->returnGranted(*callWaiter_);
+                    endCallWait(now);
                     return {false, std::min({deadline_, authDeadline_, endpoint_->authDeadline})};
                 }
                 unauthenticated = true;
@@ -391,6 +439,24 @@ private:
             }
         }
         if (unauthenticated) return finishLocal(OMNI_USD_LIVE_UNAUTHENTICATED);
+        // Each attempt holds a unit of the endpoint's call budget while it is
+        // open, and waits for one in FIFO order behind the endpoint's other
+        // calls. Time spent waiting does not count against the request's
+        // deadline, except a synchronous caller's, so a wait never shortens
+        // the attempt the service sees.
+        if (!callWaiter_) {
+            std::weak_ptr<Finite> weak = this->shared_from_this();
+            callWaiter_ = endpoint_->calls->waiter([&runtime = runtime_, weak] {
+                if (auto operation = weak.lock()) runtime.auth->wake(*operation);
+            });
+        }
+        candidate->slot = endpoint_->calls->acquire(*callWaiter_, View::operation);
+        if (!candidate->slot) {
+            if (!waitingCall_) callWaitStarted_ = now;
+            waitingCall_ = true;
+            return {false, deadline_};
+        }
+        endCallWait(Clock::now());
         candidate->context.set_deadline(
             rpcDeadlineAfter(std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - Clock::now())));
         candidate->context.set_wait_for_ready(false);
@@ -537,7 +603,8 @@ OmniUsdLiveResult statLayerMetadata(const std::string& uri, OmniUsdLiveLayerInfo
             // This wait ends at the operation deadline, so it classifies expiry
             // as the operation's own deadline check does.
             if (waited == OMNI_USD_LIVE_TIMEOUT)
-                waited = expiredWait(deadline, deadline, operation->credentialStarved());
+                waited = operation->expireCallWait() ? OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED) :
+                                                       expiredWait(deadline, deadline, operation->credentialStarved());
             request->cancel(0);
             return waited;
         }

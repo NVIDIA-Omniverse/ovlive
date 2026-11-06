@@ -3,6 +3,7 @@
 #pragma once
 #include "WireScene.h"
 #include "HostSceneStorage.h"
+#include "SceneWork.h"
 #include "SdfOperation.h"
 #include "LiveTsan.h"
 #include <omni/usd/live/Live.h>
@@ -286,7 +287,8 @@ private:
         return &projection;
     }
     // Pin this projection and its storage through callbacks, and count the
-    // forwarded call until it returns; nested read calls keep it counted.
+    // forwarded call until it returns; nested read calls keep it counted. The
+    // two pins and the depth make six atomic updates.
     struct DataCall {
         const PXR_NS::TfRefPtr<const HostSceneProjection> owner;
         const PXR_NS::TfRefPtr<HostSceneStorage> data;
@@ -294,6 +296,7 @@ private:
         explicit DataCall(const HostSceneProjection& projection)
             : owner(published(projection)), data(projection.data_), active(projection.forwardDepth_) {
             active.fetch_add(1);
+            sceneWork::synchronize(6);
         }
         ~DataCall() { active.fetch_sub(1); }
         DataCall(const DataCall&) = delete;

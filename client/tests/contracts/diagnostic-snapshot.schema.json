@@ -497,6 +497,9 @@
             },
             "limit": {
               "$ref": "#/$defs/uint64"
+            },
+            "section_id": {
+              "$ref": "#/$defs/uint64"
             }
           },
           "required": [],
@@ -767,6 +770,54 @@
               },
               "x-unique-dimensions": [
                 "phase",
+                "result"
+              ]
+            }
+          },
+          "required": [
+            "bounds",
+            "entries"
+          ],
+          "additionalProperties": true
+        },
+        "cleanup_duration_ms_by_call_result": {
+          "type": "object",
+          "properties": {
+            "bounds": {
+              "$ref": "#/$defs/bounds"
+            },
+            "entries": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "call": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "result": {
+                    "$ref": "#/$defs/uint32"
+                  },
+                  "count": {
+                    "$ref": "#/$defs/positiveCount"
+                  },
+                  "sum_ms": {
+                    "$ref": "#/$defs/uint64"
+                  },
+                  "counts": {
+                    "$ref": "#/$defs/counts"
+                  }
+                },
+                "required": [
+                  "call",
+                  "result",
+                  "count",
+                  "sum_ms",
+                  "counts"
+                ],
+                "additionalProperties": true
+              },
+              "x-unique-dimensions": [
+                "call",
                 "result"
               ]
             }
@@ -1417,6 +1468,9 @@
         },
         "reconnect_max_attempts": {
           "$ref": "#/$defs/uint32"
+        },
+        "max_calls_per_endpoint": {
+          "$ref": "#/$defs/uint64"
         }
       },
       "required": [],
@@ -1567,6 +1621,7 @@
                 "rpc_duration_ms",
                 "rpc_duration_ms_by_operation_result",
                 "shutdown_duration_ms_by_phase_result",
+                "cleanup_duration_ms_by_call_result",
                 "save_duration_ms_by_result",
                 "drain_duration_ms_by_result",
                 "auth",
@@ -1964,6 +2019,7 @@
                 "reconnect_initial_ms",
                 "reconnect_maximum_ms",
                 "reconnect_max_attempts",
+                "max_calls_per_endpoint",
                 "diagnostic_min_severity",
                 "diagnostic_allowed_flags",
                 "flags",

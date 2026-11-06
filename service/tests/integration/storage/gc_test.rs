@@ -355,7 +355,7 @@ async fn gc_second_release_deletes_after_refcount_exhausted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_gc_processes_hashes_spread_across_shards() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };

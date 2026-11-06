@@ -72,11 +72,28 @@
 //!   commit, on the replica that served it. At the creation site a commit can
 //!   be spawned for twice — by the call that committed it and again by a
 //!   client re-send carrying the same `operation_id`, possibly on another
-//!   replica (see [`BaseBootstrap::spawn_creation_base`]) — but the re-send's
-//!   state is rebuilt from byte-identical request bytes, so it is the same
-//!   `ObjectState` and builds the same blob. Either way no second writer can
-//!   ever target that key with different content. There is nothing for a
-//!   serializer, a coalescer, or a watermark to protect.
+//!   replica, or by the losing call of a race between two calls with that id
+//!   (see [`BaseBootstrap::spawn_creation_base`]) — but the second spawn's
+//!   state is rebuilt from byte-identical request bytes by the same creation
+//!   step, so it is the same `ObjectState` and builds the same blob. The one
+//!   state that need not be the same — a rebuild in which the service
+//!   supplied the layer's root section (SDD §9.7), which the replica that
+//!   committed the object may predate — is never spawned for by a replica
+//!   that has the rule: the handler skips that second spawn. Among replicas
+//!   that have the rule, then, no second writer can target that key with
+//!   different content, and there is nothing for a serializer, a coalescer,
+//!   or a watermark to protect.
+//!
+//!   The reverse version skew is not closed, and code here cannot close it:
+//!   during a rolling upgrade, or after a rollback, a replica that predates
+//!   the rule can answer a re-send (or lose the race) for an object a newer
+//!   replica committed with a supplied root. It rebuilds the empty content
+//!   without a root and spawns that state for `(object_id, 1, Base)`. That
+//!   spawn is harmless when the first run already stamped the cursor (guard
+//!   (a)); when the original call never reached its spawn, or the two runs
+//!   overlap and the adapter keeps the older replica's PUT, the layer's first
+//!   base holds no root section although the object has one, until a later
+//!   generation lands.
 //!
 //! ## One attempt, no retry — and one bounded admission
 //!
@@ -196,6 +213,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use fred::interfaces::HashesInterface;
 use tokio::sync::{Semaphore, TryAcquireError};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use super::assembler::{
@@ -304,11 +322,13 @@ pub const BOOTSTRAP_MAX_INFLIGHT: usize = 2;
 pub enum BootstrapTarget {
     /// SR-7.1 creation-time first base, written at `snap_seq = 1`.
     ///
-    /// The `1` is not a convention: `CreateLayer` applies its delta to a fresh
-    /// `ObjectState::default()` exactly once on every path (empty content
-    /// included), so the committed header sequence is `1` by construction, and
-    /// `LayerStore::create_layer` persists that same state. The bootstrap base
-    /// therefore claims coverage of exactly the commits it carries.
+    /// The `1` is not a convention: the state `CreateLayer` commits is one
+    /// apply on a fresh `ObjectState::default()` on every path (empty content
+    /// included) — the content's, or the supplied root's (SDD §9.7,
+    /// `domain::layer_root::build_creation_state`) — so the committed header
+    /// sequence is `1` by construction, and `LayerStore::create_layer`
+    /// persists that same state. The bootstrap base therefore claims coverage
+    /// of exactly the commits it carries.
     CreationBase,
     /// SR-3.6 post-restore gap re-base, written at the restore's seeded writer
     /// cursor.
@@ -546,6 +566,15 @@ pub enum BootstrapOutcome {
     /// adapter error for "checkpointing is off" would manufacture a noise
     /// floor).
     Failed,
+    /// The pre-PUT clean-up fence (`checkpoint::put_guard`, b.g65) refused the
+    /// PUT: the checkpoint clean-up deleted the backup copy of a large value
+    /// this base names within the run's reliance window, or is deleting an
+    /// earlier copy of this same generation, or the re-arm that must precede
+    /// the PUT could not be recorded in Valkey. Nothing was written or
+    /// stamped; also ticks `checkpoint_reconcile_total{publish_deferred}`.
+    /// `deferred_cleanup`. Not retried here: the layer's next periodic tick
+    /// writes its base.
+    DeferredCleanup,
 }
 
 impl BootstrapOutcome {
@@ -573,6 +602,7 @@ impl BootstrapOutcome {
             Self::UnstampedForeignRestore => CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES[7],
             Self::UnstampedWriteError => CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES[8],
             Self::Failed => CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES[9],
+            Self::DeferredCleanup => CHECKPOINT_BASE_BOOTSTRAP_OUTCOMES[10],
         }
     }
 }
@@ -585,9 +615,9 @@ impl BootstrapOutcome {
 /// every arm compiling and every label still a *member* of the vocabulary — so
 /// even the exhaustive membership test cannot catch it — while silently
 /// attributing each arm to the wrong cell. The pins below are the only place the
-/// ten strings appear twice, and that is their whole job: they are assertions,
-/// not a second mint.
-const BOOTSTRAP_OUTCOME_LABEL_PINS: [(usize, &str); 10] = [
+/// eleven strings appear twice, and that is their whole job: they are
+/// assertions, not a second mint.
+const BOOTSTRAP_OUTCOME_LABEL_PINS: [(usize, &str); 11] = [
     (0, "persisted"),
     (1, "shed"),
     (2, "skipped_header_absent"),
@@ -598,6 +628,7 @@ const BOOTSTRAP_OUTCOME_LABEL_PINS: [(usize, &str); 10] = [
     (7, "unstamped_foreign_restore"),
     (8, "unstamped_write_error"),
     (9, "failed"),
+    (10, "deferred_cleanup"),
 ];
 
 /// `str` equality, in const context (`PartialEq` is not const).
@@ -847,6 +878,11 @@ pub struct BaseBootstrap {
     /// `close()` + `wait()` drains bootstrap tasks before
     /// `ValkeyClient::quit()` with no new shutdown wiring.
     tracker: TaskTracker,
+    /// The tracker's abort token (SDD SR-6.2), the same one the
+    /// session-checkpoint dispatcher takes ([`Self::with_abort_token`]). Every
+    /// spawned run selects on it, and once it is cancelled nothing more is
+    /// spawned. A fresh, never-cancelled token unless one is set.
+    abort: CancellationToken,
     /// Metrics handle. Two families: the per-invocation
     /// `inc_checkpoint_base_bootstrap(outcome, site)` tick in
     /// [`Self::run_once`], and the `inc_checkpoint_write(result, "layer")` ticks
@@ -923,6 +959,7 @@ impl BaseBootstrap {
             client,
             keys,
             tracker,
+            abort: CancellationToken::new(),
             metrics,
             creator_replica_id,
             enabled,
@@ -931,6 +968,21 @@ impl BaseBootstrap {
             #[cfg(any(test, feature = "test-checkpoint-fault-injection"))]
             pre_stamp_hook_for_test: None,
         }
+    }
+
+    /// Set the tracker's abort token: `main.rs` passes the one the
+    /// session-checkpoint dispatcher on the same tracker takes; it is
+    /// cancelled at hold entry, and by the post-server shutdown sequence
+    /// (`grpc::transport::run_post_server_sequence`) after its drain of the
+    /// tracker. Once it is
+    /// cancelled every run ends at its next await — a PUT in flight is
+    /// dropped and the cursor is left unstamped, as after a failed PUT — and
+    /// every later spawn does nothing. An aborted run ticks no
+    /// `live_edit_checkpoint_base_bootstrap_total` cell: the one-tick-per-run
+    /// identity holds for the runs that finish.
+    pub fn with_abort_token(mut self, abort: CancellationToken) -> Self {
+        self.abort = abort;
+        self
     }
 
     /// Install a hook awaited once per run immediately before the conditional
@@ -1008,12 +1060,28 @@ impl BaseBootstrap {
     /// - an `ALREADY_COMMITTED` answer to a re-send carrying the same
     ///   `operation_id`: spawned for the RECORDED object, from the state the
     ///   handler rebuilds by parsing the re-sent bytes (byte-identical to the
-    ///   original's — the request digests match), because the original call's
-    ///   reply was lost and it may never have reached its own spawn.
+    ///   original's — the request digests match) through the same creation
+    ///   step, because the original call's reply was lost and it may never
+    ///   have reached its own spawn;
+    /// - an `ALREADY_COMMITTED` answer to the losing call of a race between
+    ///   two calls with one `operation_id`: spawned for the RECORDED object,
+    ///   from this call's own state, built the same way from byte-identical
+    ///   bytes.
     ///
-    /// **A second spawn for one object is safe.** It targets the same
+    /// Neither `ALREADY_COMMITTED` arm spawns when the handler's state holds
+    /// a root section the service supplied (SDD §9.7): the replica that
+    /// committed the recorded object may predate the supplied root and have
+    /// committed the layer empty, so that state need not be the object's.
+    ///
+    /// **A second spawn for one object is safe** when both spawning replicas
+    /// apply the layer-root rule (SDD §9.7). It targets the same
     /// `(object_id, snap_seq = 1, Base)` key with the same bytes
-    /// (`build_reset_ompf_from_state` is byte-reproducible for equal state). If
+    /// (`build_reset_ompf_from_state` is byte-reproducible for equal state).
+    /// A replica that predates the rule can still spawn a root-less state for
+    /// an object a newer replica committed with a supplied root — the reverse
+    /// version skew the handler's skip cannot close, since the older
+    /// replica's code does that spawn (module docs, "idempotent-identical").
+    /// If
     /// the first run already stamped the cursor, the second takes guard (a)
     /// before any PUT (`skipped_generation_present`); if they overlap, the
     /// adapter collapses the two PUTs into one generation (the store's
@@ -1096,10 +1164,22 @@ impl BaseBootstrap {
             // behavior of both call sites.
             return;
         }
+        if self.abort.is_cancelled() {
+            // Aborted (a hold, or shutdown after its drain): nothing may
+            // write any more.
+            return;
+        }
 
         let unit = self.clone();
+        let abort = self.abort.clone();
         self.tracker.spawn(async move {
-            unit.run_once(object_id, state, target).await;
+            // The abort first, so a run whose token was cancelled before its
+            // first poll never starts.
+            tokio::select! {
+                biased;
+                () = abort.cancelled() => {}
+                _ = unit.run_once(object_id, state, target) => {}
+            }
         });
     }
 
@@ -1153,6 +1233,9 @@ impl BaseBootstrap {
         state: ObjectState,
         target: BootstrapTarget,
     ) -> BootstrapOutcome {
+        // The clean-up fence's reliance start (`checkpoint::put_guard`): every
+        // read this run publishes from happens after it.
+        let reliance_start = std::time::Instant::now();
         let target_snap_seq = target.snap_seq();
 
         // ── Step 0: admission — acquire or shed, NEVER queue ─────────────
@@ -1442,10 +1525,22 @@ impl BaseBootstrap {
             target_snap_seq,
             Bytes::from(ompf_bytes),
             meta,
+            reliance_start,
             "base bootstrap",
         )
         .await
         {
+            Err(e) if e.is_cleanup_in_flight() => {
+                // The clean-up fence refused the PUT and `put_guard` logged
+                // why. Nothing was written, so nothing is stamped; the
+                // layer's next periodic tick writes its base.
+                self.metrics.add_checkpoint_reconcile(
+                    "publish_deferred",
+                    1,
+                    &self.creator_replica_id,
+                );
+                return BootstrapOutcome::DeferredCleanup;
+            }
             Ok(None) => {
                 // The shared guard logs the skip in its own vocabulary
                 // (`context = "base bootstrap"`), which cannot say WHICH
@@ -1805,10 +1900,10 @@ impl BaseBootstrap {
     ///
     /// This deletes ONE generation, the one this call site created. It is not a
     /// per-object reclamation and must not become one: the object may carry
-    /// older generations, and enumerating and deleting those is the
-    /// reconciliation pass's dead-object phase — which runs under the
-    /// checkpoint leader lease, re-proves it before every destructive step, and
-    /// re-checks liveness. This path holds no lease and is not entitled to
+    /// older generations, and enumerating and deleting those is the checkpoint
+    /// clean-up's dead-object phase — which claims them from the dead-object
+    /// set as positive evidence of death and re-checks liveness before every
+    /// generation it deletes. This path does neither and is not entitled to
     /// delete anything it did not itself write.
     ///
     /// # The ordering is mandatory
@@ -1822,9 +1917,9 @@ impl BaseBootstrap {
     /// # Best-effort, and why that is safe
     ///
     /// Every failure arm WARNs and gives up. The correctness backstop is the
-    /// dead-object phase of the reconciliation pass, which will enumerate and
-    /// reap this generation — sidecar-first, under the lease — whatever happens
-    /// here. This path exists to close the window in minutes rather than in up
+    /// dead-object phase of the checkpoint clean-up, which will enumerate and
+    /// reap this generation — sidecar-first, behind its liveness re-check —
+    /// whatever happens here. This path exists to close the window in minutes rather than in up
     /// to one reconcile interval, not to be the thing that closes it.
     ///
     /// That backstop rests on `le:ckpt:{recon}:dead` naming this `object_id`,
@@ -1860,9 +1955,14 @@ impl BaseBootstrap {
         };
 
         let hash_count = hashes.len();
+        // The record announces the stem on `le:ckpt:{recon}:deleting` in the
+        // same run (b.g65), so a collect that lists this base's sidecar and
+        // then reads it absent can explain the absence.
+        let stem =
+            super::checkpointer::reconcile_stem_member(object_id, handle.snap_seq, handle.kind);
         if let Err(e) = self
             .tombstone_sink()
-            .record(hashes.into_iter().collect::<Vec<String>>())
+            .record(&[stem], hashes.into_iter().collect::<Vec<String>>())
             .await
         {
             tracing::warn!(
@@ -1908,6 +2008,7 @@ impl BaseBootstrap {
             &self.keys,
             Some(&self.metrics),
             &self.creator_replica_id,
+            super::store::reconcile_grace(self.store.publish_worst_case()),
         )
     }
 }
@@ -1948,6 +2049,7 @@ mod tests {
             BootstrapOutcome::UnstampedForeignRestore,
             BootstrapOutcome::UnstampedWriteError,
             BootstrapOutcome::Failed,
+            BootstrapOutcome::DeferredCleanup,
         ];
 
         for outcome in &outcomes {

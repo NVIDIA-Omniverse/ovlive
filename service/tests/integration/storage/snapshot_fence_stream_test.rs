@@ -224,7 +224,6 @@ impl Replica {
         );
         let recovery = build_disabled_recovery_hook(Arc::clone(&layer_store), Arc::clone(&metrics));
         let svc = LiveEditService {
-            catchup_snapshot_enabled: true,
             session_store: Arc::new(SessionStore::new(client.clone(), keys.clone())),
             layer_store,
             snapshot_flights: SnapshotFlights::new(client.clone(), keys),

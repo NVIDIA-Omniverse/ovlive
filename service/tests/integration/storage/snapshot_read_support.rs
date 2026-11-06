@@ -78,7 +78,19 @@
 //!   [`ProxyAction::RefuseReplying`]: a queued command refused, so its
 //!   transaction's `EXEC` answers `EXECABORT`), or close the connection once
 //!   a command's reply has arrived, that reply undelivered
-//!   ([`ProxyAction::CloseAfterReply`]: a lost `EXEC` reply).
+//!   ([`ProxyAction::CloseAfterReply`]: a lost `EXEC` reply). A rule that
+//!   acts on a script's n-th call, or whose test asserts how many calls it
+//!   saw, counts them through [`ScriptCalls`], which a `NOSCRIPT` reload's
+//!   repeated send does not shift. [`IndexPageFault`] builds the rule that
+//!   stands in for a store whose round-1 index paging skipped or repeated a
+//!   member (b.o2i; `snapshot_read_fenced_test.rs` and
+//!   `snapshot_read_unfenced_test.rs`), with the helpers that read the
+//!   proven-skip WARN and counter.
+//!
+//! Under `test-fault-injection` it also holds what the tests that hold a
+//! fenced read's window open share: `HeldCommand`, a read-seam hold released
+//! on drop, and `lengthened_lease`, the lease such a read is granted while its
+//! client's injector lengthens fence leases.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -847,6 +859,119 @@ pub(crate) fn error_reply_script(message: &str) -> String {
     format!("return redis.error_reply('{escaped}')")
 }
 
+/// Counts one script's calls as the client makes them, from the frames a
+/// [`ProxyRule`] sees: every `EVALSHA` of the script is a send, and a send the
+/// client repeats after a `NOSCRIPT` reply is not a call of its own. A rule
+/// passes every frame to [`ScriptCalls::see`] and decides by the call number
+/// it returns, and a test asserts [`ScriptCalls::calls`], so neither depends
+/// on whether the store's script cache held the script: a concurrent
+/// `SCRIPT FLUSH` on the shared server, or a store that starts with an empty
+/// cache, adds a send but never a call.
+///
+/// The `SCRIPT LOAD` of the script's body is the signal. Every script call
+/// site in service code reloads the same way (fred's
+/// `Script::evalsha_with_reload`, `storage::lua::evalsha_once_with_reload`
+/// and `storage::lua::evalsha_reload_rebuilding` among them): it sends the
+/// load only after the `NOSCRIPT` reply to its send, and the repeat only
+/// after the load's reply. So the load arrives between a send and its
+/// repeat, and cancelling the most recent send not already cancelled makes
+/// the count exact. A load with no such send (a preload, before the first
+/// send) cancels nothing, and in cluster mode the loads after the first (one
+/// per primary) find their send already cancelled.
+///
+/// Precondition: the script's sends through the proxy are sequential and all
+/// belong to the subject, and every load of its body through the proxy after
+/// the first send follows a `NOSCRIPT`. A frame of another script, another
+/// body or another command is ignored.
+///
+/// `see` runs inside a relay task, so it never panics: a panic there would
+/// close the client's connection instead of failing the test with a message.
+#[derive(Debug)]
+pub(crate) struct ScriptCalls {
+    /// The script's SHA-1, lowercase hex.
+    sha: String,
+    state: std::sync::Mutex<ScriptCallsState>,
+}
+
+#[derive(Debug, Default)]
+struct ScriptCallsState {
+    /// `EVALSHA`s of the script seen.
+    sends: usize,
+    /// Sends cancelled by a reload's `SCRIPT LOAD`.
+    reloads: usize,
+    /// Whether the most recent send was cancelled already.
+    last_cancelled: bool,
+}
+
+impl ScriptCalls {
+    /// A counter for the script whose SHA-1 hex is `sha`.
+    pub(crate) fn new(sha: impl Into<String>) -> Self {
+        Self {
+            sha: sha.into().to_ascii_lowercase(),
+            state: std::sync::Mutex::new(ScriptCallsState::default()),
+        }
+    }
+
+    /// Record one frame. For an `EVALSHA` of the script, the number of calls
+    /// made before it (its call's index, from 0); `None` for every other
+    /// frame, a reload's `SCRIPT LOAD` included.
+    pub(crate) fn see(&self, args: &[Vec<u8>]) -> Option<usize> {
+        let name = args.first()?;
+        let mut state = self.lock();
+        if name.eq_ignore_ascii_case(b"EVALSHA") {
+            if !args
+                .get(1)
+                .is_some_and(|sha| sha.eq_ignore_ascii_case(self.sha.as_bytes()))
+            {
+                return None;
+            }
+            let before = state.sends - state.reloads;
+            state.sends += 1;
+            state.last_cancelled = false;
+            return Some(before);
+        }
+        let is_load_of_this_body = name.eq_ignore_ascii_case(b"SCRIPT")
+            && args
+                .get(1)
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(b"LOAD"))
+            && args
+                .get(2)
+                .and_then(|body| std::str::from_utf8(body).ok())
+                .is_some_and(|body| fred::util::sha1_hash(body) == self.sha);
+        if is_load_of_this_body && state.sends > 0 && !state.last_cancelled {
+            state.reloads += 1;
+            state.last_cancelled = true;
+        }
+        None
+    }
+
+    /// The script's calls so far: sends, less the ones a reload repeated.
+    /// It may briefly include a send that a later load cancels (it can go
+    /// down), so read it once the script's traffic is quiet, not as a
+    /// monotonic wake signal: a wait that wakes on a change re-reads it after
+    /// the traffic settles.
+    pub(crate) fn calls(&self) -> usize {
+        let state = self.lock();
+        state.sends - state.reloads
+    }
+
+    /// The sends a reload repeated. This count depends on the store's script
+    /// cache (a cold store or a concurrent `SCRIPT FLUSH` adds a reload)
+    /// unless a staged `-NOSCRIPT` decides it, so a test asserts it only in a
+    /// run whose reload a staged `-NOSCRIPT` decides.
+    pub(crate) fn reloads(&self) -> usize {
+        self.lock().reloads
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ScriptCallsState> {
+        // Never poisoned in practice (nothing panics under the lock); taken
+        // either way, so `see` cannot panic in a relay task.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// One relayed client connection.
 struct Relay {
     /// The connection's index, in the order the proxy accepted it.
@@ -1317,6 +1442,80 @@ fn reply_frame_len_splits_resp2_and_resp3_replies_and_waits_for_partial_ones() {
     }
 }
 
+// A count-based rule acts on the call number `see` returns, so a reload that
+// shifted it would make the rule act on the wrong call, silently.
+#[test]
+fn script_calls_counts_calls_not_sends_across_noscript_reloads() {
+    const BODY: &str = "return 1";
+    const OTHER_BODY: &str = "return 2";
+    let sha = fred::util::sha1_hash(BODY);
+    let frame =
+        |args: &[&str]| -> Vec<Vec<u8>> { args.iter().map(|a| a.as_bytes().to_vec()).collect() };
+    let send = frame(&["EVALSHA", &sha, "0"]);
+    let load = frame(&["SCRIPT", "LOAD", BODY]);
+    let calls = ScriptCalls::new(sha.clone());
+
+    // A preload, before any send, cancels nothing.
+    assert_eq!(calls.see(&load), None);
+    assert_eq!((calls.calls(), calls.reloads()), (0, 0), "a preload");
+
+    // Call 0, sent twice: a NOSCRIPT, the reload, the repeat.
+    assert_eq!(calls.see(&send), Some(0), "call 0's first send");
+    assert_eq!(calls.see(&load), None);
+    // A second load (another primary's, in cluster mode) finds the send
+    // already cancelled.
+    assert_eq!(calls.see(&load), None);
+    assert_eq!(
+        (calls.calls(), calls.reloads()),
+        (0, 1),
+        "one load cancels at most one send"
+    );
+    assert_eq!(
+        calls.see(&send),
+        Some(0),
+        "the repeat is call 0 again: the cancelled send is not counted before it"
+    );
+    assert_eq!((calls.calls(), calls.reloads()), (1, 1), "after the repeat");
+
+    // Frames of another SHA, another body, or another command are ignored.
+    let other_sha = fred::util::sha1_hash(OTHER_BODY);
+    for ignored in [
+        frame(&["EVALSHA", &other_sha, "0"]),
+        frame(&["SCRIPT", "LOAD", OTHER_BODY]),
+        frame(&["EVAL", BODY, "0"]),
+        frame(&["GET", &sha]),
+        frame(&["SCRIPT", "FLUSH"]),
+        Vec::new(),
+    ] {
+        assert_eq!(calls.see(&ignored), None, "{ignored:?}");
+    }
+    assert_eq!(
+        (calls.calls(), calls.reloads()),
+        (1, 1),
+        "nothing ignored was counted"
+    );
+
+    // Matching is case-insensitive: the command, the subcommand and the SHA.
+    let upper_sha = sha.to_ascii_uppercase();
+    assert_eq!(
+        calls.see(&frame(&["evalsha", &upper_sha, "0"])),
+        Some(1),
+        "call 1"
+    );
+    assert_eq!(calls.see(&frame(&["script", "load", BODY])), None);
+    assert_eq!(
+        calls.see(&frame(&["EvalSha", &sha, "0"])),
+        Some(1),
+        "call 1's repeat"
+    );
+    assert_eq!((calls.calls(), calls.reloads()), (2, 2));
+    assert_eq!(
+        ScriptCalls::new(upper_sha).see(&send),
+        Some(0),
+        "a counter built from an uppercase SHA matches too"
+    );
+}
+
 #[test]
 fn parse_monitor_line_reads_script_and_client_commands() {
     let script = parse_monitor_line("+1727.1 [0 lua] \"HGETALL\" \"p{7}:obj:hdr\"\r\n")
@@ -1329,4 +1528,238 @@ fn parse_monitor_line_reads_script_and_client_commands() {
     assert!(!client.issued_by_script());
     assert_eq!(client.client, "10.0.0.1:5000");
     assert_eq!(client.args, vec!["GET", "a\"b", "\u{1}"]);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Round-1 index pages that skip or repeat a member (b.o2i)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// The round-1 index page command an [`IndexPageFault`] rewrites.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IndexPage {
+    /// `SSCAN key cursor COUNT n`: one step of a set index (`obj:secs`,
+    /// `obj:dels`, a marked object's `obj:chs`).
+    Sscan,
+    /// `ZRANGE key start stop` of a sorted index (`obj:flds`, `obj:tss`): a
+    /// rank page. A whole-index `ZRANGE key 0 -1` is never rewritten.
+    Zrange,
+}
+
+/// What an [`IndexPageFault`] does to the members of a page it rewrites.
+#[derive(Debug, Clone)]
+pub(crate) enum PageMembers {
+    /// Leave the named member out (`Some`), or the page's first member
+    /// (`None`): what a cursor continued on another serving process returns
+    /// when it skipped members. A page without the named member is returned
+    /// whole.
+    Drop(Option<String>),
+    /// Return every member twice: what an `SSCAN` step returns for a set
+    /// rehashed between steps. No member is missing.
+    Repeat,
+}
+
+/// A [`ScriptReplyProxy`] rule standing in for a store whose round-1 index
+/// paging skipped or repeated members (b.o2i): it rewrites the first `pages`
+/// [`IndexPage`] frames of `key` into an `EVAL` that runs the frame's own
+/// command against the real store and returns its reply with `members`
+/// applied, in the reply's own shape (`{cursor, members}` for a step, the
+/// member list for a rank page). Every other frame is forwarded as is.
+pub(crate) struct IndexPageFault {
+    pub(crate) page: IndexPage,
+    /// The index key, set once the object exists (an object id is minted at
+    /// create); until then the rule matches nothing.
+    pub(crate) key: Arc<std::sync::OnceLock<String>>,
+    pub(crate) members: PageMembers,
+    /// How many matching frames to rewrite, from the first; `usize::MAX` for
+    /// every one.
+    pub(crate) pages: usize,
+    /// Lua run in the same `EVAL` before it returns (e.g. a `HINCRBY` of the
+    /// header's `seq`: a commit landing during round 1), or empty.
+    pub(crate) also: String,
+}
+
+impl IndexPageFault {
+    /// The rule, and the count of frames it has rewritten so far — the
+    /// vacuity guard: a test whose page was never rewritten staged nothing.
+    pub(crate) fn rule(self) -> (ProxyRule, Arc<AtomicUsize>) {
+        let rewritten = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&rewritten);
+        let rule: ProxyRule = Arc::new(move |args: &[Vec<u8>]| {
+            let key = self.key.get()?;
+            let arg = |i: usize| args.get(i).map(|a| String::from_utf8_lossy(a).into_owned());
+            let (command, ranks) = match self.page {
+                IndexPage::Sscan => ("SSCAN", false),
+                IndexPage::Zrange => ("ZRANGE", true),
+            };
+            if !arg(0)?.eq_ignore_ascii_case(command) || arg(1)? != *key {
+                return None;
+            }
+            if ranks && (args.len() != 4 || arg(3)? == "-1") {
+                return None;
+            }
+            counted
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    (n < self.pages).then_some(n + 1)
+                })
+                .ok()?;
+            let call_args = args
+                .iter()
+                .map(|a| format!("[==[{}]==]", String::from_utf8_lossy(a)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let filter = match &self.members {
+                PageMembers::Drop(member) => {
+                    let wanted = member
+                        .as_ref()
+                        .map_or_else(|| "nil".to_owned(), |m| format!("[==[{m}]==]"));
+                    format!(
+                        "local wanted = {wanted} local dropped = false \
+                         for _, m in ipairs(page) do \
+                           if not dropped and (wanted == nil or m == wanted) then \
+                             dropped = true \
+                           else out[#out + 1] = m end \
+                         end"
+                    )
+                }
+                PageMembers::Repeat => "for _, m in ipairs(page) do \
+                                          out[#out + 1] = m; out[#out + 1] = m \
+                                        end"
+                .to_owned(),
+            };
+            let (page, reply) = if ranks {
+                ("r", "out")
+            } else {
+                ("r[2]", "{r[1], out}")
+            };
+            Some(ProxyAction::Eval(format!(
+                "local r = redis.call({call_args}) local page = {page} local out = {{}} \
+                 {filter} {also} return {reply}",
+                also = self.also,
+            )))
+        });
+        (rule, rewritten)
+    }
+}
+
+/// The message prefix of the WARN `storage::diff_read::report_index_shortfall`
+/// logs for each proven round-1 skip.
+pub(crate) const INDEX_SHORTFALL_WARN_PREFIX: &str =
+    "snapshot read's index came back short of its count with no writer changing the object";
+
+/// The proven-skip WARNs in `captured` (see [`INDEX_SHORTFALL_WARN_PREFIX`]).
+pub(crate) fn index_shortfall_warnings(
+    captured: &crate::grpc::log_capture::Captured,
+) -> Vec<&serde_json::Value> {
+    captured
+        .events
+        .iter()
+        .filter(|e| {
+            e["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with(INDEX_SHORTFALL_WARN_PREFIX))
+        })
+        .collect()
+}
+
+/// Assert `warning` is the proven-skip WARN for `key` (`card` counted
+/// `counted`, the read returned `returned`), naming `consumer`, `path` and
+/// `family`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assert_index_shortfall_warning(
+    warning: &serde_json::Value,
+    consumer: &str,
+    path: &str,
+    family: &str,
+    key: &str,
+    card: &str,
+    counted: u64,
+    returned: u64,
+) {
+    use crate::grpc::log_capture::assert_field;
+    assert_eq!(
+        warning["level"], "WARN",
+        "a proven skip is a WARN: {warning}"
+    );
+    assert_field(warning, "consumer", consumer.into());
+    assert_field(warning, "path", path.into());
+    assert_field(warning, "key_family", family.into());
+    assert_field(warning, "key", key.into());
+    assert_field(warning, "card", card.into());
+    assert_field(warning, "counted", counted.into());
+    assert_field(warning, "returned", returned.into());
+}
+
+/// `live_edit_snapshot_read_index_incomplete_total` on `metrics`. Panics on
+/// an absent series: it is seeded at 0, so absence means the handle never
+/// reached the registry.
+pub(crate) fn index_incomplete(metrics: &live_edit::observability::metrics::Metrics) -> u64 {
+    use live_edit::observability::metrics::test_util::{render, sample_value};
+    sample_value(
+        &render(metrics),
+        "live_edit_snapshot_read_index_incomplete_total",
+        &[],
+    )
+    .expect("live_edit_snapshot_read_index_incomplete_total is seeded at 0") as u64
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Holding a fenced read's window open (test-fault-injection)
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// One fan-out command parked by the read seam's hold
+/// (`ObjectSnapshotReadFaultInjector::push_hold_at`), released when this
+/// guard drops if the test has not released it first, so a test that fails
+/// while a read is parked never leaves it parked. For the tests that hold a
+/// fenced read's window open until their own step has happened, with the
+/// read's lease lengthened (`lengthen_fence_leases`) so that no renewal has to
+/// land in time while the window is held.
+#[cfg(feature = "test-fault-injection")]
+pub(crate) struct HeldCommand(Arc<live_edit::storage::diff_read::SnapshotReadHold>);
+
+#[cfg(feature = "test-fault-injection")]
+impl HeldCommand {
+    pub(crate) fn new(hold: Arc<live_edit::storage::diff_read::SnapshotReadHold>) -> Self {
+        Self(hold)
+    }
+
+    /// Wait, within `budget`, until the read has reached the held command
+    /// and parked on it.
+    pub(crate) async fn parked_within(&self, budget: Duration, what: &str) {
+        tokio::time::timeout(budget, self.0.parked())
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the read did not park within {budget:?}"));
+    }
+
+    /// Let the parked read issue the held command and go on. Idempotent.
+    pub(crate) fn release(&self) {
+        self.0.release();
+    }
+}
+
+#[cfg(feature = "test-fault-injection")]
+impl Drop for HeldCommand {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// The lease a fenced read on `client` is granted at `size` while its fault
+/// injector lengthens fence leases: the lengthened block's `lease(L)`, at
+/// least `snapshot_fence::lengthened_lease_floor(client)`. A test that waits
+/// for such a lease to lapse sizes that wait from this.
+#[cfg(feature = "test-fault-injection")]
+pub(crate) fn lengthened_lease(
+    client: &ValkeyClient,
+    size: live_edit::storage::snapshot_fence::LayerSize,
+) -> Duration {
+    use live_edit::storage::snapshot_fence::{
+        coefficients, lengthened_lease_floor, ms_to_duration,
+    };
+    let floor_ms = lengthened_lease_floor(client).as_secs_f64() * 1_000.0;
+    ms_to_duration(
+        coefficients(client)
+            .with_lease_at_least(floor_ms)
+            .timing(size)
+            .lease_ms,
+    )
 }

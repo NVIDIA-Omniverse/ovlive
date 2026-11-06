@@ -14,8 +14,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'tools/release/third_party_notices.py'
-PINS = {'grpc': '1.65.4-1', 'protobuf': '5.26.0-2', 'abseil': '20240116.1-1', 're2': '20230301-1',
-        'c-ares': '1.34.8-0', 'openssl': '3.5.9-0', 'zlib': '1.3.2-0'}
+PINS = {'grpc': '1.83.1-21', 'protobuf': '5.29.5-6', 'abseil': '20250127.0-0', 're2': '20250722-4',
+        'c-ares': '1.34.9-0', 'openssl': '3.5.9-0', 'zlib': '1.3.2-0'}
 
 
 def load():
@@ -111,7 +111,7 @@ class ThirdPartyNoticesTests(unittest.TestCase):
             path = self.output / name
             original = path.read_bytes()
             path.write_bytes(original.replace(b'synthetic grpc', b'synthetic grpC', 1)
-                             if name.endswith('.txt') else original.replace(b'1.65.4-1', b'1.65.4-2', 1))
+                             if name.endswith('.txt') else original.replace(b'1.83.1-21', b'1.83.1-22', 1))
             self.assertEqual(self.run_tool('--check'), 1)
             path.write_bytes(original)
         self.assertEqual(self.run_tool('--check'), 0)

@@ -47,7 +47,7 @@
 //!
 //! ```text
 //! (G + K) × (general connection + (P − 1) × idle connection + c × backchannel)
-//!   + R × (reader connection + backchannel)
+//!   + R × reader connection
 //! ```
 //!
 //! where G is the number of general-class clients (the data, txn, maintenance
@@ -72,24 +72,28 @@
 //!   retires its client, buffers and all. Its read buffer keeps less than
 //!   `kept_read_bytes` of [`READER_LIMITS`], 256 KiB, which is within
 //!   [`XREAD_REPLY_TARGET_BYTES`]: the per-reader reply memory the stream
-//!   multiplexer already accounts for, so it is not counted again here.
-//! - **backchannel**: [`BACKCHANNEL_BYTES`], tokio-util's two 8 KiB buffers.
-//!   fred opens a backchannel connection lazily, beside a client's pipelined
-//!   connections:
-//!   - each reader's, for `CLIENT UNBLOCK`, opened the first time a command
-//!     follows a client-side XREAD timeout (`Blocking::Interrupt`, readers
-//!     only): the R term;
-//!   - on a cluster, each general client's, for `CLUSTER SLOTS`, re-created
-//!     at every topology sync of a healthy client: the c term.
+//!   multiplexer already accounts for, so it is not counted again here. A
+//!   reader never opens a backchannel: it runs fred's default
+//!   `Blocking::Block`, so fred sends it no `CLIENT UNBLOCK`, and as a
+//!   single-node client it runs no `CLUSTER SLOTS` sync.
+//! - **backchannel**: [`BACKCHANNEL_BYTES`], tokio-util's two 8 KiB buffers:
+//!   on a cluster, the backchannel connection a general client's topology
+//!   sync opens for its `CLUSTER SLOTS` and holds while the sync runs. The
+//!   vendored fred drops it when the sync ends instead of keeping it
+//!   (`vendor/fred-10.1.0.SOURCE.md` change 11), so no client holds one
+//!   between syncs; but every general client can hold one at once during a
+//!   cluster-wide resync (a failover re-syncs them all), so the bound counts
+//!   one per general client always, as it counts K: the c term.
 //!
-//!   Once a backchannel holds nothing, the router's next sweep returns both
-//!   its buffers to fresh 8 KiB ones if it carried anything since its last
-//!   cut, so this term is exact whatever the replies' sizes. The c term is
-//!   exact only because the cluster routing table owns its strings
-//!   (`fred::live_edit::retention::own_slot_ranges`): fred parses
-//!   `CLUSTER SLOTS` without copying, and a routing string kept as a view
-//!   would keep a whole read-buffer allocation alive past the sync, and with
-//!   it every `Server` cloned from the routing, a stream reader's included.
+//!   A `CLUSTER SLOTS` reply larger than the fresh read buffer grows it for the
+//!   rest of its sync only; that growth is the sync's, as a call's growth above
+//!   its limits is the call's, and it goes with the connection when the sync
+//!   ends. The c term holds past the sync only because the cluster routing
+//!   table owns its strings (`fred::live_edit::retention::own_slot_ranges`):
+//!   fred parses `CLUSTER SLOTS` without copying, and a routing string kept as
+//!   a view would keep the dropped connection's whole read-buffer allocation
+//!   alive past the sync, and with it every `Server` cloned from the routing,
+//!   a stream reader's included.
 //! - **retry buffer**: nothing. A client's retry buffer is returned to an
 //!   unallocated one once its replay empties it.
 //!
@@ -116,23 +120,14 @@
 //! timeout. The bound counts K whether or not a replacement is in progress, so
 //! it holds through one; with none in progress, K's clients do not exist.
 //!
-//! What K does not count, outside the bound:
-//!
-//! - **a retired client's backchannel, after its router ends.** A router's
-//!   end does not drop the client's backchannel;
-//!   `fred::live_edit::pool::retire` closes it on a detached task up to about
-//!   6 s later (`RETIRE_ROUTER_WAIT` plus
-//!   `RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`), after the retirement has left the
-//!   count.
-//! - **an evicted retirement, while its end runs.** The per-replica cap
-//!   removes an evicted retirement from the count at once
-//!   (`Retiring::evict_over_cap`), while its router's abort and the release
-//!   that follows are still running.
-//! - **a backchannel left open in a spare cell.** When that close times out
-//!   still waiting for the backchannel's lock (`fred::live_edit::pool::retire`
-//!   documents when), the backchannel stays open on the retired client in its
-//!   pool's spare cell until the pool drops, and no sweep cuts it again (its
-//!   router has ended). At most one per spare cell.
+//! What K does not count, outside the bound: **an evicted retirement, while
+//! its end runs.** The per-replica cap removes an evicted retirement from the
+//! count at once (`Retiring::evict_over_cap`), while its router's abort and
+//! the release that follows are still running. A retired client leaves no
+//! backchannel behind: it never stores one (a sync drops its `CLUSTER SLOTS`
+//! connection when the sync ends, and the service sends no backchannel
+//! command), and a sync cut short by its router's end or abort drops that
+//! connection with the router task's future.
 //!
 //! The terms count connection buffers only, which holds because nothing kept
 //! past a call views a read buffer. fred parses replies without copying, and
@@ -210,8 +205,10 @@ pub const GENERAL_LIMITS: RetentionLimits = RetentionLimits {
 };
 
 /// What one backchannel connection keeps: tokio-util's `Framed` read and
-/// write buffers at their 8 KiB starting size, which the router's sweep
-/// restores once the backchannel holds nothing after any use.
+/// write buffers at their 8 KiB starting size. A sync's `CLUSTER SLOTS`
+/// connection starts there and is dropped when its sync ends; a stored
+/// backchannel (none in this service) is cut back to it by the router's sweep
+/// once it holds nothing after any use.
 pub const BACKCHANNEL_BYTES: usize = 2 * FRESH_BUFFER_BYTES;
 
 /// What a drained connection that is not its client's warm connection keeps:
@@ -307,7 +304,7 @@ pub struct Topology {
 
 impl Topology {
     /// A standalone or sentinel-managed store: every client holds one
-    /// connection and no backchannel for topology syncs.
+    /// connection and runs no `CLUSTER SLOTS` sync.
     pub const fn standalone() -> Self {
         Self {
             primaries: 1,
@@ -316,7 +313,8 @@ impl Topology {
     }
 
     /// A cluster with `primaries` primaries (0 is taken as 1): a general
-    /// client holds a connection to each, plus a `CLUSTER SLOTS` backchannel.
+    /// client holds a connection to each, plus, while a topology sync runs,
+    /// that sync's `CLUSTER SLOTS` backchannel.
     pub const fn cluster(primaries: usize) -> Self {
         Self {
             primaries: if primaries == 0 { 1 } else { primaries },
@@ -338,17 +336,17 @@ impl Topology {
 /// The most every Valkey connection of one replica keeps once its traffic
 /// drains, in bytes, beyond the per-reader reply memory, with `pools` and on
 /// `topology`: `(G + K) × (general connection + (P − 1) × idle connection + c
-/// × backchannel) + R × (reader connection + backchannel)` (see the module
-/// docs for the terms). K ([`PoolSizes::replacement_clients`]) counts the
-/// retiring and connecting clients of member replacements, which exist only
-/// while a replacement is in progress but are counted always, so the bound
-/// holds through one. Not counted (module docs, *What K does not count*): a
-/// retired client's backchannel for up to about 6 s after its router ends, an
-/// evicted retirement while its abort and release run, and the rare
-/// backchannel a timed-out close leaves open in a spare cell, at most one per
-/// spare cell, until its pool drops. Each general client keeps one warm
-/// connection at its class limits whatever P is, so the bound grows by only
-/// (G + K) × 8 KiB per primary.
+/// × backchannel) + R × reader connection` (see the module docs for the
+/// terms; a reader holds no backchannel). The c term is the `CLUSTER SLOTS`
+/// connection a general client's sync holds only while it runs, counted for
+/// every general client at once, as a cluster-wide resync can open them all.
+/// K ([`PoolSizes::replacement_clients`]) counts the retiring and connecting
+/// clients of member replacements, which exist only while a replacement is in
+/// progress but are counted always, so the bound holds through one. Not
+/// counted (module docs, *What K does not count*): an evicted retirement while
+/// its abort and release run. Each general client keeps one warm connection at
+/// its class limits whatever P is, so the bound grows by only (G + K) × 8 KiB
+/// per primary.
 pub fn at_rest_bound_bytes(pools: PoolSizes, topology: Topology) -> u64 {
     let general_connection = GENERAL_LIMITS.kept_queue_bytes()
         + GENERAL_LIMITS.kept_write_bytes()
@@ -361,8 +359,7 @@ pub fn at_rest_bound_bytes(pools: PoolSizes, topology: Topology) -> u64 {
     let general_client = general_connection
         + (topology.primaries() - 1) * IDLE_CONNECTION_BYTES
         + cluster_backchannel;
-    let reader_client =
-        READER_LIMITS.kept_queue_bytes() + READER_LIMITS.kept_write_bytes() + BACKCHANNEL_BYTES;
+    let reader_client = READER_LIMITS.kept_queue_bytes() + READER_LIMITS.kept_write_bytes();
     let general_clients = pools.general_clients() + pools.replacement_clients();
     (general_clients * general_client + pools.readers * reader_client) as u64
 }
@@ -437,23 +434,28 @@ mod tests {
     }
 
     /// `at_rest_bound_bytes` at the chart pools, formula (B): `(G + K) ×
-    /// (505,856 + (P − 1) × 8,192 + c × 16,384) + R × (171,520 + 16,384)`,
-    /// with G = 136 general clients, K = 8 member-replacement clients and
-    /// R = 256 readers. One warm general connection keeps 505,856 B at
-    /// [`GENERAL_LIMITS`]: a 256-slot queue (96,256 B), the write bound
-    /// (147,456 B) and the read bound (262,144 B). Each general client keeps
-    /// one warm connection at its class limits, every other connection at the
-    /// idle shape (an 8 KiB read buffer) and, on a cluster (`c`), its
-    /// `CLUSTER SLOTS` backchannel's two 8 KiB buffers; each reader keeps its
-    /// one connection and its `CLIENT UNBLOCK` backchannel. Dropping either
-    /// backchannel term or K, going back to pass A's formula (every
-    /// connection of a general client at its class limits), or going back to
-    /// a 1,024-command general in-flight limit, changes these values.
+    /// (505,856 + (P − 1) × 8,192 + c × 16,384) + R × 171,520`, with G = 136
+    /// general clients, K = 8 member-replacement clients and R = 256 readers.
+    /// One warm general connection keeps 505,856 B at [`GENERAL_LIMITS`]: a
+    /// 256-slot queue (96,256 B), the write bound (147,456 B) and the read
+    /// bound (262,144 B). Each general client keeps one warm connection at its
+    /// class limits, every other connection at the idle shape (an 8 KiB read
+    /// buffer) and, on a cluster (`c`), the two 8 KiB buffers of the
+    /// connection a topology sync opens for its `CLUSTER SLOTS`: held only
+    /// while the sync runs (the vendored fred drops it when the sync ends,
+    /// change 11), but counted for every general client at once, as a
+    /// cluster-wide resync can open them all. Each reader keeps its one
+    /// connection and no backchannel (the readers run fred's default
+    /// `Blocking::Block`, so none opens a `CLIENT UNBLOCK` one). Dropping the
+    /// general clients' sync term or K, counting a reader backchannel again,
+    /// going back to pass A's formula (every connection of a general client at
+    /// its class limits), or going back to a 1,024-command general in-flight
+    /// limit, changes these values.
     ///
     /// The `c` term is exact, not a floor: the cluster routing table owns its
     /// strings (`fred::live_edit::retention::own_slot_ranges`), so no value
-    /// fred keeps past a sync holds a reply's read buffer alive beyond the
-    /// backchannel's own two buffers.
+    /// fred keeps past a sync holds the dropped connection's read buffer
+    /// alive.
     ///
     /// The figures are at the shipped build's in-flight slot
     /// ([`DOCUMENTED_SLOT_BYTES`]: 256 × 376 B is the 96,256 B queue); a
@@ -470,10 +472,10 @@ mod tests {
              clients (K)"
         );
         for (topology, want) in [
-            (Topology::standalone(), 120_946_688),
-            (Topology::cluster(1), 123_305_984),
-            (Topology::cluster(3), 125_665_280),
-            (Topology::cluster(10), 133_922_816),
+            (Topology::standalone(), 116_752_384),
+            (Topology::cluster(1), 119_111_680),
+            (Topology::cluster(3), 121_470_976),
+            (Topology::cluster(10), 129_728_512),
         ] {
             assert_eq!(
                 at_rest_bound_bytes(CHART_POOLS, topology),
@@ -494,18 +496,18 @@ mod tests {
         assert_eq!(Topology::cluster(0), Topology::cluster(1));
         assert_eq!(
             at_rest_bound_bytes(CHART_POOLS, Topology::cluster(0)),
-            at_this_builds_slot(123_305_984, slots_at(CHART_POOLS)),
+            at_this_builds_slot(119_111_680, slots_at(CHART_POOLS)),
             "the bound at the chart pools on a cluster of 0 primaries is the one-primary figure"
         );
     }
 
     /// The readers' term does not grow with the store's primaries: a stream
-    /// reader is a single-node client, one connection and at most one
-    /// backchannel on every topology. It is the bound with the chart's 256
-    /// readers less the bound with none, the same on a standalone store and
-    /// on a cluster of any size: 256 × (171,520 + 16,384), at the shipped
-    /// build's in-flight slot ([`DOCUMENTED_SLOT_BYTES`]; a build without
-    /// `valkey-tls` checks it at its own slot size).
+    /// reader is a single-node client, one connection and no backchannel on
+    /// every topology. It is the bound with the chart's 256 readers less the
+    /// bound with none, the same on a standalone store and on a cluster of
+    /// any size: 256 × 171,520, at the shipped build's in-flight slot
+    /// ([`DOCUMENTED_SLOT_BYTES`]; a build without `valkey-tls` checks it at
+    /// its own slot size).
     #[test]
     fn at_rest_bound_bytes_reader_term_is_the_same_at_every_primary_count() {
         let no_readers = PoolSizes {
@@ -521,10 +523,7 @@ mod tests {
             assert_eq!(
                 at_rest_bound_bytes(CHART_POOLS, topology)
                     - at_rest_bound_bytes(no_readers, topology),
-                at_this_builds_slot(
-                    256 * (171_520 + 16_384),
-                    256 * READER_LIMITS.in_flight_commands
-                ),
+                at_this_builds_slot(256 * 171_520, 256 * READER_LIMITS.in_flight_commands),
                 "the reader term on {topology:?}"
             );
         }
@@ -619,13 +618,18 @@ mod tests {
     // ── Test 20: the warm election, the per-connection decision and the
     // backchannel cut (`fred::live_edit::retention`'s pure decisions) ──────
     //
-    // These are the only deterministic coverage of F4 (the backchannel cut):
-    // a `CLUSTER SLOTS` reply big enough to grow a backchannel's buffer needs
-    // a fragmented slot map, which the shared CI cluster cannot be put into
-    // without disturbing other tests. They test the decisions alone; code
-    // review checks that the sweep calls them (`retention::sweep`,
-    // `sweep_backchannel`) and that the routing-table and sentinel hooks call
-    // `own_slot_ranges` and `own_server`.
+    // These are the only deterministic coverage of F4 (the backchannel cut).
+    // The cut applies to a stored backchannel, which no service client holds
+    // since the vendored fred's change 11: a sync drops the connection it
+    // opens for `CLUSTER SLOTS` when it ends, and the service sends no
+    // backchannel command. It stays for a client that does store one (a
+    // backchannel command's `CLIENT UNBLOCK`, `FUNCTION KILL`). A reply big
+    // enough to grow a backchannel's buffer would need a fragmented slot map,
+    // which the shared CI cluster cannot be put into without disturbing other
+    // tests. They test the decisions alone; code review checks that the sweep
+    // calls them (`retention::sweep`, `sweep_backchannel`) and that the
+    // routing-table and sentinel hooks call `own_slot_ranges` and
+    // `own_server`.
 
     /// A drained connection, not warm and not idle, with read progress `secs`
     /// seconds after `origin`, or none.
@@ -893,17 +897,19 @@ mod tests {
     }
 
     /// Test 20, `cut_backchannel(read_buffered, write_buffered, idle)`: a
-    /// backchannel that holds nothing is cut to two fresh 8 KiB buffers once
-    /// it carried anything since its last cut — whatever size it carried, so
-    /// a 6,144 B `CLUSTER SLOTS` reply (one that can double an 8 KiB buffer
-    /// behind its connection's setup replies) is cut too — and is left alone
-    /// while it holds a frame either way, or is already idle.
+    /// stored backchannel that holds nothing is cut to two fresh 8 KiB
+    /// buffers once it carried anything since its last cut — whatever size it
+    /// carried, so a 6,144 B reply (one that can double an 8 KiB buffer behind
+    /// its connection's setup replies) is cut too — and is left alone while it
+    /// holds a frame either way, or is already idle.
     ///
     /// This is the only deterministic coverage of F4, the backchannel cut: no
-    /// test drives a backchannel's buffers in place, because a `CLUSTER
-    /// SLOTS` reply large enough to grow one needs a fragmented slot map that
-    /// the shared CI cluster cannot be put into without disturbing other
-    /// tests. Code review checks that `sweep_backchannel` calls this decision.
+    /// test drives a backchannel's buffers in place. No service client stores
+    /// a backchannel since the vendored fred's change 11 (a sync's `CLUSTER
+    /// SLOTS` connection, the one it used to store, is dropped when the sync
+    /// ends), so the cut matters only for a client a backchannel command left
+    /// one on. Code review checks that `sweep_backchannel` calls this
+    /// decision.
     #[test]
     fn cut_backchannel_cuts_an_empty_backchannel_that_carried_anything_since_its_last_cut() {
         let rows: Vec<(&str, (usize, usize, bool), bool)> = vec![
@@ -1052,8 +1058,8 @@ mod tests {
     /// The sentinel copy (b.26e): `own_server`
     /// leaves the primary `Server` a sentinel names with its `host` and, with
     /// TLS, its TLS server name holding the same contents in an allocation of
-    /// its own, so the primary connection, its keys and the backchannel do
-    /// not keep the sentinel connection's read buffer alive. Code review
+    /// its own, so the primary connection, its keys and any stored backchannel
+    /// do not keep the sentinel connection's read buffer alive. Code review
     /// checks the call in `router/sentinel.rs` (`discover_primary_node`).
     #[test]
     fn own_server_copies_the_sentinel_primarys_strings_out_of_the_reply_buffer() {

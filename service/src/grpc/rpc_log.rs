@@ -32,6 +32,8 @@
 //   final status in spawned tasks, after the wrapper has returned. Each tail
 //   logs at the point its status is decided, from a clone of the setup context
 //   advanced to [`RpcStage::Stream`].
+// - **The hold gate** (`super::hold`) refuses every LiveService RPC while
+//   the fleet is held, before the auth interceptor runs.
 // - **The auth interceptor** rejects before any handler runs.
 // - **`super::metrics_layer`**, the outermost layer this code owns, keeps a
 //   per-request [`RpcCompletion`] ledger. Every emission here marks it
@@ -76,6 +78,7 @@ use std::sync::Arc;
 use tonic::Code;
 use tracing::Level;
 
+use super::graceful_shutdown::{HoldCause, StreamShutdown};
 use crate::error::{InternalFault, INTERNAL_ERROR_MSG};
 use crate::observability::metrics::{
     UPDATE_LAYER_CONFLICT_CACHE_DIVERGED, UPDATE_LAYER_CONFLICT_SEQ_FENCE,
@@ -106,10 +109,10 @@ pub(crate) enum RpcStage {
     /// Field ingest — for the uploads, the header frame — and the input
     /// validation that precedes any storage or auth work. The default: a
     /// request that fails before the handler records anything is reported
-    /// here, with no identifiers. Auth-interceptor rejections are reported
-    /// here too, and so are an upload stream that ended before its first
-    /// message without END_STREAM (`CANCELLED`) and an upload request with no
-    /// end-of-stream record (`INTERNAL`).
+    /// here, with no identifiers. Hold-gate refusals and auth-interceptor
+    /// rejections are reported here too, and so are an upload stream that
+    /// ended before its first message without END_STREAM (`CANCELLED`) and an
+    /// upload request with no end-of-stream record (`INTERNAL`).
     #[default]
     Header,
     /// Session `base_path` resolution, permission check, userinfo resolution.
@@ -283,11 +286,13 @@ pub(crate) struct RpcLogContext {
     previous_operation_id: Option<String>,
     /// `UpdateLayer`, a chained call: its `no_wait`. Emitted as `no_wait`.
     no_wait: Option<bool>,
-    /// `CreateLayer` / `UpdateLayer`: the call reached its commit — set
-    /// immediately before the handler hands the write to
-    /// `LayerStore::create_layer_with_operation` /
-    /// `LayerStore::update_layer_with_summary` ([`Self::commit_started`]).
-    /// False from [`Self::for_request`] until then, and never reset. Read by
+    /// `CreateLayer` / `UpdateLayer`: the call reached its commit
+    /// ([`Self::commit_started`]). `UpdateLayer` sets it immediately before
+    /// the handler hands the write to `LayerStore::update_layer_with_summary`.
+    /// `CreateLayer` sets it when `LayerStore::create_layer_with_operation`
+    /// returns an error with its `CreateCommitMarker` set, i.e. after the
+    /// call reached its first client-visible write. False from
+    /// [`Self::for_request`] until then, and never reset. Read by
     /// `super::layer`'s `UPSTREAM_UNAVAILABLE` choke point: a plain
     /// `UNAVAILABLE` raised before it is a refusal that applied nothing. Not
     /// emitted: the line's `stage` and the `update_layer_call` summary
@@ -336,6 +341,14 @@ pub(crate) struct RpcLogContext {
     /// `SubscribeReadLayer` line already carries `reason=shutdown`, and the
     /// level is the whole effect.
     shutdown_caused: bool,
+    /// The RPC was refused, or its stream ended, because the fleet is held
+    /// (`SERVICE_HELD`, SDD SR-6.1, SR-6.3): the hold gate refused it, or the
+    /// hold ending ended its stream (see [`Self::hold_caused`]); read only by
+    /// [`failure_level`], which logs that `UNAVAILABLE` at INFO. Not emitted:
+    /// the `SubscribeReadLayer` line carries `reason=held`, the status names
+    /// the incident, and the level is the whole effect. Separate from
+    /// `shutdown_caused`: a hold is not a shutdown.
+    hold_caused: bool,
     /// The `JoinSession` ended because its client opted in to keepalives and
     /// then sent no data for three intervals (see
     /// [`Self::client_keepalive_timed_out`]); read only by [`failure_level`],
@@ -377,6 +390,22 @@ impl RpcLogContext {
             endpoint: completion.endpoint(),
             completion: Some(completion),
             ..Default::default()
+        }
+    }
+
+    /// A context for a completion point that sees the raw HTTP request, ahead
+    /// of tonic's decoding and of the auth interceptor: the LiveService hold
+    /// gate (`super::hold`). Carries the request's ledger, and its endpoint,
+    /// when the request came through `super::metrics_layer`; otherwise the
+    /// endpoint is bucketed from the request path the way the metrics layer
+    /// buckets it.
+    pub(crate) fn for_http_request<B>(request: &http::Request<B>) -> Self {
+        match request.extensions().get::<Arc<RpcCompletion>>() {
+            Some(completion) => Self::for_completion(Arc::clone(completion)),
+            None => Self {
+                endpoint: super::metrics_layer::endpoint_name(request.uri().path()),
+                ..Default::default()
+            },
         }
     }
 
@@ -426,10 +455,13 @@ impl RpcLogContext {
         self.chained
     }
 
-    /// Mark the call's commit started: `CreateLayer` / `UpdateLayer` call it
-    /// immediately before handing the write to the store's commit, and no
-    /// step before that call writes client-visible state. Never undone: once
-    /// set, an `UNAVAILABLE` cannot be shown to have applied nothing.
+    /// Mark the call's commit started: `UpdateLayer` calls it immediately
+    /// before handing the write to the store's commit; `CreateLayer` calls it
+    /// when the store returns an error after setting its
+    /// `CreateCommitMarker`, the store's mark of the call's first
+    /// client-visible write. Either way, no step before it writes
+    /// client-visible state. Never undone: once set, an `UNAVAILABLE` cannot
+    /// be shown to have applied nothing.
     pub(crate) fn commit_started(&mut self) {
         self.commit_started = true;
     }
@@ -533,6 +565,34 @@ impl RpcLogContext {
         self.shutdown_caused = true;
     }
 
+    /// Mark this completion as caused by a fleet hold: an RPC the hold gate
+    /// (`grpc::hold`) refused `SERVICE_HELD`, or a streaming RPC whose
+    /// enrolled token the hold ending cancelled with `HoldCause::Held`
+    /// (`grpc::graceful_shutdown`), ending or refused `SERVICE_HELD`. Call
+    /// ONLY for a `SERVICE_HELD` completion. Every call and every stream on
+    /// every replica ends this way while the fleet holds — an expected
+    /// consequence of the hold, which is reported once on its own (SDD SR-7),
+    /// not a warning per call — so [`failure_level`] logs its `UNAVAILABLE`
+    /// at INFO.
+    /// A stream ended for a stale hold verdict is not marked: losing the store
+    /// is a dependency outage, logged at WARN like any other `UNAVAILABLE`.
+    pub(crate) fn hold_caused(&mut self) {
+        self.hold_caused = true;
+    }
+
+    /// Mark this completion by the cause of an observed cancel of a streaming
+    /// RPC's enrolled shutdown token: [`Self::shutdown_caused`] when graceful
+    /// shutdown cancelled it, [`Self::hold_caused`] for a fleet hold, and no
+    /// marker for a stale hold verdict. Call ONLY where the stream ends, or
+    /// is refused, because it observed that token cancelled.
+    pub(crate) fn stream_shutdown_caused(&mut self, shutdown: &StreamShutdown) {
+        match shutdown.hold_cause() {
+            None => self.shutdown_caused(),
+            Some(HoldCause::Held { .. }) => self.hold_caused(),
+            Some(HoldCause::StaleVerdict) => {}
+        }
+    }
+
     /// Mark this completion as a `JoinSession` ended by its client keepalive
     /// deadline. Call ONLY from the join's keepalive-timeout ending. A client
     /// whose laptop sleeps or whose network drops is an expected event, like a
@@ -552,8 +612,8 @@ impl RpcLogContext {
 /// The message every non-fault completion line carries. Stable and greppable:
 /// one `grep 'RPC failed'` over a pod log yields every client-visible
 /// rejection on either server, whichever completion point reported it — a
-/// handler boundary, a streaming tail, the auth interceptor, or the metrics
-/// layer's transport backstop. Three other messages complete the vocabulary,
+/// handler boundary, a streaming tail, the hold gate, the auth interceptor,
+/// or the metrics layer's transport backstop. Three other messages complete the vocabulary,
 /// each for a completion this one does not describe:
 ///
 /// - `internal error` ([`INTERNAL_ERROR_MSG`]) at ERROR, for a server fault —
@@ -573,6 +633,7 @@ pub(crate) const RPC_ABANDONED_MSG: &str = "RPC abandoned before completion";
 ///
 /// `object_resolved` is `ctx.current_object_id.is_some()`; `shutdown_caused` is
 /// the context's shutdown marker ([`RpcLogContext::shutdown_caused`]);
+/// `hold_caused` is its fleet-hold marker ([`RpcLogContext::hold_caused`]);
 /// `keepalive_timed_out` is its client-keepalive marker
 /// ([`RpcLogContext::client_keepalive_timed_out`]).
 ///
@@ -583,6 +644,7 @@ pub(crate) const RPC_ABANDONED_MSG: &str = "RPC abandoned before completion";
 /// | `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `RESOURCE_EXHAUSTED`, `OUT_OF_RANGE`, `CANCELLED`, `ABORTED` | — | info |
 /// | `PERMISSION_DENIED`, `UNAUTHENTICATED` | — | warn |
 /// | `UNAVAILABLE` | shutdown-caused, at any stage | info |
+/// | `UNAVAILABLE` | hold-caused, at any stage | info |
 /// | `UNAVAILABLE` | client-keepalive timeout, at any stage | info |
 /// | `UNAVAILABLE` | otherwise | warn |
 /// | `INTERNAL` | — | warn |
@@ -620,20 +682,23 @@ pub(crate) const RPC_ABANDONED_MSG: &str = "RPC abandoned before completion";
 /// `UNAVAILABLE` instead, at stage `storage`, at WARN like every other such
 /// `UNAVAILABLE`).
 ///
-/// The two marker rows are the only places the markers matter. Graceful
+/// The three marker rows are the only places the markers matter. Graceful
 /// shutdown ends every stream on the draining pod `UNAVAILABLE`, on every
 /// rolling restart, so at WARN it would bury real dependency outages under
-/// routine deploys. The client-keepalive timeout ends a `JoinSession` whose
+/// routine deploys. A fleet hold ends every stream on every replica
+/// `SERVICE_HELD`, a consequence of the hold, which is reported on its own, so
+/// it is INFO too. The client-keepalive timeout ends a `JoinSession` whose
 /// client went silent — a laptop that slept, a network that dropped — which is
 /// routine at any scale, so it is INFO too, and its rate is read from
-/// `live_edit_presence_keepalive_timeouts_total`. Neither marker changes the
-/// level of any other code.
+/// `live_edit_presence_keepalive_timeouts_total`. No marker changes the level
+/// of any other code.
 pub(crate) fn failure_level(
     code: Code,
     stage: RpcStage,
     object_resolved: bool,
     shutdown_caused: bool,
     keepalive_timed_out: bool,
+    hold_caused: bool,
 ) -> Option<Level> {
     match code {
         Code::Ok => None,
@@ -664,6 +729,9 @@ pub(crate) fn failure_level(
         // A graceful shutdown's retryable ending: expected on every rolling
         // restart, so not a warning.
         Code::Unavailable if shutdown_caused => Some(Level::INFO),
+        // A fleet hold's `SERVICE_HELD` ending: the hold is reported on its
+        // own; one warning per stream would add nothing.
+        Code::Unavailable if hold_caused => Some(Level::INFO),
         // A `JoinSession` whose client went silent past its keepalive
         // deadline: expected whenever a client sleeps or loses its network.
         Code::Unavailable if keepalive_timed_out => Some(Level::INFO),
@@ -783,6 +851,7 @@ pub(crate) fn log_rpc_failure(ctx: &RpcLogContext, status: &tonic::Status) {
         ctx.current_object_id.is_some(),
         ctx.shutdown_caused,
         ctx.client_keepalive_timeout,
+        ctx.hold_caused,
     ) else {
         return;
     };
@@ -938,17 +1007,24 @@ mod tests {
     /// `keepalive_timed_out` is the context's client-keepalive marker, with the
     /// same effect: a `JoinSession` ended because its client went silent past
     /// its keepalive deadline is routine, so its `UNAVAILABLE` is INFO.
+    ///
+    /// `hold_caused` is the context's fleet-hold marker, with the same effect
+    /// again: a disaster-recovery hold ends every stream on every replica
+    /// `SERVICE_HELD`, and the hold is reported on its own, so its
+    /// `UNAVAILABLE` is INFO.
     fn expected_level(
         code: Code,
         stage: RpcStage,
         resolved: bool,
         shutdown_caused: bool,
         keepalive_timed_out: bool,
+        hold_caused: bool,
     ) -> Option<Level> {
         match code {
             Code::Ok => None,
             Code::Unavailable if shutdown_caused => Some(Level::INFO),
             Code::Unavailable if keepalive_timed_out => Some(Level::INFO),
+            Code::Unavailable if hold_caused => Some(Level::INFO),
             Code::NotFound | Code::FailedPrecondition => {
                 if stage == RpcStage::Storage && resolved {
                     Some(Level::WARN)
@@ -968,8 +1044,9 @@ mod tests {
 
     // ── Level matrix ─────────────────────────────────────────────────────────
 
-    /// The full 17 × 10 × 2 × 2 × 2 matrix — code, stage, resolution, shutdown
-    /// marker, client-keepalive marker — agrees with the documented table.
+    /// The full 17 × 10 × 2 × 2 × 2 × 2 matrix — code, stage, resolution,
+    /// shutdown marker, client-keepalive marker, fleet-hold marker — agrees
+    /// with the documented table.
     ///
     /// Exhaustive by construction, so the individually interesting rows need no
     /// separate tests — they are cells in here. Two worth naming, because they
@@ -986,14 +1063,18 @@ mod tests {
                 for resolved in [false, true] {
                     for shutdown in [false, true] {
                         for keepalive in [false, true] {
-                            assert_eq!(
-                                failure_level(code, stage, resolved, shutdown, keepalive),
-                                expected_level(code, stage, resolved, shutdown, keepalive),
-                                "level table disagreement for code={code:?} stage={} \
-                                 resolved={resolved} shutdown_caused={shutdown} \
-                                 keepalive_timed_out={keepalive}",
-                                stage.label()
-                            );
+                            for hold in [false, true] {
+                                assert_eq!(
+                                    failure_level(code, stage, resolved, shutdown, keepalive, hold),
+                                    expected_level(
+                                        code, stage, resolved, shutdown, keepalive, hold
+                                    ),
+                                    "level table disagreement for code={code:?} stage={} \
+                                     resolved={resolved} shutdown_caused={shutdown} \
+                                     keepalive_timed_out={keepalive} hold_caused={hold}",
+                                    stage.label()
+                                );
+                            }
                         }
                     }
                 }
@@ -1010,8 +1091,8 @@ mod tests {
         for &code in ALL_CODES {
             for &stage in ALL_STAGES {
                 for resolved in [false, true] {
-                    let changes = failure_level(code, stage, resolved, true, false)
-                        != failure_level(code, stage, resolved, false, false);
+                    let changes = failure_level(code, stage, resolved, true, false, false)
+                        != failure_level(code, stage, resolved, false, false, false);
                     assert_eq!(
                         changes,
                         code == Code::Unavailable,
@@ -1035,8 +1116,8 @@ mod tests {
             for &stage in ALL_STAGES {
                 for resolved in [false, true] {
                     for shutdown in [false, true] {
-                        let changes = failure_level(code, stage, resolved, shutdown, true)
-                            != failure_level(code, stage, resolved, shutdown, false);
+                        let changes = failure_level(code, stage, resolved, shutdown, true, false)
+                            != failure_level(code, stage, resolved, shutdown, false, false);
                         assert_eq!(
                             changes,
                             code == Code::Unavailable && !shutdown,
@@ -1046,6 +1127,44 @@ mod tests {
                              already made INFO)",
                             stage.label()
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The fleet-hold marker, like the other two, changes the level of
+    /// `UNAVAILABLE` and of no other code, anywhere in the matrix, and only
+    /// where no other marker has already made it INFO. A marker that
+    /// downgraded, say, an `INTERNAL` would hide a real failure that happened
+    /// to land during a hold.
+    #[test]
+    fn failure_level_hold_marker_changes_no_other_code() {
+        for &code in ALL_CODES {
+            for &stage in ALL_STAGES {
+                for resolved in [false, true] {
+                    for (shutdown, keepalive) in MARKERS {
+                        let marked =
+                            failure_level(code, stage, resolved, shutdown, keepalive, true);
+                        let unmarked =
+                            failure_level(code, stage, resolved, shutdown, keepalive, false);
+                        assert_eq!(
+                            marked != unmarked,
+                            code == Code::Unavailable && !shutdown && !keepalive,
+                            "code={code:?} stage={} resolved={resolved} \
+                             shutdown_caused={shutdown} keepalive_timed_out={keepalive}: the \
+                             hold marker may change the level of UNAVAILABLE only",
+                            stage.label()
+                        );
+                        if code == Code::Unavailable {
+                            assert_eq!(
+                                marked,
+                                Some(Level::INFO),
+                                "a hold-caused UNAVAILABLE is INFO at stage={} \
+                                 resolved={resolved}",
+                                stage.label()
+                            );
+                        }
                     }
                 }
             }
@@ -1066,24 +1185,28 @@ mod tests {
             for &stage in ALL_STAGES {
                 for resolved in [false, true] {
                     for (shutdown, keepalive) in MARKERS {
-                        let level = failure_level(code, stage, resolved, shutdown, keepalive);
-                        assert!(
-                            level != Some(Level::ERROR),
-                            "code={code:?} stage={} resolved={resolved} \
-                             shutdown_caused={shutdown} keepalive_timed_out={keepalive} logs \
-                             at ERROR; the level table must never do that for ANY code — \
-                             ERROR belongs to the InternalFault arm of log_rpc_failure",
-                            stage.label()
-                        );
-                        assert!(
-                            matches!(level, None | Some(Level::WARN) | Some(Level::INFO)),
-                            "code={code:?} stage={} resolved={resolved} \
-                             shutdown_caused={shutdown} keepalive_timed_out={keepalive} \
-                             produced {level:?}; the emitter only dispatches WARN and INFO, so \
-                             any other level would be silently re-routed to WARN by its \
-                             fallback arm",
-                            stage.label()
-                        );
+                        for hold in [false, true] {
+                            let level =
+                                failure_level(code, stage, resolved, shutdown, keepalive, hold);
+                            assert!(
+                                level != Some(Level::ERROR),
+                                "code={code:?} stage={} resolved={resolved} \
+                                 shutdown_caused={shutdown} keepalive_timed_out={keepalive} \
+                                 hold_caused={hold} logs at ERROR; the level table must never \
+                                 do that for ANY code — ERROR belongs to the InternalFault arm \
+                                 of log_rpc_failure",
+                                stage.label()
+                            );
+                            assert!(
+                                matches!(level, None | Some(Level::WARN) | Some(Level::INFO)),
+                                "code={code:?} stage={} resolved={resolved} \
+                                 shutdown_caused={shutdown} keepalive_timed_out={keepalive} \
+                                 hold_caused={hold} produced {level:?}; the emitter only \
+                                 dispatches WARN and INFO, so any other level would be \
+                                 silently re-routed to WARN by its fallback arm",
+                                stage.label()
+                            );
+                        }
                     }
                 }
             }
@@ -1103,14 +1226,17 @@ mod tests {
             for &stage in ALL_STAGES {
                 for resolved in [false, true] {
                     for (shutdown, keepalive) in MARKERS {
-                        assert_eq!(
-                            failure_level(code, stage, resolved, shutdown, keepalive).is_none(),
-                            code == Code::Ok,
-                            "code={code:?} stage={} resolved={resolved} \
-                             shutdown_caused={shutdown} keepalive_timed_out={keepalive}: only \
-                             OK may be silent",
-                            stage.label()
-                        );
+                        for hold in [false, true] {
+                            assert_eq!(
+                                failure_level(code, stage, resolved, shutdown, keepalive, hold)
+                                    .is_none(),
+                                code == Code::Ok,
+                                "code={code:?} stage={} resolved={resolved} \
+                                 shutdown_caused={shutdown} keepalive_timed_out={keepalive} \
+                                 hold_caused={hold}: only OK may be silent",
+                                stage.label()
+                            );
+                        }
                     }
                 }
             }
@@ -1131,14 +1257,14 @@ mod tests {
         for &stage in ALL_STAGES {
             for resolved in [false, true] {
                 assert_eq!(
-                    failure_level(Code::Internal, stage, resolved, false, false),
+                    failure_level(Code::Internal, stage, resolved, false, false, false),
                     Some(Level::WARN),
                     "an INTERNAL reaching the table has no fault source and is client-causable; \
                      stage={} resolved={resolved}",
                     stage.label()
                 );
                 assert_eq!(
-                    failure_level(Code::OutOfRange, stage, resolved, false, false),
+                    failure_level(Code::OutOfRange, stage, resolved, false, false, false),
                     Some(Level::INFO),
                     "OUT_OF_RANGE is a client over a limit; stage={} resolved={resolved}",
                     stage.label()
@@ -1165,8 +1291,8 @@ mod tests {
     #[test]
     fn failure_level_storage_and_resolved_escalates_only_not_found_and_failed_precondition() {
         for &code in ALL_CODES {
-            let escalates = failure_level(code, RpcStage::Storage, true, false, false)
-                != failure_level(code, RpcStage::Storage, false, false, false);
+            let escalates = failure_level(code, RpcStage::Storage, true, false, false, false)
+                != failure_level(code, RpcStage::Storage, false, false, false, false);
             let should_escalate = matches!(code, Code::NotFound | Code::FailedPrecondition);
             assert_eq!(
                 escalates, should_escalate,
@@ -1175,13 +1301,13 @@ mod tests {
             );
             if should_escalate {
                 assert_eq!(
-                    failure_level(code, RpcStage::Storage, true, false, false),
+                    failure_level(code, RpcStage::Storage, true, false, false, false),
                     Some(Level::WARN),
                     "code={code:?} at the commit path against a live object is keyspace damage \
                      and must be WARN"
                 );
                 assert_eq!(
-                    failure_level(code, RpcStage::Storage, false, false, false),
+                    failure_level(code, RpcStage::Storage, false, false, false, false),
                     Some(Level::INFO),
                     "code={code:?} with no object ever resolved is the client shape and must be \
                      INFO"
@@ -1645,6 +1771,68 @@ mod tests {
         );
     }
 
+    /// `stream_shutdown_caused` marks a completion by the cause on the stream's
+    /// cancelled token, and the one `RPC failed` line follows: SIGTERM (no
+    /// cause) marks it shutdown-caused, INFO; a fleet hold marks it
+    /// hold-caused — never shutdown-caused, since a hold is not a shutdown —
+    /// INFO; a stale hold verdict marks nothing, so its `UNAVAILABLE` is WARN
+    /// like any other dependency outage. No marker is a field on the line.
+    #[test]
+    fn stream_shutdown_caused_marks_the_completion_by_the_tokens_cause() {
+        use crate::grpc::graceful_shutdown::{GracefulShutdown, HoldCause};
+
+        let ended_by = |hold: Option<HoldCause>| {
+            let shutdown = GracefulShutdown::new();
+            let (stream, _enrollment) = shutdown.enroll_stream();
+            match hold {
+                Some(cause) => shutdown.end_streams_for_hold(cause),
+                None => shutdown.cancel(),
+            }
+            stream
+        };
+        for (hold, want_shutdown, want_hold, want_level) in [
+            (None, true, false, "INFO"),
+            (
+                Some(HoldCause::Held {
+                    incident: Some("inc-1".to_owned()),
+                }),
+                false,
+                true,
+                "INFO",
+            ),
+            (Some(HoldCause::StaleVerdict), false, false, "WARN"),
+        ] {
+            let what = format!("{hold:?}");
+            let stream = ended_by(hold);
+            let mut ctx = RpcLogContext::new("SubscribeReadLayer");
+            ctx.session("sess-1");
+            ctx.at(RpcStage::Stream);
+            ctx.stream_shutdown_caused(&stream);
+            assert_eq!(
+                (ctx.shutdown_caused, ctx.hold_caused),
+                (want_shutdown, want_hold),
+                "{what}: (shutdown_caused, hold_caused)"
+            );
+
+            let status = stream.ending_status();
+            let events = capture_json(|| log_rpc_failure(&ctx, &status));
+            let failures = rpc_failure_events(&events);
+            assert_eq!(failures.len(), 1, "{what}: one line; got {events:?}");
+            assert_eq!(
+                failures[0]["level"], want_level,
+                "{what}: {:?}",
+                failures[0]
+            );
+            assert_eq!(failures[0]["fields"]["grpc_code"], "UNAVAILABLE", "{what}");
+            assert!(
+                failures[0]["fields"].get("hold_caused").is_none()
+                    && failures[0]["fields"].get("shutdown_caused").is_none(),
+                "{what}: the markers select the level and are not emitted; got {:?}",
+                failures[0]
+            );
+        }
+    }
+
     /// Every optional field an event can carry. `error` is the fault arm's
     /// detail and is present only on that arm.
     const OPTIONAL_FIELDS: &[&str] = &[
@@ -1975,7 +2163,7 @@ mod tests {
     #[test]
     fn log_rpc_failure_grpc_code_field_matches_the_metric_label_vocabulary() {
         for &code in ALL_CODES {
-            if failure_level(code, RpcStage::Header, false, false, false).is_none() {
+            if failure_level(code, RpcStage::Header, false, false, false, false).is_none() {
                 continue;
             }
             let want =
@@ -2013,8 +2201,9 @@ mod tests {
             let events = capture_json(|| {
                 log_rpc_failure(&ctx_with_everything(), &tonic::Status::new(code, "msg"));
             });
-            let want =
-                usize::from(failure_level(code, RpcStage::Resolve, true, false, false).is_some());
+            let want = usize::from(
+                failure_level(code, RpcStage::Resolve, true, false, false, false).is_some(),
+            );
             assert_eq!(
                 events.len(),
                 want,

@@ -45,7 +45,8 @@
 //! # What is measured
 //!
 //! Each case serves the service through the production server stack —
-//! `production_server_builder()`, `MetricsLayer`, the auth interceptor and
+//! `production_server_builder` at the gate's waiter cap, `MetricsLayer`, the
+//! auth interceptor and
 //! `live_service_server`, as `main.rs` builds the full-API server — on a
 //! thread spawned with an explicit [`PRODUCT_WORKER_STACK`], running a
 //! current-thread runtime whose blocking pool gets the same explicit size
@@ -96,8 +97,8 @@
 //! (`subscribe_snapshot_reads_go_no_deeper_than_the_up_to_date_catch_up`):
 //! in one process, it serves the up-to-date catch-up (no read, no build) and
 //! then every subscribe case that reads a snapshot without a fan-out pass
-//! (the first subscribe, the in-window and out-of-window reconnects, each in
-//! both catch-up modes, and the session recovery's first subscribe), and
+//! (the first subscribe, the in-window and out-of-window reconnects, and the
+//! session recovery's first subscribe), and
 //! fails a read case more than 32 KiB deeper on its worker than the
 //! up-to-date one. The budget alone cannot see a growth of that size: it
 //! pins that the snapshot read's frames stay on the worker at about the
@@ -116,14 +117,14 @@
 //! |---|---|
 //! | `CreateLayer` | new; overwrite (and its cleanup); new at `MAX_SECTION_TREE_DEPTH` |
 //! | `UpdateLayer` | fast path; header-only; cached structural cold and warm; reset; WATCH (`txn`); layer recovery from the commit (`update-layer-layer-recovery`: object gone, mapping kept); layer recovery from the mapping resolve (`update-layer-mapping-recovery`: mapping and object gone, ends `not_recoverable`); cached cold, cached warm (the plan in place's incremental depth check) and WATCH at `MAX_SECTION_TREE_DEPTH` |
-//! | `SubscribeReadLayer` | `brand_new`, `in_window` and `out_of_window` in each catch-up mode (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED` on and off); `brand_new` at `MAX_SECTION_TREE_DEPTH` in each mode; `brand_new` above the atomic-read limits (the fenced-read flight); `up_to_date`; the live relay; layer recovery; session recovery |
+//! | `SubscribeReadLayer` | `brand_new`, `in_window` and `out_of_window`; `brand_new` at `MAX_SECTION_TREE_DEPTH`; `brand_new` above the atomic-read limits (the fenced-read flight); `up_to_date`; the live relay; layer recovery; session recovery |
 //!
 //! The other `LiveService` RPCs (`Ping`, the session RPCs, `DeleteLayer`,
 //! `StatLayer`, `JoinSession`) have no case.
 //!
 //! Configurations run: the `lua` and `txn` update backends (`lua-watch-
 //! structural` commits structural deltas through the WATCH code the `txn`
-//! cases measure), both catch-up modes, and checkpoint recovery enabled, on
+//! cases measure), and checkpoint recovery enabled, on
 //! a single-node Valkey with trace export off. A Valkey Cluster topology and
 //! OTLP trace export are not run (SDD §15.1).
 //!
@@ -201,15 +202,11 @@
 //! | `update-layer-watch-deep-tree` | 79.4 | 16.0 (0) | 30.6 (1) |
 //! | `update-layer-layer-recovery` | 171.2 | 16.0 (0) | 16.0 (0) |
 //! | `update-layer-mapping-recovery` | 117.7 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-brand-new-snapshot` | 96.5 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-brand-new-legacy` | 96.5 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-brand-new-deep-tree-snapshot` | 114.5 | 37.8 (1) | 16.0 (0) |
-//! | `subscribe-brand-new-deep-tree-legacy` | 114.5 | 37.8 (1) | 16.0 (0) |
+//! | `subscribe-brand-new` | 96.5 | 16.0 (0) | 16.0 (0) |
+//! | `subscribe-brand-new-deep-tree` | 114.5 | 37.8 (1) | 16.0 (0) |
 //! | `subscribe-brand-new-above-atomic-read-limits` | 114.5 | 19.1 (1) | 16.0 (0) |
-//! | `subscribe-in-window-snapshot` | 96.5 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-in-window-legacy` | 96.5 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-out-of-window-snapshot` | 96.5 | 16.0 (0) | 16.0 (0) |
-//! | `subscribe-out-of-window-legacy` | 96.5 | 16.0 (0) | 16.0 (0) |
+//! | `subscribe-in-window` | 96.5 | 16.0 (0) | 16.0 (0) |
+//! | `subscribe-out-of-window` | 96.5 | 16.0 (0) | 16.0 (0) |
 //! | `subscribe-up-to-date` | 96.5 | 16.0 (0) | 16.0 (0) |
 //! | `subscribe-live-relay` | 39.0 | 16.0 (0) | 16.0 (0) |
 //! | `subscribe-layer-recovery` | 196.0 | 16.0 (0) | 16.0 (0) |
@@ -1070,20 +1067,16 @@ async fn update_layer_mapping_recovery_stays_within_the_stack_budget() {
 // SubscribeReadLayer
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// The catch-up `mode` label and faithful-build count a catch-up in `regime`
-/// records under `snapshot`: the faithful builds are snapshot mode's alone,
-/// and only a from-empty full state is labelled `snapshot`.
-fn mode_of(regime: &str, snapshot: bool) -> (&'static str, f64) {
-    let label = if snapshot && regime == "brand_new" {
+/// The `catchup_mode` label and faithful-build count a catch-up in `regime`
+/// records: only a from-empty full state is labelled `snapshot`, and every
+/// regime but `up_to_date` (no read, no build) builds once.
+fn mode_of(regime: &str) -> (&'static str, f64) {
+    let label = if regime == "brand_new" {
         "snapshot"
     } else {
         "legacy"
     };
-    let builds = if snapshot && regime != "up_to_date" {
-        1.0
-    } else {
-        0.0
-    };
+    let builds = if regime == "up_to_date" { 0.0 } else { 1.0 };
     (label, builds)
 }
 
@@ -1097,8 +1090,8 @@ struct Served {
 }
 
 /// One catch-up, measured from the subscribe to its caught-up ack, on a
-/// fresh service; checked to be served as `served` says by the `snapshot`
-/// mode's code. Returns the measured thread's depth, for
+/// fresh service; checked to be served as `served` says. Returns the
+/// measured thread's depth, for
 /// [`subscribe_snapshot_reads_go_no_deeper_than_the_up_to_date_catch_up`].
 async fn catch_up_case(
     case: &'static str,
@@ -1113,9 +1106,8 @@ async fn catch_up_case(
         contents,
         runs_a_pass,
     } = served;
-    let snapshot = opts.snapshot;
     let svc = fx.service(opts).await;
-    let (label, builds) = mode_of(regime, snapshot);
+    let (label, builds) = mode_of(regime);
     let (mut m, mut client) = serve(case, &svc).await;
     let (regimes_before, builds_before) = (catch_ups(&svc, regime, label), faithful_builds(&svc));
     m.open().await;
@@ -1128,7 +1120,7 @@ async fn catch_up_case(
         1.0,
     )
     .and(expect_eq(
-        "faithful (snapshot-mode) builds",
+        "faithful builds",
         faithful_builds(&svc) - builds_before,
         builds,
     ))
@@ -1150,90 +1142,39 @@ async fn catch_up_case(
 /// A first subscribe to a layer of `content`, checked, when `runs_a_pass`,
 /// to have read it by a fenced fan-out pass on `fanout-read`. Returns the
 /// measured thread's depth.
-async fn brand_new(
-    case: &'static str,
-    snapshot: bool,
-    content: oodf_ffi::OwnedDelta,
-    runs_a_pass: bool,
-) -> usize {
+async fn brand_new(case: &'static str, content: oodf_ffi::OwnedDelta, runs_a_pass: bool) -> usize {
     let fx = Fx::new().await;
     let (session_id, _) = fx.session_with_layer(&content).await;
-    let opts = Opts {
-        snapshot,
-        ..Opts::default()
-    };
     let served = Served {
         regime: "brand_new",
         contents: 1,
         runs_a_pass,
     };
-    catch_up_case(case, fx, opts, session_id, (0, 0), served).await
+    catch_up_case(case, fx, Opts::default(), session_id, (0, 0), served).await
 }
 
-/// A first subscribe: the full state at a proven cut, snapshot mode's
-/// faithful build.
+/// A first subscribe: the full state at a proven cut, the faithful build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     debug_assertions,
     ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
 )]
-async fn subscribe_brand_new_snapshot_mode_stays_within_the_stack_budget() {
-    run(brand_new(
-        "subscribe-brand-new-snapshot",
-        true,
-        base_content(),
-        false,
-    ))
-    .await;
-}
-
-/// A first subscribe under the rollback mode
-/// (`LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false`): the legacy full-content diff.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
-)]
-async fn subscribe_brand_new_legacy_mode_stays_within_the_stack_budget() {
-    run(brand_new(
-        "subscribe-brand-new-legacy",
-        false,
-        base_content(),
-        false,
-    ))
-    .await;
+async fn subscribe_brand_new_stays_within_the_stack_budget() {
+    run(brand_new("subscribe-brand-new", base_content(), false)).await;
 }
 
 /// A first subscribe to a layer whose section tree is
-/// [`MAX_SECTION_TREE_DEPTH`] deep, snapshot mode. The catch-up reads the
-/// deep chain by a fan-out pass on `fanout-read`, so this case measures that
-/// pass; the case requires it.
+/// [`MAX_SECTION_TREE_DEPTH`] deep. The catch-up reads the deep chain by a
+/// fan-out pass on `fanout-read`, so this case measures that pass; the case
+/// requires it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     debug_assertions,
     ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
 )]
-async fn subscribe_brand_new_deep_tree_snapshot_mode_stays_within_the_stack_budget() {
+async fn subscribe_brand_new_deep_tree_stays_within_the_stack_budget() {
     run(brand_new(
-        "subscribe-brand-new-deep-tree-snapshot",
-        true,
-        chain(MAX_SECTION_TREE_DEPTH),
-        true,
-    ))
-    .await;
-}
-
-/// The deep-tree first subscribe under the rollback mode; its read's pass on
-/// `fanout-read` is required.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
-)]
-async fn subscribe_brand_new_deep_tree_legacy_mode_stays_within_the_stack_budget() {
-    run(brand_new(
-        "subscribe-brand-new-deep-tree-legacy",
-        false,
+        "subscribe-brand-new-deep-tree",
         chain(MAX_SECTION_TREE_DEPTH),
         true,
     ))
@@ -1284,9 +1225,9 @@ async fn subscribe_brand_new_above_atomic_read_limits_stays_within_the_stack_bud
 }
 
 /// A reconnect whose gap is still on the layer stream: three missed
-/// structural commits. Snapshot mode delivers one coalesced diff; the
-/// rollback mode replays each commit. Returns the measured thread's depth.
-async fn in_window(case: &'static str, snapshot: bool) -> usize {
+/// structural commits, delivered as one coalesced diff. Returns the measured
+/// thread's depth.
+async fn in_window(case: &'static str) -> usize {
     let fx = Fx::new().await;
     let (session_id, object_id) = fx.session_with_layer(&base_content()).await;
     for i in 1..=3 {
@@ -1297,20 +1238,15 @@ async fn in_window(case: &'static str, snapshot: bool) -> usize {
         )
         .await;
     }
-    let contents = if snapshot { 1 } else { 3 };
-    let opts = Opts {
-        snapshot,
-        ..Opts::default()
-    };
     catch_up_case(
         case,
         fx,
-        opts,
+        Opts::default(),
         session_id,
         (object_id, 1),
         Served {
             regime: "in_window",
-            contents,
+            contents: 1,
             runs_a_pass: false,
         },
     )
@@ -1322,23 +1258,13 @@ async fn in_window(case: &'static str, snapshot: bool) -> usize {
     debug_assertions,
     ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
 )]
-async fn subscribe_in_window_snapshot_mode_stays_within_the_stack_budget() {
-    run(in_window("subscribe-in-window-snapshot", true)).await;
-}
-
-/// The rollback mode's per-commit replay: the largest catch-up future.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
-)]
-async fn subscribe_in_window_legacy_mode_stays_within_the_stack_budget() {
-    run(in_window("subscribe-in-window-legacy", false)).await;
+async fn subscribe_in_window_stays_within_the_stack_budget() {
+    run(in_window("subscribe-in-window")).await;
 }
 
 /// A reconnect whose gap was trimmed off the layer stream: one coalesced
 /// diff from the proven read. Returns the measured thread's depth.
-async fn out_of_window(case: &'static str, snapshot: bool) -> usize {
+async fn out_of_window(case: &'static str) -> usize {
     let fx = Fx::new().await;
     let (session_id, object_id) = fx.session_with_layer(&base_content()).await;
     let mut seq = 1;
@@ -1353,14 +1279,10 @@ async fn out_of_window(case: &'static str, snapshot: bool) -> usize {
     }
     // The subscriber holds 2; the entry after it, 3, is trimmed away.
     fx.trim_stream_below(object_id, seq).await;
-    let opts = Opts {
-        snapshot,
-        ..Opts::default()
-    };
     catch_up_case(
         case,
         fx,
-        opts,
+        Opts::default(),
         session_id,
         (object_id, 2),
         Served {
@@ -1377,21 +1299,11 @@ async fn out_of_window(case: &'static str, snapshot: bool) -> usize {
     debug_assertions,
     ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
 )]
-async fn subscribe_out_of_window_snapshot_mode_stays_within_the_stack_budget() {
-    run(out_of_window("subscribe-out-of-window-snapshot", true)).await;
+async fn subscribe_out_of_window_stays_within_the_stack_budget() {
+    run(out_of_window("subscribe-out-of-window")).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "release-build stack guard: run with --cargo-profile release (CI: test-release-stack-guard)"
-)]
-async fn subscribe_out_of_window_legacy_mode_stays_within_the_stack_budget() {
-    run(out_of_window("subscribe-out-of-window-legacy", false)).await;
-}
-
-/// A reconnect already at the head: no read, no build, the ack only. The
-/// same code in both modes.
+/// A reconnect already at the head: no read, no build, the ack only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg_attr(
     debug_assertions,
@@ -1566,8 +1478,8 @@ const SNAPSHOT_READ_OVER_UP_TO_DATE_MARGIN: usize = 32 * KIB;
 
 /// The relative-depth check: in one run of one build, every subscribe case
 /// that reads a snapshot without a fan-out pass — the first subscribe, the
-/// in-window and out-of-window reconnects, each in both catch-up modes, and
-/// the session recovery's first subscribe — goes at most
+/// in-window and out-of-window reconnects, and the session recovery's first
+/// subscribe — goes at most
 /// [`SNAPSHOT_READ_OVER_UP_TO_DATE_MARGIN`] deeper on its worker than the
 /// up-to-date catch-up, which reads nothing. It pins that no frame the
 /// snapshot read keeps on the worker grows by tens of KiB, a growth well
@@ -1592,40 +1504,16 @@ async fn subscribe_snapshot_reads_go_no_deeper_than_the_up_to_date_catch_up() {
         let baseline = up_to_date("relative-subscribe-up-to-date").await;
         let reads = [
             (
-                "relative-subscribe-brand-new-snapshot",
-                brand_new(
-                    "relative-subscribe-brand-new-snapshot",
-                    true,
-                    base_content(),
-                    false,
-                )
-                .await,
+                "relative-subscribe-brand-new",
+                brand_new("relative-subscribe-brand-new", base_content(), false).await,
             ),
             (
-                "relative-subscribe-brand-new-legacy",
-                brand_new(
-                    "relative-subscribe-brand-new-legacy",
-                    false,
-                    base_content(),
-                    false,
-                )
-                .await,
+                "relative-subscribe-in-window",
+                in_window("relative-subscribe-in-window").await,
             ),
             (
-                "relative-subscribe-in-window-snapshot",
-                in_window("relative-subscribe-in-window-snapshot", true).await,
-            ),
-            (
-                "relative-subscribe-in-window-legacy",
-                in_window("relative-subscribe-in-window-legacy", false).await,
-            ),
-            (
-                "relative-subscribe-out-of-window-snapshot",
-                out_of_window("relative-subscribe-out-of-window-snapshot", true).await,
-            ),
-            (
-                "relative-subscribe-out-of-window-legacy",
-                out_of_window("relative-subscribe-out-of-window-legacy", false).await,
+                "relative-subscribe-out-of-window",
+                out_of_window("relative-subscribe-out-of-window").await,
             ),
             (
                 "relative-subscribe-session-recovery",

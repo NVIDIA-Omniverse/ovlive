@@ -22,7 +22,8 @@ from tools.live.diagnostic_snapshot import InvalidSnapshot, MAX_BYTES, SnapshotV
 from tools.live.test_support import run_process, write_json
 
 SCENARIOS = {'options', 'executors', 'subjects', 'backpressure', 'applications',
-             'jitter', 'capacity', 'durations', 'status-history', 'auth-waits', 'callback-failures'}
+             'jitter', 'capacity', 'durations', 'status-history', 'auth-waits', 'callback-failures',
+             'endpoint-records', 'drain-records', 'cleanup-records'}
 MAX_CORPUS_BYTES = 64 * 1024 * 1024
 MAX_SNAPSHOTS = 1024
 

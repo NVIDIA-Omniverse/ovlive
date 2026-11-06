@@ -45,6 +45,7 @@ use uuid::Uuid;
 
 use live_edit::config::Config;
 use live_edit::storage::client::ValkeyClient;
+use live_edit::storage::test_support::connect_test_client_or_skip;
 
 /// Build a minimal `Config` pointing at the integration Valkey. Used to
 /// stand up two independent `ValkeyClient`s (publisher + subscriber) so
@@ -60,22 +61,6 @@ fn test_config(pool_size: u32) -> Config {
     cfg.valkey_pool_size = pool_size;
     cfg.valkey_reconnect_max_delay_ms = 500;
     cfg
-}
-
-/// Connect a `ValkeyClient`, returning `None` if Valkey is not reachable
-/// (CI machines without a live Valkey skip these tests gracefully — same
-/// pattern as existing `tests/integration/storage/client_test.rs`).
-async fn maybe_connect() -> Option<ValkeyClient> {
-    let cfg = test_config(2);
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(client)) => Some(client),
-        _ => None,
-    }
 }
 
 /// Kill the specific subscriber connection identified by `victim_id`.
@@ -135,8 +120,7 @@ async fn subscriber_connection_id(subscriber: &fred::clients::SubscriberClient) 
 /// "manage_subscriptions not called" up front.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_event_fires_after_client_kill_pubsub() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config(2)).await else {
         return;
     };
 
@@ -189,13 +173,15 @@ async fn pubsub_subscription_survives_connection_drop() {
     // connection is definitely different from the victim's SubscriberClient.
     // Single-client with SKIPME=yes would work too but two clients read
     // cleaner and let the test also exercise cross-client publish.
-    let Some(subscriber_side) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    // The two sides connect concurrently: one hang guard, not two.
+    let cfg = test_config(2);
+    let (subscriber_side, publisher_side) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(subscriber_side), Some(publisher_side)) = (subscriber_side, publisher_side) else {
         return;
     };
-    let publisher_side = maybe_connect()
-        .await
-        .expect("publisher-side Valkey must be reachable if subscriber-side was");
 
     let channel = format!("le:test:{}:c1-regression", Uuid::new_v4());
 
@@ -299,13 +285,15 @@ async fn pubsub_subscription_survives_connection_drop() {
 /// trip a dedicated regression.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_deleted_fanout_survives_connection_drop() {
-    let Some(subscriber_side) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    // The two sides connect concurrently: one hang guard, not two.
+    let cfg = test_config(2);
+    let (subscriber_side, publisher_side) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(subscriber_side), Some(publisher_side)) = (subscriber_side, publisher_side) else {
         return;
     };
-    let publisher_side = maybe_connect()
-        .await
-        .expect("publisher-side Valkey must be reachable");
 
     // `le:session:deleted` is the static channel used for cross-replica
     // DeleteSession fan-out. Use a per-test prefix channel instead so

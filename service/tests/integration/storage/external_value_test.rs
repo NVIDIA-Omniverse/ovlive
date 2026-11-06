@@ -1451,7 +1451,7 @@ async fn store_values_concurrent_writers_each_increment_refcount_once() {
 /// test confirms a fan-out of distinct hashes commits cleanly on cluster.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_store_many_distinct_hashes_spans_shards_without_crossslot() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -1524,7 +1524,7 @@ async fn cluster_store_many_distinct_hashes_spans_shards_without_crossslot() {
 /// test — same invariant, but exercised under cluster's slot-routing path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cluster_concurrent_writers_same_hash_increment_refcount_atomically() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
         return;
     };

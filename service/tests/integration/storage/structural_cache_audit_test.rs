@@ -33,6 +33,7 @@
 //! | Same cut | commits landing between the audit's read and its repair (the read's reply held at a proxy) still audit `match`: the copy is repaired to the read's cut, not the header; a cut behind the entry (a rolled-back header) audits `skipped` (`regressed`) and keeps the entry |
 //! | Diverged | after `rewrite_out_of_band` of a section row, a children list or a dangling list, or an out-of-band rewrite of a field row's external hash, the audit answers `diverged` at the entry's cut naming that key, drops the entry and leaves the keyspace byte-identical (`DUMP`); a checkout taken before the audit then has its put-back refused (and one taken before a `match` has it accepted); one WARN carries `object_id`, `seq` and `first_difference`; an inline value rewritten out of band is a `match` (the compact entry holds no inline value) |
 //! | Skipped | a repair past its budget (`too_far`), a trimmed stream (`gap`), an unmarked object (`NoChsComplete`), a superseded and a deleted object (`Gone`) each tick `skipped` only; so does a store error on the snapshot read or the repair's read (`ReadFailed`, injected at a proxy), and an object deleted between the read and the repair (`Gone`) |
+//! | Collision rule | the index-less copy's repair across a record whose replay counts a collision-rule divergence (a prim beside a same-named attribute; a rename onto an occupied name) is `skipped` (`collision_rule`), ticking `skipped` only; a same-kind create both rules agree on repairs to `match` |
 //! | Repair bounds | the audit repairs under the production bounds, its 64 KiB read and replay caps retired: a pending entry past 64 KiB, and five records whose delta parts sum past 64 KiB, are `match` with the repair held on the upload budget and given back; a cut one entry past the repair's 1,024-entry budget is still `skipped` (`too_far`) |
 //! | Charge on `B` | with the audit's real charge on an upload gate (`UploadBudgetAuditCharges`): refused at its first read on a budget an upload fills, or between the two records of one chunk (the second record's RP2, on a budget with room for every earlier point), the audit is `skipped` (`ChargeRefused`) with the budget back to the uploads', no slot taken, nothing queued and the cache's entry unchanged; a read over the per-audit cap is `skipped` (`ChargeOverCap`) having held only the first read's RP0; granted, its peak is the record's RP2 as priced on the index-less copy (the per-record estimate with no plan indexes), on `match` and on `diverged` alike, given back after; with the budget full, a processing step queued or an admission queued, the audit never waits and the waiter stays queued; cancelled mid repair read, or failed on it (`ReadFailed`), the budget is given back |
 //! | Above the ceiling | with the switch off, `skipped` (`AboveCeiling`) from the plain read alone, with no fenced tick; with it on, `match` through the fenced read above the plain item ceiling, far above it (past where the retired raised read's item ceiling ended) and above the plain byte ceiling alone (past the raised byte ceiling); `diverged` there too after an out-of-band rewrite, the entry dropped |
@@ -88,7 +89,7 @@ use fred::types::scripts::Script;
 use fred::types::streams::XCap;
 use fred::types::Key;
 use futures::{FutureExt, Stream, StreamExt};
-use oodf_ffi::OwnedDelta;
+use oodf_ffi::{CommandCreateSection, OwnedDelta, StructCommand};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -138,7 +139,7 @@ use live_edit::storage::structural_cache::estimate_replay_record_growth;
 use crate::common::owned_delta::{delta_with_set_field_external, delta_with_set_field_inline};
 use crate::storage::snapshot_read_atomic_test::{
     create, create_cmd, create_session, every_shape_state, ext_hash, layer_store, mock_ext_store,
-    structural, unmark, DANGLING_PARENT, ROOT, SIBLING, WORLD,
+    move_cmd, structural, unmark, DANGLING_PARENT, ROOT, SIBLING, WORLD,
 };
 use crate::storage::snapshot_read_support::{
     client_through, client_through_with_limits, client_with_limits, error_reply_script,
@@ -1188,6 +1189,63 @@ async fn audit_that_cannot_compare_is_skipped_with_its_reason() {
     }
 }
 
+/// The audit's copy carries no plan indexes, so its repair replays each
+/// record through the unindexed apply, which answers the record's counters
+/// too. A record whose replay counts a collision-rule divergence ends the
+/// repair at a `collision_rule` reload, so the audit is `skipped`
+/// (`Unreachable(CollisionRule)`) and ticks `skipped` only: a prim created
+/// beside the same-named attribute `Cube` (another collision slot, so no
+/// cascade, where the earlier rule cascaded `Cube`), and a same-parent
+/// rename onto an occupied name (`SIBLING` renamed `World`, cascading
+/// `WORLD` and its subtree). Another build may have committed either under
+/// the earlier rule. The control: a record both rules agree on, a create of
+/// `Cube`'s kind onto its name that cascades it, repairs to `match`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_repair_across_a_collision_rule_divergent_record_is_skipped_collision_rule() {
+    let cases: [(&str, OwnedDelta, AuditOutcome); 3] = [
+        (
+            "a prim beside a same-named attribute",
+            structural(vec![StructCommand::CreateSection(CommandCreateSection {
+                parent_id: WORLD,
+                section_id: AUDIT_NEW_SECTION,
+                section_name: "Cube".to_owned(),
+                section_type: 6,
+            })]),
+            AuditOutcome::Skipped(AuditSkip::Unreachable(ReloadReason::CollisionRule)),
+        ),
+        (
+            "a rename onto an occupied name",
+            structural(vec![move_cmd(SIBLING, ROOT, ROOT, "World")]),
+            AuditOutcome::Skipped(AuditSkip::Unreachable(ReloadReason::CollisionRule)),
+        ),
+        (
+            "control: a same-kind create onto an occupied name",
+            structural(vec![create_cmd(WORLD, AUDIT_NEW_SECTION, "Cube")]),
+            AuditOutcome::Match,
+        ),
+    ];
+    for (what, delta, expected) in cases {
+        let fx = Fx::new("audit-collision-rule").await;
+        let entry = fx.entry().await;
+        fx.commit(delta).await;
+        assert_eq!(
+            fx.header_cut().await.0,
+            entry.seq + 1,
+            "{what}: fixture: the audit's repair replays the one record"
+        );
+
+        let outcome = fx.run(&fx.audit(false), &entry).await;
+
+        assert_eq!(outcome, expected, "{what}");
+        let ticks = if expected == AuditOutcome::Match {
+            (1, 0, 0)
+        } else {
+            (0, 0, 1)
+        };
+        assert_eq!(fx.audits(), ticks, "{what}: one tick, of its outcome");
+    }
+}
+
 /// A fast-path record setting `WORLD`'s field `key` to `len` inline bytes.
 fn inline_record(key: &str, len: usize, set_order: u64) -> OwnedDelta {
     delta_with_set_field_inline(WORLD, key, vec![0x6B; len], set_order)
@@ -1488,8 +1546,8 @@ async fn audit_of_an_object_deleted_between_its_read_and_its_repair_is_skipped_g
 // and capped per audit. The gate-side rules are unit-tested in
 // `grpc::upload_admission`'s tests; these drive them through real audits.
 
-/// A section id [`commit_field_write_then_creation`] creates: clear of the
-/// seeded tree's.
+/// A section id [`commit_field_write_then_creation`] and the collision-rule
+/// test's creates make: clear of the seeded tree's.
 const AUDIT_NEW_SECTION: u64 = 900;
 
 /// The `UpdateLayer` budget the queue tests' gate holds: room for three
@@ -3165,7 +3223,10 @@ async fn audit_is_cancelled_by_the_shutdown_token_and_none_starts_after_it() {
 /// (`(SNAPSHOT_MEMORY_FACTOR + 1) × b`, as [`expected_grant_bytes`]); the
 /// token fires, and the audit ends with no outcome and no tick, every one of
 /// them given back — the lease by its guard's background release — and the
-/// one-audit flag cleared.
+/// one-audit flag cleared. The read's lease is lengthened
+/// (`lengthen_fence_leases`) and checked once the read is held, so a renewal
+/// landing late cannot end the held attempt and let an unheld retry finish
+/// the audit before the token fires; the hook's sizes stay production-sized.
 ///
 /// Needs `test-fault-injection` (the read's fault seam).
 ///
@@ -3186,7 +3247,7 @@ async fn audit_cancelled_mid_fenced_read_gives_back_its_pair_p_f_grant_and_lease
     let (client, plain_items) = fx.client_one_item_under_the_bound().await;
     let estimate = fx.estimate(plain_items).await;
     let injector = Arc::new(ObjectSnapshotReadFaultInjector::new());
-    injector.push_delay_at(
+    injector.lengthen_fence_leases(true).push_delay_at(
         ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
         FAN_OUT_DELAY,
     );
@@ -3212,6 +3273,13 @@ async fn audit_cancelled_mid_fenced_read_gives_back_its_pair_p_f_grant_and_lease
         );
         tokio::time::sleep(POLL_PAUSE).await;
     }
+    live_edit::storage::test_support::assert_fence_lease_lengthened(
+        fx.tv.client(),
+        fx.tv.key_schema(),
+        fx.oid,
+        &client,
+    )
+    .await;
     let mid_read = capacity(&client, &fx.cache);
     shutdown.cancel();
     let outcome = finished(handle).await;

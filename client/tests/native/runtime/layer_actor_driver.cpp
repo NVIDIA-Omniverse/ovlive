@@ -2,13 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "LiveLayerActor.h"
 #include "LiveDrain.h"
+#include "LiveMetadata.h"
 #include "../support/test_tls.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <iostream>
 #include <future>
+#include <map>
 
 using namespace omni::usd::live;
+void liveTestDumpStacks() noexcept; // tests/native/support/StackDump.cpp
 std::string publicDiagnostics();
 namespace {
 template <class T> T record()
@@ -825,7 +829,8 @@ int actorReadPauseDriver(int argc, char** argv)
         return status.state;
     };
     barrier("actor-pause-ready");
-    // Failure-only deadline: the service has sent the whole burst.
+    // Failure-only deadline: the fixture continues the barrier only once gRPC
+    // has sent the whole burst, which crosses the high-water mark.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     while (!actor->transportSnapshot().readPaused) {
         const auto state = actor->snapshot();
@@ -943,6 +948,116 @@ int actorReadPauseDriver(int argc, char** argv)
     runtime.reset(); assert(omniUsdLiveShutdown(5000) == OMNI_USD_LIVE_OK);
     std::cout << "{\"applied\":" << state.applied << ",\"covered\":" << state.covered
               << ",\"generations\":" << state.generation - paused.generation + 1
+              << ",\"diagnostics\":" << diagnostics << "}" << std::endl;
+    return 0;
+}
+// A read that ends with frames still queued settles only after the actor has
+// consumed them, so its reconnect resumes from the last frame it received. A
+// test seam holds one worker step after it observes the read still running and
+// before it checks for queued frames, while the service sends peers 2..9 and
+// ends the stream; the step ends only once the read has delivered every frame
+// and completed.
+int actorReadEndQueuedDriver(int argc, char** argv)
+{
+    assert(argc == 7 && std::string(argv[6]) == "scripted");
+    constexpr uint64_t last = 9; // One caught-up header, then peers 2..9.
+    auto options = record<OmniUsdLiveRuntimeOptions>();
+    options.callback_worker_count = 4; // The held step occupies one worker; the read's delivery needs another.
+    options.reconnect_initial_ms = 5; options.reconnect_maximum_ms = 20; // The ended read reconnects promptly.
+    options.max_update_bytes = 1024;
+    assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK);
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = argv[1]; endpointOptions.access_token = argv[5];
+    OmniUsdLiveEndpoint endpoint = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    auto runtime = getRuntime();
+    Seen seen;
+    LayerActor::Callbacks callbacks;
+    callbacks.decode = [](const LayerReadUpdate& update) {
+        LayerActor::Decoded decoded; decoded.first = update.header.sequence_num(); return decoded;
+    };
+    callbacks.applyAsync = [&](LayerProgress::Work work, std::shared_ptr<const LayerActor::Effect> effect,
+                               std::shared_ptr<LayerActor::ApplyCompletion> completion) {
+        completion->run([&] {
+            std::lock_guard<std::mutex> lock(seen.mutex);
+            seen.applied.emplace_back(work.last, effect->bytes());
+            seen.changed.notify_all();
+        });
+    };
+    callbacks.changed = [&](const LayerProgress::Snapshot& state) {
+        std::lock_guard<std::mutex> lock(seen.mutex);
+        seen.state = state; seen.changed.notify_all();
+    };
+    LayerActor::Options settings;
+    settings.session = argv[6]; settings.layer = "root.live"; settings.object = settings.resume = 1;
+    settings.initialState = std::make_shared<const std::string>("opaque-base");
+    auto actor = LayerActor::open(runtime, endpoint, std::move(settings), std::move(callbacks));
+    seen.wait([&] { return seen.state.gate == LayerProgress::Gate::Ready || failed(seen.state); });
+    const auto ready = actor->snapshot();
+    assert(!failed(ready) && ready.covered == 1);
+    struct Hold {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool armed = true, entered = false;
+        std::chrono::steady_clock::time_point watchdog;
+    } hold;
+    hold.watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(10); // Failure-only watchdog.
+    LayerActor::setBetweenReadObservationsForTest([](void* context, Request& read, bool ended) noexcept {
+        if (!context) return;
+        auto& hold = *static_cast<Hold*>(context);
+        {
+            std::lock_guard<std::mutex> lock(hold.mutex);
+            if (!hold.armed || ended) return;
+            hold.armed = false; hold.entered = true;
+        }
+        hold.changed.notify_all();
+        // The read delivers its frames and completes on other workers.
+        while (read.wait(0) != OMNI_USD_LIVE_OK) {
+            assert(std::chrono::steady_clock::now() < hold.watchdog);
+            std::this_thread::yield();
+        }
+    }, &hold);
+    actor->expireReadForTest(); // Only wakes the worker: the read already has its first response.
+    {
+        std::unique_lock<std::mutex> lock(hold.mutex);
+        assert(hold.changed.wait_until(lock, hold.watchdog, [&] { return hold.entered; }));
+    }
+    std::cout << "actor-read-observed" << std::endl;
+    std::string command; assert(std::getline(std::cin, command) && command == "continue");
+    seen.wait([&] {
+        return failed(seen.state) ||
+            (seen.state.generation > ready.generation && seen.state.gate == LayerProgress::Gate::Ready);
+    });
+    // A worker that loaded the hook before this store still finds hold, which outlives the actor.
+    LayerActor::setBetweenReadObservationsForTest(nullptr, &hold);
+    // The reconnect resumed after the ended read's last frame.
+    const auto resumed = actor->snapshot();
+    std::cout << "{\"resumed_covered\":" << resumed.covered << "}" << std::endl;
+    assert(!failed(resumed) && resumed.covered == last && resumed.generation == ready.generation + 1);
+    seen.wait([&] { return failed(seen.state) || seen.state.applied == last; });
+    const auto state = actor->snapshot();
+    assert(!failed(state) && state.applied == last);
+    {
+        std::lock_guard<std::mutex> lock(seen.mutex);
+        assert(seen.applied.size() == last - 1);
+        for (uint64_t sequence = 2; sequence <= last; ++sequence)
+            assert(seen.applied[sequence - 2].first == sequence &&
+                   seen.applied[sequence - 2].second == std::string(1024, char('a' + sequence % 26)));
+    }
+    assert(actor->close(5000) == OMNI_USD_LIVE_OK);
+    actor.reset();
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    for (;;) {
+        // A closed actor can still have a scheduler owner; observe retirement.
+        const auto result = omniUsdLiveUnregisterEndpoint(endpoint, 0);
+        if (result == OMNI_USD_LIVE_OK) break;
+        assert(result == OMNI_USD_LIVE_BUSY && std::chrono::steady_clock::now() < until);
+        std::this_thread::yield();
+    }
+    const auto diagnostics = publicDiagnostics();
+    runtime.reset(); assert(omniUsdLiveShutdown(5000) == OMNI_USD_LIVE_OK);
+    std::cout << "{\"applied\":" << state.applied << ",\"covered\":" << state.covered
+              << ",\"generations\":" << state.generation - ready.generation + 1
               << ",\"diagnostics\":" << diagnostics << "}" << std::endl;
     return 0;
 }
@@ -1206,7 +1321,8 @@ int actorReadDeadlineDriver(int argc, char** argv)
     if (!paced) {
         observe([] { return false; }); // Only the failure ends the wait.
     } else {
-        // The service has sent the burst; the held application pauses the read.
+        // The fixture continues the barrier only once gRPC has sent the burst;
+        // the held application pauses the read.
         while (!actor->transportSnapshot().readPaused) {
             assert(!failed(actor->snapshot()) && std::chrono::steady_clock::now() < watchdog);
             std::this_thread::yield();
@@ -1253,6 +1369,375 @@ int actorReadDeadlineDriver(int argc, char** argv)
     return 0;
 }
 }
+// The call_budget_exhausted records of a diagnostic snapshot, as JSON objects.
+static std::string callBudgetRecords(const DiagnosticSnapshot& snapshot)
+{
+    std::string records = "[";
+    for (const auto& entry : snapshot.records) {
+        if (entry.eventCode != OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED) continue;
+        std::map<std::string, uint64_t> fields;
+        for (uint32_t i = 0; i < entry.fieldCount; ++i)
+            fields[DiagnosticsRegistry::fieldName(entry.fields[i].key)] = entry.fields[i].value;
+        records += std::string(records.size() > 1 ? "," : "") + "{\"event\":\"" +
+            DiagnosticsRegistry::eventName(entry.eventCode) + "\",\"severity\":" + std::to_string(entry.severity);
+        for (const auto& [name, value] : fields) records += ",\"" + name + "\":" + std::to_string(value);
+        records += "}";
+    }
+    return records + "]";
+}
+// Unregisters `endpoint` once its dependents have retired; watchdog only.
+static void unregisterRetired(OmniUsdLiveEndpoint endpoint)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+    while (omniUsdLiveUnregisterEndpoint(endpoint, 0) != OMNI_USD_LIVE_OK) {
+        assert(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+    }
+}
+static const auto budgetBarrier = [](const std::string& marker) {
+    std::cout << marker << std::endl;
+    std::string command; assert(std::getline(std::cin, command) && command == "continue");
+};
+// The endpoint's call budget bounds the calls its channel keeps open. With
+// argv[7] = 8 the stream share is 6 and the call share 2: four layers' reads
+// and two joins fill the stream share, so a fifth layer and a third join are
+// refused RESOURCE_EXHAUSTED before any RPC. Each open layer then submits six
+// writes and four finite requests follow; the service holds the first two
+// writes until the Python side releases them at "budget-held", so every other
+// write and request waits on the client and completes once released. Closing a
+// layer returns its stream unit, and the refused layer then opens; the service
+// sees that layer's read end before "budget-closed" continues. With argv[7] =
+// 0, the default budget, nothing is refused and the service sees more than
+// eight calls open at once.
+int actorCallBudgetDriver(int argc, char** argv)
+{
+    assert(argc == 8);
+    const uint64_t budget = std::stoull(argv[7]);
+    const bool bounded = budget != 0;
+    auto options = record<OmniUsdLiveRuntimeOptions>();
+    options.max_calls_per_endpoint = budget;
+    assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK);
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = argv[1]; endpointOptions.access_token = argv[5];
+    OmniUsdLiveEndpoint endpoint = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    auto runtime = getRuntime();
+    const auto calls = runtime->findEndpoint(endpoint)->calls;
+    const auto until = [](auto predicate) {
+        // Watchdog only: every awaited value is established by the steps above it.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (!predicate()) { assert(std::chrono::steady_clock::now() < deadline); std::this_thread::yield(); }
+    };
+    const auto barrier = [](const std::string& marker) {
+        std::cout << marker << std::endl;
+        std::string command; assert(std::getline(std::cin, command) && command == "continue");
+    };
+    constexpr unsigned kLayers = 5, kWrites = 6, kJoins = 3;
+    std::array<Seen, kLayers> seen;
+    std::array<std::shared_ptr<LayerActor>, kLayers> actors;
+    std::array<OmniUsdLiveResult, kLayers> opened{};
+    const auto open = [&](unsigned i) -> OmniUsdLiveResult {
+        LayerActor::Callbacks callbacks;
+        callbacks.decode = [](const LayerReadUpdate& update) {
+            LayerActor::Decoded decoded; decoded.first = update.header.sequence_num(); return decoded;
+        };
+        callbacks.apply = [](const auto&, const auto&) {};
+        callbacks.changed = [&layer = seen[i]](const LayerProgress::Snapshot& state) {
+            std::lock_guard<std::mutex> lock(layer.mutex); layer.state = state; layer.changed.notify_all();
+        };
+        LayerActor::Options settings;
+        settings.session = argv[6]; settings.layer = "budget-" + std::to_string(i) + ".live";
+        settings.object = settings.resume = 1;
+        settings.initialState = std::make_shared<const std::string>("opaque-base");
+        try {
+            actors[i] = LayerActor::open(runtime, endpoint, std::move(settings), std::move(callbacks));
+        } catch (OmniUsdLiveResult result) {
+            return result;
+        }
+        seen[i].wait([&] { return seen[i].state.gate == LayerProgress::Gate::Ready || failed(seen[i].state); });
+        assert(!failed(seen[i].state));
+        return OMNI_USD_LIVE_OK;
+    };
+    const auto uri = makeSessionUri(argv[1], argv[6]);
+    auto join = record<OmniUsdLiveJoinOptions>(); join.app_name = "budget";
+    // Each join counts its established connections.
+    std::array<std::atomic<unsigned>, kJoins> connections{};
+    const OmniUsdLiveSessionCallback count = [](void* user, const OmniUsdLiveSessionEvent* event) {
+        if (event->kind == OMNI_USD_LIVE_EVENT_CONNECTION && event->result == OMNI_USD_LIVE_OK)
+            static_cast<std::atomic<unsigned>*>(user)->fetch_add(1);
+    };
+    std::array<OmniUsdLiveSession, kJoins> sessions{};
+    std::array<OmniUsdLiveResult, kJoins> joined{};
+    const auto connect = [&](unsigned i) {
+        joined[i] = omniUsdLiveJoinSession(uri.c_str(), &join, &connections[i], count, &sessions[i]);
+        if (joined[i] != OMNI_USD_LIVE_OK) return;
+        until([&] {
+            auto status = record<OmniUsdLiveStatus>();
+            assert(omniUsdLiveGetSessionStatus(sessions[i], &status) == OMNI_USD_LIVE_OK);
+            return status.state == OMNI_USD_LIVE_STATE_READY;
+        });
+    };
+    for (unsigned i = 0; i < 4; ++i) assert((opened[i] = open(i)) == OMNI_USD_LIVE_OK);
+    connect(0); connect(1);
+    assert(joined[0] == OMNI_USD_LIVE_OK && joined[1] == OMNI_USD_LIVE_OK);
+    // The stream share is full when bounded: neither waits, and neither issues an RPC.
+    opened[4] = open(4);
+    connect(2);
+    assert((opened[4] == OMNI_USD_LIVE_RESOURCE_EXHAUSTED) == bounded);
+    assert((joined[2] == OMNI_USD_LIVE_RESOURCE_EXHAUSTED) == bounded && (bounded || sessions[2]));
+    std::vector<std::shared_ptr<const std::string>> intents;
+    for (unsigned i = 0; i < kLayers; ++i)
+        for (unsigned k = 0; actors[i] && k < kWrites; ++k) {
+            intents.push_back(std::make_shared<const std::string>("w-" + std::to_string(i) + "-" + std::to_string(k)));
+            (void)actors[i]->submit(*intents.back(), intents.back());
+        }
+    // The service holds the first writes, so each layer, with writes still
+    // queued, waits for a call unit.
+    if (bounded) until([&] { return calls->counts().waiting == 4; });
+    struct Finite {
+        std::mutex mutex;
+        std::vector<OmniUsdLiveResult> results;
+        static void list(void* self, OmniUsdLiveResult result, uint64_t, const OmniUsdLiveSessionInfo* const*) {
+            auto& finite = *static_cast<Finite*>(self);
+            std::lock_guard<std::mutex> lock(finite.mutex); finite.results.push_back(result);
+        }
+        static void stat(void* self, OmniUsdLiveResult result, const OmniUsdLiveLayerInfo*) {
+            auto& finite = *static_cast<Finite*>(self);
+            std::lock_guard<std::mutex> lock(finite.mutex); finite.results.push_back(result);
+        }
+    } finite;
+    const auto layerUri = makeLayerUri(uri, "budget-0.live");
+    std::vector<OmniUsdLiveRequest> requests(4);
+    for (unsigned i = 0; i < 2; ++i) {
+        assert(omniUsdLiveListSessions(endpoint, "stream/base", &finite, Finite::list, &requests[2 * i]) ==
+               OMNI_USD_LIVE_OK);
+        assert(omniUsdLiveStatLayer(layerUri.c_str(), &finite, Finite::stat, &requests[2 * i + 1]) ==
+               OMNI_USD_LIVE_OK);
+    }
+    // Every finite request waits behind the layers before the service releases anything.
+    if (bounded) until([&] { return calls->counts().waiting == 8; });
+    barrier("budget-held");
+    std::array<uint64_t, kLayers> retired{};
+    for (unsigned i = 0; i < kLayers; ++i) {
+        if (!actors[i]) continue;
+        seen[i].wait([&] { return seen[i].state.localRetired == kWrites || failed(seen[i].state); });
+        assert(!failed(seen[i].state));
+        retired[i] = seen[i].state.localRetired;
+    }
+    for (const auto request : requests) {
+        assert(omniUsdLiveWait(request, 5000) == OMNI_USD_LIVE_OK);
+        assert(omniUsdLiveReleaseRequest(request) == OMNI_USD_LIVE_OK);
+    }
+    bool reconnected = false;
+    if (bounded) {
+        // On a full stream share a layer's read reconnects and a join the
+        // service ends rejoins, each on the unit it holds.
+        assert(calls->counts().streams == 6);
+        const auto generation = seen[1].state.generation;
+        actors[1]->resubscribeForTest();
+        seen[1].wait([&] {
+            return (seen[1].state.generation > generation && seen[1].state.gate == LayerProgress::Gate::Ready) ||
+                failed(seen[1].state);
+        });
+        assert(!failed(seen[1].state));
+        barrier("budget-rejoin"); // The service ends the first join's stream.
+        until([&] { return connections[0].load() == 2; });
+        reconnected = calls->counts().streams == 6;
+    }
+    bool reopened = false;
+    if (bounded) {
+        // A closed layer returns its stream unit once its actor stops, while
+        // its owner still holds it; the service sees its read end before the
+        // refused layer opens.
+        assert(actors[0]->close(5000) == OMNI_USD_LIVE_OK);
+        assert(calls->counts().streams == 5);
+        barrier("budget-closed");
+        reopened = open(4) == OMNI_USD_LIVE_OK;
+        actors[0].reset();
+    }
+    const auto counts = calls->counts();
+    for (auto& actor : actors)
+        if (actor) { assert(actor->close(5000) == OMNI_USD_LIVE_OK); actor.reset(); }
+    for (const auto session : sessions)
+        if (session) assert(omniUsdLiveLeaveSession(session, 5000) == OMNI_USD_LIVE_OK);
+    until([&] { return omniUsdLiveUnregisterEndpoint(endpoint, 0) == OMNI_USD_LIVE_OK; });
+    const auto snapshot = runtime->diagnostics->snapshot(0, UINT32_MAX);
+    runtime.reset(); assert(omniUsdLiveShutdown(5000) == OMNI_USD_LIVE_OK);
+    const auto list = [](const auto& values) {
+        std::string text = "[";
+        for (const auto value : values) text += (text.size() > 1 ? "," : "") + std::to_string(value);
+        return text + "]";
+    };
+    const auto records = callBudgetRecords(snapshot);
+    std::lock_guard<std::mutex> lock(finite.mutex);
+    std::cout << "{\"result\":0,\"layer_results\":" << list(opened) << ",\"join_results\":" << list(joined)
+              << ",\"retired\":" << list(retired) << ",\"finite\":" << list(finite.results)
+              << ",\"reopened\":" << (reopened ? "true" : "false")
+              << ",\"reconnected\":" << (reconnected ? "true" : "false") << ",\"peak\":" << counts.peak
+              << ",\"limit\":" << calls->limit() << ",\"records\":" << records << "}" << std::endl;
+    return 0;
+}
+// A finite request that waits for a call unit past its deadline ends
+// RESOURCE_EXHAUSTED without issuing, and a synchronous metadata caller
+// reports that result while the request's callback is still queued. With a
+// budget of 3 the call share is 2, which two Pings the service holds fill; the
+// runtime's one callback worker is held by a session callback, so no request
+// callback retires while the metadata stat expires. A ListSessions queued
+// before the stat issues once the service releases a Ping and receives its
+// whole request_timeout_ms although it waited past the stat's deadline.
+int actorCallBudgetExpiryDriver(int argc, char** argv)
+{
+    assert(argc == 7);
+    auto options = record<OmniUsdLiveRuntimeOptions>();
+    options.max_calls_per_endpoint = 3;
+    options.callback_worker_count = 1;
+    options.request_timeout_ms = 2000;
+    options.initial_open_timeout_ms = 400;
+    assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK);
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = argv[1]; endpointOptions.access_token = argv[5];
+    OmniUsdLiveEndpoint endpoint = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    auto runtime = getRuntime();
+    const auto calls = runtime->findEndpoint(endpoint)->calls;
+    const auto until = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (!predicate()) { assert(std::chrono::steady_clock::now() < deadline); std::this_thread::yield(); }
+    };
+    struct Hold {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool entered = false, released = false;
+    } hold;
+    const OmniUsdLiveSessionCallback block = [](void* user, const OmniUsdLiveSessionEvent*) {
+        auto& held = *static_cast<Hold*>(user);
+        std::unique_lock<std::mutex> lock(held.mutex);
+        if (held.entered) return;
+        held.entered = true;
+        held.changed.notify_all();
+        assert(held.changed.wait_for(lock, std::chrono::seconds(6), [&] { return held.released; }));
+    };
+    const auto uri = makeSessionUri(argv[1], argv[6]);
+    auto join = record<OmniUsdLiveJoinOptions>(); join.app_name = "budget";
+    OmniUsdLiveSession session = 0;
+    assert(omniUsdLiveJoinSession(uri.c_str(), &join, &hold, block, &session) == OMNI_USD_LIVE_OK);
+    {
+        std::unique_lock<std::mutex> lock(hold.mutex);
+        assert(hold.changed.wait_for(lock, std::chrono::seconds(6), [&] { return hold.entered; }));
+    }
+    std::vector<std::shared_ptr<Request>> pings;
+    for (unsigned i = 0; i < 2; ++i)
+        pings.push_back(submitUnary(*runtime, endpoint, rpc::PingRequest{}, UnaryCallback<rpc::PingResponse>{}, 10000));
+    budgetBarrier("expiry-held"); // The service holds both Pings.
+    struct Listed {
+        std::atomic<OmniUsdLiveResult> result{OMNI_USD_LIVE_INTERNAL_ERROR};
+        static void callback(void* self, OmniUsdLiveResult result, uint64_t, const OmniUsdLiveSessionInfo* const*) {
+            static_cast<Listed*>(self)->result.store(result);
+        }
+    } listed;
+    OmniUsdLiveRequest list = 0;
+    assert(omniUsdLiveListSessions(endpoint, "stream/base", &listed, Listed::callback, &list) == OMNI_USD_LIVE_OK);
+    until([&] { return calls->counts().waiting == 1; });
+    OmniUsdLiveLayerInfo info{};
+    info.struct_size = sizeof(info); info.abi_version = OMNI_USD_LIVE_ABI_VERSION;
+    const auto stat = statLayerMetadata(makeLayerUri(uri, "root.live"), info);
+    budgetBarrier("expiry-stat"); // The service releases the Pings and sees the ListSessions.
+    {
+        std::lock_guard<std::mutex> lock(hold.mutex);
+        hold.released = true;
+        hold.changed.notify_all();
+    }
+    assert(omniUsdLiveWait(list, 5000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveReleaseRequest(list) == OMNI_USD_LIVE_OK);
+    for (const auto& ping : pings) {
+        assert(ping->wait(5000) == OMNI_USD_LIVE_OK);
+        assert(runtime->requests->release(ping->handle) == OMNI_USD_LIVE_OK);
+    }
+    pings.clear();
+    assert(omniUsdLiveLeaveSession(session, 5000) == OMNI_USD_LIVE_OK);
+    unregisterRetired(endpoint);
+    const auto snapshot = runtime->diagnostics->snapshot(0, UINT32_MAX);
+    runtime.reset(); assert(omniUsdLiveShutdown(5000) == OMNI_USD_LIVE_OK);
+    std::cout << "{\"result\":0,\"stat\":" << stat << ",\"list\":" << listed.result.load()
+              << ",\"records\":" << callBudgetRecords(snapshot) << "}" << std::endl;
+    return 0;
+}
+// An unchained write whose first attempt ends with an unknown outcome while
+// the call share is full re-sends once a call unit is handed to it, exactly
+// once. With a budget of 3 the layer's read holds the stream share; a Ping
+// the service holds and the write fill the call share, and a ListSessions
+// queues. When the write ends unknown its unit passes to the ListSessions,
+// which the service also holds, so the re-send waits; releasing the Ping lets
+// it issue.
+int actorCallBudgetResendDriver(int argc, char** argv)
+{
+    assert(argc == 7);
+    auto options = record<OmniUsdLiveRuntimeOptions>();
+    options.max_calls_per_endpoint = 3;
+    assert(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK);
+    auto endpointOptions = record<OmniUsdLiveEndpointOptions>();
+    endpointOptions.authority = argv[1]; endpointOptions.access_token = argv[5];
+    OmniUsdLiveEndpoint endpoint = 0;
+    assert(omniUsdLiveRegisterEndpoint(&endpointOptions, &endpoint) == OMNI_USD_LIVE_OK);
+    // No timing Pings: only the capability Ping precedes the held calls.
+    auto jitter = record<OmniUsdLiveJitterParams>();
+    assert(omniUsdLiveConfigureJitterReduction(endpoint, &jitter) == OMNI_USD_LIVE_OK);
+    auto runtime = getRuntime();
+    const auto retained = runtime->findEndpoint(endpoint);
+    const auto calls = retained->calls;
+    const auto until = [](auto predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (!predicate()) { assert(std::chrono::steady_clock::now() < deadline); std::this_thread::yield(); }
+    };
+    Seen seen;
+    LayerActor::Callbacks callbacks;
+    callbacks.decode = [](const LayerReadUpdate& update) {
+        LayerActor::Decoded decoded; decoded.first = update.header.sequence_num(); return decoded;
+    };
+    callbacks.apply = [](const auto&, const auto&) {};
+    callbacks.changed = [&](const LayerProgress::Snapshot& state) {
+        std::lock_guard<std::mutex> lock(seen.mutex); seen.state = state; seen.changed.notify_all();
+    };
+    LayerActor::Options settings;
+    settings.session = argv[6]; settings.layer = "root.live"; settings.object = settings.resume = 1;
+    settings.initialState = std::make_shared<const std::string>("opaque-base");
+    auto actor = LayerActor::open(runtime, endpoint, std::move(settings), std::move(callbacks));
+    seen.wait([&] { return seen.state.gate == LayerProgress::Gate::Ready || failed(seen.state); });
+    assert(!failed(seen.state));
+    until([&] { return retained->capabilities.load() & Endpoint::kCapabilitiesKnown; });
+    budgetBarrier("resend-ready"); // The service holds later Pings and ListSessions.
+    auto ping = submitUnary(*runtime, endpoint, rpc::PingRequest{}, UnaryCallback<rpc::PingResponse>{}, 10000);
+    const auto intent = std::make_shared<const std::string>("resent-once");
+    (void)actor->submit(*intent, intent);
+    budgetBarrier("resend-write"); // The service holds the Ping and the write after committing it.
+    struct Listed {
+        std::atomic<OmniUsdLiveResult> result{OMNI_USD_LIVE_INTERNAL_ERROR};
+        static void callback(void* self, OmniUsdLiveResult result, uint64_t, const OmniUsdLiveSessionInfo* const*) {
+            static_cast<Listed*>(self)->result.store(result);
+        }
+    } listed;
+    OmniUsdLiveRequest list = 0;
+    assert(omniUsdLiveListSessions(endpoint, "base", &listed, Listed::callback, &list) == OMNI_USD_LIVE_OK);
+    until([&] { return calls->counts().waiting == 1; });
+    budgetBarrier("resend-queued"); // The write ends unknown; its unit serves the ListSessions.
+    until([&] { return calls->counts().waiting == 1; }); // The re-send waits.
+    budgetBarrier("resend-awaiting"); // The service releases the Ping and the ListSessions.
+    seen.wait([&] { return seen.state.localRetired == 1 || failed(seen.state); });
+    const auto state = seen.state;
+    assert(omniUsdLiveWait(list, 5000) == OMNI_USD_LIVE_OK);
+    assert(omniUsdLiveReleaseRequest(list) == OMNI_USD_LIVE_OK);
+    assert(ping->wait(5000) == OMNI_USD_LIVE_OK && runtime->requests->release(ping->handle) == OMNI_USD_LIVE_OK);
+    ping.reset();
+    assert(actor->close(5000) == OMNI_USD_LIVE_OK);
+    actor.reset();
+    unregisterRetired(endpoint);
+    const auto snapshot = runtime->diagnostics->snapshot(0, UINT32_MAX);
+    runtime.reset(); assert(omniUsdLiveShutdown(5000) == OMNI_USD_LIVE_OK);
+    std::cout << "{\"result\":0,\"failed\":" << (failed(state) ? "true" : "false") << ",\"layer_result\":"
+              << state.result << ",\"retired\":" << state.localRetired << ",\"list\":" << listed.result.load()
+              << ",\"records\":" << callBudgetRecords(snapshot) << "}" << std::endl;
+    return 0;
+}
 int layerActorDriver(int argc, char** argv)
 {
     if (argc > 2 && std::string(argv[2]).rfind("actor-host-fault-", 0) == 0) return actorHostFaultDriver(argc,argv);
@@ -1260,9 +1745,13 @@ int layerActorDriver(int argc, char** argv)
     if (argc > 2 && std::string(argv[2]) == "actor-buffer-emptied") return actorBufferEmptiedDriver(argc,argv);
     if (argc > 2 && std::string(argv[2]) == "actor-drop-without-close") return actorDropWithoutCloseDriver(argc,argv);
     if (argc > 2 && std::string(argv[2]) == "actor-issue-reservation") return actorIssueReservationDriver(argc,argv);
+    if (argc > 2 && std::string(argv[2]) == "actor-call-budget") return actorCallBudgetDriver(argc, argv);
+    if (argc > 2 && std::string(argv[2]) == "actor-call-budget-expiry") return actorCallBudgetExpiryDriver(argc, argv);
+    if (argc > 2 && std::string(argv[2]) == "actor-call-budget-resend") return actorCallBudgetResendDriver(argc, argv);
     if (argc > 2 && std::string(argv[2]).rfind("actor-flood-", 0) == 0) return actorFloodDriver(argc, argv);
     if (argc > 2 && std::string(argv[2]).rfind("actor-read-pause", 0) == 0)
         return actorReadPauseDriver(argc, argv);
+    if (argc > 2 && std::string(argv[2]) == "actor-read-end-queued") return actorReadEndQueuedDriver(argc, argv);
     if (argc > 2 && std::string(argv[2]).rfind("actor-read-deadline-", 0) == 0)
         return actorReadDeadlineDriver(argc, argv);
     if (argc > 2 && (std::string(argv[2]).rfind("actor-auth-server-", 0) == 0 || std::string(argv[2]) == "actor-auth-stale-generation"))
@@ -1979,6 +2468,15 @@ int layerActorDriver(int argc, char** argv)
         if (mode == "actor-jitter-fail") {
             assert(actor->failPublication(OMNI_USD_LIVE_INTERNAL_ERROR) == OMNI_USD_LIVE_OK);
             seen.wait([&] { return failed(seen.state); });
+            // A worker step can publish the failure before that worker pass ends the
+            // jitter wait, and a close begun meanwhile would resolve the hold Closed.
+            // The worker ends it Failed on its own, so close only after it has.
+            // Failure-only deadline.
+            const auto resolved = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (runtime->diagnostics->snapshot(0, 0).metrics.jitter.current) {
+                assert(std::chrono::steady_clock::now() < resolved);
+                std::this_thread::yield();
+            }
             // Close keeps both retained works.
             assert(actor->close(5000) == OMNI_USD_LIVE_OK);
             assert(actor->snapshot().applied == 1 && actor->retained().size() == 2);
@@ -2199,6 +2697,41 @@ int layerActorDriver(int argc, char** argv)
     } else {
         seen.wait([&] { return seen.state.gate == LayerProgress::Gate::Ready || failed(seen.state); });
         assert(!failed(actor->snapshot()));
+        // Writes the actor's and endpoint's auth state and every thread's stack before a watchdog of these modes fails.
+        const auto reportAuthWatchdog=[&](const char* watchdog) {
+            const auto progress=actor->snapshot();
+            const auto transport=actor->transportSnapshot();
+            const auto retained=runtime->findEndpoint(endpoint);
+            {
+                // Released before the dump, so no thread is shown waiting on a lock only this report holds.
+                std::lock_guard<std::mutex> lock(retained->mutex);
+                std::cerr << watchdog << " mode=" << mode << " wall=" << wallTimeMs()
+                    << " expiry=" << retained->expiresAtMs << " auth_failed=" << retained->authFailed
+                    << " auth_failure_serial=" << retained->authFailureSerial
+                    << " challenge=" << retained->challenge.challenge_id
+                    << " auth_deadline_remaining_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        retained->authDeadline-std::chrono::steady_clock::now()).count()
+                    << " gate=" << unsigned(progress.gate) << " result=" << progress.result
+                    << " worker_scheduled=" << transport.workerScheduled << " wake_pending=" << transport.wakePending
+                    << " read_ended=" << transport.readEnded << " queued_read_frames=" << transport.queuedReadFrames
+                    << " read_paused=" << transport.readPaused << " timing_pending=" << transport.timingPending
+                    << std::endl;
+            }
+            liveTestDumpStacks();
+        };
+        // Waits, within a failure-only watchdog, for the actor's worker to finish its scheduled pass.
+        // LIVE_TEST_EXPIRE_AUTH_IDLE_WATCHDOG expires the watchdog at once, so a test can check its report.
+        const bool expireIdleWatchdog=std::getenv("LIVE_TEST_EXPIRE_AUTH_IDLE_WATCHDOG")!=nullptr;
+        const auto awaitWorkerIdle=[&](const char* watchdog) {
+            const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+            while(expireIdleWatchdog || actor->transportSnapshot().workerScheduled) {
+                if(expireIdleWatchdog || std::chrono::steady_clock::now()>=until) {
+                    reportAuthWatchdog(watchdog);
+                    assert(!"the actor's worker stayed scheduled");
+                }
+                std::this_thread::yield();
+            }
+        };
         if (mode == "actor-auth-fail" || mode == "actor-auth-timeout" || authExpiry) {
             if(authExpiry) {
                 if(mode=="actor-auth-expiry-held") seen.wait([&] { return seen.entered; });
@@ -2222,10 +2755,7 @@ int layerActorDriver(int argc, char** argv)
                 if(mode=="actor-auth-expiry-idle") {
                     // Replacement wakes the actor: establish retirement AFTER
                     // that wake and challenge delivery, not before replacement.
-                    const auto watchdog=std::chrono::steady_clock::now()+std::chrono::seconds(3);
-                    while(actor->transportSnapshot().workerScheduled) {
-                        assert(std::chrono::steady_clock::now()<watchdog); std::this_thread::yield();
-                    }
+                    awaitWorkerIdle("auth-idle-watchdog");
                 }
                 {
                     std::lock_guard<std::mutex> lock(retained->mutex);
@@ -2238,13 +2768,8 @@ int layerActorDriver(int argc, char** argv)
                     std::lock_guard<std::mutex> lock(seen.mutex); seen.release=true; seen.changed.notify_all();
                 }
             } else {
-                // actor-auth-timeout lets a real token expire on purpose: it is the auth-watchdog probe for test-intermittent, and no correctness test runs it.
-                if (mode == "actor-auth-timeout") {
-                    const auto idleUntil = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-                    while (actor->transportSnapshot().workerScheduled) {
-                        assert(std::chrono::steady_clock::now() < idleUntil); std::this_thread::yield();
-                    }
-                }
+                // actor-auth-timeout lets a real token expire on purpose: it is the campaign's auth-watchdog probe (docs/ovlive-ci.md), and no correctness test lets its token expire.
+                if (mode == "actor-auth-timeout") awaitWorkerIdle("auth-idle-watchdog");
                 auto state = record<OmniUsdLiveAuthState>();
                 assert(omniUsdLiveGetAuthState(endpoint, &state) == OMNI_USD_LIVE_OK);
                 uint64_t generation;
@@ -2264,20 +2789,7 @@ int layerActorDriver(int argc, char** argv)
                 std::unique_lock<std::mutex> lock(seen.mutex);
                 terminalObserved=seen.changed.wait_for(lock,std::chrono::seconds(6),[&] { return failed(seen.state); });
             }
-            if(!terminalObserved) {
-                const auto progress=actor->snapshot();
-                const auto transport=actor->transportSnapshot();
-                const auto retained=runtime->findEndpoint(endpoint);
-                std::lock_guard<std::mutex> lock(retained->mutex);
-                std::cerr << "auth-terminal-watchdog mode=" << mode << " wall=" << wallTimeMs()
-                    << " expiry=" << retained->expiresAtMs << " auth_failed=" << retained->authFailed
-                    << " auth_failure_serial=" << retained->authFailureSerial
-                    << " auth_deadline_remaining_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
-                        retained->authDeadline-std::chrono::steady_clock::now()).count()
-                    << " gate=" << unsigned(progress.gate) << " result=" << progress.result
-                    << " worker_scheduled=" << transport.workerScheduled << " read_ended=" << transport.readEnded
-                    << " timing_pending=" << transport.timingPending << std::endl;
-            }
+            if(!terminalObserved) reportAuthWatchdog("auth-terminal-watchdog");
             assert(terminalObserved);
             if(authExpiry) {
                 // The active read retires without explicit close: the ordinary

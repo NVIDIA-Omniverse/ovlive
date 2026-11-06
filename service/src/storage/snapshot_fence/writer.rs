@@ -40,13 +40,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use fred::interfaces::ClientLike;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::{
-    ms_to_duration, FenceCoefficients, FenceProbe, IntentRenewVerdict, LayerSize, WriterIntent,
+    clear_intent, ms_to_duration, FenceCoefficients, FenceProbe, IntentRenewVerdict, LayerSize,
+    WriterIntent,
 };
+use crate::error::ServiceError;
+use crate::storage::client::cut_at_command_timeout;
 
 /// Reads how much of the calling RPC's deadline is left, or `None` when no
 /// deadline is in scope (a background task, a direct test call).
@@ -268,6 +272,17 @@ impl FenceWaitClock {
 /// closes the stop channel, which the task treats the same way, so the `HDEL`
 /// still runs, after the attempt is gone.
 ///
+/// The task's tail gives up within one command timeout
+/// (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`) of the stop. A stop interrupts a
+/// renew in flight, `NOSCRIPT` reload included: dropping it is a give-up, and
+/// a renew that still lands never revives a cleared intent. The tail then
+/// sends one `HDEL`, cut at that timeout, with the intent's guard disarmed
+/// first, so a failed or cut clear sends no second `HDEL` and the intent
+/// lapses at its deadline. The handle goes with its `UpdateLayer` attempt, so
+/// the stop comes by the RPC deadline at the latest; the disaster-recovery
+/// hold's after-entry bound counts the tail at one command timeout
+/// (`dr::hold::hold_write_bound`).
+///
 /// The task is tracked on the intent's client from its start
 /// (`ValkeyClient::track_fence_guard_task`), like a dropped guard's cleanup,
 /// so `ValkeyClient::quit` waits for its `HDEL` before it closes the pools:
@@ -300,7 +315,15 @@ impl IntentRenewal {
                     // A sent stop and a dropped sender both end the attempt.
                     _ = &mut stopped => break,
                     () = tokio::time::sleep(period), if renewing => {
-                        match intent.renew().await {
+                        // The stop interrupts a renew in flight: dropping it is
+                        // a give-up, and a renew that still lands never
+                        // revives a cleared intent (`snapshot_intent_renew.lua`).
+                        let renewed = tokio::select! {
+                            biased;
+                            _ = &mut stopped => break,
+                            renewed = intent.renew() => renewed,
+                        };
+                        match renewed {
                             Ok(IntentRenewVerdict::Renewed) => {}
                             Ok(IntentRenewVerdict::Lost) => {
                                 renewing = false;
@@ -321,7 +344,30 @@ impl IntentRenewal {
                     }
                 }
             }
-            if let Err(error) = (*intent).clear().await {
+            // The tail: one `HDEL`, cut at one command timeout. The guard is
+            // disarmed first, so a failed or cut clear spawns no second
+            // `HDEL`; the intent then lapses at its deadline.
+            let mut intent = intent;
+            intent.armed = false;
+            let command_timeout = intent
+                .client
+                .pool
+                .last()
+                .perf_config()
+                .default_command_timeout;
+            let cleared = cut_at_command_timeout(
+                command_timeout,
+                clear_intent(&intent.client, &intent.intent_key, &intent.token),
+            )
+            .await
+            .unwrap_or_else(|| {
+                Err(ServiceError::Unavailable(
+                    "HDEL snapshot intent cut at the Valkey command timeout \
+                     (LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS)"
+                        .to_owned(),
+                ))
+            });
+            if let Err(error) = cleared {
                 tracing::warn!(
                     error = %error,
                     "clearing a writer intent failed; the intent lapses at its deadline, so \
@@ -335,9 +381,9 @@ impl IntentRenewal {
         }
     }
 
-    /// Stop renewing and clear the intent, waiting for the `HDEL`. A failed
-    /// clear is logged by the task, not returned: the commit's outcome does
-    /// not depend on it.
+    /// Stop renewing and clear the intent, waiting for the `HDEL` (cut at one
+    /// command timeout). A failed or cut clear is logged by the task, not
+    /// returned: the commit's outcome does not depend on it.
     pub async fn clear(mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());

@@ -61,22 +61,29 @@ class LiveServiceStub(object):
     external-value release budget; nothing applied),
     CLIENT_KEEPALIVE_TIMEOUT (a JoinSession ended for client silence; see
     JoinSession), CHAIN_CHECK_UNAVAILABLE (a chained UpdateLayer whose
-    writer's latest commit could not be read; see ChainedUpdateLayerHeader)
-    and UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
-    before its commit because a dependency it needed was unavailable; nothing
-    applied). Treat an unknown reason on such an
+    writer's latest commit could not be read; see ChainedUpdateLayerHeader),
+    UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
+    before any part of its commit took effect, because a dependency it needed
+    was unavailable, or any call refused, or any JoinSession or
+    SubscribeReadLayer stream ended, by a replica that lost contact with the
+    backing store and stopped serving until it restarts; nothing applied) and
+    SERVICE_HELD (no metadata; the service is offline for disaster recovery,
+    and the message names the incident; any call refused, or any JoinSession
+    or SubscribeReadLayer stream ended, while it is; nothing applied;
+    retry_delay at least 30 s). Treat an unknown reason on such an
     UNAVAILABLE as "retry after that wait". On CreateLayer and UpdateLayer,
-    every UNAVAILABLE refused before the commit carries the detail; one a
-    server of this version answers without it comes from a write whose commit
-    had started — for example a CreateLayer refused at its commit, an
-    UpdateLayer overtaken by a later write of its client_id, or an UpdateLayer
-    refused after the server retried it internally — and its outcome is
-    unknown. During a rolling upgrade a server of an earlier version answers
-    some pre-commit refusals without the detail too; read as outcome unknown,
-    that answer is weaker but never wrong. On every other RPC an UNAVAILABLE
-    without the detail keeps its plain meaning. Recognise a nothing-applied
-    refusal by the ErrorInfo domain and reason, never by the message text.
-    This contract is that of UNAVAILABLE only.
+    every UNAVAILABLE the server knows was refused before any part of its
+    commit took effect carries the detail; one a server of this version answers
+    without it comes from a write whose commit may have taken effect — for
+    example a CreateLayer that had started replacing a layer, a CreateLayer
+    commit that may have run, an UpdateLayer overtaken by a later write of its
+    client_id, or an UpdateLayer refused after the server retried it
+    internally — and its outcome is unknown. During a rolling upgrade a server
+    of an earlier version answers some pre-commit refusals without the detail
+    too; read as outcome unknown, that answer is weaker but never wrong. On
+    every other RPC an UNAVAILABLE without the detail keeps its plain meaning.
+    Recognise a nothing-applied refusal by the ErrorInfo domain and reason,
+    never by the message text. This contract is that of UNAVAILABLE only.
 
     Chained UpdateLayer calls (UpdateLayerRequest.chained_header) add two
     refusals that carry an ErrorInfo of the same domain and no RetryInfo, and
@@ -110,6 +117,13 @@ class LiveServiceStub(object):
     carries SERVER_SHUTTING_DOWN with a retry_delay under 100 ms, since the
     server already paced the endings: reconnect, to another replica, after
     max(retry_delay, your first backoff).
+
+    Disaster-recovery hold. A hold is not a shutdown: while the service is held,
+    every replica keeps answering, ends its live JoinSession and
+    SubscribeReadLayer streams all at once, and refuses every call, each with
+    UNAVAILABLE carrying SERVICE_HELD. Retry after max(retry_delay, your own
+    backoff). A replica that loses contact with the backing store does the same
+    with UPSTREAM_UNAVAILABLE instead, until it restarts.
     """
 
     def __init__(self, channel):
@@ -191,22 +205,29 @@ class LiveServiceServicer(object):
     external-value release budget; nothing applied),
     CLIENT_KEEPALIVE_TIMEOUT (a JoinSession ended for client silence; see
     JoinSession), CHAIN_CHECK_UNAVAILABLE (a chained UpdateLayer whose
-    writer's latest commit could not be read; see ChainedUpdateLayerHeader)
-    and UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
-    before its commit because a dependency it needed was unavailable; nothing
-    applied). Treat an unknown reason on such an
+    writer's latest commit could not be read; see ChainedUpdateLayerHeader),
+    UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
+    before any part of its commit took effect, because a dependency it needed
+    was unavailable, or any call refused, or any JoinSession or
+    SubscribeReadLayer stream ended, by a replica that lost contact with the
+    backing store and stopped serving until it restarts; nothing applied) and
+    SERVICE_HELD (no metadata; the service is offline for disaster recovery,
+    and the message names the incident; any call refused, or any JoinSession
+    or SubscribeReadLayer stream ended, while it is; nothing applied;
+    retry_delay at least 30 s). Treat an unknown reason on such an
     UNAVAILABLE as "retry after that wait". On CreateLayer and UpdateLayer,
-    every UNAVAILABLE refused before the commit carries the detail; one a
-    server of this version answers without it comes from a write whose commit
-    had started — for example a CreateLayer refused at its commit, an
-    UpdateLayer overtaken by a later write of its client_id, or an UpdateLayer
-    refused after the server retried it internally — and its outcome is
-    unknown. During a rolling upgrade a server of an earlier version answers
-    some pre-commit refusals without the detail too; read as outcome unknown,
-    that answer is weaker but never wrong. On every other RPC an UNAVAILABLE
-    without the detail keeps its plain meaning. Recognise a nothing-applied
-    refusal by the ErrorInfo domain and reason, never by the message text.
-    This contract is that of UNAVAILABLE only.
+    every UNAVAILABLE the server knows was refused before any part of its
+    commit took effect carries the detail; one a server of this version answers
+    without it comes from a write whose commit may have taken effect — for
+    example a CreateLayer that had started replacing a layer, a CreateLayer
+    commit that may have run, an UpdateLayer overtaken by a later write of its
+    client_id, or an UpdateLayer refused after the server retried it
+    internally — and its outcome is unknown. During a rolling upgrade a server
+    of an earlier version answers some pre-commit refusals without the detail
+    too; read as outcome unknown, that answer is weaker but never wrong. On
+    every other RPC an UNAVAILABLE without the detail keeps its plain meaning.
+    Recognise a nothing-applied refusal by the ErrorInfo domain and reason,
+    never by the message text. This contract is that of UNAVAILABLE only.
 
     Chained UpdateLayer calls (UpdateLayerRequest.chained_header) add two
     refusals that carry an ErrorInfo of the same domain and no RetryInfo, and
@@ -240,6 +261,13 @@ class LiveServiceServicer(object):
     carries SERVER_SHUTTING_DOWN with a retry_delay under 100 ms, since the
     server already paced the endings: reconnect, to another replica, after
     max(retry_delay, your first backoff).
+
+    Disaster-recovery hold. A hold is not a shutdown: while the service is held,
+    every replica keeps answering, ends its live JoinSession and
+    SubscribeReadLayer streams all at once, and refuses every call, each with
+    UNAVAILABLE carrying SERVICE_HELD. Retry after max(retry_delay, your own
+    backoff). A replica that loses contact with the backing store does the same
+    with UPSTREAM_UNAVAILABLE instead, until it restarts.
     """
 
     def CreateSession(self, request, context):
@@ -338,6 +366,14 @@ class LiveServiceServicer(object):
         smaller deltas, creating the layer with the first and adding the rest
         with UpdateLayer; on CHILDREN_LIST_TOO_LONG, name at most 100,000
         children in one ReorderChildren.
+        Content that leaves the layer with no section, field or time sample,
+        including a header with no chunks, creates the layer holding only its
+        root section (section_id 1, parent_id 0, empty name, section_type 7).
+        Readers receive that section in catch-up, and a later CreateSection of
+        section_id 1 is refused INVALID_ARGUMENT as a duplicate; build under
+        section 1 instead. Content that leaves sections, fields or
+        time samples but no section whose parent_id is 0 is refused
+        INVALID_ARGUMENT, with nothing created.
         Every call that commits allocates a new object_id, even on overwrite of an
         existing layer; the old object_id is retired and the sequence number
         resets to 1 for the new object. Server responds with the new object_id.
@@ -407,6 +443,8 @@ class LiveServiceServicer(object):
         refusals), applying nothing. On DELTA_TOO_LARGE, send the content as
         several smaller UpdateLayers; on CHILDREN_LIST_TOO_LONG, name at most
         100,000 children in one ReorderChildren.
+        A delta that would remove the layer's last section whose parent_id is 0
+        is refused INVALID_ARGUMENT, applying nothing.
         Server responds with sequence_num and server timestamp.
         A request without an operation_id carries no idempotency key: re-sending
         one whose response was lost may apply the update again. A re-send that
@@ -565,22 +603,29 @@ class LiveService(object):
     external-value release budget; nothing applied),
     CLIENT_KEEPALIVE_TIMEOUT (a JoinSession ended for client silence; see
     JoinSession), CHAIN_CHECK_UNAVAILABLE (a chained UpdateLayer whose
-    writer's latest commit could not be read; see ChainedUpdateLayerHeader)
-    and UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
-    before its commit because a dependency it needed was unavailable; nothing
-    applied). Treat an unknown reason on such an
+    writer's latest commit could not be read; see ChainedUpdateLayerHeader),
+    UPSTREAM_UNAVAILABLE (no metadata; a CreateLayer or UpdateLayer refused
+    before any part of its commit took effect, because a dependency it needed
+    was unavailable, or any call refused, or any JoinSession or
+    SubscribeReadLayer stream ended, by a replica that lost contact with the
+    backing store and stopped serving until it restarts; nothing applied) and
+    SERVICE_HELD (no metadata; the service is offline for disaster recovery,
+    and the message names the incident; any call refused, or any JoinSession
+    or SubscribeReadLayer stream ended, while it is; nothing applied;
+    retry_delay at least 30 s). Treat an unknown reason on such an
     UNAVAILABLE as "retry after that wait". On CreateLayer and UpdateLayer,
-    every UNAVAILABLE refused before the commit carries the detail; one a
-    server of this version answers without it comes from a write whose commit
-    had started — for example a CreateLayer refused at its commit, an
-    UpdateLayer overtaken by a later write of its client_id, or an UpdateLayer
-    refused after the server retried it internally — and its outcome is
-    unknown. During a rolling upgrade a server of an earlier version answers
-    some pre-commit refusals without the detail too; read as outcome unknown,
-    that answer is weaker but never wrong. On every other RPC an UNAVAILABLE
-    without the detail keeps its plain meaning. Recognise a nothing-applied
-    refusal by the ErrorInfo domain and reason, never by the message text.
-    This contract is that of UNAVAILABLE only.
+    every UNAVAILABLE the server knows was refused before any part of its
+    commit took effect carries the detail; one a server of this version answers
+    without it comes from a write whose commit may have taken effect — for
+    example a CreateLayer that had started replacing a layer, a CreateLayer
+    commit that may have run, an UpdateLayer overtaken by a later write of its
+    client_id, or an UpdateLayer refused after the server retried it
+    internally — and its outcome is unknown. During a rolling upgrade a server
+    of an earlier version answers some pre-commit refusals without the detail
+    too; read as outcome unknown, that answer is weaker but never wrong. On
+    every other RPC an UNAVAILABLE without the detail keeps its plain meaning.
+    Recognise a nothing-applied refusal by the ErrorInfo domain and reason,
+    never by the message text. This contract is that of UNAVAILABLE only.
 
     Chained UpdateLayer calls (UpdateLayerRequest.chained_header) add two
     refusals that carry an ErrorInfo of the same domain and no RetryInfo, and
@@ -614,6 +659,13 @@ class LiveService(object):
     carries SERVER_SHUTTING_DOWN with a retry_delay under 100 ms, since the
     server already paced the endings: reconnect, to another replica, after
     max(retry_delay, your first backoff).
+
+    Disaster-recovery hold. A hold is not a shutdown: while the service is held,
+    every replica keeps answering, ends its live JoinSession and
+    SubscribeReadLayer streams all at once, and refuses every call, each with
+    UNAVAILABLE carrying SERVICE_HELD. Retry after max(retry_delay, your own
+    backoff). A replica that loses contact with the backing store does the same
+    with UPSTREAM_UNAVAILABLE instead, until it restarts.
     """
 
     @staticmethod

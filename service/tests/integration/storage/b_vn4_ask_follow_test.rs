@@ -46,28 +46,26 @@
 //!
 //! # The two-node `-ASK` facade
 //!
-//! Three [`ScriptReplyProxy`]s in front of the one standalone test store,
-//! each answering fred's cluster discovery (`CLUSTER SLOTS`: node A owns slots
-//! `[0, SPLIT)`, node B owns `[SPLIT, 16384)`; `CLUSTER INFO`:
-//! `cluster_state:ok`), so a client connected with a `redis-cluster://` URL
-//! holds one connection to A and one to B per pooled client and runs fred's
-//! clustered router against the real store. Node C is listed nowhere: a node
-//! that owns no slot yet, as in a scale-out.
-//!
-//! A answers `-ASK <slot> <target>` to EVERY frame naming the trapped key, on
-//! every attempt, as a migrating slot's source does for a key it no longer
-//! holds. The target (B or C) answers `ASKING` with `+OK` itself (the store
-//! is not a cluster node, and would refuse it), relays everything else to the
-//! store, and records every frame it receives with the connection it came on,
-//! in arrival order. B can also hold the replies behind one marked `GET`
-//! ([`ReplyGate`]), so a command is still in flight on B's connection when
-//! the redirect lands, or drop its connection on an `ASKING`. A counts any
-//! `ASKING` it receives, records every frame it answers `-ASK`, and can hold
-//! its `-ASK` behind a gate. C can refuse the setup exchange of a connection
-//! opened to it ([`SetupFault`]): its `PING` answered `-NOAUTH` or
-//! `-LOADING`, or its `CLUSTER INFO` answered `cluster_state:fail`, each in
-//! the text Valkey 9.0.3 sends. A fourth node, [`SilentNode`], accepts
-//! connections and never answers.
+//! [`AskFacade`], in `cluster_facade_support` (whose module docs describe it
+//! in full), shared with `b_myh_redirect_frame_test`: three
+//! `ScriptReplyProxy`s in front of the one standalone test store, node A
+//! owning slots `[0, SPLIT)` and node B `[SPLIT, 16384)`, so a client
+//! connected with a `redis-cluster://` URL runs fred's clustered router
+//! against the real store. Node C is listed nowhere: a node that owns no slot
+//! yet, as in a scale-out. Every test here traps a key with the facade's
+//! default shape: A answers `-ASK <slot> <target>` as an error reply to EVERY
+//! frame naming it, on every attempt, as a migrating slot's source does for a
+//! key it no longer holds. The target (B or C) answers `ASKING` with `+OK`
+//! itself, relays everything else to the store, and records every frame it
+//! receives with the connection it came on, in arrival order. B can also hold
+//! the replies behind one marked `GET` ([`ReplyGate`]), so a command is still
+//! in flight on B's connection when the redirect lands, or drop its connection
+//! on an `ASKING`. A counts any `ASKING` it receives, records every frame it
+//! answers `-ASK`, and can hold its `-ASK` behind a gate. C can refuse the
+//! setup exchange of a connection opened to it ([`SetupFault`]): its `PING`
+//! answered `-NOAUTH` or `-LOADING`, or its `CLUSTER INFO` answered
+//! `cluster_state:fail`, each in the text Valkey 9.0.3 sends. A fourth node,
+//! `SilentNode`, accepts connections and never answers.
 //!
 //! | Test | Item | What it pins |
 //! |---|---|---|
@@ -133,8 +131,9 @@
 //!
 //! # Wait budget
 //!
-//! [`CONNECT_BUDGET`] (30 s) on the one client a test connects, then each
-//! awaited command or bounded wait under [`SETTLE`] (10 s). Worst cases: (a),
+//! `CONNECT_BUDGET` (30 s, `cluster_facade_support`) on the one client a test
+//! connects, then each awaited command or bounded wait under [`SETTLE`]
+//! (10 s). Worst cases: (a),
 //! (c), (e), (h) 40 s; (i) 60 s (three commands); (d) 70 s (the held
 //! command's arrival, the redirect's landing, then the two replies); (e′) 70 s
 //! (the silent node's accept, the command beside the connect, the redirected
@@ -149,8 +148,8 @@
 //! twice, and (i), which waits out its `GET`'s 1 s timeout, both by
 //! construction.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fred::interfaces::{
@@ -176,47 +175,20 @@ use live_edit::storage::lua::UPDATE_LAYER_COMMIT_MAX_ATTEMPTS;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::{compact_snapshot, TestValkey};
 
-use crate::storage::snapshot_read_support::{
-    error_reply_script, read_atomic, read_err, test_valkey_addr, ConnProxyRule, ProxyAction,
-    ReplyGate, ScriptReplyProxy,
+use crate::storage::cluster_facade_support::{
+    answered, assert_no_router_restart, hooked, key_on, settle, store_directly, value, AskFacade,
+    Received, SetupFault, Target, LOADING_REPLY, NOAUTH_REPLY, SETTLE, SPLIT,
 };
+use crate::storage::snapshot_read_support::{read_atomic, read_err, ReplyGate};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Budgets and constants
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Bound on connecting one client.
-const CONNECT_BUDGET: Duration = Duration::from_secs(30);
-
-/// Upper bound on each awaited command or read. A deadline, not a speed
-/// claim: the healthy path takes milliseconds. A redirect that is never
-/// answered fails here instead of at the hang-killer.
-const SETTLE: Duration = Duration::from_secs(10);
-
-/// Slots below this are A's, the rest B's.
-const SPLIT: u16 = 8192;
-
 /// Upper bound on layers created while looking for one whose slot A owns.
 /// Each try lands there with even odds; the bound turns an impossible search
 /// into a failure instead of a hang.
 const MAX_LAYERS_PER_SEARCH: usize = 64;
-
-/// The node ids the facade's `CLUSTER SLOTS` reply names.
-const NODE_A_ID: &str = "b0vn40000000000000000000000000000000aaa0";
-const NODE_B_ID: &str = "b0vn40000000000000000000000000000000bbb0";
-
-/// `live_edit_valkey_router_restarts_total`.
-const ROUTER_RESTARTS: &str = "live_edit_valkey_router_restarts_total";
-
-/// Every `pool` label, restated (`VALKEY_POOLS`).
-const POOLS: [&str; 6] = [
-    "subscriber",
-    "data",
-    "txn",
-    "subscriber_pool",
-    "maintenance",
-    "snapshot",
-];
 
 /// The value stored at the trapped key: what the redirected command must
 /// return.
@@ -225,414 +197,13 @@ const ASKED_VALUE: &str = "bvn4-asked-value";
 /// The value stored at the key of the command held in flight on B.
 const IN_FLIGHT_VALUE: &str = "bvn4-in-flight-value";
 
-// ═════════════════════════════════════════════════════════════════════════════
-// The facade
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Where A's `-ASK` sends the trapped key's commands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Target {
-    /// B, a primary the client already holds a connection to.
-    B,
-    /// C, a node no `CLUSTER SLOTS` reply names.
-    C,
-    /// A node no `CLUSTER SLOTS` reply names that accepts a connection and
-    /// never answers on it ([`SilentNode`]).
-    Silent,
-}
-
-/// A listener that accepts every connection and never writes a byte on it,
-/// holding each one open: a connect to it succeeds, and the connection's setup
-/// exchange then never completes. Unlike a refused or reset connect, which
-/// fails at once, it is only ever ended by a timeout.
-struct SilentNode {
-    port: u16,
-    /// Connections accepted so far.
-    accepted: Arc<AtomicUsize>,
-    accept: tokio::task::JoinHandle<()>,
-}
-
-impl SilentNode {
-    async fn start() -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the silent listener must bind");
-        let port = listener
-            .local_addr()
-            .expect("the silent listener has an address")
-            .port();
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&accepted);
-        let accept = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                counted.fetch_add(1, Ordering::SeqCst);
-                held.push(stream);
-            }
-        });
-        Self {
-            port,
-            accepted,
-            accept,
-        }
-    }
-
-    fn accepted(&self) -> usize {
-        self.accepted.load(Ordering::SeqCst)
-    }
-}
-
-impl Drop for SilentNode {
-    fn drop(&mut self) {
-        self.accept.abort();
-    }
-}
-
-/// One frame a target node received: the client connection it came on (the
-/// proxy's accept order) and its arguments.
-#[derive(Clone, Debug)]
-struct Received {
-    conn: usize,
-    args: Vec<String>,
-}
-
-impl Received {
-    fn is(&self, name: &str) -> bool {
-        self.args
-            .first()
-            .is_some_and(|a| a.eq_ignore_ascii_case(name))
-    }
-
-    fn names(&self, key: &str) -> bool {
-        self.args[1..].iter().any(|a| a == key)
-    }
-}
-
-type Log = Arc<Mutex<Vec<Received>>>;
-
-/// How C refuses the setup exchange of a connection opened to it, as a real
-/// node does while it is not ready to serve one ([`AskFacade::refuse_setup_on_c`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SetupFault {
-    /// `PING` answered `-NOAUTH`, a node that requires a password the client
-    /// does not send ([`NOAUTH_REPLY`]).
-    NoAuth,
-    /// `CLUSTER INFO` answered `cluster_state:fail`, a node still joining the
-    /// cluster.
-    ClusterStateFail,
-    /// `PING` answered `-LOADING`, a node replaying its dataset
-    /// ([`LOADING_REPLY`]).
-    Loading,
-}
-
-/// Valkey 9.0.3's reply to a command other than `AUTH` / `HELLO` on a
-/// connection that has not authenticated (`server.c`, `shared.noautherr`).
-const NOAUTH_REPLY: &str = "NOAUTH Authentication required.";
-
-/// Valkey 9.0.3's reply to a command without the `loading` flag, `PING`
-/// among them, while the node loads its dataset (`server.c`,
-/// `shared.loadingerr`).
-const LOADING_REPLY: &str = "LOADING Valkey is loading the dataset in memory";
-
 /// fred's text for a connection whose `CLUSTER INFO` does not report
 /// `cluster_state:ok` (`src/protocol/connection.rs:615`).
 const CLUSTER_STATE_INVALID: &str = "Invalid or missing cluster state.";
 
-/// See the module docs.
-struct AskFacade {
-    _a: ScriptReplyProxy,
-    _b: ScriptReplyProxy,
-    _c: ScriptReplyProxy,
-    silent: SilentNode,
-    port_a: u16,
-    port_c: u16,
-    /// The key A answers `-ASK` for, and the node it names.
-    trap: Arc<Mutex<Option<(String, Target)>>>,
-    /// Frames naming the trapped key that reached A: each one write.
-    a_writes: Arc<AtomicUsize>,
-    /// Those frames themselves, in arrival order.
-    a_log: Log,
-    /// When set, C refuses each connection's setup exchange this way.
-    c_setup_fault: Arc<Mutex<Option<SetupFault>>>,
-    /// Setup commands C has refused: one per connection opened to it.
-    c_setup_refusals: Arc<AtomicUsize>,
-    /// `ASKING` frames that reached A. A is never an `-ASK` target here, so
-    /// one is an `ASKING` routed by its slot (a replay) instead of followed.
-    a_askings: Arc<AtomicUsize>,
-    /// When set, A holds each `-ASK` back until the gate opens
-    /// ([`ProxyAction::GatedEval`]).
-    ask_gate: Arc<Mutex<Option<ReplyGate>>>,
-    b_log: Log,
-    c_log: Log,
-    /// The key whose next `GET` on B is forwarded with every reply on its
-    /// connection held behind the gate ([`ProxyAction::HoldReplies`]).
-    hold_on_b: Arc<Mutex<Option<(String, ReplyGate)>>>,
-    /// Set once B's rule has matched that `GET`: it is on B's wire.
-    held_on_b: Arc<AtomicUsize>,
-    /// When armed, B drops the connection in place of the next `ASKING` it
-    /// receives ([`ProxyAction::Close`]), with that `ASKING` and the command
-    /// behind it still in flight.
-    close_on_b_asking: Arc<AtomicBool>,
-    /// `ASKING` frames B dropped its connection on.
-    closed_on_b: Arc<AtomicUsize>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Node {
-    A,
-    B,
-    C,
-}
-
-impl AskFacade {
-    async fn start() -> Self {
-        let ports: Arc<OnceLock<(u16, u16, u16, u16)>> = Arc::new(OnceLock::new());
-        let trap: Arc<Mutex<Option<(String, Target)>>> = Arc::new(Mutex::new(None));
-        let a_writes = Arc::new(AtomicUsize::new(0));
-        let a_askings = Arc::new(AtomicUsize::new(0));
-        let a_log: Log = Arc::default();
-        let ask_gate: Arc<Mutex<Option<ReplyGate>>> = Arc::default();
-        let b_log: Log = Arc::default();
-        let c_log: Log = Arc::default();
-        let c_setup_fault: Arc<Mutex<Option<SetupFault>>> = Arc::default();
-        let c_setup_refusals = Arc::new(AtomicUsize::new(0));
-        let hold_on_b: Arc<Mutex<Option<(String, ReplyGate)>>> = Arc::default();
-        let held_on_b = Arc::new(AtomicUsize::new(0));
-        let close_on_b_asking = Arc::new(AtomicBool::new(false));
-        let closed_on_b = Arc::new(AtomicUsize::new(0));
-        let rule = |me: Node| -> ConnProxyRule {
-            let (ports, trap, a_writes) =
-                (Arc::clone(&ports), Arc::clone(&trap), Arc::clone(&a_writes));
-            let (a_askings, ask_gate) = (Arc::clone(&a_askings), Arc::clone(&ask_gate));
-            let a_log = Arc::clone(&a_log);
-            let (c_setup_fault, c_setup_refusals) =
-                (Arc::clone(&c_setup_fault), Arc::clone(&c_setup_refusals));
-            let (close_on_b_asking, closed_on_b) =
-                (Arc::clone(&close_on_b_asking), Arc::clone(&closed_on_b));
-            let log = match me {
-                Node::A => None,
-                Node::B => Some(Arc::clone(&b_log)),
-                Node::C => Some(Arc::clone(&c_log)),
-            };
-            let (hold_on_b, held_on_b) = (Arc::clone(&hold_on_b), Arc::clone(&held_on_b));
-            Arc::new(move |conn: usize, args: &[Vec<u8>]| {
-                let (port_a, port_b, port_c, port_silent) = *ports
-                    .get()
-                    .expect("the ports are recorded before any client connects");
-                let name = args.first()?.to_ascii_uppercase();
-                if me == Node::C {
-                    let fault = *c_setup_fault.lock().expect("never poisoned");
-                    let is_cluster_info = name == b"CLUSTER"
-                        && args
-                            .get(1)
-                            .is_some_and(|sub| sub.eq_ignore_ascii_case(b"INFO"));
-                    let refusal = match fault {
-                        Some(SetupFault::NoAuth) if name == b"PING" => {
-                            Some(error_reply_script(NOAUTH_REPLY))
-                        }
-                        Some(SetupFault::Loading) if name == b"PING" => {
-                            Some(error_reply_script(LOADING_REPLY))
-                        }
-                        Some(SetupFault::ClusterStateFail) if is_cluster_info => Some(
-                            "return 'cluster_state:fail\\r\\ncluster_slots_assigned:16384\\r\\n\
-                             cluster_known_nodes:3\\r\\ncluster_size:2\\r\\n'"
-                                .to_owned(),
-                        ),
-                        _ => None,
-                    };
-                    if let Some(script) = refusal {
-                        c_setup_refusals.fetch_add(1, Ordering::SeqCst);
-                        return Some(ProxyAction::Eval(script));
-                    }
-                }
-                if name == b"CLUSTER" {
-                    return match args.get(1)?.to_ascii_uppercase().as_slice() {
-                        b"SLOTS" => Some(ProxyAction::Eval(format!(
-                            "return {{{{0, {}, {{'127.0.0.1', {port_a}, '{NODE_A_ID}'}}}}, \
-                             {{{SPLIT}, 16383, {{'127.0.0.1', {port_b}, '{NODE_B_ID}'}}}}}}",
-                            SPLIT - 1
-                        ))),
-                        b"INFO" => Some(ProxyAction::Eval(
-                            "return 'cluster_state:ok\\r\\ncluster_slots_assigned:16384\\r\\n\
-                             cluster_known_nodes:2\\r\\ncluster_size:2\\r\\n'"
-                                .to_owned(),
-                        )),
-                        _ => None,
-                    };
-                }
-                if me == Node::A {
-                    if name == b"ASKING" {
-                        a_askings.fetch_add(1, Ordering::SeqCst);
-                        return Some(ProxyAction::Eval(
-                            "return redis.status_reply('OK')".to_owned(),
-                        ));
-                    }
-                    let trap = trap.lock().expect("never poisoned");
-                    let (key, target) = trap.as_ref()?;
-                    if !args[1..].iter().any(|a| a == key.as_bytes()) {
-                        return None;
-                    }
-                    a_writes.fetch_add(1, Ordering::SeqCst);
-                    a_log.lock().expect("never poisoned").push(Received {
-                        conn,
-                        args: args
-                            .iter()
-                            .map(|a| String::from_utf8_lossy(a).into_owned())
-                            .collect(),
-                    });
-                    let slot = fred::util::redis_keyslot(key.as_bytes());
-                    let port = match target {
-                        Target::B => port_b,
-                        Target::C => port_c,
-                        Target::Silent => port_silent,
-                    };
-                    let ask = error_reply_script(&format!("ASK {slot} 127.0.0.1:{port}"));
-                    return Some(match ask_gate.lock().expect("never poisoned").as_ref() {
-                        Some(gate) => ProxyAction::GatedEval(gate.clone(), ask),
-                        None => ProxyAction::Eval(ask),
-                    });
-                }
-                let log = log.as_ref().expect("B and C keep a log");
-                log.lock().expect("never poisoned").push(Received {
-                    conn,
-                    args: args
-                        .iter()
-                        .map(|a| String::from_utf8_lossy(a).into_owned())
-                        .collect(),
-                });
-                if name == b"ASKING" {
-                    if me == Node::B && close_on_b_asking.swap(false, Ordering::SeqCst) {
-                        closed_on_b.fetch_add(1, Ordering::SeqCst);
-                        return Some(ProxyAction::Close);
-                    }
-                    // The store is not a cluster node and would refuse it.
-                    return Some(ProxyAction::Eval(
-                        "return redis.status_reply('OK')".to_owned(),
-                    ));
-                }
-                if me == Node::B && name == b"GET" {
-                    let held = hold_on_b.lock().expect("never poisoned");
-                    if let Some((key, gate)) = held.as_ref() {
-                        if args.get(1).is_some_and(|a| a == key.as_bytes()) {
-                            held_on_b.fetch_add(1, Ordering::SeqCst);
-                            return Some(ProxyAction::HoldReplies(gate.clone()));
-                        }
-                    }
-                }
-                None
-            })
-        };
-        let a = ScriptReplyProxy::start_per_connection(test_valkey_addr(), rule(Node::A)).await;
-        let b = ScriptReplyProxy::start_per_connection(test_valkey_addr(), rule(Node::B)).await;
-        let c = ScriptReplyProxy::start_per_connection(test_valkey_addr(), rule(Node::C)).await;
-        let silent = SilentNode::start().await;
-        let (port_a, port_c) = (a.port(), c.port());
-        ports
-            .set((port_a, b.port(), port_c, silent.port))
-            .expect("the ports are recorded once");
-        Self {
-            _a: a,
-            _b: b,
-            _c: c,
-            silent,
-            port_a,
-            port_c,
-            trap,
-            a_writes,
-            a_log,
-            c_setup_fault,
-            c_setup_refusals,
-            a_askings,
-            ask_gate,
-            b_log,
-            c_log,
-            hold_on_b,
-            held_on_b,
-            close_on_b_asking,
-            closed_on_b,
-        }
-    }
-
-    /// A [`TestValkey`] connected through A in cluster mode, with a
-    /// `pool_size` data pool. The proxies select `TEST_VALKEY_URL`'s database,
-    /// so the fixture shares it.
-    async fn test_valkey(&self, pool_size: u32) -> TestValkey {
-        let tv = tokio::time::timeout(
-            CONNECT_BUDGET,
-            TestValkey::setup_with_url(
-                format!("redis-cluster://127.0.0.1:{}", self.port_a),
-                pool_size,
-            ),
-        )
-        .await
-        .expect("a client must connect through the cluster facade");
-        assert!(
-            tv.client().pool.next().is_clustered(),
-            "fixture self-check: the facade is read as a cluster"
-        );
-        tv
-    }
-
-    /// From now on A answers every frame naming `key` with `-ASK` to `target`.
-    fn trap(&self, key: &str, target: Target) {
-        *self.trap.lock().expect("never poisoned") = Some((key.to_owned(), target));
-    }
-
-    /// Stop answering `-ASK`, so the fixture's drop-time cleanup reaches the
-    /// trapped key by its slot.
-    fn disarm(&self) {
-        *self.trap.lock().expect("never poisoned") = None;
-    }
-
-    fn a_writes(&self) -> usize {
-        self.a_writes.load(Ordering::SeqCst)
-    }
-
-    /// The frames A answered `-ASK`, in arrival order.
-    fn a_log(&self) -> Vec<Received> {
-        self.a_log.lock().expect("never poisoned").clone()
-    }
-
-    /// From now on C refuses each connection's setup exchange as `fault` says.
-    fn refuse_setup_on_c(&self, fault: SetupFault) {
-        *self.c_setup_fault.lock().expect("never poisoned") = Some(fault);
-    }
-
-    fn c_setup_refusals(&self) -> usize {
-        self.c_setup_refusals.load(Ordering::SeqCst)
-    }
-
-    fn log(&self, target: Target) -> Vec<Received> {
-        match target {
-            Target::B => &self.b_log,
-            Target::C => &self.c_log,
-            Target::Silent => panic!("the silent node reads no frame, so it keeps no log"),
-        }
-        .lock()
-        .expect("never poisoned")
-        .clone()
-    }
-}
-
-/// The first key `<prefix>bvn4-<what>-<i>` whose slot `on_a` says A owns (or,
-/// with `on_a` false, B owns).
-fn key_on(tv: &TestValkey, what: &str, on_a: bool) -> String {
-    (0..)
-        .map(|i| format!("{}bvn4-{what}-{i}", tv.prefix()))
-        .find(|key| (fred::util::redis_keyslot(key.as_bytes()) < SPLIT) == on_a)
-        .expect("keys hash to both halves of the slot space")
-}
-
-/// `key`'s value written straight to the store, past the facade: a write
-/// through the facade to a trapped key would be redirected itself.
-async fn store_directly(direct: &TestValkey, key: &str, value: &str) {
-    direct
-        .client()
-        .pool
-        .set::<(), _, _>(key, value, None, None, false)
-        .await
-        .expect("SET straight to the store must succeed");
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// Checks on the facade's records
+// ═════════════════════════════════════════════════════════════════════════════
 
 /// The frames `log` holds that name `key`, each with the frame received
 /// right before it on the same connection.
@@ -674,26 +245,6 @@ fn assert_each_right_behind_asking(facade: &AskFacade, target: Target, key: &str
     }
 }
 
-fn restarts_row(metrics: &Metrics) -> Vec<(&'static str, u64)> {
-    let text = render(metrics);
-    POOLS
-        .iter()
-        .map(|pool| {
-            let n = sample_value(&text, ROUTER_RESTARTS, &[("pool", pool)])
-                .unwrap_or_else(|| panic!("{ROUTER_RESTARTS}{{pool={pool:?}}} is seeded"));
-            (*pool, n as u64)
-        })
-        .collect()
-}
-
-fn assert_no_router_restart(metrics: &Metrics) {
-    assert_eq!(
-        restarts_row(metrics),
-        POOLS.iter().map(|p| (*p, 0)).collect::<Vec<_>>(),
-        "following an -ASK must not end any router: no restart may be counted"
-    );
-}
-
 fn data_reconnects(metrics: &Metrics) -> u64 {
     sample_value(
         &render(metrics),
@@ -701,30 +252,6 @@ fn data_reconnects(metrics: &Metrics) -> u64 {
         &[("pool", "data")],
     )
     .expect("valkey_reconnects_total{pool=\"data\"} is seeded") as u64
-}
-
-async fn hooked(tv: &TestValkey) -> Arc<Metrics> {
-    let metrics = Arc::new(crate::common::metrics_scrape_only("test"));
-    tv.client()
-        .install_observability_hooks(Arc::clone(&metrics))
-        .await;
-    metrics
-}
-
-/// A `GET`'s answer, its error as text, to compare against [`value`].
-fn answered(got: Result<Option<String>, fred::error::Error>) -> Result<Option<String>, String> {
-    got.map_err(|e| e.to_string())
-}
-
-/// The answer of a `GET` that read `stored`.
-fn value(stored: &str) -> Result<Option<String>, String> {
-    Ok(Some(stored.to_owned()))
-}
-
-async fn settle<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
-    tokio::time::timeout(SETTLE, fut)
-        .await
-        .unwrap_or_else(|_| panic!("{what} did not settle within {SETTLE:?}"))
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -989,7 +516,8 @@ async fn an_ask_to_a_node_that_owns_no_slot_is_followed_through_a_connection_ope
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// An `-ASK` naming a node that accepts the connection and never answers
-/// ([`SilentNode`]): the on-demand connection to it is cut at
+/// ([`SilentNode`](crate::storage::cluster_facade_support::SilentNode)): the
+/// on-demand connection to it is cut at
 /// [`ASK_TARGET_CONNECT_CAP`] (2 s), not at the client's own 30 s connection
 /// timeout. The redirected command fails transiently — `IO`, "Failed
 /// connecting to ASK target <node>" — no sooner than the cap; a command
@@ -1198,7 +726,8 @@ async fn an_asking_in_flight_when_the_targets_connection_drops_is_not_replayed_t
 /// passes falsely.
 const TIMED_OUT_GET_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A holds its `-ASK` behind a gate ([`ProxyAction::GatedEval`]) until the
+/// A holds its `-ASK` behind a gate
+/// ([`ProxyAction::GatedEval`](crate::storage::snapshot_read_support::ProxyAction::GatedEval)) until the
 /// `GET`'s caller has received `Timeout`: fred marks the command timed out in
 /// the caller's task before it returns that error, so when the gate then
 /// opens and the redirect reaches the router, the `GET` has been given up

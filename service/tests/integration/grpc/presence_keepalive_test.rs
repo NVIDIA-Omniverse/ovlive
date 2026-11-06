@@ -837,8 +837,11 @@ async fn keepalive_join_served_through_the_production_stack_is_armed_by_its_wire
         let server = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
             let _ = ready_tx.send(());
-            production_server_builder()
-                .add_service(live_service_server(svc))
+            production_server_builder(svc.upload_admission.max_waiters())
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .serve_with_incoming(incoming)
                 .await
                 .expect("test server error");

@@ -314,7 +314,8 @@ void ownedStorageRetirement() {
         ~Payload() { if(state && state->armed) { state->called=true; try { state->action(); } catch(...) { state->failed=true; } } }
     };
     const SdfPath path("/P"),after("/AfterRetirement"); const TfToken field("retiring");
-    for(unsigned operation=0;operation!=3;++operation) {
+    // Operations 3 and 4 replace and erase a time sample that holds the payload.
+    for(unsigned operation=0;operation!=5;++operation) {
         const auto owned=TfCreateRefPtr(new HostSceneStorage);
         owned->CreateSpec(path,SdfSpecTypePrim);
         const auto replacement=TfCreateRefPtr(new HostSceneStorage); replacement->CreateSpec(path,SdfSpecTypePrim);
@@ -322,9 +323,16 @@ void ownedStorageRetirement() {
         const auto state=std::make_shared<CallbackState>();
         struct Disarm { std::shared_ptr<CallbackState> state; ~Disarm() { state->armed=false; } } disarm{state};
         auto payload=std::make_shared<Payload>(); payload->state=state;
-        owned->Set(path,field,VtValue(payload)); payload.reset();
+        if(operation<3) owned->Set(path,field,VtValue(payload));
+        else owned->SetTimeSample(path,1.0,VtValue(payload));
+        payload.reset();
         state->action=[&,operation] {
-            state->coherent=operation==1 ? !owned->HasSpec(path) : owned->Get(path,field)==VtValue(std::string("replacement"));
+            VtValue sample;
+            const bool sampled=owned->QueryTimeSample(path,1.0,&sample);
+            state->coherent=operation==1 ? !owned->HasSpec(path) :
+                operation==3 ? sampled && sample==VtValue(std::string("replacement")) :
+                operation==4 ? !sampled && owned->HasSpec(path) :
+                owned->Get(path,field)==VtValue(std::string("replacement"));
             // This replaces the whole State while the outer mutator is returning.
             owned->CopyFrom(replacement);
             owned->CreateSpec(after,SdfSpecTypePrim);
@@ -332,7 +340,9 @@ void ownedStorageRetirement() {
         state->armed=true;
         if(operation==0) owned->Set(path,field,VtValue(std::string("replacement")));
         else if(operation==1) owned->EraseSpec(path);
-        else owned->CopyFrom(replacement);
+        else if(operation==2) owned->CopyFrom(replacement);
+        else if(operation==3) owned->SetTimeSample(path,1.0,VtValue(std::string("replacement")));
+        else owned->EraseTimeSample(path,1.0);
         state->armed=false;
         require(state->called && state->coherent && !state->failed && owned->HasSpec(after),
                 "retired value ran under a guard or before complete state publication");
@@ -893,6 +903,89 @@ void snapshotDuringForeignExtraction() {
             projection->Get(root, field) == VtValue(std::string("after")),
             "a capture taken during a foreign extraction observed the write");
 }
+// Authoring samples on one attribute edits its map in place, so N calls cost
+// N map operations rather than N map copies. The map's storage and its
+// nodes stay the same objects across edits that nothing else observes, and a clone, a capture or
+// a value a reader holds keeps what it saw: the next edit copies the map once.
+void sampleAuthoringEditsInPlace() {
+    const SdfPath path("/P.x");
+    const auto base = buildSceneCandidate({}, encodeEnvelope({}));
+    auto projection = TfCreateRefPtr(new HostSceneProjection(base, std::make_shared<HostFailureLatch>()));
+    projection->CreateSpec(SdfPath("/P"), SdfSpecTypePrim);
+    projection->CreateSpec(path, SdfSpecTypeAttribute);
+    auto storage = [&]() -> const SdfTimeSampleMap* {
+        const auto value = projection->Get(path, SdfFieldKeys->TimeSamples);
+        return value.IsHolding<SdfTimeSampleMap>() ? &value.UncheckedGet<SdfTimeSampleMap>() : nullptr;
+    };
+    projection->SetTimeSample(path, 0.0, VtValue(0.0));
+    const auto* map = storage();
+    require(map != nullptr, "the first sample created no map");
+    // Any copy of the map, even into the same holder, allocates new nodes.
+    const auto* first = &map->begin()->second;
+    const auto same = [&] {
+        const auto* now = storage();
+        return now == map && &now->begin()->second == first;
+    };
+    constexpr size_t count = 65536;
+    for (size_t index = 1; index != count; ++index) {
+        projection->SetTimeSample(path, double(index), VtValue(double(index)));
+        if (!same()) throw std::runtime_error("host projection: sample " + std::to_string(index) + " copied the map");
+    }
+    projection->SetTimeSample(path, 1.0, VtValue(-1.0));
+    projection->EraseTimeSample(path, 2.0);
+    require(same() && projection->GetNumTimeSamplesForPath(path) == count - 1,
+            "replacing or erasing a sample copied the map");
+    VtValue sample;
+    require(projection->QueryTimeSample(path, 1.0, &sample) && sample == VtValue(-1.0) &&
+            !projection->QueryTimeSample(path, 2.0, static_cast<VtValue*>(nullptr)) &&
+            projection->QueryTimeSample(path, double(count - 1), &sample) && sample == VtValue(double(count - 1)),
+            "in-place sample edits lost a value");
+    const auto captured = projection->capture();
+    projection->SetTimeSample(path, 3.0, VtValue(-3.0));
+    require(storage() != map && captured->QueryTimeSample(path, 3.0, &sample) && sample == VtValue(3.0),
+            "a capture observed a later sample edit");
+
+    const auto owned = TfCreateRefPtr(new HostSceneStorage);
+    owned->CreateSpec(path, SdfSpecTypeAttribute);
+    owned->SetTimeSample(path, 1.0, VtValue(1.0));
+    const auto held = owned->Get(path, SdfFieldKeys->TimeSamples);
+    const auto cloned = owned->clone();
+    owned->SetTimeSample(path, 2.0, VtValue(2.0));
+    owned->SetTimeSample(path, 1.0, VtValue(-1.0));
+    VtValue value;
+    require(held.UncheckedGet<SdfTimeSampleMap>().size() == 1 && held.UncheckedGet<SdfTimeSampleMap>().at(1.0) == VtValue(1.0) &&
+            cloned->GetNumTimeSamplesForPath(path) == 1 && cloned->QueryTimeSample(path, 1.0, &value) && value == VtValue(1.0),
+            "a held value or clone observed a later sample edit");
+    const auto snapshot = owned->clone();
+    owned->EraseTimeSample(path, 1.0);
+    owned->EraseTimeSample(path, 2.0);
+    require(!owned->Has(path, SdfFieldKeys->TimeSamples, static_cast<VtValue*>(nullptr)) &&
+            snapshot->GetNumTimeSamplesForPath(path) == 2 && snapshot->QueryTimeSample(path, 1.0, &value) && value == VtValue(-1.0),
+            "erasing the last sample kept the field or changed a clone");
+    owned->EraseTimeSample(path, 3.0);
+    require(snapshot->GetNumTimeSamplesForPath(path) == 2, "erasing an absent sample changed a clone");
+}
+// OverlaySpec is CreateSpec and a Set of each field in one edit: an empty
+// value erases its field, and an authored empty slot it does not name stays.
+void overlayKeepsUnnamedEmptySlots() {
+    struct Empty final : SdfAbstractDataConstValue {
+        Empty() : SdfAbstractDataConstValue(nullptr, typeid(void), false, typeid(void)) {}
+        bool GetValue(VtValue* output) const override { *output = VtValue(); return true; }
+        bool IsEqual(const VtValue&) const override { return false; }
+    };
+    const SdfPath path("/P");
+    const TfToken slot("slot"), kept("kept"), dropped("dropped"), added("added");
+    const auto storage = TfCreateRefPtr(new HostSceneStorage);
+    storage->CreateSpec(path, SdfSpecTypePrim);
+    storage->Set(path, slot, Empty());
+    storage->Set(path, kept, VtValue(1));
+    storage->Set(path, dropped, VtValue(2));
+    require(storage->Has(path, slot, static_cast<VtValue*>(nullptr)), "the abstract-value Set kept no empty slot");
+    storage->OverlaySpec(path, SdfSpecTypePrim, {{dropped, VtValue()}, {added, VtValue(3)}, {kept, VtValue(4)}});
+    require(storage->List(path) == std::vector<TfToken>{slot, kept, added} &&
+                storage->Get(path, kept) == VtValue(4) && storage->Get(path, added) == VtValue(3),
+            "an overlay dropped an unnamed empty slot or misapplied its fields");
+}
 // The abstract-value overloads of a discarding projection apply, notify and
 // retain nothing, like every forwarded mutation.
 void discardingAbstractValueEdits() {
@@ -1108,6 +1201,8 @@ void hostProjectionTests() {
     failedLayerDiscardsRecords();
     discardingAbstractValueEdits();
     snapshotDuringForeignExtraction();
+    overlayKeepsUnnamedEmptySlots();
+    sampleAuthoringEditsInPlace();
     directAuthoringRejectsNestedMutation();
     concurrentReadersLeaveNoNestingState();
     abstractValueExtractionFailureIsTyped();

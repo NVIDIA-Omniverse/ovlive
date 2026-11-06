@@ -47,6 +47,7 @@
 //! | Refusals | a wrong-typed key of each of the eleven families the fan-out reads ticks exactly its own `key_family` cell and names its own read; keys it never reads tick nothing |
 //! | Metrics | one `live_edit_snapshot_read_total{path="unfenced"}` tick per read under its consumer and outcome, none on `path="atomic"` and none under `ext_gc`; the duration histogram under the path, the size histograms with the read's own tallies |
 //! | Round 1 in pages | indices that each take several pages (12,000 sections, 30,000 fields): the read equals the atomic read, every round-1 window within `FANOUT_INDEX_WINDOW_MEMBERS` (the `fan-out window` event); `SSCAN` steps that repeat members (a reply-rewriting proxy) leave each member counted once |
+//! | A round-1 index short of its count (b.o2i) | a proxy leaves one member out of the read's round-1 `SSCAN` page. A structural WATCH attempt whose `seq` proof holds is a proven skip — one WARN, one tick of `live_edit_snapshot_read_index_incomplete_total`, aborted and retried on the call's retries (not `conflicts_total`) — and the retry commits the whole-state plan, for `obj:secs` and a marked object's `obj:chs`; with a commit during the read the failed proof is a lost race (`watch_read_moved`), with no WARN and no tick. An uncharged read is refused `Aborted` naming the key and counts (`transient_error`) for every consumer: the DR restore read, on its held store, with one WARN and one tick; the structural consumer's uncharged read silently, with no WARN and no tick |
 //! | Fault seam (`test-fault-injection`) | an injected transient failure is `Aborted`, a permanent one `Internal`, each classified as a real failure of the command it replaced; on a script window an injected value-row error fails under `HSTRLEN field` with no `EVALSHA` sent, and an injected cluster-state refusal falls the read back to plain commands for its later windows (`live_edit_snapshot_read_window_fallback_total` +1, no row reported as holding both shapes) |
 //! | The window script (b.gvf) | on a layer of 1,000 field rows the client issues no value-row or list-length command; each round-2/3 window is one `EVALSHA` of the window script, its one key the header; round 1 is plain. A lone children list over τ is one plain `LRANGE`. An in-script `WRONGTYPE` ticks its own family. A store-side cluster-state refusal tag falls the read back to plain commands for that window and every later one, ticking the fallback counter once; the next read tries the script again. A reply not of the script's shape fails `Internal`, attributed to the header's `EVALSHA`. The store's not-serving `-BUSY` / `-LOADING` on the `EVALSHA` fail the read retryable (`Aborted`, uncounted, no fallback; b.xd1). Every other error reply fails `Internal` without falling back: a refusal tag whose entry is out of range or whose command is foreign to its entry (even with a cluster-state text), and `FANOUT_WINDOW_ARGS` are attributed to the header's `EVALSHA`; a tag on an entry's own command with any other error is that entry's refusal. A `SCRIPT FLUSH` between windows (fault seam) costs the read one `SCRIPT LOAD`, and it completes |
 //!
@@ -83,6 +84,7 @@ use live_edit::storage::test_support::{compact_snapshot, read_object_state_for_t
 
 use crate::common::owned_delta::{
     delta_with_set_field_external, delta_with_set_field_inline, delta_with_time_sample_inline,
+    with_root,
 };
 use crate::storage::b_atj_tests::{
     assert_keyspace_type_errors_flat, assert_no_family_ticked, assert_only_family_ticked,
@@ -96,7 +98,9 @@ use crate::storage::snapshot_read_atomic_test::{
     move_cmd, structural, unmark, CUBE, DANGLING_PARENT, ROOT, SIBLING, WORLD,
 };
 use crate::storage::snapshot_read_support::{
-    client_with_limits, monitor_fence, read_atomic, test_valkey_addr, MonitorTap, MonitoredCommand,
+    assert_index_shortfall_warning, client_with_limits, index_incomplete, index_shortfall_warnings,
+    monitor_fence, read_atomic, test_valkey_addr, view, IndexPage, IndexPageFault, MonitorTap,
+    MonitoredCommand, PageMembers, SnapshotView,
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -950,7 +954,9 @@ async fn unfenced_read_of_a_wrongtype_section_hash_ticks_section() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unfenced_read_of_a_wrongtype_tombstone_hash_ticks_deleted_section() {
     let fx = Fixture::empty("sru-ref-del").await;
-    fx.update(create_section_delta(DOOMED_SECTION_ID, "Doomed"))
+    // With the layer's root section beside it, so the delete below keeps a
+    // top-level section: an update leaving none is refused (SDD §9.7).
+    fx.update(with_root(create_section_delta(DOOMED_SECTION_ID, "Doomed")))
         .await
         .expect("the setup CreateSection must land");
     fx.update(delete_section_delta(DOOMED_SECTION_ID))
@@ -1063,8 +1069,9 @@ async fn unfenced_read_over_wrongtype_keys_it_never_reads_ticks_nothing() {
 // 6. Metrics (SR-8.1, SR-8.2)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// One tick per read on `path="unfenced"`, under the consumer that read and
-/// the outcome it had, and none on `path="atomic"`; the duration histogram
+/// One tick per read on `path="unfenced"`, under the consumer that read
+/// (`structural_update`, and the DR restore Job's `dr_restore`) and the
+/// outcome it had, and none on `path="atomic"`; the duration histogram
 /// records every read under the path, the size histograms only a read that
 /// returned state, with that read's own tallies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1094,25 +1101,38 @@ async fn unfenced_reads_record_one_outcome_per_read_under_their_consumer() {
     )
     .await;
     assert!(matches!(missing, ServiceError::NotFound(_)));
+    // The DR restore Job's read of a survivor, to name its values' sites.
+    let restore = read_unfenced(
+        tv.client(),
+        tv.key_schema(),
+        oid,
+        SlimSnapshotReadConsumer::DrRestore,
+    )
+    .await;
+    assert_eq!(
+        restore.entry_count, ok.entry_count,
+        "the restore Job reads the same object state"
+    );
 
-    // `ext_gc` is the other `path="unfenced"` consumer, the clean-up's
+    // `ext_gc` is another `path="unfenced"` consumer, the clean-up's
     // reference walk (`storage::retirement`): no snapshot read here may tick
-    // it.
+    // it. `dr_restore` is the restore Job's, ticked by its one read above.
     let expected: BTreeMap<(&str, &str), u64> = BTreeMap::from([
         (("structural_update", "ok"), 1),
         (("structural_update", "not_found"), 1),
+        (("dr_restore", "ok"), 1),
     ]);
-    for consumer in ["structural_update", "ext_gc"] {
+    for consumer in ["structural_update", "ext_gc", "dr_restore"] {
         for outcome in ["ok", "not_found", "transient_error", "permanent_error"] {
             assert_eq!(
                 snapshot_reads(&metrics, consumer, "unfenced", outcome),
                 expected.get(&(consumer, outcome)).copied().unwrap_or(0),
-                "consumer={consumer}, outcome={outcome}: exactly the two reads above may tick, \
-                 each once, on path=unfenced under its own consumer and outcome"
+                "consumer={consumer}, outcome={outcome}: exactly the three reads above may \
+                 tick, each once, on path=unfenced under its own consumer and outcome"
             );
         }
     }
-    for consumer in ["catchup", "catchup_legacy_per_commit", "checkpoint"] {
+    for consumer in ["catchup", "checkpoint"] {
         for outcome in [
             "ok",
             "not_found",
@@ -2680,4 +2700,527 @@ mod fault_seam {
              was sent again"
         );
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 10. A round-1 index short of its count (b.o2i; SDD §10.5)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// An `SSCAN` cursor continued on another serving process can skip members.
+// A proxy stands in for that store: it rewrites the reader's round-1 page of
+// one index into an `EVAL` that runs the real command and leaves one member
+// out (`IndexPageFault`). The structural WATCH attempt weighs a short round 1
+// only once its `seq` proof holds: then it is a proven skip, aborted and
+// retried (one WARN, one tick of
+// `live_edit_snapshot_read_index_incomplete_total`, counted on the call's
+// retries and never on `conflicts_total`); a short round 1 whose proof failed
+// is a lost race and nothing more. An uncharged read has no `seq` proof of
+// its own and refuses a short round 1 `Aborted` (`transient_error`) for every
+// consumer; only the DR restore Job's, whose store is held against every
+// writer, also reports it as a proven skip (one WARN, one tick).
+
+/// `metric{labels}` on `metrics`, panicking on an absent series (every series
+/// read here is seeded).
+fn seeded(metrics: &Metrics, metric: &str, labels: &[(&str, &str)]) -> u64 {
+    sample_value(&render(metrics), metric, labels)
+        .unwrap_or_else(|| panic!("{metric}{labels:?} is seeded, so it must render")) as u64
+}
+
+/// `live_edit_update_layer_retries_total{path="watch",outcome="committed"}`.
+fn watch_retries(metrics: &Metrics) -> u64 {
+    seeded(
+        metrics,
+        "live_edit_update_layer_retries_total",
+        &[("path", "watch"), ("outcome", "committed")],
+    )
+}
+
+/// `live_edit_update_layer_conflicts_total{path="watch",kind="watch_read_moved"}`.
+fn watch_read_moved(metrics: &Metrics) -> u64 {
+    seeded(
+        metrics,
+        "live_edit_update_layer_conflicts_total",
+        &[("path", "watch"), ("kind", "watch_read_moved")],
+    )
+}
+
+/// Assert no `live_edit_update_layer_conflicts_total{path="watch"}` cell of
+/// any kind (`UPDATE_LAYER_CONFLICT_KINDS`) ticked: a proven skip is no
+/// conflict of any kind, its retry counted only on the call's retries. Every
+/// cell is seeded, so an absent one fails rather than reads as zero.
+fn assert_no_watch_conflict(metrics: &Metrics) {
+    let ticked: Vec<(&str, u64)> = live_edit::observability::metrics::UPDATE_LAYER_CONFLICT_KINDS
+        .iter()
+        .map(|&kind| {
+            (
+                kind,
+                seeded(
+                    metrics,
+                    "live_edit_update_layer_conflicts_total",
+                    &[("path", "watch"), ("kind", kind)],
+                ),
+            )
+        })
+        .filter(|&(_, n)| n != 0)
+        .collect();
+    assert!(
+        ticked.is_empty(),
+        "a proven skip is counted as no conflict of any kind; ticked: {ticked:?}"
+    );
+}
+
+/// [`every_shape_state`] created as `layer` (marked), read by a structural
+/// WATCH-path store (`lua-watch-structural`) whose client connects through a
+/// proxy applying `members` to the first round-1 `page` of the index `index`
+/// names, running `also` in the same `EVAL`; a metrics registry on the client
+/// and the store.
+struct ShortWatch {
+    tv: TestValkey,
+    session_id: String,
+    layer: String,
+    oid: u64,
+    /// The index key the proxy rewrites.
+    key: String,
+    store: LayerStore,
+    metrics: Arc<Metrics>,
+    /// Kept alive for the store's connections.
+    _proxy: crate::storage::snapshot_read_support::ScriptReplyProxy,
+    /// Pages the proxy rewrote.
+    rewritten: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ShortWatch {
+    async fn new(
+        layer: &str,
+        page: IndexPage,
+        index: fn(&KeySchema, &str) -> String,
+        members: PageMembers,
+        also: impl FnOnce(&KeySchema, &str) -> String,
+    ) -> Self {
+        use crate::storage::snapshot_read_support::{client_through, ScriptReplyProxy};
+
+        let tv = TestValkey::setup().await;
+        let session_id = create_session(&tv, layer).await;
+        let oid = create(&layer_store(&tv), &session_id, layer, &every_shape_state()).await;
+        let oid_str = oid.to_string();
+        let key = index(tv.key_schema(), &oid_str);
+        let (rule, rewritten) = IndexPageFault {
+            page,
+            key: Arc::new(std::sync::OnceLock::from(key.clone())),
+            members,
+            pages: 1,
+            also: also(tv.key_schema(), &oid_str),
+        }
+        .rule();
+        let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+        let proxied = client_through(&proxy).await;
+        let metrics = Arc::new(crate::common::metrics_scrape_only(layer));
+        proxied
+            .install_observability_hooks(Arc::clone(&metrics))
+            .await;
+        let store = LayerStore::new(proxied, tv.key_schema().clone(), 4096)
+            .with_update_layer_backend(UpdateLayerBackend::LuaWatchStructural)
+            .with_metrics(Arc::clone(&metrics));
+        ShortWatch {
+            tv,
+            session_id,
+            layer: layer.to_owned(),
+            oid,
+            key,
+            store,
+            metrics,
+            _proxy: proxy,
+            rewritten,
+        }
+    }
+
+    /// The structural commit of `delta` through the proxied store, which must
+    /// land, with the log lines it emitted.
+    async fn commit(&self, delta: OwnedDelta) -> crate::grpc::log_capture::Captured {
+        let ((), captured) = crate::grpc::log_capture::capture(commit(
+            &self.store,
+            &self.session_id,
+            &self.layer,
+            self.oid,
+            delta,
+        ))
+        .await;
+        captured
+    }
+
+    /// The state the same structural commit leaves on a twin of the object
+    /// read whole (no proxy), on the WATCH path too: the full-state plan.
+    async fn twin_state(&self, delta: OwnedDelta) -> SnapshotView {
+        let twin_layer = format!("{}-twin", self.layer);
+        let twin = create(
+            &layer_store(&self.tv),
+            &self.session_id,
+            &twin_layer,
+            &every_shape_state(),
+        )
+        .await;
+        let whole = LayerStore::new(self.tv.client().clone(), self.tv.key_schema().clone(), 4096)
+            .with_update_layer_backend(UpdateLayerBackend::LuaWatchStructural);
+        commit(&whole, &self.session_id, &twin_layer, twin, delta).await;
+        self.state_of(twin).await
+    }
+
+    /// `oid`'s stored state, read atomically, its object id set to the
+    /// fixture object's so that a twin's compares whole.
+    async fn state_of(&self, oid: u64) -> SnapshotView {
+        let mut state = view(
+            &read_atomic(self.tv.client(), self.tv.key_schema(), oid)
+                .await
+                .state,
+        );
+        state.object_id = self.oid;
+        state
+    }
+
+    /// The index's count, read on the fixture's own client.
+    async fn scard(&self) -> u64 {
+        use fred::interfaces::SetsInterface;
+        let n: u64 = self
+            .tv
+            .client()
+            .pool
+            .scard(&self.key)
+            .await
+            .expect("SCARD must answer");
+        assert!(n > 0, "fixture precondition: {} holds members", self.key);
+        n
+    }
+}
+
+/// Assert `captured` holds one proven-skip WARN for the structural read of
+/// `sw`'s index (`SCARD` `counted`, one member collected fewer), with no
+/// attempt number (only the fenced read has attempts).
+fn assert_one_structural_skip_warning(
+    captured: &crate::grpc::log_capture::Captured,
+    sw: &ShortWatch,
+    family: &str,
+    counted: u64,
+) {
+    let warnings = index_shortfall_warnings(captured);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one WARN for the one proven skip; capture:\n{}",
+        captured.text
+    );
+    assert_index_shortfall_warning(
+        warnings[0],
+        "structural_update",
+        "unfenced",
+        family,
+        &sw.key,
+        "SCARD",
+        counted,
+        counted - 1,
+    );
+    crate::grpc::log_capture::assert_field(warnings[0], "object_id", sw.oid.to_string().into());
+    crate::grpc::log_capture::assert_field_absent(
+        warnings[0],
+        "attempt",
+        "only the fenced read's skips name an attempt",
+    );
+}
+
+/// A structural WATCH attempt whose read's `SSCAN` of `obj:secs` skipped
+/// `CUBE`, with no commit under it, so its `seq` proof holds: a proven skip.
+/// The attempt is aborted and retried — never planned on — and the retry
+/// commits the move of `CUBE` exactly as a plan on the whole state does (a
+/// twin object committed without the proxy). The retry is counted on the
+/// call's retries, and on no `conflicts_total` cell of any kind. Without the count check the
+/// first attempt plans on a state whose `WORLD` list names `CUBE` but whose
+/// sections lack it (in a debug build the domain's cross-map `debug_assert!`
+/// panics on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn structural_attempt_whose_read_skipped_a_section_is_retried_and_commits_the_whole_state_plan(
+) {
+    let sw = ShortWatch::new(
+        "sru-short-secs",
+        IndexPage::Sscan,
+        KeySchema::obj_sections_index,
+        PageMembers::Drop(Some(CUBE.to_string())),
+        |_, _| String::new(),
+    )
+    .await;
+    let counted = sw.scard().await;
+    let delta = || structural(vec![move_cmd(CUBE, WORLD, ROOT, "Cube")]);
+
+    let captured = sw.commit(delta()).await;
+
+    assert_eq!(sw.rewritten.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        sw.state_of(sw.oid).await,
+        sw.twin_state(delta()).await,
+        "the committed state is the whole-state plan's"
+    );
+    assert_eq!(
+        watch_retries(&sw.metrics),
+        1,
+        "one retry, counted on the call's retries"
+    );
+    assert_no_watch_conflict(&sw.metrics);
+    assert_eq!(index_incomplete(&sw.metrics), 1, "one proven skip");
+    assert_one_structural_skip_warning(&captured, &sw, "sections_index", counted);
+}
+
+/// The same skip, with a commit landing during round 1 (the rewritten page's
+/// `EVAL` also advances the header's `seq`): the attempt's `seq` proof fails
+/// first, so it is a lost race — `conflicts_total{watch,watch_read_moved}`
+/// +1 — and its shortfall is never weighed: no WARN and no tick. The retry
+/// commits the move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn structural_attempt_whose_short_read_also_lost_a_race_is_a_lost_race_without_a_proven_skip()
+{
+    let sw = ShortWatch::new(
+        "sru-short-race",
+        IndexPage::Sscan,
+        KeySchema::obj_sections_index,
+        PageMembers::Drop(Some(CUBE.to_string())),
+        |keys, oid| {
+            format!(
+                "redis.call('HINCRBY', [==[{}]==], 'seq', 1)",
+                keys.obj_header(oid)
+            )
+        },
+    )
+    .await;
+
+    let captured = sw
+        .commit(structural(vec![move_cmd(CUBE, WORLD, ROOT, "Cube")]))
+        .await;
+
+    assert_eq!(sw.rewritten.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        (watch_retries(&sw.metrics), watch_read_moved(&sw.metrics)),
+        (1, 1),
+        "the failed proof is a lost race, retried"
+    );
+    assert_eq!(
+        index_incomplete(&sw.metrics),
+        0,
+        "a shortfall under a failed proof is never a proven skip"
+    );
+    assert!(
+        index_shortfall_warnings(&captured).is_empty(),
+        "no proven-skip WARN; capture:\n{}",
+        captured.text
+    );
+    let state = sw.state_of(sw.oid).await;
+    assert_eq!(
+        (
+            state.sections.get(&CUBE).map(|s| s.parent_id),
+            state.children.get(&ROOT).is_some_and(|c| c.contains(&CUBE)),
+        ),
+        (Some(ROOT), true),
+        "the retry committed the move"
+    );
+}
+
+/// A marked object's structural WATCH attempt whose read's `SSCAN` of
+/// `obj:chs` (paged in round 1 by the bounded-reply read only) skipped
+/// `WORLD`, so the read left out `WORLD`'s children list: a proven skip,
+/// aborted and retried, and the retry creates a section under `WORLD` exactly
+/// as a plan on the whole state does. Without the count check the first
+/// attempt plans on a state with no list under `WORLD`, though `CUBE` names
+/// `WORLD` its parent (in a debug build the domain's cross-map
+/// `debug_assert!` panics on it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn structural_attempt_whose_read_skipped_a_children_index_member_is_retried_and_commits_the_whole_state_plan(
+) {
+    const NEW: u64 = 5;
+    let sw = ShortWatch::new(
+        "sru-short-chs",
+        IndexPage::Sscan,
+        KeySchema::obj_children_index,
+        PageMembers::Drop(Some(WORLD.to_string())),
+        |_, _| String::new(),
+    )
+    .await;
+    let counted = sw.scard().await;
+    let delta = || structural(vec![create_cmd(WORLD, NEW, "New")]);
+
+    let captured = sw.commit(delta()).await;
+
+    assert_eq!(sw.rewritten.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let state = sw.state_of(sw.oid).await;
+    assert_eq!(
+        state.children.get(&WORLD),
+        Some(&vec![CUBE, NEW]),
+        "the new section joins WORLD's whole list"
+    );
+    assert_eq!(
+        state,
+        sw.twin_state(delta()).await,
+        "the committed state is the whole-state plan's"
+    );
+    assert_eq!(watch_retries(&sw.metrics), 1, "one retry");
+    assert_no_watch_conflict(&sw.metrics);
+    assert_eq!(index_incomplete(&sw.metrics), 1);
+    assert_one_structural_skip_warning(&captured, &sw, "children_index", counted);
+}
+
+/// What an uncharged unfenced read whose round-1 `SSCAN` of `obj:secs`
+/// skipped a section answered, with the log lines it emitted and the metrics
+/// registry of its client.
+struct UnchargedShortRead {
+    captured: crate::grpc::log_capture::Captured,
+    metrics: Arc<Metrics>,
+    /// The sections index's key and `SCARD`.
+    key: String,
+    counted: u64,
+}
+
+/// `read_object_snapshot_slim` for `consumer`, uncharged, of
+/// [`every_shape_state`] created as `layer`, through a proxy that leaves
+/// `CUBE` out of the read's first `SSCAN` page of `obj:secs`; asserted refused
+/// `Aborted`, the message naming the key and its counts, whatever the
+/// consumer: an uncharged read has no `seq` proof to weigh a short round 1
+/// against. Without the count check it returns the state missing the section.
+async fn uncharged_short_read(
+    layer: &str,
+    consumer: SlimSnapshotReadConsumer,
+) -> UnchargedShortRead {
+    use crate::storage::snapshot_read_support::{client_through, ScriptReplyProxy};
+
+    let tv = TestValkey::setup().await;
+    let session_id = create_session(&tv, layer).await;
+    let oid = create(&layer_store(&tv), &session_id, layer, &every_shape_state()).await;
+    let oid_str = oid.to_string();
+    let key = tv.key_schema().obj_sections_index(&oid_str);
+    let (rule, rewritten) = IndexPageFault {
+        page: IndexPage::Sscan,
+        key: Arc::new(std::sync::OnceLock::from(key.clone())),
+        members: PageMembers::Drop(Some(CUBE.to_string())),
+        pages: 1,
+        also: String::new(),
+    }
+    .rule();
+    let proxy = ScriptReplyProxy::start(test_valkey_addr(), rule).await;
+    let proxied = client_through(&proxy).await;
+    let metrics = Arc::new(crate::common::metrics_scrape_only(layer));
+    proxied
+        .install_observability_hooks(Arc::clone(&metrics))
+        .await;
+    let counted = {
+        use fred::interfaces::SetsInterface;
+        let n: u64 = tv
+            .client()
+            .pool
+            .scard(&key)
+            .await
+            .expect("SCARD must answer");
+        n
+    };
+
+    let (result, captured) = crate::grpc::log_capture::capture(read_object_snapshot_slim(
+        &proxied,
+        tv.key_schema(),
+        &oid_str,
+        consumer,
+    ))
+    .await;
+
+    assert_eq!(
+        rewritten.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "{consumer:?}: fixture precondition: the proxy left a member out of one page"
+    );
+    let shortfall = format!(
+        "SCARD {key} counted {counted} members, and the read collected {}",
+        counted - 1
+    );
+    match result {
+        Err(ServiceError::Aborted(message)) => assert!(
+            message.contains(&shortfall),
+            "{consumer:?}: the refusal names the key and its counts ({shortfall:?}); got \
+             {message:?}"
+        ),
+        Err(e) => panic!("{consumer:?}: a short round 1 is refused Aborted; got {e:?}"),
+        Ok(_) => panic!("{consumer:?}: a short round 1 is never returned as the object's state"),
+    }
+    UnchargedShortRead {
+        captured,
+        metrics,
+        key,
+        counted,
+    }
+}
+
+/// The DR restore Job's read (uncharged, unfenced, on a store held against
+/// every writer) whose round 1 skipped a section: refused `Aborted`
+/// ([`uncharged_short_read`]), recorded `outcome="transient_error"`, and —
+/// its held store making the shortfall a proven skip — one WARN naming the
+/// key and its counts, and one tick of the counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dr_restore_read_whose_round_one_skipped_a_section_is_refused_aborted() {
+    let read = uncharged_short_read("sru-short-dr", SlimSnapshotReadConsumer::DrRestore).await;
+
+    assert_eq!(
+        (
+            snapshot_reads(&read.metrics, "dr_restore", "unfenced", "transient_error"),
+            snapshot_reads(&read.metrics, "dr_restore", "unfenced", "ok"),
+        ),
+        (1, 0)
+    );
+    assert_eq!(index_incomplete(&read.metrics), 1, "one proven skip");
+    let warnings = index_shortfall_warnings(&read.captured);
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one WARN for the one proven skip; capture:\n{}",
+        read.captured.text
+    );
+    assert_index_shortfall_warning(
+        warnings[0],
+        "dr_restore",
+        "unfenced",
+        "sections_index",
+        &read.key,
+        "SCARD",
+        read.counted,
+        read.counted - 1,
+    );
+}
+
+/// The structural update consumer's uncharged read (test-only: in production
+/// that consumer reads charged, behind its `seq` proof) whose round 1
+/// skipped a section: refused `Aborted` and recorded `transient_error` like
+/// the DR read ([`uncharged_short_read`]), but silently — its store is not
+/// held against writers, so nothing proves the shortfall a skip rather than a
+/// commit under the read: no WARN, and no tick of the counter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uncharged_structural_read_whose_round_one_skipped_a_section_is_refused_without_a_proven_skip(
+) {
+    let read = uncharged_short_read(
+        "sru-short-uncharged",
+        SlimSnapshotReadConsumer::StructuralUpdate,
+    )
+    .await;
+
+    assert_eq!(
+        (
+            snapshot_reads(
+                &read.metrics,
+                "structural_update",
+                "unfenced",
+                "transient_error"
+            ),
+            snapshot_reads(&read.metrics, "structural_update", "unfenced", "ok"),
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        index_incomplete(&read.metrics),
+        0,
+        "a shortfall on a store not held against writers is no proven skip"
+    );
+    assert!(
+        index_shortfall_warnings(&read.captured).is_empty(),
+        "no proven-skip WARN; capture:\n{}",
+        read.captured.text
+    );
 }

@@ -14,7 +14,8 @@
 // limitations under the License.
 
 // Integration tests for diff_read: the object-snapshot round trip, the empty
-// commit's payload against the per-commit build, and build_diff_payload.
+// commit's payload, the two faithful catch-up builders' envelopes and metrics,
+// and build_diff_payload.
 //
 // Section A's round-trip cases run through three readers with identical
 // expectations: the fenced read's whole-row fan-out, and
@@ -42,9 +43,8 @@ use live_edit::domain::ompf::OmpfContainer;
 use live_edit::domain::types::{Field, FieldValue, ObjectState, Section, TimeSample};
 use live_edit::error::ServiceError;
 use live_edit::storage::diff_read::{
-    build_diff_payload, compute_per_commit_diff_at_cut, empty_commit_payload, read_object_snapshot,
-    snapshot_to_object_state, DiffResponse, ExtValueReads, ObjectSnapshot, PerCommitDiff,
-    SnapshotRead, SnapshotReadConsumer, SubscriberState,
+    build_diff_payload, empty_commit_payload, read_object_snapshot, snapshot_to_object_state,
+    DiffCase, DiffCut, ObjectSnapshot, SnapshotRead, SnapshotReadConsumer,
 };
 use live_edit::storage::external_values::MockExternalValueStore;
 use live_edit::storage::layer::{LayerStore, HEADER_FIELD_CHS_COMPLETE};
@@ -54,7 +54,7 @@ use live_edit::storage::test_support::{read_object_state_for_test, TestValkey};
 use oodf_ffi::{parse_delta, StructCommand};
 
 use crate::common::owned_delta::delta_with_set_field_inline;
-use crate::storage::snapshot_read_support::{read_atomic, read_atomic_as};
+use crate::storage::snapshot_read_support::read_atomic;
 
 fn mock_ext_store() -> Arc<MockExternalValueStore> {
     Arc::new(MockExternalValueStore::new())
@@ -392,7 +392,10 @@ async fn read_object_snapshot_nonexistent_object_returns_not_found() {
     .await;
 
     match result {
-        Err(ServiceError::NotFound(_)) => {} // expected
+        Err(ServiceError::NotFound(msg)) => assert!(
+            msg.contains("999999999"),
+            "the NotFound must name the object id, got: {msg}"
+        ),
         Err(other) => panic!("expected NotFound, got: {other:?}"),
         Ok(SnapshotRead::Snapshot(_)) => panic!("expected NotFound error, got a snapshot"),
         Ok(SnapshotRead::TooLarge(t)) => panic!("expected NotFound error, got TOO_LARGE {t:?}"),
@@ -944,348 +947,239 @@ async fn read_object_snapshot_missing_authoring_field_falls_back_to_set_order_un
 }
 
 // =============================================================================
-// A3. Integration tests: an empty commit's payload, built with no read, is
-//     what a per-commit read builds
+// A3. The steady state's empty delta, built with no read
 // =============================================================================
 
-/// Build the per-commit diff a legacy per-commit atomic read builds for the
-/// commit at `commit`, based at `commit - 1`, and assert `shortcut` — the
-/// empty-commit payload built with no read — is identical to it: the same
-/// bytes, case, section count and cut. `what` names the read's position.
-async fn assert_empty_commit_payload_matches_the_read_build(
-    tv: &TestValkey,
-    oid: u64,
-    commit: u64,
-    shortcut: &DiffResponse,
-    what: &str,
-) {
-    let snapshot = read_atomic_as(
-        tv.client(),
-        tv.key_schema(),
-        oid,
-        SnapshotReadConsumer::CatchupLegacyPerCommit,
+/// `empty_commit_payload(base)` — what a subscriber is sent for an empty
+/// commit, with no read — is the empty delta at the commit: non-empty bytes,
+/// one OMPF part (the OODF delta) and no external value, a diff
+/// (`is_diff=true`) based at the previous sequence, `base`, carrying no
+/// struct command, field or time sample; labelled `Incremental`, zero
+/// sections, at no cut (`DiffCut::Unpinned`: it reads nothing to be cut at).
+/// Checked at the smallest base an empty commit can have (1, the commit
+/// before it being at least the `CreateLayer` seed) and at larger ones.
+#[test]
+fn empty_commit_payload_is_the_empty_delta_based_at_the_previous_sequence() {
+    use oodf_ffi::OwnedDelta;
+
+    for base in [1u64, 7, 1 << 40] {
+        let payload = empty_commit_payload(base).expect("the empty-commit payload must build");
+        assert!(
+            !payload.payload.is_empty(),
+            "base {base}: the payload is never zero bytes — the subscriber still receives a \
+             message at the commit's sequence"
+        );
+        let bytes = payload.payload.to_vec();
+        let container = OmpfContainer::parse(&bytes).expect("the payload is an OMPF container");
+        assert!(
+            container.external_values.is_empty(),
+            "base {base}: the empty delta carries no external value"
+        );
+        let delta = parse_delta(container.delta_bytes).expect("the payload carries an OODF delta");
+        assert_eq!(
+            (
+                delta.struct_commands.len(),
+                delta.set_fields.len(),
+                delta.time_samples.len()
+            ),
+            (0, 0, 0),
+            "base {base}: no struct command, field or time sample"
+        );
+        assert_eq!(
+            delta,
+            OwnedDelta {
+                is_diff: true,
+                base_version: base,
+                ..Default::default()
+            },
+            "base {base}: a diff based at the previous sequence, changing nothing"
+        );
+        assert_eq!(
+            (payload.case, payload.sections_count, payload.cut),
+            (DiffCase::Incremental, 0, DiffCut::Unpinned),
+            "base {base}: labelled Incremental, zero sections, at no cut"
+        );
+    }
+}
+
+// =============================================================================
+// A4. The two catch-up builders, read-then-build, and the metrics they record
+// =============================================================================
+
+/// The `live_diff_case_total{case, service="test"}` sample in `text`, or 0.
+fn diff_case_count(text: &str, case: &str) -> u64 {
+    live_edit::observability::metrics::test_util::sample_value(
+        text,
+        "live_diff_case_total",
+        &[("case", case), ("service", "test")],
     )
-    .await;
-    assert!(
-        snapshot.cut >= commit,
-        "fixture self-check ({what}): the read's cut {} covers the commit at {commit}",
-        snapshot.cut
-    );
-    let built = match compute_per_commit_diff_at_cut(
+    .unwrap_or(0.0) as u64
+}
+
+/// Every catch-up build goes through one of the two faithful builders, each
+/// from one atomic read of the object: the brand-new subscriber's from-empty
+/// full state (`compute_faithful_full_content_at_cut`) and the reconnector's
+/// coalesced diff (`compute_faithful_coalesced_at_cut`). Each records ONE
+/// `live_diff_case_total` sample under its own case — `full_content` and
+/// `incremental` — and one `live_diff_build_duration_seconds` observation;
+/// no build emits the `up_to_date` case any more (the up-to-date reconnect
+/// builds nothing).
+///
+/// The payload envelopes are pinned beside it: the full state is a diff based
+/// at 0 that names its source format and carries every field and time sample;
+/// the coalesced diff is based at the reconnector's `have_version`, names no
+/// format, and carries only the field and time sample written after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn faithful_builders_record_their_own_diff_case_and_one_build_duration_each() {
+    use live_edit::observability::metrics::SharedMetrics;
+    use live_edit::storage::diff_read::{
+        compute_faithful_coalesced_at_cut, compute_faithful_full_content_at_cut, ExtValueReads,
+    };
+
+    let tv = TestValkey::setup().await;
+    let session_id = create_test_session(&tv).await;
+    let oid = layer_store(&tv)
+        .create_layer(
+            &session_id,
+            "faithful-builders",
+            "alice",
+            &rich_object_state(),
+            mock_ext_store(),
+        )
+        .await
+        .expect("create_layer must succeed");
+    let metrics: SharedMetrics = Arc::new(crate::common::metrics_scrape_only("test"));
+    let ext_store = mock_ext_store();
+    let snapshot = read_atomic(tv.client(), tv.key_schema(), oid).await;
+
+    let full = compute_faithful_full_content_at_cut(
         &snapshot,
-        &SubscriberState {
-            have_object_id: oid,
-            have_version: commit - 1,
-        },
-        commit,
-        mock_ext_store().as_ref(),
+        ext_store.as_ref(),
         ExtValueReads::recover_for_test(),
-        None,
+        Some(&metrics),
         "test",
     )
     .await
-    .expect("the per-commit build must succeed")
+    .expect("the full-state build must succeed")
     .into_ready()
     .expect("a build with fetch-on-miss never answers Missing")
-    {
-        PerCommitDiff::Built(built) => built,
-        PerCommitDiff::Regressed { cut, to_version } => panic!(
-            "{what}: a read whose cut covers the commit must build it; it answered Regressed \
-             {{ cut: {cut}, to_version: {to_version} }}"
+    .restored_for_test(ext_store.as_ref())
+    .await
+    .expect("the full-state layout's restores must succeed")
+    .fill(ext_store.as_ref(), None)
+    .await
+    .expect("the full-state payload must fill")
+    .into_ready()
+    .expect("a build with fetch-on-miss never answers Missing");
+    let full_bytes = full.payload.to_vec();
+    let full_delta = parse_delta(
+        OmpfContainer::parse(&full_bytes)
+            .expect("the full state is an OMPF container")
+            .delta_bytes,
+    )
+    .expect("the full state carries an OODF delta");
+    assert_eq!(full.case, DiffCase::FullContent);
+    assert_eq!(
+        (
+            full_delta.is_diff,
+            full_delta.base_version,
+            full_delta.source_format.as_str(),
+            full_delta.set_fields.len(),
+            full_delta.time_samples.len(),
         ),
-    };
-    assert_eq!(
-        built.ompf_bytes, shortcut.ompf_bytes,
-        "{what}: the empty-commit payload is byte-for-byte what the read builds"
+        (true, 0, "usda", 2, 2),
+        "the full state is a diff based at 0, naming its format, carrying every field and \
+         time sample"
     );
-    assert_eq!(
-        (built.case, built.sections_count, built.cut),
-        (shortcut.case, shortcut.sections_count, shortcut.cut),
-        "{what}: the same case, section count and cut"
-    );
-}
 
-/// `empty_commit_payload` — what a subscriber sends for an empty commit, in
-/// steady state and in a rollback replay, with no read — is identical to the
-/// per-commit diff a legacy per-commit atomic read builds for that commit
-/// (`compute_per_commit_diff_at_cut`, from the sequence before it up to it),
-/// so the wire cannot drift between the two. Checked on a layer holding
-/// sections, fields, time samples and a tombstone committed before the empty
-/// commit, at a read whose cut is the empty commit and at one whose cut is a
-/// later commit, as a replay's read can be.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_commit_payload_is_identical_to_the_per_commit_build_from_a_read() {
-    use bytes::Bytes;
-    use oodf_ffi::{CommandDeleteSection, CommandDiffChangeSection, OwnedDelta};
-
-    use crate::common::owned_delta::delta_to_ompf_bytes;
-
-    const LAYER: &str = "empty-commit-parity";
-    let tv = TestValkey::setup().await;
-    let ls = layer_store(&tv);
-    let session_id = create_test_session(&tv).await;
-    let oid = ls
-        .create_layer(
-            &session_id,
-            LAYER,
-            "alice",
-            &rich_object_state(),
-            mock_ext_store(),
-        )
-        .await
-        .expect("create_layer must succeed");
-    let commit_with_relay = |delta: OwnedDelta, client_timestamp: u64| {
-        let relay = Bytes::from(delta_to_ompf_bytes(&delta, &[]));
-        let ls = &ls;
-        let session_id = &session_id;
-        async move {
-            ls.update_layer(
-                session_id,
-                LAYER,
-                oid,
-                Some(delta),
-                Some(relay),
-                "writer",
-                client_timestamp,
-            )
-            .await
-            .expect("a commit must succeed")
-            .0
-        }
-    };
-
-    // A real commit right before the empty one, leaving a tombstone.
-    let before = commit_with_relay(
-        OwnedDelta {
-            struct_commands: vec![StructCommand::DeleteSection(CommandDeleteSection {
-                parent_id: 1,
-                section_id: 2,
-            })],
-            ..Default::default()
-        },
-        100,
-    )
-    .await;
-    // The empty commit, as `handle_update_layer` writes a header-only upload.
-    let (empty, _) = ls
-        .update_layer(&session_id, LAYER, oid, None, None, "writer", 101)
-        .await
-        .expect("an empty commit must succeed");
-    assert_eq!(empty, before + 1);
-    let shortcut = empty_commit_payload(before).expect("the empty-commit payload must build");
-
-    assert_empty_commit_payload_matches_the_read_build(
-        &tv,
-        oid,
-        empty,
-        &shortcut,
-        "read cut at the empty commit",
-    )
-    .await;
-
-    commit_with_relay(
-        OwnedDelta {
-            struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
-                parent_id: 0,
-                section_id: 3,
-                section_name: "Later".to_string(),
-                section_type: 0,
-                section_order: 1,
-            })],
-            ..Default::default()
-        },
-        102,
-    )
-    .await;
-    assert_empty_commit_payload_matches_the_read_build(
-        &tv,
-        oid,
-        empty,
-        &shortcut,
-        "read cut at a later commit",
-    )
-    .await;
-}
-
-/// `live_diff_case_total` summed over its labels: the diff builds recorded on
-/// `metrics`.
-fn diff_builds_recorded(metrics: &live_edit::observability::metrics::Metrics) -> u64 {
-    live_edit::observability::metrics::test_util::render(metrics)
-        .lines()
-        .filter_map(|line| line.strip_prefix("live_diff_case_total{"))
-        .filter_map(|rest| rest.rsplit_once(' '))
-        .map(|(_, value)| {
-            value
-                .trim()
-                .parse::<f64>()
-                .expect("a counter sample is a number") as u64
-        })
-        .sum()
-}
-
-/// `compute_per_commit_diff_at_cut` refuses a read whose cut is below the
-/// commit it is asked to rebuild (Spec SDD SR-3.2): the layer's sequence
-/// regressed, as a restore with an undersized sequence band leaves it, so the
-/// read's state cannot be trusted to hold that commit. It answers
-/// `PerCommitDiff::Regressed` with the read's cut and the commit, and builds
-/// nothing: no diff build is recorded on the `Metrics` it was handed.
-///
-/// The read is a real atomic read after the header's `seq` was rewound below
-/// the last commit. Its positive control is the same snapshot asked for a
-/// commit at its cut: that call builds, and the build is recorded on the same
-/// `Metrics`, so the zero above is not a metrics handle that records nothing.
-///
-/// With the check gone, the call answers `Built` for a commit its state does
-/// not prove: here a zero-byte, up-to-date payload, because the state reads
-/// as the rewound sequence.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compute_per_commit_diff_at_cut_refuses_a_read_whose_cut_is_below_the_commit() {
-    use bytes::Bytes;
-    use oodf_ffi::{CommandDiffChangeSection, OwnedDelta};
-
-    use crate::common::owned_delta::delta_to_ompf_bytes;
-
-    const LAYER: &str = "per-commit-regressed";
-    let tv = TestValkey::setup().await;
-    let ls = layer_store(&tv);
-    let session_id = create_test_session(&tv).await;
-    let oid = ls
-        .create_layer(
-            &session_id,
-            LAYER,
-            "alice",
-            &rich_object_state(),
-            mock_ext_store(),
-        )
-        .await
-        .expect("create_layer must succeed");
-    let delta = OwnedDelta {
-        struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
-            parent_id: 0,
-            section_id: 3,
-            section_name: "Later".to_string(),
-            section_type: 0,
-            section_order: 1,
-        })],
-        ..Default::default()
-    };
-    let relay = Bytes::from(delta_to_ompf_bytes(&delta, &[]));
-    let (commit, _) = ls
-        .update_layer(
-            &session_id,
-            LAYER,
-            oid,
-            Some(delta),
-            Some(relay),
-            "writer",
-            100,
-        )
-        .await
-        .expect("the commit must succeed");
-    let regressed = commit - 1;
-    let _: () = tv
-        .client()
-        .pool
-        .hset(
-            tv.key_schema().obj_header(&oid.to_string()),
-            ("seq", regressed.to_string()),
-        )
-        .await
-        .expect("rewinding the header sequence must succeed");
-    let snapshot = read_atomic_as(
-        tv.client(),
-        tv.key_schema(),
-        oid,
-        SnapshotReadConsumer::CatchupLegacyPerCommit,
-    )
-    .await;
-    assert_eq!(
-        snapshot.cut, regressed,
-        "fixture self-check: the atomic read's cut is the rewound header sequence"
-    );
-    let metrics = Arc::new(crate::common::metrics_scrape_only("test"));
-    let subscriber = SubscriberState {
-        have_object_id: oid,
-        have_version: regressed,
-    };
-
-    let answer = compute_per_commit_diff_at_cut(
+    // `rich_object_state` is at sequence 7; a reconnector at 4 is missing the
+    // `size` field (version 5) and the t=1.5 sample (version 6), and nothing
+    // else that carries a value.
+    let have_version = 4;
+    let coalesced = compute_faithful_coalesced_at_cut(
         &snapshot,
-        &subscriber,
-        commit,
-        mock_ext_store().as_ref(),
+        have_version,
+        ext_store.as_ref(),
         ExtValueReads::recover_for_test(),
         Some(&metrics),
         "test",
     )
     .await
-    .expect("a regressed read is an answer, not an error")
+    .expect("the coalesced build must succeed")
+    .into_ready()
+    .expect("a build with fetch-on-miss never answers Missing")
+    .restored_for_test(ext_store.as_ref())
+    .await
+    .expect("the coalesced layout's restores must succeed")
+    .fill(ext_store.as_ref(), None)
+    .await
+    .expect("the coalesced payload must fill")
     .into_ready()
     .expect("a build with fetch-on-miss never answers Missing");
-    match answer {
-        PerCommitDiff::Regressed { cut, to_version } => assert_eq!(
-            (cut, to_version),
-            (regressed, commit),
-            "Regressed carries the read's cut and the commit it was asked to rebuild"
-        ),
-        PerCommitDiff::Built(built) => panic!(
-            "a read whose cut ({regressed}) is below the commit ({commit}) must be refused; it \
-             built {} bytes",
-            built.ompf_bytes.len()
-        ),
-    }
+    let coalesced_bytes = coalesced.payload.to_vec();
+    let coalesced_delta = parse_delta(
+        OmpfContainer::parse(&coalesced_bytes)
+            .expect("the coalesced diff is an OMPF container")
+            .delta_bytes,
+    )
+    .expect("the coalesced diff carries an OODF delta");
+    assert_eq!(coalesced.case, DiffCase::Incremental);
     assert_eq!(
-        diff_builds_recorded(&metrics),
-        0,
-        "the refused call built nothing"
+        (
+            coalesced_delta.is_diff,
+            coalesced_delta.base_version,
+            coalesced_delta.source_format.as_str(),
+        ),
+        (true, have_version, ""),
+        "the coalesced diff is based at the reconnector's version and names no format"
+    );
+    assert_eq!(
+        coalesced_delta
+            .set_fields
+            .iter()
+            .map(|f| (f.section_id, f.key_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(2, "size")],
+        "only the field written after have_version"
+    );
+    assert_eq!(
+        coalesced_delta
+            .time_samples
+            .iter()
+            .map(|ts| (ts.section_id, ts.time))
+            .collect::<Vec<_>>(),
+        vec![(2, 1.5)],
+        "only the time sample written after have_version"
     );
 
-    // Positive control: the same snapshot, asked for a commit at its cut.
-    let control = compute_per_commit_diff_at_cut(
-        &snapshot,
-        &SubscriberState {
-            have_object_id: oid,
-            have_version: regressed - 1,
-        },
-        regressed,
-        mock_ext_store().as_ref(),
-        ExtValueReads::recover_for_test(),
-        Some(&metrics),
-        "test",
-    )
-    .await
-    .expect("the control build must succeed")
-    .into_ready()
-    .expect("a build with fetch-on-miss never answers Missing");
+    let text = live_edit::observability::metrics::test_util::render(&metrics);
+    assert_eq!(
+        (
+            diff_case_count(&text, "full_content"),
+            diff_case_count(&text, "incremental"),
+        ),
+        (1, 1),
+        "each builder records one sample under its own case"
+    );
     assert!(
-        matches!(control, PerCommitDiff::Built(_)),
-        "fixture self-check: a commit at the read's cut is built"
+        !text.contains("case=\"up_to_date\""),
+        "no build emits the up_to_date case"
     );
-    assert_eq!(
-        diff_builds_recorded(&metrics),
-        1,
-        "fixture self-check: a build is recorded on this Metrics"
-    );
+    let durations: u64 = text
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("live_diff_build_duration_seconds_count{")?
+                .rsplit_once(char::is_whitespace)
+                .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+                .map(|v| v as u64)
+        })
+        .sum();
+    assert_eq!(durations, 2, "one build-duration observation per build");
 }
 
 // =============================================================================
 // B. Unit tests: build_diff_payload
 // =============================================================================
-
-// 6. UpToDate returns empty vec.
-
-#[test]
-fn build_diff_payload_up_to_date_returns_empty_vec() {
-    let payload = build_diff_payload(
-        &DiffPlan::UpToDate,
-        "usda",
-        5,
-        &empty_scan(),
-        &empty_ext_data(),
-    )
-    .expect("build_diff_payload must succeed for UpToDate");
-    assert!(payload.is_empty(), "UpToDate must produce empty payload");
-}
 
 // 7. FullContent returns valid OMPF with parseable FlatBuffer.
 

@@ -20,10 +20,13 @@ limitations under the License.
   the render (_helpers.tpl, live-edit-service.renamedValueChecks). Then the pod
   memory checks: the memory limit every budget is derived from must be set,
   and the removed budget values must not be customized (_helpers.tpl,
-  live-edit-service.podMemoryChecks). They render nothing.
+  live-edit-service.podMemoryChecks). Then the removed catch-up switch must
+  not be customized either (_helpers.tpl,
+  live-edit-service.removedCatchupSwitchChecks). They render nothing.
 */}}
 {{- include "live-edit-service.renamedValueChecks" . }}
 {{- include "live-edit-service.podMemoryChecks" . }}
+{{- include "live-edit-service.removedCatchupSwitchChecks" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -35,22 +38,33 @@ data:
   LIVE_EDIT_METRICS_PORT: "{{ .Values.service.metrics.port }}"
   LIVE_EDIT_VALKEY_AUTH_MODE: "{{ include "live-edit-service.valkeyAuthMode" . }}"
   {{- /*
-    Integer rows. Helm decodes values.yaml numbers as float64, and one of a
-    million or more renders with an exponent (`1e+06`) that the binary's
-    integer parse rejects. So every integer row in this file whose accepted
-    range reaches a million goes through either the nonNegativeInteger helper
-    or `| int64`; a row with its own note says which and why, and every other
-    such row uses the helper. The helper accepts what the binary's integer
-    parse accepts (digits, with surrounding whitespace and one leading "+"
-    allowed), renders plain digits, and fails the render naming the key on
-    anything else, null included. A bare `| int64` would instead turn a
-    mistyped or null value into a silent 0, which matters most on the rows
-    where 0 means "derive", "unlimited" or "off". The two ports stay unpiped:
-    the binary caps them at 65535.
+    Integer rows. Every integer row in this file goes through the
+    nonNegativeInteger helper (_helpers.tpl). Helm decodes values.yaml numbers
+    as float64, and one of a million or more would otherwise render with an
+    exponent (`1e+06`) that the binary's integer parse rejects. The helper
+    accepts what the binary's integer parse accepts (digits, with surrounding
+    whitespace and one leading "+" allowed), renders plain digits, and fails
+    the render naming the key on anything else, null included. A bare
+    `| int64` would instead turn a mistyped or null value into a silent 0,
+    which matters most on the rows where 0 means "derive", "unlimited" or
+    "off". A row on which null, "" or 0 means unset keeps a guard around the
+    helper that leaves the variable out. The two ports stay unpiped: the
+    binary caps them at 65535.
   */}}
   LIVE_EDIT_VALKEY_POOL_SIZE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.poolSize" "value" .Values.valkey.poolSize "hint" "a connection count") }}"
   LIVE_EDIT_VALKEY_CONNECT_TIMEOUT_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.connectTimeoutSecs" "value" .Values.valkey.connectTimeoutSecs "hint" "seconds") }}"
-  LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.commandTimeoutMs" "value" .Values.valkey.commandTimeoutMs "hint" "milliseconds") }}"
+  {{- /*
+    0 (fred's "no timeout") fails the render, as the binary refuses it at
+    startup: with no timeout a Valkey command can wait forever, and the
+    disaster-recovery hold's bound on a replica's last write needs one. The
+    helper renders plain digits with leading zeros dropped, so "0", "00" and
+    "+0" all compare equal to "0" here.
+  */}}
+  {{- $commandTimeoutMs := include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.commandTimeoutMs" "value" .Values.valkey.commandTimeoutMs "hint" "milliseconds, at least 1") }}
+  {{- if eq $commandTimeoutMs "0" }}
+  {{- fail "valkey.commandTimeoutMs is 0, which is no longer accepted: 0 meant no timeout, and the service refuses it at startup. Set a timeout in milliseconds, such as the default 5000" }}
+  {{- end }}
+  LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS: "{{ $commandTimeoutMs }}"
   LIVE_EDIT_VALKEY_RECONNECT_MAX_DELAY_MS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.reconnectMaxDelayMs" "value" .Values.valkey.reconnectMaxDelayMs "hint" "milliseconds") }}"
   LIVE_EDIT_SUBSCRIBER_POOL_SIZE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.subscriberPoolSize" "value" .Values.valkey.subscriberPoolSize "hint" "a connection count") }}"
   LIVE_EDIT_SUBSCRIBER_MAX_CONCURRENT_CATCHUPS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.subscriberMaxConcurrentCatchups" "value" .Values.valkey.subscriberMaxConcurrentCatchups "hint" "a catch-up count") }}"
@@ -60,11 +74,16 @@ data:
     variable is then absent so the binary applies its own default (the
     subscription ceiling, which it derives from the pod memory limit). An
     explicit 0 waiter cap is rejected at startup, so "0 means unset" has to be
-    expressed as an absent variable rather than passed through verbatim.
-    `int64` for the reason LIVE_EDIT_MAX_LAYER_SIZE uses it.
+    expressed as an absent variable rather than passed through verbatim. The
+    `if` drops null, "" and an unquoted 0; any other value goes through the
+    helper, and a 0 however written ("0", "00", "+0", " 0") comes out as "0"
+    and is dropped too.
   */}}
   {{- if .Values.valkey.subscriberAdmissionMaxWaiters }}
-  LIVE_EDIT_SUBSCRIBER_ADMISSION_MAX_WAITERS: "{{ .Values.valkey.subscriberAdmissionMaxWaiters | int64 }}"
+  {{- $subscriberAdmissionMaxWaiters := include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.subscriberAdmissionMaxWaiters" "value" .Values.valkey.subscriberAdmissionMaxWaiters "hint" "a waiter count, 0 to follow the subscription ceiling") }}
+  {{- if ne $subscriberAdmissionMaxWaiters "0" }}
+  LIVE_EDIT_SUBSCRIBER_ADMISSION_MAX_WAITERS: "{{ $subscriberAdmissionMaxWaiters }}"
+  {{- end }}
   {{- end }}
   LIVE_EDIT_LAYER_STREAM_MAXLEN: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.layerStreamMaxlen" "value" .Values.valkey.layerStreamMaxlen "hint" "a stream entry count") }}"
   {{- /*
@@ -115,15 +134,12 @@ data:
     reach the binary: `extReleaseMaxBytes: 0` disables the budget, and a
     `memoryBytes` below 100000000 (`0` included) is refused at startup rather
     than silently dropped.
-    `int64` for the reason LIVE_EDIT_MAX_LAYER_SIZE uses it: Helm decodes
-    values.yaml numbers as float64, and a large value renders with an exponent
-    the binary's integer parse rejects.
   */}}
   {{- if not (or (kindIs "invalid" .Values.valkey.memoryBytes) (eq (toString .Values.valkey.memoryBytes) "")) }}
-  LIVE_EDIT_VALKEY_MEMORY_BYTES: "{{ .Values.valkey.memoryBytes | int64 }}"
+  LIVE_EDIT_VALKEY_MEMORY_BYTES: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.memoryBytes" "value" .Values.valkey.memoryBytes "hint" "bytes, empty to leave it unset") }}"
   {{- end }}
   {{- if not (or (kindIs "invalid" .Values.valkey.extReleaseMaxBytes) (eq (toString .Values.valkey.extReleaseMaxBytes) "")) }}
-  LIVE_EDIT_EXT_RELEASE_MAX_BYTES: "{{ .Values.valkey.extReleaseMaxBytes | int64 }}"
+  LIVE_EDIT_EXT_RELEASE_MAX_BYTES: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.extReleaseMaxBytes" "value" .Values.valkey.extReleaseMaxBytes "hint" "bytes, 0 turns the budget off, empty to derive it") }}"
   {{- end }}
   LIVE_EDIT_MAINTENANCE_POOL_SIZE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.maintenancePoolSize" "value" .Values.valkey.maintenancePoolSize "hint" "a connection count") }}"
   LIVE_EDIT_CATCHUP_SNAPSHOT_READ_CONCURRENCY: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.catchupSnapshotReadConcurrency" "value" .Values.valkey.catchupSnapshotReadConcurrency "hint" "a read count") }}"
@@ -139,34 +155,29 @@ data:
   {{- if not (kindIs "invalid" .Values.valkey.snapshotPoolSize) }}
   LIVE_EDIT_SNAPSHOT_POOL_SIZE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.snapshotPoolSize" "value" .Values.valkey.snapshotPoolSize "hint" "a connection count, or null to derive it") }}"
   {{- end }}
-  {{- /*
-    `int64` for the reason LIVE_EDIT_MAX_LAYER_SIZE uses it: Helm decodes
-    values.yaml numbers as float64, and a value of a million or more renders
-    with an exponent (`1e+06`) that the binary's integer parse rejects.
-  */}}
-  LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS: "{{ .Values.valkey.snapshotAtomicReadMaxItems | int64 }}"
-  LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_BYTES: "{{ .Values.valkey.snapshotAtomicReadMaxBytes | int64 }}"
-  LIVE_EDIT_MAX_LAYER_SIZE: "{{ .Values.layer.maxSize | int64 }}"
+  LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.snapshotAtomicReadMaxItems" "value" .Values.valkey.snapshotAtomicReadMaxItems "hint" "an item count") }}"
+  LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_BYTES: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "valkey.snapshotAtomicReadMaxBytes" "value" .Values.valkey.snapshotAtomicReadMaxBytes "hint" "bytes") }}"
+  LIVE_EDIT_MAX_LAYER_SIZE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "layer.maxSize" "value" .Values.layer.maxSize "hint" "bytes") }}"
   {{- /*
     Rendered only when set: the binary's default is DERIVED from
     LIVE_EDIT_RPC_DEADLINE_MS (`min(2000, deadline / 2)`), so leaving the value
     null lets the wait follow the deadline. A null check, not a bare `if`: an
-    explicit 0 (never wait) must still reach the binary.
+    explicit 0 (never wait) must still reach the binary. "" is not unset
+    here: the helper refuses it, naming the key.
   */}}
   {{- if not (kindIs "invalid" .Values.layer.uploadAdmissionWaitMs) }}
-  LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS: "{{ .Values.layer.uploadAdmissionWaitMs | int64 }}"
+  LIVE_EDIT_UPLOAD_ADMISSION_WAIT_MS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "layer.uploadAdmissionWaitMs" "value" .Values.layer.uploadAdmissionWaitMs "hint" "milliseconds, 0 never waits, null to derive it") }}"
   {{- end }}
-  LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS: "{{ .Values.layer.uploadAdmissionMaxWaiters | int64 }}"
+  LIVE_EDIT_UPLOAD_ADMISSION_MAX_WAITERS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "layer.uploadAdmissionMaxWaiters" "value" .Values.layer.uploadAdmissionMaxWaiters "hint" "an upload count") }}"
   LIVE_EDIT_UPDATE_LAYER_RETRY_MAX_ATTEMPTS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "layer.updateRetryMaxAttempts" "value" .Values.layer.updateRetryMaxAttempts "hint" "an attempt count") }}"
   LIVE_EDIT_UPDATE_LAYER_PER_OBJECT_CONCURRENCY: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "layer.updatePerObjectConcurrency" "value" .Values.layer.updatePerObjectConcurrency "hint" "a writer count") }}"
   LIVE_EDIT_UPDATE_LAYER_BACKEND: "{{ .Values.layer.updateLayerBackend }}"
-  LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED: "{{ .Values.layer.catchupSnapshotEnabled }}"
   {{- /*
     Both rendered unconditionally: a rate of `0` (never audit) and `false`
     are meaningful values that an `if` guard would drop as falsy. Both
     `required`, so an explicit null override fails the render rather than
     rendering "", which the binary refuses only at startup; `required` passes
-    0 and false. The rate is a fraction, so no `int64` pipe; Helm prints a
+    0 and false. The rate is a fraction, so not the integer helper; Helm prints a
     small float with an exponent (`1e-05`), which the binary's float parse
     accepts.
   */}}
@@ -179,13 +190,11 @@ data:
   LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "shutdown.overallBudgetSecs" "value" .Values.shutdown.overallBudgetSecs "hint" "seconds") }}"
   {{- /*
     Rendered unconditionally: `0` (end every stream at once) is a meaningful
-    value an `if` guard would drop as falsy. `required`, so an explicit null
-    override fails the render instead of silently rendering 0; `required`
-    passes 0. `int64`, so a large value never renders with an exponent the
-    binary's integer parse refuses.
+    value an `if` guard would drop as falsy. `required` refuses an explicit
+    null (and "") with a message saying what to set, and passes 0.
   */}}
-  LIVE_EDIT_SHUTDOWN_STREAM_END_RATE: "{{ required "shutdown.streamEndRate must be set: stream endings per second, 0 ends every stream at once (default 25)" .Values.shutdown.streamEndRate | int64 }}"
-  LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS: "{{ required "shutdown.streamEndMaxWindowSecs must be set: seconds, 0 ends every stream at once (default 20)" .Values.shutdown.streamEndMaxWindowSecs | int64 }}"
+  LIVE_EDIT_SHUTDOWN_STREAM_END_RATE: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "shutdown.streamEndRate" "value" (required "shutdown.streamEndRate must be set: stream endings per second, 0 ends every stream at once (default 25)" .Values.shutdown.streamEndRate) "hint" "stream endings per second, 0 ends every stream at once") }}"
+  LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "shutdown.streamEndMaxWindowSecs" "value" (required "shutdown.streamEndMaxWindowSecs must be set: seconds, 0 ends every stream at once (default 20)" .Values.shutdown.streamEndMaxWindowSecs) "hint" "seconds, 0 ends every stream at once") }}"
   LIVE_EDIT_LOG_LEVEL: "{{ .Values.observability.logging.level }}"
   LIVE_EDIT_LOG_FORMAT: "{{ if .Values.observability.logging.structured.enabled }}json{{ else }}pretty{{ end }}"
   {{- if .Values.observability.tracing.enabled }}
@@ -217,14 +226,15 @@ data:
   OTEL_TRACES_SAMPLER_ARG: {{ $ratio | quote }}
   LIVE_EDIT_TRACE_FILTER: {{ .Values.observability.tracing.filter | quote }}
   {{- /*
-    Batch export knobs, through `int64` for the reason LIVE_EDIT_MAX_LAYER_SIZE
-    uses it (float64 decoding renders large values with an exponent). Each must
-    be at least 1: the SDK ignores an unparseable value without a word, and a
-    queue of 0 would drop every span.
+    Batch export knobs. Each must be at least 1: the SDK ignores an
+    unparseable value without a word, and a queue of 0 would drop every span.
+    The helper refuses anything but a whole number, null and "" included, and
+    the check reads its digits, so a 0 however written fails.
   */}}
+  {{- $batchHints := dict "maxQueueSize" "a span count" "maxExportBatchSize" "a span count" "scheduleDelayMs" "milliseconds" }}
   {{- range $key, $var := dict "maxQueueSize" "OTEL_BSP_MAX_QUEUE_SIZE" "maxExportBatchSize" "OTEL_BSP_MAX_EXPORT_BATCH_SIZE" "scheduleDelayMs" "OTEL_BSP_SCHEDULE_DELAY" }}
-  {{- $value := index $.Values.observability.tracing.batch $key | int64 }}
-  {{- if lt $value 1 }}
+  {{- $value := include "live-edit-service.nonNegativeInteger" (dict "key" (printf "observability.tracing.batch.%s" $key) "value" (index $.Values.observability.tracing.batch $key) "hint" (get $batchHints $key)) }}
+  {{- if eq $value "0" }}
   {{- fail (printf "observability.tracing.batch.%s must be at least 1, got %v" $key (index $.Values.observability.tracing.batch $key)) }}
   {{- end }}
   {{ $var }}: "{{ $value }}"
@@ -300,11 +310,22 @@ data:
   LIVE_EDIT_CHECKPOINT_ADAPTER: "{{ .Values.checkpoint.adapter }}"
   LIVE_EDIT_CHECKPOINT_INTERVAL_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.interval" "value" .Values.checkpoint.interval "hint" "seconds") }}"
   LIVE_EDIT_CHECKPOINT_QUIESCE_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.quiesce" "value" .Values.checkpoint.quiesce "hint" "seconds") }}"
-  LIVE_EDIT_CHECKPOINT_TICK_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.tick" "value" .Values.checkpoint.tick "hint" "seconds") }}"
+  {{- /*
+    checkpoint.tick is at most 19 seconds: a tick of 20 or more lets backup
+    leadership lapse between ticks, and backup clean-up then skips its work.
+    The service refuses the same values at startup.
+  */}}
+  {{- $checkpointTick := include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.tick" "value" .Values.checkpoint.tick "hint" "seconds") }}
+  {{- if ge (int64 $checkpointTick) 20 }}
+  {{- fail (printf "checkpoint.tick is %s, but it must be 19 or less: a longer tick lets backup leadership lapse between ticks and backup clean-up skips its work. Set checkpoint.tick to at most 19 (the default is 10)" $checkpointTick) }}
+  {{- end }}
+  LIVE_EDIT_CHECKPOINT_TICK_SECS: "{{ $checkpointTick }}"
   LIVE_EDIT_CHECKPOINT_RETAIN_GENERATIONS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.retainGenerations" "value" .Values.checkpoint.retainGenerations "hint" "a generation count") }}"
   LIVE_EDIT_CHECKPOINT_SEQ_SAFETY_MARGIN: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.seqSafetyMargin" "value" .Values.checkpoint.seqSafetyMargin "hint" "a sequence-number count") }}"
   LIVE_EDIT_CHECKPOINT_CONNECT_TIMEOUT_MS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.connectTimeoutMs" "value" .Values.checkpoint.connectTimeoutMs "hint" "milliseconds") }}"
   LIVE_EDIT_CHECKPOINT_REQUEST_TIMEOUT_MS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.requestTimeoutMs" "value" .Values.checkpoint.requestTimeoutMs "hint" "milliseconds") }}"
+  LIVE_EDIT_CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.notFoundCacheSecs" "value" .Values.checkpoint.notFoundCacheSecs "hint" "seconds") }}"
+  LIVE_EDIT_DR_RESTORE_PARALLELISM: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.restoreParallelism" "value" .Values.checkpoint.restoreParallelism "hint" "a layer count") }}"
   LIVE_EDIT_CHECKPOINT_COUNTERS_SYNC_SECS: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.countersSyncInterval" "value" .Values.checkpoint.countersSyncInterval "hint" "seconds") }}"
   LIVE_EDIT_CHECKPOINT_COUNTER_SAFETY_MARGIN: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.counterSafetyMargin" "value" .Values.checkpoint.counterSafetyMargin "hint" "an object-id count") }}"
   LIVE_EDIT_CHECKPOINT_EXT_MIRROR_QUEUE_CAPACITY: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.extMirrorQueueCapacity" "value" .Values.checkpoint.extMirrorQueueCapacity "hint" "a queue length") }}"
@@ -317,18 +338,12 @@ data:
     them only in the ON state would move a boot-time rejection to the moment an
     operator flips the flag. `tail.enabled` renders from a YAML boolean, so it
     reaches the binary's stdlib bool parser as lower-case `true` / `false` —
-    the same shape as LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED above.
-
-    The three numeric caps go through `int64` for the same reason
-    LIVE_EDIT_MAX_LAYER_SIZE does: Helm decodes values.yaml numbers as
-    float64, and rendering one large enough to need an exponent (the 64 MiB
-    maxBytes default is already one) yields `6.7108864e+07`, which the
-    binary's integer parse rejects at startup.
+    the same shape as LIVE_EDIT_CHECKPOINT_ENABLED above.
   */}}
   LIVE_EDIT_CHECKPOINT_TAIL_ENABLED: "{{ .Values.checkpoint.tail.enabled }}"
-  LIVE_EDIT_CHECKPOINT_TAIL_MAX_CHAIN: "{{ .Values.checkpoint.tail.maxChain | int64 }}"
-  LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES: "{{ .Values.checkpoint.tail.maxEntries | int64 }}"
-  LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES: "{{ .Values.checkpoint.tail.maxBytes | int64 }}"
+  LIVE_EDIT_CHECKPOINT_TAIL_MAX_CHAIN: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.tail.maxChain" "value" .Values.checkpoint.tail.maxChain "hint" "a backup count") }}"
+  LIVE_EDIT_CHECKPOINT_TAIL_MAX_ENTRIES: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.tail.maxEntries" "value" .Values.checkpoint.tail.maxEntries "hint" "an edit count") }}"
+  LIVE_EDIT_CHECKPOINT_TAIL_MAX_BYTES: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.tail.maxBytes" "value" .Values.checkpoint.tail.maxBytes "hint" "bytes") }}"
   {{- /*
     Reconciliation cadence is the one checkpoint row that is conditional on the
     value being NON-EMPTY rather than on the adapter: its binary default is

@@ -184,6 +184,15 @@ pub enum RebaseRefusal {
     /// `put_layer_checkpoint` failed. Nothing landed at the address in any of
     /// the three; the two pre-PUT sub-arms are distinguished by their own WARNs.
     BasePut,
+    /// The pre-PUT clean-up fence (`checkpoint::put_guard`, b.g65) refused the
+    /// base PUT: the checkpoint clean-up deleted the backup copy of a large
+    /// value the new base names within the re-base's reliance window (from
+    /// before its gather), or is deleting an earlier copy of the same
+    /// generation, or the re-arm that must precede the PUT could not be
+    /// recorded in Valkey. Nothing landed at the address; the lineage is
+    /// untouched and a later tick re-attempts. The loop also counts
+    /// `checkpoint_reconcile_total{publish_deferred}`.
+    Cleanup,
 }
 
 impl RebaseDecision {
@@ -407,6 +416,10 @@ pub(crate) async fn rebase_layer_lineage_with_probe(
         .checked_add(budget)
         .unwrap_or_else(no_deadline);
 
+    // The clean-up fence's reliance start (`checkpoint::put_guard`): every
+    // read the new base is composed from — the gather and the backfill's
+    // reads — happens after it.
+    let reliance_start = std::time::Instant::now();
     let mut selection = match gather_restore_lineage(store, object_id, deadline, reserve).await {
         Ok(selection) => selection,
         Err(CheckpointError::NotFound) => return Err(CheckpointError::NotFound),
@@ -778,9 +791,10 @@ pub(crate) async fn rebase_layer_lineage_with_probe(
     // The collapsed lineage's TOTAL span: this base genuinely covers every
     // commit from the old root to S, so "commits this generation covers that the
     // previous did not" is `S - base_snap_seq`. That is the one column
-    // `adjudicate_composed_meta`'s two callers derive differently, which is
-    // exactly why it is an argument there — restore wants the head tail's
-    // interval instead. Identity (`session_id` / `layer_name` / `created_by` /
+    // `adjudicate_composed_meta`'s callers derive differently (this re-base on
+    // one side, the two restore callers on the other), which is exactly why it
+    // is an argument there — restore wants the head tail's interval instead.
+    // Identity (`session_id` / `layer_name` / `created_by` /
     // `server_ts`) is BASE-sourced by the gather's MUST: a tail meta must never
     // reach `apply::live_mapping_resolves_blob_identity`.
     let observed_commit_span = head_seq.saturating_sub(base_snap_seq);
@@ -823,6 +837,7 @@ pub(crate) async fn rebase_layer_lineage_with_probe(
         head_seq,
         Bytes::from(ompf_bytes),
         meta,
+        reliance_start,
         "re-base",
     )
     .await
@@ -830,6 +845,10 @@ pub(crate) async fn rebase_layer_lineage_with_probe(
         Ok(Some(handle)) => handle,
         Ok(None) => return Err(CheckpointError::NotFound),
         Err(CheckpointError::NotFound) => return Err(CheckpointError::NotFound),
+        // The clean-up fence refused the PUT; `put_guard` logged why.
+        Err(err) if err.is_cleanup_in_flight() => {
+            return Ok(RebaseDecision::Refused(RebaseRefusal::Cleanup));
+        }
         Err(err) => {
             // `NotImplemented` folds here too: only the `Disabled` adapter
             // produces it and the tick's enable gate makes it unreachable, so it

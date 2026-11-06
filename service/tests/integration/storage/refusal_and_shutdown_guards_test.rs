@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! b.kgb — two source-shape guards over the production code under `src/`.
+//! b.kgb — source-shape guards over the production code under `src/`.
 //!
-//! Both rules are easy to break without any behavioural test noticing, because
-//! the code that breaks them works on every path a test drives:
+//! Each rule is easy to break without any behavioural test noticing, because
+//! the code that breaks it works on every path a test drives:
 //!
 //! - **Streaming RPCs take their shutdown token only from
 //!   `GracefulShutdown::enroll_stream`** (SDD §5.6). A stream holding a bare
@@ -25,11 +25,18 @@
 //!   (a child of the parent) or all at once at t0 (a child of `begun`), and a
 //!   stream opened after t0 is not refused. The reconnect storm b.kgb fixed
 //!   comes back, on one handler, with every test green.
+//! - **A stream's endings driven by its enrolled token follow the token's
+//!   cause** (SDD SR-6.3, SR-6.5): every arm that observes it ends through
+//!   `end_on_shutdown`, and `server_shutting_down()` is built only where the
+//!   shutdown sequence alone ends a stream. A site that builds the shutdown
+//!   status itself ends every SIGTERM test correctly and ends a hold as a
+//!   shutdown.
 //! - **Every gRPC status detail is built by `crate::error`**
 //!   (`RefusalDetail` / `refusal_status`), so the `ErrorInfo` / `RetryInfo`
 //!   wire shape clients parse cannot drift between refusals.
 //!
-//! Both scans read **production** code only: comments and string-literal
+//! The scans read **production** code only (the ending scan, the feature-free
+//! release build's): comments and string-literal
 //! contents are removed by the scanner shared with `txn_checkout_test.rs`
 //! ([`code_lines_outside_strings`]), and every item under a `cfg` that holds
 //! only in test builds (`#[cfg(test)]`, `#[cfg(all(test, …))]`) is removed by
@@ -87,9 +94,10 @@ const SHARED_TOKEN_ACCESSORS: [&str; 2] = [".begun()", ".service_shutdown_token(
 /// stream selecting on them would be a bare child of it, so they exist only in
 /// test builds (`#[cfg(any(test, feature = "test-support"))]`), and the
 /// feature-free release build refuses a production call.
-const GRACEFUL_SHUTDOWN_RELEASE_API: [&str; 6] = [
+const GRACEFUL_SHUTDOWN_RELEASE_API: [&str; 7] = [
     "begun",
     "cancel",
+    "end_streams_for_hold",
     "enroll_stream",
     "enrolled",
     "new",
@@ -881,7 +889,8 @@ fn release_methods_of_graceful_shutdown(source: &str) -> Vec<String> {
 }
 
 /// The names of the functions in `flat` whose signature mentions
-/// `CancellationToken` — the ways a module can hand one out.
+/// `CancellationToken`, or `StreamShutdown` (a stream's enrolled token with its
+/// cause slot) — the ways a module can hand one out.
 fn functions_handing_out_tokens(flat: &str) -> Vec<String> {
     let mut names: Vec<String> = flat
         .match_indices("fn ")
@@ -889,8 +898,8 @@ fn functions_handing_out_tokens(flat: &str) -> Vec<String> {
         .filter_map(|(at, _)| {
             let rest = &flat[at + 3..];
             let signature_end = rest.find(['{', ';']).unwrap_or(rest.len());
-            rest[..signature_end]
-                .contains("CancellationToken")
+            let signature = &rest[..signature_end];
+            (signature.contains("CancellationToken") || signature.contains("StreamShutdown"))
                 .then(|| rest.chars().take_while(|c| is_ident(*c)).collect())
         })
         .collect();
@@ -981,7 +990,7 @@ fn streaming_handlers_take_their_shutdown_token_only_from_enroll_stream() {
     let handle = FlatCode::new(&tree.file(GRACEFUL_SHUTDOWN_MODULE).code).string();
     for anchor in [
         "pub struct GracefulShutdown { shared: Arc<Shared>, }",
-        "pub fn enroll_stream(&self) -> (CancellationToken, StreamEnrollment)",
+        "pub fn enroll_stream(&self) -> (StreamShutdown, StreamEnrollment)",
         "pub fn begun(&self) -> &CancellationToken",
         "pub(crate) fn service_shutdown_token(&self) -> &CancellationToken",
     ] {
@@ -1015,13 +1024,22 @@ fn streaming_handlers_take_their_shutdown_token_only_from_enroll_stream() {
             );
         }
     }
+    // `deref` is `StreamShutdown`'s: it lends a stream's own enrolled token
+    // (from `enroll_stream`) to the stream holding it, which this guard leaves
+    // to the stream (see `scan_shutdown_tokens`).
     assert_eq!(
         functions_handing_out_tokens(&handle),
-        ["begin", "begun", "enroll_stream", "service_shutdown_token"],
+        [
+            "begin",
+            "begun",
+            "deref",
+            "enroll_stream",
+            "service_shutdown_token"
+        ],
         "the set of functions in {GRACEFUL_SHUTDOWN_MODULE} whose signature carries a \
-         `CancellationToken` changed. A new one is a new way out of the handle that this guard \
-         does not police: decide whether it may hand the token to a stream, and extend \
-         `scan_shutdown_tokens` before adding it here"
+         `CancellationToken` or a `StreamShutdown` changed. A new one is a new way out of the \
+         handle that this guard does not police: decide whether it may hand the token to a \
+         stream, and extend `scan_shutdown_tokens` before adding it here"
     );
 
     let mut escapes = Vec::new();
@@ -1128,6 +1146,937 @@ fn streaming_handlers_take_their_shutdown_token_only_from_enroll_stream() {
              production code. Without it the stream is in no paced-ending snapshot"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Guard 1b — a stream's shutdown endings follow its token's cause
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every `server_shutting_down()` call the streaming handlers may make, in the
+/// feature-free release build: `(file, enclosing function, head of the match
+/// arm or block the call is in, why it has no hold cause to map)`. Anchored by
+/// code shape, not line, so unrelated edits do not move it.
+const SHUTDOWN_ONLY_ENDINGS: [(&str, &str, &str, &str); 7] = [
+    (
+        "src/grpc/subscribe.rs",
+        "refusal_to_status",
+        "AdmissionRefusal::ShuttingDown =>",
+        "the no-cause mapping of an admission shutdown refusal; the handler maps the token leg \
+         by its cause before it gets here, so only the gate `ValkeyClient::quit` closed reaches it",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "acquire_catchup_slot",
+        "Err(CatchUpRefusal::Closed) =>",
+        "the catch-up gate closed by `ValkeyClient::quit`: the shutdown sequence, not a token",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "acquire_snapshot_read_permit",
+        "Err(CatchUpRefusal::Closed) =>",
+        "the snapshot-read gate closed by `ValkeyClient::quit`: the shutdown sequence, not a token",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "reserve_catchup_payload",
+        "Err(CatchUpRefusal::Closed) =>",
+        "the catch-up payload budget closed by `ValkeyClient::quit`: the shutdown sequence, not \
+         a token",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "read_through_flight",
+        "Err(FlightWaitError::ShuttingDown) =>",
+        "the layer's snapshot flight closed by the shutdown sequence, not a token",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "consume_error_status",
+        "ConsumeError::ShuttingDown =>",
+        "the stream multiplexer closed by `ValkeyClient::quit`: the shutdown sequence, not a token",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "join_session_inner",
+        "if svc.shutdown.begun().is_cancelled()",
+        "JoinSession's handler refuses a join that arrives after SIGTERM's t0; `begun` is a \
+         shutdown signal only, which a hold never cancels",
+    ),
+];
+
+/// The ways to observe a cancellation token. The ending scan reads every one,
+/// on every receiver.
+const STREAM_OBSERVATIONS: [&str; 3] = [".cancelled()", ".is_cancelled()", ".cancelled_owned()"];
+
+/// Helpers a streaming handler observes a token through, by passing it as the
+/// one argument (`cancelled_or_never(token)`, from `storage`).
+const TOKEN_HELPERS: [&str; 1] = ["cancelled_or_never("];
+
+/// The receiver name of a streaming handler's enrolled token: the stream's own
+/// `StreamShutdown` (`ctx.shutdown`, `self.shutdown`, or a `shutdown`
+/// parameter — `send_racing_endings` takes it so).
+const ENROLLED_TOKEN: &str = "shutdown";
+
+/// The only other receivers a streaming handler may observe a cancellation on,
+/// per file: `(file, receiver, why its observations are not the enrolled
+/// token's endings)`. Closed world: an observation on any receiver not listed
+/// here and not [`ENROLLED_TOKEN`] fails the guard, so the enrolled token
+/// cannot be observed under an unlisted name — rebound to a local, or passed
+/// to a helper under a new parameter name — where its arms go unchecked. The
+/// scan works on names, not data flow: the enrolled token rebound to a listed
+/// name (`let session_cancel = &*ctx.shutdown;`), or handed to
+/// `cancelled_or_never` as an argument ending in a listed name, is not seen.
+const OTHER_OBSERVED_RECEIVERS: [(&str, &str, &str); 5] = [
+    (
+        "src/grpc/subscribe.rs",
+        "session_token()",
+        "`SubscriberCtx::session_token`, the subscription's session token, cancelled only once \
+         the session is gone from the store; its arms end by the deletion or absence \
+         (`end_on_session_cancel`, SDD §7.8). A hold never cancels a session token",
+    ),
+    (
+        "src/grpc/subscribe.rs",
+        "session_cancel",
+        "`send_racing_endings`' session-token parameter, which it relays as \
+         `SendOutcome::SessionCancelled`; a hold never cancels a session token",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "session_cancel",
+        "the session token, cancelled only once the session is gone from the store; its arms \
+         end the join by the deletion or absence (`end_on_session_cancel`, SDD §7.8). A hold \
+         never cancels a session token",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "teardown",
+        "the lease keeper's own stop token, cancelled by the join's teardown; the keeper only \
+         stops on it and ends no stream",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "begun()",
+        "JoinSession's handler refusal at SIGTERM's t0, a shutdown-only site \
+         (`SHUTDOWN_ONLY_ENDINGS`); `begun` is a shutdown signal a hold never cancels",
+    ),
+];
+
+/// Outcomes an observation of a stream's own token may hand on instead of
+/// ending the stream itself, per file. Closed world: every occurrence of the
+/// outcome's path in the file is either the observation's arm that produces
+/// it or a match arm `<outcome> =>` that ends through `end_on_shutdown`; any
+/// other use — `Ok(<outcome>) =>`, an or-pattern, `if let`, `matches!`, an
+/// import — fails the guard. A match arm counts only when it starts right
+/// after `{`, `,` or `}`: a correct arm with an attribute
+/// (`#[allow(…)] <outcome> =>`) or a leading `|` is reported as stray too
+/// (fail-closed; neither shape exists today). The scan matches the path by
+/// name: an aliased type (`use SendOutcome as S;`, `type S = SendOutcome;`)
+/// or `Self::ShuttingDown` is not seen.
+const RELAYED_SHUTDOWN_OUTCOMES: [(&str, &str); 2] = [
+    ("src/grpc/subscribe.rs", "SendOutcome::ShuttingDown"),
+    ("src/grpc/presence.rs", "ReplayOutcome::ShuttingDown"),
+];
+
+/// Observations of a stream's own token that only stop work and end no
+/// stream, exactly: `(file, enclosing function, count, why)`. Each must build
+/// no status.
+const STOP_ONLY_OBSERVATIONS: [(&str, &str, usize, &str); 3] = [
+    (
+        "src/grpc/presence.rs",
+        "LeaseKeeper::run",
+        1,
+        "the lease keeper stops renewing when the join's token fires; the join's own arms end \
+         the stream",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "LeaseKeeper::stopping",
+        1,
+        "the lease keeper's stop check before a rejoin; it writes nothing and ends no stream",
+    ),
+    (
+        "src/grpc/presence.rs",
+        "handle_client_message",
+        1,
+        "the PeerMessage publish is best effort (SDD §13.1); the race only abandons it at the \
+         join's ending and builds no status; both callers' loops observe the token first on \
+         their next pass and end through end_on_shutdown",
+    ),
+];
+
+/// What [`scan_stream_endings`] found in one streaming handler.
+#[derive(Default, Debug)]
+struct StreamEndingScan {
+    /// `(line, enclosing function)` of each observation of the stream's own
+    /// token whose arm or block ends through `end_on_shutdown`.
+    direct: Vec<(usize, String)>,
+    /// `(line, outcome)` of each observation that hands on a relayed outcome.
+    relayed: Vec<(usize, String)>,
+    /// `(line, enclosing function, consequence)` of every other observation.
+    other: Vec<(usize, String, String)>,
+    /// `(line, outcome, ends through end_on_shutdown)` of each match arm on a
+    /// relayed outcome.
+    relay_arms: Vec<(usize, String, bool)>,
+    /// `(line, enclosing function, what)` of each other use of a relayed
+    /// outcome's path (or a glob or braced import of its type).
+    stray_outcomes: Vec<(usize, String, String)>,
+    /// `(line, enclosing function, receiver)` of each observation on a
+    /// receiver other than [`ENROLLED_TOKEN`]: a name, `name()` for a call
+    /// result such as `begun()`, or `<expression>`.
+    other_receivers: Vec<(usize, String, String)>,
+    /// `(line, enclosing function, head)` of each `server_shutting_down()`
+    /// call.
+    shutdown_only: Vec<(usize, String, String)>,
+}
+
+/// The index of the `}` closing the `{` at `open`.
+fn matching_brace(flat: &FlatCode, open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for i in open..flat.text.len() {
+        match flat.text[i] {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `(body open, body close, name)` of every function in `flat`, named
+/// `Type::name` inside an `impl Type` block and `name` outside one.
+fn function_bodies(flat: &FlatCode) -> Vec<(usize, usize, String)> {
+    let body_of = |start: usize| -> Option<(usize, usize)> {
+        let open = (start..flat.text.len()).find(|&i| matches!(flat.text[i], '{' | ';'))?;
+        if flat.text[open] != '{' {
+            return None;
+        }
+        Some((open, matching_brace(flat, open)?))
+    };
+    // An `impl` item, not an `impl Trait` argument or return type: it stands
+    // where an item may start.
+    let impls: Vec<(usize, usize, String)> = flat
+        .find_standalone("impl")
+        .into_iter()
+        .filter(|&at| matches!(flat.text.get(at + 4), Some(' ' | '<')))
+        .filter(|&at| {
+            let before = (0..at).rev().find(|&i| flat.text[i] != ' ');
+            before.is_none_or(|i| matches!(flat.text[i], '}' | ';' | '{' | ']'))
+        })
+        .filter_map(|at| {
+            let (open, close) = body_of(at)?;
+            let header: String = flat.text[at + 4..open].iter().collect();
+            let mut header = header.trim();
+            if header.starts_with('<') {
+                let mut depth = 0i32;
+                let end = header.char_indices().find_map(|(i, c)| {
+                    match c {
+                        '<' => depth += 1,
+                        '>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                })?;
+                header = header[end..].trim();
+            }
+            if let Some((_, ty)) = header.rsplit_once(" for ") {
+                header = ty.trim();
+            }
+            let path: String = header
+                .chars()
+                .take_while(|c| is_ident(*c) || *c == ':')
+                .collect();
+            let name = path.rsplit("::").next().unwrap_or_default().to_string();
+            Some((open, close, name))
+        })
+        .collect();
+    flat.find_standalone("fn ")
+        .into_iter()
+        .filter_map(|at| {
+            let (open, close) = body_of(at)?;
+            let name: String = flat.text[at + 3..]
+                .iter()
+                .take_while(|c| is_ident(**c))
+                .collect();
+            let owner = impls
+                .iter()
+                .filter(|(o, c, _)| *o < at && at < *c)
+                .max_by_key(|(o, _, _)| *o)
+                .map(|(_, _, ty)| ty.clone());
+            Some((
+                open,
+                close,
+                owner.map_or(name.clone(), |ty| format!("{ty}::{name}")),
+            ))
+        })
+        .collect()
+}
+
+/// The innermost function of `bodies` whose body encloses `at`; empty outside
+/// every function.
+fn enclosing_function(bodies: &[(usize, usize, String)], at: usize) -> String {
+    bodies
+        .iter()
+        .filter(|(open, close, _)| *open < at && at < *close)
+        .max_by_key(|(open, _, _)| *open)
+        .map(|(_, _, name)| name.clone())
+        .unwrap_or_default()
+}
+
+/// What follows an observation (or an arm's pattern) at `at`: the arm's body
+/// after `=>` — a block, or an expression up to its `,` — or the block an
+/// `if` condition opens. Empty when the observation is part of a longer
+/// expression (`a || shutdown.is_cancelled()`, `.await`).
+fn consequence_at(flat: &FlatCode, at: usize) -> String {
+    let (start, end) = consequence_span(flat, at);
+    flat.text[start..end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// [`consequence_at`]'s text as a `[start, end)` span of `flat`; empty when
+/// there is none.
+fn consequence_span(flat: &FlatCode, mut at: usize) -> (usize, usize) {
+    let skip_spaces = |at: &mut usize| {
+        while flat.text.get(*at) == Some(&' ') {
+            *at += 1;
+        }
+    };
+    skip_spaces(&mut at);
+    if flat.starts_with_at(at, "=>") {
+        at += 2;
+        skip_spaces(&mut at);
+    } else if flat.text.get(at) != Some(&'{') {
+        return (at, at);
+    }
+    if flat.text.get(at) == Some(&'{') {
+        let close = matching_brace(flat, at).unwrap_or(flat.text.len() - 1);
+        return (at, close + 1);
+    }
+    let start = at;
+    let mut depth = 0usize;
+    while at < flat.text.len() {
+        match flat.text[at] {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => break,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => break,
+            _ => {}
+        }
+        at += 1;
+    }
+    (start, at)
+}
+
+/// The receiver of the method call whose `.` is at `at`: its identifier
+/// (`shutdown` in `ctx.shutdown.cancelled()`), `name()` when it is the result
+/// of a call (`begun()` in `svc.shutdown.begun().is_cancelled()`), or
+/// `<expression>` for anything else.
+fn receiver_label(flat: &FlatCode, at: usize) -> String {
+    let ident = flat.receiver_ident(at);
+    if !ident.is_empty() {
+        return ident;
+    }
+    if at > 0 && flat.text[at - 1] == ')' {
+        let mut depth = 0usize;
+        let mut i = at;
+        while i > 0 {
+            i -= 1;
+            match flat.text[i] {
+                ')' => depth += 1,
+                '(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let name = flat.receiver_ident(i);
+        if !name.is_empty() {
+            return format!("{name}()");
+        }
+    }
+    "<expression>".to_string()
+}
+
+/// [`receiver_label`] of the single argument of the call whose `(` is at
+/// `open` (`session_token()` for `cancelled_or_never(ctx.session_token())`).
+fn argument_label(flat: &FlatCode, open: usize) -> String {
+    let mut depth = 0usize;
+    for i in open..flat.text.len() {
+        match flat.text[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return receiver_label(flat, i);
+                }
+            }
+            _ => {}
+        }
+    }
+    "<expression>".to_string()
+}
+
+/// Observations of a token that are not a method call on it, as
+/// `(index, what is observed)`:
+///
+/// - [`TOKEN_HELPERS`] calls, labelled by their argument;
+/// - a path to an observation method (`CancellationToken::is_cancelled`), as
+///   a qualified call (labelled by its argument) or as a function handed to a
+///   method (`token.is_some_and(CancellationToken::is_cancelled)`, labelled by
+///   that method's receiver). `Status::cancelled`, a status constructor, is
+///   not one.
+fn token_observations_by_path(flat: &FlatCode) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    for helper in TOKEN_HELPERS {
+        for at in flat.find_standalone(helper) {
+            found.push((at, argument_label(flat, at + helper.len() - 1)));
+        }
+    }
+    for method in ["::cancelled", "::is_cancelled", "::cancelled_owned"] {
+        for at in flat.find_all(method) {
+            let after = at + method.len();
+            if flat.text.get(after).is_some_and(|c| is_ident(*c)) {
+                continue;
+            }
+            let path_start = (0..at)
+                .rev()
+                .take_while(|&i| is_ident(flat.text[i]) || flat.text[i] == ':')
+                .last()
+                .unwrap_or(at);
+            let path: String = flat.text[path_start..after].iter().collect();
+            if path.ends_with(&format!("Status{method}")) {
+                continue;
+            }
+            let label = if flat.text.get(after) == Some(&'(') {
+                argument_label(flat, after)
+            } else if path_start > 0 && flat.text[path_start - 1] == '(' {
+                let called = flat.receiver_ident(path_start - 1);
+                let dot = (path_start - 1).saturating_sub(called.len() + 1);
+                if !called.is_empty() && flat.text[dot] == '.' {
+                    receiver_label(flat, dot)
+                } else {
+                    format!("<{path}>")
+                }
+            } else {
+                format!("<{path}>")
+            };
+            found.push((at, label));
+        }
+    }
+    found
+}
+
+/// The head of the match arm or block a call at `at` sits in: the arm's
+/// pattern with its `=>` (`Err(CatchUpRefusal::Closed) =>`), or the code
+/// before a block's `{` (`if svc.shutdown.begun().is_cancelled()`).
+fn enclosing_head(flat: &FlatCode, at: usize) -> String {
+    let mut depth = 0i32;
+    let mut i = at;
+    let end = loop {
+        if i == 0 {
+            return String::new();
+        }
+        i -= 1;
+        match flat.text[i] {
+            ')' | ']' | '}' => depth += 1,
+            '(' | '[' | '{' if depth > 0 => depth -= 1,
+            '{' => break i,
+            '>' if depth == 0 && i > 0 && flat.text[i - 1] == '=' => break i + 1,
+            _ => {}
+        }
+    };
+    let mut depth = 0i32;
+    let mut start = end;
+    while start > 0 {
+        let c = flat.text[start - 1];
+        match c {
+            ')' | ']' => depth += 1,
+            '(' | '[' if depth > 0 => depth -= 1,
+            '}' if depth > 0 => depth += 1,
+            '{' if depth > 0 => depth -= 1,
+            ',' | ';' | '{' | '}' if depth == 0 => break,
+            _ => {}
+        }
+        start -= 1;
+    }
+    let head: String = flat.text[start..end].iter().collect();
+    let head = head.trim();
+    head.strip_suffix('{').unwrap_or(head).trim().to_string()
+}
+
+/// Classify, in what the feature-free release build compiles of a streaming
+/// handler:
+///
+/// - every observation ([`STREAM_OBSERVATIONS`]) of the stream's own enrolled
+///   token — receiver [`ENROLLED_TOKEN`] — by what its arm or block does;
+/// - every observation on any other receiver, by that receiver, for the
+///   caller to check against [`OTHER_OBSERVED_RECEIVERS`];
+/// - every occurrence of a `relayed` outcome's path: the producing arm of an
+///   observation, a match arm `<outcome> =>` (preceded by `{`, `,` or `}`), or
+///   a stray use; and a glob or braced import of the outcome's type, also
+///   stray;
+/// - every `server_shutting_down()` call with the arm or block it sits in.
+fn scan_stream_endings(source: &str, relayed: &[&str]) -> StreamEndingScan {
+    let code = release_code(source);
+    let flat = FlatCode::new(&code);
+    let bodies = function_bodies(&flat);
+    let mut scan = StreamEndingScan::default();
+    let mut producer_spans: Vec<(usize, usize)> = Vec::new();
+    for observation in STREAM_OBSERVATIONS {
+        for at in flat.find_all(observation) {
+            let line = flat.line_of[at];
+            let receiver = receiver_label(&flat, at);
+            if receiver != ENROLLED_TOKEN {
+                scan.other_receivers
+                    .push((line, enclosing_function(&bodies, at), receiver));
+                continue;
+            }
+            let (start, end) = consequence_span(&flat, at + observation.len());
+            let consequence = consequence_at(&flat, at + observation.len());
+            if consequence.contains("end_on_shutdown(") {
+                scan.direct.push((line, enclosing_function(&bodies, at)));
+            } else if let Some(outcome) = relayed.iter().find(|o| consequence.contains(**o)) {
+                scan.relayed.push((line, (*outcome).to_string()));
+                producer_spans.push((start, end));
+            } else {
+                scan.other
+                    .push((line, enclosing_function(&bodies, at), consequence));
+            }
+        }
+    }
+    // The enrolled token is classified only as a method call; observed any
+    // other way it is recorded under a label no allow-list carries.
+    for (at, label) in token_observations_by_path(&flat) {
+        let label = if label == ENROLLED_TOKEN {
+            format!("{label} (observed other than by a method call)")
+        } else {
+            label
+        };
+        scan.other_receivers
+            .push((flat.line_of[at], enclosing_function(&bodies, at), label));
+    }
+    scan.other_receivers.sort();
+    for outcome in relayed {
+        for at in flat.find_standalone(outcome) {
+            if flat
+                .text
+                .get(at + outcome.len())
+                .is_some_and(|c| is_ident(*c))
+            {
+                continue;
+            }
+            if producer_spans
+                .iter()
+                .any(|(start, end)| *start <= at && at < *end)
+            {
+                continue;
+            }
+            let line = flat.line_of[at];
+            let before = (0..at).rev().find(|&i| flat.text[i] != ' ');
+            let arm_start = before.is_some_and(|i| matches!(flat.text[i], '{' | ',' | '}'));
+            if arm_start && flat.starts_with_at(at + outcome.len(), " =>") {
+                let consequence = consequence_at(&flat, at + outcome.len());
+                scan.relay_arms.push((
+                    line,
+                    (*outcome).to_string(),
+                    consequence.contains("end_on_shutdown("),
+                ));
+            } else {
+                let context_start = before.map_or(0, |i| i.saturating_sub(24));
+                let context_end = (at + outcome.len() + 8).min(flat.text.len());
+                let context: String = flat.text[context_start..context_end].iter().collect();
+                scan.stray_outcomes.push((
+                    line,
+                    enclosing_function(&bodies, at),
+                    format!(
+                        "`{outcome}` used outside its producing arm and its `{outcome} =>` \
+                         match arms: `…{context}…`"
+                    ),
+                ));
+            }
+        }
+        let ty = outcome.rsplit_once("::").map_or(*outcome, |(ty, _)| ty);
+        for import in [format!("{ty}::*"), format!("{ty}::{{")] {
+            for at in flat.find_standalone(&import) {
+                scan.stray_outcomes.push((
+                    flat.line_of[at],
+                    enclosing_function(&bodies, at),
+                    format!(
+                        "`{import}` imports the outcome's variants, which this scan cannot follow"
+                    ),
+                ));
+            }
+        }
+    }
+    for at in flat.find_standalone("server_shutting_down(") {
+        scan.shutdown_only.push((
+            flat.line_of[at],
+            enclosing_function(&bodies, at),
+            enclosing_head(&flat, at),
+        ));
+    }
+    for list in [&mut scan.direct, &mut scan.relayed] {
+        list.sort();
+    }
+    scan
+}
+
+/// **Every streaming ending driven by a stream's own enrolled token follows
+/// that token's cause** (SDD SR-6.3, SR-6.5): in `subscribe.rs` and
+/// `presence.rs`, every arm or block that observes the token
+/// (`shutdown.cancelled()` / `.is_cancelled()` / `.cancelled_owned()`) ends
+/// through `end_on_shutdown`, which maps a fleet hold to `SERVICE_HELD`, a
+/// stale hold verdict to `UPSTREAM_UNAVAILABLE` and SIGTERM to `server
+/// shutting down`; and `server_shutting_down()` appears only at the
+/// shutdown-only sites ([`SHUTDOWN_ONLY_ENDINGS`]), which the shutdown
+/// sequence alone reaches.
+///
+/// A token-driven site that builds `server_shutting_down()` itself still ends
+/// the stream on every behavioural test of a SIGTERM, and on a hold sends the
+/// client back within 100 ms, as a shutdown, instead of after the hold's 30 s.
+/// The behavioural hold tests reach only some sites; this guard covers every
+/// one in the two files, including sites added later.
+///
+/// Allowed besides a direct `end_on_shutdown`:
+///
+/// - an observation that hands on a [`RELAYED_SHUTDOWN_OUTCOMES`] outcome
+///   (`send_racing_endings`' `SendOutcome::ShuttingDown`, the join replay's
+///   `ReplayOutcome::ShuttingDown`), provided every match arm on that outcome
+///   ends through `end_on_shutdown`;
+/// - the stop-only observations ([`STOP_ONLY_OBSERVATIONS`]), which only stop
+///   work and build no status: the lease keeper's, and `handle_client_message`'s
+///   race of the best-effort `PeerMessage` publish, whose callers end the
+///   stream through `end_on_shutdown` on their next pass.
+///
+/// **Closed world.** The guard checks the arms of an observation it
+/// recognises as the enrolled token's, so it refuses every observation it
+/// cannot place:
+///
+/// - a cancellation observed on any receiver other than the enrolled token
+///   and the listed ones ([`OTHER_OBSERVED_RECEIVERS`], each with why it is
+///   not the enrolled token) — by method call, by a path such as
+///   `CancellationToken::is_cancelled`, or through `cancelled_or_never` — so
+///   the enrolled token cannot be rebound to a local or passed to a helper
+///   under an unlisted name;
+/// - a relayed outcome used anywhere but its producing arm and a
+///   `<outcome> =>` match arm (an `Ok(<outcome>) =>`, an or-pattern, `if let`,
+///   `matches!`, an import of the variants).
+///
+/// It reads these two files only: a helper defined elsewhere that takes the
+/// enrolled token (other than `cancelled_or_never`, whose argument it reads)
+/// is outside it. And it works on names, not data flow: the enrolled token
+/// rebound to a listed name, a `cancelled_or_never` argument ending in a
+/// listed name, and a relayed outcome reached through an aliased type or
+/// `Self::` are not seen.
+#[test]
+fn streaming_endings_driven_by_the_enrolled_token_end_through_end_on_shutdown() {
+    let tree = ProductionTree::load_release();
+    tree.assert_visits(&STREAMING_HANDLERS);
+
+    let mut violations = Vec::new();
+    let mut stop_only: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut shutdown_only: Vec<(String, String, String)> = Vec::new();
+    for handler in STREAMING_HANDLERS {
+        let file = tree.file(handler);
+        let relayed: Vec<&str> = RELAYED_SHUTDOWN_OUTCOMES
+            .iter()
+            .filter(|(path, _)| *path == handler)
+            .map(|(_, outcome)| *outcome)
+            .collect();
+        let scan = scan_stream_endings(&file.source, &relayed);
+        let site = |line: usize| format!("{handler}:{line}\n    {}", file.source_line(line));
+
+        // Non-vacuity: each handler still has token-driven endings the scan
+        // recognises, and each relayed outcome is still observed and matched.
+        assert!(
+            !scan.direct.is_empty(),
+            "the scan found no observation of the enrolled token ending through \
+             `end_on_shutdown` in `{handler}`: the token or the function was renamed, or the \
+             scan broke; it would now pass anything"
+        );
+        for outcome in &relayed {
+            assert!(
+                scan.relayed.iter().any(|(_, o)| o.as_str() == *outcome)
+                    && scan
+                        .relay_arms
+                        .iter()
+                        .any(|(_, o, _)| o.as_str() == *outcome),
+                "`{handler}` no longer both produces and matches `{outcome}`; update \
+                 `RELAYED_SHUTDOWN_OUTCOMES`. Found: {scan:?}"
+            );
+        }
+
+        for (line, outcome, ends) in &scan.relay_arms {
+            if !ends {
+                violations.push(format!(
+                    "  the `{outcome}` arm does not end through `end_on_shutdown`: {}",
+                    site(*line)
+                ));
+            }
+        }
+        for (line, function, what) in &scan.stray_outcomes {
+            violations.push(format!(
+                "  in `{function}`, {what} — a consumer this guard cannot check: {}",
+                site(*line)
+            ));
+        }
+        let allowed_receivers: Vec<&str> = OTHER_OBSERVED_RECEIVERS
+            .iter()
+            .filter(|(path, _, _)| *path == handler)
+            .map(|(_, receiver, _)| *receiver)
+            .collect();
+        for (line, function, receiver) in &scan.other_receivers {
+            if !allowed_receivers.contains(&receiver.as_str()) {
+                violations.push(format!(
+                    "  `{function}` observes a cancellation on `{receiver}`, which is neither \
+                     the enrolled token `{ENROLLED_TOKEN}` nor a receiver listed for \
+                     `{handler}` in `OTHER_OBSERVED_RECEIVERS`: {}",
+                    site(*line)
+                ));
+            }
+        }
+        for receiver in &allowed_receivers {
+            assert!(
+                scan.other_receivers
+                    .iter()
+                    .any(|(_, _, found)| found.as_str() == *receiver),
+                "`{handler}` no longer observes a cancellation on `{receiver}`; remove its \
+                 `OTHER_OBSERVED_RECEIVERS` entry. Found: {:?}",
+                scan.other_receivers
+            );
+        }
+        for (line, function, consequence) in &scan.other {
+            let listed = STOP_ONLY_OBSERVATIONS
+                .iter()
+                .any(|(path, name, _, _)| *path == handler && *name == function.as_str());
+            let builds_a_status = ["server_shutting_down", "Status", "Err(", "status"]
+                .iter()
+                .any(|needle| consequence.contains(needle));
+            if listed && !builds_a_status {
+                *stop_only
+                    .entry((handler.to_string(), function.clone()))
+                    .or_default() += 1;
+            } else {
+                violations.push(format!(
+                    "  an observation of the enrolled token in `{function}` does not end \
+                     through `end_on_shutdown` (it does `{consequence}`): {}",
+                    site(*line)
+                ));
+            }
+        }
+        for (line, function, head) in &scan.shutdown_only {
+            let listed = SHUTDOWN_ONLY_ENDINGS.iter().any(|(path, name, arm, _)| {
+                *path == handler && *name == function.as_str() && *arm == head.as_str()
+            });
+            if !listed {
+                violations.push(format!(
+                    "  `server_shutting_down()` in `{function}` under `{head}` is not a listed \
+                     shutdown-only site: {}",
+                    site(*line)
+                ));
+            }
+            shutdown_only.push((handler.to_string(), function.clone(), head.clone()));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a streaming ending driven by the stream's own enrolled token does not follow its \
+         cause:\n\n{}\n\nEnd every arm that observes the enrolled token (`shutdown.cancelled()` / \
+         `shutdown.is_cancelled()`) through `end_on_shutdown`, which maps a hold to \
+         `SERVICE_HELD` or `UPSTREAM_UNAVAILABLE` and SIGTERM to `server shutting down`; \
+         observe the enrolled token only under its own name, by method call; hand on a relayed \
+         outcome only to `<outcome> =>` arms. Build `server_shutting_down()` only where the \
+         shutdown sequence alone ends the stream, and list that site in \
+         `SHUTDOWN_ONLY_ENDINGS` with why it has no hold cause.",
+        violations.join("\n")
+    );
+
+    let mut expected: Vec<(String, String, String)> = SHUTDOWN_ONLY_ENDINGS
+        .iter()
+        .map(|(path, name, head, _)| (path.to_string(), name.to_string(), head.to_string()))
+        .collect();
+    expected.sort();
+    shutdown_only.sort();
+    assert_eq!(
+        shutdown_only, expected,
+        "the shutdown-only `server_shutting_down()` sites changed (left: found, right: \
+         SHUTDOWN_ONLY_ENDINGS); remove the entry of a site that went away"
+    );
+    let expected_stop_only: BTreeMap<(String, String), usize> = STOP_ONLY_OBSERVATIONS
+        .iter()
+        .map(|(path, name, count, _)| ((path.to_string(), name.to_string()), *count))
+        .collect();
+    assert_eq!(
+        stop_only, expected_stop_only,
+        "the stop-only observations of the enrolled token changed (left: found, right: \
+         STOP_ONLY_OBSERVATIONS); remove the entry of a site that went away"
+    );
+}
+
+/// [`scan_stream_endings`] on a fixture: each observation shape it must
+/// classify — an arm block, an `if` block, an arm expression, a relayed
+/// outcome, a stop-only arm and expression — named by its enclosing function,
+/// including `impl` methods and not an `impl Trait` argument; every
+/// observation on another receiver, by name, however it is written (a
+/// rebound local, a path, `cancelled_or_never`, a qualified call); every
+/// stray use of a relayed outcome; each `server_shutting_down()` call with
+/// its arm or block head; and nothing from test-only or test-feature items,
+/// comments or strings.
+#[test]
+fn stream_ending_scanner_classifies_each_observation_and_names_each_shutdown_only_site() {
+    let fixture = concat!(
+        "fn direct_arm(ctx: &Ctx) -> Status {\n",                                    // 1
+        "    tokio::select! { () = ctx.shutdown.cancelled() => {\n",                 // 2
+        "        return Err(end_on_shutdown(&ctx.shutdown, log)); } }\n",             // 3
+        "}\n",                                                                        // 4
+        "fn direct_if(shutdown: &StreamShutdown) {\n",                                // 5
+        "    if shutdown.is_cancelled() { let s = end_on_shutdown(&shutdown, log); }\n", // 6
+        "}\n",                                                                        // 7
+        "fn arm_expr(ctx: &Ctx) -> Status {\n",                                       // 8
+        "    tokio::select! { () = ctx.shutdown.cancelled() => ctx.end_on_shutdown(), }\n", // 9
+        "}\n",                                                                        // 10
+        "async fn race<T>(op: impl std::future::Future<Output = T>) -> Out {\n",      // 11
+        "    tokio::select! { () = shutdown.cancelled() => Out::ShuttingDown, }\n",   // 12
+        "}\n",                                                                        // 13
+        "fn relay(o: Out) -> Status {\n",                                             // 14
+        "    match o { Out::ShuttingDown => { end_on_shutdown(&s, log) } _ => x() }\n", // 15
+        "}\n",                                                                        // 16
+        "impl Keeper {\n",                                                            // 17
+        "    async fn run(self) { tokio::select! { () = self.shutdown.cancelled() => {} } }\n", // 18
+        "    fn stopping(&self) -> bool { self.a.is_cancelled() || self.shutdown.is_cancelled() }\n", // 19
+        "}\n",                                                                        // 20
+        "fn reverted(ctx: &Ctx) -> Status {\n",                                       // 21
+        "    if ctx.shutdown.is_cancelled() { return Err(server_shutting_down()); }\n", // 22
+        "}\n",                                                                        // 23
+        "fn closed(r: R) -> Status {\n",                                              // 24
+        "    match r { R::Closed => { ctx.exit.set(X); Err(server_shutting_down()) }\n", // 25
+        "        R::Quit => server_shutting_down(), }\n",                             // 26
+        "    if svc.shutdown.begun().is_cancelled() { log.x(); return Err(transport::server_shutting_down()); }\n", // 27
+        "}\n",                                                                        // 28
+        "fn rebound(ctx: &Ctx) { let t = &ctx.shutdown; tokio::select! { () = t.cancelled() => { break; } } }\n", // 29
+        "fn by_path(ctx: &Ctx) { if ctx.session_token().is_some_and(CancellationToken::is_cancelled) { x(); } }\n", // 30
+        "fn helpers(ctx: &Ctx) { tokio::select! { () = cancelled_or_never(ctx.session_token()) => x(), () = cancelled_or_never(Some(&ctx.shutdown)) => y(), } }\n", // 31
+        "fn qualified(ctx: &Ctx) -> bool { CancellationToken::is_cancelled(&ctx.shutdown) }\n", // 32
+        "fn owned(ctx: &Ctx) { let f = ctx.shutdown.cancelled_owned(); let s = Status::cancelled(\"gone\"); }\n", // 33
+        "fn second_consumer(r: R) -> S { match r { Ok(Out::ShuttingDown) => Err(x), _ => Ok(()) } }\n", // 34
+        "fn peek(o: &Out) -> bool { matches!(o, Out::ShuttingDown) }\n",             // 35
+        "use Out::*;\n",                                                              // 36
+        "// ctx.shutdown.cancelled() => server_shutting_down() in a comment\n",       // 37
+        "const S: &str = \"if shutdown.is_cancelled() { server_shutting_down() }\";\n", // 38
+        "#[cfg(any(test, feature = \"test-fault-injection\"))]\n",                    // 39
+        "fn seam() { if shutdown.is_cancelled() { server_shutting_down(); } }\n",     // 40
+        "#[cfg(test)]\n",                                                             // 41
+        "mod tests { fn t() { if shutdown.is_cancelled() { server_shutting_down(); } } }\n", // 42
+    );
+    let scan = scan_stream_endings(fixture, &["Out::ShuttingDown"]);
+    assert_eq!(
+        scan.direct,
+        [
+            (2, "direct_arm".to_string()),
+            (6, "direct_if".to_string()),
+            (9, "arm_expr".to_string())
+        ],
+        "an arm block, an `if` block and an arm expression that end through `end_on_shutdown`"
+    );
+    assert_eq!(
+        scan.relayed,
+        [(12, "Out::ShuttingDown".to_string())],
+        "an arm handing on the relayed outcome"
+    );
+    assert_eq!(
+        scan.relay_arms,
+        [(15, "Out::ShuttingDown".to_string(), true)],
+        "the match arm on the relayed outcome, ending through `end_on_shutdown`"
+    );
+    let other: Vec<(usize, &str, &str)> = scan
+        .other
+        .iter()
+        .map(|(line, function, consequence)| (*line, function.as_str(), consequence.as_str()))
+        .collect();
+    assert_eq!(
+        other,
+        [
+            (18, "Keeper::run", "{}"),
+            (19, "Keeper::stopping", ""),
+            (22, "reverted", "{ return Err(server_shutting_down()); }"),
+            (33, "owned", ""),
+        ],
+        "the stop-only arm and expression, named with their `impl` type, the reverted site \
+         with its block, and a `cancelled_owned()`; the `impl Trait` argument on line 11 names \
+         no type"
+    );
+    let receivers: Vec<(usize, &str, &str)> = scan
+        .other_receivers
+        .iter()
+        .map(|(line, function, receiver)| (*line, function.as_str(), receiver.as_str()))
+        .collect();
+    assert_eq!(
+        receivers,
+        [
+            (19, "Keeper::stopping", "a"),
+            (27, "closed", "begun()"),
+            (29, "rebound", "t"),
+            (30, "by_path", "session_token()"),
+            (31, "helpers", "Some()"),
+            (31, "helpers", "session_token()"),
+            (
+                32,
+                "qualified",
+                "shutdown (observed other than by a method call)"
+            ),
+        ],
+        "every observation on another receiver, by its name: a field, a call result \
+         (`begun()`), the enrolled token rebound to a local (line 29), a path handed to a \
+         method (line 30), `cancelled_or_never`'s argument (line 31, the enrolled token \
+         wrapped as `Some()` included), and the enrolled token observed by a qualified call \
+         (line 32) — but not `Status::cancelled` (line 33)"
+    );
+    let strays: Vec<(usize, &str)> = scan
+        .stray_outcomes
+        .iter()
+        .map(|(line, function, _)| (*line, function.as_str()))
+        .collect();
+    assert_eq!(
+        strays,
+        [(34, "second_consumer"), (35, "peek"), (36, "")],
+        "every use of the relayed outcome but its producing arm (line 12) and its `=>` arm \
+         (line 15): an `Ok(…) =>` consumer, a `matches!`, and a glob import of the type's \
+         variants. Got {:?}",
+        scan.stray_outcomes
+    );
+    let shutdown_only: Vec<(usize, &str, &str)> = scan
+        .shutdown_only
+        .iter()
+        .map(|(line, function, head)| (*line, function.as_str(), head.as_str()))
+        .collect();
+    assert_eq!(
+        shutdown_only,
+        [
+            (22, "reverted", "if ctx.shutdown.is_cancelled()"),
+            (25, "closed", "R::Closed =>"),
+            (26, "closed", "R::Quit =>"),
+            (27, "closed", "if svc.shutdown.begun().is_cancelled()"),
+        ],
+        "each `server_shutting_down()` call with its arm's pattern or block's head — a block \
+         arm, an expression arm and an `if` block, a qualified call included — and none from \
+         a comment, a string, a test-feature item or a `cfg(test)` module"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

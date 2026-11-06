@@ -19,7 +19,8 @@
 // gets an isolated key namespace so tests can run in parallel safely.
 //
 // Requires a running Valkey. Address is read from TEST_VALKEY_URL, defaulting to
-// redis://127.0.0.1:6379. Tests skip gracefully if Valkey is unreachable.
+// redis://127.0.0.1:6379. Tests fail if Valkey is unreachable: at
+// `TestValkey::setup`, or at their own connect's `expect`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -134,7 +135,6 @@ async fn create_session_concurrent_same_name_exactly_one_succeeds() {
     let key_schema = KeySchema::new(&prefix);
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -216,6 +216,10 @@ async fn create_session_concurrent_same_name_exactly_one_succeeds() {
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -355,7 +359,6 @@ async fn create_session_concurrent_distinct_names_all_succeed_via_retry() {
     let key_schema = KeySchema::new(&prefix);
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -437,6 +440,10 @@ async fn create_session_concurrent_distinct_names_all_succeed_via_retry() {
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -619,7 +626,6 @@ async fn create_session_concurrent_same_name_with_pool_size_one_never_duplicates
     let key_schema = KeySchema::new(&prefix);
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -701,6 +707,10 @@ async fn create_session_concurrent_same_name_with_pool_size_one_never_duplicates
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -832,7 +842,6 @@ async fn create_session_concurrent_distinct_names_with_pool_size_one_serialize_c
     let key_schema = KeySchema::new(&prefix);
 
     let config = Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url,
@@ -914,6 +923,10 @@ async fn create_session_concurrent_distinct_names_with_pool_size_one_serialize_c
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: false,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -1623,12 +1636,12 @@ async fn delete_session_concurrent_delete_no_path_index_orphan() {
 async fn delete_session_post_delete_list_is_empty_not_orphaned() {
     // After a successful delete, `list(base_path)` must return an empty
     // result AND the path_index set itself must be empty. The stronger
-    // half of this assertion is the second: `list` already skips orphans
-    // (metadata missing but id in index) and opportunistically cleans
-    // them up, so observing an empty `list` does not by itself prove that
-    // the SREM committed. Checking the raw path_index via SMEMBERS is what
-    // distinguishes "SREM landed in the delete commit" from "list papered
-    // over an orphan on next call".
+    // half of this assertion is the second: an orphan (metadata missing
+    // but id in an index) is removed by the next ListSessions walk, so
+    // observing an empty `list` does not by itself prove that the SREM
+    // committed. Checking the raw path_index via SMEMBERS is what
+    // distinguishes "SREM landed in the delete commit" from "a walk papered
+    // over an orphan on the next call".
     let tv = TestValkey::setup().await;
     let ss = store(&tv);
     let keys = tv.key_schema();

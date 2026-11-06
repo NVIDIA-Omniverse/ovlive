@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Native graph attachment consumers against the independent semantic service."""
 import asyncio
+import dataclasses
+import functools
 import hashlib
 import json
 import os
@@ -12,19 +14,140 @@ import unittest
 
 import grpc
 from service import Principal, pb, rpc
-from graph_service import GraphState, GraphServer
+from graph_service import GraphService, GraphState, GraphServer
 from scene_graph_wire import Command as C, Field as F, Sample as S, TimeSamples as T, Delta, Token, Specifier, Variability, Paths, PathOp, typed_value, encode, decode
 from scene_graph_wire import REAL_FAMILIES, Real, String, Strings, TokenArray, real
-from scene_graph_model import Model, ranked
-from test_scene import RotatingProxy
+from scene_graph_model import CHILD_FIELDS, Model, ranked
+from test_scene import KILLED_RETURNCODE, RotatingProxy, kill_writer
 import tls_fixture
+import plan_replay
+import round_plans
+import sample_history
+import structural_history
+from writer_history import WriterMismatch, read_json
+from writer_reduction import reduce_history as reduce_writers, publish as publish_writer, round_domain
 
 AUTH = (("authorization", "Bearer synthetic-writer"),)
+
+
+class CorruptGraphWriterService(GraphService):
+    """Named test-only service defects: commit one planned edit's update with a changed value, acknowledge it
+    without committing it, or relay committed updates to readers with changed values.
+
+    `state.corrupt(header, delta)` returns the delta to commit instead, or None to commit the upload as sent. When
+    `state.swallow(header, delta)` is true, the call succeeds with the sequence the update would have taken, and the
+    ledger never holds it. `state.relay(delta)` returns the delta a read stream delivers in place of a committed
+    update's, or None to deliver the committed bytes; the ledger, snapshots and catch-up diffs keep the committed
+    bytes, so the ledger accounting passes while readers diverge from the service. Real native writers still admit,
+    issue and acknowledge the original edit. This exercises structural and sample failure reduction; no production
+    fault switch exists.
+    """
+    def frames(self, entry):
+        relay = getattr(self.state, 'relay', None)
+        # A ledger entry has a nonzero index; a read's snapshot or catch-up diff is index 0.
+        changed = relay(decode(entry.payload)) if relay and entry.index and entry.payload else None
+        if changed is not None:
+            entry = dataclasses.replace(entry, payload=encode(changed))
+        return super().frames(entry)
+
+    async def apply_update(self, method, attempt, session, old, header, payload, context):
+        swallow = getattr(self.state, 'swallow', None)
+        if swallow and payload and swallow(header, decode(payload)):
+            return pb.UpdateLayerResponse(sequence_num=old.commits[-1].sequence + 1,
+                                          server_timestamp_microseconds_since_epoch=self.state.clock())
+        corrupt = getattr(self.state, 'corrupt', None)
+        changed = corrupt(header, decode(payload)) if corrupt and payload else None
+        if changed is not None:
+            payload = encode(changed)
+        return await super().apply_update(method, attempt, session, old, header, payload, context)
+
+
+def corrupt_shared(value):
+    """The structural defect: a `shared` field write of `value`, a wire value, on /P commits -1."""
+    def corrupt(header, delta):
+        if not any((f.section, f.key, f.value) == (2, 'shared', value) for f in delta.fields):
+            return None
+        return dataclasses.replace(delta, fields=tuple(
+            dataclasses.replace(f, value=-1) if (f.section, f.key) == (2, 'shared') else f for f in delta.fields))
+    return corrupt
+
+
+def corrupt_reorder(value):
+    """The structural reorder defect: the update of the reorder edit that sets its parent's reorder field to `value`
+    commits its Reorder with the listed children in reverse."""
+    def corrupt(header, delta):
+        if not any((f.key, f.value) == (structural_history.REORDER_FIELD, value) for f in delta.fields):
+            return None
+        return dataclasses.replace(delta, commands=tuple(
+            dataclasses.replace(c, children=tuple(reversed(c.children))) if c.tag == 4 else c for c in delta.commands))
+    return corrupt
+
+
+def corrupt_sample(client_id, section, stamp):
+    """The sample defect: `client_id`'s sample record at `section` and time `stamp` commits the value -1."""
+    def corrupt(header, delta):
+        if header.client_id != client_id or not any(
+                (s.section, s.time) == (section, stamp) and s.value is not None for s in delta.samples):
+            return None
+        return dataclasses.replace(delta, samples=tuple(
+            dataclasses.replace(s, value=-1) if (s.section, s.time) == (section, stamp) and s.value is not None
+            else s for s in delta.samples))
+    return corrupt
+
+
+def relay_shared(delta):
+    """The structural relay defect: every `shared` field write on /P reaches readers as -1."""
+    if not any((f.section, f.key) == (2, 'shared') and f.value is not None for f in delta.fields):
+        return None
+    return dataclasses.replace(delta, fields=tuple(
+        dataclasses.replace(f, value=-1) if (f.section, f.key) == (2, 'shared') and f.value is not None else f
+        for f in delta.fields))
+
+
+def relay_sample(delta):
+    """The sample relay defect: every sample record at time 3.0 of section 6 reaches readers with the value -1."""
+    if not any((s.section, s.time) == (6, 3.0) and s.value is not None for s in delta.samples):
+        return None
+    return dataclasses.replace(delta, samples=tuple(
+        dataclasses.replace(s, value=-1) if (s.section, s.time) == (6, 3.0) and s.value is not None else s
+        for s in delta.samples))
+
+
+# Trials a structural or sample reduction may run. A difference between a writer's scene and the service's needs a
+# second writer to read the commit that differs, so its minimal plan keeps two writers, and confirming that each unit
+# is needed takes more trials than a one-writer plan's.
+GRAPH_REDUCTION_TRIALS = 24
+
+
+# Each round-based writer class's plan module and campaign test; a reduction trial runs a fresh fixture of the test.
+GRAPH_HISTORIES = dict(structural=structural_history, samples=sample_history)
+GRAPH_WRITER_TESTS = dict(structural='test_seeded_structural_writers_account_deleted_and_overwritten_edits',
+                          samples='test_seeded_sample_writers_account_repeated_and_erased_edits')
 
 
 def typed(state):
     return [dict(node, fields={name: typed_value(value)
                               for name, value in node["fields"].items()}) for node in state]
+
+
+def wire_value(value):
+    """The wire value of a structural plan's typed value (structural_history.typed), the inverse of typed_value."""
+    kind, raw = value['type'], value['value']
+    if kind == 'int32':
+        return raw
+    if kind == 'string':
+        return String(raw)
+    if kind == 'token[]':
+        return TokenArray(tuple(raw))
+    array = kind.endswith('[]')
+    return Real(kind[:-2] if array else kind, tuple(raw), array)
+
+
+def field_command(section, key, value):
+    """The native graph driver command that sets field `key` of `section` to a structural plan's typed value."""
+    if value['type'] == 'int32':
+        return f"set {section} {key} {value['value']}"
+    return f'set-value {section} {key} {operands(wire_value(value))}'
 
 
 def operands(value):
@@ -107,8 +230,10 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
     transport_tls = False  # Proxies terminate TLS with a per-case test CA; backends stay plaintext.
 
     async def asyncSetUp(self):
-        self.seed = int(os.environ['LIVE_TEST_SEED'])
-        self.artifact = Path(os.environ['LIVE_TEST_ARTIFACT_DIR'])
+        self.seed = getattr(self, 'seed_override', None)
+        if self.seed is None:
+            self.seed = int(os.environ['LIVE_TEST_SEED'])
+        self.artifact = getattr(self, 'artifact_override', None) or Path(os.environ['LIVE_TEST_ARTIFACT_DIR'])
         self.state = GraphState(self.seed)
         self.state.tokens = {'synthetic-writer': Principal('writer')}
         self.drivers, self.channels, self.servers, self.proxies = [], [], [], []
@@ -125,7 +250,8 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         self.object = (await self.stub.CreateLayer(iter(messages), metadata=AUTH, timeout=5)).object_id
 
     async def backend(self, name):
-        server = GraphServer(self.state, name)
+        server = GraphServer(self.state, name,
+                             service_factory=getattr(self, 'writer_service_factory', GraphService))
         self.servers.append(server)
         address = await server.start()
         channel = grpc.aio.insecure_channel(address)
@@ -193,6 +319,31 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         await driver.drainer
         self.assertEqual(driver.process.returncode, 0, driver.log_tail())
 
+    def release_holds(self):
+        """Release every planned service fault and open every rotating proxy's gate, so no writer's close waits on a
+        hold the fixture still keeps."""
+        for fault in self.state.faults:
+            fault.release.set()
+        for proxy in self.proxies:
+            if hasattr(proxy, 'gate'):
+                proxy.gate.set()
+
+    async def retire_writers(self):
+        """Release the fixture's holds, then close every native writer still running through the checked path (close)
+        and check that every writer that already exited did so cleanly; raises when any writer failed, so no
+        reduction accepts a mismatch beside a crashed writer.
+
+        The mismatch is final before this runs, so releasing the holds changes no signature; a released write
+        commits or is cancelled by its writer's close, which cancels every call still in flight."""
+        self.release_holds()
+        for driver in self.drivers:
+            if driver.process.returncode is None:
+                await self.close(driver)
+            else:
+                await driver.drainer
+                self.assertIsNone(driver.error)
+                self.assertEqual(driver.process.returncode, 0, driver.log_tail())
+
     def commits(self):
         return [entry for entry in self.state.ledger if entry.session == self.session and
                 entry.layer == 'root.live' and entry.object_id == self.object]
@@ -200,7 +351,7 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
     def expected(self):
         model = Model()
         for entry in self.commits():
-            model.apply(entry.payload, entry.sequence, per_list=self.state.reorder_rule == 'per_list')
+            model.apply(entry.payload, entry.sequence, **self.state.commit_rules())
         return typed(model.state)
 
     async def update(self, delta, stub=None):
@@ -216,6 +367,18 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         messages = [pb.UpdateLayerRequest(header=pb.UpdateLayerHeader(session_id=self.session, layer_name='root.live',
                     object_id=self.object, client_id='independent-peer'))]
         return (await (stub or self.stub).UpdateLayer(iter(messages), metadata=AUTH, timeout=5)).sequence_num
+
+    def compare_writers(self, plan, reports, attribute):
+        """`compare` for a round-based case's native reports at one convergence point. A nonzero result or pending
+        count fails plainly; a scene that differs from the one the service ledger replays to raises
+        round_plans.check_replicas's WriterMismatch, its edit named by `attribute`, the class's scene attribution
+        over its oracle's lineage."""
+        for report in reports:
+            self.assertEqual(report['result'], 0, report)
+            self.assertEqual(report['pending'], 0, report)
+        round_plans.check_replicas(plan, [dict(report, authoritative=ranked(report['authoritative']),
+                                               visible=ranked(report['visible'])) for report in reports],
+                                   ranked(self.expected()), attribute)
 
     def compare(self, state):
         self.assertEqual(state['result'], 0, state)
@@ -505,9 +668,10 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('value', expected[4]['fields'])
         await self.close(fresh)
 
-    async def test_a_fresh_reader_applies_commits_its_snapshot_already_holds(self):
-        # Without a proven stable cut the service acks a fresh snapshot at its pin and delivers again the commits
-        # the snapshot already holds, including a Create of a held section and a Reorder naming a moved child.
+    async def test_a_live_edit_0_1_fresh_reader_applies_commits_its_snapshot_already_holds(self):
+        # Live Edit 0.1.x coverage (`unverified_cut`): without a proven stable cut the service acks a fresh snapshot
+        # at its pin and delivers again the commits the snapshot already holds, including a Create of a held section
+        # and a Reorder naming a moved child.
         await self.update(Delta(commands=(C(1, 100, 1, 'R', 6), C(3, 5, 100, 'Q', old_parent=1)),
                                 fields=(F(100, 'peer', 1),)))
         await self.update(Delta(commands=(C(4, 1, children=(2, 100)),), fields=(F(100, 'peer', 2),)))
@@ -1205,6 +1369,238 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         await self.close(driver)
         await self.close(observer)
 
+    def ledger_state(self, rename_cascade):
+        """The ledger replayed with or without the rename cascade, as a client reports a scene."""
+        model = Model()
+        for entry in self.commits():
+            model.apply(entry.payload, entry.sequence, **dict(self.state.commit_rules(), rename_cascade=rename_cascade))
+        return typed(model.state)
+
+    @staticmethod
+    def shown(state):
+        """{id: (path, fields other than child fields)} of the sections a scene shows. Of siblings that share a
+        path, the lowest ID shows and the others are shadowed with their subtrees, as a client shows two siblings
+        with one name (design section 10); a client reports a shadowed section with an empty path."""
+        nodes = {node['id']: node for node in state}
+        owners = {}
+        for identity in sorted(nodes):
+            owners.setdefault(nodes[identity]['path'], identity)
+
+        def hidden(identity):
+            while identity in nodes and identity != 1:
+                node = nodes[identity]
+                if not node['path'] or owners[node['path']] != identity:
+                    return True
+                identity = node['parent']
+            return False
+        return {identity: (node['path'], {key: value for key, value in node['fields'].items() if key not in CHILD_FIELDS})
+                for identity, node in nodes.items() if not hidden(identity)}
+
+    def assert_live_rename(self, state):
+        """A reader that applied the rename live replaces the occupant, whichever rule the service stores."""
+        self.assertEqual((state['result'], state['pending']), (0, 0), state)
+        cascaded = self.shown(self.ledger_state(True))
+        self.assertEqual(self.shown(state['authoritative']), cascaded)
+        self.assertEqual(self.shown(state['visible']), cascaded)
+        if self.state.rename_rule == 'cascade':
+            self.compare(state)
+
+    def assert_late_joiner(self, state):
+        """A reader that joins after the rename shows what the service stores."""
+        self.assertEqual((state['result'], state['pending']), (0, 0), state)
+        stored = self.shown(self.expected())
+        self.assertEqual(self.shown(state['authoritative']), stored)
+        self.assertEqual(self.shown(state['visible']), stored)
+        if self.state.rename_rule == 'cascade':
+            self.compare(state)
+        else:
+            # The transition: a service that keeps both siblings differs from every reader that applied the rename
+            # live, until that reader rejoins.
+            self.assertNotEqual(stored, self.shown(self.ledger_state(True)))
+
+    async def rename_onto_occupied_name(self, rename_rule):
+        # A peer renames /P/B onto /P/A. Every reader that applies the rename live deletes /P/A with its subtree
+        # first. A service with the cascade stores the same, so a late joiner agrees; a service that keeps both
+        # siblings stores two /P/A, and a late joiner shows the lower ID there.
+        self.state.rename_rule, self.state.reorder_rule = rename_rule, 'per_list'
+        seeded = await self.update(Delta(commands=(C(1, 100, 2, 'A', 6), C(1, 101, 100, 'Inner', 6), C(1, 102, 2, 'B', 6)),
+                                         fields=(F(100, 'marker', 1), F(102, 'marker', 2))))
+        writer, _ = await self.start(host=True)
+        observer, _ = await self.start()
+        peer = await self.update(Delta(commands=(C(3, 102, 2, 'A', old_parent=2),)))
+        self.assertEqual(peer, seeded + 1)
+        for reader in (writer, observer):
+            state = await reader.command(f'wait {peer}')
+            self.assert_live_rename(state)
+            shown = self.shown(state['visible'])
+            self.assertEqual(shown[102], ('/P/A', {'marker': {'type': 'int32', 'value': 2}}))
+            self.assertFalse({100, 101} & set(shown))
+        written = await writer.command('report')
+        self.assertEqual(written['host'], self.export_public_fields(written['visible']))
+        late, _ = await self.start()
+        state = await late.command(f'wait {peer}')
+        self.assert_late_joiner(state)
+        if rename_rule == 'keep_both':
+            shown = self.shown(state['visible'])
+            self.assertEqual((shown[100][0], shown[101][0]), ('/P/A', '/P/A/Inner'))
+            self.assertNotIn(102, shown)
+            self.assertIn(102, {node['id'] for node in state['authoritative']})
+        self.assertFalse(self.state.rejections)
+        for reader in (writer, observer, late):
+            await self.close(reader)
+
+    async def test_peer_rename_onto_an_occupied_name_replaces_the_occupant_on_every_reader(self):
+        await self.rename_onto_occupied_name('cascade')
+
+    async def test_peer_rename_onto_an_occupied_name_on_a_keep_both_service_differs_only_for_late_joiners(self):
+        await self.rename_onto_occupied_name('keep_both')
+
+    async def pending_rename_onto_peer_create(self, rename_rule):
+        # A host renames /P/A to /P/B while a peer's Create of /P/B commits first. The journal replays the pending
+        # rename onto the peer's section, which it deletes in the visible scene and host content before the rename
+        # commits; once it commits, the writer and a live observer hold the same scene. The peer's section has the
+        # lower ID, so a late joiner of a service that keeps both siblings shows it at /P/B instead.
+        self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
+        self.state.rename_rule, self.state.reorder_rule = rename_rule, 'per_list'
+        seeded = await self.update(Delta(commands=(C(1, 100, 2, 'A', 6),), fields=(F(100, 'marker', 1),)))
+        driver, _ = await self.start(host=True)
+        observer, _ = await self.start()
+        fault = self.state.plan('UpdateLayer', 'before', pause=True)
+        self.addCleanup(fault.release.set)
+        submitted = await driver.command('move 100 /P/B')
+        self.assertEqual(submitted['result'], 0, submitted)
+        await asyncio.wait_for(fault.reached.wait(), 5)
+        original = submitted['pending_intents']
+        self.assertEqual(len(original), 1)
+        self.assertIn((3, 100, 2, 2, 'B'), [(c.tag, c.section, c.old_parent, c.parent, c.name)
+                                            for c in decode(bytes.fromhex(original[0]['bytes'])).commands])
+        peer = await self.update(Delta(commands=(C(1, 90, 2, 'B', 6), C(1, 91, 90, 'Inner', 6)),
+                                       fields=(F(90, 'marker', 7),)))
+        self.assertEqual(peer, seeded + 1)
+        applied = await driver.command(f'journal-applied {peer}')
+        self.assertEqual((applied['result'], applied['status_result']), (0, 0), applied)
+        self.assertEqual(applied['pending_intents'], original)
+        self.assertEqual(ranked(applied['authoritative']), ranked(self.expected()))
+        visible = self.shown(applied['visible'])
+        self.assertEqual(visible[100], ('/P/B', {'marker': {'type': 'int32', 'value': 1}}))
+        self.assertFalse({90, 91} & set(visible))
+        self.assertEqual(applied['host'], self.export_public_fields(applied['visible']))
+        fault.release.set()
+        for reader in (driver, observer):
+            self.assert_live_rename(await reader.command(f'wait {peer + 1}'))
+        late, _ = await self.start()
+        state = await late.command(f'wait {peer + 1}')
+        self.assert_late_joiner(state)
+        if rename_rule == 'keep_both':
+            shown = self.shown(state['visible'])
+            self.assertEqual((shown[90][0], shown[91][0]), ('/P/B', '/P/B/Inner'))
+            self.assertNotIn(100, shown)
+        self.assertFalse(self.state.rejections)
+        self.assertEqual(self.state.attempts['UpdateLayer'], 3)  # Seed, the peer's Create and the rename.
+        for reader in (driver, observer, late):
+            await self.close(reader)
+
+    async def test_pending_rename_onto_a_peer_create_replays_the_cascade(self):
+        await self.pending_rename_onto_peer_create('cascade')
+
+    async def test_pending_rename_onto_a_peer_create_on_a_keep_both_service_differs_only_for_late_joiners(self):
+        await self.pending_rename_onto_peer_create('keep_both')
+
+    async def same_name_rename(self, rename_rule):
+        # A rename to a section's own name changes nothing, even where a sibling shares that name: a late joiner of
+        # a service that keeps both siblings holds both /P/A, and renaming either to A again deletes neither.
+        self.state.rename_rule, self.state.reorder_rule = rename_rule, 'per_list'
+        await self.update(Delta(commands=(C(1, 100, 2, 'A', 6), C(1, 101, 100, 'Inner', 6), C(1, 102, 2, 'B', 6)),
+                                fields=(F(100, 'marker', 1), F(102, 'marker', 2))))
+        observer, _ = await self.start()
+        first = await self.update(Delta(commands=(C(3, 102, 2, 'A', old_parent=2),)))
+        late, _ = await self.start()
+        joined = await late.command(f'wait {first}')
+        self.assert_late_joiner(joined)
+        second = await self.update(Delta(commands=(C(3, 102, 2, 'A', old_parent=2), C(3, 100, 2, 'A', old_parent=2))))
+        self.assert_live_rename(await observer.command(f'wait {second}'))
+        state = await late.command(f'wait {second}')
+        self.assert_late_joiner(state)
+        self.assertEqual(self.shown(state['visible']), self.shown(joined['visible']))
+        self.assertEqual(ranked(state['authoritative']), ranked(joined['authoritative']))
+        self.assertFalse(self.state.rejections)
+        for reader in (observer, late):
+            await self.close(reader)
+
+    async def test_rename_to_its_own_name_changes_nothing(self):
+        await self.same_name_rename('cascade')
+
+    async def test_rename_to_its_own_name_changes_nothing_beside_a_duplicate_from_a_keep_both_service(self):
+        await self.same_name_rename('keep_both')
+
+    async def rename_with_stale_listing(self, rename_rule, onto_holder):
+        # An occupant is a sibling, so neither section holds the other by stored parent, but a stale children list
+        # can put one in the other's listed subtree. /P/Child{3} moves to /Q{5}, then to the root by a Move carrying
+        # its stale old parent /P: it is stored at the root while Q's list still names it. Renaming it onto Q deletes
+        # Q's listed subtree, which holds it, so both leave; renaming Q onto it deletes only it.
+        self.state.rename_rule = rename_rule
+        observer, _ = await self.start()
+        staged = await self.update(Delta(commands=(C(3, 3, 5, 'Child', old_parent=2), C(3, 3, 1, 'Child', old_parent=2))))
+        self.assertEqual(self.shown(self.expected())[3][0], '/Child')
+        rename = await self.update(Delta(commands=(C(3, 3, 1, 'Q', old_parent=1),) if onto_holder else
+                                         (C(3, 5, 1, 'Child', old_parent=1),)))
+        self.assertEqual(rename, staged + 1)
+        state = await observer.command(f'wait {rename}')
+        self.assert_live_rename(state)
+        shown = self.shown(state['visible'])
+        if onto_holder:
+            self.assertEqual(set(shown), {1, 2})
+        else:
+            self.assertEqual((set(shown), shown[5][0], shown[6][0]), ({1, 2, 5, 6}, '/Child', '/Child.other'))
+        late, _ = await self.start()
+        self.assert_late_joiner(await late.command(f'wait {rename}'))
+        self.assertFalse(self.state.rejections)
+        for reader in (observer, late):
+            await self.close(reader)
+
+    async def test_rename_onto_an_occupant_whose_listed_subtree_holds_the_section_deletes_both(self):
+        await self.rename_with_stale_listing('cascade', True)
+
+    async def test_rename_onto_an_occupant_whose_listed_subtree_holds_the_section_on_a_keep_both_service(self):
+        await self.rename_with_stale_listing('keep_both', True)
+
+    async def test_rename_onto_an_occupant_the_sections_listed_subtree_holds_deletes_only_the_occupant(self):
+        await self.rename_with_stale_listing('cascade', False)
+
+    async def test_rename_onto_an_occupant_the_sections_listed_subtree_holds_on_a_keep_both_service(self):
+        await self.rename_with_stale_listing('keep_both', False)
+
+    async def test_live_edit_0_1_known_limitation_a_redelivered_rename_cascades_a_held_section(self):
+        # Known limitation of Live Edit 0.1.x (design section 12): a catch-up without a proven stable cut is acked
+        # at an earlier pin and delivers again commits its snapshot holds. Peers rename /P/B to /P/X and on to /P/Z,
+        # then /P/Y to /P/X; no committed rename hits an occupied name. The snapshot holds Y at /P/X and B at /P/Z,
+        # so the redelivered first rename cascades Y on a late joiner although the service holds it. Live Edit 0.2.0
+        # serves every catch-up at a proven cut (`unverified_cut = 0`), and a late joiner shows what it stores.
+        seeded = await self.update(Delta(commands=(C(1, 100, 2, 'Y', 6), C(1, 101, 100, 'Inner', 6),
+                                                   C(1, 102, 2, 'B', 6)),
+                                         fields=(F(100, 'marker', 1), F(102, 'marker', 2))))
+        renames = [C(3, 102, 2, 'X', old_parent=2), C(3, 102, 2, 'Z', old_parent=2), C(3, 100, 2, 'X', old_parent=2)]
+        for command in renames:
+            last = await self.update(Delta(commands=(command,)))
+        self.assertEqual(last, seeded + 3)
+        stored = self.shown(self.expected())
+        self.assertEqual((stored[100][0], stored[101][0], stored[102][0]), ('/P/X', '/P/X/Inner', '/P/Z'))
+        for unverified_cut in (0, 3):
+            with self.subTest(unverified_cut=unverified_cut):
+                self.state.unverified_cut = unverified_cut  # 3 acks the snapshot at the seed and delivers all renames.
+                late, _ = await self.start()
+                state = await late.command(f'wait {last}')
+                if unverified_cut:
+                    self.assertEqual((state['result'], state['pending']), (0, 0), state)
+                    shown = self.shown(state['visible'])
+                    self.assertEqual(shown, {identity: entry for identity, entry in stored.items()
+                                             if identity not in (100, 101)})
+                    self.assertEqual(self.shown(state['authoritative']), shown)
+                else:
+                    self.compare(state)
+                await self.close(late)
+        self.assertFalse(self.state.rejections)
+
     async def test_captured_create_of_a_live_id_fails_definitively_after_the_peer_create(self):
         self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
         await self.live_id_collision(peer_first=True)
@@ -1217,9 +1613,12 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         # Known limitation (design section 10): section identity is client-allocated, so
         # three writers that each first-create /P/World before seeing the others
         # create three sections at one (parent, name) slot. The Live Edit service
-        # lets each later Create delete the occupant's subtree, so every scene
-        # converges on the last committed World and the earlier Worlds and their
-        # contents are deleted. No writer fails, and nothing is reissued.
+        # lets each later Create delete the occupant's subtree. Each World is an
+        # authored prim, with its own `marker` field, not an implicit container,
+        # so every scene converges on the last committed World, prim-level
+        # last-writer-wins, and the earlier Worlds and their contents are deleted
+        # and not restored. No writer fails, and nothing is reissued. Each writer
+        # whose World a later commit replaced reports it.
         writers = [(await self.start(host=True))[0] for _ in range(3)]
         base = self.state.attempts.get('UpdateLayer', 0)
         faults = [self.state.plan('UpdateLayer', 'before', attempt=base + n, pause=True) for n in (1, 2, 3)]
@@ -1251,8 +1650,615 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.state.rejections)
         self.assertEqual(self.state.attempts['UpdateLayer'], base + 3)
         self.assertEqual(len(self.commits()), final)
+        # The second commit replaced the first writer's World and the third the
+        # second's; the third writer's World stands, and no writer reports a
+        # World another writer created.
+        await self.assert_section_replaced(writers[0], [(created[0], first + 2)])
+        await self.assert_section_replaced(writers[1], [(created[1], first + 3)])
+        await self.assert_section_replaced(writers[2], [])
         for writer in writers:
             await self.close(writer)
+
+    async def assert_section_replaced(self, writer, expected):
+        # One numeric section_replaced record per replaced section the writer
+        # created, with the replacing commit's sequence, and one USD warning
+        # that names its path.
+        report = await writer.command('diagnostics')
+        records = [r for r in report['diagnostics']['recent_records'] if r['event_name'] == 'section_replaced']
+        self.assertEqual([(r['event_code'], r['subject_id'], r['incident_id'], r['fields']) for r in records],
+                         [(36, report['subject'], 0, {'section_id': section, 'applied_sequence': sequence})
+                          for section, sequence in expected], records)
+        for record in records:
+            self.assertNotIn('canonical_resource', record)
+        warnings = [w for w in report['warnings'] if 'which this client created' in w]
+        self.assertEqual(len(warnings), len(expected), report['warnings'])
+        for warning, (section, sequence) in zip(warnings, expected):
+            self.assertIn(f'root.live: the peer commit at sequence {sequence} replaced /P/World, which this client '
+                          f'created, and removed its subtree (section {section})', warning)
+
+    @staticmethod
+    def markers(nodes):
+        """Each prim's `marker` attribute default under /World, by prim path, from a scene or host projection."""
+        return {node['path'][:-len('.marker')]: node['fields']['default']['value'] for node in nodes
+                if node['path'].startswith('/World') and node['path'].endswith('.marker')}
+
+    @staticmethod
+    def world_prims(nodes):
+        return sorted(node['path'] for node in nodes if node['path'].startswith('/World') and '.' not in node['path'])
+
+    async def held_writers(self, commands, *, restore=(True, True)):
+        """Host writers that each author one command before seeing any other's: each is issued and held before
+        commit, then all commit in order. A writer whose `restore` is false restores nothing, as a client without
+        restore does. Returns the writers, the attempt count before them and the commit count before them."""
+        writers = [(await self.start(host=True))[0] for _ in commands]
+        for writer, restoring in zip(writers, restore):
+            if not restoring:
+                self.assertEqual((await writer.command('restore-rounds 0'))['result'], 0)
+        base = self.state.attempts.get('UpdateLayer', 0)
+        faults = [self.state.plan('UpdateLayer', 'before', attempt=base + n, pause=True)
+                  for n in range(1, len(commands) + 1)]
+        for fault in faults:
+            self.addCleanup(fault.release.set)
+        for writer, command, fault in zip(writers, commands, faults):
+            submitted = await writer.command(command)
+            self.assertEqual(submitted['result'], 0, submitted)
+            await asyncio.wait_for(fault.reached.wait(), 5)  # Issued, and held before commit.
+        return writers, faults, base, len(self.commits())
+
+    async def assert_final(self, writers, final, markers, *, attempts):
+        # Every writer and a late joiner hold exactly the expected prims and values, not merely equal scenes.
+        for writer in writers:
+            state = await writer.command(f'wait {final}')
+            self.compare(state)
+            self.assertEqual(self.markers(state['visible']), markers)
+            self.assertEqual(self.markers(state['host']), markers)
+        self.assertEqual(len(self.commits()), final)
+        self.assertEqual(self.state.attempts['UpdateLayer'], attempts)
+        self.assertFalse(self.state.rejections)
+        joiner, ready = await self.start()
+        self.compare(ready)
+        self.assertEqual(self.markers(ready['visible']), markers)
+        await self.close(joiner)
+        return ready
+
+    async def test_concurrent_children_of_one_implicit_container_both_survive(self):
+        # Each writer authors a child of /World into a layer without /World, so each creates its own /World, an
+        # implicit container: an `over` with no other field. The second writer's /World replaces the first's,
+        # whose creator restores BoxA under it with an ordinary write in the transaction that applies the
+        # replacement, so its visible scene and host content never lose BoxA.
+        (first, second), faults, base, before = await self.held_writers(
+            ('usd-def /World/BoxA 1', 'usd-def /World/BoxB 2'))
+        restore = self.state.plan('UpdateLayer', 'before', attempt=base + 3, pause=True)
+        self.addCleanup(restore.release.set)
+        faults[0].release.set()
+        self.assertEqual((await first.command(f'wait {before + 1}'))['result'], 0)
+        faults[1].release.set()
+        self.assertEqual((await second.command(f'wait {before + 2}'))['result'], 0)
+        await asyncio.wait_for(restore.reached.wait(), 5)
+        held = await first.command(f'journal-applied {before + 2}')
+        self.assertEqual((held['result'], held['status_result'], held['pending']), (0, 0, 1), held)
+        winner = next(node for node in held['authoritative'] if node['path'] == '/World')
+        self.assertEqual(self.markers(held['authoritative']), {'/World/BoxB': 2})
+        for scene in (held['visible'], held['host']):
+            self.assertEqual(self.markers(scene), {'/World/BoxA': 1, '/World/BoxB': 2})
+        self.assertEqual(next(node for node in held['visible'] if node['path'] == '/World/BoxA')['parent'],
+                         winner['id'])
+        restore.release.set()
+        ready = await self.assert_final((first, second), before + 3, {'/World/BoxA': 1, '/World/BoxB': 2},
+                                        attempts=base + 3)
+        self.assertEqual(self.world_prims(ready['visible']), ['/World', '/World/BoxA', '/World/BoxB'])
+        replaced = await first.command('diagnostics')
+        self.assertTrue(any('replaced /World, which this client created, and restored its content under the peer'
+                            in warning for warning in replaced['warnings']), replaced['warnings'])
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_concurrent_same_named_children_of_one_implicit_container_keep_the_first(self):
+        # Both writers author /World/BoxA under their own implicit /World. The restore drops the replaced
+        # container's BoxA, because the winning /World already holds one: the first at a path wins.
+        (first, second), faults, base, before = await self.held_writers(
+            ('usd-def /World/BoxA 1', 'usd-def /World/BoxA 2'))
+        for offset, (writer, fault) in enumerate(zip((first, second), faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        await self.assert_final((first, second), before + 2, {'/World/BoxA': 2}, attempts=base + 2)
+        # Nothing was restored, so the warning says the subtree was removed.
+        report = await first.command('diagnostics')
+        self.assertTrue(any('replaced /World, which this client created, and removed its subtree' in warning
+                            for warning in report['warnings']), report['warnings'])
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_concurrent_nested_implicit_containers_merge_their_children(self):
+        # /World and /World/Racks are implicit containers on both writers. The restore descends into the winner's
+        # /World/Racks, because the replaced writer's Racks is an implicit container too, and adds Rack_1 there.
+        (first, second), faults, base, before = await self.held_writers(
+            ('usd-def /World/Racks/Rack_1 1', 'usd-def /World/Racks/Rack_2 2'))
+        for offset, (writer, fault) in enumerate(zip((first, second), faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        ready = await self.assert_final((first, second), before + 3,
+                                        {'/World/Racks/Rack_1': 1, '/World/Racks/Rack_2': 2}, attempts=base + 3)
+        self.assertEqual(self.world_prims(ready['visible']),
+                         ['/World', '/World/Racks', '/World/Racks/Rack_1', '/World/Racks/Rack_2'])
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_three_writers_overriding_sibling_prims_under_implicit_ancestors_keep_every_override(self):
+        # #10's [source_first_write]: three writers each override one rack's attribute, and each creates
+        # /World and its rack as `over`s. The second writer's /World replaces the first's, and the third's the
+        # second's. The first writer's restore is held until the third /World commits, so it lands under a
+        # replaced /World and the service skips it; the first writer restores again while it is still pending.
+        writers, faults, base, before = await self.held_writers(
+            [f'usd-over /World/RackLarge_A{n} {n}' for n in (1, 2, 3)])
+        restore = self.state.plan('UpdateLayer', 'before', attempt=base + 4, pause=True)
+        self.addCleanup(restore.release.set)
+        for offset, (writer, fault) in enumerate(zip(writers[:2], faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        await asyncio.wait_for(restore.reached.wait(), 5)  # The first writer's restore under the second /World.
+        faults[2].release.set()
+        self.assertEqual((await writers[2].command(f'wait {before + 3}'))['result'], 0)
+        held = await writers[0].command(f'journal-applied {before + 3}')
+        self.assertEqual((held['result'], held['status_result']), (0, 0), held)
+        # The second writer's restore may already have applied; the first writer's rack never left.
+        for scene in (held['visible'], held['host']):
+            markers = self.markers(scene)
+            self.assertEqual({path: markers.get(path) for path in ('/World/RackLarge_A1', '/World/RackLarge_A3')},
+                             {'/World/RackLarge_A1': 1, '/World/RackLarge_A3': 3})
+        restore.release.set()
+        # Three overrides, the first writer's two restores and the second writer's one.
+        ready = await self.assert_final(writers, before + 6,
+                                        {f'/World/RackLarge_A{n}': n for n in (1, 2, 3)}, attempts=base + 6)
+        self.assertEqual(self.world_prims(ready['visible']),
+                         ['/World'] + [f'/World/RackLarge_A{n}' for n in (1, 2, 3)])
+        for writer in writers:
+            await self.close(writer)
+
+    async def test_a_pending_edit_under_a_replaced_implicit_container_is_restored(self):
+        # The writer's /World is committed; an edit compiled against it is held. A peer's Create of /World
+        # replaces it, and the restore copies both BoxA and the held BoxC from the visible scene. The held
+        # edit later commits under the replaced /World, where the service skips it.
+        writer, _ = await self.start(host=True)
+        committed = len(self.commits()) + 1
+        created = await writer.command('usd-def /World/BoxA 1')
+        self.assertEqual(created['result'], 0, created)
+        self.assertEqual((await writer.command(f'wait {committed}'))['result'], 0)
+        base = self.state.attempts['UpdateLayer']
+        fault = self.state.plan('UpdateLayer', 'before', attempt=base + 1, pause=True)
+        self.addCleanup(fault.release.set)
+        pending = await writer.command('usd-def /World/BoxC 3')
+        self.assertEqual(pending['result'], 0, pending)
+        await asyncio.wait_for(fault.reached.wait(), 5)
+        peer = await self.update(Delta(commands=(C(1, 900, 1, 'World', 6),)))
+        applied = await writer.command(f'journal-applied {peer}')
+        self.assertEqual((applied['result'], applied['status_result']), (0, 0), applied)
+        for scene in (applied['visible'], applied['host']):
+            self.assertEqual(self.markers(scene), {'/World/BoxA': 1, '/World/BoxC': 3})
+        self.assertEqual({node['parent'] for node in applied['visible'] if node['path'] in ('/World/BoxA', '/World/BoxC')},
+                         {900})
+        fault.release.set()
+        # BoxA, the peer's /World, the held BoxC the service skips and the restore.
+        await self.assert_final((writer,), peer + 2, {'/World/BoxA': 1, '/World/BoxC': 3}, attempts=base + 3)
+        await self.close(writer)
+
+    async def test_concurrent_authored_definitions_of_one_prim_keep_the_last(self):
+        # A typed `def` is authored, not an implicit container: the later Create replaces the earlier prim with
+        # its subtree, prim-level last-writer-wins, and nothing is restored.
+        (first, second), faults, base, before = await self.held_writers(('usd-def /World 1', 'usd-def /World 2'))
+        for offset, (writer, fault) in enumerate(zip((first, second), faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        await self.assert_final((first, second), before + 2, {'/World': 2}, attempts=base + 2)
+        report = await first.command('diagnostics')
+        self.assertTrue(any('replaced /World, which this client created, and removed its subtree' in warning
+                            for warning in report['warnings']), report['warnings'])
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_a_loser_without_restore_loses_its_implicit_container_content(self):
+        # A client without restore, as ovlive 0.1 is: its /World and BoxA go with the peer's replacing Create.
+        (first, second), faults, base, before = await self.held_writers(
+            ('usd-def /World/BoxA 1', 'usd-def /World/BoxB 2'), restore=(False, True))
+        for offset, (writer, fault) in enumerate(zip((first, second), faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        await self.assert_final((first, second), before + 2, {'/World/BoxB': 2}, attempts=base + 2)
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_restoring_one_subtree_past_the_round_bound_fails_the_layer_and_keeps_host_content(self):
+        # With a bound of one round, the first replacement restores Racks and Rack_1 under the peer's /World;
+        # the peer then replaces that restored Racks, and a second round would exceed the bound. The layer fails
+        # RESOURCE_EXHAUSTED and its host content keeps the subtree.
+        writer, _ = await self.start(host=True)
+        self.assertEqual((await writer.command('restore-rounds 1'))['result'], 0)
+        committed = len(self.commits()) + 1
+        created = await writer.command('usd-def /World/Racks/Rack_1 1')
+        self.assertEqual(created['result'], 0, created)
+        self.assertEqual((await writer.command(f'wait {committed}'))['result'], 0)
+        world = await self.update(Delta(commands=(C(1, 900, 1, 'World', 6),)))
+        restored = await writer.command(f'wait {world + 1}')
+        self.compare(restored)
+        racks = next(node for node in restored['visible'] if node['path'] == '/World/Racks')
+        self.assertEqual(racks['parent'], 900)
+        self.assertEqual(self.markers(restored['visible']), {'/World/Racks/Rack_1': 1})
+        peer = await self.update(Delta(commands=(C(1, 901, 900, 'Racks', 6),)))
+        failed = await writer.command(f'wait {peer}')
+        self.assertEqual((failed['status_state'], failed['status_result']), (7, 13), failed)
+        self.assertEqual(self.markers(failed['host']), {'/World/Racks/Rack_1': 1})
+        self.assertEqual(len(self.commits()), peer)
+        await self.close(writer)
+
+    async def committed_racks(self, writer):
+        """The writer's committed /World/Racks/Rack_1, both implicit containers above it; their sections by path."""
+        head = len(self.commits())
+        created = await writer.command('usd-def /World/Racks/Rack_1 1')
+        self.assertEqual(created['result'], 0, created)
+        state = await writer.command(f'wait {head + 1}')
+        self.assertEqual(state['result'], 0, state)
+        return {node['path']: node['id'] for node in state['visible']}
+
+    async def test_one_peer_update_replacing_a_nested_container_and_then_its_ancestor_keeps_the_content(self):
+        # One update replaces the writer's /World/Racks and then its /World. The /World restore copies the
+        # scene before the update, which still holds Rack_1, so the nested restore is covered by it, and both
+        # replacements report their content restored.
+        writer, _ = await self.start(host=True)
+        ids = await self.committed_racks(writer)
+        base = self.state.attempts['UpdateLayer']
+        peer = await self.update(Delta(commands=(C(1, 901, ids['/World'], 'Racks', 6), C(1, 902, 1, 'World', 6))))
+        restored = await writer.command(f'journal-applied {peer}')
+        self.assertEqual(self.markers(restored['visible']), {'/World/Racks/Rack_1': 1})
+        await self.assert_final((writer,), peer + 1, {'/World/Racks/Rack_1': 1}, attempts=base + 2)
+        warnings = (await writer.command('diagnostics'))['warnings']
+        for path in ('/World/Racks', '/World'):
+            self.assertTrue(any(f'replaced {path}, which this client created, and restored its content under the peer'
+                                in warning for warning in warnings), warnings)
+        await self.close(writer)
+
+    async def test_a_batch_replacing_a_nested_container_and_then_its_ancestor_applies_as_separate_updates(self):
+        # Two peer updates, the first replacing the writer's /World/Racks and the second its /World, reach the
+        # writer while its host is held behind an earlier peer update's application, so they apply as one batch.
+        # The batch applies as the two updates would separately: the Racks restore is pending when /World is
+        # replaced, so the /World restore copies it, and the writer issues both restores.
+        writer, _ = await self.start(host=True)
+        ids = await self.committed_racks(writer)
+        base = self.state.attempts['UpdateLayer']
+        self.assertEqual((await writer.command('jitter-off'))['result'], 0)
+        self.assertEqual((await writer.command('host-hold'))['result'], 0)
+        await self.update(Delta(fields=(F(4, 'value', 11),)))
+        await self.update(Delta(commands=(C(1, 901, ids['/World'], 'Racks', 6),)))
+        world = await self.update(Delta(commands=(C(1, 902, 1, 'World', 6),)))
+        self.assertEqual((await writer.command(f'covered {world}'))['result'], 0)
+        self.assertEqual((await writer.command('host-release'))['result'], 0)
+        restored = await writer.command(f'journal-applied {world}')
+        self.assertEqual(self.markers(restored['visible']), {'/World/Racks/Rack_1': 1})
+        # The restore under the replaced Racks, which the service skips, and the one under /World.
+        await self.assert_final((writer,), world + 2, {'/World/Racks/Rack_1': 1}, attempts=base + 5)
+        await self.close(writer)
+
+    async def test_a_restore_refused_for_capacity_waits_and_is_retried_when_pending_bytes_release(self):
+        # The first writer's restore admission is refused as a full endpoint refuses it: the replacement still
+        # applies and the layer stays READY. The endpoint's next pending-byte release, the replacing update's own
+        # read reservation, dispatches the retry to the host, which admits the restore and installs it into the
+        # host content; no later update arrives to retry it at an application.
+        (first, second), faults, base, before = await self.held_writers(
+            ('usd-def /World/BoxA 1', 'usd-def /World/BoxB 2'))
+        self.assertEqual((await first.command('restore-refuse 1'))['result'], 0)
+        for offset, (writer, fault) in enumerate(zip((first, second), faults), 1):
+            fault.release.set()
+            self.assertEqual((await writer.command(f'wait {before + offset}'))['result'], 0)
+        await self.assert_final((first, second), before + 3, {'/World/BoxA': 1, '/World/BoxB': 2}, attempts=base + 3)
+        for writer in (first, second):
+            await self.close(writer)
+
+    async def test_a_restored_authored_prim_keeps_its_round_after_its_restore_commits(self):
+        # With a bound of one round: replacing Racks restores the authored BoxA in round one, and that restore
+        # commits and retires. Replacing /World then copies BoxA again, round two, which fails the layer and keeps
+        # host content; no implicit container below Racks carries the round.
+        writer, _ = await self.start(host=True)
+        self.assertEqual((await writer.command('restore-rounds 1'))['result'], 0)
+        head = len(self.commits())
+        created = await writer.command('usd-def /World/Racks/BoxA 1')
+        self.assertEqual(created['result'], 0, created)
+        state = await writer.command(f'wait {head + 1}')
+        ids = {node['path']: node['id'] for node in state['visible']}
+        racks = await self.update(Delta(commands=(C(1, 901, ids['/World'], 'Racks', 6),)))
+        restored = await writer.command(f'wait {racks + 1}')
+        self.assertEqual((restored['pending'], self.markers(restored['visible'])), (0, {'/World/Racks/BoxA': 1}))
+        peer = await self.update(Delta(commands=(C(1, 902, 1, 'World', 6),)))
+        failed = await writer.command(f'wait {peer}')
+        self.assertEqual((failed['status_state'], failed['status_result']), (7, 13), failed)
+        self.assertEqual(self.markers(failed['host']), {'/World/Racks/BoxA': 1})
+        await self.close(writer)
+
+    async def test_a_combined_restore_keeps_each_sources_round_while_pending(self):
+        # With a bound of two rounds, one restore intent carries a round-two source (/W, whose copy holds the
+        # round-one restore of Box1) and a round-one source (/B with Box2). While it is held, a peer replaces the
+        # section the restored Box2 attaches under; Box2's own round is one, so its next restore is round two and
+        # fits, rather than taking the intent's highest round.
+        writer, _ = await self.start(host=True)
+        self.assertEqual((await writer.command('restore-rounds 2'))['result'], 0)
+        head = len(self.commits())
+        for command in ('usd-def /W/A/Box1 1', 'usd-def /B/Box2 2'):
+            self.assertEqual((await writer.command(command))['result'], 0)
+        state = await writer.command(f'wait {head + 2}')
+        ids = {node['path']: node['id'] for node in state['visible']}
+        first = await self.update(Delta(commands=(C(1, 901, ids['/W'], 'A', 6),)))
+        self.assertEqual((await writer.command(f'wait {first + 1}'))['result'], 0)  # Box1 restored, round one.
+        base = self.state.attempts['UpdateLayer']
+        held = self.state.plan('UpdateLayer', 'before', attempt=base + 2, pause=True)
+        self.addCleanup(held.release.set)
+        both = await self.update(Delta(commands=(C(1, 902, 1, 'W', 6), C(1, 903, 1, 'B', 6))))
+        await asyncio.wait_for(held.reached.wait(), 5)  # The combined restore, held before commit.
+        again = await self.update(Delta(commands=(C(1, 904, 1, 'B', 6),)))
+        applied = await writer.command(f'journal-applied {again}')
+        self.assertEqual((applied['result'], applied['status_result'], applied['status_state']), (0, 0, 2), applied)
+        self.assertEqual(self.markers(applied['host']), {})
+        boxes = {node['path']: node['parent'] for node in applied['visible'] if node['path'] in ('/W/A/Box1', '/B/Box2')}
+        self.assertEqual(boxes['/B/Box2'], 904)
+        held.release.set()
+        state = await writer.command(f'wait {again + 2}')
+        self.compare(state)
+        restored = {node['path']: node['fields']['default']['value'] for node in state['visible']
+                    if node['path'] in ('/W/A/Box1.marker', '/B/Box2.marker')}
+        self.assertEqual(restored, {'/W/A/Box1.marker': 1, '/B/Box2.marker': 2})
+        self.assertEqual(len(self.commits()), again + 2)
+        await self.close(writer)
+
+    async def test_one_update_replacing_more_containers_than_restores_may_wait_restores_them_all(self):
+        # One peer update replaces 65 of the writer's implicit containers, more than the 64 restores that may wait.
+        # The restore of all of them fits, so it is admitted as one intent and nothing waits.
+        writer, _ = await self.start(host=True)
+        count = 65
+        head = len(self.commits())
+        # Compact reports keep the many authoring commands within the driver's output bound.
+        self.assertEqual((await writer.command('quiet on'))['result'], 0)
+        for index in range(count):
+            self.assertEqual((await writer.command(f'usd-def /P/C{index}/Box {index}'))['result'], 0)
+        self.assertEqual((await writer.command(f'wait {head + count}'))['result'], 0)
+        self.assertEqual((await writer.command('quiet off'))['result'], 0)
+        base = self.state.attempts['UpdateLayer']
+        peer = await self.update(Delta(commands=tuple(C(1, 1000 + index, 2, f'C{index}', 6) for index in range(count))))
+        state = await writer.command(f'wait {peer + 1}')
+        self.compare(state)
+        boxes = {node['path']: node['fields']['default']['value'] for node in state['visible']
+                 if node['path'].startswith('/P/C') and node['path'].endswith('/Box.marker')}
+        self.assertEqual(boxes, {f'/P/C{index}/Box.marker': index for index in range(count)})
+        self.assertEqual({node['parent'] for node in state['visible'] if node['path'].endswith('/Box')},
+                         {1000 + index for index in range(count)})
+        self.assertEqual((state['status_state'], len(self.commits()), self.state.attempts['UpdateLayer']),
+                         (2, peer + 1, base + 2))
+        await self.close(writer)
+
+    async def test_a_pending_child_of_a_replaced_authored_ancestor_waits_for_its_creator_restore(self):
+        # The second writer creates /World/Racks/Rack_2 and then types Racks, so /World is its implicit container
+        # and Racks is authored. The first writer, having seen both, holds BoxC under Racks. The third writer's
+        # concurrent /World replaces the second's. The second writer restores Racks and Rack_2; the first does not
+        # create its own Racks, since Racks is the second writer's authored prim, and its BoxC waits until the
+        # second writer's restore holds /World/Racks, then attaches under it.
+        writers = [(await self.start(host=True))[0] for _ in range(3)]
+        base = self.state.attempts.get('UpdateLayer', 0)
+        third = self.state.plan('UpdateLayer', 'before', attempt=base + 1, pause=True)
+        self.addCleanup(third.release.set)
+        submitted = await writers[2].command('usd-def /World/BoxD 4')
+        self.assertEqual(submitted['result'], 0, submitted)
+        await asyncio.wait_for(third.reached.wait(), 5)
+        typed = len(self.commits()) + 2
+        for command in ('usd-def /World/Racks/Rack_2 2', 'usd-type /World/Racks Xform'):
+            self.assertEqual((await writers[1].command(command))['result'], 0)
+        self.assertEqual((await writers[1].command(f'wait {typed}'))['result'], 0)
+        self.assertEqual((await writers[0].command(f'wait {typed}'))['result'], 0)
+        held = self.state.plan('UpdateLayer', 'before', attempt=base + 4, pause=True)
+        self.addCleanup(held.release.set)
+        self.assertEqual((await writers[0].command('usd-def /World/Racks/BoxC 3'))['result'], 0)
+        await asyncio.wait_for(held.reached.wait(), 5)
+        third.release.set()
+        # The third writer's /World, the second writer's restore and, once the first writer applies it, the
+        # first writer's restore of BoxC.
+        restored = await writers[0].command(f'journal-applied {typed + 2}')
+        self.assertEqual(self.markers(restored['visible']),
+                         {'/World/BoxD': 4, '/World/Racks/Rack_2': 2, '/World/Racks/BoxC': 3})
+        held.release.set()
+        markers = {'/World/BoxD': 4, '/World/Racks/Rack_2': 2, '/World/Racks/BoxC': 3}
+        ready = await self.assert_final(writers, typed + 4, markers, attempts=base + 6)
+        racks = [node for node in ready['visible'] if node['path'] == '/World/Racks']
+        self.assertEqual([node['fields']['typeName']['value'] for node in racks], ['Xform'])
+        for writer in writers:
+            await self.close(writer)
+
+    async def replace_authored_world(self, typed):
+        # Authoring /World's typeName makes the writer's /World an authored prim; a peer's Create of /World, typed
+        # or an implicit container, replaces it with BoxA.
+        writer, _ = await self.start(host=True)
+        authored = len(self.commits()) + 2
+        for command in ('usd-def /World/BoxA 1', 'usd-type /World Xform'):
+            self.assertEqual((await writer.command(command))['result'], 0)
+        self.assertEqual((await writer.command(f'wait {authored}'))['result'], 0)
+        # The writer's attempts and the peer's.
+        attempts = self.state.attempts['UpdateLayer'] + 1
+        fields = (F(900, 'specifier', Specifier(0)), F(900, 'typeName', Token('Scope'))) if typed else ()
+        peer = await self.update(Delta(commands=(C(1, 900, 1, 'World', 6),), fields=fields))
+        return writer, peer, attempts
+
+    async def test_an_authored_prim_an_implicit_container_replaces_adopts_it(self):
+        # The writer's restore writes /World's prim fields onto the peer's implicit container and restores BoxA
+        # under it, so /World ends the typed prim, as it would had the writer's Create committed last.
+        writer, peer, attempts = await self.replace_authored_world(False)
+        ready = await self.assert_final((writer,), peer + 1, {'/World/BoxA': 1}, attempts=attempts + 1)
+        world = next(node for node in ready['visible'] if node['path'] == '/World')
+        # The writer's /World is an `over` whose specifier SdfCreatePrimInLayer leaves at its fallback.
+        self.assertEqual((world['id'], world['fields'].get('specifier'), world['fields']['typeName']),
+                         (900, None, typed_value(Token('Xform'))))
+        report = await writer.command('diagnostics')
+        self.assertTrue(any("replaced /World, which this client created, and restored its content under the peer's "
+                            'section' in warning for warning in report['warnings']), report['warnings'])
+        await self.close(writer)
+
+    async def test_an_authored_prim_another_authored_prim_replaces_is_not_restored(self):
+        # Prim-level last-writer-wins: the peer's typed /World removes the writer's with BoxA, and nothing is
+        # restored.
+        writer, peer, attempts = await self.replace_authored_world(True)
+        ready = await self.assert_final((writer,), peer, {}, attempts=attempts)
+        world = next(node for node in ready['visible'] if node['path'] == '/World')
+        self.assertEqual(world['fields']['typeName'], typed_value(Token('Scope')))
+        report = await writer.command('diagnostics')
+        self.assertTrue(any('replaced /World, which this client created, and removed its subtree' in warning
+                            for warning in report['warnings']), report['warnings'])
+        await self.close(writer)
+
+    async def test_a_whole_restore_counts_the_rounds_of_restored_content_it_copies(self):
+        # With a bound of one round: replacing Racks restores Sub, an implicit container, in round one. Replacing
+        # /World then copies that Sub, so its restore is round two and fails the layer, keeping host content.
+        writer, _ = await self.start(host=True)
+        self.assertEqual((await writer.command('restore-rounds 1'))['result'], 0)
+        head = len(self.commits())
+        created = await writer.command('usd-def /World/Racks/Sub/BoxA 1')
+        self.assertEqual(created['result'], 0, created)
+        state = await writer.command(f'wait {head + 1}')
+        ids = {node['path']: node['id'] for node in state['visible']}
+        racks = await self.update(Delta(commands=(C(1, 901, ids['/World'], 'Racks', 6),)))
+        restored = await writer.command(f'wait {racks + 1}')
+        self.assertEqual(self.markers(restored['visible']), {'/World/Racks/Sub/BoxA': 1})
+        peer = await self.update(Delta(commands=(C(1, 902, 1, 'World', 6),)))
+        failed = await writer.command(f'wait {peer}')
+        self.assertEqual((failed['status_state'], failed['status_result']), (7, 13), failed)
+        self.assertEqual(self.markers(failed['host']), {'/World/Racks/Sub/BoxA': 1})
+        await self.close(writer)
+
+    async def test_seeded_first_create_writers_keep_every_writers_content(self):
+        # The first-create writer campaign: in each round every writer authors, before seeing the others, a prim
+        # under shared ancestors the layer lacks (/R<round>/A, /R<round>/A/B, ...), so each creates its own implicit
+        # containers; a seeded writer also defines one of its ancestors as a typed prim, never one another writer
+        # of the round types, so an authored ancestor meets only the others' implicit containers. The writes
+        # commit in a seeded order, each replacing the containers before it, and a seeded subset of writers
+        # receives the round's commits as one batch. Every writer's prim and value survive on every writer and a
+        # late joiner, and every typed ancestor stays a typed `def`, whichever order its writer's write and the
+        # others' implicit containers at its path commit in; each round's writes commit once each, and every
+        # other commit is a restore: Creates of new sections and records of those sections, beside which it may
+        # write an authored ancestor's prim fields onto an implicit container another writer's Create holds.
+        clients, rounds = getattr(self, 'writer_clients', 4), getattr(self, 'writer_steps', 6)
+        rng = random.Random(f'first-create:{self.seed}')
+        plan = dict(master_seed=self.seed, writers=[[] for _ in range(clients)], rounds=[])
+        for round_index in range(rounds):
+            order = list(range(clients))
+            rng.shuffle(order)
+            batched = sorted(rng.sample(range(clients), rng.randrange(clients + 1)))
+            typed = set()
+            for writer in range(clients):
+                levels = ['A', 'B', 'C'][:rng.randrange(4)]
+                containers = '/'.join(levels)
+                path = '/'.join(filter(None, (f'/R{round_index}', containers, f'W{writer}')))
+                verb = rng.choice(('usd-def', 'usd-over'))
+                command = f'{verb} {path} {100 * round_index + writer + 1}'
+                if levels and rng.randrange(2):
+                    ancestor = '/'.join((f'/R{round_index}', *levels[:rng.randrange(len(levels)) + 1]))
+                    if ancestor not in typed:
+                        typed.add(ancestor)
+                        command += f' {ancestor}'
+                plan['writers'][writer].append(dict(command=command, path=path, value=100 * round_index + writer + 1))
+            plan['rounds'].append(dict(order=order, batched=batched, typed=sorted(typed)))
+        from tools.live.writer_campaign import observe_workload
+        observe_workload(self, plan)
+        self.trace['first_create_plan'] = plan
+        print(json.dumps({'first_create_master_seed': self.seed}), flush=True)
+        drivers, identities, reads = [], [], []
+        for _ in range(clients):
+            driver, opened = await self.start(host=True)
+            drivers.append(driver)
+            identities.append(opened['writer'])
+            reads.append(self.state.reads[-1]['attempt'])
+        restores, adoptions = [], []
+
+        async def committed(predicate):
+            async with asyncio.timeout(10):  # Failure watchdog only.
+                async with self.state.changed:
+                    await self.state.changed.wait_for(predicate)
+
+        async def quiesce():
+            # Every writer has applied the ledger's head with nothing pending, and nothing committed meanwhile.
+            while True:
+                frontier = len(self.commits())
+                for driver in drivers:
+                    state = await driver.command(f'settle {frontier}')
+                    self.assertEqual((state['result'], state['status_result']), (0, 0), state)
+                if len(self.commits()) == frontier:
+                    return frontier
+
+        head = await quiesce()
+        for round_index, schedule in enumerate(plan['rounds']):
+            base = self.state.attempts.get('UpdateLayer', 0)
+            faults = [self.state.plan('UpdateLayer', 'before', attempt=base + n, pause=True)
+                      for n in range(1, clients + 1)]
+            for fault in faults:
+                self.addCleanup(fault.release.set)
+            for driver, steps, fault in zip(drivers, plan['writers'], faults):
+                submitted = await driver.command(steps[round_index]['command'])
+                self.assertEqual(submitted['result'], 0, submitted)
+                await asyncio.wait_for(fault.reached.wait(), 5)
+            gates = [self.state.plan_read_frame(reads[writer], head + 1, include_suppressed=True)
+                     for writer in schedule['batched']]
+            for gate in gates:
+                self.addCleanup(gate.release.set)
+            authored = []
+            for writer in schedule['order']:
+                faults[writer].release.set()
+                seen = len(self.commits())
+                # A writer has no other write in flight before its own lands, so its next commit is this one.
+                await committed(lambda: any(entry.writer == identities[writer] for entry in self.commits()[seen:]))
+                authored.append(next(entry.sequence for entry in self.commits()[seen:]
+                                     if entry.writer == identities[writer]))
+            for gate in gates:
+                gate.release.set()
+            frontier = await quiesce()
+            for entry in self.commits()[head:frontier]:
+                if entry.sequence in authored:
+                    continue
+                self.assertIn(entry.writer, identities)
+                delta = decode(entry.payload)
+                created = {command.section for command in delta.commands}
+                self.assertTrue(all(command.tag == 1 for command in delta.commands), delta)
+                self.assertTrue(all(record.section in created for record in delta.samples), delta)
+                # The only records of a section the restore does not create: a typed ancestor's prim fields on
+                # an implicit container that holds its path.
+                adopted = [record for record in delta.fields if record.section not in created]
+                self.assertTrue(all(record.key in ('specifier', 'typeName') for record in adopted), delta)
+                self.assertTrue(created or adopted, delta)
+                if adopted:
+                    adoptions.append(entry.sequence)
+                restores.append(entry.sequence)
+            head = frontier
+        expected = {step['path']: step['value'] for steps in plan['writers'] for step in steps}
+        typed = {path: (typed_value(Specifier(0)), typed_value(Token('Xform')))
+                 for schedule in plan['rounds'] for path in schedule['typed']}
+        self.trace['first_create_restores'] = restores
+        self.trace['first_create_adoptions'] = adoptions
+
+        def ancestors(nodes):
+            fields = {node['path']: node['fields'] for node in nodes if node['path'] in typed}
+            return {path: (fields[path].get('specifier'), fields[path].get('typeName')) for path in fields}
+
+        for driver in drivers:
+            state = await driver.command(f'wait {head}')
+            self.compare(state)
+            self.assertEqual(self.markers(state['visible']), {}, 'markers outside /World')
+            self.assertEqual(self.round_markers(state['visible']), expected)
+            self.assertEqual(self.round_markers(state['host']), expected)
+            self.assertEqual(ancestors(state['visible']), typed)
+        joiner, ready = await self.start()
+        self.compare(ready)
+        self.assertEqual(self.round_markers(ready['visible']), expected)
+        self.assertEqual(ancestors(ready['visible']), typed)
+        self.assertFalse(self.state.rejections)
+        await self.close(joiner)
+        for driver in drivers:
+            await self.close(driver)
+
+    @staticmethod
+    def round_markers(nodes):
+        """Each prim's `marker` attribute default under the campaign's /R<round> roots, by prim path."""
+        return {node['path'][:-len('.marker')]: node['fields']['default']['value'] for node in nodes
+                if node['path'].startswith('/R') and node['path'].endswith('.marker')}
 
     def public_creation(self, state, prefix, amount):
         nodes = {node['path']: node for node in state}
@@ -1577,7 +2583,117 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_seeded_structural_writers_account_deleted_and_overwritten_edits(self):
         import structural_history as history
-        plan = history.generate(self.seed, clients=getattr(self, 'writer_clients', 4))
+        await self.graph_writers_with_reduction(
+            'structural', history.generate(self.seed, clients=getattr(self, 'writer_clients', 4)))
+
+    async def graph_writers_with_reduction(self, kind, plan):
+        """Run a round-based writer plan; a semantic mismatch is reduced through fresh trials and still fails."""
+        try:
+            await (self.exercise_structural if kind == 'structural' else self.exercise_samples)(plan)
+        except WriterMismatch as error:
+            publish_writer(self.artifact / f'{kind}-mismatch.json', dict(signature=error.signature,
+                                                                        evidence=error.evidence))
+            # The mismatch counts only once every writer closed cleanly; a crashed writer raises a plain error here,
+            # which is not reduced. The mismatch is published first, so it stays on record either way.
+            await self.retire_writers()
+            # Retire the original fixture before launching any reduction trial.
+            await self.cleanup()
+            self._cleanups.clear()
+            summary = await reduce_writers(plan, error.signature, self.artifact / f'{kind}-reduction',
+                                           functools.partial(self.graph_trial, kind),
+                                           domain=round_domain(GRAPH_HISTORIES[kind].validate, GRAPH_HISTORIES[kind].origin),
+                                           context=plan_replay.context(kind), max_trials=GRAPH_REDUCTION_TRIALS)
+            print(f'{kind.capitalize()} writer reduction: ' + json.dumps(summary, sort_keys=True), flush=True)
+            raise  # Reduction never turns the original failure into a pass.
+
+    async def graph_trial(self, kind, plan, directory, *, automatic_reduction=False, crash=False):
+        """One fresh fixture, service and set of native writers executing `plan`; the reducer's evaluator.
+
+        A mismatch counts only once every native writer has closed through the checked path (retire_writers); a
+        writer that cannot close or exited abnormally leaves the trial unresolved, with the mismatch's signature as
+        `mismatch`. `crash`, a test's, kills the first running writer once the mismatch is raised, before it
+        propagates, as a writer that crashed after its last reply beside a genuine mismatch.
+        """
+        GRAPH_HISTORIES[kind].validate(plan)
+        directory.mkdir(parents=True, exist_ok=True)
+        fixture = GraphTransportTests(GRAPH_WRITER_TESTS[kind])
+        fixture.artifact_override = directory
+        fixture.seed_override = plan['master_seed']
+        if 'test_service_fault' in plan:
+            fixture.writer_service_factory = CorruptGraphWriterService
+        result = dict(outcome='unresolved', cleanup_complete=False)
+        try:
+            await fixture.asyncSetUp()
+            try:
+                if automatic_reduction:
+                    await fixture.graph_writers_with_reduction(kind, plan)
+                else:
+                    await (fixture.exercise_structural if kind == 'structural' else fixture.exercise_samples)(plan)
+            except WriterMismatch:
+                if crash:
+                    driver = next(driver for driver in fixture.drivers if driver.process.returncode is None)
+                    await kill_writer(driver.process)
+                raise
+            result.update(outcome='passed')
+        except WriterMismatch as error:
+            try:
+                await fixture.retire_writers()
+                # The reducer compares only the signature; the evidence stays in the trial's result.json.
+                result.update(outcome='mismatch', signature=error.signature, **({'evidence': error.evidence}
+                                                                                if error.evidence else {}))
+            except Exception as failure:
+                result.update(error=repr(failure), mismatch=error.signature)
+        except Exception as error:
+            result.update(error=repr(error))
+        finally:
+            try:
+                # Run all registered cleanups, even on partial setup failure.
+                while fixture._cleanups:
+                    callback, args, kwargs = fixture._cleanups.pop()
+                    await callback(*args, **kwargs)
+                result['cleanup_complete'] = True
+            except Exception as error:
+                result.update(outcome='unresolved', cleanup_complete=False, cleanup_error=repr(error))
+        return result
+
+    def retryable_refusals(self):
+        """UpdateLayer and CreateLayer uploads refused UNAVAILABLE with nothing applied, which their clients re-send:
+        planned refusals and fired `refuse` write faults."""
+        from service import WriteFault
+        return (len(self.state.refusals) + self.state.refusals_dropped +
+                sum(f.fired for f in self.state.faults if isinstance(f, WriteFault) and f.action == 'refuse'))
+
+    async def round_committed(self, drivers, frontier, refusals, account):
+        """Wait, after a round's holds are released, until the ledger reaches the round's `frontier`, or until no
+        UpdateLayer call is in flight and no write of the round was refused retryably; a ledger that stops short is
+        classified by round_plans.stopped_short.
+
+        `refusals` is retryable_refusals() when the round began and `account()` the class's accounting through the
+        round. A refused write's writer re-sends it, so the wait spans the interval before the re-send. The
+        service's commits and call ends drive the wait; the timeout is only a failure watchdog, and its expiry is
+        never a signature.
+        """
+        def sequence():
+            return self.commits()[-1].sequence
+
+        def in_flight():
+            return self.state.attempts.get('UpdateLayer', 0) - self.state.ended['UpdateLayer']
+
+        def refused():
+            return self.retryable_refusals() - refusals
+        async with asyncio.timeout(10):
+            async with self.state.changed:
+                await self.state.changed.wait_for(lambda: sequence() >= frontier or not (in_flight() or refused()))
+        if sequence() < frontier:
+            round_plans.stopped_short(
+                account, frontier=frontier, sequence=sequence(), in_flight=in_flight(),
+                refused=refused(),
+                stopped=[position for position, (driver, _) in enumerate(drivers)
+                         if driver.process.returncode is not None or driver.error is not None])
+
+    async def exercise_structural(self, plan):
+        import structural_history as history
+        history.validate(plan)
         from tools.live.writer_campaign import observe_workload
         observe_workload(self, plan)
         stem = self.id().split('.')[-1]
@@ -1605,7 +2721,8 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         def expected(rounds):
             evidence['commits'] = ledger()
             persist()  # Keep the observed failing prefix even if accounting rejects it.
-            result = history.account(plan, evidence['admissions'], evidence['peers'], evidence['commits'], rounds)
+            result = history.account(plan, evidence['admissions'], evidence['peers'], evidence['commits'], rounds,
+                                     bindings=evidence.get('bindings'))
             evidence['accounting'] = result
             persist()
             return result
@@ -1630,16 +2747,33 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         proxy = RotatingProxy(self.address)
         self.proxies.append(proxy)
         address = await proxy.start()
+        fault = plan.get('test_service_fault')
+        if fault in ('corrupt-shared-w0:2', 'corrupt-reorder-w1:2'):
+            # The defect fires on its edit's value, if the plan retains the edit.
+            target = [op for writer in plan['writers'] for op in writer if op['edit'] == fault.rsplit('-', 1)[1]]
+            if target and fault.startswith('corrupt-shared'):
+                self.state.corrupt = corrupt_shared(wire_value(target[0]['value']))
+            elif target:
+                self.state.corrupt = corrupt_reorder(target[0]['value'])
+        elif fault == 'relay-shared':
+            self.state.relay = relay_shared
+
+        def converged(reports):
+            """The client-versus-service comparison, then the independent oracle, for reports at one point."""
+            self.compare_writers(plan, reports, functools.partial(history.scene_edit, lineage=oracle['lineage']))
+            for report in reports:
+                history.verify_scene(report['visible'], oracle['scene'], oracle['lineage'])
         frontier = await peer([dict(kind='create', id=1000, parent=5, name='Sentinel', value=1)])
         oracle = expected(0)
         drivers = [await self.start(address, host=True) for _ in range(plan['client_count'])]
-        for _, opened in drivers:
-            self.compare(opened)
-            history.verify_scene(opened['visible'], oracle['scene'])
-        generations = [opened['generation'] for _, opened in drivers]
+        evidence['bindings'] = [opened['writer'] for _, opened in drivers]
+        persist()  # Native writer identity is observed before the first admission.
+        converged([opened for _, opened in drivers])
         active_stub = self.stub
         for ordinal in range(plan['rounds']):
             ops = [writer[ordinal] for writer in plan['writers']]
+            # Peer effects follow the round's generated ordinal, so a reduced plan keeps each retained round's own.
+            original = ops[0]['ordinal']
             nodes = {node['id']: node for node in oracle['scene']}
             commands, prefixes = [], {}
             for op in ops:
@@ -1648,13 +2782,17 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
                     prefixes[op['writer']] = nodes[op['parent']]['path'] + '/' + op['name']
                     commands.append(f"{op['shape']} {op['parent']} {op['name']} {op['value']}")
                 elif op['kind'] == 'field':
-                    commands.append(f"set {history.leaf(branch)} default {op['value']}")
+                    commands.append(field_command(history.leaf(branch), 'default', op['value']))
                 elif op['kind'] == 'shared':
-                    commands.append(f"set 2 shared {op['value']}")
-                elif op['kind'] == 'move':
+                    commands.append(field_command(2, 'shared', op['value']))
+                elif op['kind'] in ('move', 'rename'):
+                    # A rename names the branch's own parent, so it renames the branch in place.
                     commands.append(f"move {branch['ids']['']} {nodes[op['parent']]['path']}/{op['name']}")
+                elif op['kind'] == 'reorder':
+                    commands.append(f"reverse-children {op['parent']} {history.REORDER_FIELD} {op['value']}")
                 else:
                     commands.append(f"erase {branch['ids']['']}")
+            refusals = self.retryable_refusals()
             first_attempt = self.state.attempts.get('UpdateLayer', 0) + 1
             faults = [self.state.plan('UpdateLayer', 'before', attempt=first_attempt + i, pause=True)
                       for i in range(plan['client_count'])]
@@ -1683,60 +2821,63 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
                             self.assertEqual(node['parent'], op['parent'] if parent_suffix is None else admission['ids'][parent_suffix])
                     evidence['admissions'].append(admission)
                 persist()
-                effects = [dict(kind='field', id=1, key='epoch', value=ordinal)]
-                if ordinal in (0, 2, 7):
-                    effects.append(dict(kind='move', id=2, parent=1, old_parent=1, name=f'Parent{ordinal}'))
-                if ops[0]['kind'] != 'create':
-                    writer = ordinal % plan['client_count']
-                    effects.append(dict(kind='create', id=2000 + ordinal,
-                        parent=oracle['branches'][writer]['ids'][''], name=f'Late{ordinal}', value=ordinal + 500))
+                effects = [dict(kind='field', id=1, key='epoch', value=original)]
+                if original in (0, 2, 7):
+                    effects.append(dict(kind='move', id=2, parent=1, old_parent=1, name=f'Parent{original}'))
+                # A peer creates a child under the branch of one writer, chosen by the round, that has one.
+                writer = plan['writers'][original % plan['client_count']][0]['writer']
+                if writer in oracle['branches']:
+                    effects.append(dict(kind='create', id=2000 + original,
+                        parent=oracle['branches'][writer]['ids'][''], name=f'Late{original}', value=original + 500))
                 peer_frontier = await peer(effects, active_stub)
             finally:
                 for slot in record['release_order']:
                     faults[slot].release.set()
             frontier = peer_frontier + plan['client_count']
+            await self.round_committed(drivers, frontier, refusals, lambda: expected(ordinal + 1))
             reports = await together(driver.command(f'wait {frontier}') for driver, _ in drivers)
             for report in reports:
                 self.assertEqual(report['result'], 0, report)
             oracle = expected(ordinal + 1)
-            for report in reports:
-                self.compare(report)
-                history.verify_scene(report['visible'], oracle['scene'])
+            converged(reports)
             record['confirmed_frontier'] = frontier
             if ordinal in plan['rotation_after']:
-                generations = [report['generation'] for report in reports]
-                destination, active_stub, backend = (address_b, stub_b, 'B') if ordinal == 5 else (self.address, self.stub, 'A')
+                # Rotations alternate A to B and back.
+                destination, active_stub, backend = ((address_b, stub_b, 'B')
+                                                     if plan['rotation_after'].index(ordinal) % 2 == 0
+                                                     else (self.address, self.stub, 'A'))
                 before = frontier
                 await proxy.rotate_and_wait(destination, pause=True)
-                frontier = await peer([dict(kind='field', id=1, key='epoch', value=100 + ordinal)], active_stub)
+                frontier = await peer([dict(kind='field', id=1, key='epoch', value=100 + original)], active_stub)
                 proxy.gate.set()
-                reports = await together(driver.command(f'wait {frontier}') for driver, _ in drivers)
+                resumed = await together(driver.command(f'wait {frontier}') for driver, _ in drivers)
                 oracle = expected(ordinal + 1)
-                for i, report in enumerate(reports):
-                    self.compare(report)
-                    history.verify_scene(report['visible'], oracle['scene'])
-                    self.assertGreater(report['generation'], generations[i])
-                    generations[i] = report['generation']
-                self.assertGreaterEqual(sum(r['backend'] == backend and r['cursor'] == before for r in self.state.reads), plan['client_count'])
+                converged(resumed)
+                round_plans.check_rotation(original, [r['generation'] for r in reports],
+                                           [r['generation'] for r in resumed], self.state.reads, backend, before)
                 record['rotation'] = dict(backend=backend, cursor=before, resumed=frontier)
             persist()
         fresh, opened = await self.start()
-        self.compare(opened)
-        history.verify_scene(opened['visible'], oracle['scene'])
+        converged([opened])
         self.assertEqual(len(oracle['lineage']), plan['client_count'] * plan['rounds'])
-        self.assertTrue(any(entry['deleted_ids'] for entry in oracle['lineage'].values()))
-        self.assertTrue(any('superseded_by' in entry for entry in oracle['lineage'].values()))
-        self.assertEqual(self.state.attempts['CreateLayer'], 1)
-        self.assertEqual(self.state.attempts['UpdateLayer'], len(evidence['admissions']) + len(evidence['peers']))
+        if 'origin' not in plan:  # A generated plan covers deletion and supersession; a reduced one need not.
+            self.assertTrue(any(entry['deleted_ids'] for entry in oracle['lineage'].values()))
+            self.assertTrue(any('superseded_by' in entry for entry in oracle['lineage'].values()))
+        self.assertEqual(self.state.attempts.get('CreateLayer', 0), 1)
+        self.assertEqual(self.state.attempts.get('UpdateLayer', 0), len(evidence['admissions']) + len(evidence['peers']))
         for driver, _ in drivers:
             await self.close(driver)
         await self.close(fresh)
 
     async def test_seeded_sample_writers_account_repeated_and_erased_edits(self):
         import sample_history as history
+        await self.graph_writers_with_reduction('samples', history.generate(
+            self.seed, clients=getattr(self, 'writer_clients', 4), rounds=getattr(self, 'writer_steps', 16)))
+
+    async def exercise_samples(self, plan):
+        import sample_history as history
         from tools.live.test_support import write_json
-        plan = history.generate(self.seed, clients=getattr(self, 'writer_clients', 4),
-                                rounds=getattr(self, 'writer_steps', 16))
+        history.validate(plan)
         from tools.live.writer_campaign import observe_workload
         observe_workload(self, plan)
         stem = self.id().split('.')[-1]
@@ -1775,10 +2916,14 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
             persist()
             return result
 
-        def verify(report, oracle, rounds):
-            self.compare(report)
-            history.verify_scene(report['visible'], oracle['scene'])
-            self.assertEqual((report['local_admitted'], report['local_retired']), (rounds, rounds))
+        def verify(reports, oracle, admitted):
+            """The client-versus-service comparison, then the independent oracle and each writer's admitted and
+            retired counts by plan position, for reports at one point."""
+            self.compare_writers(plan, reports, functools.partial(history.scene_edit, lineage=oracle['lineage']))
+            for report in reports:
+                history.verify_scene(report['visible'], oracle['scene'], oracle['lineage'])
+            for report, count in zip(reports, admitted):
+                self.assertEqual((report['local_admitted'], report['local_retired']), (count, count))
 
         persist()  # Inputs and seeds precede native process startup.
         address_b, stub_b = await self.backend('B')
@@ -1787,49 +2932,82 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         drivers = [await self.start(address, host=True) for _ in range(plan['client_count'])]
         evidence['bindings'] = [opened['writer'] for _, opened in drivers]
         persist()  # Native writer identity is observed before the first admission.
+        defect = plan.get('test_service_fault')
+        if defect in ('corrupt-sample-w0:6', 'swallow-sample-w0:6'):
+            # Writer 0's round-6 edit, a sample at time 3.0 of section 6, while writer 0 is retained.
+            position = next((i for i, writer in enumerate(plan['writers']) if writer[0]['writer'] == 0), None)
+            target = None if position is None else corrupt_sample(evidence['bindings'][position], 6, 3.0)
+            if defect == 'corrupt-sample-w0:6':
+                self.state.corrupt = target
+            elif target:
+                self.state.swallow = lambda header, delta: target(header, delta) is not None
+        elif defect == 'relay-sample-6:3':
+            self.state.relay = relay_sample
         oracle = expected(0)
-        for _, opened in drivers: verify(opened, oracle, 0)
+        verify([opened for _, opened in drivers], oracle, [0] * plan['client_count'])
         frontier = 1
+        admitted = [0] * plan['client_count']
+        routed = self.address  # The backend the proxy forwards to.
         for ordinal in range(plan['rounds']):
             operations = [writer[ordinal] for writer in plan['writers']]
+            original = operations[0]['ordinal']  # The round's generated ordinal names its peer sample.
             commands = [f"{op['kind']} {op['section']} {op['time_bits']}" +
                         ('' if op['value'] is None else f" {op['value']}") for op in operations]
+            # Every writer compiles against the scene at the end of the previous round; an edit that changes
+            # nothing in its map admits nothing and issues no write.
+            views = [history.sample_view(oracle['scene'], op['section']) for op in operations]
+            changes = [bool(history.compiled_samples(op, view)) for op, view in zip(operations, views)]
+            refusals = self.retryable_refusals()
             first_attempt = self.state.attempts.get('UpdateLayer', 0) + 1
             faults = [self.state.plan('UpdateLayer', 'before', attempt=first_attempt+i, pause=True)
-                      for i in range(plan['client_count'])]
+                      for i in range(sum(changes))]
             record = dict(ordinal=ordinal, commands=commands, first_attempt=first_attempt,
-                          release_order=plan['release_orders'][ordinal])
+                          release_order=plan['release_orders'][ordinal], no_ops=[not c for c in changes])
             evidence['rounds'].append(record); persist()
             try:
                 reports = await together(driver.command(command) for (driver, _),command in zip(drivers,commands))
                 await asyncio.wait_for(asyncio.gather(*(fault.reached.wait() for fault in faults)), 5)
-                for op, report in zip(operations, reports):
+                round_admissions = []
+                for writer, (op, report, change) in enumerate(zip(operations, reports, changes)):
                     self.assertEqual(report['result'], 0, report)
+                    if not change:
+                        self.assertEqual(report['pending_intents'], [], report)
+                        evidence['admissions'].append(dict(edit=op['edit'], writer=report['writer'],
+                            accepted_id=None, bytes=None, noop=True))
+                        continue
+                    admitted[writer] += 1
                     self.assertEqual(len(report['pending_intents']), 1, report)
                     intent = report['pending_intents'][0]
                     self.assertEqual(intent['id'], report['accepted_id'])
-                    evidence['admissions'].append(dict(edit=op['edit'], writer=report['writer'],
-                        accepted_id=intent['id'], local_ordinal=report['local_admitted'], bytes=intent['bytes']))
+                    admission = dict(edit=op['edit'], writer=report['writer'], accepted_id=intent['id'],
+                                     local_ordinal=report['local_admitted'], bytes=intent['bytes'])
+                    evidence['admissions'].append(admission)
+                    round_admissions.append((op, admission, views[writer]))
                 persist()  # Exact accepted occurrences and bytes precede release.
-                for op, admission in zip(operations, evidence['admissions'][-plan['client_count']:]):
+                for op, admission, view in round_admissions:
                     admission['effect'] = decoded_effect(admission['bytes'])
                     persist()  # Preserve a miscompiled losing edit before rejecting it.
-                    history.verify_effect(op, admission['effect'],
-                                          history.sample_keys(oracle['scene'], op['section']))
+                    history.verify_effect(op, admission['effect'], view)
             finally:
-                for slot in record['release_order']: faults[slot].release.set()
-            frontier += plan['client_count']
+                for slot in record['release_order']:
+                    if slot < len(faults): faults[slot].release.set()
+            frontier += len(faults)
+            await self.round_committed(drivers, frontier, refusals, lambda: expected(ordinal + 1))
             reports = await together(driver.command(f'wait {frontier}') for driver, _ in drivers)
             oracle = expected(ordinal+1)
-            for report in reports: verify(report, oracle, ordinal+1)
+            verify(reports, oracle, admitted)
             record['confirmed_frontier'] = frontier
             if ordinal in plan['rotation_after']:
-                destination, stub, backend = (address_b, stub_b, 'B') if ordinal == 5 else (self.address, self.stub, 'A')
+                # Rotations alternate A to B and back.
+                destination, stub, backend = ((address_b, stub_b, 'B') if plan['rotation_after'].index(ordinal) % 2 == 0
+                                              else (self.address, self.stub, 'A'))
                 cursor = frontier
-                await proxy.rotate_and_wait(destination, pause=True)
-                stamp = -0.0 if ordinal == 5 else 2.0
-                peer = dict(edit=f'peer:{ordinal}', after_round=ordinal, kind='sample', section=6,
-                            time_bits=history.bits(stamp), value=1000+ordinal)
+                # The test-only fault-schedule defect forwards the rotation after round 5 to the backend it leaves.
+                routed = routed if defect == 'misroute-rotation-5' and original == 5 else destination
+                await proxy.rotate_and_wait(routed, pause=True)
+                stamp = -0.0 if original == 5 else 2.0
+                peer = dict(edit=f'peer:{original}', after_round=ordinal, kind='sample', section=6,
+                            time_bits=history.bits(stamp), value=1000+original)
                 delta = Delta(samples=(S(6, stamp, peer['value']),))
                 peer['bytes'] = encode(delta).hex()
                 evidence['peers'].append(peer); persist()
@@ -1838,24 +3016,182 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
                 proxy.gate.set()
                 resumed = await together(driver.command(f'wait {frontier}') for driver, _ in drivers)
                 oracle = expected(ordinal+1)
-                for previous, report in zip(reports, resumed):
-                    verify(report, oracle, ordinal+1)
-                    self.assertGreater(report['generation'], previous['generation'])
-                self.assertGreaterEqual(sum(r['backend']==backend and r['cursor']==cursor for r in self.state.reads),
-                                        plan['client_count'])
+                verify(resumed, oracle, admitted)
+                round_plans.check_rotation(original, [r['generation'] for r in reports],
+                                           [r['generation'] for r in resumed], self.state.reads, backend, cursor)
                 record['rotation'] = dict(backend=backend, cursor=cursor, resumed=frontier)
             persist()
         fresh, opened = await self.start()
-        self.compare(opened)
-        history.verify_scene(opened['visible'], oracle['scene'])
-        self.assertEqual(oracle['native_commits'], plan['client_count']*plan['rounds'])
-        self.assertEqual(oracle['peer_commits'], 2)
-        self.assertTrue(any(item['outcome']=='no_effect' for item in oracle['lineage'].values()))
-        self.assertTrue(any(item['outcome']=='erased' for item in oracle['lineage'].values()))
-        self.assertTrue(any(item['outcome']=='superseded' for item in oracle['lineage'].values()))
-        self.assertEqual(self.state.attempts['UpdateLayer'], len(evidence['admissions'])+len(evidence['peers']))
+        self.compare_writers(plan, [opened], functools.partial(history.scene_edit, lineage=oracle['lineage']))
+        history.verify_scene(opened['visible'], oracle['scene'], oracle['lineage'])
+        self.assertEqual(oracle['native_commits'], sum(admitted))
+        self.assertEqual(oracle['peer_commits'], len(plan['rotation_after']))
+        if 'origin' not in plan:  # A generated plan covers no-op, erased and superseded edits; a reduced one need not.
+            self.assertTrue(sum(admitted) < plan['client_count']*plan['rounds'], 'no planned edit was a no-op')
+            self.assertTrue(any(item['outcome']=='no_effect' for item in oracle['lineage'].values()))
+            self.assertTrue(any(item['outcome']=='erased' for item in oracle['lineage'].values()))
+            self.assertTrue(any(item['outcome']=='superseded' for item in oracle['lineage'].values()))
+        # A selection of only no-op edits and no rotation issues no update, so the service never counts one.
+        self.assertEqual(self.state.attempts.get('UpdateLayer', 0), sum(admitted)+len(evidence['peers']))
         for driver, _ in drivers: await self.close(driver)
         await self.close(fresh)
+
+    async def reduce_graph_defect(self, kind, plan, signature, units, edits):
+        """Reduce a named test-only defect to its minimal plan, then replay that plan with and without the defect;
+        returns the reduction's directory.
+
+        A trial's evidence depends on the plan, so the replay must match only its outcome and signature."""
+        def compared(result):
+            return {key: value for key, value in result.items() if key != 'evidence'}
+        history = GRAPH_HISTORIES[kind]
+        directory = self.artifact / f'{kind}-reducer-selftest' / self._testMethodName
+        first = await self.graph_trial(kind, plan, directory, automatic_reduction=True)
+        self.assertEqual(compared(first), dict(outcome='mismatch', signature=signature, cleanup_complete=True))
+        root = directory / f'{kind}-reduction'
+        summary = read_json(root / 'reduction.json')
+        self.assertEqual(summary['status'], 'complete', summary)
+        self.assertTrue(summary['verified'] and summary['deletion_minimal'], summary)
+        self.assertEqual((summary['retained_units'], summary['retained_edits']), (units, edits))
+        self.assertEqual(history.validate(read_json(root / 'original.plan.json')), plan)
+        best = history.validate(read_json(root / 'best.plan.json'))
+        replay = await self.graph_trial(kind, best, directory / 'replay')
+        self.assertEqual(compared(replay), compared(first))
+        repaired = dict(best)
+        del repaired['test_service_fault']
+        passed = await self.graph_trial(kind, repaired, directory / 'correct-service')
+        self.assertEqual(passed, dict(outcome='passed', cleanup_complete=True))
+        publish_writer(directory / 'selftest.json', dict(first=first, replay=replay, repaired=passed, summary=summary))
+        return root
+
+    async def test_structural_writer_reduction_reexecutes_real_clients_and_service(self):
+        """The defect corrupts writer 0's first shared-field write, which needs no branch; the minimal plan keeps
+        only that edit, without the other writer, rounds or rotations. The graph class's recorded plans replay
+        through the standalone command."""
+        plan = dict(structural_history.generate(structural_history.SELFTEST_SEED, clients=2),
+                    test_service_fault='corrupt-shared-w0:2')
+        root = await self.reduce_graph_defect('structural', plan,
+                                              dict(reason='unexplained or repeated structural commit', edit='w0:2'),
+                                              ['writer:0', 'round:2'], ['w0:2'])
+        await plan_replay.check_standalone(self, root)
+
+    async def test_structural_reorder_reduction_reexecutes_real_clients_and_service(self):
+        """The defect commits writer 1's first reorder, a reversal of /P's prim children, with its Reorder's list
+        reversed, so the ledger holds bytes no writer admitted; the minimal plan keeps that edit and the creation
+        of the branch under /P it needs, without the other writer, rounds or rotations. The recorded plans replay
+        through the standalone command."""
+        plan = dict(structural_history.generate(structural_history.SELFTEST_SEED, clients=2),
+                    test_service_fault='corrupt-reorder-w1:2')
+        root = await self.reduce_graph_defect('structural', plan,
+                                              dict(reason='unexplained or repeated structural commit', edit='w1:2'),
+                                              ['writer:1', 'round:0', 'round:2'], ['w1:0', 'w1:2'])
+        await plan_replay.check_standalone(self, root)
+
+    async def test_sample_writer_reduction_reexecutes_real_clients_and_service(self):
+        """The defect corrupts writer 0's round-6 sample; the minimal plan keeps only that edit."""
+        import sample_history as history
+        plan = dict(history.generate(self.seed, clients=2, rounds=12), test_service_fault='corrupt-sample-w0:6')
+        await self.reduce_graph_defect('samples', plan,
+                                       dict(reason='sample FIFO or original bytes changed', edit='w0:6'),
+                                       ['writer:0', 'round:6'], ['w0:6'])
+
+    async def test_stopped_round_reduction_reexecutes_real_clients_and_service(self):
+        """The defect acknowledges writer 0's round-6 sample without committing it, so the round never reaches its
+        frontier; the convergence failure reduces to that edit alone."""
+        import sample_history as history
+        plan = dict(history.generate(self.seed, clients=2, rounds=12), test_service_fault='swallow-sample-w0:6')
+        await self.reduce_graph_defect('samples', plan,
+                                       dict(reason='round commits stopped short of its frontier',
+                                            cause='admitted sample occurrence missing from ledger', edit='w0:6'),
+                                       ['writer:0', 'round:6'], ['w0:6'])
+
+    async def test_rotation_fault_reduction_reexecutes_real_clients_and_service(self):
+        """The fault-schedule defect forwards the rotation after round 5 to the backend it leaves; the failure keeps
+        that rotation, its round and one writer."""
+        import sample_history as history
+        plan = dict(history.generate(self.seed, clients=2, rounds=12), test_service_fault='misroute-rotation-5')
+        await self.reduce_graph_defect(
+            'samples', plan,
+            dict(reason='writers did not resume reading on the rotation destination at its frontier', rotation=5),
+            ['rotation:5', 'writer:0', 'round:5'], ['w0:5'])
+
+    async def test_graph_trial_mismatch_beside_a_crashed_writer_is_unresolved(self):
+        """The graph evaluator accepts a mismatch only once every writer closed cleanly: each kind's defect, over its
+        minimal plan, is accepted, and the same mismatch beside a writer killed once it is raised leaves the trial
+        unresolved."""
+        cases = [
+            ('structural', round_plans.select(dict(structural_history.generate(structural_history.SELFTEST_SEED,
+                                                                               clients=2),
+                                                   test_service_fault='corrupt-shared-w0:2'), [0], [2], []),
+             dict(reason='unexplained or repeated structural commit', edit='w0:2')),
+            ('samples', round_plans.select(dict(sample_history.generate(self.seed, clients=2, rounds=12),
+                                                test_service_fault='corrupt-sample-w0:6'), [0], [6], []),
+             dict(reason='sample FIFO or original bytes changed', edit='w0:6')),
+        ]
+        for kind, plan, signature in cases:
+            with self.subTest(kind=kind):
+                root = self.artifact / f'{kind}-trial-crashed-writer'
+                healthy = await self.graph_trial(kind, plan, root / 'healthy')
+                self.assertEqual({key: value for key, value in healthy.items() if key != 'evidence'},
+                                 dict(outcome='mismatch', signature=signature, cleanup_complete=True))
+                crashed = await self.graph_trial(kind, plan, root / 'crashed', crash=True)
+                self.assertEqual((crashed['outcome'], crashed['cleanup_complete'], crashed.get('mismatch')),
+                                 ('unresolved', True, signature), crashed)
+                self.assertNotIn('signature', crashed)
+                # The killed writer's exit, not some other retire failure, leaves the trial unresolved.
+                self.assertIn(f'{KILLED_RETURNCODE} != 0', crashed.get('error', ''), crashed)
+
+    async def test_structural_relay_reduction_reexecutes_real_clients_and_service(self):
+        """The relay defect delivers every shared-field write on /P to readers as -1 while the ledger keeps the
+        uploaded value, so after round 2, in which writer 0 writes the shared field, writer 1 holds -1 and differs
+        from the service. A writer never reads its own commits, so the minimal plan keeps both writers, round 2 and
+        the creation writer 1's round-2 reorder needs. The recorded plans replay through the standalone command."""
+        plan = dict(structural_history.generate(structural_history.SELFTEST_SEED, clients=2),
+                    test_service_fault='relay-shared')
+        root = await self.reduce_graph_defect(
+            'structural', plan, dict(reason='writer authoritative scene differs from the service ledger', edit='w0:2'),
+            ['writer:0', 'writer:1', 'round:0', 'round:2'], ['w0:0', 'w0:2', 'w1:0', 'w1:2'])
+        await plan_replay.check_standalone(self, root)
+
+    async def test_sample_relay_reduction_reexecutes_real_clients_and_service(self):
+        """The relay defect delivers every sample at time 3.0 of section 6 to readers with the value -1 while the
+        ledger keeps the uploaded value, so after round 6, in which every writer sets that key, the writer whose own
+        write committed first differs from the service; the minimal plan keeps both writers and round 6. The
+        recorded plans replay through the standalone command."""
+        plan = dict(sample_history.generate(self.seed, clients=2, rounds=12), test_service_fault='relay-sample-6:3')
+        root = await self.reduce_graph_defect(
+            'samples', plan, dict(reason='writer authoritative scene differs from the service ledger', edit='w0:6'),
+            ['writer:0', 'writer:1', 'round:6'], ['w0:6', 'w1:6'])
+        await plan_replay.check_standalone(self, root)
+
+    async def test_round_wait_spans_the_interval_before_a_refused_write_is_resent(self):
+        """A write refused UNAVAILABLE with nothing applied leaves the round's ledger short with no call in flight
+        until its writer re-sends it; the round wait counts the refusal, so it waits for the re-send instead of
+        classifying the round."""
+        refusals = self.retryable_refusals()
+        self.state.plan_write('refuse', position=1, writer='independent-peer')
+        delta = Delta(fields=(F(4, 'value', 11),))
+        with self.assertRaises(grpc.aio.AioRpcError) as refused:
+            await self.update(delta)
+        self.assertEqual(refused.exception.code(), grpc.StatusCode.UNAVAILABLE)
+        frontier = self.commits()[-1].sequence + 1
+        classified = []
+
+        def account():
+            classified.append(self.commits()[-1].sequence)
+            raise WriterMismatch('lost admitted edit')
+        # The wait evaluates the short ledger, with no call in flight, before the re-send reaches the service.
+        waiting = asyncio.create_task(self.round_committed([], frontier, refusals, account))
+        self.assertEqual(await self.update(delta), frontier)
+        await waiting
+        self.assertEqual(classified, [])
+
+    async def test_sample_writers_complete_a_no_op_only_selection(self):
+        """A reduction candidate can retain only edits that change nothing, such as writer 0's round-2 erase of an
+        absent key; the trial issues no update and passes."""
+        plan = round_plans.select(sample_history.generate(self.seed, clients=2, rounds=12), [0], [2], [])
+        self.assertEqual(sample_history.compiled_samples(plan['writers'][0][0], {}), [])
+        result = await self.graph_trial('samples', plan, self.artifact / 'samples-no-op-selection')
+        self.assertEqual(result, dict(outcome='passed', cleanup_complete=True))
 
     async def test_captured_rename_reorder_naming_moved_sibling_is_rejected_definitively(self):
         self.state.advertise_capabilities = False  # One unchained write at a time, never re-sent.
@@ -2099,10 +3435,16 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
             for i, report in enumerate(reports):
                 self.assertEqual(report['result'], 0, report)
                 pending = report['pending_intents']
+                # An edit that changes nothing in the writer's visible map, such as a repeated erase, admits nothing.
+                if not history.compiled_samples(plans[i][ordinal], history.sample_view(typed(models[i].state), 4)):
+                    self.assertEqual(pending, original[i], report)
+                    self.assertEqual(report['visible'], typed(models[i].state))
+                    self.assertEqual((report['local_admitted'], report['local_retired']), (len(original[i]), 0))
+                    continue
                 self.assertEqual(pending[:-1], original[i])
                 self.assertEqual(pending[-1]['id'], report['accepted_id'])
                 self.assertGreater(report['accepted_id'], 0)
-                self.assertEqual(len({p['id'] for p in pending}), ordinal + 1)
+                self.assertEqual(len({p['id'] for p in pending}), len(original[i]) + 1)
                 original[i] = pending
                 # Check each effect against authored input before any head can
                 # commit, including values/maps later overwritten and no-op erases.
@@ -2116,11 +3458,11 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
                               provenance=report['intent_provenance'][-1])
                 authored[i].append(record)
                 write_json(directory / f'writer-{i}.admissions.json', dict(original=pending, authored=authored[i]))
-                history.verify_effect(plans[i][ordinal], effect, history.sample_keys(record['base'], 4))
+                history.verify_effect(plans[i][ordinal], effect, history.sample_view(record['base'], 4))
                 models[i].apply(bytes.fromhex(pending[-1]['bytes']))
                 record['visible'] = typed(models[i].state)
                 self.assertEqual(report['visible'], record['visible'])
-                self.assertEqual((report['local_admitted'], report['local_retired']), (ordinal + 1, 0))
+                self.assertEqual((report['local_admitted'], report['local_retired']), (len(original[i]), 0))
         peer = await self.update(Delta(samples=(S(4, 3.0, 303), S(6, -0.0, 606))))
         self.assertEqual(peer, base + 1)
         retained = await together(driver.command(f'journal-applied {peer}') for driver, _ in drivers)
@@ -2247,8 +3589,19 @@ class GraphTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((second['read_sequence'], second['result']), (sequence, 0))
         self.assertEqual(len(events(snapshot, 'stream_disconnected')), 1, 'explicit close reported a disconnect')
         self.assertEqual(len(events(snapshot, 'retry_scheduled')), 1, 'explicit close scheduled a retry')
-        self.assertEqual(len(events(snapshot, 'recovery_gate_closed')), 1)
-        self.assertEqual(len(events(snapshot, 'recovery_gate_opened')), 1)
+        gate_closed, = events(snapshot, 'recovery_gate_closed')
+        gate_opened, = events(snapshot, 'recovery_gate_opened')
+        self.assertEqual((gate_closed['event_code'], gate_closed['fields']['state']), (12, 3))
+        self.assertEqual((gate_opened['event_code'], gate_opened['fields']['state']), (13, 2))
+        self.assertLess(gate_closed['fields']['revision'], gate_opened['fields']['revision'])
+        self.assertLess(gate_closed['sequence'], gate_opened['sequence'])
+        # The layer enters READY at its open and again when the gate opens;
+        # each entry records layer_ready with that status revision.
+        layer_ready = events(snapshot, 'layer_ready')
+        self.assertEqual(len(layer_ready), 2, layer_ready)
+        self.assertEqual([(r['event_code'], r['fields']['state']) for r in layer_ready], [(10, 2), (10, 2)])
+        self.assertLess(layer_ready[0]['sequence'], gate_closed['sequence'])
+        self.assertEqual(layer_ready[1]['fields']['revision'], gate_opened['fields']['revision'])
         failures = events(snapshot, 'rpc_failed')
         self.assertEqual([r['fields']['request_id'] for r in failures], [first['request_id'], second['request_id']])
         self.assertEqual([r['fields']['stream_generation'] for r in failures],

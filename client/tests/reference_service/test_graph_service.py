@@ -116,7 +116,7 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         for entry in self.state.ledger:
             if entry.layer == "root.live" and entry.object_id == object_id and entry.sequence <= through:
                 model.trim_history(0)
-                model.apply(entry.payload, entry.sequence)
+                model.apply(entry.payload, entry.sequence, **self.state.commit_rules())
         return model
 
     def checkpoint(self):
@@ -137,7 +137,7 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         model = Model()
         for entry in self.layer().commits:
             if through is None or entry.sequence <= through:
-                model.apply(entry.payload, entry.sequence)
+                model.apply(entry.payload, entry.sequence, **self.state.commit_rules())
         return model
 
     async def test_operation_id_resend_returns_the_original_commit_without_applying_twice(self):
@@ -329,7 +329,22 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(next(n for n in observer.state if n["id"] == 5)["fields"], {"counter": 7})
         self.assertFalse(self.state.rejections)
 
-    async def test_same_parent_rename_onto_occupied_name_commits_duplicate_siblings(self):
+    async def test_same_parent_rename_onto_occupied_name_replaces_the_occupant(self):
+        self.assertEqual(self.state.rename_rule, "cascade")
+        identity = await self.create(ordinary(prim(2, "A"), prim(4, "Child", 2), prim(3, "B"),
+                                              fields=(Field(3, "counter", 3),)))
+        response = await self.update(identity, ordinary(Command(3, 3, parent=1, name="A", old_parent=1)))
+        self.assertEqual(response.sequence_num, 2)
+        state = {node["id"]: node for node in self.layer().model.state}
+        self.assertEqual(set(state), {1, 3})
+        self.assertEqual((state[3]["path"], state[3]["fields"], state[1]["fields"]["primChildren"]),
+                         ("/A", {"counter": 3}, ("A",)))
+        _, full = await self.content(self.subscribe())
+        self.assertEqual(ranked(Model().apply(full)), ranked(self.replay().state))
+        self.assertFalse(self.state.rejections)
+
+    async def test_same_parent_rename_onto_occupied_name_keeps_duplicate_siblings_on_a_keep_both_service(self):
+        self.state.rename_rule = "keep_both"
         identity = await self.create(ordinary(prim(2, "A"), prim(3, "B"), fields=(Field(3, "counter", 3),)))
         response = await self.update(identity, ordinary(Command(3, 3, parent=1, name="A", old_parent=1)))
         self.assertEqual(response.sequence_num, 2)
@@ -337,6 +352,21 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((state[2]["path"], state[3]["path"], state[1]["fields"]["primChildren"]), ("/A", "/A", ("A", "A")))
         _, full = await self.content(self.subscribe())
         self.assertEqual(Model().apply(full), self.replay().state)
+        self.assertFalse(self.state.rejections)
+
+    async def test_prim_and_property_of_one_name_coexist_for_a_late_joiner(self):
+        identity = await self.create(ordinary(prim(2, "A"), prim(3, "B"), Command(1, 4, parent=3, name="x", spec_type=1)))
+        # A Create and a Move into the other kind's slot keep both; a same-kind Create replaces the occupant.
+        await self.update(identity, ordinary(prim(5, "x", 3), Command(1, 6, parent=2, name="B", spec_type=1)))
+        await self.update(identity, ordinary(prim(7, "y", 3), Command(3, 6, parent=3, name="y", old_parent=2)))
+        self.assertEqual({node["id"]: node["path"] for node in self.replay().state},
+                         {1: "/", 2: "/A", 3: "/B", 4: "/B.x", 5: "/B/x", 6: "/B.y", 7: "/B/y"})
+        await self.update(identity, ordinary(Command(1, 8, parent=3, name="y", spec_type=8), prim(9, "y", 3)))
+        self.assertEqual({node["id"]: node["path"] for node in self.replay().state},
+                         {1: "/", 2: "/A", 3: "/B", 4: "/B.x", 5: "/B/x", 8: "/B.y", 9: "/B/y"})
+        # A snapshot states sibling indices, not stored orders.
+        _, full = await self.content(self.subscribe())
+        self.assertEqual(ranked(Model().apply(full)), ranked(self.replay().state))
         self.assertFalse(self.state.rejections)
 
     async def test_concurrent_creates_at_one_path_both_commit_and_later_replaces_earlier(self):
@@ -364,6 +394,140 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.layer().model.orphans, {2: {"counter": 2}})
         _, fresh = await self.content(self.subscribe())
         self.assertEqual(Model().apply(fresh), self.replay().state)
+        self.assertFalse(self.state.rejections)
+
+    async def orphan_then_create(self):
+        """Commit a field for the missing section 3, then a Create of 3, while a reader that holds sequence 1 reads
+        live; return the layer's object ID and that reader's model."""
+        identity = await self.create(ordinary(prim(2, "A")))
+        live = self.subscribe(identity, 1, writer="observer")
+        await self.caught_up(live, identity, 1)
+        reader = self.ledger_replay(identity, 1)
+        for sequence, payload in ((2, ordinary(fields=(Field(3, "counter", 5),))), (3, ordinary(prim(3, "B")))):
+            await self.update(identity, payload, writer="peer")
+            header, delivered = await self.content(live)
+            self.assertEqual((header.sequence_num, delivered), (sequence, payload))
+            reader.apply(delivered, sequence, delivered=True)
+        return identity, reader
+
+    async def test_orphan_data_is_not_adopted_by_a_later_create_by_default(self):
+        identity, reader = await self.orphan_then_create()
+        self.assertEqual(reader.state, self.layer().model.state)
+        self.assertEqual(next(n for n in reader.state if n["id"] == 3)["fields"], {})
+        _, full = await self.content(self.subscribe())
+        self.assertEqual(Model().apply(full), self.layer().model.state)
+        self.assertFalse(self.state.rejections)
+
+    async def test_adopted_orphan_data_reaches_late_joiners_and_early_resumers_only(self):
+        # The deployed service keys field rows by section ID alone, so a later Create of the ID owns them, and
+        # they keep the sequence of the update that wrote them.
+        self.state.adopt_orphans = True
+        identity, reader = await self.orphan_then_create()
+        adopted = next(n for n in self.layer().model.state if n["id"] == 3)
+        self.assertEqual((adopted["fields"], self.layer().model.orphans), ({"counter": 5}, {}))
+        self.assertEqual(self.layer().versions.fields[3, "counter"], 2)
+        # A reader that applied the orphan field before the Create drops it and holds none.
+        self.assertEqual(next(n for n in reader.state if n["id"] == 3)["fields"], {})
+        # A late joiner's snapshot and a resume diff from before the orphaning carry it.
+        _, full = await self.content(self.subscribe())
+        self.assertEqual(Model().apply(full), self.layer().model.state)
+        _, early = await self.content(self.subscribe(identity, 1))
+        self.assertIn((3, "counter"), {(field.section, field.key) for field in decode(early).fields})
+        self.assertEqual(self.ledger_replay(identity, 1).apply(early), self.layer().model.state)
+        # A resume diff from between the orphaning and the Create carries the section without it.
+        _, late = await self.content(self.subscribe(identity, 2))
+        self.assertNotIn((3, "counter"), {(field.section, field.key) for field in decode(late).fields})
+        self.assertEqual(next(n for n in self.ledger_replay(identity, 2).apply(late) if n["id"] == 3)["fields"], {})
+        self.assertFalse(self.state.rejections)
+
+    async def adopted_samples(self, *updates):
+        """With `adopt_orphans`, commit `updates` (bytes, or (section, time, value) samples) on a layer holding /A as
+        section 2, and return the layer's object ID and an async function that resumes from a cursor and returns
+        the resume diff's (section, time, value) sample records, its timeSamples field records and the fields of
+        section 3 in the resumer's resulting state."""
+        self.state.adopt_orphans = True
+        identity = await self.create(ordinary(prim(2, "A")))
+        for update in updates:
+            payload = update if type(update) is bytes else encode(Delta(samples=(Sample(*update),)))
+            await self.update(identity, payload, writer="peer")
+
+        async def resumed(cursor):
+            _, diff = await self.content(self.subscribe(identity, cursor))
+            delta = decode(diff)
+            state = self.ledger_replay(identity, cursor).apply(diff)
+            return ({(sample.section, sample.time, sample.value) for sample in delta.samples},
+                    [field for field in delta.fields if field.key == "timeSamples"],
+                    next((n["fields"] for n in state if n["id"] == 3), None))
+        return identity, resumed
+
+    async def test_adopted_orphan_samples_reach_a_resumer_only_when_written_after_its_cursor(self):
+        # The service versions each time sample on its own and sends a resumer only samples newer than its cursor.
+        _, resumed = await self.adopted_samples((3, 1.0, 10), (3, 2.0, 20), ordinary(prim(3, "B")))
+        adopted = next(n for n in self.layer().model.state if n["id"] == 3)
+        self.assertEqual(adopted["fields"], {"timeSamples": TimeSamples(((1.0, 10), (2.0, 20)))})
+        self.assertEqual(self.layer().versions.samples[3], {1.0: 2, 2.0: 3})
+        self.assertEqual(await resumed(1), ({(3, 1.0, 10), (3, 2.0, 20)}, [], adopted["fields"]))
+        self.assertEqual(await resumed(2), ({(3, 2.0, 20)}, [], {"timeSamples": TimeSamples(((2.0, 20),))}))
+        self.assertEqual(await resumed(3), (set(), [], {}))
+        self.assertFalse(self.state.rejections)
+
+    async def test_a_resumer_holding_an_adopting_section_gets_only_later_samples(self):
+        # Orphan t=1 at 2, the adopting Create at 3, t=2 at 4: a resume from 3 carries the t=2 row alone, so a live
+        # reader that dropped the orphan sample before the Create holds only t=2 after it.
+        identity, resumed = await self.adopted_samples((3, 1.0, 10), ordinary(prim(3, "B")), (3, 2.0, 20))
+        samples, fields, held = await resumed(3)
+        self.assertEqual((samples, fields), ({(3, 2.0, 20)}, []))
+        self.assertEqual(held, {"timeSamples": TimeSamples(((1.0, 10), (2.0, 20)))})  # The snapshot resumer's t=1.
+        self.assertFalse(self.state.rejections)
+
+    async def test_an_erase_after_adoption_leaves_a_resumer_without_the_field(self):
+        # Orphan t=1 at 2 and t=2 at 3, the Create at 4, an erase of t=2 at 5: a resume from 3 carries only the
+        # erase, which leaves a resumer that never held the samples with no timeSamples field.
+        _, resumed = await self.adopted_samples((3, 1.0, 10), (3, 2.0, 20), ordinary(prim(3, "B")), (3, 2.0, None))
+        self.assertEqual(await resumed(3), ({(3, 2.0, None)}, [], {}))
+        self.assertFalse(self.state.rejections)
+
+    async def test_an_equal_value_rewrite_of_one_adopted_sample_reaches_resumers_alone(self):
+        # Orphan t=1 at 2 and t=2 at 3, the Create at 4, t=2 rewritten with its value at 5: a resume at or after the
+        # Create carries only t=2, which the service stamps again.
+        _, resumed = await self.adopted_samples((3, 1.0, 10), (3, 2.0, 20), ordinary(prim(3, "B")), (3, 2.0, 20))
+        both = {"timeSamples": TimeSamples(((1.0, 10), (2.0, 20)))}
+        self.assertEqual(await resumed(4), ({(3, 2.0, 20)}, [], both))
+        self.assertEqual(await resumed(3), ({(3, 2.0, 20)}, [], {"timeSamples": TimeSamples(((2.0, 20),))}))
+        self.assertFalse(self.state.rejections)
+
+    async def test_an_adopted_whole_map_write_reaches_only_a_resumer_from_before_it(self):
+        # An orphan whole-map write is the service's timeSamples field row, which keeps its version through adoption.
+        empty = ordinary(fields=(Field(3, "timeSamples", TimeSamples()),))
+        _, resumed = await self.adopted_samples(empty, ordinary(prim(3, "B")))
+        self.assertEqual(self.layer().versions.wholes[3], 2)
+        samples, fields, held = await resumed(1)
+        self.assertEqual((samples, [field.value for field in fields], held),
+                         (set(), [TimeSamples()], {"timeSamples": TimeSamples()}))
+        self.assertEqual(await resumed(2), (set(), [], {}))
+        self.assertFalse(self.state.rejections)
+
+    async def test_orphan_samples_after_an_orphan_whole_map_write_resume_by_row(self):
+        # Orphan whole map {1, 2} at 2, orphan sample t=5 at 3, the Create at 4: a resume from before the whole-map
+        # write gets the whole map, and one from after it only the t=5 row.
+        whole = ordinary(fields=(Field(3, "timeSamples", TimeSamples(((1.0, 10), (2.0, 20)))),))
+        _, resumed = await self.adopted_samples(whole, (3, 5.0, 50), ordinary(prim(3, "B")))
+        every = TimeSamples(((1.0, 10), (2.0, 20), (5.0, 50)))
+        samples, fields, held = await resumed(1)
+        self.assertEqual(([field.value for field in fields], held), ([every], {"timeSamples": every}))
+        self.assertEqual(await resumed(2), ({(3, 5.0, 50)}, [], {"timeSamples": TimeSamples(((5.0, 50),))}))
+        self.assertEqual(await resumed(3), (set(), [], {}))
+        self.assertFalse(self.state.rejections)
+
+    async def test_a_write_of_an_equal_value_reaches_a_resumer_that_lacks_the_adopted_field(self):
+        # The service stamps every field it writes, so the write repairs a resumer that never held the orphan data.
+        self.state.adopt_orphans = True
+        identity, _ = await self.orphan_then_create()
+        await self.update(identity, ordinary(fields=(Field(3, "counter", 5),)), writer="peer")
+        self.assertEqual(self.layer().versions.fields[3, "counter"], 4)
+        _, diff = await self.content(self.subscribe(identity, 2))
+        self.assertIn((3, "counter"), {(field.section, field.key) for field in decode(diff).fields})
+        self.assertEqual(self.ledger_replay(identity, 2).apply(diff), self.layer().model.state)
         self.assertFalse(self.state.rejections)
 
     async def test_retired_identity_create_is_accepted(self):
@@ -527,7 +691,7 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ranked(Model().apply(fresh)), ranked(self.replay().state))
         quiet_header, quiet = await self.content(self.subscribe(identity, 3))
         self.assertEqual((quiet_header.sequence_num, quiet), (3, b""))
-        self.assertEqual(self.state.reads[0], dict(backend="B", attempt=1, object=identity, cursor=1))
+        self.assertEqual(self.state.reads[0], dict(backend="B", attempt=1, object=identity, cursor=1, writer="own"))
 
     async def test_sample_map_and_key_edits_survive_backend_resume(self):
         initial = TimeSamples(((-0.0, 1), (2.0, Token('old'))))
@@ -619,10 +783,27 @@ class GraphServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decode(payload).is_diff)
         self.assertEqual(header.client_timestamp_microseconds_since_epoch, 123)
 
-    async def test_unverified_catch_up_delivers_own_commits_made_before_the_read_opened(self):
-        # Without a proven stable cut a fresh snapshot is acked below commits it holds and delivers them again. The
-        # reader's own commits among them were made before the read opened, so they are delivered like a peer's;
-        # only the reader's commits made after the read opened are filtered.
+    async def test_fresh_catch_up_is_acked_at_its_cut_and_delivers_only_later_commits(self):
+        # Live Edit 0.2.0, the default: a fresh snapshot is acked at exactly the cut it holds, and the read delivers
+        # only commits after that cut, so no edit, the reader's own included, arrives twice.
+        identity = await self.create(ordinary(prim(2, "A")))
+        await self.update(identity, ordinary(fields=(Field(2, "counter", 1),)), writer="peer")
+        await self.update(identity, ordinary(fields=(Field(2, "counter", 2),)), writer="own")
+        stream = self.subscribe(writer="own")
+        header, snapshot = await self.content(stream)
+        self.assertEqual(header.sequence_num, 3)
+        self.assertEqual(ranked(Model().apply(snapshot)), ranked(self.replay().state))
+        await self.caught_up(stream, identity, 3)
+        later = ordinary(fields=(Field(2, "counter", 3),))
+        await self.update(identity, later, writer="peer")
+        header, payload = await self.content(stream)
+        self.assertEqual((header.sequence_num, payload), (4, later))
+
+    async def test_live_edit_0_1_unverified_catch_up_delivers_own_commits_made_before_the_read_opened(self):
+        # Live Edit 0.1.x coverage (`unverified_cut`): without a proven stable cut a fresh snapshot is acked below
+        # commits it holds and delivers them again. The reader's own commits among them were made before the read
+        # opened, so they are delivered like a peer's; only the reader's commits made after the read opened are
+        # filtered.
         identity = await self.create(ordinary(prim(2, "A")))
         peer = ordinary(fields=(Field(2, "counter", 1),))
         own = ordinary(fields=(Field(2, "counter", 2),))

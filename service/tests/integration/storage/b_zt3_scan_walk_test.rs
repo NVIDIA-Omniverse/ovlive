@@ -27,9 +27,12 @@
 //! The proxy's `hits()` shows page 2 was in flight before the abort. Only this
 //! test's clients send `SCAN` through its proxy.
 //!
-//! What the sweep, the reconciler and the checkpoint loop do with the error is
-//! pinned in their own modules (`orphan_sweep`, `ext_reconcile`,
-//! `checkpointer` unit tests), through a seam that ends a walk the same way.
+//! `complete_pages`' one consumer today is the checkpoint clean-up's keyed
+//! `ZSCAN` (`storage::recon_fence`); what the clean-up's withdrawal does with
+//! the error is pinned in the `checkpointer` unit tests, through a seam that
+//! ends a walk the same way. The keyspace walks (`orphan_sweep::scan_keyspace`)
+//! walk no fred stream since b.hyw: they step an explicit cursor
+//! (`storage::scan_guard`), which ends only on cursor `0`.
 //!
 //! # Wait budget
 //!

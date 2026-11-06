@@ -285,6 +285,10 @@ impl CheckpointStore for CountingCheckpointStore {
         self.delegate.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.delegate.delete_ext_blob(hash_hex).await
     }
@@ -358,7 +362,6 @@ impl CheckpointStore for CountingCheckpointStore {
 /// helpers stay aligned with the production struct.
 fn test_config() -> Config {
     Config {
-        catchup_snapshot_enabled: false,
         port: 0,
         metrics_port: 0,
         valkey_url: String::new(),
@@ -440,6 +443,10 @@ fn test_config() -> Config {
         session_retry_max_attempts: 32,
         session_retry_initial_delay_ms: 1,
         pod_memory: live_edit::config::PodMemoryPlan::reference(),
+        dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+        dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+        checkpoint_storage_api_not_found_cache_secs:
+            live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
         session_tokens_sweep_interval_secs: 60,
         checkpoint_enabled: true,
         checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::InMemory,

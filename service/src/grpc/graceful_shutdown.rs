@@ -14,7 +14,17 @@
 // limitations under the License.
 
 //! The graceful-shutdown handle the streaming RPCs and the uploads read
-//! (SDD §5.6), and the paced ending of the live streams.
+//! (SDD §5.6), the paced ending of the live streams, and the hold ending.
+//!
+//! **SIGTERM is the one *shutdown* signal.** It alone closes the registry,
+//! cancels `begun` and the parent, and starts the bound after GOAWAY
+//! ([`end_streams_paced`], [`GracefulShutdown::cancel`]); those steps are
+//! terminal. A disaster-recovery hold (SDD SR-6.3) is a separate,
+//! non-terminal ending ([`GracefulShutdown::end_streams_for_hold`]): it ends
+//! every enrolled stream at once with a per-stream [`HoldCause`], and touches
+//! neither the registry's `closed` flag, nor `begun`, nor the parent, so the
+//! server keeps answering and a later SIGTERM still runs the normal paced
+//! shutdown.
 //!
 //! [`GracefulShutdown`] owns three tokens' worth of state:
 //!
@@ -35,10 +45,13 @@
 //!   earlier attempt's outcome is not known.
 //! - **the enrollment registry** — every live `SubscribeReadLayer` and
 //!   `JoinSession` gets its shutdown token only from
-//!   [`GracefulShutdown::enroll_stream`]: a fresh child of the parent, entered
-//!   in the registry until the returned [`StreamEnrollment`] drops. Closing the
-//!   registry, cancelling `begun` and taking the snapshot happen under one
-//!   lock, so every stream is either in the snapshot or born cancelled.
+//!   [`GracefulShutdown::enroll_stream`]: a [`StreamShutdown`], a fresh child
+//!   of the parent with the stream's own cause slot, entered in the registry
+//!   until the returned [`StreamEnrollment`] drops. Closing the registry,
+//!   cancelling `begun` and taking the snapshot happen under one lock, so
+//!   every stream is either in the snapshot or born cancelled. The hold
+//!   ending's snapshot and its `held` flag are taken under the same lock, so
+//!   the same holds for a hold.
 //!
 //! [`end_streams_paced`] ends the snapshot of N streams in random order over a
 //! window of at most [`StreamPacing::max_window`] (W_cap): at
@@ -46,13 +59,25 @@
 //! once the cap binds (N > R × W_cap) — max(R, N / W_cap) — so the streams'
 //! reconnects reach the other replicas as a ramp rather than a step, then
 //! cancels the parent.
+//!
+//! **A stream's ending follows its own cause.** A stream that observes its
+//! token cancelled reads [`StreamShutdown::hold_cause`]: none — SIGTERM, the
+//! only other canceller — ends it `UNAVAILABLE "server shutting down"`;
+//! [`HoldCause::Held`] ends it `SERVICE_HELD`, and [`HoldCause::StaleVerdict`]
+//! `UPSTREAM_UNAVAILABLE` ([`HoldCause::status`]). The hold records the cause
+//! before it cancels, so a stream woken by the hold never reads an empty cause,
+//! and a stream the hold ended keeps its cause through a later SIGTERM. No
+//! ending here ever cancels a per-session token (SDD §7.8).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use rand::seq::SliceRandom;
 use tokio_util::sync::CancellationToken;
+use tonic::Status;
+
+use crate::error::RefusalDetail;
 
 /// The interval between two batches of the paced ending (Δ).
 pub const STREAM_END_BATCH_INTERVAL: Duration = Duration::from_millis(100);
@@ -118,14 +143,117 @@ impl Default for StreamPacing {
     }
 }
 
+/// Why the hold ending ended a stream (SDD SR-6.3, SR-6.5). Recorded on the
+/// stream's [`StreamShutdown`] before its token is cancelled; a stream whose
+/// token is cancelled with no cause recorded was ended by SIGTERM.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldCause {
+    /// The fleet is held for disaster recovery: the stream ends
+    /// `SERVICE_HELD`. `incident` is the hold marker's, `None` when the marker
+    /// names none.
+    Held {
+        /// The incident the hold marker names, if any.
+        incident: Option<String>,
+    },
+    /// This replica has had no successful hold-poll verdict for the stale
+    /// threshold, and fails closed on its own: the stream ends
+    /// `UPSTREAM_UNAVAILABLE`. No incident: there is no fleet hold.
+    StaleVerdict,
+}
+
+impl HoldCause {
+    /// The status a stream ended for this cause ends with:
+    /// [`RefusalDetail::service_held_status`] for [`Self::Held`], with its
+    /// incident; [`hold_verdict_stale`](super::transport::hold_verdict_stale)
+    /// (`UPSTREAM_UNAVAILABLE`) for [`Self::StaleVerdict`].
+    pub fn status(&self) -> Status {
+        match self {
+            Self::Held { incident } => RefusalDetail::service_held_status(incident.as_deref()),
+            Self::StaleVerdict => super::transport::hold_verdict_stale(),
+        }
+    }
+}
+
+/// One live stream's shutdown token, with the cause slot the hold ending
+/// writes. Handed out only by [`GracefulShutdown::enroll_stream`].
+///
+/// Derefs to the token, so `cancelled()` / `is_cancelled()` and every API
+/// that races a bare token read as before. A stream that observes the token
+/// cancelled reads [`Self::hold_cause`] to choose its ending
+/// ([`Self::ending_status`]).
+#[derive(Clone, Debug)]
+pub struct StreamShutdown {
+    token: CancellationToken,
+    cause: Arc<OnceLock<HoldCause>>,
+}
+
+impl StreamShutdown {
+    /// A token already cancelled, so the stream is refused at its first
+    /// check, carrying `cause` when a hold refused it. Not a child of the
+    /// parent: nothing will ever need to cancel it.
+    fn born_cancelled(cause: Option<HoldCause>) -> Self {
+        let stream = Self {
+            token: CancellationToken::new(),
+            cause: Arc::default(),
+        };
+        stream.end(cause);
+        stream
+    }
+
+    /// Record `cause` if one is given and none is recorded yet, then cancel.
+    /// The record is written before the cancel, so a stream that observes the
+    /// cancel reads the cause (the token's cancel synchronizes with its
+    /// waiters).
+    fn end(&self, cause: Option<HoldCause>) {
+        if let Some(cause) = cause {
+            let _ = self.cause.set(cause);
+        }
+        self.token.cancel();
+    }
+
+    /// Why the hold ended this stream; `None` when it did not — the token is
+    /// uncancelled, or SIGTERM cancelled it. Meaningful once the token is
+    /// cancelled. The first cause recorded stays: a SIGTERM after the hold
+    /// changes nothing.
+    pub fn hold_cause(&self) -> Option<&HoldCause> {
+        self.cause.get()
+    }
+
+    /// The status a stream that observed this token cancelled ends with:
+    /// [`HoldCause::status`] for a hold's cause,
+    /// [`server_shutting_down`](super::transport::server_shutting_down)
+    /// otherwise.
+    pub fn ending_status(&self) -> Status {
+        match self.hold_cause() {
+            Some(cause) => cause.status(),
+            None => super::transport::server_shutting_down(),
+        }
+    }
+}
+
+impl std::ops::Deref for StreamShutdown {
+    type Target = CancellationToken;
+
+    fn deref(&self) -> &CancellationToken {
+        &self.token
+    }
+}
+
 /// The registry of live streams, under [`Shared::registry`]'s lock.
 #[derive(Default)]
 struct Registry {
     /// Set when the paced ending starts, or by [`GracefulShutdown::cancel`];
-    /// never cleared. A closed registry enrolls nothing.
+    /// never cleared. A closed registry enrolls nothing. Wins over `held`: a
+    /// stream that enrolls once both are set is born cancelled with no cause,
+    /// so it ends `server shutting down`.
     closed: bool,
+    /// Set by the hold ending ([`GracefulShutdown::end_streams_for_hold`]) to
+    /// its cause; never cleared — a held process exits rather than reopen
+    /// (SDD SR-6.4). While set, a stream that enrolls is born cancelled
+    /// carrying that cause, and nothing is entered.
+    held: Option<HoldCause>,
     next_id: u64,
-    entries: HashMap<u64, CancellationToken>,
+    entries: HashMap<u64, StreamShutdown>,
 }
 
 struct Shared {
@@ -150,14 +278,21 @@ impl Shared {
 /// and the post-server sequence calls [`Self::cancel`] once the server has
 /// returned, or its bound after GOAWAY has fired.
 ///
+/// SIGTERM is the one shutdown signal: only it runs the paced ending and
+/// [`Self::cancel`]. A disaster-recovery hold ends the streams through
+/// [`Self::end_streams_for_hold`], which is not a shutdown and starts none of
+/// its steps.
+///
 /// Who reads what:
 ///
 /// * `SubscribeReadLayer` and `JoinSession` take their token only from
 ///   [`Self::enroll_stream`] — the subscription before its admission, the
 ///   join at its task-start check — and read that per-stream child everywhere
 ///   after: admission, catch-up waits, sends, the idle wait, the membership
-///   replay, the bidirectional loop and the lease keeper. Each ends the RPC
-///   `UNAVAILABLE "server shutting down"`. A per-stream child keeps the hot
+///   replay, the bidirectional loop and the lease keeper. Each ending reads
+///   the stream's own cause ([`StreamShutdown::ending_status`]): `UNAVAILABLE
+///   "server shutting down"` for SIGTERM, `SERVICE_HELD` or
+///   `UPSTREAM_UNAVAILABLE` for a hold. A per-stream child keeps the hot
 ///   paths off the shared tokens' locks: polling a token locks that token's
 ///   own mutex and waiter list.
 /// * JoinSession's handler refusal reads [`Self::begun`].
@@ -201,38 +336,93 @@ impl GracefulShutdown {
         }
     }
 
-    /// Enroll one live stream: its shutdown token, a fresh child of the
-    /// parent, and the guard that keeps it in the registry until dropped.
+    /// Enroll one live stream: its shutdown token — a fresh child of the
+    /// parent, with the stream's own cause slot — and the guard that keeps it
+    /// in the registry until dropped.
     ///
     /// Once the paced ending has started (or [`Self::cancel`] has run) the
-    /// registry is closed: the token comes back already cancelled and nothing
-    /// is enrolled, so the stream is refused at its first check.
-    pub fn enroll_stream(&self) -> (CancellationToken, StreamEnrollment) {
+    /// registry is closed: the token comes back already cancelled with no
+    /// cause and nothing is enrolled, so the stream is refused at its first
+    /// check, `server shutting down`. Once the hold ending has run
+    /// ([`Self::end_streams_for_hold`]) the token likewise comes back already
+    /// cancelled, carrying the hold's cause, so the stream ends as the hold
+    /// ended every other one. When both are set, `closed` wins.
+    pub fn enroll_stream(&self) -> (StreamShutdown, StreamEnrollment) {
         let mut registry = self.shared.registry();
-        if registry.closed {
+        if registry.closed || registry.held.is_some() {
+            let cause = if registry.closed {
+                None
+            } else {
+                registry.held.clone()
+            };
             drop(registry);
-            let token = CancellationToken::new();
-            token.cancel();
             return (
-                token,
+                StreamShutdown::born_cancelled(cause),
                 StreamEnrollment {
                     shared: Arc::clone(&self.shared),
                     id: None,
                 },
             );
         }
-        let token = self.shared.parent.child_token();
+        let stream = StreamShutdown {
+            token: self.shared.parent.child_token(),
+            cause: Arc::default(),
+        };
         let id = registry.next_id;
         registry.next_id = registry.next_id.wrapping_add(1);
-        registry.entries.insert(id, token.clone());
+        registry.entries.insert(id, stream.clone());
         drop(registry);
         (
-            token,
+            stream,
             StreamEnrollment {
                 shared: Arc::clone(&self.shared),
                 id: Some(id),
             },
         )
+    }
+
+    /// The hold ending (SDD SR-6.3): end every enrolled stream at once with
+    /// `cause`, and refuse every later enrollment with it.
+    ///
+    /// Under the registry lock it sets the never-cleared `held` flag to
+    /// `cause` (a later call replaces it, so late enrollments carry the latest
+    /// cause), takes every enrolled stream out of the registry, and for each
+    /// records `cause`, then cancels its token — so a stream woken by the
+    /// cancel always reads the cause. A stream is therefore either ended here
+    /// or born cancelled with the cause.
+    ///
+    /// Not a shutdown, and terminal for nothing: it never closes the registry
+    /// and never touches `begun` or the parent, so the server keeps serving
+    /// health checks, the uploads' `begun()` races and the scaler's
+    /// `shutting_down` probe are unaffected, and a later SIGTERM still runs
+    /// the normal paced shutdown. A stream this ended keeps its cause through
+    /// that shutdown; one that enrolls after [`Self::cancel`] is born
+    /// cancelled `server shutting down`. It cancels no per-session token.
+    ///
+    /// Once the paced ending has started the registry is already empty, so
+    /// this ends nothing: the streams in that snapshot end in their batches,
+    /// `server shutting down`.
+    ///
+    /// Logs one INFO line with the number of streams ended and the cause.
+    pub fn end_streams_for_hold(&self, cause: HoldCause) {
+        let mut registry = self.shared.registry();
+        registry.held = Some(cause.clone());
+        let ended: Vec<StreamShutdown> = registry.entries.drain().map(|(_, s)| s).collect();
+        for stream in &ended {
+            stream.end(Some(cause.clone()));
+        }
+        drop(registry);
+        let (cause_label, incident) = match &cause {
+            HoldCause::Held { incident } => ("held", incident.as_deref()),
+            HoldCause::StaleVerdict => ("stale_verdict", None),
+        };
+        tracing::info!(
+            streams = ended.len(),
+            cause = cause_label,
+            incident,
+            "hold: ended every live SubscribeReadLayer and JoinSession stream at once; later \
+             ones are refused as they enroll"
+        );
     }
 
     /// Cancelled when the paced ending starts (t0), or by [`Self::cancel`].
@@ -248,13 +438,19 @@ impl GracefulShutdown {
     /// production read of it is pinned, by file and by kind, in the
     /// shutdown-token guard (`refusal_and_shutdown_guards_test.rs`), so a new
     /// one has to be justified there.
+    ///
+    /// A shutdown signal only: SIGTERM is the one shutdown signal, and the
+    /// hold ending ([`Self::end_streams_for_hold`]), a separate non-terminal
+    /// ending, never cancels it.
     pub fn begun(&self) -> &CancellationToken {
         &self.shared.begun
     }
 
     /// Close the registry and cancel the parent: every stream still enrolled
     /// ends at once, `begun` is cancelled, and later enrollments are born
-    /// cancelled. Idempotent.
+    /// cancelled with no cause (`server shutting down`, even after a hold).
+    /// Streams the hold ending already ended are out of the registry, so they
+    /// are not cancelled again and keep their hold cause. Idempotent.
     pub fn cancel(&self) {
         let mut registry = self.shared.registry();
         registry.closed = true;
@@ -284,7 +480,8 @@ impl GracefulShutdown {
         self.shared.parent.cancelled().await;
     }
 
-    /// The number of streams enrolled now.
+    /// The number of streams enrolled now: neither ended by the hold nor
+    /// taken by the paced ending's snapshot, and not yet dropped.
     pub fn enrolled(&self) -> usize {
         self.shared.registry().entries.len()
     }
@@ -299,19 +496,24 @@ impl GracefulShutdown {
 
     /// Start the paced ending: under one lock, close the registry, cancel
     /// `begun` and take every enrolled stream's token. A stream is therefore
-    /// either in the returned snapshot or born cancelled.
+    /// either in the returned snapshot or born cancelled. A stream the hold
+    /// ending already ended is out of the registry, so it is in no snapshot.
     fn begin(&self) -> Vec<CancellationToken> {
         let mut registry = self.shared.registry();
         registry.closed = true;
         self.shared.begun.cancel();
-        registry.entries.drain().map(|(_, token)| token).collect()
+        registry
+            .entries
+            .drain()
+            .map(|(_, stream)| stream.token)
+            .collect()
     }
 }
 
 /// Keeps one stream in the [`GracefulShutdown`] registry; dropping it removes
-/// the stream. Held by the stream's task for the task's whole life, so a
-/// stream that ended on its own before the paced ending starts is not in its
-/// snapshot.
+/// the stream (a no-op once the paced ending or the hold ending has taken it
+/// out). Held by the stream's task for the task's whole life, so a stream that
+/// ended on its own before the paced ending starts is not in its snapshot.
 #[must_use = "dropping the enrollment removes the stream from the registry at once"]
 pub struct StreamEnrollment {
     shared: Arc<Shared>,
@@ -345,8 +547,9 @@ impl std::fmt::Debug for StreamEnrollment {
 /// anything left (nothing, unless [`GracefulShutdown::cancel`] ran first).
 ///
 /// Every ending is the stream's own shutdown observation, so each still ends
-/// `UNAVAILABLE "server shutting down"`, and a stream not yet reached that
-/// observes its session's deletion first ends as a deletion.
+/// `UNAVAILABLE "server shutting down"` (no hold cause is recorded on these
+/// streams), and a stream not yet reached that observes its session's deletion
+/// first ends as a deletion.
 ///
 /// Logs one INFO line at the start (`streams`, `window_ms`, `rate_per_sec`)
 /// and one at the end.
@@ -393,7 +596,11 @@ where
 mod tests {
     //! The enrollment registry, the window arithmetic and the order of the
     //! paced ending, on paused time: every wait is a virtual-clock deadline, so
-    //! each instant is asserted exactly. The schedule as `main.rs` runs it —
+    //! each instant is asserted exactly. The hold ending — cause before
+    //! cancel, the `held` flag, `closed` winning over it, and what it leaves
+    //! untouched — is pinned at the end; its endings through the real streaming
+    //! handlers are `tests/integration/grpc/hold_ending_test.rs`. The schedule
+    //! as `main.rs` runs it —
     //! drain, GOAWAY head start, batch instants and sizes, the rollback
     //! switches — is pinned through `end_streams_after_drain` in
     //! `transport.rs`'s tests; the real-server ramp is
@@ -655,7 +862,7 @@ mod tests {
             tokens.push(token);
             enrollments.push(enrollment);
         }
-        let watchers: Vec<_> = tokens.iter().map(cancelled_at).collect();
+        let watchers: Vec<_> = tokens.iter().map(|token| cancelled_at(token)).collect();
         // 1/s: ten streams over 10 s, one every second.
         let pacing = StreamPacing {
             rate_per_sec: 1,
@@ -833,5 +1040,427 @@ mod tests {
             "the last of five batches runs at t0 + 4Δ; {}",
             end[0]
         );
+    }
+
+    // ── The hold ending (SDD SR-6.3) ─────────────────────────────────────────
+
+    const INCIDENT: &str = "20261013t1708-a3f9";
+
+    fn held(incident: &str) -> HoldCause {
+        HoldCause::Held {
+            incident: Some(incident.to_owned()),
+        }
+    }
+
+    /// The `ErrorInfo` reason of `status`, as a client decodes it.
+    fn reason_of(status: &Status) -> String {
+        use tonic_types::StatusExt;
+        status
+            .get_details_error_info()
+            .unwrap_or_else(|| panic!("the ending must carry an ErrorInfo: {status:?}"))
+            .reason
+    }
+
+    /// A waker that records, at the instant it is woken, the cause its stream
+    /// carries. `CancellationToken::cancel` wakes the token's waiters
+    /// synchronously, inside the cancel, so what this records is what a
+    /// stream woken by that cancel reads first — before anything that runs
+    /// after the cancel returns.
+    struct CauseAtWake {
+        stream: StreamShutdown,
+        seen: Mutex<Vec<Option<HoldCause>>>,
+    }
+
+    impl std::task::Wake for CauseAtWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let cause = self.stream.hold_cause().cloned();
+            self.seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(cause);
+        }
+    }
+
+    /// **Cause before cancel.** Every enrolled stream's waiter, woken by the
+    /// hold's cancel of its token, already reads the hold's cause at the
+    /// moment it is woken — so no stream can end `server shutting down` for a
+    /// hold. The probe is a waker called synchronously inside the cancel; a
+    /// hold that cancelled first and recorded after would be seen with no
+    /// cause.
+    #[test]
+    fn end_streams_for_hold_records_each_cause_before_it_cancels_so_a_woken_stream_reads_it() {
+        use std::future::Future as _;
+
+        let shutdown = GracefulShutdown::new();
+        let mut streams = Vec::new();
+        let mut enrollments = Vec::new();
+        for _ in 0..3 {
+            let (stream, enrollment) = shutdown.enroll_stream();
+            streams.push(stream);
+            enrollments.push(enrollment);
+        }
+        let probes: Vec<Arc<CauseAtWake>> = streams
+            .iter()
+            .map(|stream| {
+                Arc::new(CauseAtWake {
+                    stream: stream.clone(),
+                    seen: Mutex::default(),
+                })
+            })
+            .collect();
+        let mut waits: Vec<_> = streams
+            .iter()
+            .map(|stream| Box::pin(stream.cancelled()))
+            .collect();
+        for (wait, probe) in waits.iter_mut().zip(&probes) {
+            let waker = std::task::Waker::from(Arc::clone(probe));
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(
+                wait.as_mut().poll(&mut cx).is_pending(),
+                "precondition: the stream's wait is parked on its uncancelled token"
+            );
+        }
+
+        shutdown.end_streams_for_hold(held(INCIDENT));
+
+        for (i, probe) in probes.iter().enumerate() {
+            let seen = probe.seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            assert_eq!(
+                seen.first(),
+                Some(&Some(held(INCIDENT))),
+                "stream {i}: woken by the hold's cancel, it must already read the hold's cause; \
+                 it read {seen:?} (None is a cancel that came before its cause)"
+            );
+        }
+    }
+
+    /// The hold ends every enrolled stream at once — each cancelled, each
+    /// carrying the cause, each ending `SERVICE_HELD` naming the incident —
+    /// and takes them out of the registry, so dropping their enrollments
+    /// afterwards removes nothing.
+    #[test]
+    fn end_streams_for_hold_ends_every_enrolled_stream_with_its_cause_and_drains_the_registry() {
+        let shutdown = GracefulShutdown::new();
+        let mut streams = Vec::new();
+        let mut enrollments = Vec::new();
+        for _ in 0..3 {
+            let (stream, enrollment) = shutdown.enroll_stream();
+            streams.push(stream);
+            enrollments.push(enrollment);
+        }
+        assert_eq!(shutdown.enrolled(), 3);
+
+        shutdown.end_streams_for_hold(held(INCIDENT));
+
+        assert_eq!(
+            shutdown.enrolled(),
+            0,
+            "the hold takes every stream it ended out of the registry"
+        );
+        for (i, stream) in streams.iter().enumerate() {
+            assert!(stream.is_cancelled(), "stream {i} must be ended at once");
+            assert_eq!(stream.hold_cause(), Some(&held(INCIDENT)), "stream {i}");
+            let status = stream.ending_status();
+            assert_eq!(status.code(), tonic::Code::Unavailable, "stream {i}");
+            assert_eq!(reason_of(&status), "SERVICE_HELD", "stream {i}");
+            assert!(
+                status.message().contains(INCIDENT),
+                "stream {i}: the ending names the incident; got {status:?}"
+            );
+        }
+        drop(enrollments);
+        assert_eq!(shutdown.enrolled(), 0);
+    }
+
+    /// **Not a shutdown.** The hold never closes the registry, never cancels
+    /// `begun` (the uploads' and the join handler's shutdown signal) and never
+    /// cancels the parent: the server keeps answering, and a later SIGTERM
+    /// still runs the normal shutdown.
+    #[test]
+    fn end_streams_for_hold_leaves_begun_the_parent_and_the_registry_open() {
+        let shutdown = GracefulShutdown::new();
+        let (_stream, _enrollment) = shutdown.enroll_stream();
+
+        shutdown.end_streams_for_hold(held(INCIDENT));
+
+        assert!(
+            !shutdown.begun().is_cancelled(),
+            "a hold is not a shutdown: `begun` must stay uncancelled"
+        );
+        assert!(
+            !shutdown.is_cancelled(),
+            "a hold is not a shutdown: the parent must stay uncancelled"
+        );
+        assert!(
+            !shutdown.shared.registry().closed,
+            "a hold must not close the registry: only SIGTERM does"
+        );
+    }
+
+    /// **The `held` flag.** Once the hold has run, a stream that enrolls is
+    /// born cancelled, carrying the hold's cause, and is not entered — so a
+    /// stream that passed a hold gate just before the hold ends as every
+    /// other stream did. For each cause, including a hold whose marker names
+    /// no incident.
+    #[test]
+    fn enroll_stream_after_a_hold_is_born_cancelled_with_the_hold_cause_and_not_entered() {
+        for cause in [
+            held(INCIDENT),
+            HoldCause::Held { incident: None },
+            HoldCause::StaleVerdict,
+        ] {
+            let shutdown = GracefulShutdown::new();
+            shutdown.end_streams_for_hold(cause.clone());
+
+            let (late, late_enrollment) = shutdown.enroll_stream();
+            assert!(
+                late.is_cancelled(),
+                "{cause:?}: a stream enrolling after the hold must be born cancelled"
+            );
+            assert_eq!(late.hold_cause(), Some(&cause), "{cause:?}");
+            assert_eq!(
+                shutdown.enrolled(),
+                0,
+                "{cause:?}: a born-cancelled stream is not entered"
+            );
+            drop(late_enrollment);
+            assert_eq!(shutdown.enrolled(), 0, "{cause:?}");
+
+            let status = late.ending_status();
+            assert_eq!(status.code(), tonic::Code::Unavailable, "{cause:?}");
+            match &cause {
+                HoldCause::Held { incident } => {
+                    assert_eq!(reason_of(&status), "SERVICE_HELD", "{cause:?}");
+                    let named = incident.as_deref().unwrap_or("unknown");
+                    assert_eq!(
+                        status.message(),
+                        format!("service is offline for disaster recovery (incident {named})"),
+                        "{cause:?}"
+                    );
+                }
+                HoldCause::StaleVerdict => {
+                    assert_eq!(reason_of(&status), "UPSTREAM_UNAVAILABLE", "{cause:?}");
+                    assert_eq!(
+                        status.message(),
+                        super::super::transport::HOLD_VERDICT_STALE_MSG
+                    );
+                }
+            }
+        }
+    }
+
+    /// **`closed` wins over `held`**, in either order: once SIGTERM's
+    /// `cancel()` has closed the registry, a stream that enrolls is born
+    /// cancelled with no cause and ends `server shutting down`, even though a
+    /// hold ran — the replica is going away, and the retry belongs on another.
+    #[test]
+    fn enroll_stream_with_the_registry_closed_and_held_is_born_cancelled_with_no_cause() {
+        for hold_first in [true, false] {
+            let shutdown = GracefulShutdown::new();
+            if hold_first {
+                shutdown.end_streams_for_hold(held(INCIDENT));
+                shutdown.cancel();
+            } else {
+                shutdown.cancel();
+                shutdown.end_streams_for_hold(held(INCIDENT));
+            }
+            let (late, _late) = shutdown.enroll_stream();
+            assert!(late.is_cancelled(), "hold_first={hold_first}");
+            assert_eq!(
+                late.hold_cause(),
+                None,
+                "hold_first={hold_first}: with the registry closed, `closed` wins over `held`"
+            );
+            let status = late.ending_status();
+            assert_eq!(
+                status.message(),
+                "server shutting down",
+                "hold_first={hold_first}"
+            );
+            assert_eq!(
+                reason_of(&status),
+                "SERVER_SHUTTING_DOWN",
+                "hold_first={hold_first}"
+            );
+        }
+    }
+
+    /// **SIGTERM after a hold.** A stream the hold ended keeps its
+    /// `SERVICE_HELD` ending through the later `cancel()` (its cause was
+    /// recorded first, and it is out of the registry, so it is not cancelled
+    /// again), and `cancel()` still does everything a shutdown does: `begun`
+    /// and the parent cancelled.
+    #[test]
+    fn cancel_after_a_hold_keeps_each_ended_streams_hold_cause_and_still_shuts_down() {
+        let shutdown = GracefulShutdown::new();
+        let (stream, _enrollment) = shutdown.enroll_stream();
+        shutdown.end_streams_for_hold(held(INCIDENT));
+
+        shutdown.cancel();
+
+        assert_eq!(
+            stream.hold_cause(),
+            Some(&held(INCIDENT)),
+            "a stream the hold ended keeps its cause through SIGTERM"
+        );
+        assert_eq!(reason_of(&stream.ending_status()), "SERVICE_HELD");
+        assert!(
+            shutdown.begun().is_cancelled() && shutdown.is_cancelled(),
+            "SIGTERM after a hold is a full shutdown"
+        );
+    }
+
+    /// A second hold — the verdict changing from a fleet hold to a stale one —
+    /// replaces the cause later enrollments are born with, while a stream the
+    /// first hold ended keeps the first cause.
+    #[test]
+    fn a_second_hold_changes_the_late_enrolment_cause_and_each_ended_stream_keeps_its_first() {
+        let shutdown = GracefulShutdown::new();
+        let (first, _first) = shutdown.enroll_stream();
+        shutdown.end_streams_for_hold(held(INCIDENT));
+        shutdown.end_streams_for_hold(HoldCause::StaleVerdict);
+
+        assert_eq!(first.hold_cause(), Some(&held(INCIDENT)));
+        let (late, _late) = shutdown.enroll_stream();
+        assert_eq!(
+            late.hold_cause(),
+            Some(&HoldCause::StaleVerdict),
+            "late enrollments carry the latest hold's cause"
+        );
+    }
+
+    /// SIGTERM's paced ending after a hold: the streams the hold ended are in
+    /// no snapshot — the paced ending counts none and so cancels no stream a
+    /// second time — and the parent is still cancelled at the end. The ended
+    /// streams keep their hold cause.
+    #[tokio::test(start_paused = true)]
+    async fn end_streams_paced_after_a_hold_finds_an_empty_snapshot_and_still_cancels_the_parent() {
+        let shutdown = GracefulShutdown::new();
+        let mut streams = Vec::new();
+        let mut enrollments = Vec::new();
+        for _ in 0..3 {
+            let (stream, enrollment) = shutdown.enroll_stream();
+            streams.push(stream);
+            enrollments.push(enrollment);
+        }
+        shutdown.end_streams_for_hold(held(INCIDENT));
+        let pacing = StreamPacing {
+            rate_per_sec: 10,
+            max_window: Duration::from_secs(20),
+        };
+
+        let ((), events) =
+            capture_json_events(end_streams_paced(&shutdown, pacing, &mut seeded())).await;
+
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|e| e["fields"]["message"] == START_MSG)
+            .collect();
+        assert_eq!(starts.len(), 1, "one start line; got {events:#?}");
+        assert_eq!(
+            starts[0]["fields"]["streams"], 0,
+            "the streams the hold ended are out of the registry, so in no snapshot"
+        );
+        assert!(shutdown.is_cancelled() && shutdown.begun().is_cancelled());
+        for (i, stream) in streams.iter().enumerate() {
+            assert_eq!(stream.hold_cause(), Some(&held(INCIDENT)), "stream {i}");
+        }
+    }
+
+    /// A hold once the paced ending has started finds the registry already
+    /// empty, so it ends nothing: the snapshot's stream ends in its batch,
+    /// with no cause — `server shutting down`, as SIGTERM ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_after_the_paced_ending_started_ends_nothing_and_the_snapshot_ends_as_a_shutdown(
+    ) {
+        let shutdown = GracefulShutdown::new();
+        let (early, _early_enrollment) = shutdown.enroll_stream();
+        // One stream at 1/s: its batch is the last of ten, at t0 + 900 ms.
+        let pacing = StreamPacing {
+            rate_per_sec: 1,
+            max_window: Duration::from_secs(20),
+        };
+        let ending = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move { end_streams_paced(&shutdown, pacing, &mut seeded()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), shutdown.begun().cancelled())
+            .await
+            .expect("`begun` is cancelled as the paced ending starts");
+
+        shutdown.end_streams_for_hold(held(INCIDENT));
+        assert!(
+            !early.is_cancelled(),
+            "the hold must not reach a stream the paced ending's snapshot holds"
+        );
+
+        ending.await.expect("the paced ending must not panic");
+        assert!(early.is_cancelled(), "its batch ended it");
+        assert_eq!(
+            early.hold_cause(),
+            None,
+            "a stream the paced ending ended carries no hold cause"
+        );
+        assert_eq!(early.ending_status().message(), "server shutting down");
+    }
+
+    /// The operator's line: one INFO per hold, with the number of streams it
+    /// ended, the cause, and — for a fleet hold — the incident.
+    #[tokio::test]
+    async fn end_streams_for_hold_logs_one_info_line_with_the_stream_count_and_the_cause() {
+        for (cause, label, incident) in [
+            (held(INCIDENT), "held", Some(INCIDENT)),
+            (HoldCause::StaleVerdict, "stale_verdict", None),
+        ] {
+            let shutdown = GracefulShutdown::new();
+            let (_a, _a_enrollment) = shutdown.enroll_stream();
+            let (_b, _b_enrollment) = shutdown.enroll_stream();
+
+            let ((), events) =
+                capture_json_events(async { shutdown.end_streams_for_hold(cause.clone()) }).await;
+
+            assert_eq!(
+                events.len(),
+                1,
+                "{label}: one line per hold; got {events:#?}"
+            );
+            let line = &events[0];
+            assert_eq!(line["level"], "INFO", "{label}: {line}");
+            assert_eq!(line["fields"]["streams"], 2, "{label}: {line}");
+            assert_eq!(line["fields"]["cause"], label, "{label}: {line}");
+            match incident {
+                Some(incident) => assert_eq!(line["fields"]["incident"], incident, "{line}"),
+                None => assert!(
+                    line["fields"].get("incident").is_none(),
+                    "a stale verdict has no incident; got {line}"
+                ),
+            }
+        }
+    }
+
+    /// The status each cause ends a stream with, and the no-cause ending:
+    /// `SERVICE_HELD` for a fleet hold, `UPSTREAM_UNAVAILABLE` for a stale
+    /// verdict, `SERVER_SHUTTING_DOWN` for SIGTERM — all `UNAVAILABLE`, so
+    /// every client retries.
+    #[test]
+    fn hold_cause_status_and_ending_status_map_each_cause_to_its_reason() {
+        assert_eq!(reason_of(&held(INCIDENT).status()), "SERVICE_HELD");
+        assert_eq!(
+            reason_of(&HoldCause::StaleVerdict.status()),
+            "UPSTREAM_UNAVAILABLE"
+        );
+        let shutdown = GracefulShutdown::new();
+        let (stream, _enrollment) = shutdown.enroll_stream();
+        shutdown.cancel();
+        let status = stream.ending_status();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(status.message(), "server shutting down");
+        assert_eq!(reason_of(&status), "SERVER_SHUTTING_DOWN");
+        for cause in [held(INCIDENT), HoldCause::StaleVerdict] {
+            assert_eq!(cause.status().code(), tonic::Code::Unavailable, "{cause:?}");
+        }
     }
 }

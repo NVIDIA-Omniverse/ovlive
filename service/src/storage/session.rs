@@ -35,7 +35,11 @@ use crate::storage::client::{
     map_fred_err_for_grpc, map_transient_fred_err, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
     POOL_LABEL_TXN,
 };
-use crate::storage::keys::KeySchema;
+use crate::storage::keys::{KeySchema, SESSION_META_VETO_TTL_MS};
+use crate::storage::lua::{
+    SESSION_INDEX_RELEASE_SCRIPT, SESSION_META_VETO_SCRIPT, SESSION_META_WRITE_SCRIPT,
+    SESSION_PATH_INDEX_RECONCILE_SCRIPT,
+};
 use crate::storage::retry::{retry_aborted_with_jitter, RetryConfig};
 use crate::storage::watch_guard::WatchGuard;
 use crate::storage::watched_txn::{DispatchVerdict, WatchFingerprint, WatchedExec, WatchedTxn};
@@ -50,44 +54,94 @@ pub struct SessionMeta {
     pub created_at: u64,
 }
 
-/// A path-index member whose `HGETALL le:{sid}:sess` returned empty during
-/// [`SessionStore::list`] — i.e. the path-index lists the session_id but the
-/// session metadata hash does not exist. Before session-recovery (SDD SR-2.7,
-/// Epic `t1.fgj.7v`) this was unambiguously a "true orphan" and `list` itself
-/// SREM'd the entry from both indices. With recovery in play, the absence is
-/// instead the discriminator the caller uses to decide whether to invoke
-/// `try_recover_session`: a checkpoint may exist and the member is a
-/// recovery candidate, not a deletable ghost.
+/// A names-index member whose `HGETALL le:{sid}:sess` returned empty during
+/// [`SessionStore::list`] — i.e. the names index lists the session_id but the
+/// session metadata hash did not exist when it was read. The member may be a
+/// recovery candidate (a session checkpoint would restore the metadata), a
+/// `CreateSession` still between its names commit and its metadata write, or
+/// an id nothing will ever complete.
 ///
 /// `list` surfaces these to the caller as `GhostMember` records; the caller
-/// (today: [`crate::grpc::session::handle_list_sessions`]) orchestrates the
-/// recovery+SREM loop. Keeping the SREM out of `storage::session` preserves
-/// the architectural constraint that `storage` does not depend on
-/// `checkpoint` for new behavior.
+/// (today: [`crate::grpc::session::handle_list_sessions`]) runs the recovery
+/// probe and then [`SessionStore::retire_ghost_member`], which removes the
+/// members only of an id it has vetoed. Keeping the recovery probe out of
+/// `storage::session` preserves the architectural constraint that `storage`
+/// does not depend on `checkpoint` for new behavior.
 #[derive(Debug, Clone)]
 pub struct GhostMember {
     /// Session name parsed from the `path_names_index` composite member.
     pub name: String,
     /// Session ID parsed from the `path_names_index` composite member.
     pub sid: String,
-    /// Pre-derived `name\0session_id` composite — the exact member string to
-    /// SREM from `path_names_index` when the caller decides this is a true
-    /// orphan. Cached here so the caller does not need to re-derive via
+    /// Pre-derived `name\0session_id` composite — the exact member
+    /// [`SessionStore::retire_ghost_member`] releases from `path_names_index`.
+    /// Cached here so the caller does not need to re-derive via
     /// [`KeySchema::path_name_member`].
     pub composite_member: String,
 }
 
-/// Outcome of [`SessionStore::list`] under the post-recovery contract: the
-/// `present` sessions whose `HGETALL` returned non-empty, plus the `ghosts`
-/// whose `HGETALL` returned empty. The caller decides per-ghost whether to
-/// invoke session recovery (and preserve the member on `Recovered`) or to
-/// SREM the member as a true orphan (today's behaviour, preserved on the
-/// `NoCheckpoint` / disabled-hook path).
+/// Outcome of [`SessionStore::list`]: the `present` sessions whose `HGETALL`
+/// returned non-empty, plus the `ghosts` whose `HGETALL` returned empty. The
+/// caller decides per ghost between session recovery (keeping the member on
+/// `Recovered`) and [`SessionStore::retire_ghost_member`].
 #[derive(Debug, Clone)]
 pub struct ListResult {
     pub present: Vec<SessionMeta>,
     pub ghosts: Vec<GhostMember>,
+    /// Whether the base path's `path_index` held a session id the names read
+    /// did not list: a `path_index` member no names member carries, which
+    /// [`SessionStore::reconcile_path_index`] removes (or a session committed
+    /// between the two reads, which the reconcile leaves alone). `false` when
+    /// `path_index` could not be read.
+    pub path_index_excess: bool,
 }
+
+/// What [`SessionStore::retire_ghost_member`] did with a ghost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhostRetirement {
+    /// The veto found the session's metadata: a `CreateSession` (or a
+    /// recovery) completed the id after `list` read it. Nothing was written;
+    /// the caller re-reads the metadata and lists the session.
+    Present,
+    /// The id is vetoed, or carries the session deletion marker, so no
+    /// metadata write can complete it, and both its index members are
+    /// released.
+    Retired,
+}
+
+/// The verdict of `scripts/session_meta_veto.lua`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaVeto {
+    /// The id's metadata exists; nothing was written.
+    Present,
+    /// The id now carries the veto: no metadata write for it lands from now on.
+    Vetoed,
+    /// The id's metadata is absent and it carries the session deletion
+    /// marker: the session existed and was deleted. No veto was written; no
+    /// metadata write for it lands, because the write script refuses a
+    /// marked id.
+    Deleted,
+}
+
+/// The verdict of `scripts/session_meta_write.lua`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaWrite {
+    /// The metadata is written.
+    Written,
+    /// The id carries the veto; nothing was written.
+    Vetoed,
+    /// The id carries the session deletion marker; nothing was written. An
+    /// earlier send of this write landed and another call then deleted the
+    /// session (see [`SessionStore::finish_create`]).
+    Deleted,
+}
+
+/// A test-only hook awaited once at the top of `SessionStore::finish_create`,
+/// before the metadata write is sent, with the attempt's `session_id`. See
+/// [`SessionStore::with_post_commit_hook_for_test`].
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub type PostCommitHook =
+    std::sync::Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Test-only outcome to inject into [`SessionStore::delete`] at the EXEC
 /// boundary (b.91j C-3 regression coverage). Lets an integration test drive
@@ -186,6 +240,10 @@ pub struct SessionStore {
     /// (b.bhb). See [`Self::with_watched_exec_override_for_test`].
     #[cfg(any(test, feature = "test-fault-injection"))]
     watched_exec_override_for_test: Option<crate::storage::watched_txn::WatchedExecOverrideQueue>,
+    /// Test-only hook awaited once at the top of `finish_create`, before the
+    /// metadata write is sent. See [`Self::with_post_commit_hook_for_test`].
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    post_commit_hook_for_test: Option<PostCommitHook>,
 }
 
 /// Default upper bound on the full-jitter backoff window used by
@@ -221,7 +279,27 @@ impl SessionStore {
             pre_dispatch_hook_for_test: None,
             #[cfg(any(test, feature = "test-fault-injection"))]
             watched_exec_override_for_test: None,
+            #[cfg(any(test, feature = "test-fault-injection"))]
+            post_commit_hook_for_test: None,
         }
+    }
+
+    /// Install a hook awaited once at the top of `finish_create` — after the
+    /// attempt's names commit is known to have run, before its metadata write
+    /// is sent — on every call of it (the committed path and the in-doubt path
+    /// that found the commit landed). The hook receives the attempt's
+    /// `session_id`.
+    ///
+    /// **Test-only.** The seam for staging the window between a
+    /// `CreateSession`'s names commit and its metadata write, where a
+    /// concurrent `ListSessions` walk reads the session as a ghost: pause
+    /// here, run the walk, then release the create.
+    ///
+    /// Compiled only under `#[cfg(any(test, feature = "test-fault-injection"))]`.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn with_post_commit_hook_for_test(mut self, hook: PostCommitHook) -> Self {
+        self.post_commit_hook_for_test = Some(hook);
+        self
     }
 
     /// Install a hook awaited once inside `create_once`'s WATCH window,
@@ -308,7 +386,7 @@ impl SessionStore {
     /// Builder: install the async-off-hot-path session-checkpoint dispatcher
     /// (SR-2.7, Task `t2.fgj.7v.p9`). Once installed, `create` enqueues a
     /// fire-and-forget checkpoint write after its success arm (committed
-    /// session, post-HSET) and `delete` enqueues a fire-and-forget
+    /// session, metadata written) and `delete` enqueues a fire-and-forget
     /// checkpoint delete after its success arm. Early-return paths
     /// (`AlreadyExists`, `Aborted`, `NotFound`, `Unavailable`, `Internal`) do
     /// not enqueue, matching the "no committed state change → no checkpoint
@@ -383,7 +461,7 @@ impl SessionStore {
     /// Each attempt of the retry loop runs under its own fresh UUID4
     /// `session_id`, and the id returned is the successful attempt's; the
     /// duplicate-name scans skip names members carrying any id this call
-    /// created. See [`Self::undo_create_attempt`] (and SDD §7.10) for why.
+    /// created. See [`Self::settle_failed_meta_write`] (and SDD §7.10) for why.
     ///
     /// ## Names-set uniqueness (b.91j C-7)
     ///
@@ -393,24 +471,28 @@ impl SessionStore {
     /// Because it shares the `{hex(base_path)}` hash tag with
     /// [`KeySchema::path_index`], the WATCH-SMEMBERS-SADD sequence is
     /// slot-safe on Valkey Cluster and fully atomic — the pre-fix race
-    /// window, which depended on `HSET session_meta` happening on a
+    /// window, which depended on the `session_meta` write happening on a
     /// different slot AFTER EXEC, is closed because the same-slot names set
     /// is the fence the duplicate check reads.
     ///
-    /// `HSET session_meta` still runs after EXEC and supplies the timestamps /
-    /// created_by metadata. It is not the fence, but when it is sent still
-    /// matters for uniqueness — see [`Self::undo_create_attempt`].
+    /// The `session_meta` write still runs after EXEC and supplies the
+    /// timestamps / created_by metadata, through
+    /// `scripts/session_meta_write.lua`, which refuses an id a `ListSessions`
+    /// walk has vetoed. It is not the name fence, but when it is sent, and
+    /// what a failed one means, still matter for uniqueness — see
+    /// [`Self::settle_failed_meta_write`].
     ///
-    /// A crash between EXEC and HSET leaves an entry in the names set whose
-    /// `session_meta` is missing — `list` surfaces it as a ghost member
-    /// (which the ListSessions handler removes once the recovery probe finds
-    /// no checkpoint), and a subsequent `DeleteSession` on the same
-    /// session_id returns `NotFound` from the empty-HGETALL short-circuit.
+    /// A crash between EXEC and the metadata write leaves an entry in the
+    /// names set whose `session_meta` is missing — `list` surfaces it as a
+    /// ghost member (which the ListSessions handler vetoes and removes once
+    /// the recovery probe finds no checkpoint), and a subsequent
+    /// `DeleteSession` on the same session_id returns `NotFound` from the
+    /// empty-HGETALL short-circuit.
     ///
-    /// A failed `HSET`, or a failed read while reconciling an `EXEC` whose
-    /// reply was lost, first undoes the attempt; see
-    /// [`Self::undo_create_attempt`] for the verdict and what can be left
-    /// behind.
+    /// A failed metadata write is settled with the veto; a failed read while
+    /// reconciling an `EXEC` whose reply was lost releases the attempt's
+    /// members first. See [`Self::settle_failed_meta_write`] for the verdicts
+    /// and what can be left behind.
     pub async fn create(
         &self,
         name: &str,
@@ -435,7 +517,7 @@ impl SessionStore {
         let mut own_session_ids: Vec<String> = Vec::new();
 
         retry_aborted_with_jitter("create_session", retry_cfg, |_attempt| {
-            // A fresh id per attempt (see `undo_create_attempt` for why).
+            // A fresh id per attempt (see `settle_failed_meta_write` for why).
             let session_id = uuid::Uuid::new_v4().to_string();
             own_session_ids.push(session_id.clone());
             let own_session_ids = own_session_ids.clone();
@@ -468,9 +550,11 @@ impl SessionStore {
     /// `own_session_ids` lists every id the call has created so far, this
     /// attempt's included. Returns `Aborted` on retriable failures (WATCH
     /// conflict, EXEC connection drop, a transient store error, an undone
-    /// unwatched commit, or a failure after the commit was sent that
-    /// [`Self::undo_create_attempt`] rules retriable); all other errors are
-    /// terminal.
+    /// unwatched commit, a metadata write a `ListSessions` walk vetoed, or a
+    /// failure after the commit was sent that
+    /// [`Self::settle_failed_meta_write`] or
+    /// [`Self::release_in_doubt_attempt`] rules retriable); all other errors
+    /// are terminal.
     #[allow(clippy::too_many_arguments)]
     async fn create_once(
         &self,
@@ -604,8 +688,8 @@ impl SessionStore {
         })?;
 
         // Members carrying an id this call created are skipped. See
-        // `undo_create_attempt` (and SDD §7.10) for why that cannot admit a
-        // second session with this name.
+        // `settle_failed_meta_write` (and SDD §7.10) for why that cannot admit
+        // a second session with this name.
         for member in &existing_members {
             if Self::names_a_competing_holder(member, name, own_session_ids) {
                 // UNWATCH before returning the error (WatchGuard would
@@ -671,7 +755,7 @@ impl SessionStore {
         // held the WATCH, with no attempt charged. The `CLIENT ID` witness
         // inside the transaction detects it and `compensate_unwatched_create`
         // undoes it, which is what makes that safe (or, when the compensating
-        // SREMs fail, visible on the alertable metric cell).
+        // release fails, visible on the alertable metric cell).
         match crate::storage::watched_txn::dispatch_verdict(
             &client,
             &watch_fingerprint,
@@ -778,10 +862,11 @@ impl SessionStore {
                 // Uniqueness has committed. The metadata write supplies the
                 // auxiliary fields (created_by/created_at). A crash here leaves
                 // the names entry + path_index entry pointing at a session_id
-                // whose meta is empty; list/delete handle that orphan case
+                // whose meta is empty; list/delete handle that ghost case
                 // already (see delete's empty-HGETALL short-circuit and list's
-                // ghost members). A failed write is undone inside
-                // `finish_create`, and a transient one is then retried.
+                // ghost members, which the next ListSessions vetoes and
+                // removes). A failed write is settled inside `finish_create`,
+                // which retries only an id the settle vetoed.
                 self.finish_create(
                     name,
                     base_path,
@@ -885,9 +970,25 @@ impl SessionStore {
     /// Post-EXEC tail shared by the committed and in-doubt-but-landed paths:
     /// write the auxiliary metadata and enqueue the session checkpoint.
     ///
-    /// A failed `HSET session_meta` is answered by
-    /// [`Self::undo_create_attempt`], which undoes the attempt and decides the
-    /// returned error.
+    /// The metadata is written through `scripts/session_meta_write.lua`, the
+    /// one production writer of a `CreateSession`'s metadata, which refuses
+    /// an id a `ListSessions` walk has vetoed, and an id carrying the session
+    /// deletion marker:
+    /// - **Written** → the session is complete: log, enqueue the checkpoint,
+    ///   `Ok`.
+    /// - **Deleted** → an earlier send of this write landed (the data pool
+    ///   re-sends a command whose reply was lost) and another call deleted the
+    ///   session before this call returned: the id is fresh, and
+    ///   `DeleteSession` marks only an id whose metadata it read present.
+    ///   The create did happen, so answer `Ok` with the id, INFO-logged, and
+    ///   enqueue no checkpoint (the session is gone; `DeleteSession` already
+    ///   removed its index members and enqueued its tombstone).
+    /// - **Vetoed** → a walk read this attempt as a ghost and vetoed it, so
+    ///   the id can never complete. Release its members (best effort; the
+    ///   walk releases them too) and answer `Aborted`, so the call retries
+    ///   under a new id.
+    /// - **Failed** → settled by [`Self::settle_failed_meta_write`], which
+    ///   decides the returned answer.
     #[allow(clippy::too_many_arguments)]
     async fn finish_create(
         &self,
@@ -901,35 +1002,76 @@ impl SessionStore {
         session_meta_key: &str,
         name_member: &str,
     ) -> Result<String, ServiceError> {
-        let hset_result = self
-            .client
-            .pool
-            .hset::<(), _, _>(
-                session_meta_key,
-                [
-                    ("name", name.to_owned()),
-                    ("base_path", base_path.to_owned()),
-                    ("created_by", created_by.to_owned()),
-                    ("created_at", created_at.to_string()),
-                ],
-            )
-            .await;
-        if let Err(e) = hset_result {
-            return Err(self
-                .undo_create_attempt(
+        // Test-only: the window between the names commit and the metadata
+        // write. See `with_post_commit_hook_for_test`.
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        if let Some(hook) = self.post_commit_hook_for_test.clone() {
+            hook(session_id.to_owned()).await;
+        }
+
+        // The metadata's field set. **A load-bearing co-location with the
+        // session checkpoint applier's Step B** (`apply_session_checkpoint`,
+        // `src/checkpoint/session.rs`), which writes the same four fields: a
+        // recovered session must be byte-identical to a created one, so a field
+        // added on one side must be added on the other.
+        let meta_argv = vec![
+            "name".to_owned(),
+            name.to_owned(),
+            "base_path".to_owned(),
+            base_path.to_owned(),
+            "created_by".to_owned(),
+            created_by.to_owned(),
+            "created_at".to_owned(),
+            created_at.to_string(),
+        ];
+        match self
+            .write_session_meta(session_id, session_meta_key, meta_argv)
+            .await
+        {
+            Ok(MetaWrite::Written) => Ok(self.complete_create(name, base_path, session_id)),
+            Ok(MetaWrite::Deleted) => {
+                tracing::info!(
+                    session_id = %session_id,
+                    session_name = %name,
+                    base_path = %base_path,
+                    "session created, then deleted by another call before this call returned"
+                );
+                Ok(session_id.to_owned())
+            }
+            Ok(MetaWrite::Vetoed) => {
+                self.release_abandoned_attempt(
                     name,
                     base_path,
                     session_id,
                     path_index_key,
                     path_names_key,
-                    session_meta_key,
                     name_member,
-                    "HSET session meta (create)",
-                    e,
                 )
-                .await);
+                .await;
+                Err(ServiceError::Aborted(
+                    "create_session metadata write refused: a ListSessions walk vetoed this \
+                     attempt, retry"
+                        .to_owned(),
+                ))
+            }
+            Err(cause) => {
+                self.settle_failed_meta_write(
+                    name,
+                    base_path,
+                    session_id,
+                    path_index_key,
+                    path_names_key,
+                    name_member,
+                    cause,
+                )
+                .await
+            }
         }
+    }
 
+    /// The end of every `CreateSession` whose metadata is known written: log
+    /// the creation, enqueue the session checkpoint, and return the id.
+    fn complete_create(&self, name: &str, base_path: &str, session_id: &str) -> String {
         tracing::info!(
             session_id = %session_id,
             session_name = %name,
@@ -937,15 +1079,277 @@ impl SessionStore {
             "session created"
         );
         // Enqueue the async-off-hot-path session-checkpoint write.
-        // Reached only after the EXEC committed and the post-EXEC
-        // HSET landed, so the dispatcher's read-side assembler sees
+        // Reached only after the EXEC committed and the metadata write
+        // landed, so the dispatcher's read-side assembler sees
         // populated `session_meta`. `None` (the default for tests
         // that construct `SessionStore` directly via `new`) makes
         // this a no-op so existing call sites compile unchanged.
         if let Some(writer) = &self.checkpoint_writer {
             writer.enqueue_session_checkpoint_write(session_id.to_owned());
         }
-        Ok(session_id.to_owned())
+        session_id.to_owned()
+    }
+
+    /// One `EVALSHA` of `scripts/session_meta_write.lua` on the data pool:
+    /// write `session_id`'s metadata (`argv`, field / value pairs) unless the
+    /// id carries the session deletion marker ([`MetaWrite::Deleted`]) or the
+    /// veto ([`MetaWrite::Vetoed`]). The data pool re-sends the script when
+    /// its reply is lost; a re-send that finds the marker writes nothing, so
+    /// it never brings back a session another call deleted in between.
+    /// Returns the raw fred error; the caller classifies and counts it.
+    async fn write_session_meta(
+        &self,
+        session_id: &str,
+        session_meta_key: &str,
+        argv: Vec<String>,
+    ) -> Result<MetaWrite, fred::error::Error> {
+        let keys = vec![
+            session_meta_key.to_owned(),
+            self.keys.session_meta_veto(session_id),
+            self.keys.session_deleted_marker(session_id),
+        ];
+        let reply: Vec<String> = SESSION_META_WRITE_SCRIPT
+            .evalsha_with_reload(self.client.pool.next(), keys, argv)
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("OK") => Ok(MetaWrite::Written),
+            Some("VETOED") => Ok(MetaWrite::Vetoed),
+            Some("DELETED") => Ok(MetaWrite::Deleted),
+            _ => Err(unexpected_script_reply("session_meta_write", &reply)),
+        }
+    }
+
+    /// One `EVALSHA` of `scripts/session_meta_veto.lua` on the data pool:
+    /// answer `Present` if `session_id`'s metadata exists, else `Deleted` if
+    /// the id carries the session deletion marker (no veto written; the
+    /// metadata write refuses a marked id anyway), else veto the id (with
+    /// [`SESSION_META_VETO_TTL_MS`]) so no metadata write for it lands from
+    /// now on. Idempotent. Returns the raw fred error; the caller classifies
+    /// and counts it.
+    async fn veto_session_meta(&self, session_id: &str) -> Result<MetaVeto, fred::error::Error> {
+        let keys = vec![
+            self.keys.session_meta(session_id),
+            self.keys.session_meta_veto(session_id),
+            self.keys.session_deleted_marker(session_id),
+        ];
+        let argv = vec![SESSION_META_VETO_TTL_MS.to_string()];
+        let reply: Vec<String> = SESSION_META_VETO_SCRIPT
+            .evalsha_with_reload(self.client.pool.next(), keys, argv)
+            .await?;
+        match reply.first().map(String::as_str) {
+            Some("PRESENT") => Ok(MetaVeto::Present),
+            Some("VETOED") => Ok(MetaVeto::Vetoed),
+            Some("DELETED") => Ok(MetaVeto::Deleted),
+            _ => Err(unexpected_script_reply("session_meta_veto", &reply)),
+        }
+    }
+
+    /// One `EVALSHA` of `scripts/session_index_release.lua` on the data pool:
+    /// remove `session_id` from `path_index_key` and `name_member` from
+    /// `path_names_key` in one atomic step, `path_index` first. Idempotent.
+    /// Returns the raw fred error; the caller classifies and counts it.
+    async fn release_index_members(
+        &self,
+        path_index_key: &str,
+        path_names_key: &str,
+        session_id: &str,
+        name_member: &str,
+    ) -> Result<(), fred::error::Error> {
+        let keys = vec![path_index_key.to_owned(), path_names_key.to_owned()];
+        let argv = vec![session_id.to_owned(), name_member.to_owned()];
+        let _removed: Vec<i64> = SESSION_INDEX_RELEASE_SCRIPT
+            .evalsha_with_reload(self.client.pool.next(), keys, argv)
+            .await?;
+        Ok(())
+    }
+
+    /// Best-effort release of the index members of an attempt whose id is
+    /// vetoed, so no metadata write can ever complete it. A failure is counted
+    /// and logged, and changes no answer: the members are then a ghost the
+    /// next `ListSessions` of the base path vetoes again and releases, and
+    /// until then they hold the name for other calls (this call's own scans
+    /// skip them).
+    #[allow(clippy::too_many_arguments)]
+    async fn release_abandoned_attempt(
+        &self,
+        name: &str,
+        base_path: &str,
+        session_id: &str,
+        path_index_key: &str,
+        path_names_key: &str,
+        name_member: &str,
+    ) {
+        if let Err(e) = self
+            .release_index_members(path_index_key, path_names_key, session_id, name_member)
+            .await
+        {
+            FredErrOrigin::client(&self.client, POOL_LABEL_DATA).observe_error(&e);
+            tracing::warn!(
+                session_id = %session_id,
+                session_name = %name,
+                base_path = %base_path,
+                error = %e,
+                "create_session could not release the index members of a vetoed attempt; the \
+                 attempt can never complete, and the next ListSessions of this base path \
+                 removes its members"
+            );
+        }
+    }
+
+    /// Settle a `CreateSession` metadata write that failed — the reply may
+    /// have been lost with the write landed, or the write may still land
+    /// later — and decide the error the attempt returns (b.62m, b.2tu). This
+    /// rustdoc is the source home of the CreateSession retry rules; other
+    /// sites point here (full rationale: SDD §7.10).
+    ///
+    /// **The settle** is one `EVALSHA` of `scripts/session_meta_veto.lua` for
+    /// the attempt's id, on the `{session_id}` slot the write targets. Since
+    /// the write is `scripts/session_meta_write.lua`, which refuses a vetoed
+    /// id and an id carrying the session deletion marker, the two are ordered
+    /// on one slot and the answer is exact:
+    /// - **`PRESENT`** → the write landed (its reply was lost): WARN, enqueue
+    ///   the checkpoint, and answer `Ok` with this id.
+    /// - **`DELETED`** → the metadata is absent and the id carries the
+    ///   deletion marker: the write landed (its reply was lost) and another
+    ///   call's `DeleteSession` removed the session before the settle. The id
+    ///   is fresh and `DeleteSession` marks only an id whose metadata it read
+    ///   present, so the marker proves the landing. The create did happen:
+    ///   INFO, enqueue no checkpoint (the session is gone; `DeleteSession`
+    ///   removed its index members and enqueued its tombstone), and answer
+    ///   `Ok` with this id, as [`MetaWrite::Deleted`] does. No veto is
+    ///   written, and none is needed: a late send of the write finds the
+    ///   marker and writes nothing.
+    /// - **`VETOED`** → the write never ran and now never will, so the id can
+    ///   never complete. Release its members (best effort), then
+    ///   `map_transient_fred_err(cause)`: transient (the store's `-LOADING` /
+    ///   `-BUSY` included) is `Aborted` and the call retries under a new id; a
+    ///   store write refusal (a write refused `-OOM`, …) is a plain
+    ///   `Unavailable` and is not retried (b.xd1); anything else is
+    ///   `Internal`. This holds whether or not the release succeeded: a member
+    ///   left behind is a ghost the retry's scan skips and the next
+    ///   `ListSessions` removes.
+    ///
+    ///   **On a full store** this is the path taken: the write is refused
+    ///   `-OOM` (the write script has no opener, so a full store never gains
+    ///   a session), the veto still lands (its `SET` follows a no-op opener,
+    ///   the opener rule, SDD §7.5.1), and the release's `SREM`s do not grow
+    ///   memory; so the call answers a plain `Unavailable`, is not retried
+    ///   in-process, and leaves the name free for the client's retry. On a
+    ///   store that does not follow the opener rule the veto is refused too,
+    ///   and the next arm applies.
+    /// - **The settle fails** → nothing is released, WARN, and
+    ///   `map_fred_err_for_grpc(cause)`: `Unavailable` (transient or a store
+    ///   write refusal) / `Internal`, never `Aborted`. The write may still
+    ///   land and complete this id, so a retry could complete a second
+    ///   session with the name. What remains is either a complete, listed
+    ///   session the client was not told about (the ordinary ambiguity of a
+    ///   timed-out write), or a ghost the next `ListSessions` vetoes and
+    ///   removes.
+    ///
+    /// `cause` is classified and its timeout counted here; callers must not
+    /// count it. The settle's and the release's own failures are counted here
+    /// too, each once.
+    ///
+    /// **One `session_id` per attempt.** A command that timed out on our side
+    /// can still run later — fred never writes one after its timeout fired,
+    /// but does not recall one it had already written — so no attempt reuses
+    /// an id earlier commands targeted: every late write lands on the
+    /// abandoned id's keys, never on the session the call returns.
+    ///
+    /// **The scans skip the call's own ids** (via
+    /// [`Self::names_a_competing_holder`]). This cannot admit a second session
+    /// with the same name, because at most one id per call ever holds
+    /// metadata. The metadata write is sent only after an `EXEC` known to have
+    /// run exactly once (a Committed reply, or `SISMEMBER` reading present —
+    /// the txn pool writes each command once and the commit is a `Pipeline`,
+    /// never a replayed `Transaction`). After a write failure the call answers
+    /// `Ok` only on `PRESENT` or `DELETED` (with this id either way, and no
+    /// further attempt), retries only after `VETOED` (which refuses every
+    /// later write for that id), and stops otherwise; a write a walk vetoed is
+    /// refused before it writes. So an own-id member a later attempt's scan
+    /// skips — an earlier attempt's vetoed id, an in-doubt attempt that never
+    /// sent a write, or a late `EXEC` — can never become a session.
+    ///
+    /// **The other post-commit failures** — the in-doubt `SISMEMBER` and
+    /// re-scan — send no metadata write, so metadata can never appear for
+    /// their id; they release the attempt's members through
+    /// [`Self::release_in_doubt_attempt`].
+    ///
+    /// **What can be left behind** (all keyed by an abandoned id, never by the
+    /// session the call returns): a ghost — both members, no metadata — from a
+    /// failed release or a late `EXEC`, which the next `ListSessions` vetoes
+    /// and removes; or, after a failed settle, the complete session above. No
+    /// path leaves orphan metadata or a `path_index` member without its names
+    /// member.
+    ///
+    /// No metric, unlike [`Self::compensate_unwatched_create`]: no leftover is
+    /// ever a second session sharing the name.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_failed_meta_write(
+        &self,
+        name: &str,
+        base_path: &str,
+        session_id: &str,
+        path_index_key: &str,
+        path_names_key: &str,
+        name_member: &str,
+        cause: fred::error::Error,
+    ) -> Result<String, ServiceError> {
+        const OP: &str = "EVALSHA session_meta_write (create)";
+        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
+        match self.veto_session_meta(session_id).await {
+            Ok(MetaVeto::Present) => {
+                origin.observe_error(&cause);
+                tracing::warn!(
+                    session_id = %session_id,
+                    session_name = %name,
+                    base_path = %base_path,
+                    cause = %cause,
+                    "create_session metadata write failed, but the settle found the metadata: \
+                     the reply was lost but the write landed; completing the create"
+                );
+                Ok(self.complete_create(name, base_path, session_id))
+            }
+            Ok(MetaVeto::Deleted) => {
+                origin.observe_error(&cause);
+                tracing::info!(
+                    session_id = %session_id,
+                    session_name = %name,
+                    base_path = %base_path,
+                    cause = %cause,
+                    "session created, then deleted by another call before this call returned \
+                     (found by the settle of a metadata write whose reply was lost)"
+                );
+                Ok(session_id.to_owned())
+            }
+            Ok(MetaVeto::Vetoed) => {
+                self.release_abandoned_attempt(
+                    name,
+                    base_path,
+                    session_id,
+                    path_index_key,
+                    path_names_key,
+                    name_member,
+                )
+                .await;
+                Err(map_transient_fred_err(origin, OP, cause))
+            }
+            Err(settle_err) => {
+                origin.observe_error(&settle_err);
+                tracing::warn!(
+                    session_id = %session_id,
+                    session_name = %name,
+                    base_path = %base_path,
+                    cause = %cause,
+                    settle_error = %settle_err,
+                    "create_session metadata write failed and the settle could not tell whether \
+                     it landed; not retrying. If the write still lands, the session is complete \
+                     and listed under an id the client was not told; if not, the next \
+                     ListSessions of this base path removes the incomplete entry"
+                );
+                Err(map_fred_err_for_grpc(origin, OP, cause))
+            }
+        }
     }
 
     /// Whether the `path_names_index` member `member` names a holder of `name`
@@ -955,9 +1359,9 @@ impl SessionStore {
     ///
     /// Shared by both duplicate-name scans — `create_once`'s scan under the
     /// `WATCH` and the in-doubt re-scan in `reconcile_in_doubt_create` — so the
-    /// two cannot drift. See [`Self::undo_create_attempt`] (and SDD §7.10) for
-    /// why skipping the call's own ids cannot admit a second session with the
-    /// same name.
+    /// two cannot drift. See [`Self::settle_failed_meta_write`] (and SDD §7.10)
+    /// for why skipping the call's own ids cannot admit a second session with
+    /// the same name.
     fn names_a_competing_holder(member: &str, name: &str, own_session_ids: &[String]) -> bool {
         KeySchema::split_path_name_member(member).is_some_and(|(existing_name, sid)| {
             existing_name == name && !own_session_ids.iter().any(|own| own == sid)
@@ -969,7 +1373,8 @@ impl SessionStore {
     ///
     /// Both members are uniquely ours — the `session_id` is a UUID minted for
     /// this attempt, and `session_meta` has not been written yet — so
-    /// `SREM`ing them restores the pre-attempt keyspace exactly and the
+    /// releasing them (one `scripts/session_index_release.lua` run, both
+    /// members at once) restores the pre-attempt keyspace exactly and the
     /// caller's retry, under a new `session_id`, re-decides the duplicate scan
     /// under a live `WATCH`. Runs on the data pool: the txn slot is being
     /// released, and its connection is the one whose identity is in question.
@@ -979,7 +1384,9 @@ impl SessionStore {
     /// `committed_unwatched` cell — and reported as `Internal` rather than
     /// `Aborted`, since retrying would leave the unfenced members in place —
     /// and the retry's scan skips this attempt's id, so they would not even
-    /// stop it.
+    /// stop it. The members carry no metadata (none was written for the id),
+    /// so the next `ListSessions` of the base path vetoes the id and removes
+    /// them.
     ///
     /// `fingerprint_moved` is diagnostic decoration only (see
     /// [`crate::storage::watched_txn::WatchFingerprint::moved_since`]); it never
@@ -994,27 +1401,15 @@ impl SessionStore {
         name_member: &str,
         fingerprint_moved: Option<bool>,
     ) -> Result<String, ServiceError> {
-        let index_srem = self
-            .client
-            .pool
-            .srem::<i64, _, _>(path_index_key, session_id)
+        let released = self
+            .release_index_members(path_index_key, path_names_key, session_id, name_member)
             .await;
-        let names_srem = self
-            .client
-            .pool
-            .srem::<i64, _, _>(path_names_key, name_member)
-            .await;
-
-        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
-        for e in [index_srem.as_ref().err(), names_srem.as_ref().err()]
-            .into_iter()
-            .flatten()
-        {
-            origin.observe_error(e);
+        if let Err(e) = &released {
+            FredErrOrigin::client(&self.client, POOL_LABEL_DATA).observe_error(e);
         }
         let metrics = self.client.metrics_snapshot();
-        match (index_srem, names_srem) {
-            (Ok(_), Ok(_)) => {
+        match released {
+            Ok(()) => {
                 if let Some(metrics) = metrics {
                     metrics.inc_storage_watch_voided(
                         WATCH_VOIDED_PATH_CREATE_SESSION,
@@ -1033,7 +1428,7 @@ impl SessionStore {
                     "create_session committed unwatched, compensated, retry".to_owned(),
                 ))
             }
-            (index_result, names_result) => {
+            Err(release_error) => {
                 if let Some(metrics) = metrics {
                     metrics.inc_storage_watch_voided(
                         WATCH_VOIDED_PATH_CREATE_SESSION,
@@ -1044,12 +1439,12 @@ impl SessionStore {
                     session_id = %session_id,
                     session_name = %name,
                     fingerprint_moved = ?fingerprint_moved,
-                    path_index_error = ?index_result.err(),
-                    path_names_error = ?names_result.err(),
+                    release_error = %release_error,
                     "create_session committed on a connection that did not hold its WATCH and \
-                     the compensating SREM failed: the duplicate-name check did not run and its \
-                     members are still in the index. A second session may now share this name at \
-                     this base path; the leaked member must be removed by hand"
+                     the compensating release failed: the duplicate-name check did not run and \
+                     its members are still in the index. A second session may now share this \
+                     name at this base path until the next ListSessions of it removes the \
+                     members, which carry no metadata"
                 );
                 Err(ServiceError::Internal(
                     "create_session committed without its WATCH and could not be undone".to_owned(),
@@ -1058,145 +1453,75 @@ impl SessionStore {
         }
     }
 
-    /// Undo a `create_once` attempt whose commit landed, or may have landed,
-    /// and whose next round trip failed; then decide the error the attempt
-    /// returns (b.62m). This rustdoc is the source home of the CreateSession
-    /// retry invariants; other sites point here (full rationale: SDD §7.10).
+    /// Release the index members of a `create_once` attempt whose `EXEC`
+    /// reply was lost and whose reconciling read then failed — the
+    /// `SISMEMBER` in [`Self::reconcile_in_doubt_create`] (the commit may not
+    /// have landed) or its re-scan after a landed commit — and decide the
+    /// error the attempt returns (b.62m). The CreateSession retry rules are
+    /// stated at [`Self::settle_failed_meta_write`].
     ///
-    /// Callers: the `HSET session_meta` in [`Self::finish_create`], and in
-    /// [`Self::reconcile_in_doubt_create`] the `SISMEMBER` (the commit may
-    /// not have landed) and the re-scan after a landed commit. `cause` is
-    /// classified and its timeout counted here; callers must not count it.
+    /// No metadata write was sent for this id, so metadata can never appear
+    /// for it, and releasing its members is safe whether or not the commit
+    /// landed. The release is one `scripts/session_index_release.lua` run, so
+    /// a stalled store costs one command timeout and the release never leaves
+    /// a `path_index` member without its names member. `cause` is classified
+    /// and its timeout counted here, and the release's own failure is counted
+    /// here too; callers must not count either.
     ///
-    /// **One `session_id` per attempt.** A command that timed out on our side
-    /// can still run later — fred never writes one after its timeout fired,
-    /// but does not recall one it had already written — so no attempt reuses
-    /// an id earlier commands
-    /// targeted: every late write lands on the abandoned id's keys, never on
-    /// the session the call returns. That is also why the undo is safe
-    /// whether or not the commit landed.
-    ///
-    /// **The scans skip the call's own ids** (via
-    /// [`Self::names_a_competing_holder`]). This cannot admit a second session
-    /// with the same name, because at most one id per call is ever completed
-    /// by an `HSET`: it is sent only after an `EXEC` known to have run exactly
-    /// once (a Committed reply, or `SISMEMBER` reading present — the txn pool
-    /// writes each command once and the commit is a `Pipeline`, never a
-    /// replayed `Transaction`), and no retry follows an `HSET` failure whose
-    /// names `SREM` was not confirmed. A later attempt can meet an own-id
-    /// member only from an earlier attempt's late `EXEC`: a ghost.
-    ///
-    /// **The undo:** three concurrent data-pool commands, so a stalled store
-    /// costs one command timeout, not three — `SREM` the names member, `SREM`
-    /// the `path_index` member, and `DEL session_meta` (which matters only to
-    /// the `HSET` caller). Each one's timeout is counted on the data pool.
-    ///
-    /// **The verdict turns on the names `SREM` alone** — the set the scans
-    /// read:
+    /// **The verdict:**
     /// - **Released** → `map_transient_fred_err(cause)`: transient (the
     ///   store's `-LOADING` / `-BUSY` included) is `Aborted` and the call
-    ///   retries under a new id; a store write refusal (an `HSET session_meta`
-    ///   refused `-OOM`, …) is a plain `Unavailable` and is not retried
-    ///   (b.xd1); anything else is `Internal`. A failed `path_index` `SREM` or
-    ///   `DEL` only logs a WARN; it leaves unlisted debris under the abandoned
-    ///   id.
+    ///   retries under a new id; a store write refusal is a plain
+    ///   `Unavailable` and is not retried (b.xd1); anything else is
+    ///   `Internal`.
     /// - **Not released** → `map_fred_err_for_grpc(cause)`: `Unavailable`
     ///   (transient or a store write refusal) / `Internal`, never `Aborted`,
-    ///   plus a WARN. For the `HSET` caller a
-    ///   retry would break uniqueness: that id's `HSET` may still land and
-    ///   complete it beside the retry's session. For the in-doubt callers no
-    ///   `HSET` was sent, so stopping leaves only a self-healing ghost, while a
+    ///   plus a WARN. Stopping leaves at most a self-healing ghost, while a
     ///   retry would go back into the failing pool and risk a complete session
-    ///   nobody was told about. If the commit landed, the name stays claimed;
-    ///   with no metadata, until the next ListSessions of the base path gets
-    ///   `NoCheckpoint` and removes the entry. If it never landed (possible
-    ///   only on the `SISMEMBER` path), nothing holds the name.
+    ///   nobody was told about. If the commit landed, the name stays claimed
+    ///   until the next ListSessions of the base path vetoes the id and
+    ///   removes both members (or neither, never one: the release is atomic).
+    ///   If it never landed (possible only on the `SISMEMBER` path), nothing
+    ///   holds the name.
     ///
-    /// **Late writes** (no undo covers a write that lands after it; all are
-    /// keyed by the abandoned id):
-    /// - the original `HSET`, landing after the `DEL` or with no `DEL` run:
-    ///   an unlisted, inert orphan `session_meta` if the name was released; if
-    ///   the names `SREM` also failed, a complete session with no checkpoint
-    ///   yet, which ListSessions lists and never removes (accepted: the usual
-    ///   ambiguity of a timed-out write);
-    /// - the undo's own `SREM path_index` / `DEL`, landing late or never: an
-    ///   inert `path_index` member or orphan metadata;
-    /// - an in-flight `EXEC` (after the `SISMEMBER` read "absent", a released
-    ///   undo, or a transient `EXEC` error frame): a ghost that the call's own
-    ///   retry ignores and ListSessions removes.
-    ///
-    /// No metric, unlike [`Self::compensate_unwatched_create`]: no leftover is
-    /// ever a second session sharing the name.
+    /// A late-landing `EXEC` of this attempt (after the `SISMEMBER` read
+    /// "absent", or after a release) leaves a ghost the call's own retry
+    /// ignores and the next ListSessions removes.
     #[allow(clippy::too_many_arguments)]
-    async fn undo_create_attempt(
+    async fn release_in_doubt_attempt(
         &self,
         name: &str,
         base_path: &str,
         session_id: &str,
         path_index_key: &str,
         path_names_key: &str,
-        session_meta_key: &str,
         name_member: &str,
         op: &str,
         cause: fred::error::Error,
     ) -> ServiceError {
-        let (names_srem, index_srem, meta_del) = tokio::join!(
-            self.client
-                .pool
-                .srem::<i64, _, _>(path_names_key, name_member),
-            self.client
-                .pool
-                .srem::<i64, _, _>(path_index_key, session_id),
-            self.client.pool.del::<i64, _>(session_meta_key),
-        );
-
         let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
-        for e in [
-            names_srem.as_ref().err(),
-            index_srem.as_ref().err(),
-            meta_del.as_ref().err(),
-        ]
-        .into_iter()
-        .flatten()
+        match self
+            .release_index_members(path_index_key, path_names_key, session_id, name_member)
+            .await
         {
-            origin.observe_error(e);
-        }
-
-        if names_srem.is_ok() {
-            if index_srem.is_err() || meta_del.is_err() {
+            Ok(()) => map_transient_fred_err(origin, op, cause),
+            Err(release_error) => {
+                origin.observe_error(&release_error);
                 tracing::warn!(
                     session_id = %session_id,
                     session_name = %name,
                     base_path = %base_path,
                     op = %op,
                     cause = %cause,
-                    path_index_error = ?index_srem.err(),
-                    session_meta_error = ?meta_del.err(),
-                    "create_session failed after its commit was sent; the name was released but \
-                     part of the undo failed. A transient failure retries under a new session_id; \
-                     whatever the failed commands leave behind belongs to this abandoned \
-                     session_id and stays unlisted"
+                    release_error = %release_error,
+                    "create_session lost its commit's reply, could not finish reconciling it, \
+                     and could not release the attempt's index members; not retrying. If the \
+                     commit landed, the name stays claimed until the next ListSessions of this \
+                     base path removes the incomplete entry"
                 );
+                map_fred_err_for_grpc(origin, op, cause)
             }
-            return map_transient_fred_err(origin, op, cause);
         }
-
-        tracing::warn!(
-            session_id = %session_id,
-            session_name = %name,
-            base_path = %base_path,
-            op = %op,
-            cause = %cause,
-            path_names_error = ?names_srem.err(),
-            path_index_error = ?index_srem.err(),
-            session_meta_error = ?meta_del.err(),
-            "create_session failed after its commit was sent and the undo could not release \
-             the name. If the commit landed, the name stays claimed: the next ListSessions of \
-             this base path removes the incomplete entry if it has no metadata, but if a \
-             timed-out metadata write still reached the store, the session is complete and \
-             stays"
-        );
-        map_fred_err_for_grpc(origin, op, cause)
     }
 
     /// Resolve a `create_once` whose `EXEC` reply never arrived (b.bhb).
@@ -1206,9 +1531,10 @@ impl SessionStore {
     /// on the data pool — the txn connection is the one that just failed.
     ///
     /// When that `SISMEMBER`, or the re-scan after a landed commit, fails, the
-    /// attempt is undone through [`Self::undo_create_attempt`] before anything
-    /// is retried. The `SISMEMBER` answer holds only for the moment it was
-    /// read; see [`Self::undo_create_attempt`] for a late-landing `EXEC`.
+    /// attempt's index members are released through
+    /// [`Self::release_in_doubt_attempt`] before anything is retried. The
+    /// `SISMEMBER` answer holds only for the moment it was read; see
+    /// [`Self::release_in_doubt_attempt`] for a late-landing `EXEC`.
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_in_doubt_create(
         &self,
@@ -1234,23 +1560,22 @@ impl SessionStore {
             Err(e) => {
                 // Cannot tell whether the commit landed. A bare `Aborted` would
                 // leave a landed commit behind as a ghost holding the name for
-                // other calls, so undo the attempt first; see
-                // `undo_create_attempt` for the verdict.
+                // other calls, so release the attempt's members first; see
+                // `release_in_doubt_attempt` for the verdict.
                 tracing::warn!(
                     session_id = %session_id,
                     cause = %cause,
                     error = %e,
                     "create_session EXEC reply lost and the reconciling SISMEMBER also failed; \
-                     undoing the attempt"
+                     releasing the attempt's index members"
                 );
                 return Err(self
-                    .undo_create_attempt(
+                    .release_in_doubt_attempt(
                         name,
                         base_path,
                         session_id,
                         path_index_key,
                         path_names_key,
-                        session_meta_key,
                         name_member,
                         "SISMEMBER path names index (in-doubt reconcile)",
                         e,
@@ -1262,7 +1587,8 @@ impl SessionStore {
         if !landed {
             // The transaction had not run when the `SISMEMBER` read. Same
             // disposition as pre-b.bhb. A late `EXEC` of this attempt leaves
-            // only a ghost that the retry ignores (see `undo_create_attempt`).
+            // only a ghost that the retry ignores (see
+            // `release_in_doubt_attempt`).
             return Err(ServiceError::Aborted(
                 "create_session transaction canceled (connection drop), retry".to_owned(),
             ));
@@ -1274,19 +1600,19 @@ impl SessionStore {
         // call created — is a uniqueness violation this attempt must not paper
         // over.
         //
-        // A failed re-scan undoes the landed attempt first rather than leave it
-        // as a ghost; see `undo_create_attempt` for the verdict.
+        // A failed re-scan releases the landed attempt's members first rather
+        // than leave them as a ghost; see `release_in_doubt_attempt` for the
+        // verdict.
         let members: Vec<String> = match self.client.pool.smembers(path_names_key).await {
             Ok(members) => members,
             Err(e) => {
                 return Err(self
-                    .undo_create_attempt(
+                    .release_in_doubt_attempt(
                         name,
                         base_path,
                         session_id,
                         path_index_key,
                         path_names_key,
-                        session_meta_key,
                         name_member,
                         "SMEMBERS path names index (in-doubt re-scan)",
                         e,
@@ -1672,18 +1998,30 @@ impl SessionStore {
     /// `session_meta` HGETALL came back empty).
     ///
     /// **Recovery-aware contract (Epic `t1.fgj.7v`, SDD SR-2.7).** This call
-    /// no longer opportunistically `SREM`s ghosts. With session-recovery
-    /// (SR-2.7) in play, an empty HGETALL is ambiguous: it may indicate a
-    /// truly-orphaned member (today's "selective key loss survivor" being
-    /// the *cleanup* end of that contract) OR a recovery candidate whose
-    /// session-checkpoint would restore the missing keys. The discrimination
-    /// primitive between those two cases is
+    /// removes nothing. An empty HGETALL is ambiguous: it may indicate an id
+    /// nothing will complete, a recovery candidate whose session-checkpoint
+    /// would restore the missing keys, or a `CreateSession` still between its
+    /// names commit and its metadata write. The discrimination primitive for
+    /// the second case is
     /// [`crate::checkpoint::SessionRecoveryHook::try_recover_session`], which
     /// `storage::session` MUST NOT call directly (architectural rule: no new
-    /// `storage → checkpoint` dependency). The caller — today
-    /// [`crate::grpc::session::handle_list_sessions`] — orchestrates the
-    /// recovery+SREM loop and decides whether each ghost is preserved
-    /// (recovered) or SREM'd (NoCheckpoint / disabled hook).
+    /// `storage → checkpoint` dependency); the third is settled by the veto in
+    /// [`Self::retire_ghost_member`]. The caller — today
+    /// [`crate::grpc::session::handle_list_sessions`] — runs the recovery
+    /// probe and then that veto for each ghost.
+    ///
+    /// **Stale `path_index` members.** Once the names read succeeds, an
+    /// `SMEMBERS` of the base path's `path_index` runs concurrently with the
+    /// `HGETALL`s, adding no round trip (with an empty names index it is the
+    /// only read after the names read). When it holds any session id the names
+    /// read did not list, the result carries `path_index_excess`, and the
+    /// caller runs [`Self::reconcile_path_index`]. An exact membership test,
+    /// not a count: a names-only member (a `DeleteSession` stopped between
+    /// its two `SREM`s) would otherwise offset a `path_index`-only one. A
+    /// session committed between the two reads also sets the flag; the
+    /// reconcile then reads both sets atomically and removes nothing. The
+    /// read costs at most the names read's own size, since every writer adds
+    /// both members together. A failed read is counted and reads as no excess.
     pub async fn list(&self, base_path: &str) -> Result<ListResult, ServiceError> {
         let path_names_key = self.keys.path_names_index(base_path);
 
@@ -1702,9 +2040,17 @@ impl SessionStore {
                 })?;
 
         if members.is_empty() {
+            // Nothing to list, but `path_index` may hold members no names
+            // member carries (or a session committed after the names read);
+            // the reconcile removes only those it still finds stale.
+            let path_index_excess = self
+                .read_path_index(base_path)
+                .await
+                .is_some_and(|ids| !ids.is_empty());
             return Ok(ListResult {
                 present: Vec::new(),
                 ghosts: Vec::new(),
+                path_index_excess,
             });
         }
 
@@ -1742,7 +2088,18 @@ impl SessionStore {
             });
         }
 
-        let results = futures::future::try_join_all(meta_futures).await?;
+        // The `path_index` members, read concurrently with the `HGETALL`s. Any
+        // id the names read did not list is a member no names member carries.
+        let (results, path_index_ids) = tokio::join!(
+            futures::future::try_join_all(meta_futures),
+            self.read_path_index(base_path),
+        );
+        let path_index_excess = path_index_ids.is_some_and(|ids| {
+            let listed: std::collections::HashSet<&str> =
+                pairs.iter().map(|(_, sid)| sid.as_str()).collect();
+            ids.iter().any(|id| !listed.contains(id.as_str()))
+        });
+        let results = results?;
 
         let mut present = Vec::with_capacity(pairs.len());
         let mut ghosts: Vec<GhostMember> = Vec::new();
@@ -1783,7 +2140,118 @@ impl SessionStore {
             });
         }
 
-        Ok(ListResult { present, ghosts })
+        Ok(ListResult {
+            present,
+            ghosts,
+            path_index_excess,
+        })
+    }
+
+    /// `SMEMBERS` of `base_path`'s `path_index`, for [`Self::list`]'s
+    /// stale-member check. A failure is counted here and answers `None` ("no
+    /// excess"): the check is best effort and never fails the list.
+    async fn read_path_index(&self, base_path: &str) -> Option<Vec<String>> {
+        match self
+            .client
+            .pool
+            .smembers::<Vec<String>, _>(self.keys.path_index(base_path))
+            .await
+        {
+            Ok(ids) => Some(ids),
+            Err(e) => {
+                FredErrOrigin::client(&self.client, POOL_LABEL_DATA).observe_error(&e);
+                tracing::debug!(
+                    base_path = %base_path,
+                    error = %e,
+                    "SMEMBERS path index (list) failed; skipping the stale path_index check"
+                );
+                None
+            }
+        }
+    }
+
+    /// Retire one ghost `list` returned for `base_path`: veto its id, and
+    /// release its two index members only once the id is vetoed or carries the
+    /// deletion marker (b.2tu).
+    ///
+    /// The veto is `scripts/session_meta_veto.lua` on the id's `{session_id}`
+    /// slot. A `CreateSession` writes metadata only through
+    /// `scripts/session_meta_write.lua`, which refuses a vetoed id, so exactly
+    /// one of the two wins:
+    /// - **`PRESENT`** → the metadata exists now: a `CreateSession` (or a
+    ///   recovery) completed the id after `list` read it. Nothing is written;
+    ///   [`GhostRetirement::Present`], and the caller re-reads and lists it.
+    /// - **`VETOED`** → no metadata write can complete the id from now on, so
+    ///   its members are released (`scripts/session_index_release.lua`, both
+    ///   at once); [`GhostRetirement::Retired`].
+    /// - **`DELETED`** → the metadata is absent and the id carries the session
+    ///   deletion marker: the write script refuses a marked id, so no metadata
+    ///   write can complete it either. No veto is written; the members are
+    ///   released as on `VETOED`; [`GhostRetirement::Retired`].
+    ///
+    /// So a walk never removes the members of a session `CreateSession`
+    /// answered OK for, and a walk command that lands late is harmless. Any
+    /// failure is returned with both members kept (a veto without a release
+    /// keeps them too); the veto is idempotent, so the next walk repeats it.
+    /// Two round trips per retired ghost, one per kept one. Both scripts run on
+    /// a full store (the veto's `SET` follows a no-op opener, SDD §7.5.1; the
+    /// release only removes), so ghosts are retired there too.
+    pub async fn retire_ghost_member(
+        &self,
+        base_path: &str,
+        ghost: &GhostMember,
+    ) -> Result<GhostRetirement, ServiceError> {
+        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
+        let veto = self
+            .veto_session_meta(&ghost.sid)
+            .await
+            .map_err(|e| map_fred_err_for_grpc(origin, "EVALSHA session_meta_veto (list)", e))?;
+        match veto {
+            MetaVeto::Present => Ok(GhostRetirement::Present),
+            // `Deleted`: the id carries the deletion marker, so no metadata
+            // write can complete it (the write script refuses a marked id);
+            // released exactly as a vetoed id is, with no veto written.
+            MetaVeto::Vetoed | MetaVeto::Deleted => {
+                self.release_index_members(
+                    &self.keys.path_index(base_path),
+                    &self.keys.path_names_index(base_path),
+                    &ghost.sid,
+                    &ghost.composite_member,
+                )
+                .await
+                .map_err(|e| {
+                    map_fred_err_for_grpc(origin, "EVALSHA session_index_release (list)", e)
+                })?;
+                Ok(GhostRetirement::Retired)
+            }
+        }
+    }
+
+    /// Remove every `path_index` member at `base_path` that no names member
+    /// carries, in one `scripts/session_path_index_reconcile.lua` run; returns
+    /// how many were removed (b.2tu).
+    ///
+    /// Safe at any time: every writer adds a session's two members atomically
+    /// and every remover takes the `path_index` member first or both at once,
+    /// so a `path_index`-only member is always garbage — what an older build's
+    /// two-command clean-up left. Called by the `ListSessions` handler when
+    /// [`Self::list`] reported [`ListResult::path_index_excess`].
+    pub async fn reconcile_path_index(&self, base_path: &str) -> Result<u64, ServiceError> {
+        let keys = vec![
+            self.keys.path_index(base_path),
+            self.keys.path_names_index(base_path),
+        ];
+        let removed: u64 = SESSION_PATH_INDEX_RECONCILE_SCRIPT
+            .evalsha_with_reload(self.client.pool.next(), keys, Vec::<String>::new())
+            .await
+            .map_err(|e| {
+                map_fred_err_for_grpc(
+                    FredErrOrigin::client(&self.client, POOL_LABEL_DATA),
+                    "EVALSHA session_path_index_reconcile (list)",
+                    e,
+                )
+            })?;
+        Ok(removed)
     }
 
     /// Fetch a single session's metadata by `session_id`.
@@ -1911,6 +2379,15 @@ pub(crate) async fn session_deleted_marker_exists(
         .pool
         .exists(keys.session_deleted_marker(session_id))
         .await
+}
+
+/// The error for a session script reply none of its shapes matches: a protocol
+/// error, which the mappers classify as permanent (`Internal`).
+fn unexpected_script_reply(script: &str, reply: &[String]) -> fred::error::Error {
+    fred::error::Error::new(
+        fred::error::ErrorKind::Protocol,
+        format!("{script}.lua: unexpected reply {reply:?}"),
+    )
 }
 
 /// Validate a session name per PRD §3.1.1 and SDD §23.1.
@@ -2087,10 +2564,11 @@ mod tests {
     // Subtask `t3.fgj.7v.fp.ka` (Epic `t1.fgj.7v`, SDD SR-2.7).
     //
     // These tests pin the new contract:
-    //   - `list` returns `ListResult { present, ghosts }` and does NOT
-    //     auto-SREM on empty HGETALL. The caller (today
-    //     `crate::grpc::session::handle_list_sessions`) orchestrates the
-    //     recovery-aware cleanup. The pre-recovery integration test
+    //   - `list` returns `ListResult { present, ghosts, .. }` and removes
+    //     nothing on an empty HGETALL. The caller (today
+    //     `crate::grpc::session::handle_list_sessions`) runs the recovery
+    //     probe and then `SessionStore::retire_ghost_member` (veto, then
+    //     release) for each ghost. The pre-recovery integration test
     //     `list_sessions_orphan_surfaced_as_ghost_not_removed`
     //     (`tests/integration/storage/session_test.rs`) covers the
     //     full end-to-end shape — these inline tests are scoped to the
@@ -2137,8 +2615,9 @@ mod tests {
             "composite_member must be pre-derived so the caller does not re-derive"
         );
 
-        // `list` MUST NOT have SREM'd either index — the caller owns
-        // that decision (recovery-aware).
+        // `list` MUST NOT have removed the ghost from either index — the
+        // caller decides, through the recovery probe and then the veto and
+        // release in `retire_ghost_member`.
         let path_index_members: Vec<String> = tv
             .client()
             .pool
@@ -2147,7 +2626,7 @@ mod tests {
             .expect("SMEMBERS");
         assert!(
             path_index_members.contains(&sid_ghost),
-            "ghost MUST remain in path_index after list — caller owns SREM"
+            "ghost MUST remain in path_index after list — the caller's walk owns its release"
         );
     }
 

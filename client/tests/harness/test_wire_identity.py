@@ -35,9 +35,9 @@ class WireIdentityTests(unittest.TestCase):
             path = self.include / "flatbuffers" / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("synthetic SDK " + name)
-            headers[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            headers["include/flatbuffers/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
         for name in ("source/live/wire/OmpfEnvelope.cpp", "source/live/wire/OmpfEnvelope.h",
-                     "source/live/wire/schema/provenance.json", "source/live/wire/schema/schema.fbs",
+                     "source/live/wire/third_party/flatbuffers/provenance.json", "source/live/wire/schema/schema.fbs",
                      "tests/native/wire/envelope.cpp"):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,8 +47,8 @@ class WireIdentityTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             if not path.exists():
                 path.write_text("synthetic source " + name)
-        (self.root / "source/live/wire/schema/provenance.json").write_text(json.dumps({
-            "flatbuffers": {"package": "flatbuffers", "version": "synthetic-pin", "headers": headers}}))
+        (self.root / "source/live/wire/third_party/flatbuffers/provenance.json").write_text(json.dumps({
+            "package": "flatbuffers", "version": "synthetic-pin", "files": headers}))
         self.artifact = self.root / "wire-driver"
         self.artifact.write_bytes(b"synthetic native artifact")
         result = subprocess.run([sys.executable, str(SCRIPT), "--root", str(self.root),

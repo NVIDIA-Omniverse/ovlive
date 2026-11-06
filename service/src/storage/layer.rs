@@ -31,12 +31,14 @@ use fred::interfaces::{
     StreamsInterface, TransactionInterface,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::checkpoint::SessionCheckpointWriter;
 use crate::config::UpdateLayerBackend;
 use crate::domain::delta::StorageMutation;
 use crate::domain::delta::{BoundedPlan, MutationAllowance, RewriteCount};
+use crate::domain::layer_root::{check_keeps_top_level_section, has_top_level_section};
 use crate::domain::pass_timing::{self, Pass};
 use crate::domain::plan_index::PlanIndexes;
 use crate::domain::time::now_micros;
@@ -69,9 +71,10 @@ use crate::observability::metrics::{
     WATCH_VOIDED_WITNESS_UNAVAILABLE,
 };
 use crate::storage::client::{
-    is_router_retry_budget_exhausted_error, is_wrongtype_reply, map_fred_err_for_grpc,
-    map_snapshot_load_err, map_transient_fred_err, refuse_store_write, FredErrOrigin,
-    TxnRoutingSyncFailure, ValkeyClient, POOL_LABEL_DATA, POOL_LABEL_SNAPSHOT, POOL_LABEL_TXN,
+    is_router_retry_budget_exhausted_error, is_txn_redirect_refusal, is_wrongtype_reply,
+    map_fred_err_for_grpc, map_snapshot_load_err, map_transient_fred_err, refuse_store_write,
+    refuse_store_write_hinted, FredErrOrigin, TxnRoutingSyncFailure, ValkeyClient, POOL_LABEL_DATA,
+    POOL_LABEL_SNAPSHOT, POOL_LABEL_TXN,
 };
 use crate::storage::commit_chain::{commit_chain_fold, fresh_commit_chain, update_stream_payload};
 use crate::storage::commit_charge::{
@@ -81,17 +84,20 @@ use crate::storage::commit_charge::{
 use crate::storage::counters::{CounterStore, ObjectIdCounterRepair};
 use crate::storage::diff_read::{
     classify_snapshot_read_err, header_to_object_state, read_object_snapshot_slim_charged,
-    ChargedSnapshotRead, FanoutAllowance, SnapshotCardinalities, SnapshotCeilings,
-    SnapshotKeyFamily, StructuralSnapshotFacts,
+    report_index_shortfall, ChargedSnapshotRead, FanoutAllowance, SlimSnapshotReadConsumer,
+    SnapshotCardinalities, SnapshotCeilings, SnapshotKeyFamily, SnapshotReadPath,
+    StructuralSnapshotFacts,
 };
+use crate::storage::dr_write::UnmapOutcome;
 use crate::storage::external_values::{
     delta_external_hashes, enqueue_ext_releases_accounted, hash_from_hex, ExtRelease,
     ExternalValueStore, ReleaseEvent,
 };
 use crate::storage::keys::{self, KeySchema};
 use crate::storage::lua::{
-    encode_delta, is_fast_path, script_call_bytes, UpdateScriptMode, UpdateScriptPrefix,
-    COMMIT_RECORD_RETRACT_SCRIPT, CREATE_LAYER_COMMIT_SCRIPT, KEYSPACE_TYPE_PROBE_SCRIPT,
+    encode_delta, evalsha_with_attempts_and_reload, is_fast_path, script_call_bytes,
+    UpdateScriptMode, UpdateScriptPrefix, COMMIT_RECORD_RETRACT_SCRIPT, CREATE_LAYER_COMMIT_SCRIPT,
+    KEYSPACE_TYPE_PROBE_SCRIPT, LAYER_UNMAP_MAX_ATTEMPTS, LAYER_UNMAP_SCRIPT,
     RETIRED_OBJECT_WAKE_SCRIPT, STREAM_COLLISION_PROBE_SCRIPT, UPDATE_LAYER_FAST_SCRIPT,
 };
 use crate::storage::memory_budget::{kib_for_bytes, MemoryBudget, RETIREMENT_SERIES};
@@ -1193,6 +1199,87 @@ impl CreateOperation {
 pub struct CreateCommit {
     pub object_id: u64,
     pub outcome: OperationOutcome,
+}
+
+/// `CreateLayer`'s commit marker: set by
+/// [`LayerStore::create_layer_with_operation`] at the call's first
+/// client-visible write, read by the `CreateLayer` handler only after the call
+/// returns an error (b.4q2).
+///
+/// **The invariant.** No step of a `CreateLayer` before the marker writes
+/// client-visible state, so an `UNAVAILABLE` returned with the marker clear
+/// means the call applied nothing. The handler's pre-commit choke point
+/// (`grpc::layer`'s `refused_before_commit`) answers a plain one carrying
+/// `UPSTREAM_UNAVAILABLE`, and passes one that already carries a detail
+/// through unchanged: a store write refusal before the marker (the
+/// allocation, the counter repair writes, the materialization `EXEC`)
+/// answers `STORE_WRITE_REFUSED` with its `condition` and retry hint
+/// (`storage::client::refuse_store_write_hinted`). From the marker on — the
+/// overwrite fence and every commit run — a refusal stays plain, outcome
+/// unknown. A step that would write client-visible state must set the marker
+/// before itself. The store sets it:
+///
+/// - **before an overwrite's fence:** at the top of each commit-loop run
+///   while the call plans against an existing mapping value (an overwrite, a
+///   re-plan onto another object, or a mapping value that names no object),
+///   before the fence `HSET`. The fence is itself client-visible (an
+///   `UpdateLayer` of the fenced object is refused), and a fenced overwrite
+///   can be completed after the answer, by the call's finisher or the orphan
+///   sweep;
+/// - **after each commit run**, unless the run failed with exactly `Routing`
+///   "Too many redirections."
+///   ([`is_txn_redirect_refusal`](crate::storage::client::is_txn_redirect_refusal)),
+///   the one failure that proves the script did not run. Any reply, and any
+///   other error — a timeout, "Too many failed write attempts.", a store
+///   write refusal — sets it.
+///
+/// **Why the earlier steps are invisible.** Only three paths make an object a
+/// layer: this call's commit script (`create_layer_commit.lua`, the only
+/// writer of a layer mapping on this path), the overwrite finisher (spawned
+/// only after a fence), and the orphan sweep's completion of a stranded
+/// overwrite (which needs a fence naming the object). Readers resolve a layer
+/// through its mapping, and the sweep vetoes an unclaimed unmapped object
+/// before retiring it. So the step-1 read, the object-id allocation and its
+/// counter repair, the materialization's pre-`MULTI` guards and `obj:ext`
+/// pre-image read, the materialization `MULTI`/`EXEC` (whatever its failure:
+/// a timeout, a redirect, a replay's refused `XADD 1-0`, a store write
+/// refusal), the check read after a failed run, and every commit run that
+/// failed with the exact redirect shape on a call that never planned against
+/// an existing mapping leave nothing a client can reach: at most an unmapped
+/// orphan object for the sweep. Both conditions the clear marker rests on —
+/// the call's own `expected` mapping and its own runs' results — are
+/// call-local, and nothing in the store can make them false later.
+///
+/// **External-value references.** Before the marker the call releases none of
+/// its caller's pre-flight external-value increments on an error. A
+/// materialized orphan holds them, and the orphan sweep's retirement of it
+/// gives them back once; increments no materialization took up are drained by
+/// the reference-count reconciler (SDD §11.1). Releasing them on the error
+/// path too would release them twice, since the call cannot tell whether its
+/// materialization landed.
+///
+/// An [`AtomicBool`](std::sync::atomic::AtomicBool) so the store's future stays
+/// `Send` while it holds a shared reference. Nothing reads it while the call
+/// runs; [`LayerStore::create_layer`] passes a throwaway one.
+#[derive(Debug, Default)]
+pub struct CreateCommitMarker(std::sync::atomic::AtomicBool);
+
+impl CreateCommitMarker {
+    /// A clear marker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the call reached its first client-visible write.
+    pub fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set the marker: the call is about to write, or may have written,
+    /// client-visible state.
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// One fault for `CreateLayer`'s commit-script dispatch. **Test-only**; see
@@ -3102,7 +3189,17 @@ pub struct LayerStore {
     client: ValkeyClient,
     keys: KeySchema,
     counters: CounterStore,
+    /// The tracked background cleanups: the `CreateLayer` commit finisher,
+    /// the overwrite cleanup bodies and the torn-commit record retract. Every
+    /// one is spawned through [`Self::spawn_cleanup`], so it also ends when
+    /// `cleanup_abort` is cancelled.
     cleanup_tracker: TaskTracker,
+    /// The tracked cleanups' abort token (SDD SR-6.2, "Abort token for
+    /// trackers"): cancelled at hold entry ([`Self::cleanup_abort_token`]) and,
+    /// after the drain, at shutdown ([`Self::abort_cleanup_tasks`]). Every
+    /// tracked task selects on it, so it ends at its next await, and a task
+    /// spawned after the cancel ends before it starts. Never reset.
+    cleanup_abort: CancellationToken,
     /// Approximate MAXLEN applied to every `XADD` on per-object layer streams:
     /// the entry cap. When `0`, MAXLEN is omitted entirely (no entry cap).
     layer_stream_maxlen: u64,
@@ -3185,16 +3282,16 @@ pub struct LayerStore {
     /// the honest posture with no adapter wired.
     object_id_counter_repair: Option<Arc<dyn ObjectIdCounterRepair>>,
     /// Whether the delete paths register the retired `object_id` on
-    /// `le:ckpt:{recon}:dead` for the reconciliation pass to reap (b.vn6).
+    /// `le:ckpt:{recon}:dead` for the checkpoint clean-up to reap (b.vn6).
     ///
     /// Gated rather than unconditional for one reason: that ZSET has exactly
-    /// one consumer, the checkpoint loop's reconciliation tick, and the loop is
-    /// spawned only when `LIVE_EDIT_CHECKPOINT_ENABLED=true` against a real
-    /// adapter. With checkpointing off nothing would ever drain it, so an
-    /// unconditional `ZADD` would grow one member per DeleteLayer forever
-    /// against a `noeviction` Valkey — an unbounded leak introduced by a leak
-    /// fix. `main.rs` sets this to the same predicate that decides whether the
-    /// loop is spawned at all.
+    /// one consumer, the checkpoint clean-up task's dead-object phase (b.g65),
+    /// and that task is spawned only when `LIVE_EDIT_CHECKPOINT_ENABLED=true`
+    /// against a real adapter. With checkpointing off nothing would ever drain
+    /// it, so an unconditional `ZADD` would grow one member per DeleteLayer
+    /// forever against a `noeviction` Valkey — an unbounded leak introduced by
+    /// a leak fix. `main.rs` sets this to the same predicate that decides
+    /// whether the clean-up task is spawned at all.
     ///
     /// `false` (the default, and the state for every test that constructs a
     /// bare `LayerStore`) keeps the delete paths byte-identical to their
@@ -3426,7 +3523,7 @@ pub struct LayerStore {
     /// consumed once per target, immediately after
     /// [`LayerStore::delete_layer_target`] installs its admission guard —
     /// after the retirement size read, the reservation and the mapping
-    /// re-read — but BEFORE the retry loop's step 2 `DEL mapping`. If the
+    /// re-read — but BEFORE the retry loop's step 2 unmap. If the
     /// popped entry is `Some(err)`, that call short-circuits and returns
     /// `err` having written nothing to the store. An empty queue lets the
     /// call run normally.
@@ -3541,15 +3638,15 @@ pub struct LayerStore {
     /// the spawned cleanup task blocks on this 2-party barrier at its very
     /// start — before scheduling ext-value GC or UNLINKing any OLD object
     /// key — until the test arrives at the barrier too. This lets a test that
-    /// needs the OLD object's data to *survive* long enough for a parked
-    /// subscriber to replay it (the mid-window `Deleted` sentinel path, as
-    /// opposed to the cleanup-wins Site-A `NotFound` path) hold cleanup off
-    /// deterministically, then release it once the subscriber has finished.
+    /// needs the OLD object's data to *survive* until a parked subscriber has
+    /// read it (the `Deleted` sentinel path, as opposed to the cleanup-wins
+    /// `NotFound` path) hold cleanup off deterministically, then release it
+    /// once the subscriber has finished.
     ///
-    /// Without this gate the spawned cleanup races the subscriber's in-window
-    /// replay: `cleanup_old_object_retrying` can UNLINK the OLD header before the
-    /// replay's first per-commit snapshot read of OLD reads it, flipping the
-    /// outcome to the Site-A rebootstrap (see `subscribe.rs` `catch_up_in_window`).
+    /// Without this gate the spawned cleanup races the subscriber's catch-up:
+    /// `cleanup_old_object_retrying` can UNLINK the OLD header before the
+    /// catch-up's state read of OLD reads it, flipping the outcome to the
+    /// `NotFound` re-bootstrap (see `subscribe.rs` `read_state_with_recovery`).
     ///
     /// **Test-only.** Production call sites never populate this — exposed only
     /// through `with_overwrite_cleanup_gate_for_test`. Same cfg-gating as the
@@ -3648,6 +3745,10 @@ pub struct LayerStore {
     /// [`Self::with_release_recovery_override_for_test`].
     #[cfg(any(test, feature = "test-fault-injection"))]
     release_recovery_override_for_test: Option<ReleaseRecoveryOverride>,
+    /// Test-only hook around each send of `DeleteLayer`'s conditional unmap.
+    /// See [`Self::with_layer_unmap_hook_for_test`].
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    layer_unmap_hook_for_test: Option<LayerUnmapHook>,
 }
 
 /// A hook [`LayerStore::with_commit_landed_hook_for_test`] installs: awaited by
@@ -3756,6 +3857,32 @@ pub enum ReleaseRecoveryOverride {
     HandBackOnEveryAttempt,
 }
 
+/// Where [`LayerStore::with_layer_unmap_hook_for_test`]'s hook is called from,
+/// in `DeleteLayer`'s retry loop. `send` numbers the unmap sends of one target
+/// block from 1, across the loop's re-runs; a re-run after the unmap settled
+/// sends none and calls no hook. The one re-send to a mapping that spells the
+/// object non-canonically (`LayerStore::send_layer_unmap`) is a send like any
+/// other: it takes the next number and calls the hook at both points.
+#[cfg(any(test, feature = "test-fault-injection"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerUnmapHookPoint {
+    /// Just before the send. `max_attempts` is the attempt budget the send
+    /// goes out with, the same value handed to fred.
+    BeforeSend { send: u32, max_attempts: u32 },
+    /// Just after the send's reply arrived (or the `BeforeSend` hook's error
+    /// replaced it), before the loop acts on it.
+    AfterSend { send: u32 },
+}
+
+/// The hook type of [`LayerStore::with_layer_unmap_hook_for_test`]. A returned
+/// `Some(error)` replaces the send's result with `error`.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub type LayerUnmapHook = Arc<
+    dyn Fn(LayerUnmapHookPoint) -> futures::future::BoxFuture<'static, Option<fred::error::Error>>
+        + Send
+        + Sync,
+>;
+
 impl LayerStore {
     /// A store with entry cap `layer_stream_maxlen` (`0` = none), the
     /// production default relay byte budget
@@ -3785,6 +3912,7 @@ impl LayerStore {
             keys,
             counters,
             cleanup_tracker: TaskTracker::new(),
+            cleanup_abort: CancellationToken::new(),
             layer_stream_maxlen,
             relay_retention,
             commit_release_ring_ttl_ms: crate::storage::keys::commit_release_ring_ttl(
@@ -3886,6 +4014,8 @@ impl LayerStore {
             release_record_read_hook_for_test: None,
             #[cfg(any(test, feature = "test-fault-injection"))]
             release_recovery_override_for_test: None,
+            #[cfg(any(test, feature = "test-fault-injection"))]
+            layer_unmap_hook_for_test: None,
         }
     }
 
@@ -4197,6 +4327,31 @@ impl LayerStore {
         rule: ReleaseRecoveryOverride,
     ) -> Self {
         self.release_recovery_override_for_test = Some(rule);
+        self
+    }
+
+    /// Install a hook awaited around each send of `DeleteLayer`'s conditional
+    /// unmap (`layer_unmap.lua`, [`Self::delete_layer_target`]'s step 2), at
+    /// the two [`LayerUnmapHookPoint`]s:
+    ///
+    /// - `BeforeSend`: `Some(error)` means the script is not sent and `error`
+    ///   is the send's result (a failure before the write). `None` sends it.
+    /// - `AfterSend`: `Some(error)` discards the reply of a script that ran and
+    ///   makes `error` the result (a lost reply). `None` keeps the result.
+    ///
+    /// Either way the result then takes the production classification
+    /// (`map_transient_fred_err`), so a transient error leaves the send in
+    /// doubt and re-runs the loop. The hook's future may also act on the
+    /// store, e.g. commit a same-name `CreateLayer` between the delete's
+    /// steps; it runs inside the delete's call, so it must not wait on that
+    /// call.
+    ///
+    /// **Test-only.** Compiled only under
+    /// `#[cfg(any(test, feature = "test-fault-injection"))]` so release builds
+    /// do not carry the seam.
+    #[cfg(any(test, feature = "test-fault-injection"))]
+    pub fn with_layer_unmap_hook_for_test(mut self, hook: LayerUnmapHook) -> Self {
+        self.layer_unmap_hook_for_test = Some(hook);
         self
     }
 
@@ -4854,7 +5009,7 @@ impl LayerStore {
     /// Install a queue of synthetic `ServiceError`s consumed by
     /// `delete_layer` immediately after its admission guard is installed —
     /// after the retirement size read, the reservation and the mapping
-    /// re-read — but BEFORE step 2's `DEL mapping`. Each target pops one
+    /// re-read — but BEFORE step 2's unmap. Each target pops one
     /// entry: `Some(err)` short-circuits the call and returns `err` having
     /// written nothing to the store; an empty queue lets the call run
     /// normally.
@@ -4918,6 +5073,9 @@ impl LayerStore {
     ///   dropped before the write, a redirect the `txn_pool` does not follow).
     /// - `script_ran: true` — the real `EVALSHA` is sent and runs, then its
     ///   reply is discarded and the fault's error is the result: a lost reply.
+    ///   Paired with `Routing` "Too many redirections." it models an
+    ///   impossible state (that error proves the script did not run;
+    ///   `is_txn_redirect_refusal`), and the dispatch panics on it.
     ///
     /// Either way the dispatch still takes its `txn_pool` checkout first and,
     /// on a run that syncs its routing against a clustered store, still runs
@@ -5013,6 +5171,12 @@ impl LayerStore {
     /// hygiene: the script runs under no `WATCH`, and a connection the sync
     /// opens carries no transaction state.
     ///
+    /// That sync is the repeated run's only one: its checkout is taken with
+    /// `ValkeyClient::acquire_txn_for_caller_synced`, which records the
+    /// pool's routing epoch for the slot after a routing-stale mark but
+    /// leaves the re-sync to this sync. A first run's checkout re-syncs a
+    /// slot whose routing is behind itself (`ValkeyClient::acquire_txn_for`).
+    ///
     /// No sync clears a migration's refusal. `process_ask` (`:251`) syncs
     /// nothing, and the slot keeps its old owner until the migration finishes,
     /// so a repeated run sent while the slot is still mid-migration meets the
@@ -5033,7 +5197,14 @@ impl LayerStore {
             .create_layer_commit_fault_injector_for_test
             .as_ref()
             .and_then(|queue| queue.lock().unwrap().pop_front());
-        let client = self.client.acquire_txn_for(mapping_key).await;
+        // A repeated run syncs below, so its checkout leaves the re-sync after
+        // a pool-wide routing-stale mark to it (it still records the epoch):
+        // one sync before the run, not two.
+        let client = if sync_routing {
+            self.client.acquire_txn_for_caller_synced(mapping_key).await
+        } else {
+            self.client.acquire_txn_for(mapping_key).await
+        };
         if sync_routing && client.is_clustered() {
             #[cfg(any(test, feature = "test-fault-injection"))]
             if let Some(counter) = self
@@ -5061,6 +5232,17 @@ impl LayerStore {
         }
         #[cfg(any(test, feature = "test-fault-injection"))]
         if let Some(fault) = fault {
+            // A script that ran cannot fail with the exact redirect shape:
+            // that error proves the `EVALSHA` was answered with a redirect
+            // and never run (`is_txn_redirect_refusal`). The call trusts that
+            // proof (its commit marker stays clear), so a fault modelling the
+            // impossible pair would make a test pin a false answer.
+            assert!(
+                !(fault.script_ran && is_txn_redirect_refusal(&fault.error)),
+                "CreateCommitFault {{ script_ran: true }} with `Routing` \"Too many \
+                 redirections.\" models an impossible state: that error proves the script did \
+                 not run"
+            );
             if fault.script_ran {
                 let _ran: Result<Vec<String>, fred::error::Error> = CREATE_LAYER_COMMIT_SCRIPT
                     .evalsha_with_reload(&client, script_keys, script_argv)
@@ -5427,11 +5609,11 @@ impl LayerStore {
     /// Turn on dead-object registration on the delete paths (b.vn6).
     ///
     /// Wired in `main.rs` with the SAME predicate that decides whether the
-    /// checkpoint loop is spawned (`LIVE_EDIT_CHECKPOINT_ENABLED` against a
-    /// non-`Disabled` adapter) — deliberately *not* the looser adapter-only
-    /// check the sibling `with_object_id_counter_repair` uses. That one enables
-    /// a READ; this one enables a durable write to a ZSET whose only consumer
-    /// is the reconciliation tick inside that loop. See the
+    /// checkpoint clean-up task is spawned (`LIVE_EDIT_CHECKPOINT_ENABLED`
+    /// against a non-`Disabled` adapter) — deliberately *not* the looser
+    /// adapter-only check the sibling `with_object_id_counter_repair` uses.
+    /// That one enables a READ; this one enables a durable write to a ZSET
+    /// whose only consumer is that task's dead-object phase. See the
     /// [`register_dead_objects`](Self::register_dead_objects) field doc.
     pub fn with_dead_object_registration(mut self, enabled: bool) -> Self {
         self.register_dead_objects = enabled;
@@ -5495,44 +5677,50 @@ impl LayerStore {
         )
     }
 
-    /// Register `object_id` on `le:ckpt:{recon}:dead` so the reconciliation
-    /// pass reaps its checkpoint generations (b.vn6).
+    /// Register `object_id` on `le:ckpt:{recon}:dead` so the checkpoint
+    /// clean-up's dead-object phase reaps its checkpoint generations (b.vn6).
     ///
     /// **Best-effort, and deliberately so.** Every caller has already committed
-    /// the delete; a failure here must not fail the RPC, because the layer IS
-    /// gone and reporting an error would tell the client something false. What
-    /// a failure costs is the reclamation, not correctness — the generations
-    /// stay in the store as they did before this existed, which is exactly the
-    /// pre-b.vn6 status quo. The WARN is the signal.
+    /// the delete — `DeleteLayer` calls it right after its unmap, its
+    /// commit point (b.g65) — so a failure here must not fail the RPC: the
+    /// layer IS gone and reporting an error would tell the client something
+    /// false. What a failure costs is the reclamation, not correctness — the
+    /// generations stay in the store as they did before this existed, which
+    /// is exactly the pre-b.vn6 status quo. The WARN is the signal.
     ///
-    /// No-ops entirely when [`Self::register_dead_objects`] is off.
-    async fn register_dead_object(&self, object_id: u64) {
+    /// Returns whether the registration landed, so a caller can try once more
+    /// later — after its teardown has freed memory on a full store — when the
+    /// first attempt did not (`ZADD NX`, so a repeat is a no-op). `false` when
+    /// [`Self::register_dead_objects`] is off, where it writes nothing.
+    async fn register_dead_object(&self, object_id: u64) -> bool {
         if !self.register_dead_objects {
-            return;
+            return false;
         }
-        if let Err(e) = crate::storage::external_values::recon_register(
+        match crate::storage::external_values::recon_register(
             &self.client,
             &self.keys.checkpoint_reconcile_dead(),
             &[object_id.to_string()],
         )
         .await
         {
-            tracing::warn!(
-                object_id,
-                error = %e,
-                "could not register a deleted object on the checkpoint dead-object ZSET; its \
-                 checkpoint generations will not be reclaimed by the reconciliation pass (a \
-                 storage leak, not a correctness problem — the layer itself is gone)"
-            );
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(
+                    object_id,
+                    error = %e,
+                    "could not register a deleted object on the checkpoint dead-object ZSET; \
+                     its checkpoint generations will not be reclaimed by the backup clean-up (a \
+                     storage leak, not a correctness problem — the layer itself is gone)"
+                );
+                false
+            }
         }
     }
 
-    /// Expose the configured MAXLEN — the entry cap — for callers that need an
-    /// entry bound when reading the stream (e.g. the subscribe handler's
-    /// rollback-mode in-window replay). Zero means no entry cap — callers
-    /// should treat that as "no explicit bound" and rely on their own
-    /// guardrails. The stream may hold fewer entries: the relay byte budget
-    /// ([`Self::with_layer_stream_max_bytes`]) trims it too.
+    /// The configured MAXLEN: the entry cap that writes trim each object's
+    /// stream to (the commit's `XADD MAXLEN ~`). Zero means no entry cap —
+    /// the write adds no MAXLEN trim. The stream may hold fewer entries: the
+    /// relay byte budget ([`Self::with_layer_stream_max_bytes`]) trims it too.
     pub fn layer_stream_maxlen(&self) -> u64 {
         self.layer_stream_maxlen
     }
@@ -5621,6 +5809,43 @@ impl LayerStore {
         }
     }
 
+    /// Spawn a tracked background cleanup on `cleanup_tracker`, ended by the
+    /// abort token as well as by its own completion: the abort is checked
+    /// first, so a cleanup spawned once the token is cancelled never starts.
+    /// An aborted cleanup stops at its next await, mid-step; every tracked
+    /// body is safe to stop anywhere, because the orphan sweep completes what
+    /// a finisher or an overwrite cleanup leaves, and an unretracted commit
+    /// record only answers a re-send `ALREADY_COMMITTED`.
+    fn spawn_cleanup<F>(&self, body: F) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let abort = self.cleanup_abort.clone();
+        self.cleanup_tracker.spawn(async move {
+            tokio::select! {
+                biased;
+                () = abort.cancelled() => {}
+                () = body => {}
+            }
+        })
+    }
+
+    /// The tracked cleanups' abort token, for the hold entry routine's abort
+    /// set (`grpc::hold::HoldWriterAborts`): cancelling it ends every tracked
+    /// cleanup at its next await, and every later one before it starts. The
+    /// token is shared by every clone of this store.
+    pub fn cleanup_abort_token(&self) -> CancellationToken {
+        self.cleanup_abort.clone()
+    }
+
+    /// Cancel the tracked cleanups' abort token. Graceful shutdown calls it
+    /// after [`Self::wait_for_cleanup`], so the drain still lets tracked work
+    /// finish first and only what outlives it is aborted before the Valkey
+    /// pools close. Idempotent.
+    pub fn abort_cleanup_tasks(&self) {
+        self.cleanup_abort.cancel();
+    }
+
     /// Wait for all pending background cleanup tasks to complete, with a timeout.
     ///
     /// Called during graceful shutdown to avoid orphaned Valkey keys from
@@ -5631,8 +5856,12 @@ impl LayerStore {
     /// fits runs within the drain. Closing the tracker also ends
     /// every `CreateLayer` commit finisher at its next check
     /// ([`Self::run_create_commit_finisher`]); the orphan sweep completes what
-    /// a finisher leaves.
-    pub async fn wait_for_cleanup(&self, timeout: Duration) {
+    /// a finisher leaves. Does not cancel the abort token: a cleanup still
+    /// running when this returns runs on until [`Self::abort_cleanup_tasks`].
+    ///
+    /// Returns how many cleanups were still pending when it gave up: 0 when
+    /// the tracker drained within `timeout`.
+    pub async fn wait_for_cleanup(&self, timeout: Duration) -> usize {
         // First: end the retirement allowance's waits. A cleanup body queued
         // for it ends at once with the replaced object's header kept for the
         // orphan sweep, instead of holding the shutdown budget, and so does one
@@ -5646,11 +5875,14 @@ impl LayerStore {
             .await
             .is_err()
         {
+            let pending = self.cleanup_tracker.len();
             tracing::warn!(
                 "timed out waiting for layer cleanup tasks; {} tasks still pending",
-                self.cleanup_tracker.len()
+                pending
             );
+            return pending;
         }
+        0
     }
 
     /// List all layer names in a session by reading the layers index.
@@ -5930,12 +6162,29 @@ impl LayerStore {
     /// Then, for the object it names, one re-enterable block
     /// ([`Self::delete_layer_target`]) that waits for the retirement
     /// allowance before it changes anything, re-reads the mapping, and runs
-    /// steps 2–6 in a retry loop:
+    /// steps 2–5 in a retry loop:
     ///
-    /// 2. DEL layer mapping. Done BEFORE the `deleted` XADD so that subscribers
-    ///    who wake up on the XADD and re-read the mapping see `nil` (normal
-    ///    NOT_FOUND path) rather than the stale `same_oid` branch that would
-    ///    otherwise fire during the mapping-still-alive window.
+    /// 2. Unmap the layer (`layer_unmap.lua`, one atomic step): while the
+    ///    mapping still names the object, delete it and remove the layer's
+    ///    layers-index member; with no mapping, remove the member; with the
+    ///    mapping naming another object, write nothing — while no earlier send
+    ///    of the block is in doubt that retargets the delete (below), and on a
+    ///    send after one that failed (it may have landed) the delete goes on
+    ///    retiring its object and leaves the other one, with an INFO line. (A
+    ///    mapping spelling this same object non-canonically, `0123`, is sent
+    ///    the unmap once more expecting that text, and the re-send's answer is
+    ///    taken by the same rules.) Each send is written at
+    ///    most once, and a re-run after a send settled sends none, so a
+    ///    same-name `CreateLayer` committed after the unmap keeps its mapping
+    ///    and member however the later steps fail and re-run. Done BEFORE the
+    ///    `deleted` XADD so that subscribers who wake up on the XADD and
+    ///    re-read the mapping see `nil` (normal NOT_FOUND path) rather than
+    ///    the stale `same_oid` branch that would otherwise fire during the
+    ///    mapping-still-alive window. Then record the object on the checkpoint
+    ///    dead-object set (b.g65): the unmap is the delete's commit point, so
+    ///    every later exit leaves it registered. A retried attempt registers
+    ///    again until one lands; the success exit registers once more if none
+    ///    did.
     /// 3. XADD "deleted" sentinel to the per-object stream (subscribers
     ///    consuming it re-read the mapping and observe the delete).
     /// 4. Release the object's external-value references →
@@ -5948,12 +6197,17 @@ impl LayerStore {
     ///    header and `obj:ext` first, the indices last
     ///    (`storage::retirement::Teardown`). The expiry comes first so the
     ///    stream never outlives the header without one.
-    /// 6. SREM layers index.
+    ///
+    /// There is no step 6: the layers-index member goes in step 2, so no
+    /// later step can remove a member a same-name `CreateLayer` added since.
     ///
     /// The block answers [`DeleteLayerStep::Retarget`] when the mapping names
-    /// another object by the time the allowance is granted: the block is
-    /// re-entered for that object, bounded by the RPC deadline (policy 9: a
-    /// delete whose wait let a replacement commit deletes the replacement).
+    /// another object by the time the allowance is granted, or when an unmap
+    /// send finds it so with no earlier send of the block in doubt (the first
+    /// send, or the re-send after a non-canonical spelling of this object):
+    /// the block is re-entered for that
+    /// object, bounded by the RPC deadline (policy 9: a replacement that
+    /// committed before this delete's unmap is deleted too).
     ///
     /// `enqueue_session_checkpoint_write` gates the SR-2.7 per-layer
     /// session-checkpoint rewrite at the success exit. The two public entry
@@ -5990,38 +6244,41 @@ impl LayerStore {
             })?;
 
         // One block per target (b.178 SR-16.2's seam): re-entered whenever the
-        // mapping names another object by the time this delete may proceed.
-        loop {
+        // mapping names another object by the time this delete may proceed,
+        // or when an unmap send finds it so with no earlier send of the block
+        // in doubt.
+        let dead_registered = loop {
             match self
                 .delete_layer_target(session_id, layer_name, object_id, &ext_value_store)
                 .await?
             {
-                DeleteLayerStep::Done => break,
+                DeleteLayerStep::Done { dead_registered } => break dead_registered,
                 DeleteLayerStep::Retarget(next) => {
                     tracing::info!(
                         session_id = %session_id,
                         layer_name = %layer_name,
                         object_id,
                         replacement_object_id = next,
-                        "the layer was replaced while its delete waited for the retirement \
-                         allowance; deleting the replacement"
+                        "the layer was replaced before its delete unmapped it; deleting the \
+                         replacement"
                     );
                     object_id = next;
                 }
             }
-        }
+        };
 
         // Step 7 (b.3gx): the per-object admission semaphore entry was
         // retired by the block's guard when it returned — see the guard
         // installation in `delete_layer_target` for the full rationale.
 
-        // Step 8 (b.vn6): record positive evidence that this object is DEAD, so
-        // the reconciliation pass can reap the checkpoint generations it leaves
-        // behind. Placed at the cascade's success-only exit, beside the
-        // `schedule_old_object_ext_gc` obligation the loop body already
-        // discharges, and for the same reason: this is the moment — and the
-        // only moment — at which the service knows for certain that this
-        // `object_id` will never be live again.
+        // Step 8 (b.vn6, b.g65): the object was recorded DEAD inside the retry
+        // loop, right after the unmap that killed it, so every exit
+        // after that unmap — a step failing past its retries, a store write
+        // refusal, the RPC deadline or a client cancel mid-teardown — leaves
+        // it registered for the backup clean-up to reap its checkpoint
+        // generations. This is the fallback: one more registration only if
+        // none landed in the loop, typically a full store that refused the
+        // write before the teardown freed memory.
         //
         // Unconditional on BOTH entry points (`delete_layer` and
         // `delete_layer_during_session_delete`): a deleted layer leaks its
@@ -6035,7 +6292,9 @@ impl LayerStore {
         // Positive evidence only. See `KeySchema::checkpoint_reconcile_dead`
         // for why a sweep that INFERRED death from an absent header would be a
         // DR-corpus-deleting bug rather than a cheaper version of this.
-        self.register_dead_object(object_id).await;
+        if !dead_registered {
+            self.register_dead_object(object_id).await;
+        }
 
         tracing::info!(
             session_id = %session_id,
@@ -6085,7 +6344,7 @@ impl LayerStore {
     ///    beside it, and the block goes on (a wrong-typed `obj:flds`
     ///    or `obj:tss` then fails the release's walk, and every wrong-typed
     ///    index stops the teardown after its first `UNLINK`: the delete
-    ///    answers `INTERNAL` without its layers-index `SREM`, b.yz5); any
+    ///    answers `INTERNAL`, the layer already unmapped, b.yz5); any
     ///    other failure answers as the mapping read's does
     ///    (`map_fred_err_for_grpc`: `UNAVAILABLE` or `INTERNAL`), with nothing
     ///    done.
@@ -6100,7 +6359,7 @@ impl LayerStore {
     ///    retry hint, nothing changed.
     /// 3. Re-read the mapping, its errors mapped as step 1 of
     ///    [`Self::delete_layer_inner`]'s: still this object, or gone → step
-    ///    4, for this object (a mapping gone before the loop's `DEL` answers
+    ///    4, for this object (a mapping gone before the loop's unmap answers
     ///    OK, as it always has); another object → drop the reservation,
     ///    retire this object's admission entry and structural-cache entry on
     ///    this replica at once (a one-shot [`SemaphoreMapGuard`] drop), and
@@ -6114,10 +6373,14 @@ impl LayerStore {
     /// 4. Install the admission guard ([`SemaphoreMapGuard`]), which retires
     ///    both entries on every exit from here, including an in-loop
     ///    `Retarget`.
-    /// 5. The retry loop, steps 2–6 of [`Self::delete_layer_inner`]'s docs.
-    ///    Its body answers [`DeleteLayerStep::Done`]; this build's
-    ///    unconditional `DEL` never answers `Retarget` there — b.178's
-    ///    conditional mapping delete will, and re-enters this block.
+    /// 5. The retry loop, steps 2–5 of [`Self::delete_layer_inner`]'s docs.
+    ///    Its body answers [`DeleteLayerStep::Done`], or
+    ///    [`DeleteLayerStep::Retarget`] when an unmap send with no earlier send
+    ///    of the block in doubt — the first send, or the re-send after a
+    ///    non-canonical spelling of this object — finds the mapping naming
+    ///    another object. No send wrote anything then, and the caller
+    ///    re-enters this block for that object. A send after one that failed
+    ///    (so may have landed) never retargets.
     async fn delete_layer_target(
         &self,
         session_id: &str,
@@ -6217,8 +6480,26 @@ impl LayerStore {
         let layers_index_key = self.keys.layers_index(session_id);
         let hex_layer = keys::hex_encode(layer_name);
         let walk = RetirementWalk::reserved(Arc::clone(&reservation));
+        // Whether an attempt's dead-object registration landed (b.g65): a
+        // retried attempt registers again until one does, and the success exit
+        // of `delete_layer_inner` registers once more if none did.
+        let dead_registered = std::sync::atomic::AtomicBool::new(false);
+        let dead_registered = &dead_registered;
+        // Step 2's unmap, across this block's re-runs of the loop body:
+        // `unmap_settled` once a send answered `UNMAPPED` or `ABSENT` (or, after
+        // a send in doubt, `OTHER`), after which no re-run sends it again;
+        // `unmap_in_doubt` once a send failed, so it may have landed with its
+        // reply lost; `unmap_sends` numbers the sends for the test hook. A
+        // `Retarget` drops all three with the block, so the next target starts
+        // afresh.
+        let unmap_settled = std::sync::atomic::AtomicBool::new(false);
+        let unmap_settled = &unmap_settled;
+        let unmap_in_doubt = std::sync::atomic::AtomicBool::new(false);
+        let unmap_in_doubt = &unmap_in_doubt;
+        let unmap_sends = std::sync::atomic::AtomicU32::new(0);
+        let unmap_sends = &unmap_sends;
 
-        // b.fd9: steps 2-6 run inside `retry_aborted_with_jitter` so transient
+        // b.fd9: steps 2-5 run inside `retry_aborted_with_jitter` so transient
         // Valkey blips mid-cascade are retried internally rather than leaving
         // a half-cleaned layer. Each step's Valkey round-trip routes its fred
         // error through `map_transient_fred_err`, which surfaces transient
@@ -6226,13 +6507,21 @@ impl LayerStore {
         // router carve-outs, and the store's not-serving `-LOADING` / `-BUSY`)
         // as `Aborted("transient I/O: ...")` — the in-band retry signal the
         // helper recognizes. A store write refusal (`-OOM`, `-MISCONF`,
-        // `-READONLY`, `-NOREPLICAS` — e.g. on the mapping `DEL` or the
-        // sentinel `XADD`) is a plain `Unavailable` that exits the loop
-        // without being retried, and every other error is `Internal` and
-        // exits the loop immediately (`storage::client::store_write_refusal`).
+        // `-READONLY`, `-NOREPLICAS` — e.g. on the unmap or the sentinel
+        // `XADD`) is a plain `Unavailable` that exits the loop without being
+        // retried, and every other error is `Internal` and exits the loop
+        // immediately (`storage::client::store_write_refusal`).
         //
-        // All steps are individually idempotent:
-        //   * DEL mapping — DEL of an absent key is a no-op (returns 0).
+        // A re-run repeats every step but the unmap:
+        //   * The unmap — conditional, and written at most once: each send
+        //     removes the mapping and the layers-index member only while the
+        //     mapping still names this object (`layer_unmap.lua`), fred never
+        //     re-sends it (`lua::LAYER_UNMAP_MAX_ATTEMPTS`), and once a send
+        //     settled it no re-run sends it again. So a same-name
+        //     `CreateLayer` that commits after the unmap landed — while a
+        //     later step fails and the body re-runs — keeps its mapping and
+        //     its member. A send after one in doubt never retargets: its
+        //     `OTHER` may follow this delete's own landed unmap.
         //   * XADD `*` deleted — auto-id, so a retry appends a *second*
         //     `deleted` sentinel to the stream. Duplicate `deleted` markers
         //     are harmless: subscribers re-read the mapping and observe nil
@@ -6242,11 +6531,10 @@ impl LayerStore {
         //     finds every row a failed attempt left.
         //   * PEXPIRE stream — applying the grace TTL twice is harmless;
         //     PEXPIRE of an absent key is a no-op.
-        //   * SREM layers index — SREM of a missing member is a no-op.
         //
         // Step 1 (resolve `object_id` via `get_layer_mapping`) and the mapping
         // re-read ran OUTSIDE this loop because their semantics differ: once
-        // the loop body's first attempt DELs the mapping, a retry that
+        // the loop body's first attempt unmaps the layer, a retry that
         // re-issued `get_layer_mapping` would see `nil` and incorrectly report
         // `NotFound`. The cached `object_id` is referenced verbatim on every
         // retry.
@@ -6306,24 +6594,88 @@ impl LayerStore {
                     }
                 }
 
-                // Step 2: DEL the layer mapping first. This ensures
-                // subscribers that wake up from the upcoming `deleted`
-                // XADD and re-read the mapping see `nil` (the normal
-                // NOT_FOUND path), rather than racing against a
-                // still-present mapping pointing at the same object_id
-                // (which would hit the `same_oid` defensive warn path on
-                // every DeleteLayer).
-                self.client
-                    .pool
-                    .del::<(), _>(&mapping_key)
-                    .await
-                    .map_err(|e| {
-                        map_transient_fred_err(
-                            FredErrOrigin::client(&self.client, POOL_LABEL_DATA),
-                            "DEL layer mapping",
-                            e,
+                // Step 2: unmap the layer first, the mapping and its
+                // layers-index member together (`layer_unmap.lua`). Done
+                // before the `deleted` XADD so that subscribers that wake up
+                // from it and re-read the mapping see `nil` (the normal
+                // NOT_FOUND path), rather than racing against a still-present
+                // mapping pointing at the same object_id (which would hit the
+                // `same_oid` defensive warn path on every DeleteLayer). Done
+                // before the teardown so that a same-name `CreateLayer`
+                // committing during it keeps the member it adds.
+                if !unmap_settled.load(std::sync::atomic::Ordering::Relaxed) {
+                    let reply = self
+                        .send_layer_unmap(
+                            &mapping_key,
+                            &layers_index_key,
+                            &oid_str,
+                            &hex_layer,
+                            unmap_sends,
                         )
-                    })?;
+                        .await;
+                    let reply = match reply {
+                        Ok(reply) => reply,
+                        Err(e) => {
+                            // It may have landed with its reply lost: from
+                            // now on no send of this block retargets. A
+                            // non-transient error exits the loop anyway.
+                            unmap_in_doubt.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Err(e);
+                        }
+                    };
+                    match reply {
+                        UnmapOutcome::Unmapped | UnmapOutcome::Absent => {}
+                        UnmapOutcome::Other(current)
+                            if !unmap_in_doubt.load(std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            // No earlier send can have landed, so the layer
+                            // was replaced before this delete removed it:
+                            // delete the replacement (policy 9), writing
+                            // nothing here. The admission guard retires this
+                            // object's entries as the block returns.
+                            return Ok(DeleteLayerStep::Retarget(current));
+                        }
+                        UnmapOutcome::Other(current) => {
+                            // An earlier send may have unmapped this object
+                            // before a same-name `CreateLayer` mapped
+                            // `current`, so `current` is not a replacement
+                            // this delete may remove: finish retiring this
+                            // object and leave it. Either way the mapping has
+                            // moved off this object, so no re-run needs to
+                            // send the unmap again.
+                            tracing::info!(
+                                session_id = %session_id,
+                                layer_name = %layer_name,
+                                object_id,
+                                replacement_object_id = current,
+                                "the layer names another object after an earlier unmap of this \
+                                 delete whose outcome is unknown; finishing the delete of its \
+                                 object and keeping the other one"
+                            );
+                        }
+                    }
+                    unmap_settled.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // Step 2b (b.g65): the unmap is this delete's commit
+                // point — the same "this call deleted the layer, just now"
+                // evidence the success exit used to wait for — so record the
+                // object dead here, before anything below can stop the delete
+                // (a step failing past its retries, a store refusal, the RPC
+                // deadline or a client cancel during the paged walk or
+                // teardown). Recorded at the success exit only, such an exit
+                // left the object unregistered for good: a client retry
+                // answers `NOT_FOUND` and the orphan sweep registers nothing,
+                // so its backups were never reclaimed. Best-effort, like the
+                // exit's registration; the backup clean-up defers a member
+                // whose header still stands with no mapping naming it
+                // (`DeadObjectLiveness::LiveUnmapped`), so registering before
+                // the teardown is safe.
+                if !dead_registered.load(std::sync::atomic::Ordering::Relaxed)
+                    && self.register_dead_object(object_id).await
+                {
+                    dead_registered.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 // Step 3: Append the `deleted` sentinel to the per-object
                 // stream, through the shared retirement wake-up
@@ -6359,8 +6711,8 @@ impl LayerStore {
                 // below; the reference-count reconciler is left the
                 // references). Either way step 5b's teardown then stops at
                 // the foreign index after its first `UNLINK`, and the delete
-                // answers `INTERNAL` without step 6's `SREM` (b.yz5).
-                // Best-effort: a
+                // answers `INTERNAL`, its layer already unmapped by step 2
+                // (b.yz5). Best-effort: a
                 // failure here is logged at warn and does NOT gate step 5.
                 // That is deliberate and unchanged — retaining `obj:hdr` to
                 // gate the teardown would re-open the b.1ah re-adoption hazard.
@@ -6382,7 +6734,7 @@ impl LayerStore {
                 // A failure here still does NOT by itself drive a retry OF
                 // THIS CASCADE. The incidental recovery path is unchanged
                 // too — an INDEPENDENT transient error out of step 5's
-                // teardown or step 6's layers-index `SREM` re-runs the whole
+                // stream expiry or teardown re-runs the whole
                 // loop body — but that re-run re-derives nothing: the begin
                 // wrote `ext_gc_scheduled` before the enqueue precisely so it
                 // cannot (its own `HGET` of the flag is the re-entry guard),
@@ -6442,23 +6794,128 @@ impl LayerStore {
                 )
                 .await?;
 
-                // Step 6: Remove from layers index.
-                self.client
-                    .pool
-                    .srem::<(), _, _>(&layers_index_key, &hex_layer)
-                    .await
-                    .map_err(|e| {
-                        map_transient_fred_err(
-                            FredErrOrigin::client(&self.client, POOL_LABEL_DATA),
-                            "SREM layers index",
-                            e,
-                        )
-                    })?;
-
-                Ok::<DeleteLayerStep, ServiceError>(DeleteLayerStep::Done)
+                // No step 6: the layers-index member went with the mapping in
+                // step 2's unmap, before the teardown, so nothing after it can
+                // remove a member a same-name `CreateLayer` added since.
+                Ok::<DeleteLayerStep, ServiceError>(DeleteLayerStep::Done {
+                    dead_registered: dead_registered.load(std::sync::atomic::Ordering::Relaxed),
+                })
             }
         })
         .await
+    }
+
+    /// `DeleteLayer`'s conditional unmap of `oid_str` (the object's canonical
+    /// decimal): one send of `layer_unmap.lua` ([`Self::send_layer_unmap_once`]),
+    /// and one more only when the mapping spells this very object some other
+    /// way. Each send bumps `sends` and is numbered by it for the test hook
+    /// ([`Self::with_layer_unmap_hook_for_test`]).
+    ///
+    /// The script compares the stored text with its expected value exactly,
+    /// but step 1's `get_layer_mapping` resolves the object with
+    /// `parse::<u64>`, which also accepts `0123` or `+123`. So a mapping
+    /// written out of band in such a spelling answers `OTHER <stored>` naming
+    /// this object. Retargeting on it would re-enter for the same object
+    /// without end, and refusing would leave the layer — and its session's
+    /// `DeleteSession` cascade — undeletable. Instead the unmap is sent once
+    /// more with the stored text as the expected value: the comparison stays
+    /// exact, and a concurrent `CreateLayer` always writes the canonical
+    /// decimal of a new object, so the re-send cannot remove its mapping. The
+    /// re-send is the same one-attempt send with the same error mapping (a
+    /// failure is in doubt like the first send's), and on `UNMAPPED` it
+    /// removes the layers-index member as the first would have (the member,
+    /// `hex_layer`, is unchanged). Its reply is decoded as the first's, except
+    /// that a second non-canonical spelling of this object is `Internal`:
+    /// there is no third send.
+    ///
+    /// A send's failure maps through `map_transient_fred_err` under the label
+    /// [`LAYER_UNMAP_OP`]: transient → `Aborted` (the retry loop re-runs), a
+    /// store write refusal → `Unavailable`, anything else → `Internal`. A reply
+    /// the script never gives, or an `OTHER` whose object id is not a `u64`,
+    /// is `Internal`.
+    async fn send_layer_unmap(
+        &self,
+        mapping_key: &str,
+        layers_index_key: &str,
+        oid_str: &str,
+        hex_layer: &str,
+        sends: &std::sync::atomic::AtomicU32,
+    ) -> Result<UnmapOutcome, ServiceError> {
+        let send = || sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let reply = self
+            .send_layer_unmap_once(mapping_key, layers_index_key, oid_str, hex_layer, send())
+            .await?;
+        let stored = match decode_layer_unmap_reply(&reply, oid_str)? {
+            LayerUnmapReply::Outcome(outcome) => return Ok(outcome),
+            LayerUnmapReply::ThisObjectSpelledOtherwise(stored) => stored,
+        };
+        let reply = self
+            .send_layer_unmap_once(mapping_key, layers_index_key, &stored, hex_layer, send())
+            .await?;
+        match decode_layer_unmap_reply(&reply, oid_str)? {
+            LayerUnmapReply::Outcome(outcome) => Ok(outcome),
+            LayerUnmapReply::ThisObjectSpelledOtherwise(current) => {
+                Err(ServiceError::Internal(format!(
+                    "{LAYER_UNMAP_OP}: the layer mapping holds a non-canonical spelling of this \
+                     object id ({current:?})"
+                )))
+            }
+        }
+    }
+
+    /// One send of `layer_unmap.lua` expecting the mapping to hold `expected`:
+    /// on the data pool, on the `{session_id}` slot, written to the wire at
+    /// most once ([`LAYER_UNMAP_MAX_ATTEMPTS`]; reloaded and sent once more on
+    /// `NOSCRIPT`), around the test hook's two points. Answers the raw reply;
+    /// a failure is mapped as [`Self::send_layer_unmap`] describes.
+    async fn send_layer_unmap_once(
+        &self,
+        mapping_key: &str,
+        layers_index_key: &str,
+        expected: &str,
+        hex_layer: &str,
+        #[cfg_attr(
+            not(any(test, feature = "test-fault-injection")),
+            allow(unused_variables)
+        )]
+        send: u32,
+    ) -> Result<Vec<String>, ServiceError> {
+        let max_attempts = LAYER_UNMAP_MAX_ATTEMPTS;
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        let injected = match self.layer_unmap_hook_for_test.as_ref() {
+            Some(hook) => hook(LayerUnmapHookPoint::BeforeSend { send, max_attempts }).await,
+            None => None,
+        };
+        #[cfg(not(any(test, feature = "test-fault-injection")))]
+        let injected: Option<fred::error::Error> = None;
+        let result: Result<Vec<String>, fred::error::Error> = match injected {
+            Some(error) => Err(error),
+            None => {
+                evalsha_with_attempts_and_reload(
+                    self.client.pool.next(),
+                    &LAYER_UNMAP_SCRIPT,
+                    vec![mapping_key.to_owned(), layers_index_key.to_owned()],
+                    vec![expected.into(), hex_layer.into()],
+                    max_attempts,
+                )
+                .await
+            }
+        };
+        #[cfg(any(test, feature = "test-fault-injection"))]
+        let result = match self.layer_unmap_hook_for_test.as_ref() {
+            Some(hook) => match hook(LayerUnmapHookPoint::AfterSend { send }).await {
+                Some(error) => Err(error),
+                None => result,
+            },
+            None => result,
+        };
+        result.map_err(|e| {
+            map_transient_fred_err(
+                FredErrOrigin::client(&self.client, POOL_LABEL_DATA),
+                LAYER_UNMAP_OP,
+                e,
+            )
+        })
     }
 
     /// Delete a layer and its underlying object (SDD §7.11), then rewrite the
@@ -6587,7 +7044,8 @@ impl LayerStore {
     ///
     /// The storage-level entry point for callers that never see the wire's
     /// operation id (the checkpoint lane, the storage suites). Every call
-    /// creates — or overwrites — the layer.
+    /// creates — or overwrites — the layer. It answers no client refusal
+    /// detail, so it passes a throwaway [`CreateCommitMarker`].
     pub async fn create_layer(
         &self,
         session_id: &str,
@@ -6604,6 +7062,7 @@ impl LayerStore {
                 state,
                 ext_value_store,
                 None,
+                &CreateCommitMarker::new(),
             )
             .await?;
         Ok(commit.object_id)
@@ -6666,7 +7125,10 @@ impl LayerStore {
     /// reply and the check after a failed run. The commit script runs once per
     /// run on the `txn_pool`, which neither replays a command nor follows a
     /// redirect, so a dropped connection, a `MOVED` / `-ASK` or a lost reply
-    /// fails it whether or not it ran. On any failure other than a wrong-type
+    /// fails it whether or not it ran. (Only a redirect's own failure, exactly
+    /// `Routing` "Too many redirections.", proves the script did not run; the
+    /// call handles it like any other failure, and the shape matters only to
+    /// the commit marker.) On any failure other than a wrong-type
     /// refusal (or a new layer's store write refusal) the call reads the
     /// mapping, its commit claim and, with an operation id, its operation
     /// record in one `MGET`, and decides in the script's order:
@@ -6758,7 +7220,22 @@ impl LayerStore {
     /// after the layer was replaced or deleted. Without an operation the call
     /// is answered [`OperationOutcome::Unspecified`] and behaves as before.
     ///
+    /// **The commit marker.** `commit_marker` is set at the call's first
+    /// client-visible write — before an overwrite's fence, and after any
+    /// commit run that did not fail with exactly `Routing` "Too many
+    /// redirections." — and never cleared (see [`CreateCommitMarker`] for the
+    /// invariant and why every earlier step is invisible). An error returned
+    /// with it clear means the call applied nothing: every failure before the
+    /// commit loop, whatever its shape, and, on a call that never planned
+    /// against an existing mapping, a give-up whose every run failed with that
+    /// exact shape (the check read failing, or the run budget spent with the
+    /// mapping still absent or moved by another writer) or whose check found
+    /// this call's object vetoed. The marker is the caller's to read, after
+    /// the call returns. Before it, the call releases none of its caller's
+    /// pre-flight external-value increments on an error path.
+    ///
     /// SDD §7.9.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_layer_with_operation(
         &self,
         session_id: &str,
@@ -6767,6 +7244,7 @@ impl LayerStore {
         state: &ObjectState,
         ext_value_store: Arc<dyn ExternalValueStore>,
         operation: Option<CreateOperation>,
+        commit_marker: &CreateCommitMarker,
     ) -> Result<CreateCommit, ServiceError> {
         // Step 1: Check for existing mapping — and, with an operation id, for
         // the operation's record, in the same `MGET` (see "Exactly once across
@@ -6919,6 +7397,18 @@ impl LayerStore {
         #[cfg(any(test, feature = "test-fault-injection"))]
         let mut post_failed_run_hook = self.create_layer_post_failed_run_hook_for_test.clone();
         loop {
+            // The commit marker, before an overwrite's fence (b.4q2;
+            // `CreateCommitMarker`): a run against an existing mapping value —
+            // an overwrite, a re-plan onto another object, or a mapping value
+            // that names no object — writes client-visible state from here
+            // on: the fence below refuses `UpdateLayer`s of the fenced
+            // object, and a fenced overwrite can take effect after the call
+            // answers, through its finisher or the orphan sweep's completion
+            // of the fence. Set on every such run, so a re-plan that leaves
+            // the new-layer plan sets it too.
+            if expected.is_some() {
+                commit_marker.set();
+            }
             // b.qw6 item 1: the superseded-flag protocol against the
             // CreateLayer-overwrite vs UpdateLayer race. Before a run flips the
             // mapping away from the object it names, HSET `superseded=1` on
@@ -7032,6 +7522,15 @@ impl LayerStore {
                     repeated_run,
                 )
                 .await;
+            // The commit marker, after the run (b.4q2; `CreateCommitMarker`):
+            // any reply, and any error but the exact redirect refusal, may
+            // mean the script ran and mapped this call's object. Only
+            // `Routing` "Too many redirections." proves it did not
+            // (`is_txn_redirect_refusal`), so only it leaves the marker as it
+            // was.
+            if !matches!(&committed, Err(e) if is_txn_redirect_refusal(e)) {
+                commit_marker.set();
+            }
             // What the run's reply, or the check after a failed run, says
             // about this call's commit. One decision table serves both
             // ([`decide_create_commit`]): the operation record, the commit
@@ -7219,11 +7718,15 @@ impl LayerStore {
                     // Whether the script ran is unknown here: the connection
                     // dropped before the write, a `MOVED` / `-ASK` hit the
                     // `txn_pool` (which follows no redirect), or the reply was
-                    // lost.
+                    // lost. Only the redirect's own `Routing` "Too many
+                    // redirections." proves it did not run; that proof is
+                    // carried by the commit marker, which it left unset.
                     //
                     // The dispatch already observed `e` where it received it
                     // (a command timeout counted, a store write refused `-OOM`
-                    // noted on the store out-of-memory signal, b.pa1), since
+                    // noted on the store out-of-memory signal, b.pa1, a
+                    // redirect refusal marking the `txn_pool`'s routing
+                    // stale, b.4q2), since
                     // this arm may run the commit again or re-plan without
                     // ever answering it; so the mapping counts nothing (an
                     // origin without metrics).
@@ -7247,7 +7750,11 @@ impl LayerStore {
                     // keeps every other code for a call whose content had not
                     // taken effect. The mapper's `INTERNAL` for a permanent
                     // error would claim that; its message is kept for the
-                    // operator.
+                    // operator. One give-up is not in doubt: a new layer whose
+                    // every run failed with the exact redirect refusal ran
+                    // nothing, its commit marker is still clear, and the
+                    // handler answers this same plain `UNAVAILABLE` carrying
+                    // `UPSTREAM_UNAVAILABLE` (`CreateCommitMarker`).
                     let gave_up = || match mapped() {
                         ServiceError::Internal(message) => ServiceError::Unavailable(message),
                         unavailable => unavailable,
@@ -7255,12 +7762,19 @@ impl LayerStore {
                     // A new layer: a store write refusal refused the script's
                     // first write, so the mapping did not move and nothing of
                     // this call is visible (its object is an orphan for the
-                    // sweep): plain `UNAVAILABLE` (no `CreateLayer`
-                    // commit-stage refusal carries a retry hint), counted at
+                    // sweep): plain `UNAVAILABLE` with no
+                    // `STORE_WRITE_REFUSED` hint, counted at
                     // `stage="create_commit"` — see
-                    // `storage::client::store_write_refusal`. A new layer
-                    // only: an overwrite's expected object is fenced, so it
-                    // keeps the path below, uncounted, where the mapper
+                    // `storage::client::store_write_refusal`. It stays plain
+                    // at the wire too: the run set the commit marker (only an
+                    // exact redirect refusal leaves it clear), so the
+                    // handler's choke point adds nothing
+                    // (`StoreWriteRefusal::into_unhinted_service_error`) —
+                    // unlike a store write refusal before the marker (the
+                    // allocation, the counter repair, the materialization),
+                    // which answers `STORE_WRITE_REFUSED`. A new layer only:
+                    // an overwrite's expected object is fenced, so it keeps
+                    // the path below, uncounted, where the mapper
                     // answers a refusal with the plain `UNAVAILABLE` that
                     // claims nothing about what was applied (b.xd1).
                     if expected.is_none() {
@@ -7323,7 +7837,12 @@ impl LayerStore {
                         // The read failed too: whether the commit landed is
                         // unknown. Answer the commit's own failure as a plain
                         // `UNAVAILABLE`; an overwrite hands its fenced object
-                        // to a finisher.
+                        // to a finisher. One exception, as for `gave_up`
+                        // above: a new layer whose every run failed with the
+                        // exact redirect refusal is known not to have landed —
+                        // its commit marker is still clear, so the handler
+                        // answers this same `UNAVAILABLE` carrying
+                        // `UPSTREAM_UNAVAILABLE`.
                         Err(read_error) => {
                             if let Some(old_oid_str) = expected.as_deref() {
                                 tracing::error!(
@@ -7685,7 +8204,7 @@ impl LayerStore {
             ext_value_store: Arc::clone(ext_value_store),
         };
         let store = self.clone();
-        self.cleanup_tracker.spawn(async move {
+        self.spawn_cleanup(async move {
             store.run_create_commit_finisher(job).await;
         });
     }
@@ -7717,7 +8236,8 @@ impl LayerStore {
     /// It makes no run once the new object's `created_at` plus the orphan
     /// sweep grace has passed, or once `cleanup_tracker` is closed (shutdown,
     /// [`Self::wait_for_cleanup`]); past those the orphan sweep completes the
-    /// overwrite instead.
+    /// overwrite instead. The tracked cleanups' abort token ends it at once,
+    /// mid-run, without its closing WARN ([`Self::spawn_cleanup`]).
     ///
     /// It never re-plans: after the call's answer, a newer create owns the
     /// layer. It stops on any definitive reply:
@@ -8012,16 +8532,18 @@ impl LayerStore {
     ///    re-read the mapping and re-bootstrap on the new object (SDD §7.9,
     ///    §12.4). A failure is logged at WARN and does not fail anything.
     /// 3. Enqueue the session-checkpoint write: the layer → object map moved.
-    /// 4. Run the cleanup body ([`OverwriteCleanupContext::run`]): retry the
-    ///    wake-up if it failed, and only once it has landed, reserve the
-    ///    retirement's memory on the retirement allowance, schedule the
-    ///    external-value releases (the paged reference walk), register the
-    ///    object for checkpoint reclamation (when enabled), give the stream its
-    ///    expiry, then delete the object's keys in pages, the header and
-    ///    `obj:ext` first. A body whose wake-up never lands,
-    ///    or whose expiry fails, deletes nothing and leaves the header to the
-    ///    orphan sweep — except a wake-up the store refused because it is out
-    ///    of memory, after which the body retires the object anyway.
+    /// 4. Run the cleanup body ([`OverwriteCleanupContext::run`]): register the
+    ///    object for checkpoint reclamation (when enabled) first, so every
+    ///    exit leaves it registered (b.g65); retry the wake-up if it failed,
+    ///    and only once it has landed, reserve the retirement's memory on the
+    ///    retirement allowance, schedule the external-value releases (the
+    ///    paged reference walk), give the stream its expiry, then delete the
+    ///    object's keys in pages, the header and `obj:ext` first, registering
+    ///    once more if the first registration did not land. A body whose
+    ///    wake-up never lands, or whose expiry fails, deletes nothing and
+    ///    leaves the header to the orphan sweep — except a wake-up the store
+    ///    refused because it is out of memory, after which the body retires
+    ///    the object anyway.
     ///
     /// `cleanup` says whether the body is spawned on `cleanup_tracker` (the
     /// call and the finisher, which return without waiting for it) or awaited
@@ -8049,7 +8571,7 @@ impl LayerStore {
         self.enqueue_session_checkpoint_write(session_id);
         match cleanup {
             OverwriteCleanup::Spawn => {
-                self.cleanup_tracker.spawn(async move {
+                self.spawn_cleanup(async move {
                     context.run(old_oid, woke, true).await;
                 });
                 false
@@ -8622,9 +9144,8 @@ impl LayerStore {
     /// (b.gze verbatim relay). Checkpoint tail capture additionally reads that
     /// field's *absence* as a classification signal: an `update`-typed entry
     /// at an explicit `{seq}-0` ID with no `ompf` field IS the §8.4 empty-delta
-    /// shape. So does `SubscribeReadLayer`: its steady state and its
-    /// rollback-mode in-window replay send such an entry (above sequence 1) as
-    /// the empty delta with no read. Hence the invariant every production write
+    /// shape. So does `SubscribeReadLayer`: its steady state sends such an
+    /// entry (above sequence 1) as the empty delta with no read. Hence the invariant every production write
     /// upholds — **a state-changing commit must carry non-empty relay bytes.**
     ///
     /// **Precondition, refused on every backend:** `delta = Some(_)` requires
@@ -10012,10 +10533,12 @@ impl LayerStore {
     /// cancel it), and graceful shutdown's `wait_for_cleanup` drains it. The
     /// caller awaits the returned handle, so in the normal case the retract has
     /// finished before `INTERNAL` is answered and a prompt re-send cannot
-    /// overtake it. Three cases remain, each leaving the re-send answered
+    /// overtake it. Four cases remain, each leaving the re-send answered
     /// `ALREADY_COMMITTED` for an edit that did not fully land:
     ///
     /// - a process crash between the torn `EXEC` and the retract;
+    /// - a retract aborted by the tracked cleanups' abort token, at hold entry
+    ///   or after shutdown's drain ([`Self::spawn_cleanup`]);
     /// - a retract that fails — logged at ERROR;
     /// - a race after the handler is dropped while it awaits the handle (the
     ///   server deadline, or a client cancel or connection reset). The task
@@ -10049,7 +10572,7 @@ impl LayerStore {
         let client_id = client_id.to_owned();
         #[cfg(any(test, feature = "test-fault-injection"))]
         let retract_hook = self.torn_commit_retract_hook_for_test.clone();
-        self.cleanup_tracker.spawn(async move {
+        self.spawn_cleanup(async move {
             // Test-only: park before the `EVALSHA` leaves. The hook is handed
             // the client from its own `pool.next()` call, which round-robins,
             // so it is not necessarily the one the `EVALSHA` below uses. See
@@ -10405,7 +10928,12 @@ impl LayerStore {
     ///    ([`NeedsCharge`]), after a refused plan growth with the plan's exact
     ///    need, which counts its rollback's rebuilds; that refused plan's
     ///    scratch and rollback run above what is held until the synchronous
-    ///    plan and its rollback return. Then the **size gate**
+    ///    plan and its rollback return. A plan that fits but would take the
+    ///    layer from at least one top-level section to none (the entry had one
+    ///    before the plan and its planned state has none) is refused next,
+    ///    before the size gate: the entry goes back rolled back and the attempt
+    ///    answers `INVALID_ARGUMENT` (`DeltaError::RemovesLastTopLevelSection`,
+    ///    SDD §9.7). Then the **size gate**
     ///    (`storage::structural_size_gate`): a plan whose work
     ///    ([`StructuralWork::of_plan`], over the pre-plan state read through
     ///    the journal) is over
@@ -10449,7 +10977,7 @@ impl LayerStore {
     /// | `STALE` | rolled back and put back | `Aborted`, a `seq_fence` conflict; the retry repairs and re-plans |
     /// | `CACHE_DIVERGED` | discarded (`divergence_total`, `reloads_total{reason="diverged"}`, a `cache_diverged` conflict) | the call's first: `Aborted`, and the retry reloads; any later one: the WATCH path, now |
     /// | `FENCED` | rolled back and put back | a `snapshot_fence_wait` conflict and an uncounted wait on the call's fence clock (`AttemptOutcome::WaitUncounted`, backend `lua`), then the attempt again from step 1 |
-    /// | a delta `Err` (the plan's, other than a ceiling), a transport or in-doubt failure, `WRONGTYPE_KEY`, `SEQ_OVERFLOW`, `SET_ORDER_OVERFLOW`, `STREAM_ID_COLLISION`, `ENCODING` | rolled back and put back | the error |
+    /// | a delta `Err` (the plan's, other than a ceiling, or the root-removal refusal raised after the plan, before the size gate: `INVALID_ARGUMENT`), a transport or in-doubt failure, `WRONGTYPE_KEY`, `SEQ_OVERFLOW`, `SET_ORDER_OVERFLOW`, `STREAM_ID_COLLISION`, `ENCODING` | rolled back and put back | the error |
     /// | `NotFound` / `FailedPrecondition` (`SUPERSEDED`, `PARTIAL_HEADER`) | discarded | the error |
     ///
     /// The `STALE` and `CACHE_DIVERGED` conflicts carry the attempt's path
@@ -10812,6 +11340,11 @@ impl LayerStore {
             // the entry as put back, or for the resumed hit's first RP0 when
             // that is larger.
             let mut stats = crate::domain::delta::ApplyDeltaStats::default();
+            // Whether the state this attempt plans on has a top-level section,
+            // for the root-removal check after the plan (SDD §9.7). Taken per
+            // attempt, from the entry actually planned on: a reload after
+            // `CACHE_DIVERGED` plans on a fresh one.
+            let had_top_level = has_top_level_section(&entry.entry().state);
             let plan = pass_timing::time(Pass::Plan, || {
                 entry.plan_in_place(
                     delta.clone(),
@@ -10895,6 +11428,18 @@ impl LayerStore {
                     return Err(ServiceError::from(e));
                 }
             };
+            // A plan that would take the layer from at least one top-level
+            // section to none is refused `INVALID_ARGUMENT` before any commit
+            // work, as a plan error is: the plan ran in place, so the entry's
+            // state is the planned state, and `put_back_held` rolls it back
+            // through its journal. The rule is checked here and on the WATCH
+            // path rather than in the delta engine, which must keep
+            // reproducing stored history (restore, compose, replay, repair);
+            // a layer stored without one is never refused.
+            if let Err(e) = check_keeps_top_level_section(had_top_level, &entry.entry().state) {
+                self.count_put_back(&request, entry.put_back_held());
+                return Err(ServiceError::from(e));
+            }
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics.inc_delta_create_section_skipped_missing_parent(
                     stats.create_section_skipped_missing_parent,
@@ -12171,7 +12716,11 @@ impl LayerStore {
         // header's, and one `HGET obj:hdr seq` after it must still read that
         // `seq`. Every commit advances `seq`, so either inequality means a
         // commit landed during the read, and the attempt returns `Aborted`
-        // for `update_layer`'s retry loop to re-run.
+        // for `update_layer`'s retry loop to re-run. The proof shows no writer
+        // changed the object, not that the read saw all of it: once it holds,
+        // a read whose round 1 came back short of an index's count (a cursor
+        // continued on another serving process skipped members) is aborted
+        // the same way, as a skip rather than a lost race.
         //
         // b.k1r medium: the "needs snapshot" predicate is exactly the
         // inverse of `lua::is_fast_path`, which is the single source of
@@ -12330,6 +12879,12 @@ impl LayerStore {
             MutationAllowance::UNBOUNDED
         };
         let mut stats = crate::domain::delta::ApplyDeltaStats::default();
+        // Whether the state this attempt plans on has a top-level section,
+        // for the root-removal check after the plan (SDD §9.7). Only the
+        // snapshot branch holds the object's sections: a fast-shaped delta's
+        // header-only state holds none, and that delta cannot change the
+        // tree (`is_fast_path`).
+        let had_top_level = needs_snapshot && has_top_level_section(&state);
         let (mut mutations, mut rewrite) = match crate::domain::delta::apply_delta_bounded(
             &mut state,
             delta.clone(),
@@ -12351,6 +12906,16 @@ impl LayerStore {
             }
             Err(e) => return Err(ServiceError::from(e)),
         };
+        // A plan that would take the layer from at least one top-level section
+        // to none is refused `INVALID_ARGUMENT` before any commit work, exiting
+        // as a plan error does (the `WatchGuard` releases the WATCH). The rule
+        // is checked here and on the cached structural route rather than in the
+        // delta engine, which must keep reproducing stored history (restore,
+        // compose, replay, repair); a layer stored without one is never
+        // refused.
+        if needs_snapshot {
+            check_keeps_top_level_section(had_top_level, &state).map_err(ServiceError::from)?;
+        }
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.inc_delta_create_section_skipped_missing_parent(
                 stats.create_section_skipped_missing_parent,
@@ -12890,7 +13455,7 @@ impl LayerStore {
         // must ride along; removing it for either one breaks the other. The
         // relay consumer also classifies by absence: `SubscribeReadLayer`
         // sends an ompf-less entry above sequence 1 as the empty delta, with
-        // no read, in steady state and in its rollback-mode in-window replay.
+        // no read, in steady state.
         //
         // The enforcement is upstream, at the call's entry:
         // `update_layer_with_summary` refuses a `Some` delta without non-empty
@@ -13779,8 +14344,8 @@ impl LayerStore {
     ///
     /// Every retirement path appends a tombstone with an *auto* ID, through
     /// the shared wake-up script (`wake_retired_object_stream`: `PEXPIRE` →
-    /// `XADD * payload deleted` → `PEXPIRE`): `delete_layer` does `DEL
-    /// mapping` → the wake-up → ext-GC → `cleanup_old_object` (which UNLINKs
+    /// `XADD * payload deleted` → `PEXPIRE`): `delete_layer` does the unmap
+    /// (`layer_unmap.lua`) → the wake-up → ext-GC → `cleanup_old_object` (which UNLINKs
     /// the header), the `CreateLayer`-overwrite path does `HSET superseded=1`
     /// → flip mapping → the wake-up on the old stream, and the orphan sweep
     /// does `HSET superseded=1` → the wake-up → ext-GC → UNLINK. An auto ID is
@@ -13957,6 +14522,15 @@ impl LayerStore {
     /// `live_edit_update_layer_conflicts_total{path="watch",kind="watch_read_moved"}`,
     /// and the same kind on `call`, the attempt's call record.
     ///
+    /// Only once the proof holds is a read whose round 1 came back short of a
+    /// count weighed ([`ChargedSnapshotRead::Incomplete`]): with no commit
+    /// under the read, that is a cursor that skipped members, so the attempt
+    /// logs one WARN, ticks `live_edit_snapshot_read_index_incomplete_total`
+    /// and is `Aborted("object snapshot index read incomplete while loading
+    /// structural update: …")` — retried by `update_layer`'s loop and counted
+    /// on its retries, never on `conflicts_total`. A short round 1 whose proof
+    /// failed is the lost race above, and nothing more.
+    ///
     /// Other failures are the read's own: `NotFound` for an absent header or
     /// one without a numeric `seq` (SR-1.5), and a failed read or re-read
     /// classified by `classify_snapshot_read_err` (transient → `Aborted`,
@@ -13997,11 +14571,17 @@ impl LayerStore {
             hook().await;
         }
 
-        let mut snapshot =
+        // A read whose round 1 came back short of a count is weighed only
+        // after the proof below.
+        let (mut snapshot, shortfall) =
             match read_object_snapshot_slim_charged(&self.client, &self.keys, oid_str, allowance)
                 .await?
             {
-                ChargedSnapshotRead::Snapshot(snapshot) => snapshot,
+                ChargedSnapshotRead::Snapshot(snapshot) => (snapshot, None),
+                ChargedSnapshotRead::Incomplete {
+                    snapshot,
+                    shortfall,
+                } => (snapshot, Some(shortfall)),
                 ChargedSnapshotRead::Stopped { target } => {
                     return Ok(WatchSnapshotRead::Stopped { target })
                 }
@@ -14061,6 +14641,25 @@ impl LayerStore {
             return Err(ServiceError::Aborted(
                 "object snapshot changed while loading structural update".to_owned(),
             ));
+        }
+        // The proof held, so no commit changed the object under the read: a
+        // round 1 short of a count is a cursor that skipped members (a store
+        // failover, restart or shard move), not a lost race. Never planned
+        // on: aborted for `update_layer`'s retry loop, and not counted on
+        // `conflicts_total`, which counts races.
+        if let Some(shortfall) = shortfall {
+            report_index_shortfall(
+                self.client.metrics_snapshot().as_ref(),
+                oid_str,
+                SlimSnapshotReadConsumer::StructuralUpdate,
+                SnapshotReadPath::Unfenced,
+                &shortfall,
+                None,
+            );
+            return Err(ServiceError::Aborted(format!(
+                "object snapshot index read incomplete while loading structural update: \
+                 {shortfall}"
+            )));
         }
         // The unfenced fan-out always reports the facts; an absent report is
         // read as an unmarked object's ("unknown"), which over-deletes rather
@@ -15729,9 +16328,61 @@ impl LayerStore {
     /// a `surplus_acquire` release's pre-flight increment is owed by no later
     /// event. The reconciler is the only drain for either.
     async fn enqueue_ext_releases(&self, object_id: u64, releases: &[ExtReleaseWithReason]) {
+        self.enqueue_ext_releases_unless_held(object_id, releases, None)
+            .await;
+    }
+
+    /// [`Self::enqueue_ext_releases`] under a checkpoint restore's hold write
+    /// fence (SDD SR-6.2; `None` is the plain enqueue). The fence is checked
+    /// before each attempt and, inside the enqueue, immediately before its
+    /// script and before a `NOSCRIPT` reload's `SCRIPT LOAD` and re-send
+    /// (`storage::client::evalsha_with_fenced_reload`); once it is closed the
+    /// enqueue is skipped and nothing more is sent. A skip leaks the batch's
+    /// references — the safe direction, which the disaster-recovery restore
+    /// Job's recount (or the reconciler) corrects — counts them per reference
+    /// on `ext_ref_release_enqueue_failed_total`, and logs one INFO line naming
+    /// the object. A script sent before the fence closed that fails after it
+    /// is booked the same way, with its error on the INFO line, and is not
+    /// retried: the retry would be a send after entry.
+    async fn enqueue_ext_releases_unless_held(
+        &self,
+        object_id: u64,
+        releases: &[ExtReleaseWithReason],
+        hold_fence: Option<&CancellationToken>,
+    ) {
         if releases.is_empty() {
             return;
         }
+        // `sent_error` is `None` when nothing was sent (a skip), or the error
+        // of a script sent before the fence closed that failed after it: that
+        // one is not retried either, because the retry would be a send after
+        // entry, and whether it landed is unknown.
+        let stop_for_hold = |sent_error: Option<&ServiceError>| {
+            if let Some(metrics) = self.metrics.as_ref() {
+                metrics.inc_ext_ref_release_enqueue_failed(releases.len() as u64);
+            }
+            match sent_error {
+                None => tracing::info!(
+                    object_id,
+                    releases = releases.len(),
+                    "checkpoint restore skipped its external-value release enqueue: this replica \
+                     entered a disaster-recovery hold, or lost contact with the store's hold \
+                     state, after the restore landed; the references \
+                     stay counted until the restore Job's recount or the reference-count \
+                     reconciler corrects them"
+                ),
+                Some(e) => tracing::info!(
+                    object_id,
+                    releases = releases.len(),
+                    error = %e,
+                    "checkpoint restore's external-value release enqueue failed after this \
+                     replica entered a disaster-recovery hold or lost contact with the store's \
+                     hold state, and is not retried; whether it \
+                     landed is unknown, so its references are counted as not released until \
+                     the restore Job's recount or the reference-count reconciler corrects them"
+                ),
+            }
+        };
         let payload = ext_release_payload(releases);
         // b.yuo: a commit's `surplus_acquire` release hands back the
         // pre-flight `+1` of a hash the object still references, so its
@@ -15749,7 +16400,19 @@ impl LayerStore {
             .collect();
         let mut attempt = 0;
         loop {
-            match enqueue_ext_releases_accounted(&self.client, &self.keys, &accounted).await {
+            if crate::storage::client::hold_fence_closed(hold_fence) {
+                stop_for_hold(None);
+                return;
+            }
+            match enqueue_ext_releases_accounted(&self.client, &self.keys, &accounted, hold_fence)
+                .await
+            {
+                Err(e) if crate::storage::client::hold_fence_closed(hold_fence) => {
+                    let sent_error =
+                        (!crate::storage::client::is_hold_fence_refusal(&e)).then_some(&e);
+                    stop_for_hold(sent_error);
+                    return;
+                }
                 Ok(()) => {
                     if let Some(metrics) = self.metrics.as_ref() {
                         for &reason in EXT_REF_RELEASE_REASONS {
@@ -16303,11 +16966,17 @@ impl LayerStore {
         // the transaction is discarded) or the `EXEC` refused as a whole
         // (`-EXECABORT Transaction discarded because of: OOM …`). Either way
         // no queued command of that send ran — though a replay's refusal can
-        // follow a first send that landed, leaving an unmapped orphan: plain
-        // `UNAVAILABLE` (no `CreateLayer` commit-stage refusal carries a
-        // retry hint),
-        // counted at `stage="create_commit"`. See
-        // `storage::client::store_write_refusal`.
+        // follow a first send that landed, leaving an unmapped orphan, which
+        // no client can reach. The materialization comes before the call's
+        // commit marker, so the answer is the hinted refusal: `UNAVAILABLE`
+        // carrying `STORE_WRITE_REFUSED` with its `condition` and retry hint
+        // (`refuse_store_write_hinted`), counted at `stage="create_commit"`,
+        // which the handler's pre-commit choke point passes through
+        // unchanged. Any other failure below that answers a plain
+        // `UNAVAILABLE` the choke point answers carrying
+        // `UPSTREAM_UNAVAILABLE`. See
+        // `storage::client::store_write_refusal` and
+        // `StoreWriteRefusal::into_unhinted_service_error`.
         //
         // A timeout — the reply outliving the size-scaled timeout above, which
         // the queued commands carry into `exec_txn` — reads `UNAVAILABLE`, and
@@ -16344,7 +17013,7 @@ impl LayerStore {
             )
             .await
         {
-            if let Some(refused) = refuse_store_write(
+            if let Some(refused) = refuse_store_write_hinted(
                 self.store_write_origin(POOL_LABEL_TXN),
                 STORE_WRITE_REFUSED_STAGE_CREATE_COMMIT,
                 &e,
@@ -16470,6 +17139,7 @@ impl LayerStore {
     /// |---|---|---|
     /// | [`RestoreWriteOutcome::Materialized`] | object written | cleared by `EXEC` |
     /// | [`RestoreWriteOutcome::PeerLandedHeader`] — pre-`MULTI` read, or post-conflict re-read | untouched | explicit `UNWATCH`, or already `mark_unwatched` |
+    /// | [`RestoreWriteOutcome::HoldFenced`] — `hold_fence` closed at the check immediately before the `EXEC` | untouched (the transaction was never sent) | explicit `UNWATCH` |
     /// | `Err(Unavailable)` — dirty header, L2 refuse, tripped `EXEC`, `EXEC` error, in-doubt | untouched, or unknown on the last two | explicit `UNWATCH`, `mark_unwatched` after a tripped `EXEC`, or `Drop`'s |
     /// | `Err(Unavailable)` — transient failure of either header read, of the pre-`MULTI` keyspace probe or the `obj:ext` pre-image read beside it, or of the `MULTI` open | untouched | explicit `UNWATCH`, already `mark_unwatched`, or none armed — the probe and the pre-image read both fail at their join, before `acquire_txn_for`, so no `WATCH` exists to dispose of |
     /// | `Err(PermanentKeyspaceRefusal)` — either header read found a wrong-typed `obj:hdr`, or the pre-`MULTI` keyspace probe found one — including a wrong-typed `obj:ext`, since the probe's verdict is consulted before the pre-image read's | untouched | explicit `UNWATCH`, already `mark_unwatched`, or none armed — the keyspace probe fails at its join with the pre-image read, before `acquire_txn_for` |
@@ -16496,6 +17166,33 @@ impl LayerStore {
     /// the object header-less, which is exactly the state the next attempt
     /// expects.
     ///
+    /// # The hold write fence
+    ///
+    /// `hold_fence` is the layer restore's hold write fence (SDD SR-6.2; the
+    /// token lives in `checkpoint`, which passes it here, `None` from callers
+    /// with no fence). It is checked once, after every read and all the
+    /// queueing and immediately before the `EXEC`, which sends the whole
+    /// `MULTI … EXEC` as one unit: a closed fence sends nothing and answers
+    /// [`RestoreWriteOutcome::HoldFenced`]. The fence does not stop an `EXEC`
+    /// handed to fred before it closed: it runs under the configured Valkey
+    /// command timeout (this transaction is opened with [`WatchedTxn::open`],
+    /// not the size-scaled `txn_timeout`; the bound assumes
+    /// `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS` > 0), and fred writes the
+    /// pipeline only while its caller still waits — once the caller gives up,
+    /// fred writes no frame of it not yet written, even behind a reconnect,
+    /// and sends a `DISCARD` after a cut `MULTI`. So it is written within
+    /// that timeout of the fence closing, or never; a frame fred had already
+    /// written is not recalled, a residual (`checkpoint::hold_fence`; SDD
+    /// §15.3 *Vendored fred* change 9). The fence is checked again
+    /// in the trailing release enqueue of a committed `EXEC`, before each
+    /// attempt, immediately before its script, and before a `NOSCRIPT`
+    /// reload's `SCRIPT LOAD` and re-send
+    /// ([`Self::enqueue_ext_releases_unless_held`]): once it is closed the
+    /// enqueue is skipped and nothing more is sent, the releases leaking their
+    /// references and ticking `ext_ref_release_enqueue_failed_total` with an
+    /// INFO line naming the object. So every write this function would hand
+    /// to fred after the fence closes is refused.
+    ///
     /// An `InDoubt` `EXEC` is **not** reconciled (policy P3). Both answers are
     /// states the next attempt handles — it landed, so the re-read sees a
     /// complete header and reports the layer present; it did not, so the
@@ -16519,7 +17216,8 @@ impl LayerStore {
     ///   [`RestoreWriteOutcome::PeerLandedHeader`] arm, no `MULTI`, no `EXEC`.
     /// * [`Self::with_restore_write_before_exec_hook_for_test`] — fires after
     ///   the read passed empty, after the queueing, after the L2 check, and
-    ///   immediately before the `EXEC`. A peer header landed from here lands in
+    ///   immediately before the `EXEC` (only the hold write fence's local check
+    ///   sits between them). A peer header landed from here lands in
     ///   the read→`EXEC` window and trips the `EXEC`: the
     ///   [`WatchedExec::Conflict`] arm, its post-conflict positive-evidence
     ///   re-read, and that read's own
@@ -16534,6 +17232,7 @@ impl LayerStore {
         state: &ObjectState,
         server_ts: u64,
         checkpoint_cursor: CheckpointCursorStamp,
+        hold_fence: Option<&CancellationToken>,
     ) -> Result<RestoreWriteOutcome, ServiceError> {
         let object_id: u64 = oid_str
             .parse()
@@ -16856,6 +17555,21 @@ impl LayerStore {
             hook(&conn).await;
         }
 
+        // ── The hold write fence (SDD SR-6.2), immediately before the `EXEC` ──
+        //
+        // Nothing of this transaction has reached the store yet: `MULTI` and
+        // every queued mutation sit in the pipeline's local buffer until the
+        // `EXEC` sends them as one unit. So a fence closed (by a hold or a
+        // stale-verdict entry) anywhere in the materialization so far — the
+        // probe, the checkout, the `WATCH`, the header read — stops it here
+        // with nothing written: unwatch, drop the unsent transaction, and
+        // answer `HoldFenced`. No releases are owed, because nothing was
+        // written.
+        if crate::storage::client::hold_fence_closed(hold_fence) {
+            let _ = conn.unwatch_pinned().await;
+            return Ok(RestoreWriteOutcome::HoldFenced);
+        }
+
         match txn
             .exec(FredErrOrigin::client(&self.client, POOL_LABEL_TXN))
             .await
@@ -16924,8 +17638,9 @@ impl LayerStore {
                     // written, and which ones came from which replica's
                     // generation is not recoverable.
                     //
-                    // The `enqueue_ext_releases` below still runs on this arm,
-                    // and that is not a contradiction: the object is already
+                    // The `enqueue_ext_releases` below still runs on this arm
+                    // (unless the hold write fence skips it), and that is not a
+                    // contradiction: the object is already
                     // corrupt, so the choice is only which refcount error to
                     // take. Withholding the releases would leak one reference
                     // per superseded hash in the common case — a voided witness
@@ -16962,7 +17677,16 @@ impl LayerStore {
                 // superseded — rows it overwrote whose hashes the restored state
                 // does not hold — are owed back. ONLY on this arm: a tripped
                 // `EXEC` wrote nothing and therefore owes nothing.
-                self.enqueue_ext_releases(object_id, &ext_plan.releases)
+                //
+                // Under the hold write fence (SDD SR-6.2): a hold or
+                // stale-verdict entry while this `EXEC` was in flight, or
+                // during the enqueue's reads or a `NOSCRIPT` reload, skips the
+                // rest of the enqueue, so it sends nothing after entry.
+                // The skipped releases leak their references — the safe
+                // direction — and are counted per reference on
+                // `ext_ref_release_enqueue_failed_total`
+                // (`Self::enqueue_ext_releases_unless_held`).
+                self.enqueue_ext_releases_unless_held(object_id, &ext_plan.releases, hold_fence)
                     .await;
                 Ok(RestoreWriteOutcome::Materialized)
             }
@@ -17015,13 +17739,14 @@ impl LayerStore {
 
 /// What [`LayerStore::write_restored_object`] found and did (b.h4m).
 ///
-/// Two variants, because the DR restore's materialization has exactly two
+/// Three variants, because the DR restore's materialization has exactly three
 /// non-error endings and the caller must be able to tell them apart: one of them
-/// wrote the object, the other deliberately wrote nothing because a peer replica
-/// had already restored it. `apply_restore` maps the second to
-/// `ApplyOutcome::AlreadyPresent`, which folds into
-/// `RecoveryOutcome::Restored` — the layer IS there, so every consumer's retry
-/// succeeds — rather than into an error the client would see.
+/// wrote the object; one deliberately wrote nothing because a peer replica had
+/// already restored it, which `apply_restore` maps to
+/// `ApplyOutcome::AlreadyPresent`, folding into `RecoveryOutcome::Restored` —
+/// the layer IS there, so every consumer's retry succeeds — rather than into an
+/// error the client would see; and one wrote nothing because the hold write
+/// fence was closed, which `apply_restore` maps to its hold refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestoreWriteOutcome {
     /// The `EXEC` committed: this attempt wrote the restored object.
@@ -17036,6 +17761,10 @@ pub(crate) enum RestoreWriteOutcome {
     /// `checkpoint_recovery_attempts_total{result="restored"}` for a restore
     /// that never ran.
     PeerLandedHeader,
+    /// The hold write fence passed in was closed immediately before the
+    /// `EXEC`, so the transaction was never sent: nothing was written and no
+    /// releases are owed (SDD SR-6.2).
+    HoldFenced,
 }
 
 /// Which commit path is running the pre-`MULTI` keyspace type probe (b.zvd).
@@ -18423,28 +19152,347 @@ fn note_undecodable_ext_index_field(
 }
 
 /// The commands [`queue_object_state`] queues for `state` and `ext_plan`,
-/// counted exactly as it queues them, for `write_object`'s size-scaled
-/// transaction timeout (`storage::client::txn_timeout`): the header `HSET`;
-/// per section its `HSET` and index `SADD`; per non-empty children list its
-/// `DEL`, one `RPUSH` per child and its index `SADD`; per field and per time
-/// sample its `HDEL`, `HSET` and index `ZADD`; and one `HSET` or `HDEL` per
-/// external-value index write. `MULTI`, `EXEC` and the caller's own commands
-/// are not in it. Edit the two together.
+/// counted exactly as it queues them, for the size-scaled transaction
+/// timeouts (`storage::client::txn_timeout`) of `write_object` and the restore
+/// Job's batches (`dr_restore`): the header `HSET` plus every
+/// [`StateUnit`]'s [`StateUnit::commands`] — per section its `HSET` and index
+/// `SADD`; per non-empty children list its `DEL`, one `RPUSH` per child and
+/// its index `SADD`; per field and per time sample its `HDEL`, `HSET` and
+/// index `ZADD`; and one `HSET` or `HDEL` per external-value index write.
+/// `MULTI`, `EXEC` and the caller's own commands are not in it. The count
+/// and the queueing walk the same units ([`state_units`]).
 fn object_state_command_count(state: &ObjectState, ext_plan: &ExtIndexPlan) -> u64 {
-    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
-    let lists = state
-        .children
+    state_units(state, ext_plan).fold(1u64, |sum, unit| sum.saturating_add(unit.commands()))
+}
+
+/// One unit of an object's materialized state, as [`queue_object_state`]
+/// queues it after the header `HSET`: the commands one row (or one children
+/// list, or one external-value index write) and its index member take.
+/// Kept whole in one transaction, so a row and its index member land
+/// together, except where the restore Job's batches cut a children list
+/// longer than their command limit (`dr_restore`, which queues those slices
+/// itself; nothing reads the list before the restored header lands).
+#[derive(Clone, Copy, Debug)]
+enum StateUnit<'a> {
+    /// A section's `HSET` and its `obj:secs` `SADD`: 2 commands.
+    Section(&'a Section),
+    /// A non-empty children list: `DEL`, one `RPUSH` per child and its
+    /// `obj:chs` `SADD`: `ids.len() + 2` commands.
+    Children {
+        /// The parent section.
+        parent: u64,
+        /// The children, in order.
+        ids: &'a [u64],
+    },
+    /// A field's `HDEL` of both value shapes, `HSET` and `obj:flds` `ZADD`:
+    /// 3 commands.
+    Field(&'a Field),
+    /// A time sample's `HDEL`, `HSET` and `obj:tss` `ZADD`: 3 commands.
+    TimeSample(&'a TimeSample),
+    /// One `HSET le:{oid}:obj:ext <hash_hex> <count>`: 1 command.
+    ExtSet(&'a (String, String)),
+    /// One `HDEL le:{oid}:obj:ext <hash_hex>`: 1 command.
+    ExtDel(&'a String),
+}
+
+impl StateUnit<'_> {
+    /// The commands this unit queues.
+    fn commands(&self) -> u64 {
+        match self {
+            Self::Section(_) => 2,
+            Self::Children { ids, .. } => u64::try_from(ids.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(2),
+            Self::Field(_) | Self::TimeSample(_) => 3,
+            Self::ExtSet(_) | Self::ExtDel(_) => 1,
+        }
+    }
+
+    /// The bytes of the arguments this unit queues whose length follows its
+    /// content, counted from above, for the restore Job's byte bound on a
+    /// batch (`dr_restore::RESTORE_BATCH_ARG_BYTES`): a section's name; a
+    /// field's name six times, since its row key (the `HDEL`'s and the
+    /// `HSET`'s) and its index member each carry it hex-encoded; and a field's
+    /// or a time sample's value as queued — an inline value base64-encoded (4
+    /// bytes per 3, rounded up), an external one as its hash's 64 hex digits
+    /// and at most 20 size digits. Every other argument (the key prefix,
+    /// decimal ids, orders, versions and scores, a child id, an index field's
+    /// hash and count) is at most a constant per command, which the per-command
+    /// cost the batch's command bound prices already holds.
+    fn arg_bytes(&self) -> u64 {
+        let value_bytes = |value: &FieldValue| -> u64 {
+            match value {
+                FieldValue::Inline(bytes) => (bytes.len() as u64).div_ceil(3).saturating_mul(4),
+                FieldValue::External { .. } => 64 + 20,
+            }
+        };
+        match self {
+            Self::Section(section) => section.name.len() as u64,
+            Self::Field(field) => (field.key_name.len() as u64)
+                .saturating_mul(6)
+                .saturating_add(value_bytes(&field.value)),
+            Self::TimeSample(sample) => value_bytes(&sample.value),
+            Self::Children { .. } | Self::ExtSet(_) | Self::ExtDel(_) => 0,
+        }
+    }
+}
+
+/// Every [`StateUnit`] of `state` and `ext_plan`, in the order
+/// [`queue_object_state`] queues them: sections, non-empty children lists,
+/// fields, time samples, the external-value index `HSET`s, then its `HDEL`s.
+/// Deterministic for one unmutated `state`, so a caller may walk it more
+/// than once and slice it the same way each time.
+fn state_units<'a>(
+    state: &'a ObjectState,
+    ext_plan: &'a ExtIndexPlan,
+) -> impl Iterator<Item = StateUnit<'a>> + 'a {
+    state
+        .sections
         .values()
-        .filter(|children| !children.is_empty())
-        .fold(0u64, |sum, children| {
-            sum.saturating_add(2).saturating_add(count(children.len()))
-        });
-    1u64.saturating_add(count(state.sections.len()).saturating_mul(2))
-        .saturating_add(lists)
-        .saturating_add(count(state.fields.len()).saturating_mul(3))
-        .saturating_add(count(state.time_samples.len()).saturating_mul(3))
-        .saturating_add(count(ext_plan.set.len()))
-        .saturating_add(count(ext_plan.del.len()))
+        .map(StateUnit::Section)
+        .chain(
+            state
+                .children
+                .iter()
+                .filter(|(_, ids)| !ids.is_empty())
+                .map(|(parent, ids)| StateUnit::Children {
+                    parent: *parent,
+                    ids: ids.as_slice(),
+                }),
+        )
+        .chain(state.fields.values().map(StateUnit::Field))
+        .chain(state.time_samples.values().map(StateUnit::TimeSample))
+        .chain(ext_plan.set.iter().map(StateUnit::ExtSet))
+        .chain(ext_plan.del.iter().map(StateUnit::ExtDel))
+}
+
+/// The pairs of an object's header `HSET` (SDD §7.2): the 12 canonical
+/// fields, the children-index completeness marker, the fence identity
+/// `commit_chain`, and, when `checkpoint_cursor` is `Some`, the three cursor
+/// columns, folded into the same `HSET` (b.4fh). Shared by
+/// [`queue_object_state`] (which passes a fresh `commit_chain`) and the
+/// restore Job's header transaction (`dr_restore`, which passes the value it
+/// generated, so an in-doubt retry can recognise its own landed header).
+#[allow(clippy::too_many_arguments)]
+fn object_header_pairs(
+    state: &ObjectState,
+    session_id: &str,
+    layer_name: &str,
+    created_by: &str,
+    server_ts: u64,
+    checkpoint_cursor: Option<CheckpointCursorStamp>,
+    commit_chain: String,
+) -> Vec<(&'static str, String)> {
+    let mut header_pairs: Vec<(&'static str, String)> = vec![
+        ("seq", state.sequence_num.to_string()),
+        ("first_ver", state.first_version.to_string()),
+        ("src_fmt", state.source_format.clone()),
+        ("next_set_order", state.next_set_order.to_string()),
+        ("session_id", session_id.to_owned()),
+        ("layer_name", layer_name.to_owned()),
+        ("created_by", created_by.to_owned()),
+        ("created_at", server_ts.to_string()),
+        ("modified_at", server_ts.to_string()),
+        ("last_client_id", String::new()),
+        ("last_client_ts", "0".to_owned()),
+        ("last_server_ts", server_ts.to_string()),
+        // The children-index completeness marker. Not one of the 12 canonical
+        // fields, and written unconditionally — an object with no children has
+        // an empty index, which is complete. It is true on commit because this
+        // HSET and the children loop below (every list `state` holds, each
+        // with its `obj:chs` member) share the caller's one transaction, so no
+        // crash can leave the marker without the index. See
+        // `HEADER_FIELD_CHS_COMPLETE` for why nothing else writes or clears it.
+        // (The restore Job writes the header last, in its own transaction
+        // after every row batch, fenced on header-absent: the marker lands
+        // only once every list and its member already has.)
+        (HEADER_FIELD_CHS_COMPLETE, CHS_COMPLETE_MARKED.to_owned()),
+        // The fence identity, also not one of the 12 canonical fields: a new
+        // random value on every materialization, a restore included, so a
+        // re-materialization at an unchanged `seq` (two restores of one
+        // checkpoint generation copy the same `created_at`) is still a
+        // different object to anyone holding the previous value. See
+        // `storage::commit_chain`.
+        (HEADER_FIELD_COMMIT_CHAIN, commit_chain),
+    ];
+    if let Some(cursor) = checkpoint_cursor {
+        header_pairs.push(("last_checkpoint_seq", cursor.snap_seq.to_string()));
+        header_pairs.push(("last_checkpoint_ms", cursor.written_at_ms.to_string()));
+        header_pairs.push(("restore_seq_bump", cursor.restore_seq_bump.to_string()));
+    }
+    header_pairs
+}
+
+/// Queue one [`StateUnit`] of object `oid_str` into an open transaction:
+/// exactly [`StateUnit::commands`] commands, the same ones
+/// [`queue_object_state`] queues for it. `ext_index_key` is the object's
+/// `obj:ext` key.
+async fn queue_state_unit<
+    C: HashesInterface + KeysInterface + SetsInterface + SortedSetsInterface + ListInterface,
+>(
+    origin: FredErrOrigin<'_>,
+    trx: &C,
+    keys: &KeySchema,
+    oid_str: &str,
+    ext_index_key: &str,
+    unit: StateUnit<'_>,
+) -> Result<(), ServiceError> {
+    match unit {
+        StateUnit::Section(section) => {
+            let sid = section.section_id.to_string();
+            let section_key = keys.obj_section(oid_str, &sid);
+            let _: () = trx
+                .hset(&section_key, section_hash_fields(section))
+                .await
+                .map_err(|e| ServiceError::Internal(format!("HSET section failed: {e}")))?;
+
+            let _: () = trx
+                .sadd(keys.obj_sections_index(oid_str), &sid)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("SADD sections index failed: {e}")))?;
+        }
+        StateUnit::Children { parent, ids } => {
+            // Children lists, plus the parent-id index that makes them
+            // enumerable at retirement (b.jdr — `obj:chs`, see
+            // `KeySchema::obj_children_index`).
+            //
+            // The index member is written inside the same unit — and the same
+            // MULTI/EXEC — as the list it describes, so the two cannot
+            // diverge. One single-member SADD per parent (mirroring the
+            // `obj:secs` write above) rather than one bulk SADD of every
+            // parent: bulk arity would scale with the object's parent count,
+            // the same unbounded-command failure mode `UNLINK_CHUNK_SIZE`
+            // exists to avoid. This is also the materializer for the
+            // `apply_checkpoint` restore path, which is why the checkpoint
+            // blob format needs no change: the index is rebuilt from
+            // `state.children` on restore.
+            //
+            // A parent whose list is empty writes no key (nothing to RPUSH),
+            // so it must not be indexed either — `remove_child_from_parent`
+            // legitimately leaves an empty Vec behind. [`state_units`] yields
+            // no unit for one, mirroring the `is_empty` fork in the
+            // `SetChildren` mutation arm.
+            let parent_str = parent.to_string();
+            let children_key = keys.obj_children(oid_str, &parent_str);
+            // b.zvd: DEL before the RPUSHes, mirroring `execute_mutation`'s
+            // `SetChildren` arm. On a freshly-minted `object_id` this is a
+            // no-op. On the `apply_checkpoint` restore path — which
+            // deliberately materializes at a KNOWN `object_id` over a possibly
+            // surviving keyspace — it converts a silent append-and-duplicate
+            // (every restored child id landing a second time behind the
+            // survivors) into the replace the restore intends. It is also what
+            // keeps this call site's list keys out of `create_probe_keys`, and
+            // therefore what keeps `ProbedType`'s "no `List` variant" reasoning
+            // true here: whatever type the key held, the RPUSH lands on a key
+            // that no longer exists. It is also what makes the unit idempotent
+            // under the restore Job's batch retries.
+            let _: () = trx
+                .del(&children_key)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("DEL children list failed: {e}")))?;
+            for child_id in ids {
+                let _: () = trx
+                    .rpush(&children_key, child_id.to_string())
+                    .await
+                    .map_err(|e| ServiceError::Internal(format!("RPUSH children failed: {e}")))?;
+            }
+            let _: () = trx
+                .sadd(keys.obj_children_index(oid_str), &parent_str)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("SADD children index failed: {e}")))?;
+        }
+        StateUnit::Field(field) => {
+            let sid = field.section_id.to_string();
+            let field_key = keys.obj_field(oid_str, &sid, &field.key_name);
+
+            let hash_fields = field_value_hash_fields(
+                &field.value,
+                field.set_order,
+                field.authoring_set_order,
+                field.version,
+            );
+            // b.zvd: clear both value shapes before writing one, exactly as
+            // `execute_mutation`'s `SetField` arm does. Load-bearing on the
+            // restore path, where the row may already exist in the other shape.
+            // Safe to queue only because the pre-`MULTI` type probe has
+            // proven this key is a hash or absent — an `HDEL` against a
+            // wrong-typed key would raise its `WRONGTYPE` inside the `EXEC`,
+            // where the siblings still commit. See `VALUE_HFIELDS`. (The
+            // restore Job wipes the object first, so its rows are absent.)
+            let _: () = trx
+                .hdel(&field_key, VALUE_HFIELDS.to_vec())
+                .await
+                .map_err(|e| {
+                    ServiceError::Internal(format!("HDEL field value shape failed: {e}"))
+                })?;
+            let _: () = trx
+                .hset(&field_key, hash_fields)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("HSET field failed: {e}")))?;
+
+            // Sorted set: member = "{section_id}:{hex(key_name)}", score = version.
+            let member = KeySchema::field_member(&sid, &field.key_name);
+            let _: () = trx
+                .zadd(
+                    keys.obj_fields_index(oid_str),
+                    None,
+                    None,
+                    false,
+                    false,
+                    (field.version as f64, member),
+                )
+                .await
+                .map_err(|e| ServiceError::Internal(format!("ZADD fields index failed: {e}")))?;
+        }
+        StateUnit::TimeSample(sample) => {
+            let sid = sample.section_id.to_string();
+            let time_f64 = sample.time.into_inner();
+            let ts_key = keys.obj_time_sample(oid_str, &sid, time_f64);
+
+            let hash_fields = time_sample_hash_fields(&sample.value, sample.version);
+            // b.zvd: see the field unit above — same delete-then-write
+            // ordering, same type-probe precondition.
+            let _: () = trx
+                .hdel(&ts_key, VALUE_HFIELDS.to_vec())
+                .await
+                .map_err(|e| {
+                    ServiceError::Internal(format!("HDEL time sample value shape failed: {e}"))
+                })?;
+            let _: () = trx
+                .hset(&ts_key, hash_fields)
+                .await
+                .map_err(|e| ServiceError::Internal(format!("HSET time sample failed: {e}")))?;
+
+            // Sorted set: member = "{section_id}:{hex_f64(time)}", score = version.
+            let member = KeySchema::time_sample_member(&sid, time_f64);
+            let _: () = trx
+                .zadd(
+                    keys.obj_time_samples_index(oid_str),
+                    None,
+                    None,
+                    false,
+                    false,
+                    (sample.version as f64, member),
+                )
+                .await
+                .map_err(|e| {
+                    ServiceError::Internal(format!("ZADD time samples index failed: {e}"))
+                })?;
+        }
+        StateUnit::ExtSet((hash_hex, count)) => {
+            let _: () = trx
+                .hset(ext_index_key, [(hash_hex.as_str(), count.as_str())])
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "HSET ext index", e))?;
+        }
+        StateUnit::ExtDel(hash_hex) => {
+            let _: () = trx
+                .hdel(ext_index_key, hash_hex.as_str())
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "HDEL ext index", e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Queue one object's entire materialized state into an open transaction —
@@ -18475,15 +19523,22 @@ fn object_state_command_count(state: &ObjectState, ext_plan: &ExtIndexPlan) -> u
 /// it is folded into the SAME `HSET` as the 12 canonical header fields rather
 /// than trailing it (b.4fh) — see [`CheckpointCursorStamp`].
 ///
-/// That `HSET` also carries the children-index completeness marker
-/// ([`HEADER_FIELD_CHS_COMPLETE`] = [`CHS_COMPLETE_MARKED`]) on both entry
-/// points. This body is the marker's only writer, and it is sound here because
-/// the children loop below rewrites every list `state` holds together with its
-/// `obj:chs` member in the same transaction.
+/// That `HSET` ([`object_header_pairs`]) also carries the children-index
+/// completeness marker ([`HEADER_FIELD_CHS_COMPLETE`] = [`CHS_COMPLETE_MARKED`])
+/// on both entry points. This body and the restore Job's header transaction
+/// (`dr_restore`) are the marker's only writers, and it is sound in both: here
+/// the children units rewrite every list `state` holds together with its
+/// `obj:chs` member in the same transaction; the Job writes the header after
+/// every row batch has landed.
 ///
 /// It also carries a fresh [`HEADER_FIELD_COMMIT_CHAIN`] on both entry points,
 /// so every materialization lands a new fence identity atomically with the
 /// state it names.
+///
+/// The body is the header `HSET` and then one [`queue_state_unit`] per
+/// [`StateUnit`], so the restore Job's batches (`dr_restore`), which queue
+/// the same units in slices, queue exactly what this queues, but for an
+/// `LTRIM` before each later slice of a children list they cut.
 #[allow(clippy::too_many_arguments)]
 async fn queue_object_state<
     C: HashesInterface + KeysInterface + SetsInterface + SortedSetsInterface + ListInterface,
@@ -18509,210 +19564,34 @@ async fn queue_object_state<
     // eliminates the partial-header window between EXEC and a separate
     // trailing HSET).
     let header_key = keys.obj_header(oid_str);
-    let mut header_pairs: Vec<(&'static str, String)> = vec![
-        ("seq", state.sequence_num.to_string()),
-        ("first_ver", state.first_version.to_string()),
-        ("src_fmt", state.source_format.clone()),
-        ("next_set_order", state.next_set_order.to_string()),
-        ("session_id", session_id.to_owned()),
-        ("layer_name", layer_name.to_owned()),
-        ("created_by", created_by.to_owned()),
-        ("created_at", server_ts.to_string()),
-        ("modified_at", server_ts.to_string()),
-        ("last_client_id", String::new()),
-        ("last_client_ts", "0".to_owned()),
-        ("last_server_ts", server_ts.to_string()),
-        // The children-index completeness marker. Not one of the 12 canonical
-        // fields, and written unconditionally — an object with no children has
-        // an empty index, which is complete. It is true on commit because this
-        // HSET and the children loop below (every list `state` holds, each
-        // with its `obj:chs` member) share the caller's one transaction, so no
-        // crash can leave the marker without the index. See
-        // `HEADER_FIELD_CHS_COMPLETE` for why nothing else writes or clears it.
-        (HEADER_FIELD_CHS_COMPLETE, CHS_COMPLETE_MARKED.to_owned()),
-        // The fence identity, also not one of the 12 canonical fields: a new
-        // random value on every materialization, a restore included, so a
-        // re-materialization at an unchanged `seq` (two restores of one
-        // checkpoint generation copy the same `created_at`) is still a
-        // different object to anyone holding the previous value. See
-        // `storage::commit_chain`.
-        (HEADER_FIELD_COMMIT_CHAIN, fresh_commit_chain()),
-    ];
-    if let Some(cursor) = checkpoint_cursor {
-        header_pairs.push(("last_checkpoint_seq", cursor.snap_seq.to_string()));
-        header_pairs.push(("last_checkpoint_ms", cursor.written_at_ms.to_string()));
-        header_pairs.push(("restore_seq_bump", cursor.restore_seq_bump.to_string()));
-    }
+    let header_pairs = object_header_pairs(
+        state,
+        session_id,
+        layer_name,
+        created_by,
+        server_ts,
+        checkpoint_cursor,
+        fresh_commit_chain(),
+    );
     let _: () = trx
         .hset(&header_key, header_pairs)
         .await
         .map_err(|e| ServiceError::Internal(format!("HSET obj header failed: {e}")))?;
 
-    // Sections.
-    let sections_index_key = keys.obj_sections_index(oid_str);
-    for section in state.sections.values() {
-        let sid = section.section_id.to_string();
-        let section_key = keys.obj_section(oid_str, &sid);
-        let _: () = trx
-            .hset(&section_key, section_hash_fields(section))
-            .await
-            .map_err(|e| ServiceError::Internal(format!("HSET section failed: {e}")))?;
-
-        let _: () = trx
-            .sadd(&sections_index_key, &sid)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("SADD sections index failed: {e}")))?;
-    }
-
-    // Children lists, plus the parent-id index that makes them enumerable
-    // at retirement (b.jdr — `obj:chs`, see `KeySchema::obj_children_index`).
+    // The rows, one [`StateUnit`] at a time, in [`state_units`]' order:
+    // sections, children lists with their parent index (`obj:chs`), fields,
+    // time samples, then the external-value reference index (b.qpf), inside
+    // the same MULTI/EXEC as the field / time-sample rows it describes —
+    // `le:{oid}:obj:ext` carries the `{object_id}` hash tag, so it is
+    // in-slot. Rebuilt from `state` here, which is what lets the restore path
+    // inherit the fix without a checkpoint-format change.
     //
-    // The index member is written inside the same loop iteration — and the
-    // same MULTI/EXEC — as the list it describes, so the two cannot
-    // diverge. One single-member SADD per parent (mirroring the `obj:secs`
-    // write above) rather than one bulk SADD of every parent: bulk arity
-    // would scale with the object's parent count, the same unbounded-command
-    // failure mode `UNLINK_CHUNK_SIZE` exists to avoid. This is also the
-    // materializer for the `apply_checkpoint` restore path, which is why the
-    // checkpoint blob format needs no change: the index is rebuilt from
-    // `state.children` on restore.
-    //
-    // This loop is also what makes the header HSET's `chs_complete` marker
-    // true: it indexes every non-empty list it writes, in the same
-    // transaction as the marker.
-    let children_index_key = keys.obj_children_index(oid_str);
-    for (parent_id, child_ids) in &state.children {
-        // A parent whose list is empty writes no key (nothing to RPUSH),
-        // so it must not be indexed either — `remove_child_from_parent`
-        // legitimately leaves an empty Vec behind. Mirrors the `is_empty`
-        // fork in the `SetChildren` mutation arm.
-        if child_ids.is_empty() {
-            continue;
-        }
-        let parent_str = parent_id.to_string();
-        let children_key = keys.obj_children(oid_str, &parent_str);
-        // b.zvd: DEL before the RPUSHes, mirroring `execute_mutation`'s
-        // `SetChildren` arm. On a freshly-minted `object_id` this is a
-        // no-op. On the `apply_checkpoint` restore path — which
-        // deliberately materializes at a KNOWN `object_id` over a possibly
-        // surviving keyspace — it converts a silent append-and-duplicate
-        // (every restored child id landing a second time behind the
-        // survivors) into the replace the restore intends. It is also what
-        // keeps this call site's list keys out of `create_probe_keys`, and
-        // therefore what keeps `ProbedType`'s "no `List` variant" reasoning
-        // true here: whatever type the key held, the RPUSH lands on a key
-        // that no longer exists.
-        let _: () = trx
-            .del(&children_key)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("DEL children list failed: {e}")))?;
-        for child_id in child_ids {
-            let _: () = trx
-                .rpush(&children_key, child_id.to_string())
-                .await
-                .map_err(|e| ServiceError::Internal(format!("RPUSH children failed: {e}")))?;
-        }
-        let _: () = trx
-            .sadd(&children_index_key, &parent_str)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("SADD children index failed: {e}")))?;
+    // The children units are also what make the header HSET's
+    // `chs_complete` marker true: they index every non-empty list they
+    // write, in the same transaction as the marker.
+    for unit in state_units(state, ext_plan) {
+        queue_state_unit(origin, trx, keys, oid_str, ext_index_key, unit).await?;
     }
-
-    // Fields.
-    let fields_index_key = keys.obj_fields_index(oid_str);
-    for field in state.fields.values() {
-        let sid = field.section_id.to_string();
-        let field_key = keys.obj_field(oid_str, &sid, &field.key_name);
-
-        let hash_fields = field_value_hash_fields(
-            &field.value,
-            field.set_order,
-            field.authoring_set_order,
-            field.version,
-        );
-        // b.zvd: clear both value shapes before writing one, exactly as
-        // `execute_mutation`'s `SetField` arm does. Load-bearing on the
-        // restore path, where the row may already exist in the other shape.
-        // Safe to queue only because the pre-`MULTI` type probe above has
-        // proven this key is a hash or absent — an `HDEL` against a
-        // wrong-typed key would raise its `WRONGTYPE` inside the `EXEC`,
-        // where the siblings still commit. See `VALUE_HFIELDS`.
-        let _: () = trx
-            .hdel(&field_key, VALUE_HFIELDS.to_vec())
-            .await
-            .map_err(|e| ServiceError::Internal(format!("HDEL field value shape failed: {e}")))?;
-        let _: () = trx
-            .hset(&field_key, hash_fields)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("HSET field failed: {e}")))?;
-
-        // Sorted set: member = "{section_id}:{hex(key_name)}", score = version.
-        let member = KeySchema::field_member(&sid, &field.key_name);
-        let _: () = trx
-            .zadd(
-                &fields_index_key,
-                None,
-                None,
-                false,
-                false,
-                (field.version as f64, member),
-            )
-            .await
-            .map_err(|e| ServiceError::Internal(format!("ZADD fields index failed: {e}")))?;
-    }
-
-    // Time samples.
-    let ts_index_key = keys.obj_time_samples_index(oid_str);
-    for sample in state.time_samples.values() {
-        let sid = sample.section_id.to_string();
-        let time_f64 = sample.time.into_inner();
-        let ts_key = keys.obj_time_sample(oid_str, &sid, time_f64);
-
-        let hash_fields = time_sample_hash_fields(&sample.value, sample.version);
-        // b.zvd: see the fields loop above — same delete-then-write
-        // ordering, same type-probe precondition.
-        let _: () = trx
-            .hdel(&ts_key, VALUE_HFIELDS.to_vec())
-            .await
-            .map_err(|e| {
-                ServiceError::Internal(format!("HDEL time sample value shape failed: {e}"))
-            })?;
-        let _: () = trx
-            .hset(&ts_key, hash_fields)
-            .await
-            .map_err(|e| ServiceError::Internal(format!("HSET time sample failed: {e}")))?;
-
-        // Sorted set: member = "{section_id}:{hex_f64(time)}", score = version.
-        let member = KeySchema::time_sample_member(&sid, time_f64);
-        let _: () = trx
-            .zadd(
-                &ts_index_key,
-                None,
-                None,
-                false,
-                false,
-                (sample.version as f64, member),
-            )
-            .await
-            .map_err(|e| ServiceError::Internal(format!("ZADD time samples index failed: {e}")))?;
-    }
-
-    // External-value reference index (b.qpf), inside the same MULTI/EXEC as
-    // the field / time-sample rows it describes — `le:{oid}:obj:ext`
-    // carries the `{object_id}` hash tag, so it is in-slot. Rebuilt from
-    // `state` here, which is what lets the restore path inherit the fix
-    // without a checkpoint-format change.
-    // An object write reports no commit size, so its byte and command counts
-    // are discarded.
-    queue_ext_index_writes(
-        origin,
-        trx,
-        ext_index_key,
-        ext_plan,
-        &mut CommitBytes::default(),
-        &mut QueuedTally::default(),
-    )
-    .await?;
 
     Ok(())
 }
@@ -19160,24 +20039,19 @@ async fn execute_mutation<
             section_id,
             key_name,
         } => {
-            let sid = section_id.to_string();
-            let field_key = keys.obj_field(oid_str, &sid, key_name);
-            bytes.add(&field_key);
-            let _: () = trx
-                .del(&field_key)
-                .await
-                .map_err(|e| map_snapshot_load_err(origin, "DEL field", e))?;
-            queued.queued();
-
-            let fields_index_key = keys.obj_fields_index(oid_str);
-            let member = KeySchema::field_member(&sid, key_name);
-            bytes.add(&fields_index_key);
-            bytes.add(&member);
-            let _: () = trx
-                .zrem(&fields_index_key, &member)
-                .await
-                .map_err(|e| map_snapshot_load_err(origin, "ZREM fields index", e))?;
-            queued.queued();
+            queue_value_row_delete(
+                origin,
+                trx,
+                keys,
+                oid_str,
+                ValueRow::Field {
+                    section_id: *section_id,
+                    key_name,
+                },
+                bytes,
+                queued,
+            )
+            .await?;
         }
 
         StorageMutation::SetTimeSample { sample } => {
@@ -19219,9 +20093,127 @@ async fn execute_mutation<
         }
 
         StorageMutation::DeleteTimeSample { section_id, time } => {
+            queue_value_row_delete(
+                origin,
+                trx,
+                keys,
+                oid_str,
+                ValueRow::TimeSample {
+                    section_id: *section_id,
+                    time: time.into_inner(),
+                },
+                bytes,
+                queued,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// One value row of an object, borrowed: what [`queue_value_row_delete`]
+/// removes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ValueRow<'a> {
+    /// A field row `(section, key)`.
+    Field {
+        /// The section.
+        section_id: u64,
+        /// The field key.
+        key_name: &'a str,
+    },
+    /// A time-sample row `(section, time)`.
+    TimeSample {
+        /// The section.
+        section_id: u64,
+        /// The sample's time, bit-exact: a legacy `-0.0` sample's row is
+        /// its own, apart from `0.0`'s.
+        time: f64,
+    },
+    /// A field row named by its `obj:flds` member exactly as an index read
+    /// returned it (accept-loss's value removal,
+    /// `dr_restore::ValueRemovalBatch`).
+    FieldMember(&'a str),
+    /// A time-sample row named by its `obj:tss` member exactly as an index
+    /// read returned it, so a legacy `-0.0` member names its own row.
+    TimeSampleMember(&'a str),
+}
+
+/// One value row of an object, owned, as the restore planner's report names
+/// the rows a value removal deletes (`dr::job::plan::report`'s
+/// `rows_referencing`, a test oracle).
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ValueRowKey {
+    /// A field row `(section, key)`.
+    Field {
+        /// The section.
+        section_id: u64,
+        /// The field key.
+        key_name: String,
+    },
+    /// A time-sample row `(section, time)`, the time as its `f64` bits
+    /// (bit-exact, as the row's key and member encode it).
+    TimeSample {
+        /// The section.
+        section_id: u64,
+        /// The sample's time, as `f64::to_bits`.
+        time_bits: u64,
+    },
+}
+
+/// Queue the delete of one value row into `trx`: the row key's `DEL`, then
+/// its index member's `ZREM` (`obj:flds` for a field, `obj:tss` for a time
+/// sample), adding each command's key and arguments to `bytes` and counting
+/// each on `queued`. The one definition of a value row's delete: the commit
+/// path's `DeleteField` and `DeleteTimeSample` arms ([`execute_mutation`],
+/// two commands each, [`commands_for`]) and accept-loss's value removal
+/// (`dr_restore::ValueRemovalBatch`) both queue through it, so the key and
+/// member encoding cannot drift between them. A row named by its member as
+/// read ([`ValueRow::FieldMember`], [`ValueRow::TimeSampleMember`]) has its
+/// key built from that member and its `ZREM` names that member exactly, so a
+/// member that does not round-trip through the row's decoded form (a legacy
+/// `-0.0` sample's among them) is still the one removed. Idempotent.
+async fn queue_value_row_delete<C>(
+    origin: FredErrOrigin<'_>,
+    trx: &C,
+    keys: &KeySchema,
+    oid_str: &str,
+    row: ValueRow<'_>,
+    bytes: &mut CommitBytes,
+    queued: &mut QueuedTally,
+) -> Result<(), ServiceError>
+where
+    C: KeysInterface + SortedSetsInterface,
+{
+    match row {
+        ValueRow::Field {
+            section_id,
+            key_name,
+        } => {
             let sid = section_id.to_string();
-            let time_f64 = time.into_inner();
-            let ts_key = keys.obj_time_sample(oid_str, &sid, time_f64);
+            let field_key = keys.obj_field(oid_str, &sid, key_name);
+            bytes.add(&field_key);
+            let _: () = trx
+                .del(&field_key)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "DEL field", e))?;
+            queued.queued();
+
+            let fields_index_key = keys.obj_fields_index(oid_str);
+            let member = KeySchema::field_member(&sid, key_name);
+            bytes.add(&fields_index_key);
+            bytes.add(&member);
+            let _: () = trx
+                .zrem(&fields_index_key, &member)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "ZREM fields index", e))?;
+            queued.queued();
+        }
+        ValueRow::TimeSample { section_id, time } => {
+            let sid = section_id.to_string();
+            let ts_key = keys.obj_time_sample(oid_str, &sid, time);
             bytes.add(&ts_key);
             let _: () = trx
                 .del(&ts_key)
@@ -19230,7 +20222,7 @@ async fn execute_mutation<
             queued.queued();
 
             let ts_index_key = keys.obj_time_samples_index(oid_str);
-            let member = KeySchema::time_sample_member(&sid, time_f64);
+            let member = KeySchema::time_sample_member(&sid, time);
             bytes.add(&ts_index_key);
             bytes.add(&member);
             let _: () = trx
@@ -19239,8 +20231,43 @@ async fn execute_mutation<
                 .map_err(|e| map_snapshot_load_err(origin, "ZREM time samples index", e))?;
             queued.queued();
         }
-    }
+        ValueRow::FieldMember(member) => {
+            let field_key = keys.obj_field_from_member(oid_str, member);
+            bytes.add(&field_key);
+            let _: () = trx
+                .del(&field_key)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "DEL field", e))?;
+            queued.queued();
 
+            let fields_index_key = keys.obj_fields_index(oid_str);
+            bytes.add(&fields_index_key);
+            bytes.add(member);
+            let _: () = trx
+                .zrem(&fields_index_key, member)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "ZREM fields index", e))?;
+            queued.queued();
+        }
+        ValueRow::TimeSampleMember(member) => {
+            let ts_key = keys.obj_ts_from_member(oid_str, member);
+            bytes.add(&ts_key);
+            let _: () = trx
+                .del(&ts_key)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "DEL time sample", e))?;
+            queued.queued();
+
+            let ts_index_key = keys.obj_time_samples_index(oid_str);
+            bytes.add(&ts_index_key);
+            bytes.add(member);
+            let _: () = trx
+                .zrem(&ts_index_key, member)
+                .await
+                .map_err(|e| map_snapshot_load_err(origin, "ZREM time samples index", e))?;
+            queued.queued();
+        }
+    }
     Ok(())
 }
 
@@ -19614,9 +20641,58 @@ pub(crate) enum StrandedOverwriteCommit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeleteLayerStep {
     /// The target was deleted, or its mapping was already gone.
-    Done,
+    /// `dead_registered` says whether the retry loop's registration of the
+    /// object on the dead-object set landed (b.g65); when it did not, the
+    /// success exit registers once more.
+    Done { dead_registered: bool },
     /// The mapping names another object: re-enter the block for it.
     Retarget(u64),
+}
+
+/// The operation label of `DeleteLayer`'s unmap in the errors it can answer —
+/// a store write refusal's `UNAVAILABLE` message among them, which clients see
+/// ("unmap layer: the backing store refused a write ...").
+const LAYER_UNMAP_OP: &str = "unmap layer";
+
+/// One `layer_unmap.lua` reply, decoded against the object the delete
+/// resolved ([`decode_layer_unmap_reply`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LayerUnmapReply {
+    /// `UNMAPPED`, `ABSENT`, or `OTHER` naming a different object.
+    Outcome(UnmapOutcome),
+    /// `OTHER` whose stored text parses to the resolved object but is not its
+    /// canonical decimal (`0123`, `+123`): the stored text, which
+    /// [`LayerStore::send_layer_unmap`] sends back once as the expected value.
+    ThisObjectSpelledOtherwise(String),
+}
+
+/// Decode a `layer_unmap.lua` reply for the object whose canonical decimal
+/// is `oid_str`. A reply the script never gives, or an `OTHER` whose stored
+/// value is not a `u64`, is `Internal`.
+fn decode_layer_unmap_reply(
+    reply: &[String],
+    oid_str: &str,
+) -> Result<LayerUnmapReply, ServiceError> {
+    match reply {
+        [word] if word == "UNMAPPED" => Ok(LayerUnmapReply::Outcome(UnmapOutcome::Unmapped)),
+        [word] if word == "ABSENT" => Ok(LayerUnmapReply::Outcome(UnmapOutcome::Absent)),
+        [word, current] if word == "OTHER" => match current.parse::<u64>() {
+            // `parse` accepts spellings the script's exact comparison does
+            // not: never answer `Other(this object)`, whose retarget would
+            // re-enter for the same object without end.
+            Ok(id) if id.to_string() == oid_str => {
+                Ok(LayerUnmapReply::ThisObjectSpelledOtherwise(current.clone()))
+            }
+            Ok(id) => Ok(LayerUnmapReply::Outcome(UnmapOutcome::Other(id))),
+            Err(_) => Err(ServiceError::Internal(format!(
+                "{LAYER_UNMAP_OP}: the layer mapping names {current:?}, which is not an \
+                 object id"
+            ))),
+        },
+        _ => Err(ServiceError::Internal(format!(
+            "{LAYER_UNMAP_OP}: layer_unmap.lua returned an unexpected reply {reply:?}"
+        ))),
+    }
 }
 
 /// How [`LayerStore::run_overwrite_tail`] runs its cleanup body.
@@ -19745,10 +20821,15 @@ impl OverwriteCleanupContext {
     ///
     /// Order, each step only after the one before it:
     ///
+    /// 0. Checkpoint reclamation registration, when enabled (b.vn6; a
+    ///    `ZADD NX`, so a repeat is a no-op), first (b.g65), so every exit
+    ///    below leaves the replaced object registered. The overwrite already
+    ///    unmapped it, and its header's `superseded=1` makes the clean-up's
+    ///    dead-object phase defer it until the header is gone.
     /// 1. Wake-up: when the inline attempt failed, up to
     ///    [`OVERWRITE_WAKE_RETRIES`] more, each after a full-jitter backoff
-    ///    (100 ms doubling to 1 s). If none lands: WARN, and nothing is
-    ///    touched — the fenced, unmapped header stays for the orphan sweep,
+    ///    (100 ms doubling to 1 s). If none lands: WARN, and no key of the
+    ///    object is touched — the fenced, unmapped header stays for the orphan sweep,
     ///    which re-runs this tail. The exception: an attempt the store refused
     ///    because it is out of memory ([`OverwriteWake::OutOfMemory`], WARN)
     ///    ends the retries and the retirement goes on, because deleting keys
@@ -19777,15 +20858,15 @@ impl OverwriteCleanupContext {
     ///    SDD §11.3: the paged reference walk; its own `ext_gc_scheduled`
     ///    guard makes a repeat a no-op), then the reservation shrinks to its
     ///    page.
-    /// 4. Checkpoint reclamation registration, when enabled (b.vn6; a
-    ///    `ZADD NX`, so a repeat is a no-op).
-    /// 5. The stream's expiry ([`pexpire_layer_stream`]): subscribers lagging
+    /// 4. The stream's expiry ([`pexpire_layer_stream`]): subscribers lagging
     ///    between `XREAD` round trips still read the `deleted` entry inside
     ///    the grace. If it fails: WARN, and the keys are kept for the sweep.
-    /// 6. Key deletion in pages ([`cleanup_old_object_retrying`]: the header
+    /// 5. Key deletion in pages ([`cleanup_old_object_retrying`]: the header
     ///    and `obj:ext` first, the indices last), a page that fails
     ///    transiently after the first `UNLINK` retried in place before the
     ///    WARN — once the header is gone no sweep finds the object again.
+    /// 6. If step 0's registration did not land, one more attempt, now that
+    ///    the teardown has freed memory on a full store.
     ///
     /// Every failure is logged at WARN and swallowed: the call that spawned
     /// this has already answered.
@@ -19809,6 +20890,16 @@ impl OverwriteCleanupContext {
         let _ = spawned;
 
         let old_oid_str = old_oid.to_string();
+
+        // b.vn6, b.g65: the replaced object's checkpoint-store obligation,
+        // recorded first, so no exit below (a wake-up that never lands, a
+        // failed size read, a shutdown refusal, a failed expiry or teardown)
+        // can leave it unregistered. Every caller runs this only after the
+        // overwrite's flip landed and the mapping stopped naming `old_oid`,
+        // so the evidence holds here; its header still carries
+        // `superseded=1`, which the clean-up's dead-object phase reads as
+        // `LiveSuperseded` and defers until the header is gone.
+        let dead_registered = self.register_dead(&old_oid_str).await;
 
         let mut retries: u32 = 0;
         while woke == OverwriteWake::Failed && retries < OVERWRITE_WAKE_RETRIES {
@@ -19910,28 +21001,6 @@ impl OverwriteCleanupContext {
         // retirement's page alone from here on.
         reservation.shrink_to_page();
 
-        // b.vn6: the replaced object's checkpoint-store obligation, beside its
-        // ext-GC one. Best-effort with the same posture as
-        // `LayerStore::register_dead_object` (which this cannot reuse — the
-        // body holds no `&LayerStore`): a failure costs the reclamation, never
-        // correctness.
-        if self.register_dead_objects {
-            if let Err(e) = crate::storage::external_values::recon_register(
-                &self.client,
-                &self.keys.checkpoint_reconcile_dead(),
-                std::slice::from_ref(&old_oid_str),
-            )
-            .await
-            {
-                tracing::warn!(
-                    old_object_id = %old_oid_str,
-                    error = %e,
-                    "could not register a superseded object on the checkpoint dead-object ZSET; \
-                     its checkpoint generations will not be reclaimed by the reconciliation pass"
-                );
-            }
-        }
-
         // The stream's expiry BEFORE the keys go: once the header is gone no
         // sweep can find this object again, so a stream left without an expiry
         // then would stay forever.
@@ -19972,7 +21041,47 @@ impl OverwriteCleanupContext {
             );
             return false;
         }
+
+        // The registration's fallback: once more, now that the teardown has
+        // freed memory, if the one at the start did not land (a full store
+        // refusing the write).
+        if !dead_registered {
+            self.register_dead(&old_oid_str).await;
+        }
         true
+    }
+
+    /// Register `old_oid` on `le:ckpt:{recon}:dead` so the checkpoint
+    /// clean-up's dead-object phase reaps its checkpoint generations (b.vn6),
+    /// and return whether the write landed; `false` when registration is off.
+    ///
+    /// Best-effort with the same posture as `LayerStore::register_dead_object`
+    /// (which this cannot reuse — the body holds no `&LayerStore`): a failure
+    /// costs the reclamation, never correctness. A `ZADD NX`, so a repeat is a
+    /// no-op.
+    async fn register_dead(&self, old_oid_str: &str) -> bool {
+        if !self.register_dead_objects {
+            return false;
+        }
+        match crate::storage::external_values::recon_register(
+            &self.client,
+            &self.keys.checkpoint_reconcile_dead(),
+            &[old_oid_str.to_owned()],
+        )
+        .await
+        {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    old_object_id = %old_oid_str,
+                    error = %e,
+                    "could not register a superseded object on the checkpoint dead-object ZSET; \
+                     unless a later attempt lands, its checkpoint generations will not be \
+                     reclaimed by the backup clean-up"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -21583,6 +22692,16 @@ pub(crate) async fn pexpire_layer_stream(
         })?;
     Ok(())
 }
+
+// The restore Job's object writes: the batched writer, its header and
+// clear-flags transactions, and the Job-owned wipe. A child module so it
+// reaches this module's private queueing body (`StateUnit`,
+// `queue_state_unit`, `object_header_pairs`) and its external-value index
+// plan.
+pub(crate) mod dr_restore;
+#[cfg(any(test, feature = "test-support"))]
+pub use dr_restore::planned_restore_transactions_for_test;
+pub use dr_restore::RESTORE_BATCH_ARG_BYTES;
 
 // The fence route guard: every `UpdateLayerRoute` honours the snapshot fence
 // (see the dispatch in `LayerStore::update_layer_once`). A child module so its
@@ -24812,6 +25931,7 @@ mod tests {
                     &state_referencing(a, 1),
                     2_000 + attempt,
                     restore_cursor(),
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("restore attempt {attempt} must succeed: {e}"));
@@ -24944,6 +26064,7 @@ mod tests {
                 &state_referencing(b, RESTORED_SEQ),
                 2_000,
                 restore_cursor(),
+                None,
             )
             .await
             .expect("the restore must succeed");
@@ -25022,6 +26143,124 @@ mod tests {
             .await
             .expect("EXISTS must succeed");
         assert!(b_data, "the restored value's blob must survive");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // The tracked cleanups' abort token (SDD SR-6.2, "Abort token for
+    // trackers")
+    //
+    // `spawn_cleanup` is the one way a tracked cleanup is spawned (the
+    // `CreateLayer` commit finisher, the overwrite cleanups, the torn-commit
+    // retract), so these drive it directly with bodies that stand in for a
+    // long cleanup. Valkey-backed only because a `LayerStore` needs a client.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Bound on each wait in the abort-token tests. Unreachable on the
+    /// healthy path.
+    const CLEANUP_ABORT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// A tracked cleanup still running when the abort token is cancelled — a
+    /// hold's entry — ends at once, mid-body, and one spawned after the
+    /// cancel never starts. The token is shared by every clone of the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_abort_token_ends_a_running_cleanup_and_every_later_one_before_it_starts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tv = crate::storage::test_support::TestValkey::setup().await;
+        let store = LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096);
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        store.spawn_cleanup({
+            let finished = Arc::clone(&finished);
+            async move {
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+        tokio::time::timeout(CLEANUP_ABORT_SETTLE, started_rx)
+            .await
+            .expect("the tracked cleanup must start")
+            .expect("the tracked cleanup signals its start");
+
+        store.clone().cleanup_abort_token().cancel();
+        store.cleanup_tracker.close();
+        tokio::time::timeout(CLEANUP_ABORT_SETTLE, store.cleanup_tracker.wait())
+            .await
+            .expect(
+                "a running tracked cleanup must end when the abort token is cancelled, though its \
+                 body never returns",
+            );
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "it ended mid-body, by the abort"
+        );
+
+        let started_late = Arc::new(AtomicBool::new(false));
+        store.spawn_cleanup({
+            let started_late = Arc::clone(&started_late);
+            async move { started_late.store(true, Ordering::SeqCst) }
+        });
+        tokio::time::timeout(CLEANUP_ABORT_SETTLE, store.cleanup_tracker.wait())
+            .await
+            .expect("a cleanup spawned after the abort ends at once");
+        assert!(
+            !started_late.load(Ordering::SeqCst),
+            "a cleanup spawned after the abort must never start its body"
+        );
+    }
+
+    /// Shutdown keeps its close-and-wait drain: `wait_for_cleanup` lets a
+    /// tracked cleanup run, and cancels nothing — a cleanup outliving the
+    /// drain is still running when it returns — and only
+    /// `abort_cleanup_tasks`, run after it, ends what is left.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drain_lets_cleanups_finish_and_only_the_abort_after_it_ends_the_rest() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tv = crate::storage::test_support::TestValkey::setup().await;
+        let store = LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096);
+
+        let quick_done = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        store.spawn_cleanup({
+            let quick_done = Arc::clone(&quick_done);
+            async move {
+                let _ = release_rx.await;
+                quick_done.store(true, Ordering::SeqCst);
+            }
+        });
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        store.spawn_cleanup(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        tokio::time::timeout(CLEANUP_ABORT_SETTLE, started_rx)
+            .await
+            .expect("the long cleanup must start")
+            .expect("the long cleanup signals its start");
+
+        release_tx.send(()).expect("the quick cleanup is waiting");
+        // The drain's own budget: it runs out on the long cleanup, so this
+        // is how long the test pays, and how long the quick one has.
+        store
+            .wait_for_cleanup(std::time::Duration::from_secs(2))
+            .await;
+        assert!(
+            quick_done.load(Ordering::SeqCst),
+            "the drain lets a tracked cleanup finish"
+        );
+        assert!(
+            !store.cleanup_abort_token().is_cancelled() && !store.cleanup_tracker.is_empty(),
+            "the drain cancels nothing: the long cleanup outlives it"
+        );
+
+        store.abort_cleanup_tasks();
+        assert!(store.cleanup_abort_token().is_cancelled());
+        tokio::time::timeout(CLEANUP_ABORT_SETTLE, store.cleanup_tracker.wait())
+            .await
+            .expect("the abort after the drain ends the cleanup that outlived it");
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -25592,8 +26831,8 @@ mod tests {
     /// OVER-release guard rather than a
     /// tidiness one. The deferral arm returns `Err`; `delete_layer`'s cascade
     /// can re-run the whole retirement on an INDEPENDENT transient in a later
-    /// step (`retry_aborted_with_jitter` re-drives step 5 or step 6, which
-    /// re-enters step 4), and the orphan sweep revisits any object whose header
+    /// step (`retry_aborted_with_jitter` re-runs the body after a failed step
+    /// 5, which re-enters step 4), and the orphan sweep revisits any object whose header
     /// survived its teardown. A re-run re-derives the same members from the
     /// surviving rows and `obj:ext` and — with the `{gc}` slot recovered by then,
     /// which is exactly what the second store here models — enqueues them for

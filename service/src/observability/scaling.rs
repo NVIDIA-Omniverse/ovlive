@@ -156,6 +156,13 @@ pub struct ServiceScalingSource {
     /// Process CPU seconds; production passes
     /// [`crate::observability::process_cpu::cpu_seconds_total`].
     pub cpu_seconds: fn() -> Option<f64>,
+    /// Whether this replica is held for disaster recovery (SDD SR-7a), read
+    /// at each snapshot. Production passes a receiver of the hold reactor's
+    /// `held` signal (`grpc::hold::HoldReactorSettings::held`): `true` from
+    /// hold entry until the latest verdict is `Serving` again. A held replica
+    /// stays ready (readiness is `SERVING` while held), so the scaler sees
+    /// it, and freezes the replica count while any pod reports it.
+    pub held: tokio::sync::watch::Receiver<bool>,
 }
 
 impl ServiceScalingSource {
@@ -187,6 +194,7 @@ impl ScalingSnapshotSource for ServiceScalingSource {
             cpu_seconds_total: (self.cpu_seconds)(),
             catchup_read_concurrency: self.catchup_read_concurrency,
             max_concurrent_catchups: self.max_concurrent_catchups,
+            held: *self.held.borrow(),
         }
     }
 }

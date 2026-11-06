@@ -35,7 +35,7 @@ Stream endings are in {ref}`How streams end <live-edit-api-streams-endings>`, an
 | `ABORTED` | Only a chained `UpdateLayer` whose predecessor has not committed ({ref}`Chained writes <live-edit-api-writing-layers-chained>`) | No | Recover the chain |
 | `CANCELLED` | An upload's stream ended before you finished sending, or one of its chunks was over 4 MB or undecodable | No; {ref}`unknown <live-edit-api-errors-unknown-outcome>` if you had finished sending | Re-send, re-chunking first if a chunk was over 4 MB, since the same chunks fail again |
 | `DEADLINE_EXCEEDED` | The call ran past its deadline | Unknown for an upload; no if it was still sending | Re-send an upload with the same `operation_id`. A large upload or a structural edit to a very large layer fails again: change the request ({ref}`Sending an upload <live-edit-api-writing-layers-uploads>`) |
-| `UNAVAILABLE` | A transient condition: shutdown, capacity, or an unavailable dependency | No with a {ref}`retry hint <live-edit-api-errors-retry-hints>`; otherwise possibly | Retry with your own backoff, waiting at least any `retry_delay`; for uploads, see {ref}`unknown outcomes <live-edit-api-errors-unknown-outcome>` |
+| `UNAVAILABLE` | A transient condition: shutdown, capacity, an unavailable dependency, or disaster recovery | No with a {ref}`retry hint <live-edit-api-errors-retry-hints>`; otherwise possibly | Retry with your own backoff, waiting at least any `retry_delay`; for uploads, see {ref}`unknown outcomes <live-edit-api-errors-unknown-outcome>` |
 | `RESOURCE_EXHAUSTED` | Never returned by the service itself: an HTTP/2 layer closed the connection | Unknown for uploads in flight | See {ref}`Transport errors <live-edit-api-errors-transport>` |
 | `OUT_OF_RANGE` | A single gRPC message exceeded 4 MB | No | Send content in smaller chunks |
 | `INTERNAL` | A server fault; the service's own `INTERNAL` carries only the message `internal error` | Not guaranteed | Do not retry the request unchanged; report it to the operator. A `CreateLayer` that replaces a layer may still take effect later: read the layer before acting on the assumption that it did not. One case has its own action: every update to one layer failing while other layers accept updates means that layer is used up: replace it ({ref}`Delta content <live-edit-api-validation-delta>`) |
@@ -44,8 +44,10 @@ Some answers need care:
 
 - **`CreateSession` after `UNAVAILABLE`.** A retry can answer `ALREADY_EXISTS` because the failed attempt still holds the name.
   Call `ListSessions` for the base path: it returns the session if the attempt completed, and otherwise frees the name for the next create.
+  While the service's storage refuses writes, `ListSessions` cannot free the name; keep retrying with your own backoff, and call `ListSessions` again once `CreateSession` stops answering `UNAVAILABLE`.
 - **`DeleteLayer` after `UNAVAILABLE` or `DEADLINE_EXCEEDED`.** The failed attempt may already have deleted the layer, so a retry answering `NOT_FOUND` means it is gone.
   The layer's subscriptions then end `NOT_FOUND` once the service finishes the delete, usually within minutes.
+  A retry is a new delete: if another client created a layer of that name in the meantime, the retry deletes that layer.
   A delete of any layer can wait behind other deletes and replacements on a busy server and reach the deadline having changed nothing; retry it.
 - **`DeleteSession` after `UNAVAILABLE` or `DEADLINE_EXCEEDED`.** The failed attempt may already have deleted some of the session's layers.
   Re-send it: the retry resumes the deletion where it stopped, and `NOT_FOUND` on the re-send means the session is gone.
@@ -71,12 +73,13 @@ Every row is an `UNAVAILABLE`, and "retry" means after at least `retry_delay`, k
 | `READER_CAPACITY` | A subscribe could not start its live feed in time on a busy replica | No | Retry |
 | `CATCHUP_CAPACITY`, metadata `wait` (sometimes absent) | A subscribe could not start its catch-up in time on a busy replica | No | Retry |
 | `UPLOAD_CAPACITY`, metadata `cause` | The replica's upload capacity is full | No | Retry |
-| `STORE_WRITE_REFUSED`, metadata `condition` | The service could not store data the call needed, for example because its storage is full | No | Retry; report it to the operator if it persists, since full storage may not clear by itself |
+| `STORE_WRITE_REFUSED`, metadata `condition` | The service's storage refused a write the call needed, for example because it is full | No | Retry; report it to the operator if it persists, since full storage may not clear by itself |
 | `SNAPSHOT_FENCE_TIMEOUT` | An `UpdateLayer` waited its limit while the layer was briefly closed to writes | No | Retry |
 | `EXT_RELEASE_BUDGET_FULL` | An upload with external values waited its deadline out because the service had no room for more external values yet | No | Retry |
 | `CLIENT_KEEPALIVE_TIMEOUT` | A `JoinSession` sent no data for three keepalive intervals | No | Rejoin, and send keepalives from the network thread ({ref}`Keepalives <live-edit-api-streams-keepalives>`) |
 | `CHAIN_CHECK_UNAVAILABLE` | A chained `UpdateLayer` could not read its chain's state | No | Retry |
-| `UPSTREAM_UNAVAILABLE` | A service an upload depends on was unavailable before its commit | No | Retry |
+| `UPSTREAM_UNAVAILABLE` | Something an upload depends on was unavailable or moving its data; or the replica lost contact with the service's storage, so it refused a call or ended a stream | No | Retry |
+| `SERVICE_HELD` | The service is offline for disaster recovery: every replica refuses every call and ends every stream until it returns. The message names the incident | No | Retry; `retry_delay` is at least 30 seconds |
 
 The other reasons carry no metadata.
 Metadata values name the exact limit or condition that was hit; they are diagnostic only: log them, and never branch on them.
@@ -88,7 +91,7 @@ Use a hint as follows:
 - **An unknown `reason` on `UNAVAILABLE` means "retry after that wait".** New reasons may be added.
 - **On `CreateLayer` and `UpdateLayer`, a hint means this call applied nothing.**
   A re-send is safe unless an earlier attempt of the same write is still in doubt; then re-send with that attempt's `operation_id`.
-  On other calls it means only "retry after that wait".
+  On other calls it means only "retry after that wait", except `SERVICE_HELD` and `UPSTREAM_UNAVAILABLE`: a call refused with either applied nothing.
 - **Recognise a hint by its domain and `reason`, never by the message text.**
   The only messages a client matches are the hint-less refusal in rule 5 of {ref}`Safe re-sends <live-edit-api-writing-layers-operation-id>` and the `session is missing` stream ending ({ref}`How streams end <live-edit-api-streams-endings>`).
 - **These rules cover `UNAVAILABLE` only.** The two chained-write refusals and the two {ref}`size refusals <live-edit-api-validation-too-large>` carry an `ErrorInfo` on other codes, with no `RetryInfo`, and mean what their own rows state.
@@ -96,7 +99,7 @@ Use a hint as follows:
 (live-edit-api-errors-unknown-outcome)=
 ## When an upload's outcome is unknown
 
-Every `UNAVAILABLE` the service gives a `CreateLayer` or `UpdateLayer` before its commit starts carries a hint, so a plain one may have applied.
+Every `UNAVAILABLE` on a `CreateLayer` or `UpdateLayer` that the service knows applied nothing carries a hint, so a plain one may have applied.
 Treat these answers as outcome unknown, and re-send with the same `operation_id`:
 
 - a plain `UNAVAILABLE`, including `UpdateLayer outcome unknown: …` after the service's own retries;
@@ -148,7 +151,11 @@ Presence during a long move is in {ref}`Joining a session <live-edit-api-streams
 The service's handlers never return `RESOURCE_EXHAUSTED`.
 When every stream on a connection fails with it at once, an HTTP/2 layer closed the connection with GOAWAY `ENHANCE_YOUR_CALM`.
 On h2 0.4.16 to 0.4.18 that is usually your own library ({ref}`Client requirements <live-edit-api-overview-client-requirements>`).
-On a direct connection, the service does the same when about 2,000 small messages you sent sit unread, or after more than 100 empty, non-final DATA frames.
+The service closes a direct connection past 100 empty, non-final DATA frames or 135,000 unread small messages (by default; deployments can set it as low as 4,000).
+It also closes one after refusing 10,240 malformed requests or late request data on it over its life; a connection kept open for days, on which the service ended many calls early, can reach this in normal use.
+It also closes one when you cancel more than 20 calls at once just after starting them.
+In each case, reconnect and retry, re-sending an upload that was in flight with the same `operation_id`.
+If the close recurs soon after connecting, check your HTTP/2 library for malformed requests.
 In a Rust client, the `h2::Error` in the status's source chain says which side: `is_library()` for your own library, `is_remote()` for the service or a proxy.
 
 (live-edit-api-errors-references)=

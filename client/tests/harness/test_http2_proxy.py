@@ -33,6 +33,12 @@ def reader(data):
     return stream
 
 
+def rejected(stream):
+    """The CONTINUATION that ends a rejected header block: the rejection field as an HPACK literal without indexing."""
+    field = h2.INGRESS_REJECTED.encode()
+    return h2.Frame(9, 4, stream, b'\x00' + bytes([len(field)]) + field + b'\x011').encode()
+
+
 class Http2ProxyTests(unittest.IsolatedAsyncioTestCase):
     async def test_literal_control_frames_and_validation(self):
         self.assertEqual(h2.reset(3).encode(), bytes.fromhex('00000403000000000300000008'))
@@ -85,6 +91,37 @@ class Http2ProxyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AssertionError):
             await proxy.reset_active()
 
+    async def test_stream_age_limit_ends_exactly_the_aged_streams_and_keeps_the_connection(self):
+        proxy = h2.Http2Proxy('unused:1', max_stream_age_ms=100, record_frames=False)
+        client, server = Writer(), Writer()
+        connection = h2.Connection(1, proxy.target, None, client)
+        connection.server = server
+        proxy.connections.append(connection)
+        # Stream 1 opens at clock 0, stream 3 at clock 60; stream 1 half-closes its request and stays active.
+        await proxy.pump(connection, reader(bytes.fromhex('000000010400000001000000000100000001')), server, False)
+        self.assertEqual(await proxy.advance_stream_clock(60), [])
+        await proxy.pump(connection, reader(bytes.fromhex('000000010400000003')), server, False)
+        self.assertEqual((connection.active, connection.opened), ({1, 3}, {1: 0, 3: 60}))
+        client.bytes.clear(), server.bytes.clear()
+        # Stream 1 reaches the limit at clock 100; stream 3, 40 ms old, stays.
+        ended = await proxy.advance_stream_clock(40)
+        self.assertEqual(ended, [dict(action='stream-age', connection=1, stream=1, code=8, age_ms=100)])
+        self.assertEqual(bytes(client.bytes), bytes.fromhex('00000403000000000100000008'))
+        self.assertEqual(bytes(server.bytes), bytes.fromhex('00000403000000000100000008'))
+        self.assertEqual((connection.active, connection.opened, connection.closed), ({3}, {3: 60}, False))
+        self.assertEqual(await proxy.advance_stream_clock(59), [])
+        self.assertEqual([e['stream'] for e in await proxy.advance_stream_clock(1)], [3])
+        # Only injected actions are evidence when forwarded frames are not recorded.
+        self.assertEqual([e['action'] for e in proxy.events], ['stream-age', 'stream-age'])
+        self.assertEqual(proxy.snapshot()['stream_clock_ms'], 160)
+        for options in (dict(max_stream_age_ms=0), dict(max_stream_age_ms=True)):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                h2.Http2Proxy('unused:1', **options)
+        with self.assertRaises(ValueError):
+            await h2.Http2Proxy('unused:1').advance_stream_clock(1)
+        with self.assertRaises(ValueError):
+            await proxy.advance_stream_clock(-1)
+
     async def test_pump_tracks_half_closed_requests_and_terminal_responses(self):
         proxy = h2.Http2Proxy('unused:1')
         client, server = Writer(), Writer()
@@ -108,8 +145,9 @@ class Http2ProxyTests(unittest.IsolatedAsyncioTestCase):
         proxy.reject_new_streams('envoy')
         headers, data = h2.Frame(1, 4, 1, b'\x82'), h2.Frame(0, 1, 1, b'x' * 5)
         await proxy.pump(connection, reader(headers.encode() + data.encode()), server, False)
-        # The header block still reaches the backend's HPACK decoder, then the stream is cancelled.
-        self.assertEqual(bytes(server.bytes), headers.encode() + h2.reset(1, 8).encode())
+        # The header block still reaches the backend's HPACK decoder, ended by the rejection field, then the
+        # stream is cancelled.
+        self.assertEqual(bytes(server.bytes), h2.Frame(1, 0, 1, b'\x82').encode() + rejected(1) + h2.reset(1, 8).encode())
         self.assertEqual(bytes(client.bytes), h2.Frame(1, 5, 1, h2.INGRESS_RESPONSES['envoy']).encode() +
                          h2.Frame(8, 0, 0, struct.pack('>I', 5)).encode())
         self.assertEqual(connection.active, set())
@@ -158,7 +196,8 @@ class Http2ProxyTests(unittest.IsolatedAsyncioTestCase):
         proxy.reject_new_streams('envoy')
         headers, continuation = h2.Frame(1, 0, 1, b'\x82'), h2.Frame(9, 4, 1, b'\x86')
         await proxy.pump(connection, reader(headers.encode() + continuation.encode()), server, False)
-        self.assertEqual(bytes(server.bytes), headers.encode() + continuation.encode() + h2.reset(1, 8).encode())
+        self.assertEqual(bytes(server.bytes), headers.encode() + h2.Frame(9, 0, 1, b'\x86').encode() + rejected(1) +
+                         h2.reset(1, 8).encode())
         self.assertEqual(bytes(client.bytes), h2.Frame(1, 5, 1, h2.INGRESS_RESPONSES['envoy']).encode())
         self.assertEqual([e['action'] for e in proxy.events], ['ingress-reject'])
 
@@ -170,8 +209,9 @@ class Http2ProxyTests(unittest.IsolatedAsyncioTestCase):
         proxy.reject_new_streams('http401', 2)
         streams = [h2.Frame(1, 4, stream, b'\x82') for stream in (1, 3, 5)]
         await proxy.pump(connection, reader(b''.join(f.encode() for f in streams)), server, False)
-        self.assertEqual(bytes(server.bytes), streams[0].encode() + h2.reset(1, 8).encode() +
-                         streams[1].encode() + h2.reset(3, 8).encode() + streams[2].encode())
+        self.assertEqual(bytes(server.bytes), h2.Frame(1, 0, 1, b'\x82').encode() + rejected(1) + h2.reset(1, 8).encode() +
+                         h2.Frame(1, 0, 3, b'\x82').encode() + rejected(3) + h2.reset(3, 8).encode() +
+                         streams[2].encode())
         self.assertEqual(bytes(client.bytes), b''.join(h2.Frame(1, 5, stream, h2.INGRESS_RESPONSES['http401']).encode()
                                                        for stream in (1, 3)))
         self.assertEqual((proxy.ingress, proxy.rejected, connection.active),

@@ -36,13 +36,24 @@
 //! | Isolation | an overwrite's new object gets a flight of its own; a delete under the read fails every waiter `NotFound`; a restore under the read is retried and every waiter is handed the restored cut to check against its own pin |
 //! | Failure | a failed read leaves the map at once and is never reused; a panicking read stage fails its waiters `Internal`, fires `done` and leaves the registry usable |
 //! | Cancellation (SR-7.4) | one waiter or every waiter cancelled in the predecessor wait, the slot wait, the fenced-permit wait, the memory wait, a `RETRY_AFTER` sleep and the read: slots, permits and the budget back in full, no flight left, no live lease after the lease |
+//! | Lease lever (test-only) | a held read whose lease the test lengthened, renewals stalled, outlives a production lease on the store's clock and verifies on its first attempt, its flight's size and grant production-sized |
 //!
-//! The arms that hold a read open with the fan-out's delay seam (to join it,
+//! The arms that hold a read open with the fan-out's seams (to join it,
 //! break it, check it is not charged, or delete, overwrite or restore its
 //! object under it), or fail it, and the two-waiter drop-order arm that
 //! parks a leave with the flights' leave seam, sit in the inner
 //! `#[cfg(feature = "test-fault-injection")] mod seams`, compiled out without
-//! that feature. Where a test must stop a flight at an
+//! that feature; so does the cancelled-during-the-read arm of the
+//! cancellation tests. An arm whose step must land while the read is held
+//! parks the read's first fenced command on the seam's hold until that step
+//! has happened, and lengthens the read's lease
+//! (`lengthen_fence_leases`, at least twice the client's command timeout) so
+//! a renewal starved by a loaded runner cannot end the held attempt; what the
+//! flight derives from its size stays production-sized (its size and grant
+//! are pinned so by `mod seams`' lease test, and its wait cap is sized from
+//! `snapshot_fence::coefficients`, which the lever does not touch).
+//!
+//! Where a test must stop a flight at an
 //! exact step — just after its release was sent, or as a predecessor's `done`
 //! fires — it polls the waiter's future by hand (a no-op waker, or a waker
 //! that records the capacity held when it is woken). A stop between two store
@@ -62,11 +73,16 @@
 //! Nothing here asserts how long anything took. A few tests need real time to
 //! pass: `reader_wait_max(L)` at these layers is ~27 s (W_wave dominates it),
 //! so the reader-cap test (~31 s) and the long-chain two-wave test (~29 s)
-//! each take about that long, and the fence-sleep tests sleep a staged
-//! writers' gap of a few seconds. Every other test takes well under a second
-//! or, holding a read open with the delay seam, a few seconds. A wait that
-//! must *not* end is checked over [`QUIET`] (300 ms), which can only miss a
-//! defect, never fail a correct build.
+//! each take about that long, the fence-sleep tests sleep a staged writers'
+//! gap of a few seconds, the uncharged-read test and the hand-polled put-back
+//! test (`flight_reopened_by_a_broken_read_goes_back_open_…`) each hold their
+//! read open for [`HOLD`] (2 s) with the delay seam, and the lengthened-lease
+//! test waits, on the store's clock, for a production lease (~2.0 s at this
+//! ceiling) to pass. Every other test takes well under a second: a held read
+//! is released as soon as the test's step under it has happened. A wait that
+//! must *not* end is checked
+//! over [`QUIET`] (300 ms), which can only miss a defect, never fail a
+//! correct build.
 //!
 //! # Hang budget
 //!
@@ -127,6 +143,8 @@ use crate::common::owned_delta::delta_with_set_field_inline;
 use crate::storage::snapshot_read_atomic_test::{
     commit, create, create_session, every_shape_state, layer_store, SIBLING,
 };
+#[cfg(feature = "test-fault-injection")]
+use crate::storage::snapshot_read_support::{lengthened_lease, HeldCommand};
 use crate::storage::snapshot_read_support::{on_current_thread, read_too_large};
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -150,7 +168,10 @@ const CAP_READ_BUDGET: Duration = Duration::from_secs(60);
 /// settling. Unreachable on a healthy run.
 const SIGNAL_BUDGET: Duration = Duration::from_secs(10);
 
-/// Bound on a lease nobody releases lapsing: one lease (~2.2 s) plus slack.
+/// Bound on a lease nobody releases lapsing: one lease plus slack — a
+/// production lease (~2.0 s at this ceiling) or a lengthened one (`lengthen_fence_leases`,
+/// at least twice the command timeout; the arms that set it assert that it
+/// stays below this).
 const LAPSE_BUDGET: Duration = Duration::from_secs(15);
 
 /// The one deadline over a whole test. See the module's hang budget.
@@ -163,7 +184,10 @@ const QUIET: Duration = Duration::from_millis(300);
 const ROOMY: Duration = Duration::from_secs(60);
 
 /// How long the fan-out's delay seam holds a read open between grant and
-/// release (renewals keep the ~2.2 s lease live through it).
+/// release where only the time spent matters, never a step inside it: the
+/// uncharged-read test's spend past its waiter's budget, and the hand-polled
+/// put-back test's held pass, whose seq move breaks the attempt whether or
+/// not the lease lapses first.
 #[cfg(feature = "test-fault-injection")]
 const HOLD: Duration = Duration::from_secs(2);
 
@@ -810,6 +834,85 @@ async fn build_all(reads: Vec<FlightRead>, what: &str) {
 /// flight's waiters count their work against.
 fn reader_wait_max(client: &ValkeyClient, size: LayerSize) -> Duration {
     CappedFenceWait::new(client, 0, SnapshotReadConsumer::Catchup).cap(size)
+}
+
+/// The first command of the fixture flight's next fenced fan-out. Not
+/// `next_read`, which a `DeleteLayer` or overwrite cleanup started while the
+/// flight reads would also match: its retirement size read consults the seam
+/// as a lone first command (b.fsz MR-D4), and a hold taken there would let the
+/// flight's read run unheld past the retirement the test stages under it.
+#[cfg(feature = "test-fault-injection")]
+fn first_fenced_command() -> live_edit::storage::diff_read::ObjectSnapshotReadFaultTarget {
+    live_edit::storage::diff_read::ObjectSnapshotReadFaultTarget::nth_command(
+        live_edit::storage::diff_read::ObjectSnapshotReader::FencedFanout,
+        0,
+    )
+}
+
+/// Hold the fixture flight's next read open after its grant, on its first
+/// fenced command ([`first_fenced_command`]), until the test releases it (or
+/// drops the guard), on an injector that lengthens the read's lease
+/// (`lengthen_fence_leases`): a renewal starved by a loaded runner cannot end
+/// the held attempt, while the flight's size, grant and wait cap stay
+/// production-sized. Asserts [`LAPSE_BUDGET`] outlasts that lease, so a
+/// held read that is never released still lapses inside the budget.
+#[cfg(feature = "test-fault-injection")]
+fn hold_next_read(fx: &Fx) -> HeldCommand {
+    let [hold] = holds_on(&lengthened_injector(fx));
+    hold
+}
+
+/// [`hold_next_read`] for the next `N` fenced reads (or attempts) of the
+/// fixture flight, one hold each, in order, on one injector.
+#[cfg(feature = "test-fault-injection")]
+fn hold_next_reads<const N: usize>(fx: &Fx) -> [HeldCommand; N] {
+    holds_on(&lengthened_injector(fx))
+}
+
+/// A fresh injector on the fixture's client that lengthens every fenced
+/// read's lease from now on, after asserting [`LAPSE_BUDGET`] outlasts such a
+/// lease at the fixture's size.
+#[cfg(feature = "test-fault-injection")]
+fn lengthened_injector(
+    fx: &Fx,
+) -> Arc<live_edit::storage::diff_read::ObjectSnapshotReadFaultInjector> {
+    let lengthened = lengthened_lease(&fx.client, fx.estimate);
+    assert!(
+        LAPSE_BUDGET > lengthened,
+        "fixture: LAPSE_BUDGET ({LAPSE_BUDGET:?}) must outlast a lengthened lease \
+         ({lengthened:?})"
+    );
+    let seam = fx.injector();
+    seam.lengthen_fence_leases(true);
+    seam
+}
+
+/// `N` holds queued on `seam`, each on the first command of the next fenced
+/// fan-out ([`first_fenced_command`]).
+#[cfg(feature = "test-fault-injection")]
+fn holds_on<const N: usize>(
+    seam: &live_edit::storage::diff_read::ObjectSnapshotReadFaultInjector,
+) -> [HeldCommand; N] {
+    std::array::from_fn(|_| HeldCommand::new(seam.push_hold_at(first_fenced_command())))
+}
+
+/// Wait until the read `hold` holds is parked on it, its flight `Reading`,
+/// and assert its lease is the lengthened one: the fixture's injector is
+/// still the one the lever was set on.
+#[cfg(feature = "test-fault-injection")]
+async fn reading_held(fx: &Fx, hold: &HeldCommand, what: &str) {
+    hold.parked_within(READ_BUDGET, what).await;
+    until(what, || {
+        fx.registered() == Some((true, FlightState::Reading))
+    })
+    .await;
+    live_edit::storage::test_support::assert_fence_lease_lengthened(
+        fx.tv.client(),
+        fx.keys(),
+        fx.oid,
+        &fx.client,
+    )
+    .await;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2037,8 +2140,9 @@ enum At {
     /// In a `RETRY_AFTER` sleep (a writers' gap staged), holding only its
     /// slot.
     RetrySleep,
-    /// Reading between grant and release (the fan-out held by the delay
-    /// seam), holding a lease, its slot, permit and grant.
+    /// Reading between grant and release (its first fenced command held on
+    /// the seam until the cancellation), holding a lease, its slot, permit
+    /// and grant.
     #[cfg_attr(not(feature = "test-fault-injection"), allow(dead_code))]
     Reading,
 }
@@ -2139,6 +2243,10 @@ async fn cancelled_at(at: At, every_waiter: bool) {
     // What the flight will wait at.
     let blocker = block_at(&fx, at).await;
     let mut predecessor = None;
+    // `At::Reading`'s read, held on its first fenced command until the
+    // cancellation has happened.
+    #[cfg(feature = "test-fault-injection")]
+    let mut held_read = None;
     match at {
         At::Predecessor => {
             let read = served(spawn_read(fx.attach(), ROOMY), "the predecessor").await;
@@ -2150,10 +2258,9 @@ async fn cancelled_at(at: At, every_waiter: bool) {
         }
         At::Reading => {
             #[cfg(feature = "test-fault-injection")]
-            fx.injector().push_delay_at(
-                live_edit::storage::diff_read::ObjectSnapshotReadFaultTarget::next_read(),
-                HOLD,
-            );
+            {
+                held_read = Some(hold_next_read(&fx));
+            }
         }
         At::SlotWait | At::PermitWait | At::MemoryWait => {}
     }
@@ -2185,10 +2292,8 @@ async fn cancelled_at(at: At, every_waiter: bool) {
             .await
         }
         At::Reading => {
-            until(&what, || {
-                fx.registered() == Some((true, FlightState::Reading))
-            })
-            .await
+            #[cfg(feature = "test-fault-injection")]
+            reading_held(&fx, held_read.as_ref().expect("armed above"), &what).await;
         }
     }
 
@@ -2199,6 +2304,10 @@ async fn cancelled_at(at: At, every_waiter: bool) {
     } else {
         Some(t2)
     };
+    // The held read's step is done: let it go (a no-op once every waiter
+    // has left, the read dropped with them).
+    #[cfg(feature = "test-fault-injection")]
+    drop(held_read);
     if every_waiter {
         if at != At::Predecessor {
             until(&format!("{what}: the flight left the map"), || {
@@ -2335,30 +2444,8 @@ mod seams {
     use super::*;
 
     use fred::error::{Error as FredError, ErrorKind as FredErrorKind};
-    use live_edit::storage::diff_read::{ObjectSnapshotReadFaultTarget, ObjectSnapshotReader};
 
     use crate::storage::snapshot_read_atomic_test::mock_ext_store;
-
-    /// Hold the fixture flight's next read open for [`HOLD`] after its grant:
-    /// a delay on the first command of the next fenced fan-out, which only
-    /// the flight's read issues. Not `next_read`, which a `DeleteLayer` or
-    /// overwrite cleanup started while the flight reads would also match: its
-    /// retirement size read consults the seam as a lone first command (b.fsz
-    /// MR-D4), and taking the delay there would let the flight's read run
-    /// unheld past the retirement the test stages under it.
-    fn hold_next_read(fx: &Fx) {
-        fx.injector().push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-            HOLD,
-        );
-    }
-
-    async fn until_reading(fx: &Fx, what: &str) {
-        until(what, || {
-            fx.registered() == Some((true, FlightState::Reading))
-        })
-        .await;
-    }
 
     /// Regression (post-completion review F4 (i)): two waiters of one flight
     /// cancelled together — as a session deletion or a replica drain ends
@@ -2462,9 +2549,9 @@ mod seams {
     async fn flight_waiter_arriving_between_grant_and_release_joins_and_the_wave_costs_one_epoch() {
         within_test_budget(async {
             let fx = Fx::new("sf-join-reading", Shape::DEFAULT).await;
-            hold_next_read(&fx);
+            let hold = hold_next_read(&fx);
             let first = spawn_read(fx.attach(), ROOMY);
-            until_reading(&fx, "the read holds its lease").await;
+            reading_held(&fx, &hold, "the read holds its lease").await;
 
             let pin = fx.seq().await;
             let late = fx.attach();
@@ -2474,6 +2561,7 @@ mod seams {
                 "a waiter arriving while the flight reads under its fence joins it"
             );
             let late = spawn_read(late, ROOMY);
+            hold.release();
             let (r1, r2) = (served(first, "first").await, served(late, "late").await);
 
             assert_eq!(
@@ -2497,30 +2585,32 @@ mod seams {
     }
 
     /// A `BROKEN` read (the header moved under the pass) is retried in the
-    /// same flight, which reopens — `Queued`, attachable — for the retry: a
-    /// waiter arriving after the broken attempt joins it, and both are served
-    /// the retry's snapshot at the new `seq`.
+    /// same flight, which reopens — `Queued`, attachable — for the retry and
+    /// stays attachable while the retry reads: a waiter arriving after the
+    /// broken attempt, while the retry reads, joins the reopened flight, and
+    /// both are served the retry's snapshot at the new `seq`.
+    ///
+    /// Both attempts are held on their first fenced command: the first until
+    /// the header has moved under it, the retry until the late waiter has
+    /// attached. A flight that did not reopen stays closed through its
+    /// retry, so the late waiter would lead a flight of its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flight_broken_read_reopens_its_flight_and_retries_it_for_every_waiter() {
         within_test_budget(async {
             let fx = Fx::new("sf-broken", Shape::DEFAULT).await;
-            // Hold the first attempt's pass, and the retry's, open: command 0
-            // of each attempt.
-            let target =
-                ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0);
-            fx.injector()
-                .push_delay_at(target, HOLD)
-                .push_delay_at(target, HOLD);
+            let [first_attempt, retry] = hold_next_reads(&fx);
             let first = spawn_read(fx.attach(), ROOMY);
-            until_reading(&fx, "the first attempt holds its lease").await;
+            reading_held(&fx, &first_attempt, "the first attempt holds its lease").await;
             fx.set_seq(fx.seq().await + 1).await;
             let moved = fx.seq().await;
+            first_attempt.release();
 
             until("the broken attempt ends and the flight reopens", || {
                 fx.reads("fence_broken") == 1
                     && fx.registered().is_some_and(|(attachable, _)| attachable)
             })
             .await;
+            reading_held(&fx, &retry, "the retry holds its lease").await;
             let late = fx.attach();
             assert_eq!(
                 late.role(),
@@ -2528,6 +2618,7 @@ mod seams {
                 "a broken read reopens its flight for the retry"
             );
             let late = spawn_read(late, ROOMY);
+            retry.release();
             let (r1, r2) = (served(first, "first").await, served(late, "late").await);
 
             assert_eq!(
@@ -2598,17 +2689,30 @@ mod seams {
     /// Overwrite during a fenced flight: the layer's new object (a new
     /// `object_id`) gets a flight of its own — a catch-up of it never joins
     /// the old object's — and is served its own state at or past its pin.
-    /// The old flight's waiter gets the old object's state, or `NotFound` if
-    /// the overwrite's cleanup took it first; never the new object's.
+    /// The old flight's waiter is served the old object's state, never the
+    /// new object's.
+    ///
+    /// Both orders are fixed: the old read is held until the overwrite and
+    /// the newcomer's attach have landed, and the overwrite's spawned
+    /// clean-up of the old object is parked on its hold gate
+    /// (`with_overwrite_cleanup_gate_for_test`) until the old waiter has been
+    /// served, so the old object's keys are all there when its read resumes,
+    /// and that waiter is served (never `NotFound`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flight_of_an_overwritten_layer_is_not_joined_by_a_catch_up_of_its_new_object() {
         within_test_budget(async {
             let fx = Fx::new("sf-overwrite", Shape::DEFAULT).await;
-            hold_next_read(&fx);
+            let cleanup_gate = Arc::new(tokio::sync::Barrier::new(2));
+            let overwriter = fx
+                .ls
+                .clone()
+                .with_overwrite_cleanup_gate_for_test(Arc::clone(&cleanup_gate));
+            let hold = hold_next_read(&fx);
             let old = spawn_read(fx.attach(), ROOMY);
-            until_reading(&fx, "the old object's read").await;
+            reading_held(&fx, &hold, "the old object's read").await;
 
-            let new_oid = create(&fx.ls, &fx.session_id, &fx.layer, &every_shape_state()).await;
+            let new_oid =
+                create(&overwriter, &fx.session_id, &fx.layer, &every_shape_state()).await;
             assert_ne!(new_oid, fx.oid, "fixture: the overwrite made a new object");
             let new_estimate = estimate_of(&fx.client, fx.keys(), new_oid).await;
             let pin = fx.seq_of(new_oid).await;
@@ -2619,6 +2723,15 @@ mod seams {
                 "the new object has a flight of its own"
             );
             assert_eq!(fx.flights.len(), 2);
+            assert_eq!(
+                fx.registered(),
+                Some((true, FlightState::Reading)),
+                "fixture: the overwrite and the newcomer's attach landed under the old object's \
+                 held read"
+            );
+            // The new flight waits for the only fenced permit, which the
+            // held read has: release it before waiting for the new one.
+            hold.release();
 
             let new_read = served(spawn_read(newcomer, ROOMY), "the new object").await;
             assert_eq!(new_read.snapshot().state.object_id, new_oid);
@@ -2626,14 +2739,17 @@ mod seams {
                 new_read.snapshot().cut >= pin,
                 "its own cut ≥ pin check holds"
             );
-            match joined(old, "the old object").await {
-                Ok(read) => {
-                    assert_eq!(read.snapshot().state.object_id, fx.oid);
-                    drop(turn(read, "the old object").await);
-                }
-                Err(FlightWaitError::Read(ServiceError::NotFound(_))) => {}
-                Err(e) => panic!("the old object's waiter: its state or NotFound; got {e:?}"),
-            }
+            let old_read = served(old, "the old object").await;
+            assert_eq!(
+                old_read.snapshot().state.object_id,
+                fx.oid,
+                "the old flight's waiter is served the old object, its clean-up still parked"
+            );
+            drop(turn(old_read, "the old object").await);
+            // The old waiter is served: let the overwrite's clean-up go on.
+            tokio::time::timeout(SIGNAL_BUDGET, cleanup_gate.wait())
+                .await
+                .expect("the overwrite's spawned clean-up parks on its gate");
             drop(turn(new_read, "the new object").await);
             fx.assert_idle("after both flights").await;
         })
@@ -2648,9 +2764,9 @@ mod seams {
     ) {
         within_test_budget(async {
             let fx = Fx::new("sf-delete", Shape::DEFAULT).await;
-            hold_next_read(&fx);
+            let hold = hold_next_read(&fx);
             let w1 = spawn_read(fx.attach(), ROOMY);
-            until_reading(&fx, "the read").await;
+            reading_held(&fx, &hold, "the read").await;
             let w2 = spawn_read(fx.attach(), ROOMY);
 
             fx.ls
@@ -2659,6 +2775,12 @@ mod seams {
                 .expect("DeleteLayer must succeed under the read");
             let new_oid = create(&fx.ls, &fx.session_id, &fx.layer, &every_shape_state()).await;
             assert_ne!(new_oid, fx.oid);
+            assert_eq!(
+                fx.registered(),
+                Some((true, FlightState::Reading)),
+                "fixture: the delete and the recreate landed under the held read"
+            );
+            hold.release();
 
             for (who, task) in [("w1", w1), ("w2", w2)] {
                 let e = joined(task, who).await;
@@ -2697,9 +2819,9 @@ mod seams {
             let fx = Fx::new("sf-restore", Shape::DEFAULT).await;
             fx.set_seq(BEFORE).await;
             let pin_before = fx.seq().await;
-            hold_next_read(&fx);
+            let hold = hold_next_read(&fx);
             let early = spawn_read(fx.attach(), ROOMY);
-            until_reading(&fx, "the read").await;
+            reading_held(&fx, &hold, "the read").await;
 
             let header: std::collections::HashMap<String, String> = fx
                 .tv
@@ -2728,6 +2850,7 @@ mod seams {
             let late = fx.attach();
             assert_eq!(late.role(), FlightRole::JoinedRead);
             let late = spawn_read(late, ROOMY);
+            hold.release();
 
             let (r_early, r_late) = (served(early, "early").await, served(late, "late").await);
             let cut = assert_one_snapshot(&[&r_early, &r_late], "across the restore");
@@ -2754,14 +2877,20 @@ mod seams {
 
     /// The read itself is work, never charged: a waiter whose capacity
     /// budget (200 ms) is far shorter than the read it waits for — held open
-    /// for [`HOLD`] between grant and release — is served.
+    /// for [`HOLD`] between grant and release by the delay seam — is served.
+    /// The delay is a spend, not a window: no step lands inside it, and a
+    /// lease lost during it ends that attempt only after the waiter's budget
+    /// has run out, so the read still outlasts the budget.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flight_waiter_is_not_charged_for_the_read_it_waits_for() {
         within_test_budget(async {
             let fx = Fx::new("sf-read-uncharged", Shape::DEFAULT).await;
-            hold_next_read(&fx);
+            fx.injector().push_delay_at(first_fenced_command(), HOLD);
             let task = spawn_read(fx.attach(), Duration::from_millis(200));
-            until_reading(&fx, "the read holds its lease").await;
+            until("the read holds its lease", || {
+                fx.registered() == Some((true, FlightState::Reading))
+            })
+            .await;
             let read = served(task, "a waiter whose budget the read outlasts").await;
             drop(turn(read, "the uncharged waiter").await);
             fx.assert_idle("after the flight").await;
@@ -2778,10 +2907,7 @@ mod seams {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flight_reopened_by_a_broken_read_goes_back_open_when_its_successor_is_abandoned() {
         hand_polled("sf-put-back-open", Shape::DEFAULT, |fx| async move {
-            fx.injector().push_delay_at(
-                ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-                HOLD,
-            );
+            fx.injector().push_delay_at(first_fenced_command(), HOLD);
             let budget = CapacityBudget::new(ROOMY);
             let mut leader = Box::pin(fx.attach().read(&budget));
             drive_until(leader.as_mut(), "the pass is held open", || {
@@ -2898,6 +3024,100 @@ mod seams {
             );
             drop(held_open);
             fx.assert_idle("after both flights").await;
+        })
+        .await;
+    }
+
+    /// The lease lever the held-read arms here rely on
+    /// (`lengthen_fence_leases`, b.24b): a flight's read held on its first
+    /// fenced command, with every renewal stalled until the store's clock has
+    /// passed the deadline a production lease would have had, keeps its
+    /// lease. Renewals then resume, the read is released, its release
+    /// verifies, and the first attempt is served with no broken read. A
+    /// production lease would have lapsed at that deadline: its next renewal
+    /// answers `LOST` (or its release `BROKEN`), and the (unheld) retry is
+    /// served after one `fence_broken` read.
+    ///
+    /// The lever moves the lease only: while the read is parked, the
+    /// flight's size is the estimate it was created with and the budget
+    /// holds the flight's production grant for that size, nothing more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flight_read_held_past_a_production_lease_keeps_its_lengthened_lease_and_production_sizes(
+    ) {
+        within_test_budget(async {
+            let fx = Fx::new("sf-lengthened-lease", Shape::DEFAULT).await;
+            let seam = lengthened_injector(&fx);
+            seam.stall_fence_renewals(true);
+            let [hold] = holds_on(&seam);
+            let task = spawn_read(fx.attach(), ROOMY);
+            // The lease check first, while the stalled lease still has
+            // nearly all of its length left.
+            reading_held(&fx, &hold, "the held read").await;
+
+            assert_eq!(
+                fx.flights.lookup(fx.oid).map(|l| l.size),
+                Some(fx.estimate),
+                "the lever moved no size: the flight is sized from its estimate"
+            );
+            let grant = kib_for_bytes(flight_grant_bytes(fx.estimate.bytes)) * 1024;
+            assert!(
+                grant <= fx.budget().total_bytes(),
+                "fixture: the grant is not clamped to the budget"
+            );
+            assert_eq!(
+                (fx.budget().reserved_bytes(), fx.budget().overcommit_bytes()),
+                (grant, 0),
+                "the lever moved no grant: the budget holds the flight's production grant"
+            );
+
+            let epoch_start: i64 = fx
+                .tv
+                .client()
+                .pool
+                .hget::<Option<String>, _, _>(fx.fence_key(), "epoch_start")
+                .await
+                .expect("HGET epoch_start must succeed")
+                .expect("the held read's epoch has started")
+                .parse()
+                .expect("epoch_start is an integer");
+            let production_lease_ms = live_edit::storage::snapshot_fence::coefficients(&fx.client)
+                .timing(fx.estimate)
+                .lease_ms
+                .ceil() as i64;
+            let past = async {
+                while fx.now().await <= epoch_start + production_lease_ms {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            tokio::time::timeout(LAPSE_BUDGET, past)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the store clock did not pass a production lease ({production_lease_ms} \
+                         ms) within {LAPSE_BUDGET:?}"
+                    )
+                });
+            let now = fx.now().await;
+            assert!(
+                now > epoch_start + production_lease_ms,
+                "fixture: with no renewal yet, the store clock ({now}) is past the deadline a \
+                 production lease would have had ({epoch_start} + {production_lease_ms} ms)"
+            );
+            // A production lease has lapsed by now. Resume renewals so the
+            // rest of the read depends on no time window: a lapsed lease's
+            // next renewal answers LOST, a live one's extends it.
+            seam.stall_fence_renewals(false);
+
+            hold.release();
+            let read = served(task, "the held read").await;
+            assert_eq!(
+                (fx.reads("fence_broken"), fx.reads("ok")),
+                (0, 1),
+                "the lengthened lease outlived a production lease with every renewal stalled: \
+                 the held attempt verified"
+            );
+            drop(turn(read, "the held read").await);
+            fx.assert_idle("after the flight").await;
         })
         .await;
     }

@@ -67,8 +67,8 @@
 //! | [`a_connection_whose_flush_expired_is_not_flushed_again_before_the_router_waits`] | b.zt3 guard on expired connections (`flush`), close of a connection judged dead (rev 4) | a 16 MiB `SET` fed to a connection A stopped reading: its flush expires at the 4 s bound, the router's re-flush before it waits idle fails at once (its DEBUG line, once), and the read loop closes A with the slow verdict, through a close that waits on nothing, within the bound + 2 s; one `(expired flush)` WARN; rider 1: the close returns the in-flight commands (the one-attempt `SET` fails with the verdict, a multi-attempt `GET` is re-sent and answered) |
 //! | [`a_command_written_to_a_connection_whose_flush_expired_fails_at_once_without_being_fed`] | b.zt3 guard on expired connections (`feed`), close of a connection judged dead (rev 4) | the same, with the `SET`, a custom `ECHO` for B and a `GET` for A in one pipeline: the `GET`, fed to A in the router step its flush expired in, fails at once with the slow verdict (its DEBUG line, once), which closes A, through a close that waits on nothing, within the bound + 2 s; one WARN; rider 1 as above |
 //! | [`a_free_reader_already_on_the_owner_takes_a_new_binding_without_a_retarget`] | T1 | node affinity end to end |
-//! | [`a_command_queued_behind_a_cluster_readers_blocked_read_interrupts_it_and_the_read_is_replanned`] | T13 | an outside command queued behind a clustered reader's live blocked read (no production path sends one since b.19i) is interrupted by fred's `Blocking::Interrupt` (`CLIENT UNBLOCK`): it does not wait out the BLOCK, and the reader re-plans on `-UNBLOCKED` |
-//! | [`a_client_unblock_on_a_single_node_cluster_reader_is_replanned_without_loss`] | T13 | the `CLIENT UNBLOCK` re-plan on the single-node reader |
+//! | [`a_command_behind_a_cluster_readers_timed_out_read_opens_no_second_connection_and_gets_its_own_reply`] | T13, b.9sh | a command on a clustered reader's client behind its own read that timed out on the client but is still blocked on the server opens no connection (no handshake `AUTH`, no `CLIENT UNBLOCK`, the reader's connection id unchanged), waits for that read's BLOCK to end, and gets its own reply |
+//! | [`a_client_unblock_on_a_single_node_cluster_reader_is_replanned_without_loss`] | T13 | an outside `CLIENT UNBLOCK` re-planned on the single-node reader |
 //! | [`a_cluster_readers_due_reauth_wakes_its_read_and_auths_between_reads`] | b.19i | a clustered reader's own re-AUTH: a credential wake, one `AUTH` between reads, no `CLIENT UNBLOCK`, no `-UNBLOCKED`, no fred refresh scheduled on the reader's client |
 //! | [`a_cluster_clients_auth_broadcast_behind_a_blocked_read_fails_at_the_slow_bound_and_a_drain_inside_it_flags_no_connection`] | b.zt3 T8 (inverts the b.19i pin) | a cluster client's `AUTH` broadcast drains behind a node's blocked read: a drain that ends inside the slow bound leaves no connection declared unresponsive; one that outlasts it fails the `AUTH` with the slow-verdict error at the bound, closes that node's connection, and a command for the other node is answered |
 //! | [`an_idle_cluster_readers_keepalive_consumes_one_fault_per_tick`] | T12 | `test-fault-injection` only: one `PING` per tick on the one connection |
@@ -143,7 +143,8 @@
 //! fred's 5 s command timeout per one-shot command (an `XADD`, a `DEL`, a
 //! `CLIENT KILL`, a poll's last `CLIENT LIST`), and the key purge — a
 //! `TestValkey`'s drop on a multi-thread runtime, or `purge_keys` on a
-//! current-thread one (a `SCAN` page and an `UNLINK`, 5 s each) — is under
+//! current-thread one (a wait for the walk's next key and an `UNLINK`, 5 s
+//! each) — is under
 //! 180 s. That is the kill deadline `.config/nextest.toml` sets for this whole
 //! module (60 s × 3), in place of the global 120 s hang-killer, which kills a
 //! test silently. These are deadlines, not sleeps: the healthy path takes a
@@ -172,7 +173,7 @@
 //! | `a_connection_whose_flush_expired_is_not_flushed_again_before_the_router_waits` | 30 + 5 + close 25 + purge 10 = 70 s |
 //! | `a_command_written_to_a_connection_whose_flush_expired_fails_at_once_without_being_fed` | 30 + 5 + close 25 + purge 10 = 70 s |
 //! | `a_free_reader_already_on_the_owner_takes_a_new_binding_without_a_retarget` | 30 + (10 + 5 + 10) × 2 + 10 + 25 + purge 10 = 125 s |
-//! | `a_command_queued_behind_a_cluster_readers_blocked_read_interrupts_it_and_the_read_is_replanned` | 30 + 25 + blocked poll 15 + `PING` 10 + 10 + purge 10 = 100 s |
+//! | `a_command_behind_a_cluster_readers_timed_out_read_opens_no_second_connection_and_gets_its_own_reply` | 30 + 25 + blocked poll 15 + unblock 20 (`CLIENT UNBLOCK` 5 + poll 15) + `XADD` 5 + 0.3 + blocked poll 15 + 0.5 + `XADD` 5 + 10 + purge 10 = 135.8 s |
 //! | `a_cluster_readers_due_reauth_wakes_its_read_and_auths_between_reads` | 30 + 25 + 15 + 10 × 2 + 5 + 10 + purge 10 = 115 s |
 //! | `a_cluster_clients_auth_broadcast_behind_a_blocked_read_fails_at_the_slow_bound_and_a_drain_inside_it_flags_no_connection` | 172.25 s (its own docs) |
 //! | `a_client_unblock_on_a_single_node_cluster_reader_is_replanned_without_loss` | 30 + 25 + unblock poll 15 + 5 + 10 + purge 10 = 95 s |
@@ -197,7 +198,7 @@
 //! | `faults::a_forced_reconnect_whose_slot_owner_has_not_moved_reconnects_the_same_client` | 30 + 10 + (5 + 10) × 3 + purge 10 = 95 s |
 //! | `faults::a_failed_keepalive_on_a_node_still_a_primary_reconnects_instead_of_retiring` | 30 + 25 + 10 + 10 + 10 + purge 10 = 95 s |
 //! | `faults::a_failed_retarget_that_ends_the_subscriptions_makes_the_next_connect_a_bind` | 30 + 25 + 10 + 10 + 10 + 5 + 10 + purge 10 = 110 s |
-//! | `faults::a_retarget_whose_quit_overruns_aborts_the_old_router_and_restarts_nothing`, `…_fails_inside_its_bound_…` | 30 + 25 + blocked poll 15 + 10 + 25 + close poll 15 + 0.5 + `DEL` 5 × 2 + quit 10 = 140.5 s |
+//! | `faults::a_retarget_whose_quit_overruns_aborts_the_old_router_and_restarts_nothing`, `…_fails_inside_its_bound_…` | 30 + 25 + blocked poll 15 + unblock 20 (`CLIENT UNBLOCK` 5 + poll 15) + 10 + 25 + close poll 15 + 0.5 + `DEL` 5 × 2 + quit 10 = 160.5 s |
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -225,8 +226,8 @@ use live_edit::storage::{consume_layer_stream, LayerStreamConsumer, StreamCursor
 
 use super::mux_test_helpers::{
     assert_no_fred_refresh_on_reader, await_mux, await_reader_blocked_in_xread, install_metrics,
-    read_series, read_unblocked_retries, reauths, recv_seqs, wakes, xadd_update, ScriptedProvider,
-    SETTLE,
+    read_series, read_unblocked_retries, reauths, recv_seqs, unblock_reader_read, wakes,
+    xadd_update, ScriptedProvider, SETTLE,
 };
 use super::snapshot_read_support::{
     error_reply_script, test_valkey_addr, ProxyAction, ProxyRule, ScriptReplyProxy,
@@ -723,8 +724,9 @@ struct ClusterFacade {
     echo_stop_reading: Arc<Mutex<Option<String>>>,
     /// The arguments of each `AUTH` frame relayed, on either node, in order.
     auths: Arc<Mutex<Vec<Vec<String>>>>,
-    /// `CLIENT UNBLOCK` frames relayed, on either node: a backchannel
-    /// interrupting a blocked read.
+    /// `CLIENT UNBLOCK` frames relayed, on either node: another client's
+    /// unblock of a blocked read, or a fred backchannel's under
+    /// `Blocking::Interrupt` (which no service client runs since b.9sh).
     client_unblocks: Arc<AtomicUsize>,
 }
 
@@ -2210,72 +2212,181 @@ async fn a_free_reader_already_on_the_owner_takes_a_new_binding_without_a_retarg
     );
 }
 
-/// T13: a command from outside the reader loop, queued behind a clustered
-/// reader's *live* blocked `XREAD`, interrupts the read instead of waiting it
-/// out: fred's `Blocking::Interrupt` sends `CLIENT UNBLOCK` first, over a
-/// backchannel, so the command is answered at once rather than after the
-/// 30 s BLOCK, and the reader takes the interrupted read's `-UNBLOCKED` as a
-/// re-plan (counted). The test sends that command itself — a `PING` on the
-/// reader's client — to pin the interrupt and the reader's re-plan. It does
-/// not tell a single-node reader client from a cluster one: a `PING` is
-/// interrupted the same way on either.
+/// T13 (b.9sh): a command sent on a clustered reader's client behind the
+/// reader's own timed-out read — one that timed out on the service's side
+/// while still blocked on the server — opens no second connection, waits for
+/// that read's BLOCK to end, and gets its own reply, not the abandoned
+/// read's.
 ///
-/// No production path sends such a command since b.19i: a reader sends its
-/// own other commands — probes, head checks, keepalive and its credential
-/// re-AUTH — only between reads, and fred schedules no credential refresh on a
-/// reader (the re-AUTH's own path is
-/// [`a_cluster_readers_due_reauth_wakes_its_read_and_auths_between_reads`]).
-/// What `Blocking::Interrupt` still serves in production is the residual
-/// case, and it looks different from this test: the reader's next command
-/// after a client-side `XREAD` timeout that did not force a reconnect, while
-/// that timed-out read is still blocked on the server. There the interrupted
-/// read is the reader's own abandoned one, its `-UNBLOCKED` goes to a caller
-/// that has already dropped it, and nothing is re-planned or counted. (A pin
-/// of that residual path is deferred.)
+/// This is the residual case the readers' `Blocking::Interrupt` once served:
+/// a reader's next command after a client-side XREAD timeout that forced no
+/// reconnect. Under `Interrupt` fred sent `CLIENT UNBLOCK` before that
+/// command, over a backchannel connection it opened on first use and kept for
+/// the life of the client: a second store connection per reader. Under fred's
+/// default `Blocking::Block` (b.9sh) the command is written to the reader's one
+/// connection and the store runs it once the abandoned read ends; fred keeps
+/// the timed-out read first in the connection's buffer, so that read's late
+/// reply goes to its dropped caller and the command gets its own.
 ///
-/// The subscription is dropped once the read is blocked and before the
-/// `PING`. A subscription leaving does not wake the read, and the reader
-/// applies the removal before it plans another read, so the interrupted
-/// reader has nothing to re-issue. With the subscription still live, its
-/// re-issued XREAD could be written ahead of the `PING`, which would then
-/// wait behind the new BLOCK: a race in fred's interrupt (it decides when the
-/// command is sent), which is why the readers no longer leave their re-AUTH
-/// to fred. Re-planning with nothing lost is pinned by
-/// [`a_client_unblock_on_a_single_node_cluster_reader_is_replanned_without_loss`].
+/// The state is staged by hand on the reader's production client (its config,
+/// policies and limits are the readers' template's): the reader is left idle,
+/// with no subscription and its keepalive off, so the client is the test's.
+/// Driving the reader loop itself there would need the store to hold back an
+/// XREAD's reply past `block_ms` + 5 s, twice (a timeout streak forces a
+/// reconnect on its first timeout). The abandoned read is an `XREAD BLOCK`
+/// on a quiet stream with a client-side timeout far below its BLOCK; once the
+/// server still shows it blocked, a one-attempt `XREAD` of another stream
+/// holding one entry is sent, then the quiet stream is appended to, which
+/// ends the abandoned read.
+///
+/// Every connection's handshake `AUTH`s with the [`ScriptedProvider`]'s
+/// password (the provider is not ticking, so nothing else sends one), so the
+/// facade's `AUTH` count since the staging began counts the connections
+/// opened: none, where the readers' `Interrupt` showed one (the backchannel)
+/// with a `CLIENT UNBLOCK` frame. The reader's own connection id is unchanged.
+/// The command is not answered within `STILL_WAITING` while the abandoned
+/// read holds the connection (a window that can only miss a regression under
+/// extreme load, never fail a correct build), and is answered with its own
+/// stream's entry once the BLOCK ends.
+///
+/// Without `test-fault-injection` the keepalive knob is absent, and the
+/// production keepalive (every 200 s, from a random offset) may send a `PING`
+/// on the client during the test: it queues behind the read like the
+/// command and changes none of the assertions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_command_queued_behind_a_cluster_readers_blocked_read_interrupts_it_and_the_read_is_replanned(
+async fn a_command_behind_a_cluster_readers_timed_out_read_opens_no_second_connection_and_gets_its_own_reply(
 ) {
+    use fred::interfaces::StreamsInterface;
+    use fred::types::config::Options;
+    use fred::types::streams::XReadResponse;
+    use fred::types::Value;
+
+    /// The abandoned read's server-side BLOCK: far past every deadline here,
+    /// so only the append to its stream ends it.
+    const ABANDONED_BLOCK_MS: u64 = 60_000;
+    /// The abandoned read's client-side timeout: far below its BLOCK, as the
+    /// reader's XREAD timeout is below a read the store never answers.
+    const ABANDONED_TIMEOUT: Duration = Duration::from_millis(300);
+    /// How long the command must still be waiting behind the abandoned read.
+    const STILL_WAITING: Duration = Duration::from_millis(500);
+    const PASSWORD: &str = "b9sh-no-backchannel-password";
+
     let facade = ClusterFacade::start().await;
-    let tv = facade.test_valkey(1).await;
-    let metrics = install_metrics(&tv).await;
+    let provider = ScriptedProvider::new(PASSWORD);
+    let tv = facade.test_valkey_with_provider(1, provider.clone()).await;
+    let client = tv.client();
+    #[cfg(feature = "test-fault-injection")]
+    client
+        .stream_mux
+        .set_knobs_for_test(live_edit::storage::stream_mux::StreamMuxKnobs {
+            keepalive_interval: None,
+            ..client.stream_mux.knobs()
+        });
     let oid = facade.object_on(&tv, Node::A, 0, &[]);
+    let quiet = facade.object_on(&tv, Node::A, oid, &[oid]);
+    let answered = facade.object_on(&tv, Node::A, quiet, &[oid, quiet]);
+    let (quiet_key, answered_key) = (
+        tv.key_schema().layer_stream(quiet),
+        tv.key_schema().layer_stream(answered),
+    );
+
+    // Connect the reader to A, then leave it idle: its subscription gone and
+    // the read that left blocked ended from the data pool.
     let c = subscribe(&tv, oid).await;
     xadd_update(&tv, oid, 1).await;
     assert_eq!(recv_seqs(&c, 1).await, [1]);
-    let reader = tv
-        .client()
+    let reader = client
         .stream_mux
         .reader_client_for_test(0)
         .expect("connected");
-    await_reader_blocked_in_xread(tv.client().pool.next(), &reader).await;
+    assert_eq!(reader.active_connections(), vec![facade.server(Node::A)]);
+    await_reader_blocked_in_xread(client.pool.next(), &reader).await;
     drop(c);
-    let unblocks_before = facade.client_unblocks();
+    unblock_reader_read(client.pool.next(), &reader).await;
+    xadd_update(&tv, answered, 1).await;
+    let connections_before = reader.connection_ids();
+    let (auths_before, unblocks_before) = (facade.auths(), facade.client_unblocks());
 
-    tokio::time::timeout(SETTLE, reader.ping::<()>(None))
+    // The abandoned read: timed out on the client, still blocked on the
+    // server.
+    let abandoned = reader
+        .with_options(&Options {
+            timeout: Some(ABANDONED_TIMEOUT),
+            max_attempts: Some(1),
+            ..Default::default()
+        })
+        .xread::<Value, _, _>(None, Some(ABANDONED_BLOCK_MS), quiet_key.as_str(), "$")
         .await
-        .expect("a command behind the blocked XREAD must interrupt it, not wait out the 30 s BLOCK")
-        .expect("the PING is answered");
-    let deadline = Instant::now() + SETTLE;
-    await_until(
-        "the interrupted read's -UNBLOCKED must reach the reader",
-        deadline,
-        || read_unblocked_retries(&metrics) >= 1,
-    )
-    .await;
-    assert!(
-        facade.client_unblocks() > unblocks_before,
-        "the interrupt is fred's CLIENT UNBLOCK, relayed by the facade"
+        .expect_err("the abandoned read must time out on the client, inside its BLOCK");
+    assert_eq!(
+        *abandoned.kind(),
+        fred::error::ErrorKind::Timeout,
+        "precondition: a client-side timeout: {abandoned:?}"
     );
+    await_reader_blocked_in_xread(client.pool.next(), &reader).await;
+
+    // The reader's next command, behind it.
+    let mut next = {
+        let reader = reader.clone();
+        let answered_key = answered_key.clone();
+        tokio::spawn(async move {
+            reader
+                .with_options(&Options {
+                    timeout: Some(SETTLE),
+                    max_attempts: Some(1),
+                    ..Default::default()
+                })
+                .xread_map::<String, String, String, String, _, _>(
+                    None,
+                    None,
+                    answered_key.as_str(),
+                    "0-0",
+                )
+                .await
+        })
+    };
+    let early = tokio::time::timeout(STILL_WAITING, &mut next).await;
+
+    assert_eq!(
+        facade.auth_args_since(auths_before),
+        Vec::<Vec<String>>::new(),
+        "no connection was opened for the command behind the timed-out read: a backchannel's \
+         handshake would AUTH with the provider's password"
+    );
+    assert_eq!(
+        facade.client_unblocks(),
+        unblocks_before,
+        "no CLIENT UNBLOCK: the readers run fred's default Blocking::Block"
+    );
+    assert_eq!(
+        reader.connection_ids(),
+        connections_before,
+        "the reader kept its one connection"
+    );
+    assert!(
+        early.is_err(),
+        "the command cannot be answered while the abandoned read holds the connection; got \
+         {early:?}"
+    );
+
+    // End the abandoned read: its reply goes to its dropped caller, and the
+    // command gets its own.
+    xadd_update(&tv, quiet, 1).await;
+    let reply: XReadResponse<String, String, String, String> = tokio::time::timeout(SETTLE, next)
+        .await
+        .expect("the command must be answered once the abandoned read's BLOCK ends")
+        .expect("the command task must not panic")
+        .expect("the command is answered");
+    let ids: Vec<(&String, Vec<&String>)> = reply
+        .iter()
+        .map(|(key, entries)| (key, entries.iter().map(|(id, _)| id).collect()))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![(&answered_key, vec![&"1-0".to_owned()])],
+        "the command's own reply — its stream's one entry — not the abandoned read's"
+    );
+    assert_eq!(reader.connection_ids(), connections_before);
 }
 
 /// b.19i on a cluster reader (design item 4): the busy-reader case of
@@ -2291,10 +2402,10 @@ async fn a_command_queued_behind_a_cluster_readers_blocked_read_interrupts_it_an
 /// `-UNBLOCKED`; fred schedules no refresh on the reader's client
 /// ([`assert_no_fred_refresh_on_reader`]); its connection is not reconnected;
 /// the next update is delivered.
-/// Before b.19i fred's refresh task sent that `AUTH` itself, through
-/// `Blocking::Interrupt` — the path
-/// [`a_command_queued_behind_a_cluster_readers_blocked_read_interrupts_it_and_the_read_is_replanned`]
-/// shows.
+/// Before b.19i fred's refresh task sent that `AUTH` itself, through the
+/// readers' `Blocking::Interrupt` of the time: a `CLIENT UNBLOCK` over a
+/// backchannel connection, which the readers no longer open (b.9sh,
+/// [`a_command_behind_a_cluster_readers_timed_out_read_opens_no_second_connection_and_gets_its_own_reply`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cluster_readers_due_reauth_wakes_its_read_and_auths_between_reads() {
     use live_edit::observability::metrics::{
@@ -4163,10 +4274,12 @@ mod faults {
     // router (`vendor/fred-10.1.0/src/router/commands.rs:122-123`,
     // `router/utils.rs:99-114`). So a `QUIT` does not finish when a command
     // ahead of it is never answered: here an `ECHO` the facade stalls on A,
-    // sent on the reader's client while its subscription is gone and its read
-    // in flight (the `ECHO` interrupts that read, `Blocking::Interrupt`, and
-    // the reader goes idle). The reader's next binding is on B, so it retires
-    // its connection to A and its `QUIT` hangs in that drain:
+    // sent on the reader's client once its subscription is gone and the read
+    // it left blocked has been ended from the data pool (`CLIENT UNBLOCK`,
+    // `unblock_reader_read`; under fred's default `Blocking::Block` the `ECHO`
+    // would otherwise only queue behind that read), so the reader is idle.
+    // The reader's next binding is on B, so it retires its connection to A
+    // and its `QUIT` hangs in that drain:
     //
     // - with the 5 s command timeout, past `QUIT_TIMEOUT` (2 s): an overrun;
     // - with a 500 ms command timeout, fred fails the `QUIT` itself inside
@@ -4222,14 +4335,15 @@ mod faults {
             .reader_client_for_test(0)
             .expect("connected to A");
         let old_connection = sole_connection_id(&old);
-        // The `ECHO` below must meet a read the server shows blocked, so it
-        // interrupts that read rather than queueing behind its BLOCK; a
-        // subscription leaving does not wake the read, so it stays blocked.
+        // A subscription leaving does not wake the read, so it stays blocked:
+        // wait until the server shows it blocked, drop the subscription, then
+        // end the read from the data pool, leaving the reader idle.
         await_reader_blocked_in_xread(client.pool.next(), &old).await;
         drop(first);
         // A subscription's drop releases its router reference and queues the
         // reader's removal synchronously, so this holds at once; no wait.
         assert_eq!(client.stream_mux.snapshot().subscriptions(), 0);
+        unblock_reader_read(client.pool.next(), &old).await;
         let watchers_before = client.router_watchers_for_test();
 
         let marker = format!("b-azh-stall-{}", uuid::Uuid::new_v4());
@@ -4243,7 +4357,7 @@ mod faults {
         });
         let deadline = Instant::now() + SETTLE;
         await_until(
-            "the ECHO must be stalled on A and the reader's read interrupted",
+            "the ECHO must be stalled on A, after the reader's read was re-planned",
             deadline,
             || {
                 facade.echo_stalled.load(Ordering::SeqCst) == 1

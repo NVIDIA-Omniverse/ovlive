@@ -32,14 +32,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ScalerConfig;
 use crate::decide::{
-    Action, Decision, Engine, EngineConfig, Observation, PodObservation, PodReport,
+    Action, BlockReason, Decision, Engine, EngineConfig, Observation, PodObservation, PodReport,
     FLEET_READ_BUDGET,
 };
 use crate::kube::{Endpoint, KubeClient};
 use crate::obs::{
     self, Heartbeat, ScalerMetrics, DIRECTION_DOWN, DIRECTION_NONE, DIRECTION_UP, REASON_AT_TARGET,
-    REASON_BELOW_TARGET, REASON_NO_DATA, REASON_SCALE_DOWN_BLOCKED, STAGE_DELETION_COST,
-    STAGE_ENDPOINTS, STAGE_PATCH_SCALE, STAGE_SCALE, STAGE_SNAPSHOT,
+    REASON_BELOW_TARGET, REASON_HELD, REASON_NO_DATA, REASON_SCALE_DOWN_BLOCKED,
+    STAGE_DELETION_COST, STAGE_ENDPOINTS, STAGE_PATCH_SCALE, STAGE_SCALE, STAGE_SNAPSHOT,
 };
 use crate::snapshot::{ScalingSnapshot, SCALING_SNAPSHOT_PATH};
 
@@ -227,6 +227,9 @@ impl Scaler {
     async fn apply(&mut self, decision: &Decision, replicas: u32) {
         let (direction, reason) = match &decision.action {
             Action::NoData => (DIRECTION_NONE, REASON_NO_DATA),
+            Action::Hold if decision.scale_down_blocked == Some(BlockReason::Held) => {
+                (DIRECTION_NONE, REASON_HELD)
+            }
             Action::Hold if decision.scale_down_blocked.is_some() => {
                 (DIRECTION_NONE, REASON_SCALE_DOWN_BLOCKED)
             }
@@ -267,7 +270,14 @@ impl Scaler {
                 }
             }
             Action::Hold | Action::NoData => {
-                if let Some(blocked) = decision.scale_down_blocked {
+                if decision.scale_down_blocked == Some(BlockReason::Held) {
+                    tracing::debug!(
+                        replicas,
+                        desired = decision.desired,
+                        reason = BlockReason::Held.label(),
+                        "replica count frozen: a server pod reports a disaster-recovery hold"
+                    );
+                } else if let Some(blocked) = decision.scale_down_blocked {
                     tracing::debug!(
                         replicas,
                         desired = decision.desired,

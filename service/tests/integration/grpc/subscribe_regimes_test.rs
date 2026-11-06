@@ -23,14 +23,15 @@
 // authoritative behavioural spec.
 //
 // Coverage (matching b.ebu Epic 4 Task 1 acceptance criteria):
-//   1. Fast-subscriber per-commit (Regime 1 steady-state)
-//   2. In-window reconnect (Regime 2, `XRANGE` slice)
-//   3. Out-of-window fallback with state-parity (Regime 3, one coalesced diff
-//      built from the catch-up's atomic read; above the atomic-read limits,
-//      from the layer's shared fenced read)
+//   1. Fast-subscriber per-commit (steady-state relay)
+//   2. In-window reconnect (Regime 2, one coalesced diff, decided by the
+//      in-window point read)
+//   3. Out-of-window fallback with state-parity (Regime 3, the same coalesced
+//      diff built from the catch-up's atomic read; above the atomic-read
+//      limits, from the layer's shared fenced read)
 //   4. CreateLayer overwrite during active subscription
 //   5. DeleteLayer during active subscription terminates with NOT_FOUND
-//   6. Self-echo suppression in per-commit path
+//   6. Self-echo suppression in the steady-state relay
 
 // The `test-fault-injection` gate repeated on the imports below (and on the
 // b.vd8 stable-cut helper cluster further down) is load-bearing, not cosmetic:
@@ -192,18 +193,6 @@ impl PooledTestValkey {
         .await
     }
 
-    /// [`Self::setup`] against `valkey_url` instead of `TEST_VALKEY_URL` — a
-    /// `ScriptReplyProxy` in front of the test store, for instance.
-    async fn setup_with_url(valkey_url: String) -> Self {
-        Self::setup_with_url_and_pools(
-            valkey_url,
-            0,
-            8,
-            live_edit::config::SNAPSHOT_ATOMIC_READ_MAX_ITEMS_DEFAULT,
-        )
-        .await
-    }
-
     async fn setup_with_url_and_pools(
         valkey_url: String,
         valkey_pool_size: u32,
@@ -215,7 +204,6 @@ impl PooledTestValkey {
         let key_schema = KeySchema::new(&prefix);
 
         let config = Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url,
@@ -308,6 +296,10 @@ impl PooledTestValkey {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: live_edit::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: live_edit::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: live_edit::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                live_edit::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs: 60,
             checkpoint_enabled: false,
             checkpoint_adapter: live_edit::checkpoint::CheckpointAdapter::Disabled,
@@ -433,7 +425,6 @@ fn build_pooled_service_from_layer_store(
     ));
 
     LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),
@@ -520,6 +511,19 @@ async fn create_session_and_layer_pooled(
         .await
         .expect("create_layer must succeed for test setup");
     (session_id, response.into_inner().object_id)
+}
+
+/// The state the server commits for [`create_session_and_layer_pooled`]'s
+/// empty create content, built by the service's own creation step: the layer
+/// holding only its root section (SDD §9.7), at sequence 1. A local mirror of
+/// such a layer starts here.
+fn empty_create_state() -> ObjectState {
+    live_edit::domain::layer_root::build_creation_state(
+        Some(crate::common::owned_delta::empty_delta()),
+        &mut live_edit::domain::delta::ApplyDeltaStats::default(),
+    )
+    .expect("the empty create content builds its state")
+    .state
 }
 
 /// Build an UpdateLayerRequest header.
@@ -733,7 +737,7 @@ fn apply_ompf_to_state(state: &mut ObjectState, ompf_bytes: &[u8]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 1. Fast-subscriber per-commit (Regime 1 steady-state)
+// 1. Fast-subscriber per-commit (steady-state relay)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -763,6 +767,7 @@ async fn fast_subscriber_receives_each_commit_individually() {
     // b.rdr: the brand-new catch-up terminates with a total_size==0 caught-up
     // ack carrying the delivered version (seq=1) before steady state begins.
     recv_caught_up_ack(&mut stream, object_id, 1).await;
+    assert_catch_up_payload_returned(&svc, "regime 1");
 
     // Issue N = 10 back-to-back updates from a *different* writer client_id so
     // self-echo suppression doesn't filter them out for our subscriber.
@@ -801,7 +806,7 @@ async fn fast_subscriber_receives_each_commit_individually() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_window_reconnect_replays_individual_per_commit_diffs() {
+async fn in_window_reconnect_sends_one_coalesced_diff_of_the_missed_commits() {
     let tv = PooledTestValkey::setup().await;
     let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
@@ -836,41 +841,64 @@ async fn in_window_reconnect_replays_individual_per_commit_diffs() {
         .await;
     }
 
-    // Reconnect with have_version=5 — expect Regime-2 replay of 6, 7, 8.
+    // Reconnect with have_version=5 — expect ONE coalesced diff covering 6..=8,
+    // based at 5, then the caught-up ack.
     let sub_req = subscribe_request(&session_id, "inwindow-layer", object_id, 5, "sub-2");
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
         .expect("subscribe must succeed");
     let mut stream = response.into_inner();
 
-    let mut observed_seqs = Vec::new();
-    for _ in 0..M {
-        let (header, body) = recv_message(&mut stream).await;
-        observed_seqs.push(header.sequence_num);
-        assert_eq!(header.object_id, object_id);
+    let (header, body) = recv_message(&mut stream).await;
+    assert_eq!(
+        (header.object_id, header.sequence_num),
+        (object_id, 8),
+        "the in-window catch-up is one diff at the layer's sequence"
+    );
+    assert!(header.total_size > 0, "the coalesced diff carries content");
+    let container = OmpfContainer::parse(&body).expect("parse OMPF");
+    let delta = oodf_ffi::parse_delta(container.delta_bytes).expect("parse OODF delta");
+    assert_eq!(
+        (delta.is_diff, delta.base_version),
+        (true, 5),
+        "the coalesced diff is based at the reconnect's version"
+    );
+    let carried: HashSet<u64> = delta
+        .struct_commands
+        .iter()
+        .filter_map(|command| match command {
+            StructCommand::DiffChangeSection(c) => Some(c.section_id),
+            _ => None,
+        })
+        .collect();
+    for missed in 200..200 + M {
         assert!(
-            !body.is_empty(),
-            "per-commit diff body must be non-empty — state mutation happened"
+            carried.contains(&missed),
+            "the coalesced diff must carry section {missed}, committed after the reconnect's \
+             version; carried {carried:?}"
         );
-        // Regime-2 per-commit diffs carry total_size > 0; the Regime-3 coalesced
-        // path in this scenario would deliver ONE message (ruled out by seeing
-        // 3 separate headers). Still sanity-check total_size > 0.
-        assert!(header.total_size > 0);
     }
 
-    assert_eq!(
-        observed_seqs,
-        vec![6, 7, 8],
-        "in-window replay must deliver contiguous seqs 6, 7, 8"
-    );
-
-    // After the per-commit replay, the in-window catch-up now terminates with
-    // the exactly-once caught-up ack (`total_size==0`) emitted centrally by
-    // `run_catch_up` (b.dy5). Its `tracked_version` is the last *replayed*
-    // endpoint — here seq=8, which equals `current_seq` because the replay
-    // covered the whole gap. Before b.dy5 the in-window path emitted no
+    // The in-window catch-up terminates with the exactly-once caught-up ack
+    // (`total_size==0`) emitted centrally by `run_catch_up` (b.dy5), at the
+    // coalesced diff's version. Before b.dy5 the in-window path emitted no
     // terminator and the subscriber never fired the client's `OkLatest`.
     recv_caught_up_ack(&mut stream, object_id, 8).await;
+    assert_catch_up_payload_returned(&svc, "regime 2");
+    assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
+}
+
+/// b.ntm (T4, T14): a catch-up's payload, in any regime, holds the replica's
+/// catch-up payload budget only while its pages are unsent: once its content
+/// and ack have been taken and dropped (`recv_message` copies the body out),
+/// the budget is back to zero.
+fn assert_catch_up_payload_returned(svc: &LiveEditService, regime: &str) {
+    let budget = &svc.valkey.catchup_payload_budget;
+    assert_eq!(
+        (budget.reserved_bytes(), budget.overcommit_bytes()),
+        (0, 0),
+        "{regime}: the catch-up's pages, taken, returned the catch-up payload budget"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -890,11 +918,12 @@ async fn out_of_window_reconnect_coalesces_and_reaches_state_parity() {
     // Walk the subscriber forward to seq=5 with a trackable, reproducible
     // sequence of section IDs. Keep a local ObjectState mirror so we can
     // reconstruct the subscriber's view after catch-up.
-    let mut local_state = ObjectState::default();
-
-    // Apply the *same* empty create delta the test helper used so local_state
-    // matches the server's seq=1 snapshot.
-    apply_delta(&mut local_state, None).expect("mirror create_layer (empty delta)");
+    //
+    // Build the mirror from the *same* empty create content the test helper
+    // sent, through the service's creation step, so local_state matches the
+    // server's seq=1 snapshot: the layer holding only its root section (SDD
+    // §9.7).
+    let mut local_state = empty_create_state();
 
     for i in 0..4u64 {
         let section_id = 100 + i;
@@ -969,6 +998,7 @@ async fn out_of_window_reconnect_coalesces_and_reaches_state_parity() {
     // initial-sync. After draining the terminator the consumer opens at $, so
     // no further messages land until new writes (of which there are none here).
     recv_caught_up_ack(&mut stream, object_id, 15).await;
+    assert_catch_up_payload_returned(&svc, "regime 3");
     assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
 
     // Reconstruct the subscriber's view: start at the local mirror (seq=5) and
@@ -988,7 +1018,7 @@ async fn out_of_window_reconnect_coalesces_and_reaches_state_parity() {
     // history, so the subscriber's reconstructed sections all carry the
     // `apply_delta`-bumped version rather than the per-commit versions the
     // server recorded. For state-parity the structural identity of each
-    // section (id, parent, name, type, order) is what must match.
+    // section (id, parent, name, type, position) is what must match.
     let server_snapshot =
         read_object_state_for_test(&svc.valkey, &svc.key_schema, &object_id.to_string())
             .await
@@ -1020,9 +1050,18 @@ async fn out_of_window_reconnect_coalesces_and_reaches_state_parity() {
             local_sec.section_type, server_sec.section_type,
             "section {sid} type must match"
         );
+        // The catch-up sends each section at its position among its parent's
+        // children (the walked position, SDD §12.9), not at the key the server
+        // stored for it (every section here is authored at order 0).
+        let walked_position = server_state
+            .children
+            .get(&server_sec.parent_id)
+            .and_then(|kids| kids.iter().position(|kid| kid == sid))
+            .unwrap_or_else(|| panic!("section {sid} is listed under its parent on the server"))
+            as u32;
         assert_eq!(
-            local_sec.section_order, server_sec.section_order,
-            "section {sid} order must match"
+            local_sec.section_order, walked_position,
+            "section {sid} order must be its walked position"
         );
     }
 
@@ -1223,7 +1262,7 @@ async fn overwrite_during_subscription_rebootstraps_on_new_object() {
     recv_caught_up_ack(&mut stream, new_object_id, 1).await;
 
     // Confirm steady-state continues on the new object: issue an UpdateLayer
-    // against new_object_id and expect a per-commit diff.
+    // against new_object_id and expect it relayed.
     apply_unique_update(
         &svc,
         &session_id,
@@ -1241,25 +1280,24 @@ async fn overwrite_during_subscription_rebootstraps_on_new_object() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4b. CreateLayer overwrite during active subscription — SNAPSHOT-mode state
-//     parity + strict per-generation catch-up (SR-2.3, SDD §12.4 step 3 / §12.3)
+// 4b. CreateLayer overwrite during active subscription — state parity +
+//     strict per-generation catch-up (SR-2.3, SDD §12.4 step 3 / §12.3)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Extension (NOT a rewrite) of
 // `overwrite_during_subscription_rebootstraps_on_new_object`, which drives the
-// same ordering only in the DEFAULT `catchup_snapshot_enabled = false` mode with EMPTY
-// deltas on both generations — it never engages the corrected-snapshot builder
-// and never asserts net-state parity or the no-cross-generation-leak invariant.
+// same ordering with EMPTY deltas on both generations — it never asserts
+// net-state parity or the no-cross-generation-leak invariant.
 //
-// This test runs in `Snapshot` mode and gives each generation DISTINCTIVE
-// content in DISJOINT section-id spaces (old = {1,2}, new = {10,11}). It proves
+// This test gives each generation DISTINCTIVE content in DISJOINT section-id
+// spaces (old = {1,2}, new = {10,11}). It proves
 // that when the shared layer is overwritten mid-session — the overwrite arriving
 // via the steady-state `XREAD BLOCK` AFTER the subscriber has already completed
 // its initial catch-up, so it exercises the steady-state-phase re-bootstrap site
 // (`run_steady_state` → `handle_deleted_and_rebootstrap` → `catch_up_brand_new`
-// → `send_full_state` Snapshot arm) — the attached subscriber cleanly
+// → `send_full_state`) — the attached subscriber cleanly
 // re-bootstraps onto the NEW `object_id` and receives EXACTLY that generation's
-// current state through the corrected catch-up path, with NOTHING from the old
+// current state through the faithful full-state build, with NOTHING from the old
 // generation leaking across (catch-up strictly per-generation).
 //
 // checkpoint_enabled stays false (SR-4.1) — the fixture `Config` sets it and no
@@ -1267,8 +1305,7 @@ async fn overwrite_during_subscription_rebootstraps_on_new_object() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_overwrite_rebootstrap_delivers_new_generation_state_no_cross_leak() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-ow-layer";
     let (session_id, old_object_id) =
@@ -1808,33 +1845,6 @@ async fn subscribers_do_not_starve_concurrent_update_layer() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// 8. M3 — per-commit message content is bounded to its declared sequence_num
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Before M3, the legacy diff build loaded the current materialized state without an
-// upper-version bound. This meant that for each per-commit replay entry, the
-// resulting diff carried every section whose `first_version > have_version`
-// — which, under a burst of N commits all sitting on the stream before the
-// subscriber drained any of them, caused "content bleed-through": the diff
-// labelled for seq=K contained sections added at seq=K+1..N as well.
-//
-// After M3, a per-commit replay's diff is bounded to `upper_version = K`
-// (today `compute_per_commit_diff_at_cut`). Sections with `first_version > K`
-// are excluded from the seq=K diff
-// so each message's content corresponds ONLY to that sequence_num's mutation.
-//
-// The bug is most reliably triggered by Regime 2 replay: apply N updates
-// sequentially (each adding a unique section), then subscribe with
-// `have_version = 1` so the subscriber triggers `catch_up_in_window`, which
-// computes a per-commit diff for each of the N retained stream entries
-// (`replay_commit_diff`: each from its own atomic read of the layer, whose cut
-// is the *current* post-N state, built by `compute_per_commit_diff_at_cut`),
-// then sends them. Without the bound, every replayed message carries all N
-// sections; with it, each replayed message carries only the one section it
-// introduced. The bound itself is unchanged since M3: `Some(upper_version)`
-// into the same diff planner.
-
 /// Parse an OMPF body from a subscriber message and return the list of
 /// (section_id, section_name) tuples carried by its OODF delta.
 ///
@@ -1856,101 +1866,6 @@ fn extract_diff_change_sections(ompf_bytes: &[u8]) -> Vec<(u64, String)> {
         }
     }
     out
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn regime2_replay_bounds_each_per_commit_to_its_own_sequence_num() {
-    const UPDATE_COUNT: u64 = 5;
-
-    let tv = PooledTestValkey::setup().await;
-    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-
-    let (session_id, object_id) =
-        create_session_and_layer_pooled(&tv, &svc, "m3-session", "m3-layer").await;
-
-    // Sequential writes — each adds a unique, identifiable section. After
-    // this block the server has accumulated all UPDATE_COUNT sections; the
-    // stream retains entries 2-0..UPDATE_COUNT+1-0, each labelled with the
-    // seq at which it committed.
-    for i in 0..UPDATE_COUNT {
-        let section_id = 700 + i;
-        let client_id = format!("writer-{i}");
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "m3-layer",
-            object_id,
-            &client_id,
-            section_id,
-        )
-        .await;
-    }
-
-    // Subscribe with have_version=1 — one past the CreateLayer seq but behind
-    // current. This triggers Regime 2 (in-window replay): the server issues
-    // XRANGE, gets UPDATE_COUNT entries, and reads and builds each commit's
-    // diff in a loop (`replay_commit_diff` → `compute_per_commit_diff_at_cut`)
-    // before sending them. Each build takes the M3 bound: without
-    // `upper_version = Some(seq)`, the diff built from the post-N atomic read
-    // bleeds sections from later seqs into the earlier messages.
-    let sub_req = subscribe_request(&session_id, "m3-layer", object_id, 1, "m3-sub");
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    // Collect UPDATE_COUNT per-commit messages (Regime 2 replays each entry
-    // as its own per-commit diff). Build seq -> sections map.
-    let mut sections_by_seq: std::collections::HashMap<u64, Vec<(u64, String)>> =
-        std::collections::HashMap::new();
-    for _ in 0..UPDATE_COUNT {
-        let (header, body) = recv_message(&mut stream).await;
-        let sections = extract_diff_change_sections(&body);
-        sections_by_seq.insert(header.sequence_num, sections);
-    }
-
-    // Observed seqs must be exactly 2..=UPDATE_COUNT+1, each exactly once.
-    let observed_seqs: std::collections::HashSet<u64> = sections_by_seq.keys().copied().collect();
-    let expected_seqs: std::collections::HashSet<u64> = (2..=UPDATE_COUNT + 1).collect();
-    assert_eq!(
-        observed_seqs,
-        expected_seqs,
-        "expected exactly seqs 2..={} once each, got {observed_seqs:?}",
-        UPDATE_COUNT + 1
-    );
-
-    // Section i was committed at seq i+2-700 — i.e. section_id 700+i was
-    // introduced by the (i+2)th sequence_num. Map seq -> expected section_id.
-    //
-    // With M3's upper_version bound, each per-commit diff carries ONLY the
-    // section introduced at that seq (first_version == seq <= upper_version).
-    // Without M3, the earliest replayed seq (=2) would scoop up every section
-    // whose first_version > have_version (1), i.e. ALL UPDATE_COUNT sections.
-    for (i, section_id) in (0..UPDATE_COUNT).map(|i| (i, 700 + i)) {
-        let seq = i + 2;
-        let sections = sections_by_seq
-            .get(&seq)
-            .unwrap_or_else(|| panic!("must have received per-commit for seq={seq}"));
-        assert_eq!(
-            sections.len(),
-            1,
-            "M3 bound violated: message at seq={seq} must carry exactly one \
-             section (the one introduced at that seq); got {} sections: {sections:?}. \
-             Without M3 this test fails — the earlier messages carry a superset \
-             of all sections added in seqs > have_version.",
-            sections.len()
-        );
-        let (sid, sname) = &sections[0];
-        assert_eq!(
-            *sid, section_id,
-            "seq={seq} must carry section {section_id}, got {sid}"
-        );
-        assert_eq!(
-            sname,
-            &format!("sec-{section_id}"),
-            "section_name at seq={seq} must match sec-{section_id}"
-        );
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2089,21 +2004,26 @@ async fn natural_out_of_window_without_explicit_xtrim_falls_into_regime3() {
         "coalesced Regime-3 diff body must be non-empty"
     );
 
-    // Regime 2 would deliver one message per retained entry (i.e. many
-    // messages); Regime 3 delivers exactly ONE coalesced diff followed by the
+    // Regime 3 delivers exactly ONE coalesced diff followed by the
     // exactly-once caught-up ack (`total_size==0`) emitted centrally by
-    // `run_catch_up` (b.dy5). For Regime 3 the terminator's `tracked_version`
-    // equals the coalesced header's `current_seq` (the whole catch-up was the
-    // one coalesced diff). After draining it the consumer opens at $, so a
-    // short quiescent window confirms Regime-3 semantics with no extra traffic.
+    // `run_catch_up` (b.dy5). The terminator's `tracked_version` equals the
+    // coalesced header's `current_seq` (the whole catch-up was the one
+    // coalesced diff). After draining it the consumer opens at $, so a short
+    // quiescent window confirms there is no extra traffic. Regime 2 sends the
+    // same one-diff shape, so the regime itself is read off its counter.
     recv_caught_up_ack(&mut stream, object_id, expected_current_seq).await;
     assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
+    await_regime(&svc, "out_of_window", "legacy", 1).await;
+    assert_eq!(
+        read_regime_total(&svc.metrics, &svc.service_label, "in_window", "legacy"),
+        0,
+        "the trimmed reconnect must not be served in window"
+    );
 
     // Reconstruct state-parity just enough to show the coalesced diff
     // carries substantive content — full parity is already covered by the
     // forced-XTRIM Regime-3 test above, so we keep this light.
-    let mut local_state = ObjectState::default();
-    apply_delta(&mut local_state, None).expect("seq=1 mirror");
+    let mut local_state = empty_create_state();
     apply_ompf_to_state(&mut local_state, &body);
     let server_snapshot =
         read_object_state_for_test(&svc.valkey, &svc.key_schema, &object_id.to_string())
@@ -2213,213 +2133,24 @@ async fn subscriber_claiming_version_ahead_of_server_is_acked_and_tails_from_tai
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 11. XRANGE COUNT boundary — gap > COUNT but still in-window — b.776 item 3
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// Regime 2's rollback-mode replay (this fixture runs rollback mode) reads the
-// in-window entries in pages, capped in all at `layer_stream_maxlen` entries
-// (see `in_window_xrange_count` and `read_in_window_replay` in
-// `src/grpc/subscribe.rs`). When a subscriber's gap is larger than that cap but
-// the stream still retains all entries (approximate `MAXLEN ~ N` trimming lets
-// small N coexist with more retained entries under Valkey's per-node
-// granularity), the replay under-replays — it reads only the first
-// cap's worth of entries. The steady-state consumer, positioned at the last replayed
-// entry id, must pick up the remainder via XREAD BLOCK so the subscriber
-// eventually reaches state parity.
-//
-// This test asserts the subscriber observes all M per-commit sequence_nums
-// contiguously, even when M > COUNT. Under approximate trim with MAXLEN=5 and
-// M=10 XADDs, Valkey does NOT clip any entries (trim only fires around the
-// ~100-entry node boundary), so the stream still holds all 10 entries. This
-// is the exact gap-> COUNT-but-in-window scenario the ticket calls out.
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn in_window_reconnect_with_gap_larger_than_xrange_count_still_catches_up() {
-    let tv = PooledTestValkey::setup().await;
-    // XRANGE COUNT = `layer_stream_maxlen` = 5. With M = 10 updates, the
-    // subscriber's gap (9 entries: seqs 2..=10 after CreateLayer's seq=1)
-    // exceeds COUNT, so the XRANGE slice returns only the first 5 (seqs
-    // 2..=6). The remaining 4 (seqs 7..=10) must reach the subscriber via
-    // the steady-state consumer.
-    const XRANGE_COUNT: u64 = 5;
-    // M = XRANGE_COUNT + 5 per the ticket recommendation.
-    const M: u64 = XRANGE_COUNT + 5;
-
-    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), XRANGE_COUNT);
-
-    let (session_id, object_id) = create_session_and_layer_pooled(
-        &tv,
-        &svc,
-        "count-boundary-session",
-        "count-boundary-layer",
-    )
-    .await;
-
-    // Apply M updates before subscribing. Each commit produces a unique
-    // section so per-commit diffs are non-empty.
-    for i in 0..M {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "count-boundary-layer",
-            object_id,
-            "writer-boundary",
-            2_000 + i,
-        )
-        .await;
-    }
-
-    // Precondition: the stream must still retain all entries — otherwise
-    // the subscriber would fall into Regime 3 and this test wouldn't
-    // exercise the COUNT-boundary. Approximate `MAXLEN ~ 5` only trims at
-    // Valkey's per-node boundary (~100 entries), so M+1=11 XADDs
-    // (CreateLayer 1-0 plus M=10 UpdateLayer entries) is far below the
-    // trim threshold and XLEN must equal M+1.
-    let stream_key = tv.key_schema().layer_stream(object_id);
-    let xlen: u64 = tv
-        .client()
-        .pool
-        .xlen(&stream_key)
-        .await
-        .expect("XLEN must succeed");
-    assert_eq!(
-        xlen,
-        M + 1,
-        "approximate MAXLEN ~ {XRANGE_COUNT} must NOT have clipped — M+1={} XADDs \
-         (CreateLayer 1-0 + {M} updates) sits well below Valkey's per-node trim \
-         threshold (~100). Got XLEN={xlen}. If this assertion fails, the test has \
-         drifted out of its designed regime.",
-        M + 1
-    );
-    // Verify entry 2-0 is present and is the second entry — so the
-    // subscriber's XRANGE from 2-0 will match and Regime 2 triggers.
-    // Decode field VALUEs as `Bytes`, not `String`: gRPC-path stream entries
-    // carry the binary `ompf` field (b.gze), which is not valid UTF-8 and
-    // fails `String` decode. This probe only inspects the entry ID.
-    let probe_2_0: Vec<(String, HashMap<String, Bytes>)> = tv
-        .client()
-        .pool
-        .xrange_values(&stream_key, "2-0", "2-0", Some(1))
-        .await
-        .expect("XRANGE probe must succeed");
-    assert_eq!(
-        probe_2_0.first().map(|(id, _)| id.as_str()),
-        Some("2-0"),
-        "entry 2-0 must still be on the stream so Regime 2 is selected"
-    );
-
-    // Subscribe with have_version=1 → XRANGE from 2-0 with COUNT=5 returns
-    // entries 2-0..6-0. The in-window branch opens the steady-state consumer
-    // at entry id 6-0, computes a per-commit diff for each (seqs 2..=6), then
-    // sends them. The consumer must then deliver 7-0..(M+1)-0 via XREAD
-    // BLOCK.
-    let sub_req = subscribe_request(
-        &session_id,
-        "count-boundary-layer",
-        object_id,
-        1,
-        "sub-boundary",
-    );
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    // GUARDRAIL (b.dy5): the in-window catch-up terminator must carry the
-    // last *replayed* endpoint (`tracked_version`), NOT a recomputed
-    // `current_seq`. The XRANGE slice under-replays — COUNT=5 returns seqs
-    // 2..=6 only — so the catch-up phase ends at the under-replayed endpoint
-    // (seq 6), STRICTLY LESS THAN the layer header's current_seq (M+1=11). The
-    // exactly-once caught-up ack `run_catch_up` now emits must land BETWEEN the
-    // in-window replay and the steady-state remainder, and it must echo seq=6.
-    // Acking current_seq (11) here would make the client treat the unreplayed
-    // real edits (seqs 7..=11) as already-seen — the precise regression this
-    // pins.
-    //
-    // Phase 1 — Regime-2 in-window replay: exactly XRANGE_COUNT per-commit
-    // diffs, contiguous seqs 2..=(XRANGE_COUNT+1) = 2..=6.
-    let mut replayed_seqs = Vec::with_capacity(XRANGE_COUNT as usize);
-    for _ in 0..XRANGE_COUNT {
-        let (header, body) = recv_message(&mut stream).await;
-        replayed_seqs.push(header.sequence_num);
-        assert_eq!(header.object_id, object_id);
-        assert!(
-            header.total_size > 0,
-            "in-window per-commit diff must carry content (total_size > 0)"
-        );
-        assert!(
-            !body.is_empty(),
-            "every in-window per-commit diff must be non-empty"
-        );
-    }
-    let replay_expected: Vec<u64> = (2..=XRANGE_COUNT + 1).collect();
-    assert_eq!(
-        replayed_seqs, replay_expected,
-        "Regime-2 replay must deliver the first XRANGE_COUNT entries (seqs {:?}) \
-         before the under-replay terminator",
-        replay_expected
-    );
-
-    // Phase 2 — the caught-up terminator. Its sequence_num is the last
-    // *replayed* endpoint (the XRANGE slice's last entry, seq=6), which is
-    // STRICTLY LESS THAN the layer's current_seq (M+1). This inequality is the
-    // core of the guardrail: it proves the terminator carries `tracked_version`
-    // and not `current_seq`.
-    let under_replayed_endpoint = XRANGE_COUNT + 1; // last replayed seq = 6
-    let current_seq = M + 1; // layer header's current sequence_num = 11
-    assert!(
-        under_replayed_endpoint < current_seq,
-        "test precondition: under-replayed endpoint ({under_replayed_endpoint}) must be \
-         strictly less than current_seq ({current_seq}) for this guardrail to mean anything"
-    );
-    let ack = recv_caught_up_ack(&mut stream, object_id, under_replayed_endpoint).await;
-    assert!(
-        ack.sequence_num < current_seq,
-        "caught-up terminator must carry the under-replayed endpoint \
-         ({under_replayed_endpoint}), strictly less than current_seq ({current_seq}); \
-         got {} — acking current_seq would silently skip the unreplayed real edits",
-        ack.sequence_num
-    );
-
-    // Phase 3 — steady-state remainder: the consumer, positioned at the last
-    // replayed entry id, picks up seqs 7..=(M+1) via XREAD BLOCK.
-    let mut remainder_seqs = Vec::with_capacity((M - XRANGE_COUNT) as usize);
-    for _ in 0..(M - XRANGE_COUNT) {
-        let (header, body) = recv_message(&mut stream).await;
-        remainder_seqs.push(header.sequence_num);
-        assert_eq!(header.object_id, object_id);
-        assert!(
-            !body.is_empty(),
-            "every steady-state per-commit diff must be non-empty"
-        );
-    }
-    let remainder_expected: Vec<u64> = (XRANGE_COUNT + 2..=M + 1).collect();
-    assert_eq!(
-        remainder_seqs, remainder_expected,
-        "steady-state consumer must pick up the remainder (seqs {:?}) AFTER the \
-         caught-up terminator, so the subscriber still reaches contiguous parity \
-         across the XRANGE boundary",
-        remainder_expected
-    );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // 12. b.q2f — overwrite-rebootstrap against a saturated subscriber_pool
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// An overwrite makes the subscribe handler unregister its consumer and
-// register a new one under the same RPC-lifetime admission. Two sites do it:
+// An overwrite makes the subscribe handler give up the OLD object's stream and
+// register the new one under the same RPC-lifetime admission. Two sites do it:
 //
-//   * `catch_up_in_window` when an in-window `XRANGE` slice contains a
-//     `deleted` sentinel mid-slice.
+//   * `catch_up_in_window` when its in-window point read
+//     (`read_in_window_point`) finds a `deleted` sentinel as the stream's last
+//     entry — the only place a sentinel can sit. It drops its catch-up slot
+//     and its OLD stream-reader reservation; no consumer is registered yet.
 //   * `run_steady_state` when an already-active subscriber receives
-//     `LayerNotification::Deleted` from its consumer.
+//     `LayerNotification::Deleted` from its consumer. It calls
+//     `consumer.shutdown_and_release()`.
 //
-// Both call `consumer.shutdown_and_release()` and then
-// `handle_deleted_and_rebootstrap` → `catch_up_brand_new` → `open_consumer`,
-// which registers the new generation's stream with the multiplexer — taking
-// no second admission, which is what keeps the re-bootstrap from competing at
-// admission with new arrivals.
+// Both then call `handle_deleted_and_rebootstrap` → `catch_up_brand_new`,
+// which reserves and registers the new generation's stream with the
+// multiplexer — taking no second admission, which is what keeps the
+// re-bootstrap from competing at admission with new arrivals.
 //
 // `tests/integration/storage/stream_consumer_test.rs` pins the consumer-level
 // halves on their own (re-bootstrap and end-of-subscription churn, the
@@ -2435,23 +2166,18 @@ async fn in_window_reconnect_with_gap_larger_than_xrange_count_still_catches_up(
 //      flips `old → new`, and `deleted` is XADDed to the old per-object
 //      stream. Each subscriber's consumer delivers the sentinel, at which
 //      point `run_steady_state` runs `consumer.shutdown_and_release()` and
-//      then `handle_deleted_and_rebootstrap` → `catch_up_brand_new` →
-//      `open_consumer`.
+//      then `handle_deleted_and_rebootstrap` → `catch_up_brand_new`, which
+//      registers the new object's stream at its proven read's cut.
 //   3. Every subscriber must land on the new generation promptly.
 //
-// Note on the `catch_up_in_window` mid-slice variant: the ticket specifically
-// calls out `catch_up_in_window` hitting `deleted` mid-slice as the uncovered
-// scenario. Triggering that variant deterministically requires the
-// subscriber's `get_layer_mapping` to observe the OLD mapping while the
-// subscriber's subsequent `XRANGE` sees the `deleted` sentinel appended by a
-// concurrent overwrite — a real-production race but one that cannot be
-// reproduced without a fault-injection seam between those two calls (none
-// exists in the subscribe handler, and adding one is out-of-scope for this
-// test-only ticket). The `catch_up_in_window` and `run_steady_state`
-// `Deleted` handlers share the same `shutdown_and_release →
-// handle_deleted_and_rebootstrap → catch_up_brand_new → open_consumer`
-// chain, so exercising the steady-state variant covers the same chain
-// end-to-end.
+// Note on the `catch_up_in_window` sentinel variant: triggering it requires
+// the subscriber's `get_layer_mapping` and header read to observe the OLD
+// object while its subsequent in-window point read sees the `deleted`
+// sentinel appended by a concurrent overwrite — a real-production race that
+// needs a fault-injection seam between those reads. This test exercises the
+// steady-state variant only; both variants share the
+// `handle_deleted_and_rebootstrap → catch_up_brand_new` chain. The catch-up
+// variant has its own test in section 13, on the `CatchUpXrangeSeam`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn overwrite_rebootstrap_against_saturated_subscriber_pool_completes_promptly() {
@@ -2596,15 +2322,14 @@ async fn overwrite_rebootstrap_against_saturated_subscriber_pool_completes_promp
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 13. Literal `catch_up_in_window` mid-slice `Deleted` handler (b.fdy)
+// 13. Literal `catch_up_in_window` deleted-sentinel handler (b.fdy)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // The b.q2f ticket asked for an integration test that exercises the
-// `catch_up_in_window` mid-slice `Deleted` handler — the specific scenario
-// where an in-window replay's `xrange_values` slice contains the overwrite's
-// `deleted` sentinel, the handler calls `consumer.shutdown_and_release()`, and
-// re-bootstraps via
-// `handle_deleted_and_rebootstrap → catch_up_brand_new → open_consumer`.
+// `catch_up_in_window` `Deleted` handler — the specific scenario where the
+// in-window point read finds the overwrite's `deleted` sentinel as the
+// stream's last entry, past the reconnect's position, and the catch-up
+// re-bootstraps via `handle_deleted_and_rebootstrap → catch_up_brand_new`.
 //
 // b.q2f's test writer could not trigger that path deterministically
 // without a production-side fault-injection seam between
@@ -2621,44 +2346,42 @@ async fn overwrite_rebootstrap_against_saturated_subscriber_pool_completes_promp
 //   3. Spawn subscriber with `have_object_id=old_object_id`,
 //      `have_version=1`. Its `run_catch_up` runs
 //      `get_layer_mapping` → OLD, `read_object_header` → current_seq=3,
-//      then parks at the seam (before `xrange_values`).
+//      then parks at the seam (before the in-window stream read).
 //   4. From the test, arrive at the seam's first rendezvous to confirm
 //      the subscriber is parked. Then fire a `CreateLayer` overwrite
 //      (new object_id, mapping flips, `XADD deleted` appended to the
 //      OLD stream). Then arrive at the seam's second rendezvous to
 //      release the subscriber.
-//   5. Subscriber's `xrange_values` slice now contains [2-0, 3-0,
-//      <deleted>]. The Regime-2 rollback replay parses the slice and scans it
-//      for a `LayerNotification::Deleted` sentinel BEFORE it opens a consumer,
-//      computes a diff or sends anything. The scan hits the mid-slice
-//      sentinel, releases the catch-up slot and runs
+//   5. The OLD stream now holds [2-0, 3-0, <deleted>]. The in-window point
+//      read (`read_in_window_point`) finds `2-0` — in window — and the
+//      `deleted` sentinel as the stream's last entry, which
+//      `catch_up_in_window` acts on BEFORE any state read, build or send:
+//      it releases the catch-up slot and runs
 //      `handle_deleted_and_rebootstrap → catch_up_brand_new`, so the
 //      subscriber's first message is the Regime-1 full-state header for the
-//      NEW object, then its caught-up ack — and the OLD object's commits 2
-//      and 3 are never sent: the new object's full state supersedes them, and
-//      sending them first would put content ahead of the re-bootstrap's
-//      capacity waits.
+//      NEW object, then its caught-up ack — and nothing of the OLD object is
+//      ever sent: the new object's full state supersedes it, and sending it
+//      first would put content ahead of the re-bootstrap's capacity waits.
 //
 // Pre-seam, this test could not be written: there was no way to make
-// `get_layer_mapping` observe OLD and `xrange_values` observe `deleted`
+// `get_layer_mapping` observe OLD and the stream read observe `deleted`
 // deterministically. The seam closes that gap and lets the test prove
-// the literal mid-slice handler — not just its steady-state sibling —
+// the in-window `Deleted` handler — not just its steady-state sibling —
 // runs through the full rebootstrap chain correctly.
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
+async fn catch_up_in_window_deleted_sentinel_triggers_rebootstrap() {
     let tv = PooledTestValkey::setup().await;
 
     // Install a hold gate on the overwrite's spawned `cleanup_old_object`
     // task so the OLD object's data survives until the subscriber has
-    // finished. That keeps every OLD commit computable, which is what makes
-    // "no OLD message was sent" mean something: were the replay to compute
-    // and send before acting on the sentinel, the intact data would let it.
-    // Without the gate the cleanup could UNLINK the OLD header first and a
-    // compute would answer `NotFound` instead — the Site A path the
-    // between-computes test drives. The test releases the gate only after the
-    // subscriber has finished.
+    // finished. That keeps the OLD object readable, which is what makes
+    // "no OLD message was sent" mean something: were the catch-up to read,
+    // build and send before acting on the sentinel, the intact data would let
+    // it. Without the gate the cleanup could UNLINK the OLD header first and
+    // the read would answer `NotFound` instead — section 13b's ordering. The
+    // test releases the gate only after the subscriber has finished.
     let cleanup_gate = Arc::new(tokio::sync::Barrier::new(2));
     let layer_store = Arc::new(
         LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096)
@@ -2678,12 +2401,12 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
     let (session_id, old_object_id) =
         create_session_and_layer_pooled(&tv, &svc, "fdy-session", "fdy-layer").await;
 
-    // Commit two updates so the subscriber's in-window slice has real
-    // entries at `{have_version+1}-0 = 2-0` and `3-0` BEFORE the `deleted`
-    // sentinel appended by the overwrite. Without at least one real entry
-    // at `2-0`, `catch_up_in_window`'s first-entry-ID check would miss and
-    // the subscriber would fall through to Regime 3 (coalesced diff) — not
-    // the path we're exercising.
+    // Commit two updates so the OLD stream holds real entries at
+    // `{have_version+1}-0 = 2-0` and `3-0` BEFORE the `deleted` sentinel
+    // appended by the overwrite. Without an entry at `2-0`, the in-window
+    // point read (`read_in_window_point`) would miss and the subscriber
+    // would fall through to Regime 3 (`catch_up_out_of_window`) — not the
+    // path we're exercising.
     apply_unique_update(
         &svc,
         &session_id,
@@ -2723,7 +2446,7 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
 
         // The first message is whatever the catch-up sent first: the
         // Regime-1 full-state header for the NEW object when the sentinel is
-        // acted on before any content, an OLD per-commit replay otherwise.
+        // acted on before any content, OLD content otherwise.
         let (first, _body) = recv_message(&mut stream).await;
         ((first.object_id, first.sequence_num), stream)
     });
@@ -2731,7 +2454,7 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
     // Rendezvous 1: wait for the subscriber to park at the seam. After
     // `wait_until_parked` returns we KNOW the subscriber has resolved
     // `get_layer_mapping` → OLD and read `read_object_header(OLD)` → seq=3,
-    // and is blocked just before `xrange_values`. Firing the overwrite only
+    // and is blocked just before its in-window stream read. Firing the overwrite only
     // now guarantees those two reads observed the pre-overwrite state — the
     // subscriber cannot instead take the brand-new / NotFound path and skip
     // the seam (the deadlock the single-barrier design risked).
@@ -2747,7 +2470,7 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
     //     release the subscriber)
     //   * spawns `cleanup_old_object` — which immediately blocks on
     //     `cleanup_gate`, so the OLD object's data is guaranteed intact for
-    //     the subscriber's replay until we release the gate below.
+    //     the subscriber's catch-up until we release the gate below.
     let overwrite_ompf = delta_to_ompf_bytes(&crate::common::owned_delta::empty_delta(), &[]);
     let overwrite_stream = streaming_create(vec![
         make_create_header(&session_id, "fdy-layer"),
@@ -2763,12 +2486,12 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
         "overwrite must allocate a fresh object_id"
     );
 
-    // Rendezvous 2: release the subscriber. It issues `xrange_values` on the
-    // OLD stream, which sees entries [2-0, 3-0, <deleted>] — the `deleted`
-    // sentinel is what the overwrite XADDed above. Because `cleanup_gate`
-    // still holds the cleanup task, the OLD object's data is intact, so the
-    // only thing that can keep commits 2 and 3 off the wire is the up-front
-    // sentinel scan, which re-bootstraps onto the NEW object.
+    // Rendezvous 2: release the subscriber. Its in-window point read on the
+    // OLD stream sees [2-0, 3-0, <deleted>] — the `deleted` sentinel is what
+    // the overwrite XADDed above. Because `cleanup_gate` still holds the
+    // cleanup task, the OLD object's data is intact, so the only thing that
+    // can keep OLD content off the wire is acting on the sentinel up front,
+    // which re-bootstraps onto the NEW object.
     seam.release().await;
 
     // The subscriber's first message, bounded by a generous timeout so a
@@ -2795,12 +2518,12 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
         (new_object_id, 1),
         "the first message must be the Regime-1 full-state header for the NEW object at seq=1: \
          a `deleted` sentinel in the retained window re-bootstraps before any content. Seeing \
-         the OLD object ({old_object_id}) here means its commits were replayed first"
+         the OLD object ({old_object_id}) here means its content was sent first"
     );
     recv_caught_up_ack(&mut stream, new_object_id, 1).await;
 
     // Nothing from the OLD object follows either. A commit on the NEW object
-    // is the next message, so no OLD replay can sit between the ack and it.
+    // is the next message, so no OLD content can sit between the ack and it.
     apply_unique_update(
         &svc,
         &session_id,
@@ -2824,29 +2547,31 @@ async fn catch_up_in_window_mid_slice_deleted_triggers_rebootstrap() {
 //
 // b.jvx: the failure shape the issue body describes — the OLD object's data
 // keys are already UNLINKed when the in-window reconnect reaches them. Section
-// 13 holds the cleanup back so the OLD object stays computable; this test
+// 13 holds the cleanup back so the OLD object stays readable; this test
 // forces the OPPOSITE ordering — cleanup wins, so the OLD header / section
-// indices / etc. are gone by the time the subscriber reads its slice.
-// Pre-b.jvx, the per-commit replay's first compute against OLD surfaced that
+// indices / etc. are gone by the time the subscriber reads the stream.
+// Pre-b.jvx, the in-window catch-up's first read against OLD surfaced that
 // as `Status { code: NotFound, message: "object N not found" }` to the client.
 //
-// The rollback replay now scans the parsed slice for a `deleted` sentinel
-// BEFORE it computes any per-commit diff, so here — the slice is
-// [2-0, <deleted>] — the scan is what re-bootstraps, and the first compute
-// against the cleaned-up OLD object never runs. What this test pins is the
-// outcome both orderings owe: the first message is the NEW object's
-// full-state header, with no OLD content and no `NotFound` ahead of it. The
-// per-commit compute's own `NotFound` classifier (Site A — a slice with no
-// sentinel, the OLD state UNLINKed between two computes) is driven by
-// `an_in_window_replay_whose_state_is_cleaned_up_between_computes_rebootstraps_before_content`
-// in `subscribe_capacity_budget_test.rs`, parked at the between-computes seam.
+// `catch_up_in_window` acts on a `deleted` sentinel at the stream's end
+// BEFORE any state read, so here — the stream is [2-0, <deleted>] — the
+// sentinel is what re-bootstraps, and no read against the cleaned-up OLD
+// object runs. What this test pins is the outcome both orderings owe: the
+// first message is the NEW object's full-state header, with no OLD content
+// and no `NotFound` ahead of it. A `NotFound` from the in-window catch-up's
+// own state read (no sentinel, the OLD state UNLINKed before the read) is
+// covered elsewhere: with a restore, by
+// `b21r_recovery_policy::in_window_snapshot_coalesced_read_restored_retries_once_and_serves_the_same_object`;
+// with no recovery, re-bootstrapping onto the overwrite's NEW object, by
+// `subscribe_capacity_budget_test::a_catch_up_that_rebootstraps_before_its_first_ack_completes_one_first_catch_up`.
+// Sections 16–17 cover the out-of-window catch-up's `NotFound`.
 //
 // Ordering trick: between firing the overwrite and releasing the seam,
 // call `wait_for_cleanup` on the layer store. `wait_for_cleanup`
-// (storage/layer.rs:652) blocks until the spawned `cleanup_old_object`
+// blocks until the spawned `cleanup_old_object`
 // task has drained — at which point the OLD object's header has been
 // UNLINKed (the per-object stream itself survives 30 s via PEXPIRE, see
-// `STREAM_DELETE_GRACE_MS`, so the subscriber's subsequent `xrange_values`
+// `STREAM_DELETE_GRACE_MS`, so the subscriber's subsequent stream read
 // against OLD still returns the retained entries). Only THEN do we
 // release the seam.
 //
@@ -2861,8 +2586,8 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
     let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     // Install the b.fdy seam so the subscriber parks between
-    // `read_object_header(OLD)` and `xrange_values(OLD)` — the window in
-    // which the test fires the overwrite + drains cleanup.
+    // `read_object_header(OLD)` and its in-window stream read of OLD — the
+    // window in which the test fires the overwrite + drains cleanup.
     let seam = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
     svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&seam));
     let svc = Arc::new(svc);
@@ -2870,11 +2595,10 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
     let (session_id, old_object_id) =
         create_session_and_layer_pooled(&tv, &svc, "jvx-a-session", "jvx-a-layer").await;
 
-    // Commit ONE update so the in-window slice starts at the
-    // `have_version+1 = 2-0` boundary the subscriber expects. Without at
-    // least one real entry at 2-0, `catch_up_in_window`'s first-entry-ID
-    // check would miss and Regime 3 (out_of_window) would take over —
-    // wrong path. One update is enough: the slice is then [2-0, <deleted>].
+    // Commit ONE update so the stream holds the `have_version+1 = 2-0` entry
+    // the subscriber expects. Without a real entry at 2-0 the in-window point
+    // read would miss and Regime 3 (out_of_window) would take over — wrong
+    // path. One update is enough: the stream is then [2-0, <deleted>].
     apply_unique_update(
         &svc,
         &session_id,
@@ -2887,7 +2611,7 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
 
     // Spawn subscriber: have_object_id=OLD, have_version=1. Its
     // `run_catch_up_inner` resolves mapping → OLD, reads header (seq=2),
-    // then parks at the seam BEFORE issuing `xrange_values`.
+    // then parks at the seam BEFORE its in-window stream read.
     let sub_svc = Arc::clone(&svc);
     let sub_session_id = session_id.clone();
     let sub_task = tokio::spawn(async move {
@@ -2905,9 +2629,9 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
 
         // The subscriber's first header is the Regime-1 full-state header
         // for the NEW object delivered by the rebootstrap chain (followed by
-        // the b.rdr caught-up ack). A replay that computed against the
-        // cleaned-up OLD object and let its `NotFound` through would instead
-        // surface `Status::not_found("object N not found")` as a stream error.
+        // the b.rdr caught-up ack). A catch-up that read the cleaned-up OLD
+        // object and let its `NotFound` through would instead surface
+        // `Status::not_found("object N not found")` as a stream error.
         let (header, _body) = recv_message(&mut stream).await;
         let first = (header.object_id, header.sequence_num);
 
@@ -2916,9 +2640,9 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
         // for stray messages so the ack is not misread as a leak.
         recv_caught_up_ack(&mut stream, header.object_id, header.sequence_num).await;
 
-        // Actively probe for a further message. If the replay were allowed
-        // to send a per-commit diff against OLD before pivoting to
-        // rebootstrap, an extra message would land here.
+        // Actively probe for a further message. If the catch-up were allowed
+        // to send OLD content before pivoting to rebootstrap, an extra
+        // message would land here.
         // `assert_no_next_message` waits the full window and panics on any
         // arrival (header OR stream error), turning the absence-of-leak
         // claim into a real probe instead of a tautology over the loop bound.
@@ -2937,7 +2661,7 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
 
     // Fire the CreateLayer overwrite while the subscriber is parked at
     // the seam (`wait_until_parked` above guarantees the subscriber has NOT
-    // yet issued its `xrange_values` call). The overwrite:
+    // yet issued its in-window stream read). The overwrite:
     //   * allocates NEW object_id
     //   * sets the layer mapping → NEW (inside MULTI/EXEC)
     //   * `XADD * payload deleted` on the OLD stream (after MULTI/EXEC)
@@ -2963,26 +2687,25 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
     // time-samples / deleted-sections indices) have been UNLINKed.
     // Critically, the OLD per-object STREAM is NOT UNLINKed — it's
     // PEXPIRE'd with `STREAM_DELETE_GRACE_MS = 30_000` so the subscriber's
-    // subsequent `xrange_values(OLD)` still returns [2-0, <deleted>].
+    // subsequent stream read of OLD still finds [2-0, <deleted>].
     //
     // This is the load-bearing ordering step that distinguishes this
     // test from the section-13 variant: section 13 holds the cleanup back
-    // so the OLD object stays computable; here we force cleanup to win, so
-    // any per-commit compute against OLD would answer `NotFound`.
+    // so the OLD object stays readable; here we force cleanup to win, so
+    // any state read against OLD would answer `NotFound`.
     svc.layer_store.wait_for_cleanup(SUBSCRIBER_DEADLINE).await;
 
-    // Release the subscriber. Its `xrange_values(OLD)` returns
-    // [2-0, <deleted>]. The rollback replay parses the slice and scans it
-    // for a `deleted` sentinel before computing anything; the scan hits it,
-    // releases the catch-up slot and runs
-    // `handle_deleted_and_rebootstrap(ctx, OLD)` → mapping re-lookup returns
-    // NEW → `catch_up_brand_new(NEW)` → Regime-1 full-state header for NEW at
-    // seq=1. No per-commit compute against the cleaned-up OLD object runs.
+    // Release the subscriber. Its in-window point read of OLD finds 2-0 and
+    // the `deleted` sentinel at the stream's end; `catch_up_in_window` acts
+    // on the sentinel before any state read, releases the catch-up slot and
+    // runs `handle_deleted_and_rebootstrap(ctx, OLD)` → mapping re-lookup
+    // returns NEW → `catch_up_brand_new(NEW)` → Regime-1 full-state header
+    // for NEW at seq=1. No read against the cleaned-up OLD object runs.
     seam.release().await;
 
     // The subscriber task receives the first header, then runs
     // `assert_no_next_message` for 500 ms to prove no second message
-    // (per-commit replay against OLD, stray Status error, etc.) leaks
+    // (OLD content, stray Status error, etc.) leaks
     // through before returning. The SUBSCRIBER_DEADLINE ceiling covers the
     // first-message wait plus the 500 ms second-message probe plus scheduling
     // slack, with generous headroom under heavy parallel load.
@@ -3000,14 +2723,14 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
             "subscriber task panicked — either `recv_message` saw a Status error on the first \
              message (a NotFound from the cleaned-up OLD object propagated to the client), or \
              `assert_no_next_message` observed a second message after the rebootstrap header \
-             (the replay sent a diff against OLD before pivoting to the re-bootstrap)",
+             (the catch-up sent OLD content before pivoting to the re-bootstrap)",
         );
 
     // The re-bootstrap produces the Regime-1 full-state header for the NEW
     // object at seq=1 (delivered via `handle_deleted_and_rebootstrap →
     // catch_up_brand_new`), followed by the b.rdr total_size==0 caught-up
-    // ack on the NEW object. No per-commit replay against OLD is delivered:
-    // the sentinel scan re-bootstraps before any compute or send. The
+    // ack on the NEW object. No OLD content is delivered: the sentinel
+    // re-bootstraps before any read, build or send. The
     // "header + ack, nothing else" invariant is enforced inside the spawned
     // task (the explicit `recv_caught_up_ack` drain plus
     // `assert_no_next_message`); here we only need to confirm the full-state
@@ -3029,7 +2752,7 @@ async fn catch_up_in_window_after_cleanup_raced_ahead_rebootstraps_before_any_co
 // Sanity: with no seam installed, `run_catch_up` runs exactly as release
 // builds do — the b.fdy cfg-gated `if let Some(seam) = ...` is a no-op.
 // Covers the compile-time contract that the seam doesn't regress the
-// default path, separate from the mid-slice Deleted variant above.
+// default path, separate from the deleted-sentinel variant in section 13.
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3055,10 +2778,10 @@ async fn catch_up_in_window_seam_is_inert_when_not_installed() {
     )
     .await;
 
-    // Regime-2 subscribe with `have_version=1` expects a single per-commit
-    // replay for seq=2 — the normal in-window path — with no wait and no
-    // rebootstrap. Any hang here would indicate the cfg-gated seam branch
-    // somehow fired on a `None` seam.
+    // Regime-2 subscribe with `have_version=1` expects one coalesced diff at
+    // seq=2 — the normal in-window path — with no wait and no rebootstrap.
+    // Any hang here would indicate the cfg-gated seam branch somehow fired on
+    // a `None` seam.
     let sub_req = subscribe_request(
         &session_id,
         "fdy-inert-layer",
@@ -3077,7 +2800,7 @@ async fn catch_up_in_window_seam_is_inert_when_not_installed() {
 
     let (header, _body) = tokio::time::timeout(Duration::from_secs(2), recv_message(&mut stream))
         .await
-        .expect("per-commit replay must not hang when seam is not installed");
+        .expect("the in-window catch-up must not hang when seam is not installed");
     assert_eq!(header.object_id, object_id);
     assert_eq!(header.sequence_num, 2);
 }
@@ -3086,7 +2809,7 @@ async fn catch_up_in_window_seam_is_inert_when_not_installed() {
 // 15. b.jvx Site B — `run_catch_up_inner` initial header-read NotFound
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Mirrors the section-13b Site A test for the b.jvx Site B classifier on
+// Mirrors the section-13b test for the b.jvx Site B classifier on
 // `run_catch_up_inner`'s same-object `read_object_header(OLD)` call, which runs
 // under `read_state_with_recovery`: its `NotFound` takes the recovery hook and,
 // failing it, `handle_deleted_and_rebootstrap(...)`. Drives the test through
@@ -3254,7 +2977,7 @@ async fn run_catch_up_inner_header_notfound_after_cleanup_triggers_rebootstrap()
 // 16. b.jvx Site C arm 1 — `catch_up_out_of_window` NotFound at its atomic read
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Mirrors the section-13b Site A test for the b.jvx Site C classifier on
+// Mirrors the section-13b test for the b.jvx Site C classifier on
 // `catch_up_out_of_window`'s state read — today the catch-up's proven read
 // (`catch_up_proven_read`: a read permit, then the atomic read) under
 // `read_state_with_recovery`, whose `NotFound` takes the recovery hook and,
@@ -3262,14 +2985,13 @@ async fn run_catch_up_inner_header_notfound_after_cleanup_triggers_rebootstrap()
 // `handle_deleted_and_rebootstrap(...)`. Drives the test through
 // `CatchUpOutOfWindowSeam::new_before_header_read` (b.xmk), which parks the
 // subscriber in `catch_up_out_of_window` after the caller's reader
-// reservation (in this rollback-mode fixture, taken under the slot) and before
-// the read permit and the atomic read. Nothing is registered and nothing has
+// reservation and before the read permit and the atomic read. Nothing is registered and nothing has
 // been read from OLD's state when it parks.
 //
 // Out-of-window regime is forced by the MAXLEN=4 + 5 update + `have_version=1`
 // pattern: by the time the subscriber subscribes, the stream's
 // `start_id = have_version+1 = 2-0` entry has been evicted by `XADD MAXLEN ~`
-// trimming, so `xrange_values` mis-aligns and `run_catch_up_inner` falls
+// trimming, so the in-window point read misses and `run_catch_up_inner` falls
 // through to `catch_up_out_of_window` (this mirrors the existing
 // out-of-window test `out_of_window_reconnect_coalesces_and_reaches_state_parity`).
 //
@@ -3315,7 +3037,7 @@ async fn catch_up_out_of_window_header_notfound_after_cleanup_triggers_rebootstr
     }
 
     // Deterministically force `2-0` out of the window so the subscriber's
-    // `xrange_values(start=2-0)` in `run_catch_up_inner` mis-aligns and
+    // in-window point read for `2-0` in `run_catch_up_inner` misses and
     // `catch_up_out_of_window` takes over. Mirrors the same XTRIM trick the
     // existing out-of-window test
     // (`out_of_window_reconnect_coalesces_and_reaches_state_parity`) uses.
@@ -3329,7 +3051,7 @@ async fn catch_up_out_of_window_header_notfound_after_cleanup_triggers_rebootstr
         .expect("XTRIM to force out-of-window must succeed");
 
     // Spawn subscriber with have_object_id=OLD, have_version=1. The
-    // mapping → OLD path matches, the in-window slice mis-aligns (start_id
+    // mapping → OLD path matches, the in-window point read misses (start_id
     // 2-0 evicted), and `run_catch_up_inner` falls through to
     // `catch_up_out_of_window`. It then reserves its stream reader and parks
     // at the Site C arm-1 seam BEFORE its atomic read of OLD.
@@ -3503,7 +3225,7 @@ async fn catch_up_out_of_window_compute_diff_notfound_after_cleanup_triggers_reb
 
     // Spawn subscriber with have_object_id=OLD, have_version=1. By the time
     // the arm-2 seam fires, the subscriber has already executed:
-    //   1. its stream-reader reservation (under the slot, in rollback mode)
+    //   1. its stream-reader reservation
     //   2. arm-1 seam — auto-completes via a 1-party `Barrier::new(1)`
     //      (b.m52 hardening). `new_before_compute_diff` populates
     //      `park_before_header_read` with a single-party barrier so the
@@ -4033,8 +3755,8 @@ async fn steady_state_relays_field_only_move_verbatim() {
 }
 
 // (c) Burst-no-coalesce: rapid same-field updates each relay their OWN commit
-//     rather than coalescing to an empty broadcast (the prior compute_diff_at_cut
-//     window-filter symptom). Each broadcast body must be non-empty and decode
+//     rather than coalescing to an empty broadcast (the window-filter symptom
+//     of the reconstructed steady state this relay replaced). Each broadcast body must be non-empty and decode
 //     to the field set on THAT commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steady_state_burst_relays_each_commit_no_coalesce() {
@@ -4243,10 +3965,6 @@ async fn apply_empty_update(
 //     it: 1 after the catch-up, 4 after B's relayed commit, 6 after A's own
 //     suppressed write. That base is A's tracked version, so the relay and
 //     self-echo arms must each advance it.
-//
-//     The bound of a per-commit diff to its own commit is pinned on the
-//     rollback replay, the one path left that rebuilds a commit from a read
-//     (`regime2_replay_bounds_each_per_commit_to_its_own_sequence_num`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steady_state_empty_commit_is_delivered_as_the_empty_delta_and_never_skipped() {
     const LAYER: &str = "empty-commit-layer";
@@ -4593,31 +4311,23 @@ async fn steady_state_relay_path_suppresses_self_echo() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 8. Catch-up regime switch (Plan b.msb, Task 3): off = unchanged legacy
-//    full-content; snapshot = corrected faithful full-state create.
+// 8. Brand-new catch-up (Plan b.msb, Task 3): the faithful full-state create.
 //
-// `LiveEditService.catchup_snapshot_enabled` gates `send_full_state` in
-// `src/grpc/subscribe.rs`: `Off` (default) runs today's legacy `compute_diff_at_cut`
-// full-content path, `Snapshot` routes to Task 2's `compute_faithful_full_content_at_cut`
-// builder. These two tests pin the wiring/dispatch + invariant preservation:
-//   - off  → byte-for-byte today's brand-new catch-up (SR-1.2 via reconstruction).
-//   - snapshot → still a valid from-empty full-state create (is_diff=true,
-//     base_version=0) with the caught-up terminator (total_size==0) preserved
-//     (SDD §12.3), AND the corrected builder is proven routed via the faithful
-//     authoring `set_order` marker (vs the legacy cumulative cursor).
+// `send_full_state` in `src/grpc/subscribe.rs` builds a brand-new subscriber's
+// message #1 with `compute_faithful_full_content_at_cut`. This test pins the
+// wiring + invariant preservation: still a valid from-empty full-state create
+// (is_diff=true, base_version=0) with the caught-up terminator
+// (total_size==0) preserved (SDD §12.3), AND the faithful builder is proven
+// routed via its dense-unique `set_order` marker (vs the stored cumulative
+// cursor a reconstruction of stored state would emit).
 //
 // The heavier end-to-end multi-commit establishment + no-wipe correctness
-// assertions (SR-6.3 / SR-3.1) are Task 4 — deliberately NOT duplicated here.
-//
-// `catchup_snapshot_enabled` is a PUBLIC field and the fixture builds the service by
-// value, so mode selection is local to THIS file: build the service, then flip
-// the field on the owned instance before serving. The shared `helpers.rs`
-// signature is untouched (a sibling test relies on it) and every pre-existing
-// test in this file keeps the default `Off`, so none of them change behaviour.
+// assertions (SR-6.3 / SR-3.1) are Task 4's, below — deliberately NOT
+// duplicated here.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Section id the establish-before-join writer creates in the catch-up-switch
-/// tests below.
+/// Section id the establish-before-join writer creates in the brand-new
+/// catch-up test below.
 const SWITCH_SECTION_ID: u64 = 33;
 /// Authoring `set_order` of the FIRST field the establish writer sets. Applied
 /// against a fresh layer (`next_set_order == 0`), so its stored cumulative
@@ -4627,20 +4337,17 @@ const SWITCH_FIRST_AUTHORING_SET_ORDER: u64 = 100;
 /// Authoring `set_order` of the SECOND ("marker") field. After the first field
 /// advanced `next_set_order` to `SWITCH_FIRST_AUTHORING_SET_ORDER + 1 == 101`,
 /// this field's STORED cumulative `set_order` becomes `101 + 42 == 143`, while
-/// its authoring rank stays `42`. The two builders therefore diverge on the
-/// marker field's emitted `set_order`:
-///   - legacy `compute_diff_at_cut` (`Off`) clones the stored field → emits the
-///     cumulative cursor `143`.
-///   - faithful snapshot (`Snapshot`) emits a DENSE-UNIQUE index (b.bdx): the
-///     two live fields sort by `(version, authoring_set_order)` to first→0,
-///     marker→1, so the marker emits `1` — neither the raw authoring rank (42)
-///     nor the cumulative cursor (143).
+/// its authoring rank stays `42`. A builder that cloned the stored field would
+/// emit the cumulative cursor `143`; the faithful full-state builder emits a
+/// DENSE-UNIQUE index (b.bdx): the two live fields sort by
+/// `(version, authoring_set_order)` to first→0, marker→1, so the marker emits
+/// `1` — neither the raw authoring rank (42) nor the cumulative cursor (143).
 ///
-/// That divergence is the observable proving which builder the dispatch routed
-/// to.
+/// That divergence is the observable proving the faithful builder served the
+/// catch-up.
 const SWITCH_MARKER_AUTHORING_SET_ORDER: u64 = 42;
-/// The stored cumulative `set_order` the legacy path would emit for the marker
-/// field (`101 + 42`). Used only to assert the snapshot path is NOT emitting it.
+/// The stored cumulative `set_order` of the marker field (`101 + 42`). Used
+/// only to assert the catch-up is NOT emitting it.
 const SWITCH_MARKER_CUMULATIVE_SET_ORDER: u64 = 143;
 /// Server sequence_num after CreateLayer (seq=1) + two establish updates.
 const SWITCH_ESTABLISHED_SEQ: u64 = 3;
@@ -4714,91 +4421,16 @@ async fn establish_prim_with_diverging_set_order(
     .await;
 }
 
-// (a) Off = unchanged: with the switch explicitly `Off`, a brand-new joiner
-//     gets today's reconstructed full-content diff (is_diff=true) at the current
-//     seq, terminated by the total_size==0 caught-up ack — identical to
-//     `brand_new_catch_up_still_reconstructs_full_content_diff`. Pins that
-//     setting `Off` explicitly is a no-op relative to the default.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catchup_switch_off_delivers_legacy_reconstructed_full_content() {
-    let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    // Explicit — this is the default, but the test's contract is that `Off` is a
-    // no-op relative to the default-behaviour tests, so pin it locally.
-    svc.catchup_snapshot_enabled = false;
-
-    let (session_id, object_id) = create_session_and_layer_pooled(
-        &tv,
-        &svc,
-        "catchup-switch-off-session",
-        "catchup-switch-off-layer",
-    )
-    .await;
-
-    establish_prim_with_diverging_set_order(
-        &svc,
-        &session_id,
-        "catchup-switch-off-layer",
-        object_id,
-    )
-    .await;
-
-    // Brand-new subscribe (object_id=0, seq=0) → full-content catch-up.
-    let sub_req = subscribe_request(&session_id, "catchup-switch-off-layer", 0, 0, "late-joiner");
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let (header, body) = recv_message(&mut stream).await;
-    assert_eq!(
-        header.object_id, object_id,
-        "message #1 object_id must match"
-    );
-    assert_eq!(
-        header.sequence_num, SWITCH_ESTABLISHED_SEQ,
-        "off-mode catch-up delivers state at the current seq"
-    );
-
-    let decoded = decode_broadcast_delta(&body);
-    assert!(
-        decoded.is_diff,
-        "off-mode brand-new catch-up stays reconstructed full-content (is_diff=true); got {}",
-        decoded.is_diff
-    );
-    // Distinguishing marker: the legacy `compute_diff_at_cut` path clones the stored
-    // field, so the marker's emitted set_order is the CUMULATIVE cursor (143),
-    // NOT the authoring rank — the exact opposite of the snapshot path below.
-    let marker = decoded
-        .set_fields
-        .iter()
-        .find(|sf| sf.key_name == "marker")
-        .expect("off-mode reconstructed full content must carry the marker field");
-    assert_eq!(
-        marker.set_order, SWITCH_MARKER_CUMULATIVE_SET_ORDER,
-        "off-mode (legacy compute_diff_at_cut) emits the stored cumulative set_order (143), not the \
-         authoring rank"
-    );
-
-    // The caught-up terminator (total_size==0) is preserved in off mode.
-    recv_caught_up_ack(&mut stream, object_id, SWITCH_ESTABLISHED_SEQ).await;
-}
-
-// (b) Snapshot = corrected full-state create dispatched: with the switch
-//     `Snapshot`, message #1 is still a valid from-empty full-state create
-//     (is_diff=true, base_version=0) that applies cleanly onto an EMPTY tree,
-//     the total_size==0 caught-up terminator is still emitted (SDD §12.3), and
-//     the faithful authoring `set_order` marker proves the dispatch routed to
-//     Task 2's builder rather than the legacy `compute_diff_at_cut` path.
+// Message #1 is a valid from-empty full-state create (is_diff=true,
+// base_version=0) that applies cleanly onto an EMPTY tree, the total_size==0
+// caught-up terminator is still emitted (SDD §12.3), and the faithful
+// `set_order` marker proves Task 2's builder served it.
 //
 // NOTE: deep multi-commit correctness (SR-6.3 / SR-3.1) is Task 4 — not here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
+async fn brand_new_catch_up_is_the_faithful_full_state_create() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    // Select snapshot mode locally on this owned instance — the shared
-    // `helpers.rs` builder signature is untouched.
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let (session_id, object_id) = create_session_and_layer_pooled(
         &tv,
@@ -4836,31 +4468,31 @@ async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
     );
     assert_eq!(
         header.sequence_num, SWITCH_ESTABLISHED_SEQ,
-        "snapshot-mode catch-up delivers state at the current seq"
+        "the brand-new catch-up delivers state at the current seq"
     );
     assert!(
         !body.is_empty(),
-        "snapshot-mode message #1 must carry a non-empty full-state body"
+        "message #1 must carry a non-empty full-state body"
     );
 
     let decoded = decode_broadcast_delta(&body);
     assert!(
         decoded.is_diff,
-        "snapshot-mode message #1 must be a full-state create (is_diff=true); got {}",
+        "message #1 must be a full-state create (is_diff=true); got {}",
         decoded.is_diff
     );
     assert_eq!(
         decoded.base_version, 0,
-        "snapshot-mode message #1 must be from-empty (base_version=0) per SR-1.2"
+        "message #1 must be from-empty (base_version=0) per SR-1.2"
     );
 
     // Distinguishing marker (b.bdx): the faithful builder emits a DENSE-UNIQUE
     // `set_order`, NOT the raw authoring rank and NOT the cumulative cursor. Two
     // live fields on section 33 — "first" (version 2, authoring 100) and "marker"
     // (version 3, authoring 42) — sort by `(version, authoring_set_order)` to
-    // first→0, marker→1. So the marker's dense set_order is 1: still distinct
-    // from the legacy cumulative cursor (143, pinned by the off-mode test),
-    // proving the dispatch routed to the faithful builder, not `compute_diff_at_cut`.
+    // first→0, marker→1. So the marker's dense set_order is 1: distinct from
+    // the stored cumulative cursor (143), proving the faithful builder served
+    // the catch-up rather than a reconstruction of stored state.
     const SWITCH_MARKER_DENSE_SET_ORDER: u64 = 1;
     let marker = decoded
         .set_fields
@@ -4869,10 +4501,10 @@ async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
         .expect("snapshot full-state create must carry the marker field");
     assert_eq!(
         marker.set_order, SWITCH_MARKER_DENSE_SET_ORDER,
-        "snapshot-mode (faithful builder) must emit the dense-unique set_order (1), NOT the raw \
-         authoring rank ({SWITCH_MARKER_AUTHORING_SET_ORDER}) and NOT the legacy cumulative cursor \
-         ({SWITCH_MARKER_CUMULATIVE_SET_ORDER}) — this proves the mode dispatch routed to \
-         compute_faithful_full_content_at_cut"
+        "the faithful builder must emit the dense-unique set_order (1), NOT the raw authoring \
+         rank ({SWITCH_MARKER_AUTHORING_SET_ORDER}) and NOT the stored cumulative cursor \
+         ({SWITCH_MARKER_CUMULATIVE_SET_ORDER}) — this proves \
+         compute_faithful_full_content_at_cut served the catch-up"
     );
 
     // The body must apply cleanly onto an EMPTY ObjectState (it's a valid
@@ -4901,17 +4533,17 @@ async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
         "reconstructed tree must carry the 'marker' field"
     );
 
-    // The caught-up terminator (total_size==0) is still emitted in snapshot mode
-    // — `run_catch_up` owns it uniformly across both regimes (SDD §12.3).
+    // The caught-up terminator (total_size==0) is still emitted — `run_catch_up`
+    // owns it uniformly across every regime (SDD §12.3).
     recv_caught_up_ack(&mut stream, object_id, SWITCH_ESTABLISHED_SEQ).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SR-6.3 / SR-3.1 — corrected-snapshot late-join establishment + no-wipe (t3.msb.35.7t.ub)
 //
-// End-to-end in-process coverage of the wired `Snapshot` catch-up mode against a
-// real Valkey. Task 4 promotes the switch smoke tests above (which only prove the
-// dispatch routed to the faithful builder) into deep multi-commit correctness:
+// End-to-end in-process coverage of the faithful catch-up against a real
+// Valkey. Task 4 promotes the smoke test above (which only proves the faithful
+// builder served the catch-up) into deep multi-commit correctness:
 //   1. `snapshot_late_join_catch_up_establishes_correct_scene` — a fresh
 //      late-joiner's message #1, applied to an EMPTY tree, reproduces exactly the
 //      live scene (created-then-abandoned scratch prim dropped, final field values
@@ -4920,10 +4552,8 @@ async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
 //      caught-up client issues its next incremental write, the prior writer's scene
 //      survives intact (SR-3.1 no-wipe), positively asserted.
 //
-// Both build the service in `Snapshot` mode by flipping the PUBLIC
-// `catchup_snapshot_enabled` field on the owned instance (shared `helpers.rs` untouched;
-// `PooledTestValkey`'s default stays `Off`). `checkpoint_enabled` stays `false`
-// (SR-4.1) — the fixture `Config` already sets it, and no DR path is engaged.
+// `checkpoint_enabled` stays `false` (SR-4.1) — the fixture `Config` already
+// sets it, and no DR path is engaged.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Non-existent parent id the establishment test reparents the scratch prim under
@@ -4933,8 +4563,8 @@ async fn catchup_switch_snapshot_dispatches_corrected_full_state_create() {
 /// catch-up path fixes (SR-5.2 reachable-from-root pruning).
 const ABANDON_ORPHAN_PARENT: u64 = 888_888;
 
-/// 1. Establishment (SR-1.1 / SR-6.3 first clause): build the service in
-///    `Snapshot` mode, commit a multi-commit editing history (parent→child
+/// 1. Establishment (SR-1.1 / SR-6.3 first clause): build the service,
+///    commit a multi-commit editing history (parent→child
 ///    sections with distinct `section_order`; a burst of field updates across
 ///    separate commits so the true last-writer value + authoring rank matter; and
 ///    a created-then-abandoned scratch prim), then late-join a FRESH subscriber and
@@ -4943,8 +4573,7 @@ const ABANDON_ORPHAN_PARENT: u64 = 888_888;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_late_join_catch_up_establishes_correct_scene() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-establish-layer";
     let (session_id, object_id) =
@@ -5118,7 +4747,7 @@ async fn snapshot_late_join_catch_up_establishes_correct_scene() {
     );
     assert_eq!(
         header.sequence_num, ESTABLISHED_SEQ,
-        "snapshot-mode catch-up delivers the current scene at seq={ESTABLISHED_SEQ}"
+        "the catch-up delivers the current scene at seq={ESTABLISHED_SEQ}"
     );
     assert!(
         header.total_size > 0,
@@ -5346,8 +4975,7 @@ async fn snapshot_late_join_catch_up_establishes_correct_scene() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_caught_up_client_write_preserves_prior_state() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-nowipe-layer";
     let (session_id, object_id) =
@@ -5556,23 +5184,24 @@ async fn snapshot_caught_up_client_write_preserves_prior_state() {
 // (t3.msb.js.eg.vx)
 //
 // The Task-4 snapshot tests above (`snapshot_late_join_catch_up_establishes_correct_scene`,
-// `snapshot_caught_up_client_write_preserves_prior_state`) run in Snapshot mode but
-// with MAXLEN=4096 and no trim; `natural_out_of_window_without_explicit_xtrim_falls_into_regime3`
-// forces a real approximate trim but in Off/legacy mode. Neither exercises the
-// intersection: a fresh Snapshot-mode late-join on a stream whose earliest entries
-// have provably been evicted by Valkey's approximate `MAXLEN ~ N` trim. Because
+// `snapshot_caught_up_client_write_preserves_prior_state`) run with MAXLEN=4096
+// and no trim; `natural_out_of_window_without_explicit_xtrim_falls_into_regime3`
+// forces a real approximate trim but serves a reconnector, not a late-joiner.
+// Neither exercises the intersection: a fresh late-join on a stream whose
+// earliest entries have provably been evicted by Valkey's approximate
+// `MAXLEN ~ N` trim. Because
 // `compute_faithful_full_content_at_cut` reconstructs from MATERIALIZED state + persisted
 // `authoring_set_order` and NEVER reads the stream, the established scene must be
 // bit-identical whether or not history survives — but nothing asserts that today.
 //
-// These three tests use the proven forced-trim recipe from the Off-mode test
-// (MAXLEN=4, ~200 distinct writes, XLEN/XRANGE-verify entry `2-0` is evicted),
-// but drive the scene under `catchup_snapshot_enabled = true`. All run under the
-// default DR-disabled `build_pooled_service` wiring. Every stream await is bounded
+// These three tests use the proven forced-trim recipe from the natural
+// out-of-window test (MAXLEN=4, ~200 distinct writes, XLEN/XRANGE-verify entry
+// `2-0` is evicted). All run under the default DR-disabled
+// `build_pooled_service` wiring. Every stream await is bounded
 // by `recv_message` / `SUBSCRIBER_DEADLINE`; no `proptest!` macros are added here.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// 1. A forced-trim + Snapshot-mode late-join still establishes the correct scene.
+/// 1. A late-join on a forced-trim stream still establishes the correct scene.
 ///    Build the multi-commit editing history (root + children, a last-writer-wins
 ///    burst whose authoring rank diverges from the cumulative cursor, and a
 ///    created-then-abandoned scratch prim), THEN drive a large heartbeat write
@@ -5586,11 +5215,11 @@ async fn snapshot_late_join_on_trimmed_stream_establishes_correct_scene() {
     // entries once the write count crosses Valkey's per-node threshold (~100).
     const MAXLEN: u64 = 4;
     // Distinct heartbeat writes after the scene commits, sized to reliably evict
-    // entry `2-0` on redis/valkey 7.x (same threshold the Off-mode test proved).
+    // entry `2-0` on redis/valkey 7.x (same threshold the natural out-of-window
+    // test proved).
     const HEARTBEAT_WRITES: u64 = 200;
 
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), MAXLEN);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), MAXLEN);
 
     let layer = "snap-trim-establish-layer";
     let (session_id, object_id) =
@@ -5852,7 +5481,7 @@ async fn snapshot_late_join_on_trimmed_stream_establishes_correct_scene() {
     );
     assert_eq!(
         header.sequence_num, established_seq,
-        "snapshot-mode catch-up delivers the current scene at the established seq"
+        "the catch-up delivers the current scene at the established seq"
     );
     assert!(
         header.total_size > 0,
@@ -6086,8 +5715,7 @@ async fn snapshot_caught_up_after_trim_client_write_preserves_prior_state() {
     const MAXLEN: u64 = 4;
     const HEARTBEAT_WRITES: u64 = 200;
 
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), MAXLEN);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), MAXLEN);
 
     let layer = "snap-trim-nowipe-layer";
     let (session_id, object_id) =
@@ -6382,7 +6010,7 @@ async fn snapshot_caught_up_after_trim_client_write_preserves_prior_state() {
 }
 
 /// 3. Retention-independence encoded as a checked property: two fresh
-///    Snapshot-mode late-joins — one with full stream history, one after the
+///    late-joins — one with full stream history, one after the
 ///    stream has been forced to near-minimum retention — must reconstruct
 ///    byte-for-byte identical scenes (same emitted section set, section metadata,
 ///    final field values, and per-field authoring ranks). This holds because
@@ -6444,8 +6072,7 @@ async fn snapshot_late_join_is_independent_of_surviving_stream_length() {
     let tv = PooledTestValkey::setup().await;
     // Roomy MAXLEN so the scene commits are all retained for the FIRST late-join;
     // an explicit XTRIM later forces the SECOND join onto a minimal stream.
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-retention-layer";
     let (session_id, object_id) =
@@ -6688,7 +6315,7 @@ async fn snapshot_late_join_is_independent_of_surviving_stream_length() {
 //
 // The trimmed-stream snapshot tests above (`snapshot_late_join_on_trimmed_stream_*`)
 // all late-join FRESH (object_id=0, seq=0 → brand-new / `compute_faithful_full_content_at_cut`).
-// These three exercise the OTHER Snapshot-mode entrypoint — `compute_faithful_coalesced_at_cut`
+// These three exercise the OTHER faithful entrypoint — `compute_faithful_coalesced_at_cut`
 // — reached ONLY by an advanced reconnector whose stale `have_version` is > 0 and whose
 // stream slice has been evicted (small MAXLEN + explicit `XTRIM MINID`), so it provably
 // lands in Regime 3 (`catch_up_out_of_window`), NOT in_window and NOT brand_new. Unlike
@@ -6838,9 +6465,8 @@ fn emitted_delete_section_ids(delta: &OwnedDelta) -> std::collections::HashSet<u
 /// — holding BOTH the soon-to-be-abandoned prim `OOW_ABANDONED_PRIM` (under root)
 /// AND the soon-to-be-deleted section `OOW_TOMBSTONE_SECTION` (under root), plus a
 /// burst field (`childA.posX`) whose stored cumulative cursor diverges from its
-/// authoring rank and whose value the final burst overwrites. Independent of the
-/// `catchup_snapshot_enabled` mode (that only affects the later subscribe), so tests 1
-/// and 3 share it.
+/// authoring rank and whose value the final burst overwrites. The out-of-window
+/// tests below share it.
 async fn build_oow_reconnect_scene(
     tv: &PooledTestValkey,
     svc: &LiveEditService,
@@ -6852,8 +6478,7 @@ async fn build_oow_reconnect_scene(
 
     // Reconnector mirror — the empty-create (seq=1) plus the two pre-window
     // commits it applied before disconnecting.
-    let mut mirror = ObjectState::default();
-    apply_delta(&mut mirror, None).expect("mirror empty create (seq=1)");
+    let mut mirror = empty_create_state();
 
     // ── Commit 1 (seq=2): root R(1)+name; child A(2)+posX("first", so=5); scratch
     //    SC(99)+temp under root; deletable DL(50)+dlf under root. ──
@@ -7041,15 +6666,13 @@ async fn build_oow_reconnect_scene(
     //    STRUCTURALLY re-assert childA(2) under root R(1) via DiffChangeSection,
     //    keeping its DIVERGENT stored section_order (10). Re-asserting the section
     //    bumps its `last_version` to 6 (> have_version=3), so the coalesced
-    //    catch-up re-emits childA as a modified section and, in snapshot mode,
-    //    restates its unchanged sibling childB(3) with it (R now has a changed
-    //    child) — the only two live sections re-emitted in this scene. That
-    //    makes the reconnect exercise the b.bdx coalesced sibling-order
-    //    override: A's stored order stays 10 but its real per-parent sibling
-    //    index under R is 0 (first live child), so the emitted `section_order`
-    //    MUST be 0, not 10 (asserted by the Snapshot establish test; the
-    //    Off-mode regression pin keeps 10 because the legacy path emits the
-    //    stored order verbatim). ──
+    //    catch-up re-emits childA as a modified section and restates its
+    //    unchanged sibling childB(3) with it (R now has a changed child) — the
+    //    only two live sections re-emitted in this scene. That makes the
+    //    reconnect exercise the b.bdx coalesced sibling-order override: A's
+    //    stored order stays 10 but its real per-parent sibling index under R is
+    //    0 (first live child), so the emitted `section_order` MUST be 0, not 10
+    //    (asserted by the establish test). ──
     let commit5 = OwnedDelta {
         is_diff: false,
         struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
@@ -7082,7 +6705,7 @@ async fn build_oow_reconnect_scene(
 
     // ── Force a GENUINE out-of-window reconnect: trim the stream so the
     //    reconnector's start id ({have_version+1}-0 = "4-0") is not present, so
-    //    the reconnect XRANGE slice misses and falls into Regime 3. ──
+    //    the reconnect's in-window point read misses and falls into Regime 3. ──
     let stream_key = tv.key_schema().layer_stream(object_id);
     let cap: XCap = XCap::try_from(("MINID", "=", format!("{OOW_CURRENT_SEQ}-0").as_str()))
         .expect("build MINID xcap");
@@ -7112,7 +6735,7 @@ async fn build_oow_reconnect_scene(
     (session_id, object_id, mirror)
 }
 
-/// 1. Snapshot mode: a GENUINE out-of-window reconnector receives a FAITHFUL
+/// 1. A GENUINE out-of-window reconnector receives a FAITHFUL
 ///    coalesced catch-up — `base_version = have_version` (never 0), the current
 ///    server seq in the header, exactly-once caught-up ack — that RETRACTS BOTH
 ///    ghost legs (tombstoned DL(50) AND abandoned-unreachable SC(99)) via
@@ -7121,8 +6744,7 @@ async fn build_oow_reconnect_scene(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_out_of_window_reconnect_establishes_correct_scene() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
 
     let layer = "snap-oow-establish-layer";
     let (session_id, object_id, mut mirror) =
@@ -7335,7 +6957,7 @@ async fn snapshot_out_of_window_reconnect_establishes_correct_scene() {
     );
 }
 
-/// b.bdx (test-review path a): a Snapshot-mode COALESCED (out-of-window reconnect)
+/// b.bdx (test-review path a): a COALESCED (out-of-window reconnect)
 /// catch-up must emit each RE-EMITTED live section's REAL per-parent sibling index
 /// in `section_order`, NOT the divergent STORED order — the coalesced analogue of
 /// the from-empty `snapshot_late_join_catch_up_establishes_correct_scene` coverage,
@@ -7356,8 +6978,7 @@ async fn snapshot_out_of_window_reconnect_establishes_correct_scene() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_out_of_window_reconnect_reemits_real_sibling_order() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
 
     let layer = "snap-oow-sibling-order-layer";
     let (session_id, object_id) =
@@ -7366,9 +6987,9 @@ async fn snapshot_out_of_window_reconnect_reemits_real_sibling_order() {
     const HAVE_VERSION: u64 = 2;
     const CURRENT_SEQ: u64 = 4;
 
-    // Reconnector mirror: empty create (seq=1) + commit1 (seq=2) creating root P(1).
-    let mut mirror = ObjectState::default();
-    apply_delta(&mut mirror, None).expect("mirror empty create (seq=1)");
+    // Reconnector mirror: empty create (seq=1, the layer's root section 1) + commit1
+    // (seq=2) making that root P(1).
+    let mut mirror = empty_create_state();
 
     // ── Commit 1 (seq=2): root P(1) + name. The reconnector's last applied version. ──
     let commit1 = OwnedDelta {
@@ -7590,7 +7211,7 @@ async fn snapshot_out_of_window_reconnect_reemits_real_sibling_order() {
     assert_eq!(server_state.sections[&12].section_order, 20);
 }
 
-/// 2. Snapshot mode, SR-3.1 no-wipe: after a GENUINE out-of-window reconnector has
+/// 2. SR-3.1 no-wipe: after a GENUINE out-of-window reconnector has
 ///    fully caught up, its next incremental write must leave the prior writer's
 ///    sections + field values intact (asserted positively on server state and on a
 ///    present-from-start witness's reconstructed tree); the relay is not a reset
@@ -7598,8 +7219,7 @@ async fn snapshot_out_of_window_reconnect_reemits_real_sibling_order() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_out_of_window_reconnect_caught_up_client_write_preserves_prior_state() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
 
     let layer = "snap-oow-nowipe-layer";
     let (session_id, object_id) =
@@ -7830,132 +7450,17 @@ async fn snapshot_out_of_window_reconnect_caught_up_client_write_preserves_prior
     assert_no_next_message(&mut b_stream, Duration::from_millis(300)).await;
 }
 
-/// 3. Off mode (default): the SAME trimmed out-of-window scenario as test 1, run
-///    through the LEGACY coalesced diff. Pins that the Engineer's Snapshot branch
-///    does not alter default behavior — Regime 3 still delivers a single coalesced
-///    envelope labelled the current seq, retracts ONLY the tombstoned section, and
-///    leaves the abandoned-unreachable prim as the known legacy ghost (the exact
-///    divergence Snapshot mode corrects). State-parity holds against the FULL
-///    materialized state (orphan included), matching `compute_diff_at_cut`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn off_mode_out_of_window_reconnect_unchanged_regression_pin() {
-    let tv = PooledTestValkey::setup().await;
-    // Legacy mode — the shared fixture pins `catchup_snapshot_enabled = false`
-    // (legacy per-commit reconstruction). Assert it so a fixture drift to the
-    // corrected-snapshot path can't silently reinterpret this regression pin.
-    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-    assert!(
-        !svc.catchup_snapshot_enabled,
-        "regression pin must run in the legacy (snapshot-disabled) mode"
-    );
-
-    let layer = "off-oow-regression-layer";
-    let (session_id, object_id, mut mirror) =
-        build_oow_reconnect_scene(&tv, &svc, "off-oow-regression", layer).await;
-
-    let snap = read_object_state_for_test(tv.client(), tv.key_schema(), &object_id.to_string())
-        .await
-        .expect("read_object_state_for_test must succeed");
-    let server_state = snapshot_to_object_state(&snap);
-
-    // ── Reconnect presenting the stale have_version on the SAME object_id. ──
-    let sub_req = subscribe_request(
-        &session_id,
-        layer,
-        object_id,
-        OOW_HAVE_VERSION,
-        "reconnector",
-    );
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let (header, body) = recv_message(&mut stream).await;
-    assert_eq!(
-        header.object_id, object_id,
-        "message #1 object_id must match"
-    );
-    assert_eq!(
-        header.sequence_num, OOW_CURRENT_SEQ,
-        "legacy coalesced envelope must carry the current server seq"
-    );
-    assert!(
-        !body.is_empty(),
-        "legacy coalesced envelope must be non-empty"
-    );
-
-    let decoded = decode_broadcast_delta(&body);
-    assert!(decoded.is_diff, "legacy coalesced diff is is_diff=true");
-    assert_eq!(
-        decoded.base_version, OOW_HAVE_VERSION,
-        "legacy coalesced diff base_version equals have_version"
-    );
-
-    // ── Legacy retraction set: ONLY the tombstoned section — the abandoned prim is
-    //    NOT retracted (the known legacy ghost that Snapshot mode fixes). ──
-    let retracted = emitted_delete_section_ids(&decoded);
-    assert!(
-        retracted.contains(&OOW_TOMBSTONE_SECTION),
-        "legacy coalesced diff must still retract the tombstoned section {OOW_TOMBSTONE_SECTION}; retracted={retracted:?}"
-    );
-    assert!(
-        !retracted.contains(&OOW_ABANDONED_PRIM),
-        "legacy coalesced diff must NOT retract the abandoned prim {OOW_ABANDONED_PRIM} (unchanged legacy behavior); retracted={retracted:?}"
-    );
-
-    // ── Exactly-once caught-up ack with tracked_version == current seq. ──
-    recv_caught_up_ack(&mut stream, object_id, OOW_CURRENT_SEQ).await;
-    assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
-
-    // ── State-parity: the legacy reconstruction (read-side, honoring the emitted
-    //    DiffDeleteSection retractions) equals the FULL materialized state —
-    //    including the abandoned orphan the legacy path re-emits as a stale ghost. ──
-    apply_catchup_read_side(&mut mirror, &body);
-    let reconstructed_ids: std::collections::HashSet<u64> =
-        mirror.sections.keys().copied().collect();
-    let server_ids: std::collections::HashSet<u64> =
-        server_state.sections.keys().copied().collect();
-    assert_eq!(
-        reconstructed_ids, server_ids,
-        "legacy Regime-3 reconstruction must equal the server's full materialized section set \
-         (abandoned orphan re-emitted as a stale ghost — unchanged legacy behavior)"
-    );
-    assert!(
-        mirror.sections.contains_key(&OOW_ABANDONED_PRIM),
-        "legacy mode keeps the abandoned prim {OOW_ABANDONED_PRIM} as a stale ghost"
-    );
-    assert!(
-        !mirror.sections.contains_key(&OOW_TOMBSTONE_SECTION),
-        "legacy mode still retracts the tombstoned section {OOW_TOMBSTONE_SECTION}"
-    );
-    // Structural section-identity parity against the server materialized state.
-    for (sid, s) in &server_state.sections {
-        let r = mirror
-            .sections
-            .get(sid)
-            .unwrap_or_else(|| panic!("section {sid} must reconstruct in legacy mode"));
-        assert_eq!(r.parent_id, s.parent_id, "section {sid} parent parity");
-        assert_eq!(r.name, s.name, "section {sid} name parity");
-        assert_eq!(
-            r.section_order, s.section_order,
-            "section {sid} order parity"
-        );
-        assert_eq!(r.section_type, s.section_type, "section {sid} type parity");
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// Snapshot-mode IN-WINDOW reconnect (Plan b.msb Epic 4 Task 1, t2.msb.xq.so).
+// IN-WINDOW reconnect (Plan b.msb Epic 4 Task 1, t2.msb.xq.so).
 //
 // The in-window regime differs from the out-of-window analogues above in exactly
 // ONE structural respect: the per-object stream is NOT trimmed, so the
 // reconnector's start id `{have_version+1}-0` is still present and `run_catch_up`
-// selects the `in_window` branch (rather than falling through to Regime 3). Under
-// `catchup_snapshot_enabled = true`, Task 1's `catch_up_in_window_snapshot` converges
-// on the SAME faithful `compute_faithful_coalesced_at_cut` primitive the out-of-window
-// Snapshot arm already uses — so the delivered envelope, ghost retraction, and
-// state-parity properties are byte-identical to the out-of-window Snapshot tests;
+// selects the `in_window` branch (rather than falling through to Regime 3).
+// `catch_up_in_window` converges on the SAME faithful
+// `compute_faithful_coalesced_at_cut` primitive the out-of-window regime uses —
+// so the delivered envelope, ghost retraction, and state-parity properties are
+// byte-identical to the out-of-window tests;
 // the tests below mirror those 1:1 with the trim replaced by an untrimmed
 // start-id-PRESENT probe.
 //
@@ -8004,8 +7509,7 @@ async fn build_in_window_reconnect_scene(
 
     // Reconnector mirror — the empty-create (seq=1) plus the two pre-window
     // commits it applied before disconnecting.
-    let mut mirror = ObjectState::default();
-    apply_delta(&mut mirror, None).expect("mirror empty create (seq=1)");
+    let mut mirror = empty_create_state();
 
     // ── Commit 1 (seq=2): root R(1)+name; child A(2)+posX("first", so=5); scratch
     //    SC(99)+temp under root; deletable DL(50)+dlf under root. ──
@@ -8193,15 +7697,13 @@ async fn build_in_window_reconnect_scene(
     //    STRUCTURALLY re-assert childA(2) under root R(1) via DiffChangeSection,
     //    keeping its DIVERGENT stored section_order (10). Re-asserting the section
     //    bumps its `last_version` to 6 (> have_version=3), so the coalesced
-    //    catch-up re-emits childA as a modified section and, in snapshot mode,
-    //    restates its unchanged sibling childB(3) with it (R now has a changed
-    //    child) — the only two live sections re-emitted in this scene. That
-    //    makes the reconnect exercise the b.bdx coalesced sibling-order
-    //    override: A's stored order stays 10 but its real per-parent sibling
-    //    index under R is 0 (first live child), so the emitted `section_order`
-    //    MUST be 0, not 10 (asserted by the Snapshot establish test; the
-    //    Off-mode regression pin is unaffected — it only checks per-commit seq
-    //    contiguity). ──
+    //    catch-up re-emits childA as a modified section and restates its
+    //    unchanged sibling childB(3) with it (R now has a changed child) — the
+    //    only two live sections re-emitted in this scene. That makes the
+    //    reconnect exercise the b.bdx coalesced sibling-order override: A's
+    //    stored order stays 10 but its real per-parent sibling index under R is
+    //    0 (first live child), so the emitted `section_order` MUST be 0, not 10
+    //    (asserted by the in-window establish test). ──
     let commit5 = OwnedDelta {
         is_diff: false,
         struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
@@ -8252,8 +7754,8 @@ async fn build_in_window_reconnect_scene(
     (session_id, object_id, mirror)
 }
 
-/// In-window Snapshot mode: an in-window reconnector receives the SAME faithful
-/// coalesced catch-up as the out-of-window Snapshot path — `base_version =
+/// In window: an in-window reconnector receives the SAME faithful
+/// coalesced catch-up as the out-of-window path — `base_version =
 /// have_version` (never 0), the current server seq in the header, exactly-once
 /// caught-up ack — that RETRACTS BOTH ghost legs (tombstoned DL(50) AND
 /// abandoned-unreachable SC(99)) via `DiffDeleteSection`, so the reconnector's
@@ -8263,8 +7765,7 @@ async fn build_in_window_reconnect_scene(
 async fn snapshot_in_window_reconnect_establishes_correct_scene() {
     let tv = PooledTestValkey::setup().await;
     // Roomy MAXLEN so nothing trims — the whole point of the in-window regime.
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-inwindow-establish-layer";
     let (session_id, object_id, mut mirror) =
@@ -8371,8 +7872,7 @@ async fn snapshot_in_window_reconnect_establishes_correct_scene() {
     );
 
     // ── A SINGLE non-empty body then the exactly-once caught-up ack; no trailing
-    //    messages (in-window Snapshot delivers ONE coalesced envelope, not a
-    //    per-commit replay). ──
+    //    messages (the in-window catch-up delivers ONE coalesced envelope). ──
     recv_caught_up_ack(&mut stream, object_id, OOW_CURRENT_SEQ).await;
     assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
 
@@ -8474,7 +7974,7 @@ async fn snapshot_in_window_reconnect_establishes_correct_scene() {
     );
 }
 
-/// In-window Snapshot mode, SR-3.1 no-wipe: after a Snapshot-mode IN-WINDOW
+/// In window, SR-3.1 no-wipe: after an IN-WINDOW
 /// reconnector has caught up, its next incremental write must leave the prior
 /// writer's sections + field values intact (asserted positively on server state
 /// and on a present-from-start witness's reconstructed tree); the relay is not a
@@ -8485,8 +7985,7 @@ async fn snapshot_in_window_reconnect_establishes_correct_scene() {
 async fn snapshot_in_window_reconnect_caught_up_client_write_preserves_prior_state() {
     let tv = PooledTestValkey::setup().await;
     // Roomy MAXLEN so B's start id is retained and B lands in the in_window regime.
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "snap-inwindow-nowipe-layer";
     let (session_id, object_id) =
@@ -8715,76 +8214,6 @@ async fn snapshot_in_window_reconnect_caught_up_client_write_preserves_prior_sta
     assert_no_next_message(&mut b_stream, Duration::from_millis(300)).await;
 }
 
-/// Legacy path (this fixture forces `catchup_snapshot_enabled = false`; the
-/// product default is now ON): the SAME untrimmed in-window scenario, run through
-/// the LEGACY per-commit `XRANGE` replay. Pins that Task 1's Snapshot-gated source
-/// edit leaves the legacy in-window path intact — the reconnector still
-/// receives the missed commits (seqs 4, 5, 6) as individual per-commit diffs (NOT a
-/// single coalesced envelope, NOT a from-empty reset), then the exactly-once
-/// caught-up ack at the last replayed seq. Complements the pre-existing
-/// `in_window_reconnect_replays_individual_per_commit_diffs` pin by driving the
-/// rich multi-section history through the legacy in-window path.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn off_mode_in_window_reconnect_unchanged_regression_pin() {
-    let tv = PooledTestValkey::setup().await;
-    // Legacy mode — the shared fixture pins `catchup_snapshot_enabled = false`
-    // (legacy per-commit reconstruction). Assert it so a fixture drift to the
-    // corrected-snapshot path can't silently reinterpret this regression pin.
-    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    assert!(
-        !svc.catchup_snapshot_enabled,
-        "regression pin must run in the legacy (snapshot-disabled) mode"
-    );
-
-    let layer = "off-inwindow-regression-layer";
-    let (session_id, object_id, _mirror) =
-        build_in_window_reconnect_scene(&tv, &svc, "off-inwindow-regression", layer).await;
-
-    // ── Reconnect presenting the stale have_version on the SAME object_id. Off mode
-    //    replays the missed commits per-commit (seqs 4, 5, 6). ──
-    let sub_req = subscribe_request(
-        &session_id,
-        layer,
-        object_id,
-        OOW_HAVE_VERSION,
-        "reconnector",
-    );
-    let response = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed");
-    let mut stream = response.into_inner();
-
-    let mut observed_seqs = Vec::new();
-    for _ in OOW_HAVE_VERSION..OOW_CURRENT_SEQ {
-        let (header, body) = recv_message(&mut stream).await;
-        assert_eq!(header.object_id, object_id);
-        assert!(
-            !body.is_empty(),
-            "each legacy per-commit diff body must be non-empty"
-        );
-        assert!(
-            header.total_size > 0,
-            "a per-commit diff carries total_size > 0 (rules out the caught-up ack)"
-        );
-        // A per-commit replay entry must never be a from-empty reset.
-        let decoded = decode_broadcast_delta(&body);
-        assert!(
-            !(decoded.is_diff && decoded.base_version == 0),
-            "a legacy per-commit replay entry must NOT be a base_version=0 reset"
-        );
-        observed_seqs.push(header.sequence_num);
-    }
-    assert_eq!(
-        observed_seqs,
-        vec![4, 5, 6],
-        "Off-mode in-window replay must deliver the missed commits as contiguous per-commit seqs 4, 5, 6"
-    );
-
-    // ── Exactly-once caught-up ack at the last replayed seq; no trailing messages. ──
-    recv_caught_up_ack(&mut stream, object_id, OOW_CURRENT_SEQ).await;
-    assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // SR-2.4 — empty-session (no-edits) brand-new establishment (t3.msb.xq.e6.nq)
 //
@@ -8796,25 +8225,65 @@ async fn off_mode_in_window_reconnect_unchanged_regression_pin() {
 // `base_version=0`), NOT a zero-size/absent one, and the only legitimate
 // zero-size signal is the caught-up terminator (`total_size==0`) that follows.
 //
-// Both tests below share the same assertion shape, differing only in catch-up
-// mode: the primary drives `Snapshot` (exercising `compute_faithful_full_content_at_cut`
-// on an empty net-live scene), the base-case parity test drives the default `Off`
-// (exercising the legacy `compute_diff_at_cut` full-content path). Both prove message #1
-// is a NON-zero-size content header — never the terminator — so a regression that
-// collapses the empty scene into a terminator-only stream is caught in either
-// mode. `checkpoint_enabled` stays `false` (SR-4.1) — the fixture `Config` wires
-// the disabled recovery hooks, so no DR path is engaged.
+// The test below exercises `compute_faithful_full_content_at_cut` on an empty
+// net-live scene and proves message #1 is a NON-zero-size content header —
+// never the terminator — so a regression that collapses the empty scene into a
+// terminator-only stream is caught. `checkpoint_enabled` stays `false`
+// (SR-4.1) — the fixture `Config` wires the disabled recovery hooks, so no DR
+// path is engaged.
+//
+// A layer with no section at all is now only a layer stored before the
+// layer-root rule (SDD §9.7): an empty `CreateLayer` through the handler holds
+// the service-supplied root. So the test seeds its layer at the storage
+// layer, with exactly the state an empty create committed before the rule
+// ([`seed_rootless_empty_layer_pooled`]), and serves it unchanged. The layer an
+// empty create makes now is covered by
+// `empty_create_join_establishes_the_root_section`.
 //
 // The crux distinguished carefully throughout: an ILLEGITIMATE zero-size
 // establishment message (message #1) vs. the LEGITIMATE zero-size caught-up
 // terminator (the ONE and only zero-size message the stream may carry).
 // ═══════════════════════════════════════════════════════════════════════════════
 
+/// Create a session and, at the storage layer, a layer holding no section at
+/// all: exactly the state an empty `CreateLayer` committed before the
+/// layer-root rule (the delta engine's apply of no content to a fresh state, at
+/// sequence 1). `LayerStore::create_layer` applies no root rule, so this is how
+/// a layer stored before the rule is staged.
+async fn seed_rootless_empty_layer_pooled(
+    tv: &PooledTestValkey,
+    svc: &LiveEditService,
+    session_name: &str,
+    layer_name: &str,
+) -> (String, u64) {
+    let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+        .create(session_name, "/stage", "test-user")
+        .await
+        .expect("session creation must succeed");
+    let mut legacy = ObjectState::default();
+    apply_delta(&mut legacy, None).expect("an empty apply succeeds");
+    assert!(
+        legacy.sections.is_empty() && legacy.sequence_num == 1,
+        "fixture: the legacy empty create holds no section, at sequence 1"
+    );
+    let object_id = svc
+        .layer_store
+        .create_layer(
+            &session_id,
+            layer_name,
+            "test-user",
+            &legacy,
+            Arc::new(MockExternalValueStore::new()),
+        )
+        .await
+        .expect("the root-less layer must be seeded");
+    (session_id, object_id)
+}
+
 /// Assert the decoded empty-session establishment delta is a valid, well-formed
 /// EMPTY from-empty create and that it applies cleanly onto a fresh empty
-/// `ObjectState`, leaving that state empty. Shared by both mode variants below so
-/// the establishment contract is asserted identically regardless of catch-up
-/// mode. `body` is the reassembled message-#1 OMPF payload.
+/// `ObjectState`, leaving that state empty. `body` is the reassembled
+/// message-#1 OMPF payload.
 fn assert_empty_establishment_body(body: &[u8]) {
     // decode_broadcast_delta re-asserts the OMPF carries a NON-empty OODF delta
     // (guards the burst-coalesce-to-empty regression b.gze): the empty-create is
@@ -8868,24 +8337,21 @@ fn assert_empty_establishment_body(body: &[u8]) {
     );
 }
 
-/// Primary (Snapshot mode): an empty session (session + layer, zero committed
-/// edits) subscribed brand-new must yield a message #1 that is a NON-zero-size
-/// content header decoding to a valid empty from-empty create, followed by the
-/// zero-size caught-up terminator at seq=1 — never a terminator-only stream.
+/// An empty session (session + layer, zero committed edits) subscribed
+/// brand-new must yield a message #1 that is a NON-zero-size content header
+/// decoding to a valid empty from-empty create, followed by the zero-size
+/// caught-up terminator at seq=1 — never a terminator-only stream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn empty_session_snapshot_join_establishes_valid_empty_create() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    // Select snapshot mode locally on this owned instance — the shared
-    // `helpers.rs` builder signature is untouched. This exercises
-    // `compute_faithful_full_content_at_cut` on an EMPTY net-live scene.
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
-    // Empty session: create the session + layer (an empty-create delta) and issue
-    // NO UpdateLayer calls. Nothing has been edited.
+    // Empty session: a layer stored with no section (seeded as an empty create
+    // committed it before the layer-root rule) and NO UpdateLayer calls.
+    // Nothing has been edited.
     let layer = "empty-snap-layer";
     let (session_id, object_id) =
-        create_session_and_layer_pooled(&tv, &svc, "empty-snap-session", layer).await;
+        seed_rootless_empty_layer_pooled(&tv, &svc, "empty-snap-session", layer).await;
 
     // Brand-new subscribe (object_id=0, sequence_num=0).
     let sub_req = subscribe_request(&session_id, layer, 0, 0, "empty-late-joiner");
@@ -8923,50 +8389,52 @@ async fn empty_session_snapshot_join_establishes_valid_empty_create() {
     assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
 }
 
-/// Base-case parity (legacy path — this fixture leaves `catchup_snapshot_enabled`
-/// at the fixture default of `false`, while the product default is now ON): the
-/// identical observable establishment contract must hold on the legacy catch-up
-/// path, exercising the legacy `compute_diff_at_cut` full-content path. Guards that the
-/// empty-session base case holds regardless of catch-up mode and catches any
-/// regression collapsing the empty scene into a terminator-only stream.
+/// The layer an empty `CreateLayer` makes now (SDD §9.7): created through the
+/// handler with empty content, it holds only the service-supplied root, and a
+/// brand-new subscriber's message #1 is a from-empty create carrying exactly that
+/// root, `DiffChangeSection(parent 0, section 1, "", type 7, order 0)`, at
+/// sequence 1, then the caught-up terminator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn empty_session_off_mode_join_establishes_valid_empty_create() {
+async fn empty_create_join_establishes_the_root_section() {
+    let root = StructCommand::DiffChangeSection(CommandDiffChangeSection {
+        parent_id: 0,
+        section_id: 1,
+        section_name: String::new(),
+        section_type: 7,
+        section_order: 0,
+    });
     let tv = PooledTestValkey::setup().await;
-    // Legacy mode — leave `catchup_snapshot_enabled` at the fixture's `false`.
     let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-
-    // Empty session: create the session + layer and issue NO UpdateLayer calls.
-    let layer = "empty-off-layer";
+    let layer = "empty-create-layer";
     let (session_id, object_id) =
-        create_session_and_layer_pooled(&tv, &svc, "empty-off-session", layer).await;
+        create_session_and_layer_pooled(&tv, &svc, "empty-create-session", layer).await;
 
-    // Brand-new subscribe (object_id=0, sequence_num=0).
-    let sub_req = subscribe_request(&session_id, layer, 0, 0, "empty-late-joiner");
+    let sub_req = subscribe_request(&session_id, layer, 0, 0, "empty-create-joiner");
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
         .expect("subscribe must succeed");
     let mut stream = response.into_inner();
-
-    // Message #1 MUST be the content header — NOT the terminator.
     let (header, body) = recv_message(&mut stream).await;
+    assert_eq!(
+        (header.object_id, header.sequence_num),
+        (object_id, 1),
+        "message #1 is the created object at sequence 1"
+    );
+    let decoded = decode_broadcast_delta(&body);
     assert!(
-        header.total_size > 0,
-        "empty-session (Off mode) message #1 MUST be a NON-zero-size content \
-         header — never the terminator-only collapse; got total_size={}",
-        header.total_size
+        decoded.is_diff && decoded.base_version == 0,
+        "message #1 is a from-empty create"
     );
     assert_eq!(
-        header.object_id, object_id,
-        "message #1 object_id must match the created object"
+        decoded.struct_commands,
+        vec![root],
+        "message #1 must carry exactly the layer's root"
     );
-    assert_eq!(
-        header.sequence_num, 1,
-        "message #1 must carry the empty-create seq (1)"
+    assert!(
+        decoded.set_fields.is_empty() && decoded.time_samples.is_empty(),
+        "the root holds no field or time sample"
     );
 
-    assert_empty_establishment_body(&body);
-
-    // The ONLY legitimate zero-size message: the caught-up terminator at seq=1.
     recv_caught_up_ack(&mut stream, object_id, 1).await;
     assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
 }
@@ -9150,14 +8618,13 @@ async fn watcher_turned_writer_keeps_updates_flowing() {
 // b.bdx — Corrected-snapshot catch-up OFFLINE acceptance against the committed
 // C++ golden oracle.
 //
-// This validates the corrected snapshot catch-up (`catchup_snapshot_enabled = true`,
-// now the product default) against the committed golden
+// This validates the corrected snapshot catch-up against the committed golden
 // `tools/fixtures/gze_cpp_catchup_oracle.json` — the catch-up broadcast the LIVE
 // legacy C++ server produced over 36 REAL captured Kit deltas
 // (`tools/fixtures/gze_inbound_deltas.json`). It runs fully OFFLINE (no live
 // server; the C++ host is unreachable from the sandbox) by replaying the same 36
-// deltas through the in-process service and late-joining a fresh Snapshot-mode
-// subscriber, then diffing our catch-up against the golden.
+// deltas through the in-process service and late-joining a fresh subscriber,
+// then diffing our catch-up against the golden.
 //
 // THE ACCEPTANCE BAR IS DELIBERATELY NOT BYTE-IDENTICAL `setOrder` INTEGERS.
 // The from-empty Kit client keys each catch-up field into an ordered
@@ -9310,6 +8777,43 @@ async fn replay_gze_captured_deltas(
     )
 }
 
+/// The layer-root rule (SDD §9.7) refuses none of Kit's real traffic: the 36
+/// captured Kit deltas replay through the handlers on both structural commit
+/// routes — the WATCH path (`txn`) and the cached structural route (`lua`) —
+/// and every delta is accepted ([`replay_gze_delta_range`] fails on any
+/// refusal), ending at the surviving generation's last sequence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gze_kit_replay_is_accepted_on_both_update_layer_backends() {
+    use live_edit::config::UpdateLayerBackend;
+
+    let kinds = gze_delta_kinds();
+    let last_create = kinds
+        .iter()
+        .rposition(|k| k == "CreateLayer")
+        .expect("the capture holds a CreateLayer");
+    let expected_seq = (kinds.len() - last_create) as u64;
+    for backend in [UpdateLayerBackend::Txn, UpdateLayerBackend::Lua] {
+        let tv = PooledTestValkey::setup().await;
+        let layer_store = Arc::new(
+            LayerStore::new(tv.client().clone(), tv.key_schema().clone(), 4096)
+                .with_update_layer_backend(backend),
+        );
+        let svc =
+            build_pooled_service_from_layer_store(&tv, Arc::new(AllowAllPermissions), layer_store);
+        let session_id = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+            .create("gze-root-rule-session", "/stage", "test-user")
+            .await
+            .expect("session creation must succeed");
+
+        let (_, seq) = replay_gze_captured_deltas(&svc, &session_id, "gze-root-rule-layer").await;
+
+        assert_eq!(
+            seq, expected_seq,
+            "{backend:?}: the surviving generation's create and every update after it committed"
+        );
+    }
+}
+
 /// The golden's `setFields` as an ordered `(sectionId, keyName)` sequence,
 /// sorted by the C++ server's emitted `setOrder`.
 fn golden_field_sequence(golden: &serde_json::Value) -> Vec<(u64, String)> {
@@ -9370,8 +8874,7 @@ fn assert_dense_unique_set_orders(decoded: &OwnedDelta, context: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_catchup_matches_cpp_golden_oracle_offline() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "gze-golden-layer";
     // Create the session only; the fixture's leading CreateLayer entries
@@ -9385,7 +8888,7 @@ async fn snapshot_catchup_matches_cpp_golden_oracle_offline() {
     // ── Replay the 36 real captured deltas in order. ──
     let (object_id, _current_seq) = replay_gze_captured_deltas(&svc, &session_id, layer).await;
 
-    // ── Late-join a FRESH subscriber (object_id=0, seq=0) in Snapshot mode and
+    // ── Late-join a FRESH subscriber (object_id=0, seq=0) and
     //    capture the single corrected full-state catch-up message. ──
     let sub_req = subscribe_request(&session_id, layer, 0, 0, "gze-late-joiner");
     let response = handle_subscribe_read_layer(&svc, sub_req)
@@ -9519,8 +9022,7 @@ const GZE_RECONNECT_HAVE_VERSION: u64 = 20;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coalesced_reconnect_catchup_set_order_matches_cpp_golden_subsequence_offline() {
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "gze-coalesced-layer";
     let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
@@ -9539,7 +9041,7 @@ async fn coalesced_reconnect_catchup_set_order_matches_cpp_golden_subsequence_of
 
     // ── Reconnect at a MID-WINDOW have_version on the SAME object_id. This is a
     //    reconnector, not a late joiner, so it routes through the coalesced
-    //    builder (both reconnect regimes converge on it under Snapshot mode). ──
+    //    builder (both reconnect regimes converge on it). ──
     let sub_req = subscribe_request(
         &session_id,
         layer,
@@ -9670,7 +9172,7 @@ async fn coalesced_reconnect_catchup_set_order_matches_cpp_golden_subsequence_of
 //     reference) and the server's root-reachable materialized state (what
 //     `snapshot_in_window_reconnect_establishes_correct_scene` uses).
 //
-// Path under test: `catch_up_in_window` → `catch_up_in_window_snapshot` →
+// Path under test: `catch_up_in_window` → `build_catch_up` →
 // `compute_faithful_coalesced_at_cut` → `DiffEngine::plan_faithful_coalesced`, pinned by
 // the `live_subscribe_regime_total{regime="in_window", catchup_mode="legacy"}`
 // tick asserted per row — the same series that ticked on dev.
@@ -10061,8 +9563,7 @@ async fn run_in_window_fold_case(case: &InWindowFoldCase) {
     let tv = PooledTestValkey::setup().await;
     // Roomy MAXLEN so the 35-commit history is never trimmed — the reconnector's
     // start id `{have_version+1}-0` must still be present for the in_window branch.
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = format!("gze-in-window-fold-layer-{have_version}");
     let layer = layer.as_str();
@@ -10541,8 +10042,8 @@ async fn run_in_window_fold_case(case: &InWindowFoldCase) {
 //     every "the sections it names as present are net-live" check below would
 //     pass vacuously over an empty set. The re-state is a legal no-op edit:
 //     `apply_diff_change_section` excludes the section itself from the
-//     sibling-name conflict scan (`find_child_by_name(..., Some(section_id))`),
-//     so re-stating a row's own `(parent, name)` cannot trip
+//     sibling-collision lookup (`find_child_by_name(..., Some(section_id))`),
+//     so re-stating a row's own parent, type and name cannot trip
 //     `DuplicateSiblingName`, and with parent and order unchanged it rewrites no
 //     children list either — it advances `last_version` and nothing else.
 //   commit B (seq 37) — `DeleteSection` of a real captured LEAF prim, and
@@ -10689,8 +10190,7 @@ async fn snapshot_in_window_reconnect_real_traffic_plus_ghost_retraction_discrim
     let tv = PooledTestValkey::setup().await;
     // Roomy MAXLEN so nothing trims: the reconnector's start id must survive for
     // the in_window branch to be selected.
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let layer = "gze-ghost-fold-layer";
     let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
@@ -11136,12 +10636,10 @@ async fn snapshot_in_window_reconnect_real_traffic_plus_ghost_retraction_discrim
 // No catch-up regime hands the literal `$` to XREAD any more. Each registers
 // its stream at a durable stream id (`grpc::subscribe::stream_cursor_at`):
 // `{header_seq}-0` on the up-to-date path (the header it just read); the cut
-// of its proven state read on the brand-new, snapshot-mode in-window and
-// out-of-window catch-ups (its own atomic read at or below the atomic-read
-// limits, its layer's shared fenced read above them); the last entry id of its
-// in-window `XRANGE` slice on the rollback-mode per-commit replay. So every
-// later XREAD — including every post-reconnect retry — resumes from that fixed
-// ID. That closes the loss window `$` left open. (The interim above-ceiling
+// of its proven state read on the brand-new, in-window and out-of-window
+// catch-ups (its own atomic read at or below the atomic-read limits, its
+// layer's shared fenced read above them). So every later XREAD — including
+// every post-reconnect retry — resumes from that fixed ID. That closes the loss window `$` left open. (The interim above-ceiling
 // path, now gone, registered at a pin re-read before its state read, which
 // moved the race to the DUPLICATE side: a commit landing between the pin and
 // the state read was carried by BOTH the state sent during catch-up and the
@@ -11349,10 +10847,9 @@ async fn steady_state_drops_commits_at_or_below_the_tracked_version() {
 // nothing) is pinned in `checkpoint/assembler_test.rs`.
 //
 // The tests below drive the window deterministically with the
-// `CatchUpStateReadSeam` (Regimes 1 and 2), the `CatchUpOutOfWindowSeam`
-// (Regime 3) and, for the rollback-mode replay above the limits, the
-// `CatchUpXrangeSeam`: each parks the subscriber after P, before the read
-// that serves it, and a real commit lands while it is parked. The placement
+// `CatchUpStateReadSeam` (Regimes 1 and 2) and the `CatchUpOutOfWindowSeam`
+// (Regime 3): each parks the subscriber after P, before the read that serves
+// it, and a real commit lands while it is parked. The placement
 // half — that the stream is registered at the cut, not at P, so the
 // folded-in commits are not even queued — is pinned in
 // `subscribe_capacity_budget_test.rs`, where a shrunk backlog cap turns a
@@ -11371,23 +10868,14 @@ async fn steady_state_drops_commits_at_or_below_the_tracked_version() {
 // atomic read) and above it (section 6, the shared fenced read), so the matrix
 // costs one line per cell:
 //
-// | regime            | `catchup_snapshot_enabled` | build from the proven snapshot         |
-// |-------------------|----------------------------|----------------------------------------|
-// | 1 `brand_new`     | `true`  (production)       | `compute_faithful_full_content_at_cut` |
-// | 1 `brand_new`     | `false` (rollback knob)    | `compute_diff_at_cut` (full content)   |
-// | 2 `in_window`     | `true`  (production)       | `compute_faithful_coalesced_at_cut`    |
-// | 3 `out_of_window` | `true`  (production)       | `compute_faithful_coalesced_at_cut`    |
-// | 3 `out_of_window` | `false` (rollback knob)    | `compute_diff_at_cut` (coalesced)      |
+// | regime            | build from the proven snapshot         |
+// |-------------------|----------------------------------------|
+// | 1 `brand_new`     | `compute_faithful_full_content_at_cut` |
+// | 2 `in_window`     | `compute_faithful_coalesced_at_cut`    |
+// | 3 `out_of_window` | `compute_faithful_coalesced_at_cut`    |
 //
-// (Regime 2 with `catchup_snapshot_enabled = false` is deliberately ABSENT at
-// the shipped ceiling and is not a gap: that arm replays the retained window
-// per-commit, each diff built from its own atomic read and version-bounded to
-// its own commit, and acks the last replayed commit's own sequence number,
-// never a read's cut (`compute_per_commit_diff_at_cut` documents why). There is
-// no P→state-read overlap to close, so there is nothing for these assertions
-// to say about it. Above the atomic-read limits that arm hands over to the
-// out-of-window route, which reads through the flight and does serve a cut,
-// so section 6 adds it as a cell of its own.)
+// Regimes 2 and 3 share a builder but not a call site, a cursor pin or a seam,
+// so each is a cell of its own.
 
 /// Prometheus `service` label the pooled fixture stamps on every observation.
 const VD8_SERVICE: &str = "test";
@@ -11477,33 +10965,18 @@ enum Vd8Regime {
     InWindow,
     /// Regime 3 — reconnector whose start id has been trimmed away.
     OutOfWindow,
-    /// Regime 2 in rollback mode (`catchup_snapshot_enabled = false`) above
-    /// the atomic-read limits only: the per-commit replay's first read
-    /// answers `TOO_LARGE` and the replay hands over to the out-of-window
-    /// route, which reads through the layer's flight (Spec SDD SR-3.4).
-    InWindowRollback,
 }
 
 #[cfg(feature = "test-fault-injection")]
 impl Vd8Regime {
-    /// The regime's name in layer, session and client ids.
+    /// The regime's name in layer, session and client ids — and the `regime`
+    /// label the stable-cut counters carry, the same vocabulary
+    /// `observe_subscribe_regime` uses, which is what makes the two joinable.
     fn label(self) -> &'static str {
         match self {
             Self::BrandNew => "brand_new",
             Self::InWindow => "in_window",
             Self::OutOfWindow => "out_of_window",
-            Self::InWindowRollback => "in_window_rollback",
-        }
-    }
-
-    /// The `regime` label the stable-cut counters carry — the same vocabulary
-    /// `observe_subscribe_regime` uses, which is what makes the two joinable.
-    /// A rollback replay's hand-over records its read under the out-of-window
-    /// route that took it.
-    fn stable_cut_label(self) -> &'static str {
-        match self {
-            Self::InWindowRollback => "out_of_window",
-            other => other.label(),
         }
     }
 
@@ -11586,9 +11059,6 @@ enum Vd8Park {
     CoalescedRead(Arc<live_edit::grpc::subscribe::CatchUpStateReadSeam>),
     /// Parked before the out-of-window catch-up's proven read (Regime 3).
     OutOfWindowDiff(Arc<live_edit::grpc::subscribe::CatchUpOutOfWindowSeam>),
-    /// Parked before the rollback-mode in-window replay's `XRANGE` slice and
-    /// every read after it (Regime 2, rollback mode).
-    ReplaySlice(Arc<live_edit::grpc::subscribe::CatchUpXrangeSeam>),
 }
 
 #[cfg(feature = "test-fault-injection")]
@@ -11603,7 +11073,6 @@ impl Vd8Park {
             Self::FullStateRead(seam) => seam.wait_until_parked_pre_full_state().await,
             Self::CoalescedRead(seam) => seam.wait_until_parked_pre_coalesced().await,
             Self::OutOfWindowDiff(seam) => seam.wait_until_parked_pre_compute_diff().await,
-            Self::ReplaySlice(seam) => seam.wait_until_parked().await,
         }
     }
 
@@ -11613,7 +11082,6 @@ impl Vd8Park {
             Self::FullStateRead(seam) => seam.arrive_at_pre_full_state().await,
             Self::CoalescedRead(seam) => seam.arrive_at_pre_coalesced().await,
             Self::OutOfWindowDiff(seam) => seam.arrive_at_pre_compute_diff().await,
-            Self::ReplaySlice(seam) => seam.release().await,
         }
     }
 }
@@ -11641,11 +11109,6 @@ fn install_vd8_park(svc: &mut LiveEditService, regime: Vd8Regime) -> Vd8Park {
             );
             svc.catch_up_out_of_window_seam_for_test = Some(Arc::clone(&seam));
             Vd8Park::OutOfWindowDiff(seam)
-        }
-        Vd8Regime::InWindowRollback => {
-            let seam = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
-            svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&seam));
-            Vd8Park::ReplaySlice(seam)
         }
     }
 }
@@ -11725,7 +11188,7 @@ struct Vd8Case {
     window_seq: u64,
 }
 
-/// Drive one `(regime, catchup_snapshot_enabled, ceiling)` cell of the matrix:
+/// Drive one `(regime, ceiling)` cell of the matrix:
 /// park the subscriber after its header read P and before the read that serves
 /// it, land a real commit, release, and assert the catch-up folded the commit
 /// in, ACKED it, stamped it, and delivered it exactly once.
@@ -11760,21 +11223,14 @@ struct Vd8Case {
 #[cfg(feature = "test-fault-injection")]
 async fn assert_stable_cut_folds_and_acks_window_commit(
     regime: Vd8Regime,
-    catchup_snapshot_enabled: bool,
     ceiling: Vd8Ceiling,
 ) -> Vd8Case {
-    let mode = if catchup_snapshot_enabled {
-        "snapshot"
-    } else {
-        "off"
-    };
-    let layer = format!("vd8-{}-{mode}-layer", regime.label());
+    let layer = format!("vd8-{}-layer", regime.label());
     let pin = regime.seed_commits() + 1;
     let window_seq = pin + 1;
 
     let tv = ceiling.setup().await;
     let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), regime.stream_maxlen());
-    svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
     let park = install_vd8_park(&mut svc, regime);
     let svc = Arc::new(svc);
     // The snapshot-read counters are recorded on the client's metrics.
@@ -11785,7 +11241,7 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
         &tv,
         &svc,
         regime,
-        &format!("vd8-{}-{mode}", regime.label()),
+        &format!("vd8-{}", regime.label()),
         &layer,
     )
     .await;
@@ -11824,7 +11280,7 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
             _ => object_id,
         },
         regime.have_version(),
-        &format!("vd8-{}-{mode}-subscriber", regime.label()),
+        &format!("vd8-{}-subscriber", regime.label()),
     );
     let response = handle_subscribe_read_layer(&svc, sub_req)
         .await
@@ -11841,9 +11297,9 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
     let delta = decode_broadcast_delta(&body);
     assert!(
         struct_command_section_ids(&delta).contains(&VD8_WINDOW_SECTION),
-        "[{} / catchup_snapshot_enabled={catchup_snapshot_enabled}] the catch-up payload must \
-         carry the commit that landed after its header read P — without that the duplicate this \
-         block is about never existed and the rest of this case proves nothing",
+        "[{}] the catch-up payload must carry the commit that landed after its header read P — \
+         without that the duplicate this block is about never existed and the rest of this case \
+         proves nothing",
         regime.label()
     );
 
@@ -11852,9 +11308,9 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
     assert_eq!(
         content.sequence_num,
         window_seq,
-        "[{} / catchup_snapshot_enabled={catchup_snapshot_enabled}] the catch-up content must be \
-         labelled with its proven read's cut ({window_seq}); labelling it with P ({pin}) \
-         under-claims a payload that already carries commit {window_seq}",
+        "[{}] the catch-up content must be labelled with its proven read's cut ({window_seq}); \
+         labelling it with P ({pin}) under-claims a payload that already carries commit \
+         {window_seq}",
         regime.label()
     );
 
@@ -11875,8 +11331,7 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
             content.client_timestamp_microseconds_since_epoch,
         ),
         (at_cut.last_server_ts, at_cut.last_client_ts),
-        "[{} / catchup_snapshot_enabled={catchup_snapshot_enabled}] the content header must carry \
-         the timestamps the header held at the cut it serves",
+        "[{}] the content header must carry the timestamps the header held at the cut it serves",
         regime.label()
     );
     assert_eq!(
@@ -11893,30 +11348,28 @@ async fn assert_stable_cut_folds_and_acks_window_commit(
     // 5. Exactly once: the window commit is not delivered again after the ack.
     assert_no_next_message(&mut stream, Duration::from_secs(3)).await;
 
-    let regime_label = regime.stable_cut_label();
+    let regime_label = regime.label();
     assert_eq!(
         read_stable_cut_total(&svc.metrics, "verified", regime_label),
         1,
-        "[{regime_label} / catchup_snapshot_enabled={catchup_snapshot_enabled} / {ceiling:?}] the \
-         catch-up state read must record exactly one verified cut on its OWN regime series"
+        "[{regime_label} / {ceiling:?}] the catch-up state read must record exactly one verified \
+         cut on its OWN regime series"
     );
     assert_eq!(
         read_stable_cut_total(&svc.metrics, "unverified", regime_label),
         0,
-        "[{regime_label} / catchup_snapshot_enabled={catchup_snapshot_enabled} / {ceiling:?}] a \
-         cut at or above P must not be reported as unverified"
+        "[{regime_label} / {ceiling:?}] a cut at or above P must not be reported as unverified"
     );
     assert_eq!(
         read_catchup_snapshot_reads(&svc.metrics, "fenced", "fence_broken"),
         0,
-        "[{regime_label} / catchup_snapshot_enabled={catchup_snapshot_enabled} / {ceiling:?}] a \
-         commit that landed before the read must not cost a fenced read a broken attempt"
+        "[{regime_label} / {ceiling:?}] a commit that landed before the read must not cost a \
+         fenced read a broken attempt"
     );
     assert_eq!(
         read_catchup_snapshot_reads(&svc.metrics, ceiling.served_path(), "ok"),
         1,
-        "[{regime_label} / catchup_snapshot_enabled={catchup_snapshot_enabled} / {ceiling:?}] the \
-         catch-up served its one {} read",
+        "[{regime_label} / {ceiling:?}] the catch-up served its one {} read",
         ceiling.served_path()
     );
 
@@ -11955,13 +11408,9 @@ async fn stable_cut_brand_new_commit_inside_pin_window_delivered_exactly_once() 
     /// Section written after the catch-up completes — the loss-freedom probe.
     const POST_CATCH_UP_SECTION: u64 = 604;
 
-    // Production default: the corrected faithful full-state catch-up.
-    let mut case = assert_stable_cut_folds_and_acks_window_commit(
-        Vd8Regime::BrandNew,
-        true,
-        Vd8Ceiling::Shipped,
-    )
-    .await;
+    let mut case =
+        assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::BrandNew, Vd8Ceiling::Shipped)
+            .await;
 
     // Loss-freedom leg (Regime 1 only — it is the one regime whose payload is a
     // self-contained full state, so a local mirror built from it can be checked
@@ -11998,21 +11447,6 @@ async fn stable_cut_brand_new_commit_inside_pin_window_delivered_exactly_once() 
     );
 }
 
-// ── 1b. Regime 1 with the rollback knob off: same guarantee, other builder ───
-//
-// `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false` swaps the full-state builder from
-// `compute_faithful_full_content_at_cut` to the legacy `compute_diff_at_cut`.
-// That is a genuinely separate build site, and it is the arm an operator lands
-// on when rolling the catch-up correction back — so the exactly-once handoff
-// has to survive there too, or the rollback knob silently reopens this issue.
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stable_cut_brand_new_legacy_mode_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::BrandNew, false, Vd8Ceiling::Shipped)
-        .await;
-}
-
 // ── 2. Regime 1 (brand new), quiescent layer: verified on the first pass ─────
 //
 // The common case, and the other half of the ack-≤-content invariant: with no
@@ -12028,8 +11462,7 @@ async fn stable_cut_brand_new_quiescent_layer_verifies_at_the_pinned_sequence() 
     const CURRENT_SEQ: u64 = 3;
 
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
 
     let (session_id, object_id) =
         create_session_and_layer_pooled(&tv, &svc, "vd8-quiescent-session", LAYER).await;
@@ -12067,20 +11500,15 @@ async fn stable_cut_brand_new_quiescent_layer_verifies_at_the_pinned_sequence() 
 
 // ── 3. Regime 2 (in-window reconnect): the site with no other coverage ───────
 //
-// A reconnector whose start id is still retained takes
-// `catch_up_in_window_snapshot`, which takes its atomic read under its
-// catch-up slot and builds coalesced state through
-// `compute_faithful_coalesced_at_cut` — a THIRD build and delivery site,
-// reached only when `catchup_snapshot_enabled` is true (the `false` arm
-// replays the retained window per-commit, each diff version-bounded to its
-// commit and acked at that commit, never at a read's cut). Parked via
-// `CatchUpStateReadSeam::new_before_coalesced`.
+// A reconnector whose start id is still retained takes `catch_up_in_window`,
+// which takes its atomic read under its catch-up slot and builds coalesced
+// state through `compute_faithful_coalesced_at_cut` — a THIRD delivery site.
+// Parked via `CatchUpStateReadSeam::new_before_coalesced`.
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stable_cut_in_window_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::InWindow, true, Vd8Ceiling::Shipped)
-        .await;
+    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::InWindow, Vd8Ceiling::Shipped).await;
 }
 
 // ── 4. Regime 3 (out of window): same window, same exactly-once outcome ──────
@@ -12090,31 +11518,12 @@ async fn stable_cut_in_window_commit_inside_pin_window_delivered_exactly_once() 
 // parks before the read permit and the atomic read. The out-of-window regime
 // is forced with the established MAXLEN=4 + 5-commit + `have_version=1` +
 // deterministic XTRIM shape (see the b.jvx Site C tests).
-//
-// Both knob positions are covered: the `true` arm builds through
-// `compute_faithful_coalesced_at_cut`, the `false` arm through the legacy
-// coalesced `compute_diff_at_cut` — again two distinct build sites.
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stable_cut_out_of_window_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(
-        Vd8Regime::OutOfWindow,
-        true,
-        Vd8Ceiling::Shipped,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stable_cut_out_of_window_legacy_mode_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(
-        Vd8Regime::OutOfWindow,
-        false,
-        Vd8Ceiling::Shipped,
-    )
-    .await;
+    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::OutOfWindow, Vd8Ceiling::Shipped)
+        .await;
 }
 
 // ── 5. Sequence regression: end UNAVAILABLE, never ack the pin ───────────────
@@ -12135,11 +11544,9 @@ async fn stable_cut_out_of_window_legacy_mode_commit_inside_pin_window_delivered
 // left is the regression.
 //
 // The regression is staged by rewriting the header's `seq` column below P
-// while the subscriber is parked after P and before its proven read. At the
-// shipped ceiling, one cell per build/delivery site family: brand new in the
-// production mode, the in-window snapshot reconnect, and the rollback-mode
-// out-of-window reconnect; above it (section 6), every regime in both modes.
-// Each cell also checks that the regression was caught on the read its
+// while the subscriber is parked after P and before its proven read. One cell
+// per regime, at the shipped ceiling and above it (section 6). Each cell also
+// checks that the regression was caught on the read its
 // ceiling names: one `ok` read on that path, and one fenced-read flight above
 // the ceiling (none at the shipped one).
 
@@ -12152,30 +11559,17 @@ const SEQUENCE_REGRESSED_MSG: &str =
 #[cfg(feature = "test-fault-injection")]
 async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     regime: Vd8Regime,
-    catchup_snapshot_enabled: bool,
     ceiling: Vd8Ceiling,
 ) {
-    let mode = if catchup_snapshot_enabled {
-        "snapshot"
-    } else {
-        "off"
-    };
     let name = regime.label();
-    let label = regime.stable_cut_label();
-    let layer = format!("vd8-regressed-{name}-{mode}-layer");
+    let label = regime.label();
+    let layer = format!("vd8-regressed-{name}-layer");
     let pin = regime.seed_commits() + 1;
     // Below P, as a restore from a checkpoint taken earlier would leave it.
-    // The rollback replay's case goes further, to its `have_version` — the
-    // case b.h7b left open, where the interim path served zero bytes and
-    // acked the pin.
-    let regressed = match regime {
-        Vd8Regime::InWindowRollback => regime.have_version(),
-        _ => pin - 1,
-    };
+    let regressed = pin - 1;
 
     let tv = ceiling.setup().await;
     let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), regime.stream_maxlen());
-    svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
     let park = install_vd8_park(&mut svc, regime);
     let svc = Arc::new(svc);
     // The snapshot-read and flight counters are recorded on the client's
@@ -12183,14 +11577,8 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     tv.client()
         .install_observability_hooks(Arc::clone(&svc.metrics))
         .await;
-    let (session_id, object_id) = seed_vd8_layer(
-        &tv,
-        &svc,
-        regime,
-        &format!("vd8-regressed-{name}-{mode}"),
-        &layer,
-    )
-    .await;
+    let (session_id, object_id) =
+        seed_vd8_layer(&tv, &svc, regime, &format!("vd8-regressed-{name}"), &layer).await;
     let header_key = tv.key_schema().obj_header(&object_id.to_string());
 
     let have_object_id = match regime {
@@ -12204,7 +11592,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
             &layer,
             have_object_id,
             regime.have_version(),
-            &format!("vd8-regressed-{name}-{mode}-subscriber"),
+            &format!("vd8-regressed-{name}-subscriber"),
         ),
     )
     .await
@@ -12230,39 +11618,34 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     {
         Some(Err(status)) => status,
         Some(Ok(msg)) => panic!(
-            "[{label} / {mode}] a regressed catch-up must send nothing before its ending — no \
-             content and no caught-up ack at P ({pin}); got {msg:?}"
+            "[{label}] a regressed catch-up must send nothing before its ending — no content and \
+             no caught-up ack at P ({pin}); got {msg:?}"
         ),
-        None => panic!("[{label} / {mode}] the stream ended with no status: a bare EOS is gRPC OK"),
+        None => panic!("[{label}] the stream ended with no status: a bare EOS is gRPC OK"),
     };
     assert_eq!(
         status.code(),
         tonic::Code::Unavailable,
-        "[{label} / {mode}] a regression is retryable, not NOT_FOUND: the layer exists; got \
-         {status:?}"
+        "[{label}] a regression is retryable, not NOT_FOUND: the layer exists; got {status:?}"
     );
-    assert_eq!(
-        status.message(),
-        SEQUENCE_REGRESSED_MSG,
-        "[{label} / {mode}]"
-    );
+    assert_eq!(status.message(), SEQUENCE_REGRESSED_MSG, "[{label}]");
     assert!(
         tokio::time::timeout(SUBSCRIBER_DEADLINE, stream.next())
             .await
             .expect("the stream ends after its status")
             .is_none(),
-        "[{label} / {mode}] the status is the stream's terminal item"
+        "[{label}] the status is the stream's terminal item"
     );
 
     assert_eq!(
         read_stable_cut_total(&svc.metrics, "unverified", label),
         1,
-        "[{label} / {mode}] the regression records one `unverified` cut on its own regime series"
+        "[{label}] the regression records one `unverified` cut on its own regime series"
     );
     assert_eq!(
         read_stable_cut_total(&svc.metrics, "verified", label),
         0,
-        "[{label} / {mode}] nothing was served, so nothing is reported verified"
+        "[{label}] nothing was served, so nothing is reported verified"
     );
     let exits_error = || {
         live_edit::observability::metrics::test_util::sample_value(
@@ -12279,7 +11662,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     while exits_error() != 1 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "[{label} / {mode}] the regression ending is counted once under exit reason `error`"
+            "[{label}] the regression ending is counted once under exit reason `error`"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -12289,7 +11672,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     assert_eq!(
         read_catchup_snapshot_reads(&svc.metrics, ceiling.served_path(), "ok"),
         1,
-        "[{label} / {mode} / {ceiling:?}] the regression is caught on the catch-up's one {} read",
+        "[{label} / {ceiling:?}] the regression is caught on the catch-up's one {} read",
         ceiling.served_path()
     );
     let flight_leaders = live_edit::observability::metrics::test_util::sample_value(
@@ -12304,8 +11687,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
             Vd8Ceiling::Shipped => 0,
             Vd8Ceiling::Above => 1,
         },
-        "[{label} / {mode} / {ceiling:?}] one fenced-read flight above the ceiling, none at the \
-         shipped one"
+        "[{label} / {ceiling:?}] one fenced-read flight above the ceiling, none at the shipped one"
     );
 
     // A retried subscribe re-reads the current header and catches up at it.
@@ -12314,9 +11696,8 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     if !matches!(regime, Vd8Regime::BrandNew) {
         return;
     }
-    let mut retry_svc =
+    let retry_svc =
         build_pooled_service(&tv, Arc::new(AllowAllPermissions), regime.stream_maxlen());
-    retry_svc.catchup_snapshot_enabled = catchup_snapshot_enabled;
     let mut retried = handle_subscribe_read_layer(
         &retry_svc,
         subscribe_request(
@@ -12324,7 +11705,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
             &layer,
             have_object_id,
             regime.have_version(),
-            &format!("vd8-regressed-{name}-{mode}-retry"),
+            &format!("vd8-regressed-{name}-retry"),
         ),
     )
     .await
@@ -12334,7 +11715,7 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
     assert_eq!(
         (content.object_id, content.sequence_num),
         (object_id, regressed),
-        "[{label} / {mode}] the retried subscribe serves the layer at its current header"
+        "[{label}] the retried subscribe serves the layer at its current header"
     );
     recv_caught_up_ack(&mut retried, object_id, regressed).await;
 }
@@ -12344,7 +11725,6 @@ async fn assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
 async fn stable_cut_brand_new_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::BrandNew,
-        true,
         Vd8Ceiling::Shipped,
     )
     .await;
@@ -12355,7 +11735,6 @@ async fn stable_cut_brand_new_sequence_regression_ends_unavailable_and_never_ack
 async fn stable_cut_in_window_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::InWindow,
-        true,
         Vd8Ceiling::Shipped,
     )
     .await;
@@ -12363,11 +11742,9 @@ async fn stable_cut_in_window_sequence_regression_ends_unavailable_and_never_ack
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stable_cut_out_of_window_legacy_mode_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-) {
+async fn stable_cut_out_of_window_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::OutOfWindow,
-        false,
         Vd8Ceiling::Shipped,
     )
     .await;
@@ -12380,62 +11757,25 @@ async fn stable_cut_out_of_window_legacy_mode_sequence_regression_ends_unavailab
 // (Epic 3): the catch-up attaches with no slot, checks the flight's cut
 // against its own P, registers its stream at that cut and builds from the
 // shared snapshot in its build turn. The matrix holds there cell for cell, in
-// every regime and both modes — the rollback-mode in-window replay included,
-// which hands over to the out-of-window route at its first `TOO_LARGE` and is
-// served there — and a sequence regression ends every one of them
-// `UNAVAILABLE` before content. The rollback replay's regression is staged
-// down to its `have_version`: the case b.h7b left on the interim path, which
-// served it zero bytes and acked the pin.
+// every regime, and a sequence regression ends every one of them
+// `UNAVAILABLE` before content.
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_cut_brand_new_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::BrandNew, true, Vd8Ceiling::Above)
-        .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_brand_new_legacy_mode_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::BrandNew, false, Vd8Ceiling::Above)
-        .await;
+    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::BrandNew, Vd8Ceiling::Above).await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_cut_in_window_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::InWindow, true, Vd8Ceiling::Above)
-        .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_in_window_legacy_mode_replay_hand_over_commit_inside_pin_window_delivered_exactly_once(
-) {
-    assert_stable_cut_folds_and_acks_window_commit(
-        Vd8Regime::InWindowRollback,
-        false,
-        Vd8Ceiling::Above,
-    )
-    .await;
+    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::InWindow, Vd8Ceiling::Above).await;
 }
 
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_cut_out_of_window_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::OutOfWindow, true, Vd8Ceiling::Above)
-        .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_out_of_window_legacy_mode_commit_inside_pin_window_delivered_exactly_once() {
-    assert_stable_cut_folds_and_acks_window_commit(
-        Vd8Regime::OutOfWindow,
-        false,
-        Vd8Ceiling::Above,
-    )
-    .await;
+    assert_stable_cut_folds_and_acks_window_commit(Vd8Regime::OutOfWindow, Vd8Ceiling::Above).await;
 }
 
 #[cfg(feature = "test-fault-injection")]
@@ -12443,19 +11783,6 @@ async fn fenced_cut_out_of_window_legacy_mode_commit_inside_pin_window_delivered
 async fn fenced_cut_brand_new_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::BrandNew,
-        true,
-        Vd8Ceiling::Above,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_brand_new_legacy_mode_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-) {
-    assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-        Vd8Regime::BrandNew,
-        false,
         Vd8Ceiling::Above,
     )
     .await;
@@ -12466,23 +11793,6 @@ async fn fenced_cut_brand_new_legacy_mode_sequence_regression_ends_unavailable_a
 async fn fenced_cut_in_window_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::InWindow,
-        true,
-        Vd8Ceiling::Above,
-    )
-    .await;
-}
-
-/// The case b.h7b left on the interim path: a rollback-mode replay whose
-/// layer's sequence regressed to its own `have_version` was served zero bytes
-/// and acked the pin. Through the flight it ends `UNAVAILABLE` before any
-/// content or ack.
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_in_window_legacy_mode_replay_regression_to_have_version_ends_unavailable_and_never_acks_the_pin(
-) {
-    assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-        Vd8Regime::InWindowRollback,
-        false,
         Vd8Ceiling::Above,
     )
     .await;
@@ -12493,19 +11803,6 @@ async fn fenced_cut_in_window_legacy_mode_replay_regression_to_have_version_ends
 async fn fenced_cut_out_of_window_sequence_regression_ends_unavailable_and_never_acks_the_pin() {
     assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
         Vd8Regime::OutOfWindow,
-        true,
-        Vd8Ceiling::Above,
-    )
-    .await;
-}
-
-#[cfg(feature = "test-fault-injection")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fenced_cut_out_of_window_legacy_mode_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-) {
-    assert_sequence_regression_ends_unavailable_and_never_acks_the_pin(
-        Vd8Regime::OutOfWindow,
-        false,
         Vd8Ceiling::Above,
     )
     .await;
@@ -12523,13 +11820,12 @@ async fn fenced_cut_out_of_window_legacy_mode_sequence_regression_ends_unavailab
 // read error propagates unchanged.
 //
 // The pre-existing tests drive that policy at the header-read sites with the
-// checkpoint hook disabled (NotRecoverable), in the legacy catch-up mode, and
-// the recovery-hook suite drives Restored / Transient / Permanent at the one
-// site that holds no consumer. The cases below cover what those leave: the
-// same outcomes at the sites that DO hold a consumer, the in-window snapshot
-// coalesced site's Restored-and-retry, the snapshot-mode out-of-window read,
-// and the consumer shutdown that must precede a re-bootstrap on a one-slot
-// subscriber pool.
+// checkpoint hook disabled (NotRecoverable), and the recovery-hook suite
+// drives Restored / Transient / Permanent at the one site that holds no
+// consumer. The cases below cover what those leave: the same outcomes at the
+// sites that DO hold a consumer, the in-window coalesced site's
+// Restored-and-retry, the out-of-window coalesced read, and the consumer
+// shutdown that must precede a re-bootstrap on a one-slot subscriber pool.
 //
 // Every case parks the subscriber at an existing b.xmk / b.fdy seam, changes
 // the keyspace under it, and releases it. `SUBSCRIBER_DEADLINE` (30 s) bounds
@@ -12750,7 +12046,6 @@ mod b21r_recovery_policy {
     async fn in_window_snapshot_coalesced_read_restored_retries_once_and_serves_the_same_object() {
         let tv = PooledTestValkey::setup().await;
         let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-        svc.catchup_snapshot_enabled = true;
         let seam = Arc::new(live_edit::grpc::subscribe::CatchUpXrangeSeam::new());
         svc.catch_up_xrange_seam_for_test = Some(Arc::clone(&seam));
         let (session_id, object_id) = create_session_and_layer_pooled(
@@ -12825,12 +12120,13 @@ mod b21r_recovery_policy {
         );
     }
 
-    /// The snapshot-mode out-of-window read (`compute_faithful_coalesced_at_cut`) under
+    /// The out-of-window read (`compute_faithful_coalesced_at_cut`) under
     /// the overwrite race: the OLD object's keys are cleaned up between the
     /// header read and the coalesced read, recovery is disabled
     /// (`NotRecoverable`), and the subscriber re-bootstraps onto the NEW object.
-    /// The legacy (`compute_diff_at_cut`) twin is
-    /// `catch_up_out_of_window_compute_diff_notfound_after_cleanup_triggers_rebootstrap`.
+    /// Section 17's
+    /// `catch_up_out_of_window_compute_diff_notfound_after_cleanup_triggers_rebootstrap`
+    /// drives the same race on the fixture's default reader pool.
     ///
     /// Run with `subscriber_pool` stream readers: with one reader the OLD and
     /// NEW generations' streams are served by the same reader, with eight they
@@ -12838,7 +12134,6 @@ mod b21r_recovery_policy {
     async fn out_of_window_snapshot_overwrite_rebootstrap(subscriber_pool: u32, tag: &str) {
         let tv = PooledTestValkey::setup_with_pools(8, subscriber_pool).await;
         let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-        svc.catchup_snapshot_enabled = true;
         let seam =
             Arc::new(live_edit::grpc::subscribe::CatchUpOutOfWindowSeam::new_before_compute_diff());
         svc.catch_up_out_of_window_seam_for_test = Some(Arc::clone(&seam));
@@ -12879,7 +12174,7 @@ mod b21r_recovery_policy {
         assert_eq!(
             (header.object_id, header.sequence_num),
             (new_object_id, 1),
-            "the snapshot-mode coalesced read's NotFound must re-bootstrap onto the NEW object"
+            "the coalesced read's NotFound must re-bootstrap onto the NEW object"
         );
         recv_caught_up_ack(&mut stream, header.object_id, header.sequence_num).await;
     }
@@ -12896,7 +12191,7 @@ mod b21r_recovery_policy {
 
     /// A state read that fails with anything other than `NotFound` propagates
     /// unchanged: no recovery attempt, no re-bootstrap. Driven at the
-    /// out-of-window coalesced read (snapshot mode, consumer held) by retyping
+    /// out-of-window coalesced read (consumer held) by retyping
     /// `obj:hdr` to a string while the subscriber is parked — a permanent
     /// `WRONGTYPE`, which the catch-up surfaces as INTERNAL.
     ///
@@ -12906,7 +12201,6 @@ mod b21r_recovery_policy {
     async fn out_of_window_non_notfound_read_error_propagates_without_recovery_or_rebootstrap() {
         let tv = PooledTestValkey::setup().await;
         let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4);
-        svc.catchup_snapshot_enabled = true;
         let seam =
             Arc::new(live_edit::grpc::subscribe::CatchUpOutOfWindowSeam::new_before_compute_diff());
         svc.catch_up_out_of_window_seam_for_test = Some(Arc::clone(&seam));
@@ -13135,26 +12429,15 @@ async fn await_mux_keys(svc: &LiveEditService, keys: usize) {
 // pulls the in-window slice `XRANGE {have_version+1}-0 + COUNT <MAXLEN>` in
 // one reply moves up to a whole retention window per reconnect.
 //
-// - Snapshot mode (the default) needs only two answers from the stream —
-//   whether `{have_version+1}-0` is still there, and whether the last entry is
-//   a `deleted` sentinel — so an in-window catch-up reads at most two entries
-//   however large the window. Counted off a `MONITOR` feed: every `XRANGE` /
-//   `XREVRANGE` a client sent on the layer stream during the catch-up, re-run
-//   afterwards on the quiescent stream. The pre-b.yvh slice read all eight.
-// - Rollback mode replays every retained commit, so it reads the window in
-//   byte-sized pages. A window longer than one page is replayed whole and
-//   acked at its last commit; a head trim between two pages (here staged with
-//   `ScriptReplyProxy`'s `HoldReplies` on the first page) can leave a hole
-//   past the cursor, so the replay re-checks `{have_version+1}-0` after its
-//   last page and falls back to Regime 3 rather than replay around the hole.
+// The in-window catch-up needs only two answers from the stream — whether
+// `{have_version+1}-0` is still there, and whether the last entry is a
+// `deleted` sentinel — so it reads at most two entries however large the
+// window. Counted off a `MONITOR` feed: every `XRANGE` / `XREVRANGE` a client
+// sent on the layer stream during the catch-up, re-run afterwards on the
+// quiescent stream. The pre-b.yvh slice read all eight.
 
-/// Relay bytes of each large commit in the snapshot-mode test.
+/// Relay bytes of each large commit in the test below.
 const LARGE_RELAY_BYTES: usize = 64 * 1024;
-
-/// Commits past `have_version` in the rollback-mode tests: more than the
-/// replay's first page (64, from `stream_mux::DEFAULT_ENTRY_ESTIMATE` against
-/// the 1 MiB page target), so the window takes two pages.
-const MULTI_PAGE_COMMITS: u64 = 70;
 
 /// Every `XRANGE` / `XREVRANGE` a client (not a script) sent on `stream_key`
 /// in `feed`, re-run on the stream now, as `(entries, relay bytes)` returned.
@@ -13213,17 +12496,15 @@ async fn await_regime(svc: &LiveEditService, regime: &str, mode: &str, target: u
     }
 }
 
-/// Snapshot mode, in window, eight 64 KiB commits behind: the catch-up's
-/// stream reads return at most two entries — the point read of
-/// `{have_version+1}-0` and the last entry — where the slice returned all
-/// eight. The regime is still `in_window`, and the content is one coalesced
-/// diff to the header sequence.
+/// In window, eight 64 KiB commits behind: the catch-up's stream reads return
+/// at most two entries — the point read of `{have_version+1}-0` and the last
+/// entry — where the slice returned all eight. The regime is still
+/// `in_window`, and the content is one coalesced diff to the header sequence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_in_window_catch_up_reads_at_most_two_stream_entries() {
     const BEHIND: u64 = 8;
     let tv = PooledTestValkey::setup().await;
-    let mut svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    svc.catchup_snapshot_enabled = true;
+    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
     let (session_id, object_id) =
         create_session_and_layer_pooled(&tv, &svc, "iw-point-session", "iw-point-layer").await;
     apply_unique_update(
@@ -13297,185 +12578,5 @@ async fn snapshot_in_window_catch_up_reads_at_most_two_stream_entries() {
     assert!(
         bytes <= 2 * (LARGE_RELAY_BYTES + 1024),
         "at most two entries' relay bytes; got {bytes}"
-    );
-}
-
-/// Rollback mode, a window of more than one page: every commit is replayed,
-/// in order, and the catch-up acks the last one. The `MONITOR` feed shows the
-/// read took two pages and the window-start re-check.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rollback_in_window_replay_longer_than_one_page_replays_every_commit_and_acks_the_last() {
-    let tv = PooledTestValkey::setup().await;
-    let svc = build_pooled_service(&tv, Arc::new(AllowAllPermissions), 4096);
-    assert!(!svc.catchup_snapshot_enabled, "fixture: rollback mode");
-    let (session_id, object_id) =
-        create_session_and_layer_pooled(&tv, &svc, "iw-pages-session", "iw-pages-layer").await;
-    for i in 0..MULTI_PAGE_COMMITS {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "iw-pages-layer",
-            object_id,
-            "writer",
-            100 + i,
-        )
-        .await;
-    }
-    let current = 1 + MULTI_PAGE_COMMITS;
-    let stream_key = tv.key_schema().layer_stream(object_id);
-    let mut tap = crate::storage::snapshot_read_support::MonitorTap::start(
-        &crate::storage::snapshot_read_support::test_valkey_addr(),
-    )
-    .await;
-
-    let sub_req = subscribe_request(&session_id, "iw-pages-layer", object_id, 1, "sub-iw-pages");
-    let mut stream = handle_subscribe_read_layer(&svc, sub_req)
-        .await
-        .expect("subscribe must succeed")
-        .into_inner();
-    let mut seqs = Vec::new();
-    for _ in 0..MULTI_PAGE_COMMITS {
-        let (header, _) = recv_message(&mut stream).await;
-        seqs.push(header.sequence_num);
-    }
-    assert_eq!(
-        seqs,
-        (2..=current).collect::<Vec<_>>(),
-        "every commit of the window, replayed in order"
-    );
-    recv_caught_up_ack(&mut stream, object_id, current).await;
-
-    let fence = crate::storage::snapshot_read_support::monitor_fence(&tv.prefix);
-    let _: Option<String> = tv
-        .client()
-        .pool
-        .get(&fence)
-        .await
-        .expect("the fence GET must succeed");
-    let feed = tap.drain_until(&fence).await;
-    let reads: Vec<Vec<String>> = feed
-        .iter()
-        .filter(|c| {
-            !c.issued_by_script()
-                && c.name() == "XRANGE"
-                && c.args.get(1).map(String::as_str) == Some(stream_key.as_str())
-        })
-        .map(|c| c.args[2..].to_vec())
-        .collect();
-    let pages = reads.iter().filter(|a| a[1] == "+").count();
-    assert!(
-        pages >= 2,
-        "fixture: the replay must have taken more than one page; reads {reads:?}"
-    );
-    assert!(
-        reads.iter().any(|a| a[0] == "2-0" && a[1] == "2-0"),
-        "a multi-page read re-checks that the window start is still held; reads {reads:?}"
-    );
-}
-
-/// Rollback mode, a multi-page window trimmed between its pages: the first
-/// page is read, then a head trim (`XTRIM MINID = 68-0`) removes the window
-/// start and two entries past the cursor. The next page starts beyond the
-/// hole; the replay's window-start re-check finds `2-0` gone and the catch-up
-/// falls back to Regime 3 — one coalesced diff to the header sequence — instead
-/// of replaying around the hole and acking commits it never delivered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rollback_in_window_replay_trimmed_between_pages_falls_back_to_out_of_window() {
-    use crate::storage::snapshot_read_support::{ProxyAction, ReplyGate, ScriptReplyProxy};
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    let gate = ReplyGate::new();
-    let armed = Arc::new(AtomicBool::new(false));
-    let stream_key_slot: Arc<std::sync::Mutex<String>> =
-        Arc::new(std::sync::Mutex::new(String::new()));
-    let rule: crate::storage::snapshot_read_support::ProxyRule = {
-        let (gate, armed, key) = (
-            gate.clone(),
-            Arc::clone(&armed),
-            Arc::clone(&stream_key_slot),
-        );
-        Arc::new(move |args: &[Vec<u8>]| {
-            let is_first_page = args.len() >= 4
-                && args[0].eq_ignore_ascii_case(b"XRANGE")
-                && args[1] == key.lock().unwrap().as_bytes()
-                && args[2] == b"2-0"
-                && args[3] == b"+";
-            // Once: the hold covers the first page only.
-            (is_first_page && armed.swap(false, Ordering::SeqCst))
-                .then(|| ProxyAction::HoldReplies(gate.clone()))
-        })
-    };
-    // Declared before the fixture, so the fixture drops (and cleans up
-    // through the proxy) first.
-    let proxy = ScriptReplyProxy::start(
-        crate::storage::snapshot_read_support::test_valkey_addr(),
-        rule,
-    )
-    .await;
-    let tv = PooledTestValkey::setup_with_url(proxy.url()).await;
-    // The trim goes through a connection of its own, never the held one.
-    let direct = live_edit::storage::test_support::TestValkey::setup().await;
-    let svc = Arc::new(build_pooled_service(
-        &tv,
-        Arc::new(AllowAllPermissions),
-        4096,
-    ));
-    assert!(!svc.catchup_snapshot_enabled, "fixture: rollback mode");
-    let (session_id, object_id) =
-        create_session_and_layer_pooled(&tv, &svc, "iw-trim-session", "iw-trim-layer").await;
-    for i in 0..MULTI_PAGE_COMMITS {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "iw-trim-layer",
-            object_id,
-            "writer",
-            100 + i,
-        )
-        .await;
-    }
-    let current = 1 + MULTI_PAGE_COMMITS;
-    let stream_key = tv.key_schema().layer_stream(object_id);
-    *stream_key_slot.lock().unwrap() = stream_key.clone();
-    armed.store(true, Ordering::SeqCst);
-
-    let subscribing = {
-        let svc = Arc::clone(&svc);
-        let sub_req = subscribe_request(&session_id, "iw-trim-layer", object_id, 1, "sub-iw-trim");
-        tokio::spawn(async move { handle_subscribe_read_layer(&svc, sub_req).await })
-    };
-    // The first page has run on the store; its reply is held at the proxy.
-    gate.reply_held().await;
-    let cap: XCap = XCap::try_from(("MINID", "=", "68-0")).expect("build MINID xcap");
-    let _: () = direct
-        .client()
-        .pool
-        .xtrim(&stream_key, cap)
-        .await
-        .expect("the staged head trim must succeed");
-    gate.open();
-
-    let mut stream = tokio::time::timeout(SUBSCRIBER_DEADLINE, subscribing)
-        .await
-        .expect("the subscribe must return within the deadline")
-        .expect("the subscribe task must not panic")
-        .expect("subscribe must succeed")
-        .into_inner();
-    assert_eq!(proxy.hits(), 1, "fixture: the first page was held once");
-    let (header, body) = recv_message(&mut stream).await;
-    assert_eq!(
-        header.sequence_num, current,
-        "a window trimmed between pages must fall back to Regime 3's one coalesced diff to the \
-         header ({current}); a per-commit message at {} is the replay acking around the hole",
-        header.sequence_num
-    );
-    assert!(!body.is_empty());
-    recv_caught_up_ack(&mut stream, object_id, current).await;
-    assert_no_next_message(&mut stream, Duration::from_millis(500)).await;
-    await_regime(&svc, "out_of_window", "legacy", 1).await;
-    assert_eq!(
-        read_regime_total(&svc.metrics, &svc.service_label, "in_window", "legacy"),
-        0,
-        "the trimmed window is not served in-window"
     );
 }

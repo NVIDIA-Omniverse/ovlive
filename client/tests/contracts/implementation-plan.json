@@ -3,20 +3,6 @@
   "objective": "Fully execute docs/ovlive-design.md",
   "packages": [
     {
-      "id": "M0.1",
-      "name": "M0.1 Source manifest",
-      "work": "`tests/contracts/source-manifest.json`: upstream commit, allowlisted files with scope and state, proto hash; `source/live/wire/schema/provenance.json`: schema package identity and hashes",
-      "depends_on": [],
-      "exit_criteria": "Every file in the allowlist has a stated reason; nothing the provenance exclusion list names appears",
-      "status": "in_progress",
-      "evidence": [
-        "tests/contracts/source-manifest.json",
-        "source/live/wire/schema/provenance.json",
-        "source/live/wire/schema/LICENSE.txt"
-      ],
-      "coverage_limit": "The Live proto and the exact pinned source-only OMPF schema are vendored and hashed with their original license, and every manifest entry states its scope. The clause \"nothing the provenance exclusion list names appears\" is open: it needs reconciliation of the allowlist against the implementation provenance and the release link map."
-    },
-    {
       "id": "M0.2",
       "name": "M0.2 ABI draft",
       "work": "`Live.h` reviewed as text: every function in design section 16, every struct, every result code, every unit suffix; `CreatedSession` versus listed metadata; operational status/callback, `SdfLayer::Export` recovery, endpoint ownership, and diagnostic contracts from design sections 4, 13, 17 and 18",
@@ -65,9 +51,7 @@
       "status": "complete",
       "evidence": [
         "tests/contracts/catalog.json",
-        "tests/harness/test_doc_claims.py",
-        "docs/ovlive-design.md#11-layer-creation-save-and-replacement",
-        "tests/harness/test_build_inputs.py"
+        "docs/ovlive-design.md#11-layer-creation-save-and-replacement"
       ]
     },
     {
@@ -602,12 +586,18 @@
       "evidence": [
         "tests/reference_service/writer_history.py",
         "tests/reference_service/test_plugin.py::PluginTests.test_seeded_public_writers_account_every_edit_and_conflict",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_coalesced_public_writers_account_every_edit_and_conflict",
         "tests/harness/test_writer_history.py",
         "tests/reference_service/writer_reduction.py",
+        "tests/reference_service/round_plans.py",
         "tests/harness/test_writer_reduction.py",
         "tools/live/writer_campaign.py",
         "tools/live/writer_fuzz.py",
         "tests/harness/test_writer_campaign.py",
+        "tests/reference_service/test_staged_samples.py::StagedSampleTests.test_staged_samples_converge_beside_seeded_writers",
+        "tests/reference_service/test_staged_samples.py::StagedSampleTests.test_staged_samples_corrupt_reduction_reexecutes_staged_samples_and_service",
+        "tests/reference_service/staged_sample_history.py",
+        "tests/harness/test_staged_sample_history.py",
         "tests/reference_service/test_plugin.py::PluginTests.test_public_writer_reduction_reexecutes_real_clients_and_service",
         "docs/ovlive-support-boundary.md",
         "tests/reference_service/structural_history.py",
@@ -621,9 +611,32 @@
         "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_native_sample_writers_preserve_keys_replace_maps_and_resume",
         "tests/reference_service/sample_history.py",
         "tests/harness/test_sample_history.py",
-        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_seeded_sample_writers_account_repeated_and_erased_edits"
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_seeded_sample_writers_account_repeated_and_erased_edits",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_structural_writer_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_structural_reorder_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_sample_writer_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_stopped_round_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_rotation_fault_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_structural_relay_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_graph_transport.py::GraphTransportTests.test_sample_relay_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/rotation_history.py",
+        "tests/harness/test_rotation_history.py",
+        "tests/reference_service/test_plugin.py::PluginTests.test_queued_rotation_fault_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_uncertain_before_cut_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_uncertain_after_cut_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_uncertain_leaked_cut_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_coalesced_queued_rotation_corrupt_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_coalesced_queued_rotation_fault_reduction_reexecutes_real_clients_and_service",
+        "tests/reference_service/period_plans.py",
+        "tests/harness/test_period_plans.py",
+        "tests/reference_service/test_plugin.py::PluginTests.test_stream_age_corrupt_reduction_truncates_and_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_stream_age_resume_reduction_truncates_and_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_long_rotation_corrupt_reduction_truncates_and_reexecutes_real_clients_and_service",
+        "tests/reference_service/test_plugin.py::PluginTests.test_long_rotation_resume_reduction_truncates_and_reexecutes_real_clients_and_service",
+        "tests/reference_service/plan_replay.py",
+        "tests/harness/test_plan_replay.py"
       ],
-      "coverage_limit": "An eight-process public-plugin scenario admits 128 root int32 edits with simultaneous first-RPC barriers, complete planned/admitted/committed histories, explicit supersession lineage, late join and fresh observer. Inputs and candidate identity are recorded before workers; native publication events drive convergence. Deliberate missing-loser, duplicate, invented, FIFO, writer-identity and admission mutations validate the accounting oracle. The root-field public-plugin profile automatically reduces semantic admission/commit discrepancies through fresh client/service trials, preserves original inputs/edit IDs, and verifies the final candidate afresh. Standalone plan replay checks source, native/SDK, reference dependency, sanitizer and fixture identities. A corrupting reference-service fixture exercises the automatic failure path and proves the reduced inputs pass with the healthy service. Reduction deletes operations while retaining all original nonempty writers and the first-RPC hold recipe; convergence watchdogs, structural/sample histories, fault schedules, larger/nightly populations and the full qualification gate remain open. A four-process private-attachment structural workload adds 48 public-constructor/field/move/delete/replacement admissions, an independent high-level typed scene and exact-once/FIFO ledger oracle, late-child/ancestor-move gates and two safe backend rotations. Broad structure/value fuzzing and shrinking remain incomplete. Transport-free native graph failures have automatic bounded batch/command/field deletion and identity-checked standalone replay, qualified by an explicit native reporting defect. This does not complete multiwriter fault-schedule reduction, broad value shrinking or the full fuzz gate. The independent graph profile adds sample maps and per-key edits, 80 seeded sample transitions, exact signed-zero/type-only resume diffs, and native two-writer narrow-edit versus whole-map conflict witnesses. Sample-record reduction preserves timestamp identity; this remains bounded component qualification. A four-native-writer seeded sample workload adds 64 admissions with repeated equal payloads, no-op erases, independently validated wire effects and a wire-independent FIFO/round/lineage oracle. Complete typed semantic scenes survive A/B/A rotations and fresh observation. The common entrypoint has mandatory writer-fuzz CI/nightly profiles with fixed and derived seeds: root populations through 32 public-plugin writers, structural/sample populations through eight private-attachment writers, safe A/B/A rotations and uncertain-write recovery. Each case uses fresh processes/service state, verifies candidate/dependency provenance, records observed client population and enforces completion/cleanup/evidence checks. The profiles have bounded case/campaign watchdogs, native-client admission limits and post-completion artifact rejection thresholds. This is locally executable campaign coverage, not external CI scheduling, prolonged soaks, parser fuzzing, broad fault-schedule generation/reduction or full platform/resource qualification."
+      "coverage_limit": "An eight-process public-plugin scenario admits 128 root int32 edits with simultaneous first-RPC barriers, complete planned/admitted/committed histories, explicit supersession lineage, late join and fresh observer. Inputs and candidate identity are recorded before workers; native publication events drive convergence. Deliberate missing-loser, duplicate, invented, FIFO, writer-identity and admission mutations validate the accounting oracle. The root-field public-plugin profile automatically reduces semantic admission/commit discrepancies through fresh client/service trials, preserves original inputs/edit IDs, and verifies the final candidate afresh. Standalone plan replay checks source, native/SDK, reference dependency, sanitizer and fixture identities. Graph, rotation and period reductions record their case, scale and trial identities, and the common runner replays their best or original plan once through the reducer's evaluator after checking its recorded hash and the source, native/SDK, reference dependency and interpreter and sanitizer identities, exiting 1 when it reproduces the recorded signature, 2 when it does not and 3 when refused; one self-test of each class qualifies the replay with and without its defect and the refusal of an altered plan or hash. A corrupting reference-service fixture exercises the automatic failure path and proves the reduced inputs pass with the healthy service. Reduction deletes operations while retaining all original nonempty writers and the first-RPC hold recipe. Structural and sample semantic failures reduce by deleting whole writers, rounds and backend rotations from the seeded plan, each class qualified by its own corrupting reference-service fixture, replay of the reduced plan and a pass against the healthy service. Their rotation-check failures and rounds whose commits stop short of the round frontier reduce the same way, qualified by a misrouted rotation and an acknowledged but uncommitted edit. A writer scene that differs from the one the service ledger replays to, the client-versus-service comparison, reduces the same way by the first edit in plan order that the class's scene attribution names over every differing reader, qualified by a reference service that relays every structural shared-field write, and every sample at one key, to readers with a changed value while its ledger keeps the uploaded one; the comparison's wait result and pending count remain plain checks. The queued-rotation and uncertain-write root-field cases run seeded round-based plans and reduce the same way: a queued-rotation resume failure by its rotation, and a write-cut ledger failure (a write cut before execution committed, a write cut after its commit missing or repeated, or a queued write issued) by its first discrepant edit, each qualified by a misrouted rotation, a cut write the service applies or loses, or a cut write released early so its queued writes follow. The coalesced queued-rotation case reduces its accounting mismatches by the least planned unexplained field or least uncovered writer, and its resume failures by rotation, qualified by an owned edit the service corrupts in whichever coalesced run carries it and a misrouted rotation. The stream-age case runs seeded period plans and reduces its per-period ledger accounting mismatches and its expiry resume failures, whose signatures name the failing period: the first trial replays the plan cut after that period, never the whole plan, then whole two-period cycles and writers are deleted, qualified by an edit the service corrupts after an expiry and a peer commit before an expiry that the period's frontier does not count. The long-rotations case reduces its per-rotation ledger accounting mismatches and its rotation resume failures the same way, qualified by an edit the service corrupts on backend B and a rotation forwarded to the backend it leaves. The package campaign's staged-samples case reduces its per-round layer accounting mismatches by deleting whole participant samples with the writers on their layers, writers and rounds from the seeded plan, and its reduction records the stage, the SDK interpreter it records and its sample executables beside the trial identities, so a replay refuses a changed stage; a self-test case of the campaign qualifies it with a value the service corrupts in one writer edit. Client-side convergence stalls, the coalesced queued-rotation pending and attempt ranges, the long-rotations case's other checks, the soak fault schedule, the stream-age case's other checks and resource bounds, larger/nightly populations and the full qualification gate remain open. A four-process private-attachment structural workload adds 48 public-constructor/field/move/delete/replacement admissions, an independent high-level typed scene and exact-once/FIFO ledger oracle, late-child/ancestor-move gates and two safe backend rotations. Broad structure/value fuzzing and shrinking remain incomplete. Transport-free native graph failures have automatic bounded batch/command/field deletion and identity-checked standalone replay, qualified by an explicit native reporting defect. This does not complete multiwriter fault-schedule reduction, broad value shrinking or the full fuzz gate. The independent graph profile adds sample maps and per-key edits, 80 seeded sample transitions, exact signed-zero/type-only resume diffs, and native two-writer narrow-edit versus whole-map conflict witnesses. Sample-record reduction preserves timestamp identity; this remains bounded component qualification. A four-native-writer seeded sample workload adds 64 admissions with repeated equal payloads, no-op erases, independently validated wire effects and a wire-independent FIFO/round/lineage oracle. Complete typed semantic scenes survive A/B/A rotations and fresh observation. The common entrypoint has mandatory writer-fuzz CI/nightly profiles with fixed and derived seeds: root populations through 32 public-plugin writers, structural/sample populations through eight private-attachment writers, safe A/B/A rotations and uncertain-write recovery. Each case uses fresh processes/service state, verifies candidate/dependency provenance, records observed client population and enforces completion/cleanup/evidence checks. The profiles have bounded case/campaign watchdogs, native-client admission limits and post-completion artifact rejection thresholds. This is locally executable campaign coverage, not external CI scheduling, prolonged soaks, parser fuzzing, broad fault-schedule generation/reduction or full platform/resource qualification."
     },
     {
       "id": "M2.9",
@@ -662,6 +675,7 @@
       "status": "in_progress",
       "evidence": [
         "tests/reference_service/test_plugin.py::PluginTests.test_seeded_writers_resume_queued_edits_through_two_backend_rotations",
+        "tests/reference_service/test_plugin.py::PluginTests.test_seeded_coalesced_writers_resume_queued_edits_through_two_backend_rotations",
         "tests/reference_service/test_scene.py::SceneInfrastructureTests",
         "tests/native/plugin/driver.cpp",
         "docs/ovlive-support-boundary.md",

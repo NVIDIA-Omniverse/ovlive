@@ -75,8 +75,8 @@ envSecretName: "live-edit-env"
 
 # The service sizes its memory budgets from the memory limit and stops at
 # startup, naming the limit it needs, when the limit cannot carry the chart's
-# settings (2709Mi (2,709 MiB, about 2.65Gi) at its defaults, on any CPU count;
-# 2809Mi on any CPU count with a checkpoint backup store).
+# settings (2687Mi (2,687 MiB, about 2.62Gi) at its defaults, on any CPU count;
+# 3282Mi on any CPU count with a checkpoint backup store).
 # 4Gi leaves room; the pod's actual use at local load stays far below it.
 resources:
   requests:

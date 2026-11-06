@@ -104,6 +104,9 @@ def load(content):
     phases = data['shutdown_phases']
     require({number(r['value']) for r in phases} == set(range(9)) and
             len({identifier(r['name']) for r in phases}) == 9 and len(phases) == 9, 'invalid shutdown phases')
+    calls = data['cleanup_calls']
+    require(isinstance(calls, list) and len(calls) == 5 and {number(r['value']) for r in calls} == set(range(1, 6)) and
+            len({identifier(r['name']) for r in calls}) == 5, 'invalid cleanup calls')
     kinds = data['operation_auth_wait_kinds']
     require(len(kinds) == 3 and {number(r['value']) for r in kinds} == set(range(3)) and
             len({identifier(r['name']) for r in kinds}) == 3 and all(r['meaning'] for r in kinds),
@@ -126,6 +129,9 @@ def render(data):
         lines.append(f"    static_assert(static_cast<uint32_t>(CallbackKind::{kind['name']}) == {kind['value']});")
     for phase in data['shutdown_phases']:
         lines.append(f"    static_assert(static_cast<uint32_t>(ShutdownPhase::{phase['name']}) == {phase['value']});")
+    for call in data['cleanup_calls']:
+        lines.append(f"    static_assert(static_cast<uint32_t>(CleanupCall::{call['name']}) == {call['value']});")
+    lines.append(f"    static_assert(kCleanupCallCount == {len(data['cleanup_calls']) + 1});")
     for rows in data['domains'].values():
         for row in rows:
             lines.append(f'    static_assert({row["symbol"]} == {row["value"]});')

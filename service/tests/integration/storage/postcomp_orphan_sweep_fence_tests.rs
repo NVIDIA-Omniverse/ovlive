@@ -26,7 +26,7 @@
 //! nothing stopped an `UpdateLayer` from committing to that object BETWEEN the
 //! read and the UNLINK — and an orphan is precisely the object where such a
 //! straggler is likely, because the classic way to mint one is a `delete_layer`
-//! that died after `DEL mapping`, leaving a writer that resolved the mapping a
+//! that died after its unmap, leaving a writer that resolved the mapping a
 //! moment earlier still able to commit.
 //!
 //! That straggler releases the hashes IT supersedes (`ExtRelease::commit`),
@@ -314,6 +314,33 @@ impl ExternalValueStore for RendezvousExtStore {
         self.inner.probe_values(hashes).await
     }
 
+    // The catch-up payload's reads are defaulted on the trait: an omitted arm
+    // would substitute the default (a whole-value read) for the real store's
+    // own, so they delegate too.
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<live_edit::storage::external_values::ExtValueLengths, ServiceError> {
+        self.inner.probe_value_lengths(hashes).await
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.read_value_range(hash, start, len).await
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: live_edit::storage::external_values::OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        self.inner.recover_value(hash, on_fetched).await
+    }
+
     async fn process_pending(
         &self,
         policy: &live_edit::storage::external_values::GcPolicy,
@@ -411,14 +438,15 @@ async fn shared_hash_fixture(
          a member here would make every `exactly one member` assertion below ambiguous"
     );
 
-    // Orphan the doomed object.
+    // Orphan the doomed object: delete its mapping, as the unmap of a
+    // `delete_layer` that died after it did.
     let mapping_key = tv.key_schema().layer_mapping(&session_id, &doomed_layer);
     let removed: i64 = tv
         .client()
         .pool
         .del(&mapping_key)
         .await
-        .expect("DEL layer mapping must succeed");
+        .expect("DEL of the layer mapping must succeed");
     assert_eq!(
         removed, 1,
         "fixture precondition: the mapping must have existed and been removed — with it still \

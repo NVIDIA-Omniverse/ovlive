@@ -515,7 +515,8 @@ async fn delete_session_cascade_notfound_is_idempotent_marker_not_bail() {
 // failure is not dressed up as retriable. No class answers `ABORTED`.
 
 /// The realistic transient shape end to end: `delete_layer`'s own retry loop
-/// (budget 1) exhausts on a transient `DEL layer mapping` blip, the cascade
+/// (budget 1) exhausts on a transient blip injected at the top of its body,
+/// before the unmap, the cascade
 /// answers `UNAVAILABLE` carrying the counts, and the client's retry — the
 /// behaviour `UNAVAILABLE` exists to trigger — completes the delete.
 #[cfg(feature = "test-fault-injection")]
@@ -538,7 +539,7 @@ async fn delete_session_cascade_transient_layer_failure_returns_unavailable_with
     let (session_id, _oid) = create_session_and_layer(&tv, &svc, "cascade-transient", LAYER).await;
 
     queue.lock().unwrap().push_back(ServiceError::Aborted(
-        "transient I/O: DEL layer mapping failed (Timeout): synthetic blip".to_owned(),
+        "transient I/O: synthetic blip at the top of the delete body (Timeout)".to_owned(),
     ));
 
     let status = handle_delete_session(&svc, delete_request(&session_id))

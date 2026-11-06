@@ -11,6 +11,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -561,16 +562,29 @@ SectionIdAllocator::SectionIdAllocator(size_t maxIds, size_t maxAttempts, std::f
             return std::uniform_int_distribution<uint64_t>{}(source);
         };
 }
+bool SectionIdAllocator::contains(uint64_t id) const {
+    return staged_.count(id) != 0 || std::binary_search(sorted_.begin(), sorted_.end(), id);
+}
+void SectionIdAllocator::insert(uint64_t id) {
+    staged_.insert(id);
+    if (staged_.size() < std::max(kMinStaged, sorted_.size() / kStagedDivisor)) return;
+    // A failed merge leaves the ID staged, so the history still holds it.
+    std::vector<uint64_t> merged;
+    merged.reserve(size());
+    std::merge(sorted_.begin(), sorted_.end(), staged_.begin(), staged_.end(), std::back_inserter(merged));
+    sorted_.swap(merged);
+    staged_.clear();
+}
 void SectionIdAllocator::observe(uint64_t id) {
     if (id <= 1) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (observed_.count(id)) return;
-    if (observed_.size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
-    observed_.insert(id);
+    if (contains(id)) return;
+    if (size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
+    insert(id);
 }
 uint64_t SectionIdAllocator::allocate(WireSceneWorkBudget* work, const std::function<bool(uint64_t)>& taken) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (observed_.size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
+    if (size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
     for (size_t attempt = 0; attempt < maxAttempts_; ++attempt) {
         if (work) spend(128, work->remaining);
         uint64_t id;
@@ -579,21 +593,26 @@ uint64_t SectionIdAllocator::allocate(WireSceneWorkBudget* work, const std::func
         } catch (const wire::DecodeError&) { throw; } catch (const std::bad_alloc&) {
             throw;
         } catch (...) { fail(wire::ErrorKind::ResourceLimit, "section ID entropy failure"); }
-        if (id <= 1 || observed_.count(id)) continue;
-        if (observed_.size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
-        observed_.insert(id);
+        if (id <= 1 || contains(id)) continue;
+        if (size() >= maxIds_) fail(wire::ErrorKind::ResourceLimit, "section ID history exhausted");
+        insert(id);
         if (!taken || !taken(id)) return id;
     }
     fail(wire::ErrorKind::ResourceLimit, "section ID collision attempts exhausted");
 }
 size_t SectionIdAllocator::observedCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return observed_.size();
+    return size();
+}
+SectionIdAllocator::Storage SectionIdAllocator::storageForTest() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {sorted_.size(), staged_.size(), sorted_.capacity()};
 }
 
 FieldEditIntentPtr FieldEditCompiler::compile(const WireScenePtr& base,
     const std::shared_ptr<const SdfOperationLog>& original, const FieldEditLimits& limits,
-    const std::shared_ptr<SectionIdAllocator>& suppliedIds, WireScenePtr* applied, std::vector<uint64_t>* issued) {
+    const std::shared_ptr<SectionIdAllocator>& suppliedIds, WireScenePtr* applied, std::vector<uint64_t>* issued,
+    WireReplayStep* appliedStep) {
     if (!base || !original || !original->operations)
         fail(wire::ErrorKind::Malformed, "field intent requires retained base and sealed owners");
     // The log limit bounds the raw log before any per-operation work. The
@@ -933,9 +952,53 @@ FieldEditIntentPtr FieldEditCompiler::compile(const WireScenePtr& base,
         (void)id;
         spend(1, budget.work.remaining);
     }
-    for (auto& record : records) {
+    // Records whose final value is the one the base holds change nothing and
+    // are not emitted: an edit undone within the log compiles to nothing, and
+    // a whole-map rewrite emits only the keys it changes or removes. A field
+    // has one record; an equivalent sample time has an erase and a set when
+    // the set authors other key bits, and its last record decides for both.
+    // The base is the scene the host edited, so this is decided once, here,
+    // and replay onto a newer scene never revisits it; a peer's later value
+    // at that field stands.
+    // A sample record applies at the base's equivalent key: an erase removes
+    // it whatever its bits, and a set keeps its bits unless an erase of the
+    // same time precedes the set in the update (`authored`), which then
+    // authors the set's bits.
+    const auto unchanged = [&](const FieldRecord& record, bool authored = false) {
+        const auto path = base->pathForSection(record.section);
+        if (path.IsEmpty()) return false;
+        spend(64, budget.work.remaining);
+        if (!record.sample) {
+            const auto before = base->data()->Get(path, record.field);
+            return record.value.IsEmpty() ? before.IsEmpty() : !before.IsEmpty() && sameWireValue(before, record.value);
+        }
+        const auto map = base->data()->Get(path, SdfDataTokens->TimeSamples);
+        const auto* samples = map.IsHolding<SdfTimeSampleMap>() ? &map.UncheckedGet<SdfTimeSampleMap>() : nullptr;
+        const auto found = samples ? samples->find(record.time) : SdfTimeSampleMap::const_iterator{};
+        const bool present = samples && found != samples->end();
+        if (record.value.IsEmpty()) return !present;
+        return present && (!authored || std::signbit(found->first) == std::signbit(record.time)) &&
+            sameWireValue(found->second, record.value);
+    };
+    std::vector<bool> dropped(records.size());
+    std::map<std::pair<uint64_t, double>, std::vector<size_t>> sampleKeys;
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (records[i].sample) sampleKeys[{records[i].section, records[i].time}].push_back(i);
+        else dropped[i] = unchanged(records[i]);
+    }
+    for (const auto& [key, group] : sampleKeys)
+        if (unchanged(records[group.back()], group.size() > 1))
+            for (const auto i : group) dropped[i] = true;
+    // The emitted records of each section, and whether each is the
+    // specifier `over`, which an implicit container's only record is.
+    std::map<uint64_t, std::pair<size_t, bool>> emitted;
+    for (size_t i = 0; i < records.size(); ++i) {
+        auto& record = records[i];
         spend(sizeof(FieldRecord), budget.work.remaining);
-        if (!retained(record.section)) continue;
+        if (!retained(record.section) || dropped[i]) continue;
+        auto& [count, over] = emitted[record.section];
+        over = (count++ == 0 || over) && !record.sample && record.field == SdfFieldKeys->Specifier &&
+            record.value.IsHolding<SdfSpecifier>() && record.value.UncheckedGet<SdfSpecifier>() == SdfSpecifierOver;
         if (record.sample) {
             metadata.samples.push_back({record.section, record.time, {}});
             values.samples.push_back(std::move(record.value));
@@ -1017,8 +1080,9 @@ FieldEditIntentPtr FieldEditCompiler::compile(const WireScenePtr& base,
     auto bytes = wire::encodeUsdEnvelope(metadata, values, framing, limits.values);
     spend(bytes.size(), budget.retained);
     spend(bytes.size(), budget.work.remaining);
+    WireReplayStep step;
     const auto candidate = buildSceneCandidate(base, bytes, limits.scene, &budget.work,
-        WireSceneBatchPolicy::OrdinaryUpdate);
+        WireSceneBatchPolicy::OrdinaryUpdate, &step);
 
     // Host storage holds its baseline, which is `base`, plus the log's edits:
     // every edit it stores is recorded, and each flush rebaselines it on the
@@ -1066,12 +1130,24 @@ FieldEditIntentPtr FieldEditCompiler::compile(const WireScenePtr& base,
             result->unsupportedStructure_ = UnsupportedOperation::Reason::MoveCycle;
     }
     result->concurrentStructureSupported_ = result->unsupportedStructure_ == UnsupportedOperation::Reason{};
+    // An implicit container: a prim the log creates whose only emitted
+    // record, if any, is its specifier `over`; SdfCreatePrimInLayer creates a
+    // missing ancestor so.
+    for (const auto& [path, spec] : graph) {
+        (void)path;
+        spend(1, budget.work.remaining);
+        if (spec.type != SdfSpecTypePrim || !retainedIds.count(spec.id) || inBase(spec.id)) continue;
+        const auto found = emitted.find(spec.id);
+        if (found == emitted.end() || (found->second.first == 1 && found->second.second))
+            result->implicitContainers_.push_back(spec.id);
+    }
     result->operations_ = original->operations;
     result->planned_ = planned;
     result->bytes_ = std::move(bytes);
     result->retainedBytes_ = limits.maxRetainedBytes - budget.retained;
     result->workUsed_ = limits.maxWork - budget.work.remaining;
     if (applied) *applied = candidate;
+    if (appliedStep) *appliedStep = step;
     return result;
 }
 namespace {
@@ -1106,15 +1182,16 @@ std::string failureDescription(const std::exception_ptr& failure) {
 } // namespace
 void setFieldEditCompileCheck(bool enabled) noexcept { compileCheck.store(enabled, std::memory_order_relaxed); }
 FieldEditIntentPtr compileFieldEdits(const WireScenePtr& base, const std::shared_ptr<const SdfOperationLog>& original,
-    const FieldEditLimits& limits, const std::shared_ptr<SectionIdAllocator>& suppliedIds, WireScenePtr* applied) {
+    const FieldEditLimits& limits, const std::shared_ptr<SectionIdAllocator>& suppliedIds, WireScenePtr* applied,
+    WireReplayStep* appliedStep) {
     compilations.fetch_add(1, std::memory_order_relaxed);
     if (!limits.footprint || !compileCheck.load(std::memory_order_relaxed))
-        return FieldEditCompiler::compile(base, original, limits, suppliedIds, applied, nullptr);
+        return FieldEditCompiler::compile(base, original, limits, suppliedIds, applied, nullptr, appliedStep);
     std::vector<uint64_t> issued;
     FieldEditIntentPtr result;
     std::exception_ptr failure;
     try {
-        result = FieldEditCompiler::compile(base, original, limits, suppliedIds, applied, &issued);
+        result = FieldEditCompiler::compile(base, original, limits, suppliedIds, applied, &issued, appliedStep);
     } catch (...) { failure = std::current_exception(); }
     // The whole-scene compilation draws the identities the footprint drew, in
     // order, and then deterministic ones.

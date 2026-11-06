@@ -48,8 +48,8 @@
 //!
 //! When a reply's first entry for a key is past the entry after the id the key
 //! was read from, the reader checks that stream's head (`XRANGE key - + COUNT
-//! 1`) on its own connection before fanning the key out — between reads, so no
-//! XREAD is in flight to interrupt. The check only classifies: when the head
+//! 1`) on its own connection before fanning the key out — between reads, so it
+//! never waits behind an XREAD's `BLOCK`. The check only classifies: when the head
 //! is past the read position, each subscription more than one id below the
 //! reply's first entry for the key gets a trim marker carrying that entry's
 //! id, ahead of its entries; its consumer decides, against its catch-up floor,
@@ -88,7 +88,7 @@
 //!   a managed frontend answers `AUTH` even for a dead backend session.
 //!
 //! The reader also checks its own connection's health, only ever between
-//! reads, so no check interrupts an XREAD in flight:
+//! reads, so no check waits behind an XREAD in flight:
 //! - **Idle keepalive.** While it holds a connection and has nothing to read
 //!   (no subscription — a reservation alone registers nothing — no XREAD in
 //!   flight and no backoff pending) it `PING`s its connection every
@@ -119,19 +119,12 @@
 //! - **`-UNBLOCKED`** — a `CLIENT UNBLOCK … ERROR` of a live read — is not a
 //!   failure: re-plan at once from the cursors, with no budget charge, no
 //!   backoff and a DEBUG line, up to `MAX_CONSECUTIVE_UNBLOCK_RETRIES` in a
-//!   row. Since the reader sends its own re-AUTH between reads, no command of
-//!   this process's interrupts a live read. The one case left for
-//!   `Blocking::Interrupt` — the reader's next command after a client-side
-//!   XREAD timeout that did not force a reconnect, while the old read is still
-//!   blocked on the server — interrupts that old, abandoned read: fred keeps
-//!   the timed-out command first in the connection's buffer (a timeout only
-//!   marks it `timed_out`), so the `-UNBLOCKED` reply is handed to its dropped
-//!   caller and the reader never sees it. That case costs fred's backchannel
-//!   connection and nothing else. A `-UNBLOCKED` the reader does see comes from
-//!   outside the service. Three, not one, because fred interrupts a blocking
-//!   command on two paths (before the write, and after it when the read buffer
-//!   is non-empty), so a re-issued XREAD can be interrupted again by the same
-//!   queued command. Past that it is transient.
+//!   row. The service never sends one: its clients, the readers included, run
+//!   fred's default `Blocking::Block`, so a `-UNBLOCKED` the reader sees
+//!   comes from outside the service (an operator or another client on the
+//!   store). Past the retry limit it is transient, so an outside client that
+//!   keeps unblocking the read is charged and backed off rather than
+//!   re-planned without end.
 //! - **`-MOVED`** (`is_moved_redirect`, a cluster only): the reader re-resolves
 //!   its slot's owner (syncing the readers' routing view once when that
 //!   view still names the reader's node — single-flight across the readers,
@@ -159,6 +152,17 @@
 //! - **`Timeout`**: transient plus the rate-limited forced reconnect, because
 //!   fred cannot see a blocked connection that has wedged.
 //!
+//! A timeout that forces no reconnect leaves the abandoned read blocked on
+//! the server. Under `Blocking::Block` the reader's next command is written
+//! to the same connection behind it and runs once that read ends; its own
+//! bound covers the wait (a probe's timeout forces a reconnect, a re-AUTH
+//! counts `failed`, an XREAD timeout continues the streak). The abandoned
+//! read's reply never reaches that command: fred keeps the timed-out command
+//! first in the connection's buffer (a timeout only marks it `timed_out`),
+//! so the reply goes to its dropped caller, and the reader reads those
+//! entries again from its cursors. No reader opens a second connection
+//! (`ValkeyClient::reader_builder` gives the reasons).
+//!
 //! On a cluster, every forced reconnect first checks that the reader's node
 //! still serves it, so a reader never keeps reconnecting a node that no longer
 //! does: on every phase but the idle keepalive it re-resolves the bound slot's
@@ -179,6 +183,7 @@
 //! retires it.
 
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -200,6 +205,7 @@ use tokio_util::sync::CancellationToken;
 use super::core::{
     Entry, Failure, Head, Heads, OverflowBound, ReadPlan, ReadSizing, ReaderCore, StreamId,
 };
+use super::delivery_ledger::DeliveryLedger;
 use super::{ChannelSink, Ctl, MuxShared, StreamMuxKnobs, DEFAULT_ENTRY_ESTIMATE, WAKE_KEY_TTL_MS};
 #[cfg(any(test, feature = "test-fault-injection"))]
 use super::{MuxFault, MuxFaultSite};
@@ -213,10 +219,11 @@ use crate::observability::metrics::{
 use crate::storage::client::{
     is_client_unblocked_error, is_moved_redirect, is_transient_fred_error, FredErrOrigin,
     PoolUseToken, ReaderConnectError, ReaderConnector, POOL_LABEL_SUBSCRIBER,
+    VALKEY_TOKEN_REAUTH_MAX_INTERVAL, VALKEY_TOKEN_ROTATION_FANOUT_CEILING,
 };
 use crate::storage::keys::KeySchema;
 use crate::storage::notifications::{
-    LayerNotification, NOTIFICATION_PAYLOAD_FIELD, RELAY_OMPF_FIELD,
+    LayerNotification, NOTIFICATION_PAYLOAD_FIELD, RELAY_OMPF_FIELD, XREAD_BLOCK_MS,
 };
 
 /// Consecutive XREAD failures — transient ones, plus the whole-reader
@@ -241,6 +248,12 @@ pub const FORCE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// this-many timeouts.
 pub const FORCE_RECONNECT_REARM_EVERY: u32 = 8;
 /// `-UNBLOCKED` replies re-issued immediately before they count as failures.
+/// Every one comes from outside the service (the readers run fred's default
+/// `Blocking::Block`, so no service command unblocks a read): a small
+/// allowance re-plans an operator's or another client's occasional unblock at
+/// no cost, and past it each one is charged and backed off like a transient
+/// failure, so an outside client that keeps unblocking a reader's read
+/// cannot spin it. The count resets with the rest of [`TransientBudget`].
 pub const MAX_CONSECUTIVE_UNBLOCK_RETRIES: u32 = 3;
 const WAKE_ATTEMPTS: u32 = 3;
 const WAKE_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -251,6 +264,85 @@ const WAKE_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// production value of `StreamMuxKnobs::probe_timeout`. (The idle→active
 /// connection probe is bounded by `READER_PROBE_TIMEOUT` instead.)
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How far past its `BLOCK` a multiplexed XREAD's client-side timeout is set,
+/// so that on a live connection the server's own `BLOCK` expiry answers first.
+/// A read with no answer by `BLOCK` plus this margin fails client-side and
+/// counts on the reader's timeout streak.
+pub const XREAD_CLIENT_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
+/// Ceiling, in production, from a reader's re-AUTH tick firing to the rotated
+/// credential being on its connection, with an XREAD in flight and even when
+/// the credential wake fails (b.19i) — at the default command timeout, and
+/// excluding the two residual costs listed below. The steps:
+///
+/// 1. the tick's `fetch(None)`, bounded by [`PROBE_TIMEOUT`];
+/// 2. the in-flight read returning, bounded by its client timeout:
+///    [`XREAD_BLOCK_MS`] plus [`XREAD_CLIENT_TIMEOUT_MARGIN`] (a landed wake
+///    only shortens this);
+/// 3. the reply's head checks, bounded by [`PROBE_TIMEOUT`];
+/// 4. the `AUTH`, bounded by [`PROBE_TIMEOUT`], or — when the read's timeout
+///    forced a reconnect instead of answering — that reconnect, bounded by
+///    [`FORCE_RECONNECT_TIMEOUT`].
+///
+/// Step 4 takes the larger of its two bounds because the credential lands at
+/// whichever comes first: a forced reconnect leaves the pending credential in
+/// place, so the `AUTH` still follows it, but the reconnect's handshake
+/// already carries the new token (the reader client's provider `fetch`es it),
+/// which makes that later `AUTH` redundant. `2 + 30 + 5 + 2 + 10 = 49 s`.
+///
+/// Within those limits the sum is a conservative ceiling, not a reachable
+/// worst case: the read's client timeout started before the tick, so steps 1
+/// and 2 overlap; and step 3 runs only on a reply while a forced reconnect
+/// runs only on an error, so step 3 and the reconnect never both run.
+///
+/// Two residual costs on the path are **not** in this bound, and spend the slack the
+/// floor leaves above `VALKEY_TOKEN_REAUTH_MAX_INTERVAL` plus this bound
+/// (41 s at the defaults; see the assertion below):
+///
+/// - **A late tick.** The next tick is scheduled from when a tick is
+///   serviced, and servicing waits out any inline step in progress (head
+///   checks, a `-MOVED` routing sync, a poison-key isolation, the connection
+///   probe, the keepalive), so a reader's ticks can be one interval plus that
+///   step apart — a few seconds when the connection survives.
+/// - **A `-MOVED` head check.** It awaits `slot_moved`, whose routing sync is
+///   bounded by `LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS` (5 s by default, no upper
+///   cap) rather than by a constant here; when the slot has not moved the
+///   reader then sends its `AUTH`. That path costs `2 + 35 + 2 + T_cmd + 2 s`:
+///   46 s at the default, under this bound, and over it once `T_cmd` exceeds
+///   8 s.
+pub const REAUTH_LANDING_BOUND: Duration = PROBE_TIMEOUT
+    .saturating_add(Duration::from_millis(XREAD_BLOCK_MS))
+    .saturating_add(XREAD_CLIENT_TIMEOUT_MARGIN)
+    .saturating_add(PROBE_TIMEOUT)
+    .saturating_add(
+        if FORCE_RECONNECT_TIMEOUT.as_millis() > PROBE_TIMEOUT.as_millis() {
+            FORCE_RECONNECT_TIMEOUT
+        } else {
+            PROBE_TIMEOUT
+        },
+    );
+
+// The Valkey prolongation floor covers busy stream readers, mechanized. The
+// floor, `VALKEY_TOKEN_ROTATION_FANOUT_CEILING`, is two tick intervals: every
+// client ticks within one `VALKEY_TOKEN_REAUTH_MAX_INTERVAL` of the rotated
+// token's pickup, and that tick falls inside the provider's fan-out window. A
+// reader's tick may also be late by the inline step it is waiting out, which
+// the slack also covers. The second interval is that slack, and a busy reader
+// spends part of it landing its `AUTH` after its tick. If the sum below
+// outgrows the floor, a rotation picked up with headroom at the floor can
+// still reach a busy reader's connection after the old token expires, and the
+// per-rotation headroom WARN stays silent while that reader is dropped. The
+// assertion covers the constants only: a late tick and a `-MOVED` head check's
+// routing sync spend the slack left above the sum (41 s at the defaults)
+// unasserted — see `REAUTH_LANDING_BOUND`.
+const _: () = assert!(
+    VALKEY_TOKEN_REAUTH_MAX_INTERVAL.as_millis() + REAUTH_LANDING_BOUND.as_millis()
+        <= VALKEY_TOKEN_ROTATION_FANOUT_CEILING.as_millis(),
+    "a stream reader's re-AUTH tick plus REAUTH_LANDING_BOUND (fetch + XREAD client timeout + \
+     head checks + AUTH or forced reconnect) must fit inside VALKEY_TOKEN_ROTATION_FANOUT_CEILING, \
+     the Valkey prolongation floor, or the per-rotation headroom WARN no longer covers busy \
+     stream readers. Shorten the reader's bounds or the tick cadence, or raise the floor (and \
+     the operator docs and alert that state it)."
+);
 const SHUTDOWN_WAKE_TIMEOUT: Duration = Duration::from_millis(500);
 const PANIC_RESTART_DELAY: Duration = Duration::from_millis(100);
 const STANDALONE_WAKE_TAG: &str = "mux";
@@ -432,7 +524,12 @@ struct PendingWake {
 }
 
 struct LoopState {
-    schema: KeySchema,
+    /// The key schema the reader names its wake key under: that of the latest
+    /// subscription added under a different prefix than the one before.
+    /// `None` until the first `Ctl::Add`. A read is planned only over the
+    /// subscriptions the reader was sent, so one is always set by then, and
+    /// the reader never names a key under a schema no registration gave it.
+    schema: Option<KeySchema>,
     slot_tag: Option<(u16, String)>,
     budget: TransientBudget,
     /// Number of the read most recently issued — the reader's running XREAD
@@ -663,8 +760,8 @@ impl LoopState {
                 sink,
                 key_schema,
             } => {
-                if key_schema.prefix() != self.schema.prefix() {
-                    self.schema = key_schema;
+                if self.schema.as_ref().map(KeySchema::prefix) != Some(key_schema.prefix()) {
+                    self.schema = Some(key_schema);
                 }
                 core.add(sub, key, cursor, sink);
                 self.joined = true;
@@ -743,7 +840,10 @@ impl LoopState {
         } else {
             STANDALONE_WAKE_TAG.to_owned()
         };
-        self.schema.stream_mux_wake(&tag, &ctx.instance, ctx.idx)
+        self.schema
+            .as_ref()
+            .expect("planned reads follow an Add, which sets the schema")
+            .stream_mux_wake(&tag, &ctx.instance, ctx.idx)
     }
 }
 
@@ -776,7 +876,7 @@ async fn reader_loop(
 ) -> bool {
     let mut core = Core::new();
     let mut st = LoopState {
-        schema: KeySchema::default(),
+        schema: None,
         slot_tag: None,
         budget: TransientBudget::default(),
         read: 0,
@@ -1062,7 +1162,7 @@ fn start_xread(ctx: &ReaderCtx, plan: ReadPlan, knobs: &StreamMuxKnobs) -> Xread
         }
     }
     let options = Options {
-        timeout: Some(Duration::from_millis(knobs.block_ms + 5_000)),
+        timeout: Some(Duration::from_millis(knobs.block_ms) + XREAD_CLIENT_TIMEOUT_MARGIN),
         max_attempts: Some(CONSUMER_XREAD_MAX_ATTEMPTS),
         ..Default::default()
     };
@@ -1683,8 +1783,8 @@ enum ProbeOutcome {
 /// connection — the one that XREAD will use, which the connection step just
 /// made sure targets the read's slot owner on a cluster. Bounded by
 /// `knobs.reader_probe_timeout` ([`super::READER_PROBE_TIMEOUT`]) and raced
-/// against the reader's cancellation. No XREAD is in flight, so it interrupts
-/// nothing.
+/// against the reader's cancellation. No XREAD is in flight, so it waits
+/// behind no `BLOCK`.
 async fn probe_connection(ctx: &ReaderCtx, knobs: &StreamMuxKnobs) -> ProbeOutcome {
     tokio::select! {
         biased;
@@ -1867,7 +1967,7 @@ fn charge_failed_probe(
 }
 
 /// One idle keepalive tick, on a connected reader with nothing to read (no
-/// XREAD in flight, so the `PING` interrupts nothing): one `PING` on the
+/// XREAD in flight, so the `PING` waits behind no `BLOCK`): one `PING` on the
 /// reader's connection under `knobs.probe_timeout`, raced against the reader's
 /// cancellation.
 ///
@@ -2097,7 +2197,7 @@ async fn handle_result(
                 Ok(reply) => {
                     st.answered();
                     let wake_key = core.inflight_wake_key().map(str::to_owned);
-                    let batch = parse_reply(reply, wake_key.as_deref());
+                    let batch = parse_reply(reply, wake_key.as_deref(), &ctx.shared.ledger);
                     if let (Some(m), Some(bytes)) =
                         (&metrics, reply_bytes(&batch, wake_key.as_deref()))
                     {
@@ -2134,6 +2234,13 @@ async fn handle_result(
                         st.failed();
                     }
                     let out = core.on_read_ok(batch, &heads);
+                    // The live-delivery budget, after the fan-out (the reply's
+                    // copies not delivered are dropped by now): while the
+                    // replica is over it, the subscription holding the most
+                    // is ended. The reader never waits for it.
+                    if out.delivered > 0 {
+                        ctx.shared.ledger.enforce();
+                    }
                     if out.overflowed > 0 {
                         let on_bytes = out.overflowed_on_bytes;
                         let on_entries = out.overflowed - on_bytes;
@@ -2404,7 +2511,7 @@ async fn isolate_permanent_failure(
 /// ([`ReaderCore::gap_suspects`]): `(key, id the key was read from)`.
 ///
 /// Each check is one `XRANGE key - + COUNT 1` on the reader's own connection,
-/// which is idle between reads (no XREAD is in flight to interrupt) and, on a
+/// which is idle between reads (no XREAD is in flight to wait behind) and, on a
 /// cluster, connected to the keys' hash slot's owner. The checks run concurrently under one
 /// overall `knobs.probe_timeout` and race the reader's cancellation. Counts
 /// `live_edit_stream_mux_head_checks_total{result}` once per key. Returns the
@@ -2557,6 +2664,7 @@ fn charge_failed_head_checks(
 fn parse_reply(
     reply: XReadResponse<String, String, String, Bytes>,
     wake_key: Option<&str>,
+    ledger: &Arc<DeliveryLedger>,
 ) -> Vec<(String, Vec<Entry<LayerNotification>>)> {
     reply
         .into_iter()
@@ -2570,16 +2678,20 @@ fn parse_reply(
                         return None;
                     };
                     let bytes = entry_bytes(&id_str, &fields);
-                    let payload = if is_wake {
-                        None
+                    let (payload, relay_copy) = if is_wake {
+                        (None, None)
                     } else {
-                        parse_payload(&key, &id_str, &fields)
+                        match parse_payload(&key, id, &id_str, &fields, ledger) {
+                            Some((payload, relay_copy)) => (Some(payload), relay_copy),
+                            None => (None, None),
+                        }
                     };
                     Some(Entry {
                         id,
                         id_str,
                         payload,
                         bytes,
+                        relay_copy,
                     })
                 })
                 .collect();
@@ -2619,13 +2731,19 @@ fn reply_bytes(
 /// decodes zero-copy, so every field `Bytes` is a slice of the whole
 /// multi-key XREAD reply, and keeping that slice would keep every other layer's
 /// entries in the reply alive for as long as one subscriber has this entry
-/// queued. One copy per entry per reader; every subscriber of the entry shares
-/// it.
+/// queued. The copy is the live-delivery ledger's
+/// ([`DeliveryLedger::relay_buf`]): charged to the live-delivery budget until
+/// its last holder drops it, and shared with a live copy of the same entry
+/// another read already made, so every subscriber of the entry on the replica
+/// shares one copy. Answers the copy's serial beside the notification, for
+/// the entry to hand every offer of it ([`Entry::relay_copy`]).
 fn parse_payload(
     key: &str,
+    entry_id: StreamId,
     id: &str,
     fields: &std::collections::HashMap<String, Bytes>,
-) -> Option<LayerNotification> {
+    ledger: &Arc<DeliveryLedger>,
+) -> Option<(LayerNotification, Option<NonZeroU64>)> {
     let Some(raw) = fields.get(NOTIFICATION_PAYLOAD_FIELD) else {
         tracing::warn!(stream_key = %key, entry_id = %id, "stream entry missing `payload` field; skipping");
         return None;
@@ -2635,13 +2753,13 @@ fn parse_payload(
         return None;
     };
     match LayerNotification::parse(text) {
-        Ok(n) => Some(
-            n.with_relay_ompf(
-                fields
-                    .get(RELAY_OMPF_FIELD)
-                    .map(|ompf| Bytes::copy_from_slice(ompf)),
-            ),
-        ),
+        Ok(n) => {
+            let (relay, serial) = fields
+                .get(RELAY_OMPF_FIELD)
+                .map(|ompf| ledger.relay_buf(key, entry_id, ompf).into_parts())
+                .unzip();
+            Some((n.with_relay_ompf(relay), serial))
+        }
         Err(e) => {
             tracing::warn!(stream_key = %key, entry_id = %id, payload = %text, error = %e, "unparseable stream notification; skipping");
             None
@@ -2653,6 +2771,12 @@ fn parse_payload(
 mod tests {
     use super::*;
     use fred::error::{Error, ErrorKind};
+
+    /// A live-delivery ledger with no budget to enforce, for sinks and replies
+    /// built outside a multiplexer.
+    fn test_ledger() -> Arc<DeliveryLedger> {
+        DeliveryLedger::new(u64::MAX, Arc::new(std::sync::Mutex::new(None)))
+    }
 
     #[test]
     fn should_force_reconnect_fires_first_then_every_rearm_period() {
@@ -2691,7 +2815,7 @@ mod tests {
     /// read in flight.
     fn state_with_a_pending_wake_for_read_2() -> LoopState {
         LoopState {
-            schema: KeySchema::default(),
+            schema: None,
             slot_tag: None,
             budget: TransientBudget::default(),
             read: 2,
@@ -2898,9 +3022,10 @@ mod tests {
     /// The production values the behaviour tests override through
     /// `StreamMuxKnobs` (20 ms backoffs, a budget of 3, shortened watchdogs,
     /// shrunk backlog caps, small reply targets, short probe bounds, a
-    /// millisecond keepalive, a short liveness age). Every fault test runs on
-    /// the overrides, so without this a change to a production value would
-    /// pass every test.
+    /// millisecond keepalive, a short liveness age), plus the XREAD
+    /// client-timeout margin and the re-AUTH landing bound derived from them.
+    /// Every fault test runs on the overrides, so without this a change to a
+    /// production value would pass every test.
     #[test]
     fn production_reader_constants_are_the_documented_values() {
         use crate::storage::notifications::{
@@ -2949,6 +3074,21 @@ mod tests {
             "a third of Azure Managed Redis's 10-minute idle-connection timeout"
         );
         assert_eq!(XREAD_BLOCK_MS, 30_000);
+        assert_eq!(
+            XREAD_CLIENT_TIMEOUT_MARGIN,
+            Duration::from_secs(5),
+            "a multiplexed XREAD's client-side timeout is its BLOCK plus 5 s"
+        );
+        // The ceiling the `const` assertion beside it holds, together with one
+        // re-AUTH tick interval, within the Valkey prolongation floor. That
+        // assertion only checks the sum fits; this pins the sum itself, so a
+        // change to one of its parts that still fits the floor shows up here.
+        assert_eq!(
+            REAUTH_LANDING_BOUND,
+            Duration::from_secs(49),
+            "fetch (2 s) + XREAD BLOCK (30 s) + client-timeout margin (5 s) + head checks (2 s) \
+             + the larger of AUTH (2 s) and a forced reconnect (10 s)"
+        );
         assert_eq!(CONSUMER_SEND_WATCHDOG, Duration::from_secs(5));
         assert_eq!(OUTER_SEND_DEADLINE, Duration::from_secs(5));
 
@@ -2972,6 +3112,28 @@ mod tests {
             CONSUMER_CHANNEL_CAPACITY as u64 * 2048,
             "the byte thresholds are the entry thresholds × 2 KiB, so a backlog of entries up to \
              2 KiB reaches the entry limits first"
+        );
+    }
+
+    /// The connection-wide slow bound clears a multiplexed XREAD's client-side
+    /// budget, `XREAD_BLOCK_MS` plus [`XREAD_CLIENT_TIMEOUT_MARGIN`] — the
+    /// longest legitimate single-command wait in the service. If the budget
+    /// reached `UNRESPONSIVE_MAX_TIMEOUT`, fred's unresponsive check would reap
+    /// healthy reader connections mid-`BLOCK`. Lives here rather than beside
+    /// `UNRESPONSIVE_MAX_TIMEOUT` in `storage::client` because this module is
+    /// private and the margin is defined in it.
+    #[test]
+    fn unresponsive_max_timeout_clears_the_xread_client_timeout() {
+        use crate::storage::client::UNRESPONSIVE_MAX_TIMEOUT;
+
+        let xread_budget = Duration::from_millis(XREAD_BLOCK_MS) + XREAD_CLIENT_TIMEOUT_MARGIN;
+        assert!(
+            UNRESPONSIVE_MAX_TIMEOUT > xread_budget,
+            "UNRESPONSIVE_MAX_TIMEOUT ({UNRESPONSIVE_MAX_TIMEOUT:?}) must exceed a stream \
+             reader's XREAD client timeout ({xread_budget:?} = XREAD_BLOCK_MS + \
+             XREAD_CLIENT_TIMEOUT_MARGIN), or the unresponsive check reaps healthy reader \
+             connections mid-BLOCK; raising either term requires raising \
+             UNRESPONSIVE_MAX_TIMEOUT too"
         );
     }
 
@@ -3041,7 +3203,7 @@ mod tests {
             1,
             "a".to_owned(),
             StreamId { ms: 0, seq: 0 },
-            ChannelSink::new(&knobs).0,
+            ChannelSink::new(&knobs, test_ledger(), None).0,
         );
         if in_flight {
             core.plan_read("w").expect("a non-empty core plans");
@@ -3058,7 +3220,7 @@ mod tests {
             2,
             key.to_owned(),
             StreamId { ms: 0, seq: 0 },
-            ChannelSink::new(&knobs).0,
+            ChannelSink::new(&knobs, test_ledger(), None).0,
         );
     }
 
@@ -3184,6 +3346,7 @@ mod tests {
             next_sub: std::sync::atomic::AtomicU64::new(1),
             knobs: std::sync::Mutex::new(StreamMuxKnobs::new()),
             metrics: Arc::new(std::sync::Mutex::new(None)),
+            ledger: test_ledger(),
             stats: Vec::new(),
             conns: vec![std::sync::Mutex::new(super::super::ReaderSlot::default())],
             faults: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -3209,7 +3372,7 @@ mod tests {
             1,
             key.to_owned(),
             StreamId { ms: 0, seq: 0 },
-            ChannelSink::new(&StreamMuxKnobs::new()).0,
+            ChannelSink::new(&StreamMuxKnobs::new(), test_ledger(), None).0,
         );
         core
     }
@@ -3420,7 +3583,8 @@ mod tests {
     /// A one-subscription core on [`SLOT_A_KEY`], and its sink's terminal
     /// slot, which records how the subscription ended.
     fn core_with_terminal() -> (Core, super::super::TerminalSlot) {
-        let (sink, _rx, _backlog, terminal) = ChannelSink::new(&StreamMuxKnobs::new());
+        let (sink, _rx, _backlog, terminal) =
+            ChannelSink::new(&StreamMuxKnobs::new(), test_ledger(), None);
         let mut core = Core::new();
         core.add(1, SLOT_A_KEY.to_owned(), StreamId { ms: 0, seq: 0 }, sink);
         (core, terminal)
@@ -3559,7 +3723,7 @@ mod tests {
             ],
         );
         reply.insert("w".into(), vec![("9-1".into(), f(&[("w", b"1")]))]);
-        let mut parsed = parse_reply(reply, Some("w"));
+        let mut parsed = parse_reply(reply, Some("w"), &test_ledger());
         parsed.sort_by(|a, b| a.0.cmp(&b.0));
         let (_, s) = &parsed[0];
         assert_eq!(s.len(), 3, "an unparseable id is dropped");
@@ -3605,7 +3769,7 @@ mod tests {
             ],
         );
         reply.insert("w".into(), vec![("9-1".into(), fields(&[("w", b"1")]))]);
-        let mut parsed = parse_reply(reply, Some("w"));
+        let mut parsed = parse_reply(reply, Some("w"), &test_ledger());
         parsed.sort_by(|a, b| a.0.cmp(&b.0));
         let sizes = |key: usize| parsed[key].1.iter().map(|e| e.bytes).collect::<Vec<_>>();
         assert_eq!(
@@ -3635,7 +3799,7 @@ mod tests {
                     .collect(),
             );
         }
-        parse_reply(reply, Some("w"))
+        parse_reply(reply, Some("w"), &test_ledger())
     }
 
     /// A reply that carried no layer-stream entry records no reply-bytes sample
@@ -3720,11 +3884,15 @@ mod tests {
             "fixture self-check: the input field is a slice of the reply buffer, as fred's is"
         );
 
-        let relay = match parse_payload("s", "1-0", &f) {
-            Some(LayerNotification::Update {
-                relay_ompf: Some(relay),
-                ..
-            }) => relay,
+        let relay = match parse_payload("s", StreamId { ms: 1, seq: 0 }, "1-0", &f, &test_ledger())
+        {
+            Some((
+                LayerNotification::Update {
+                    relay_ompf: Some(relay),
+                    ..
+                },
+                _,
+            )) => relay,
             other => panic!("expected an update carrying its relay OMPF, got {other:?}"),
         };
         assert_eq!(&relay[..], ompf, "the relay bytes are unchanged");

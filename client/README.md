@@ -14,14 +14,14 @@ The ovlive client is one C++ runtime in the shared library `omni_usd_live` that 
 | **USD integration** | [Scene source](source/live/scene/) · [Resolver source](source/live/resolver/) | The `.live` file format, scene storage and reconciliation, and `live://` resolution. |
 | **Python package** | [Bindings and package](source/bindings/python/omni/usd/live/) · [Python guide](docs/ovlive-python.md) | The `omni.usd.live` API and host helpers. |
 | **Kit extension** | [Extension source](source/kit/) · [Kit guide](docs/ovlive-kit.md) | Extension ID `omni_usd_live`, bootstrapped by `omni.kit.live_services`, with public Python API `omni.usd.live`. |
-| **Protocol and encoding** | [LiveService protobuf](source/live/protos/nvidia/omniverse/live/v1alpha/live.proto) · [Protocol provenance](source/live/protos/PROVENANCE.md) · [Wire source](source/live/wire/) | The vendored service contract and the OMPF/FlatBuffers USD delta encoding. |
+| **Protocol and encoding** | [LiveService protobuf](source/live/protos/nvidia/omniverse/live/v1alpha/live.proto) · [Protocol notes](source/live/protos/README.md) · [Wire source](source/live/wire/) | The vendored service contract and the OMPF/FlatBuffers USD delta encoding. |
 | **Samples** | [Native samples](source/live/samples/) · [Python participant](source/bindings/python/omni/usd/live/sample.py) · [Samples guide](docs/ovlive-samples.md) | Authoring, session, recovery and diagnostics examples. |
 | **Tests** | [Native drivers](tests/native/) · [Reference service](tests/reference_service/) · [Testing guide](docs/ovlive-testing.md) | Component, transport, many-writer, package and host-integration validation. The reference service is a test fixture, not a deployable server. |
 | **Build and release** | [Build tools](tools/live/) · [Release tools](tools/release/) · [Dependency manifests](deps/README.md) | Provisioned builds, package staging, repository checks and release qualification. |
 
 ## Quick start
 
-The steps run from the repository root on Linux. On a machine with an installed [worker configuration](docs/ovlive-ci.md#worker-configuration), `client/build.sh`, `client/test.sh` and `client/clean.sh` build, test and clean without parameters ([local commands](docs/ovlive-build.md#local-commands)). macOS arm64 builds and runs as an experiment, but this platform is unsupported; to try it, follow the [macOS source-build workflow](docs/ovlive-build.md#macos-source-sdks) instead.
+The steps run from the repository root on Linux. On a machine with an installed [worker configuration](docs/ovlive-ci.md#worker-configuration), `client/build.sh`, `client/test.sh` and `client/clean.sh` build, test and clean without parameters ([local commands](docs/ovlive-build.md#local-commands)). macOS arm64 builds and runs as an unsupported development build; to try it, follow the [macOS source-build workflow](docs/ovlive-build.md#macos-source-sdks) instead.
 
 **1. Build and stage a package.** Provision the SDKs and tools in the [build prerequisites](docs/ovlive-build.md#prerequisites), then configure, build and stage the package in one step:
 
@@ -52,7 +52,15 @@ python3 client/tools/live/build.py \
   --plugin-driver <test-build-dir>/live_plugin_driver
 ```
 
-**4. Connect to your own endpoint.** With a Live Services endpoint and an access token it accepts, follow the [Python quick start](docs/ovlive-python.md#quick-start) or run the [participant samples](docs/ovlive-samples.md#participant-samples).
+**4. Try the samples against the reference service.** Start the repository's reference service alone on loopback with the reference interpreter of the [local setup](docs/ovlive-testing.md#local-setup). It prints one JSON line with an `authority` and a `token` it accepts, and stops on Ctrl+C. It is a test fixture, not a deployable service:
+
+```sh
+<reference-python> -B client/tools/live/reference.py serve
+```
+
+Pass that authority and token to the [participant samples](docs/ovlive-samples.md#participant-samples) or the [Python quick start](docs/ovlive-python.md#quick-start).
+
+**5. Connect to your own endpoint.** With a Live Services endpoint and an access token it accepts, follow the [Python quick start](docs/ovlive-python.md#quick-start) or run the [participant samples](docs/ovlive-samples.md#participant-samples).
 
 ## Working in the client
 

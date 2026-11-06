@@ -132,6 +132,7 @@ template<class Response> struct Call {
     std::chrono::steady_clock::time_point started;
     EndpointLease endpoint;
     std::shared_ptr<UnaryTimingReceipt> timingReceipt;
+    CallSlot slot; // Held from before preparation until completion.
 };
 
 template<class Response> struct Tag final : CompletionTag {
@@ -159,6 +160,7 @@ template<class Response> struct Tag final : CompletionTag {
             error.request_id, 1, error.grpc_status_present, error.grpc_status, 0, 0, call->payload->tokenGeneration);
         const auto outcome = error;
         if (ok) call->auth->completed(*call->endpoint, call->payload->tokenGeneration, call->status.error_code());
+        call->slot.reset(); // The call is closed: its unit goes to a waiter before delivery.
         // Transfer the only payload/callback owner to the worker BEFORE enqueue.
         // Otherwise a fast worker could report quiescence while a CQ reference
         // still owns host captures, destroying those captures on the CQ later.
@@ -174,7 +176,7 @@ template<class Response> struct Tag final : CompletionTag {
 template<class Input, class Response, class Prepare>
 std::shared_ptr<Request> submit(Runtime& runtime, OmniUsdLiveEndpoint endpoint, const Input& input,
     UnaryCallback<Response> callback, uint32_t timeoutMs, uint32_t operation, bool mutation, Prepare prepare,
-    bool timing = false, std::shared_ptr<UnaryTimingReceipt> receipt = {}) {
+    bool timing = false, std::shared_ptr<UnaryTimingReceipt> receipt = {}, CallSlot slot = {}) {
     // Hold admission against final unregister while preparing the transport.
     auto lease = runtime.acquireEndpoint(endpoint);
     if (!lease) throw OmniUsdLiveResult(runtime.closing ? OMNI_USD_LIVE_BUSY : OMNI_USD_LIVE_INVALID_HANDLE);
@@ -201,6 +203,12 @@ std::shared_ptr<Request> submit(Runtime& runtime, OmniUsdLiveEndpoint endpoint, 
         if (payload->callback) payload->callback(payload->error, payload->response, payload->tokenGeneration);
     };
     auto tag = std::make_unique<Tag<Response>>(call);
+    // This single-attempt primitive never waits for a call unit: without a
+    // slot its caller obtained, one the endpoint's budget cannot spare refuses
+    // the call before anything issues. An optional timing Ping, which a layer
+    // skips for one sampling period, is refused without a record.
+    call->slot = slot ? std::move(slot) : lease->calls->tryAcquire(operation, !timing);
+    if (!call->slot) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
     // Admit before preparing: gRPC serializes the input into the call when it
     // prepares the reader, and a prepared reader discarded without StartCall
     // never releases that buffer, so no refusal may follow preparation.
@@ -257,10 +265,11 @@ LIVE_DEFINE_UNARY(StatLayer, OMNI_USD_LIVE_OPERATION_STAT, false)
 LIVE_DEFINE_UNARY(DeleteLayer, OMNI_USD_LIVE_OPERATION_DELETE, true)
 #undef LIVE_DEFINE_UNARY
 std::shared_ptr<Request> submitTimingPing(Runtime& runtime, OmniUsdLiveEndpoint endpoint, const rpc::PingRequest& input,
-    UnaryCallback<rpc::PingResponse> callback, uint32_t timeoutMs, std::shared_ptr<UnaryTimingReceipt> receipt) {
+    UnaryCallback<rpc::PingResponse> callback, uint32_t timeoutMs, std::shared_ptr<UnaryTimingReceipt> receipt,
+    CallSlot slot) {
     return submit(runtime, endpoint, input, std::move(callback), timeoutMs, OMNI_USD_LIVE_OPERATION_PING, false,
         [](rpc::LiveService::Stub& stub, grpc::ClientContext* context, const rpc::PingRequest& message,
             grpc::CompletionQueue* queue) { return stub.PrepareAsyncPing(context, message, queue); },
-        true, std::move(receipt));
+        true, std::move(receipt), std::move(slot));
 }
 } // namespace omni::usd::live

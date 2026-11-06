@@ -217,7 +217,10 @@ impl LiveServer {
             let _ = ready_tx.send(());
             Server::builder()
                 .layer(metrics_layer)
-                .add_service(live_service_server(svc))
+                .add_service(live_service_server(
+                    svc,
+                    live_edit::grpc::hold::HoldGate::always_open(),
+                ))
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
                 })

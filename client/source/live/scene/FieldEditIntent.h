@@ -50,8 +50,17 @@ struct FieldEditLimits {
 // probabilistic uniqueness across clients/unseen history, so they also rely on
 // service collision rejection. Never reuse observed or already allocated IDs,
 // even after failed preparation. The optional private generator must not reenter.
+// The history forgets no ID: the service lets a retired ID be created again,
+// and a peer's update compiled while the ID was live can name it at any later
+// sequence, so no retired ID is ever safe to reuse. It holds IDs in one sorted
+// array of exact capacity, 8 bytes each, beside a staging set of fewer than
+// max(kMinStaged, sorted IDs / kStagedDivisor) IDs, one tree node each (48
+// bytes with libstdc++ and glibc on 64-bit hosts), that merges into a new
+// array when it fills: at most 9.5 bytes per ID beyond the kMinStaged floor,
+// and a merge holds both arrays until it completes.
 class SectionIdAllocator final {
 public:
+    static constexpr size_t kMinStaged = 4096, kStagedDivisor = 32;
     explicit SectionIdAllocator(size_t maxIds = size_t(1) << 26, size_t maxAttempts = 64,
         std::function<uint64_t()> random = {});
     // Optional exclusive transaction budget charges every entropy/collision
@@ -60,11 +69,22 @@ public:
     uint64_t allocate(WireSceneWorkBudget* = nullptr, const std::function<bool(uint64_t)>& taken = {});
     void observe(uint64_t);
     size_t observedCount() const;
+    // Test seam: the IDs the sorted array and the staging set hold, and the
+    // array's capacity.
+    struct Storage {
+        size_t sorted = 0, staged = 0, capacity = 0;
+    };
+    Storage storageForTest() const;
 private:
+    // Under mutex_.
+    bool contains(uint64_t) const;
+    size_t size() const noexcept { return sorted_.size() + staged_.size(); }
+    void insert(uint64_t);
     const size_t maxIds_, maxAttempts_;
     std::function<uint64_t()> random_;
     mutable std::mutex mutex_;
-    std::set<uint64_t> observed_;
+    std::vector<uint64_t> sorted_;
+    std::set<uint64_t> staged_;
 };
 class FieldEditIntent;
 using FieldEditIntentPtr = std::shared_ptr<const FieldEditIntent>;
@@ -73,7 +93,7 @@ using FieldEditIntentPtr = std::shared_ptr<const FieldEditIntent>;
 struct FieldEditCompiler {
     static FieldEditIntentPtr compile(const WireScenePtr&, const std::shared_ptr<const SdfOperationLog>&,
         const FieldEditLimits&, const std::shared_ptr<SectionIdAllocator>&, WireScenePtr* applied,
-        std::vector<uint64_t>* issued);
+        std::vector<uint64_t>* issued, WireReplayStep* appliedStep = nullptr);
 };
 // Standalone identity-aware one-spec structural, field, dictionary and sample compiler.
 // CopyFrom and changing an existing identity's type remain unsupported.
@@ -106,9 +126,15 @@ public:
     bool empty() const { return empty_; }
     // Whether compilation planned the namespace (see FieldEditLimits::footprint).
     bool planned() const { return planned_; }
+    // The implicit containers the update creates: each prim section it
+    // creates whose only record, if any, sets its specifier to `over`, with
+    // no typeName or other field, as SdfCreatePrimInLayer creates a missing
+    // ancestor. Child fields follow structure and are no records.
+    const std::vector<uint64_t>& implicitContainers() const { return implicitContainers_; }
 private:
     friend struct FieldEditCompiler;
     std::shared_ptr<const std::vector<SdfOperation>> operations_;
+    std::vector<uint64_t> implicitContainers_;
     std::string bytes_;
     bool concurrentStructureSupported_ = true, empty_ = false, planned_ = true;
     UnsupportedOperation::Reason unsupportedStructure_{};
@@ -128,12 +154,15 @@ private:
 // allocator for the entire incarnation when compiling multiple logs; the
 // default temporary allocator only protects this standalone compilation.
 // A non-null `applied` receives the verified scene of base plus this intent,
-// which the compiled intent does not retain. A log whose `data` is null, a
+// which the compiled intent does not retain, and a non-null `appliedStep` its
+// build as the replay step that applies the compiled bytes to base
+// (buildSceneCandidate). A log whose `data` is null, a
 // prefix of a host edit buffer whose capture holds later records too, is
 // verified only against its operations replayed onto the base; the rest of
 // the buffer is verified against its capture when it compiles.
 FieldEditIntentPtr compileFieldEdits(const WireScenePtr&, const std::shared_ptr<const SdfOperationLog>&,
-    const FieldEditLimits& = {}, const std::shared_ptr<SectionIdAllocator>& = {}, WireScenePtr* applied = nullptr);
+    const FieldEditLimits& = {}, const std::shared_ptr<SectionIdAllocator>& = {}, WireScenePtr* applied = nullptr,
+    WireReplayStep* appliedStep = nullptr);
 // Test hook, off by default: while enabled, every compilation at the
 // footprint also compiles the log against the whole scene, drawing the same
 // identities, and throws std::logic_error unless both compile the same bytes,

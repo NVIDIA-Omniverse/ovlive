@@ -79,6 +79,15 @@
 //   observations a grace apart. Same residual class as the crash-window
 //   leftovers in §11.3 — see SDD §11.1 and §11.3.
 //
+// * A meta without data (the DR restore Job's recount, `storage::ext_reconcile`):
+//   outside a restore the writer and the GC keep meta and data together, but
+//   the restore Job's authoritative recount sets each referenced value's
+//   count exactly and creates a meta with no data for a value whose bytes
+//   only the backup store holds. The first read fetches the bytes
+//   (fetch-on-miss, whose rewrite keeps a present meta's count:
+//   `ExtRecoveryRewrite`). Every reader of that shape is audited in
+//   `storage::ext_reconcile`'s module header.
+//
 // * Release ledger (b.yuo): beside the unchanged pending Set, three `{gc}`
 //   companion keys account every owed release — `pending:age` (first-enqueue
 //   time), `pending:bytes` (the blob bytes the member accounts for) and
@@ -263,7 +272,7 @@ use crate::domain::delta::DeltaError;
 use crate::domain::types::{FieldValue, ObjectState};
 use crate::error::{ExternalValueError, ServiceError};
 use crate::observability::metrics::{
-    SharedMetrics, EXT_VALUE_VERIFY_HASH_MISMATCH, EXT_VALUE_VERIFY_OK,
+    self, SharedMetrics, EXT_VALUE_VERIFY_HASH_MISMATCH, EXT_VALUE_VERIFY_OK,
     EXT_VALUE_VERIFY_SIZE_MISMATCH, GC_DECREMENT_OUTCOME_APPLIED, GC_DECREMENT_OUTCOME_REPLAYED,
     GC_DECREMENT_OUTCOME_STALE, GC_OLDER_BUILD_EVENT_CLAIM_DROPPED,
     GC_OLDER_BUILD_EVENT_LOCK_TAKEN_OVER, GC_OLDER_BUILD_EVENT_RELEASE_STAMPED,
@@ -272,8 +281,9 @@ use crate::observability::metrics::{
     GC_OOM_COLLECTION_OUTCOME_REFUSED, STORE_WRITE_REFUSED_STAGE_EXT_STORE,
 };
 use crate::storage::client::{
-    map_fred_err_for_grpc, map_transient_fred_err, refuse_store_write, store_write_refusal,
-    FredErrOrigin, StoreWriteRefusal, ValkeyClient, POOL_LABEL_DATA, POOL_LABEL_MAINTENANCE,
+    evalsha_with_fenced_reload, map_fred_err_for_grpc, map_transient_fred_err, refuse_store_write,
+    store_write_refusal, FencedEvalError, FredErrOrigin, StoreWriteRefusal, ValkeyClient,
+    HOLD_FENCE_UNSENT, POOL_LABEL_DATA, POOL_LABEL_MAINTENANCE,
 };
 use crate::storage::ext_recovery_singleflight::ExtRecoverySingleflight;
 use crate::storage::ext_release_gate::ExtReleaseGate;
@@ -436,7 +446,7 @@ pub static EXT_STORE_VALUE_SCRIPT: LazyLock<Script> =
 
 /// Compiled Lua script for atomic CAS acquire-or-refresh of a plain leader
 /// lock — `le:checkpoint:leader` or `le:presence:sweeper:leader` (b.kf1
-/// H-stor-4 follow-up). Replaces the GET-then-SET
+/// H-stor-4 follow-up) — or of the DR Job lease (`KeySchema::dr_job_lease`). Replaces the GET-then-SET
 /// pair that had a sub-30 s clobber window where another replica's NX
 /// claim could land between our GET and our refresh-SET. Builds before the
 /// GC protocol marker also took `le:gc:leader` with it; this build takes that
@@ -476,6 +486,14 @@ pub static GC_OOM_SIGNAL_SCRIPT: LazyLock<Script> =
 /// position would hide a duplicate-leadership window rather than close it.
 pub static LEADER_REFRESH_IF_HELD_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::from_lua(include_str!("scripts/leader_refresh_if_held.lua")));
+
+/// Compiled Lua script that deletes a plain lease only while it still holds
+/// the calling process's `LeaderIdentity::lock_value` — the release half of
+/// [`LEADER_ACQUIRE_OR_REFRESH_SCRIPT`] and [`LEADER_REFRESH_IF_HELD_SCRIPT`].
+/// Used only through [`release_leader_lock_if_held`], by the disaster
+/// recovery Job's lease. See `scripts/leader_release_if_held.lua`.
+pub static LEADER_RELEASE_IF_HELD_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::from_lua(include_str!("scripts/leader_release_if_held.lua")));
 
 /// Compiled Lua script that atomically claims a pending GC member by
 /// SREMing it from `ext_pending` and ZADDing it to `ext_inflight` with
@@ -807,8 +825,8 @@ pub const GC_LEADER_TAKEOVER_BELOW_MS: u64 = LEADER_LOCK_TTL_MS / 3;
 /// until progress resumes, which at worst lets the key lapse during that pass
 /// — exactly the behaviour before the ticker existed.
 ///
-/// The gate keys on the GC loop alone. The orphan sweep, the reconciler and
-/// the external-value backup repair
+/// The gate keys on the GC loop alone. The orphan sweep, the reconciler, the
+/// external-value backup repair and the checkpoint clean-up
 /// ride the same key and identity, and keep it through a long pass of their
 /// own because the GC loop beside them keeps marking progress; when that loop
 /// is wedged, their passes lose the key mid-pass as they did before the
@@ -1042,8 +1060,9 @@ pub const ENQUEUE_ATTEMPT_VOID_RETENTION: std::time::Duration =
 /// sent by this call, and the next sweep resolves it. Past it before the
 /// re-send that follows a `NOSCRIPT` reload: the re-send is not made, and the
 /// answer is an outcome-unknown `Err`, because an earlier copy of the call may
-/// have run (rule E). Without this bound a supported
-/// setting (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS=0`) or a frozen process could
+/// have run (rule E). Without this bound a zero command timeout (fred's "no
+/// timeout", which `Config::from_env` refuses but a client built directly
+/// still accepts) or a frozen process could
 /// let the service decide a send after any finite record retention, so this is
 /// what makes every service decision independent of V.
 ///
@@ -1243,13 +1262,27 @@ fn is_transient_aborted(err: &ServiceError) -> bool {
     matches!(err, ServiceError::Aborted(msg) if msg.starts_with("transient I/O:"))
 }
 
-/// Internal helper used by `read_batch` to distinguish "meta absent" (unknown
-/// hash) from "meta present, data missing" (integrity error). See the `match`
-/// in `read_batch` for how this disambiguates the two error variants.
+/// Internal helper used by `read_batch` and `recover_value` to distinguish
+/// "meta absent" (unknown hash) from "meta present, data missing". The second
+/// is the meta without data a DR restore's recount leaves for a value whose
+/// bytes only the backup store holds (`storage::ext_reconcile`), which
+/// fetch-on-miss fills; outside a restore it is an integrity error. See
+/// `ValkeyExternalValueStore::recover_miss` for how this disambiguates the
+/// two error variants and their logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetaState {
     Present,
     Missing,
+}
+
+impl MetaState {
+    /// The `meta` label of `live_edit_checkpoint_ext_recovery_total`.
+    fn label(self) -> &'static str {
+        match self {
+            MetaState::Present => metrics::EXT_RECOVERY_META_PRESENT,
+            MetaState::Missing => metrics::EXT_RECOVERY_META_ABSENT,
+        }
+    }
 }
 
 // ── Release events (b.qpf) ─────────────────────────────────────────────────
@@ -1508,7 +1541,7 @@ pub(crate) async fn enqueue_ext_releases(
     releases: &[ExtRelease],
 ) -> Result<(), ServiceError> {
     let entries: Vec<(String, bool)> = releases.iter().map(|r| (r.member(), true)).collect();
-    enqueue_ext_release_entries(client, keys, &entries).await
+    enqueue_ext_release_entries(client, keys, &entries, None).await
 }
 
 /// [`enqueue_ext_releases`] with a per-release byte-accounting choice
@@ -1521,16 +1554,21 @@ pub(crate) async fn enqueue_ext_releases(
 /// budget would hold uploads back for garbage that is not garbage. Every other
 /// release — `rewrite`, retirement, a re-send's hand-back, a reconciler repair
 /// — accounts the full size, an upper bound on what its decrement can free.
+///
+/// `hold_fence` is a checkpoint restore's hold write fence (`None` on every
+/// other path): a closed fence stops the enqueue immediately before its
+/// script, which is then not sent (see [`enqueue_ext_release_entries`]).
 pub(crate) async fn enqueue_ext_releases_accounted(
     client: &ValkeyClient,
     keys: &KeySchema,
     releases: &[(ExtRelease, bool)],
+    hold_fence: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), ServiceError> {
     let entries: Vec<(String, bool)> = releases
         .iter()
         .map(|(r, accounts_blob)| (r.member(), *accounts_blob))
         .collect();
-    enqueue_ext_release_entries(client, keys, &entries).await
+    enqueue_ext_release_entries(client, keys, &entries, hold_fence).await
 }
 
 /// The ARGV pairs `member, bytes` behind every enqueue (b.yuo): read each
@@ -1706,25 +1744,44 @@ fn log_refused_replays(refused: i64, context: &'static str) {
 /// The script's own failure is the enqueue's failure, classified like the bare
 /// `SADD` it replaces: transient fred errors as the in-loop `Aborted`, so
 /// callers inside a retry loop retry; permanent ones as `Internal`.
+///
+/// `hold_fence` is a checkpoint restore's hold write fence (SDD SR-6.2;
+/// `None` everywhere else, which sends exactly as `evalsha_with_reload`
+/// does). With a fence, the script is sent through
+/// [`evalsha_with_fenced_reload`]: the fence is checked after the `STRLEN`
+/// reads and immediately before the script, and again before a `NOSCRIPT`
+/// reload's `SCRIPT LOAD` and re-sent `EVALSHA`. Once it is closed nothing
+/// more is sent and the enqueue answers
+/// `Unavailable(`[`HOLD_FENCE_UNSENT`]`)`, which the restore's caller
+/// (`LayerStore::enqueue_ext_releases_unless_held`) tells apart from a
+/// failure with
+/// [`is_hold_fence_refusal`](crate::storage::client::is_hold_fence_refusal).
 async fn enqueue_ext_release_entries(
     client: &ValkeyClient,
     keys: &KeySchema,
     entries: &[(String, bool)],
+    hold_fence: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(), ServiceError> {
     if entries.is_empty() {
         return Ok(());
     }
     let argv = release_entry_argv(client, keys, ReleaseEntries::Pairs(entries)).await;
-    let (_added, refused): (i64, i64) = EXT_RELEASE_ENQUEUE_SCRIPT
-        .evalsha_with_reload(client.pool.next(), release_enqueue_keys(keys), argv)
-        .await
-        .map_err(|e| {
-            map_transient_fred_err(
-                FredErrOrigin::client(client, POOL_LABEL_DATA),
-                "EVALSHA ext_release_enqueue",
-                e,
-            )
-        })?;
+    let (_added, refused): (i64, i64) = evalsha_with_fenced_reload(
+        &EXT_RELEASE_ENQUEUE_SCRIPT,
+        client.pool.next(),
+        release_enqueue_keys(keys),
+        argv,
+        hold_fence,
+    )
+    .await
+    .map_err(|e| match e {
+        FencedEvalError::Held => ServiceError::Unavailable(HOLD_FENCE_UNSENT.to_owned()),
+        FencedEvalError::Fred(e) => map_transient_fred_err(
+            FredErrOrigin::client(client, POOL_LABEL_DATA),
+            "EVALSHA ext_release_enqueue",
+            e,
+        ),
+    })?;
     log_refused_replays(refused, "plain enqueue");
     Ok(())
 }
@@ -2730,16 +2787,48 @@ pub struct ExtValueProbe {
     pub missing: Vec<[u8; 32]>,
 }
 
+/// What [`ExternalValueStore::probe_value_lengths`] found: the stored length
+/// of every probed hash that is stored, and the hashes that are not. Reads no
+/// value bytes.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExtValueLengths {
+    /// The stored length, in bytes, of every probed hash that is stored.
+    pub lengths: std::collections::HashMap<[u8; 32], u64>,
+    /// Every probed hash that is not stored, in the order it was asked for.
+    pub missing: Vec<[u8; 32]>,
+}
+
+/// What [`ExternalValueStore::recover_value`]'s caller charges for the value
+/// the checkpoint adapter answered, called with its fetched length once the
+/// fetch answers and before the store writes it back. The store holds the
+/// top-up it returns until the write-back returns, and drops it on every
+/// other exit (an error, a cancelled call): a catch-up restoring a value
+/// before its layout charges the bytes beyond its declared size this way
+/// (`storage::ompf_payload::restore_in_batches`), so they are charged while
+/// they are held. [`charge_nothing`] is the hook of a caller that charges no
+/// budget.
+pub type OnFetched<'a> =
+    &'a (dyn Fn(u64) -> Option<crate::storage::memory_budget::MemoryTopUp> + Send + Sync);
+
+/// The [`OnFetched`] hook that charges nothing, for a caller of
+/// [`ExternalValueStore::recover_value`] that charges no budget (a store's own
+/// miss arms, tests and diagnostics).
+pub fn charge_nothing(_fetched: u64) -> Option<crate::storage::memory_budget::MemoryTopUp> {
+    None
+}
+
 /// Async trait for external value storage with dedup, refcounting, and GC.
 ///
 /// Implementations are expected to be wrapped in `Arc<dyn ExternalValueStore>`.
 ///
 /// # Blob readers
 ///
-/// The methods that return blob bytes ([`Self::load_values`],
-/// [`Self::read_batch`], [`Self::read_batch_with_recovery_counter`],
-/// [`Self::probe_values`]) have one production reader, the catch-up build
-/// (`diff_read::resolve_external_values`). **A new reader of blob bytes must
+/// The methods that return blob bytes or lengths ([`Self::load_values`],
+/// [`Self::read_batch`], [`Self::probe_values`], [`Self::probe_value_lengths`],
+/// [`Self::read_value_range`], [`Self::recover_value`]) have one production
+/// reader, the catch-up build (`storage::ompf_payload`, through
+/// `diff_read`'s payload layout and the catch-up's restore of the values it
+/// finds missing under a live read hold). **A new reader of blob bytes must
 /// follow the GC miss protocol** (probe; on a miss take a `{gc}` read hold
 /// ([`ReadHold`]), re-read the layer and rebuild; SDD §11.2, §11.3): the GC
 /// may collect a released blob 5 s after its release, so a blob a reader's
@@ -2787,6 +2876,30 @@ pub trait ExternalValueStore: Send + Sync {
     ///
     /// SDD §11.1.
     async fn store_values(&self, values: &[(&[u8; 32], &[u8])]) -> Result<(), ServiceError>;
+
+    /// [`Self::store_values`] under a checkpoint restore's hold write fence
+    /// (SDD SR-6.2): the layer restore's external-value pre-store
+    /// (`checkpoint::apply::apply_restore`) is its one caller. A store that
+    /// sends to Valkey checks the fence before every send of every value's
+    /// script — the first `EVALSHA`, and a `NOSCRIPT` reload's `SCRIPT LOAD`
+    /// and re-send (`storage::client::evalsha_with_fenced_reload`) — and once
+    /// it is closed sends nothing more for that value and answers
+    /// `Unavailable(`[`HOLD_FENCE_UNSENT`]`)`. With `hold_fence` `None` it is
+    /// [`Self::store_values`] exactly.
+    ///
+    /// The default ignores the fence and calls [`Self::store_values`]: right
+    /// for a test double that sends nothing to Valkey. A store that writes to
+    /// Valkey overrides it, and a wrapping implementation delegates to its
+    /// inner store's `store_values_unless_held` (one that fell back to the
+    /// default would drop the fence).
+    async fn store_values_unless_held(
+        &self,
+        values: &[(&[u8; 32], &[u8])],
+        hold_fence: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), ServiceError> {
+        let _ = hold_fence;
+        self.store_values(values).await
+    }
 
     /// [`Self::store_values`] for bytes the caller has VERIFIED against their
     /// hash, plus one heal. When a pair's data key already exists and is not
@@ -2864,11 +2977,17 @@ pub trait ExternalValueStore: Send + Sync {
     /// Batch-read external values by hash, returning a map of hash → data.
     ///
     /// Unlike `load_values`, this method returns an error if any hash is
-    /// missing (`MetaNotFound` or `DataNotFound`), because missing data
-    /// during diff reconstruction indicates a data integrity issue — once a
-    /// stale read is ruled out: a catch-up build probes first
-    /// ([`Self::probe_values`]) and reads through this only for a hash still
-    /// missing after it re-read the layer under the `{gc}` read hold (b.yuo).
+    /// missing (`MetaNotFound` or `DataNotFound`) and fetch-on-miss could not
+    /// supply it, because missing data during diff reconstruction indicates
+    /// a data integrity issue — once a stale read is ruled out (b.yuo), and
+    /// outside the meta without data a DR restore leaves for a value only the
+    /// backup store holds, whose fetch is the expected first read
+    /// (`storage::ext_reconcile`). The catch-up build itself no longer reads
+    /// through this: it probes lengths ([`Self::probe_value_lengths`]), reads
+    /// in ranges ([`Self::read_value_range`]), and restores a hash still
+    /// missing after its re-read under the `{gc}` read hold through
+    /// [`Self::recover_value`], whose default for a store with no restore of
+    /// its own is this method.
     ///
     /// SDD §11.2 — pipelined: for every hash, `GET ext_data` and
     /// `HEXISTS ext_meta ref_count` go in one pipeline, one round trip per
@@ -2884,51 +3003,20 @@ pub trait ExternalValueStore: Send + Sync {
         hashes: &[[u8; 32]],
     ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError>;
 
-    /// Variant of [`Self::read_batch`] that additionally accepts an
-    /// optional `&AtomicUsize` recovery counter. When the SR-3.2 fallback
-    /// successfully recovers a missing blob from the configured
-    /// `CheckpointStore`, the counter is incremented once per recovered
-    /// hash. Other outcomes (hot-path hit, `adapter_miss`,
-    /// `adapter_transient`, `adapter_permanent`, `adapter_other`) leave
-    /// the counter untouched — the count reflects exactly the number of
-    /// hashes whose data was reconstructed via the adapter during this
-    /// call.
-    ///
-    /// Used by the version-diff builds behind
-    /// [`crate::storage::diff_read::compute_diff_at_cut`] and
-    /// [`crate::storage::diff_read::compute_per_commit_diff_at_cut`] (Subtask
-    /// `t3.fgj.zc.p6.78`) so an operator-readable INFO log line can
-    /// surface `(object_id, recovered_count)` together — `object_id` is
-    /// not in scope inside this method, so the count travels up to the
-    /// caller via the shared counter.
-    ///
-    /// Default implementation delegates to [`Self::read_batch`] with no
-    /// counter participation, so the previous contract is preserved for
-    /// any impl that does not override.
-    ///
-    /// A new caller must follow the GC miss protocol: see the trait's *Blob
-    /// readers*.
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        _recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
-        self.read_batch(hashes).await
-    }
-
     /// Probe read of external values by hash, with no recovery (b.yuo, the
     /// catch-up miss protocol; SDD §11.2): the bytes of every hash that is
     /// stored, and the hashes that are not.
     ///
     /// Unlike [`Self::read_batch`], a missing hash is an answer here, not an
     /// error: nothing is logged and the checkpoint adapter is never consulted,
-    /// so no blob is fetched or re-stored. A catch-up build reads through this
-    /// first, because a blob can be missing for a reason that is no damage at
-    /// all: a commit after the catch-up's snapshot released it and the GC
+    /// so no blob is fetched or re-stored. A catch-up build probes first —
+    /// today through [`Self::probe_value_lengths`], whose default is this
+    /// method — because a blob can be missing for a reason that is no damage
+    /// at all: a commit after the catch-up's snapshot released it and the GC
     /// collected it. Such a catch-up re-reads its state under the `{gc}` read
-    /// hold ([`ReadHold`]) and builds again; only a hash still
-    /// missing then is genuinely missing, and [`Self::read_batch`]
-    /// (fetch-on-miss through the adapter, then `INTERNAL`) serves it.
+    /// hold ([`ReadHold`]) and builds again; only a hash still missing then is
+    /// genuinely missing, and fetch-on-miss through the adapter
+    /// ([`Self::recover_value`], then `INTERNAL`) serves it.
     ///
     /// [`ExtValueProbe::missing`] keeps the order of `hashes`. A failed read
     /// is an `Err`, classified as the store's other reads classify it. Empty
@@ -2942,6 +3030,121 @@ pub trait ExternalValueStore: Send + Sync {
     /// The probe is the protocol's first step, not the whole of it: a new
     /// caller must follow the GC miss protocol, see the trait's *Blob readers*.
     async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError>;
+
+    /// The catch-up payload builder's length probe (b.ntm; SDD §11.2): the
+    /// stored length of every hash in `hashes` that is stored, and the hashes
+    /// that are not, in the order asked for, reading no value byte. A catch-up
+    /// lays its payload out from these lengths, reserves its memory, and only
+    /// then reads the values in ranges ([`Self::read_value_range`]). A missing
+    /// hash is an answer, not an error, as in [`Self::probe_values`]: nothing
+    /// is logged and the checkpoint adapter is never consulted. Empty input
+    /// answers an empty probe with no store call.
+    ///
+    /// The store answers with one `STRLEN` of each data key, and an `EXISTS`
+    /// for a key that reads 0 (an absent key and an empty value both read 0).
+    /// The default, for a store with no length read of its own, is
+    /// [`Self::probe_values`]'s answer measured. It is a blob reader under the
+    /// GC miss protocol: see the trait's *Blob readers*.
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<ExtValueLengths, ServiceError> {
+        let probe = self.probe_values(hashes).await?;
+        Ok(ExtValueLengths {
+            lengths: probe
+                .found
+                .iter()
+                .map(|(hash, data)| (*hash, data.len() as u64))
+                .collect(),
+            missing: probe.missing,
+        })
+    }
+
+    /// The catch-up payload builder's ranged read (b.ntm; SDD §11.2): the
+    /// `len` bytes of the value stored under `hash` from byte `start`, or as
+    /// many of them as are stored — fewer when the value is shorter than
+    /// `start + len` or no longer stored (empty then), which the caller reads
+    /// as missing. The caller copies the answer into its payload page and
+    /// drops it, and never asks for more than
+    /// `storage::ext_backup::EXT_VALUE_READ_CHUNK_BYTES` (65,472 B) at once,
+    /// so no reply frame outgrows the connection's counted read buffer (SDD
+    /// §15.3).
+    ///
+    /// The store answers with one `GETRANGE` of the data key. The default, for
+    /// a store with no ranged read, reads the whole value through
+    /// [`Self::probe_values`] and slices it. It is a blob reader under the GC
+    /// miss protocol: see the trait's *Blob readers*.
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        let probe = self.probe_values(std::slice::from_ref(hash)).await?;
+        let Some(data) = probe.found.get(hash) else {
+            return Ok(bytes::Bytes::new());
+        };
+        let start = usize::try_from(start).unwrap_or(usize::MAX).min(data.len());
+        let end = start.saturating_add(len).min(data.len());
+        Ok(bytes::Bytes::copy_from_slice(&data[start..end]))
+    }
+
+    /// The catch-up payload builder's fetch-on-miss of one value (b.ntm, D1;
+    /// SDD §11.2): the bytes of `hash`, restored through the checkpoint
+    /// adapter as [`Self::read_batch`] does for a hash whose data is missing,
+    /// written back to the store before this returns, or an error when it
+    /// cannot be restored (`INTERNAL`, or `UNAVAILABLE` for a transient
+    /// failure). One hash per call, so the type itself keeps a caller from
+    /// holding a whole layer's restored values at once: a catch-up restores
+    /// the values its layout found missing in batches, each charged to the
+    /// catch-up payload budget while its bytes are held
+    /// (`storage::ompf_payload::restore_in_batches`), and a value its fill
+    /// finds missing one at a time under a forced top-up. Only a catch-up
+    /// whose `{gc}` read hold the store confirmed live calls this, and only
+    /// for hashes its length probe found not stored — never for a value it
+    /// found still stored, at its laid-out length or another — so it never
+    /// reads a stored value's bytes whole. Its write-back is fetch-on-miss's
+    /// `recover` store: on a meta that exists it stores the bytes and adds no
+    /// `+1` and no stamp, and only on an absent meta does it pay the ordinary
+    /// store's `+1` (`ext_store_value.lua`). The store answers with the
+    /// adapter's own allocation, the one its write-back stored from, so the
+    /// value's bytes are freed when the caller drops the answer.
+    ///
+    /// `on_fetched` ([`OnFetched`]) is called with the fetched length once
+    /// the adapter has answered the value and before its write-back; the
+    /// store holds the top-up it returns until the write-back returns, and
+    /// drops it on every error and on a cancelled call. A caller that charges
+    /// the value for its declared size before the fetch charges the bytes
+    /// beyond it this way, while they are held. [`charge_nothing`] charges
+    /// nothing.
+    ///
+    /// The store reads `HEXISTS ext_meta ref_count`, then restores through
+    /// the adapter, logging the miss as `read_batch`'s miss arms do: an
+    /// unknown hash (no meta) is an integrity error, logged at ERROR; a meta
+    /// without data — what a DR restore's recount leaves for a value only the
+    /// backup store holds (`storage::ext_reconcile`), whose fetch is the
+    /// expected first read after a restore — is logged at DEBUG, with one
+    /// ERROR only when the fetch fails and the failure is not a transient
+    /// `UNAVAILABLE`. The default, for a store with no restore of its own, is
+    /// [`Self::read_batch`] of the one hash, which then calls `on_fetched`
+    /// with the length it read and drops its top-up at once: it has no
+    /// write-back of its own to hold it across. It is a blob reader under the
+    /// GC miss protocol: see the trait's *Blob readers*.
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        let mut read = self.read_batch(std::slice::from_ref(hash)).await?;
+        let bytes = read.remove(hash).map(bytes::Bytes::from).ok_or_else(|| {
+            ServiceError::Internal(
+                "the store's whole-value read answered without the value it was asked for"
+                    .to_owned(),
+            )
+        })?;
+        drop(on_fetched(bytes.len() as u64));
+        Ok(bytes)
+    }
 
     /// Enqueue a retiring object's owed `ref_count` decrements onto the pending
     /// release set for background GC, as ONE ATTEMPT of its retirement intent
@@ -3107,7 +3310,7 @@ pub struct ValkeyExternalValueStore {
     /// unit tests construct the store without it.
     ext_mirror_sender: Option<crate::checkpoint::ExtMirrorSender>,
     /// Optional `CheckpointStore` adapter handle used as the recovery
-    /// fallback on `read_batch` misses (Epic `t1.fgj.zc` Task
+    /// fallback on `read_batch` and `recover_value` misses (Epic `t1.fgj.zc` Task
     /// `t2.fgj.zc.p6`, SDD SR-3.2). `None` when checkpoint is disabled
     /// or the adapter is `Disabled`; on a miss the original
     /// `ExternalValueError` surfaces straight to the caller with no
@@ -3115,6 +3318,16 @@ pub struct ValkeyExternalValueStore {
     /// engages the singleflight-coalesced `get_ext_blob` →
     /// `store_recovered_values` rewrite path. See `try_recover_via_checkpoint`.
     checkpoint_store: Option<Arc<dyn CheckpointStore>>,
+    /// The disaster-recovery hold write fence of the fetch-on-miss rewrite
+    /// (SDD SR-6.2; `checkpoint::hold_fence`): the on-access repairs' token,
+    /// cancelled at hold entry and at stale-verdict entry. The rewrite runs
+    /// inside a read already past the LiveService gate — a deadline-exempt
+    /// `SubscribeReadLayer` catch-up among them — so neither the gate nor an
+    /// RPC deadline stops it; the fence, checked immediately before the
+    /// rewrite's `EVALSHA` and before a `NOSCRIPT` reload's re-send, refuses
+    /// it after entry. `None` (tests, and stores built without
+    /// [`Self::with_recovery_hold_fence`]) sends unfenced.
+    recovery_hold_fence: Option<tokio_util::sync::CancellationToken>,
     /// Per-hash singleflight guard for the SR-3.2 recovery path. Always
     /// allocated so the `Some(checkpoint_store)` branch can rely on it
     /// without a runtime `Option` check on the hot path; when
@@ -3187,6 +3400,7 @@ impl ValkeyExternalValueStore {
             metrics: None,
             ext_mirror_sender: None,
             checkpoint_store: None,
+            recovery_hold_fence: None,
             recovery_singleflight: Arc::new(ExtRecoverySingleflight::new()),
             ext_value_verify: ExtValueVerifyMode::Enforce,
             ext_release_gate: None,
@@ -3262,7 +3476,7 @@ impl ValkeyExternalValueStore {
     /// `with_metrics` / `with_ext_mirror_sender` so the production
     /// wiring stays a single chained expression. Only call this when
     /// checkpoint is enabled with a non-`Disabled` adapter — when the
-    /// field is `None`, `read_batch` misses surface straight to the
+    /// field is `None`, `read_batch` and `recover_value` misses surface straight to the
     /// caller with no adapter consult (byte-identical pre-Task
     /// behaviour). When `Some(adapter)`, a missing-meta / missing-data
     /// hash drives a singleflight-coalesced `get_ext_blob` →
@@ -3273,15 +3487,32 @@ impl ValkeyExternalValueStore {
         self
     }
 
+    /// Attach the disaster-recovery hold write fence of the fetch-on-miss
+    /// rewrite (SDD SR-6.2): `main.rs` passes the on-access repairs' token,
+    /// the one `HoldWriter::OnAccessRepairs` registers. Once it is cancelled
+    /// the rewrite sends nothing, and the read that needed it fails
+    /// `Unavailable(`[`HOLD_FENCE_UNSENT`]`)` — the transient answer the
+    /// read already gives for a transient adapter failure, so the client
+    /// retries elsewhere. Without it the rewrite is unfenced.
+    pub fn with_recovery_hold_fence(mut self, fence: tokio_util::sync::CancellationToken) -> Self {
+        self.recovery_hold_fence = Some(fence);
+        self
+    }
+
     /// Attempt to recover a missing ext-value blob via the configured
-    /// `CheckpointStore` adapter (SDD SR-3.2). Called from the
-    /// `read_batch` miss arms BEFORE the original `ExternalValueError`
+    /// `CheckpointStore` adapter (SDD SR-3.2). Called through
+    /// [`Self::recover_miss`], from `read_batch`'s miss arm and
+    /// `recover_value`, BEFORE the original `ExternalValueError`
     /// surfaces, so a successful recovery transparently fills the hash
-    /// without the caller observing the miss.
+    /// without the caller observing the miss. `meta` is what
+    /// `HEXISTS ext_meta ref_count` answered, for the recovery counter's
+    /// `meta` label. `on_fetched` is the caller's charge for the fetched
+    /// length, held across the rewrite ([`ExternalValueStore::recover_value`]).
     ///
-    /// Returns `Ok(bytes)` when the adapter served the blob; the bytes
-    /// have been rewritten into Valkey via `store_recovered_values` (a
-    /// `store_values` that sends no mirror copy) before this returns, so a
+    /// Returns `Ok(bytes)` when the adapter served the blob — the adapter's
+    /// own allocation, uncopied; the bytes have been rewritten into Valkey
+    /// via `store_recovered_values` (a `store_values` that sends no mirror
+    /// copy, and stores this same allocation) before this returns, so a
     /// follow-up `read_batch` for the same hash hits Valkey alone with no
     /// adapter consult.
     ///
@@ -3306,8 +3537,8 @@ impl ValkeyExternalValueStore {
     /// against a freshly-recovered layer issues exactly one adapter
     /// call + Valkey rewrite per hash; subsequent waiters share the
     /// result. Every outcome ticks the
-    /// `live_edit_checkpoint_ext_recovery_total{result=...}` counter
-    /// for operator visibility.
+    /// `live_edit_checkpoint_ext_recovery_total{result=...,meta=...}`
+    /// counter for operator visibility.
     ///
     /// The policy itself is [`recover_ext_value_via_checkpoint`], shared with
     /// [`MockExternalValueStore`]; this store supplies only its
@@ -3316,9 +3547,10 @@ impl ValkeyExternalValueStore {
         &self,
         hash_hex: &str,
         hash: &[u8; 32],
+        meta: MetaState,
         original_error: ServiceError,
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-    ) -> Result<Vec<u8>, ServiceError> {
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
         recover_ext_value_via_checkpoint(
             self,
             self.checkpoint_store.clone(),
@@ -3326,10 +3558,79 @@ impl ValkeyExternalValueStore {
             self.metrics.as_ref(),
             hash_hex,
             hash,
+            meta,
             original_error,
-            recovery_counter,
+            on_fetched,
         )
         .await
+    }
+
+    /// Fetch-on-miss for one hash whose data key the store does not hold,
+    /// with the miss's logging: the one place both `read_batch`'s miss arm
+    /// and `recover_value` (the catch-up's restore) take a miss, so the two
+    /// entry points cannot log it differently. `meta` is what
+    /// `HEXISTS ext_meta ref_count` answered; it is also the recovery
+    /// counter's `meta` label.
+    ///
+    /// - [`MetaState::Missing`], an unknown hash: an integrity error, logged
+    ///   at ERROR before the fetch; the error is `MetaNotFound` unless the
+    ///   backup store supplies the value.
+    /// - [`MetaState::Present`], a meta without data: what a DR restore's
+    ///   recount leaves for a value only the backup store holds
+    ///   (`storage::ext_reconcile`), whose fetch is the expected first read
+    ///   after a restore. DEBUG before the fetch, and one ERROR only when the
+    ///   fetch fails — never on a transient answer (`UNAVAILABLE`), which the
+    ///   client retries.
+    ///
+    /// The bytes and their rewrite come from
+    /// [`Self::try_recover_via_checkpoint`], which holds `on_fetched`'s
+    /// top-up across the rewrite (`read_batch` passes [`charge_nothing`]).
+    async fn recover_miss(
+        &self,
+        hash_hex: &str,
+        hash: &[u8; 32],
+        meta: MetaState,
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        match meta {
+            MetaState::Missing => {
+                tracing::error!(
+                    hash = %hash_hex,
+                    "external value meta not found during diff reconstruction"
+                );
+                let original = ServiceError::from(ExternalValueError::MetaNotFound {
+                    hash_hex: hash_hex.to_owned(),
+                });
+                self.try_recover_via_checkpoint(hash_hex, hash, meta, original, on_fetched)
+                    .await
+            }
+            MetaState::Present => {
+                tracing::debug!(
+                    hash = %hash_hex,
+                    "external value data not in the store while its reference count is: \
+                     fetching it from the backup store"
+                );
+                let original = ServiceError::from(ExternalValueError::DataNotFound {
+                    hash_hex: hash_hex.to_owned(),
+                });
+                self.try_recover_via_checkpoint(hash_hex, hash, meta, original, on_fetched)
+                    .await
+                    .inspect_err(|e| {
+                        if !matches!(
+                            e,
+                            ServiceError::Unavailable(_)
+                                | ServiceError::UnavailableWithDetail { .. }
+                        ) {
+                            tracing::error!(
+                                hash = %hash_hex,
+                                error = %e,
+                                "external value data not found during diff reconstruction, \
+                                 and the backup store could not supply it"
+                            );
+                        }
+                    })
+            }
+        }
     }
 
     /// Install a queue of synthetic `(visit_index, PendingFault)` entries
@@ -3446,22 +3747,33 @@ impl ValkeyExternalValueStore {
 }
 
 impl ValkeyExternalValueStore {
-    /// The body of [`ExternalValueStore::store_values`] (`verified` false)
+    /// The body of [`ExternalValueStore::store_values`] and
+    /// [`ExternalValueStore::store_values_unless_held`] (`verified` false)
     /// and [`ExternalValueStore::store_verified_values`] (`verified` true),
-    /// both [`ExtMirroring::Send`], and of the recovery rewrite
-    /// [`ExtRecoveryRewrite::store_recovered_values`] (`verified` false,
-    /// [`ExtMirroring::Skip`]).
+    /// all [`ExtMirroring::Send`] and [`ExtStoreMode::Store`], and of the
+    /// recovery rewrite [`ExtRecoveryRewrite::store_recovered_values`]
+    /// (`verified` false, [`ExtMirroring::Skip`], [`ExtStoreMode::Recover`]).
     /// `verified` is passed to `ext_store_value.lua` as its ARGV[2] flag, which
-    /// arms the script's type / length heal of an existing data key.
+    /// arms the script's type / length heal of an existing data key; `mode` as
+    /// its ARGV[3], whose recover mode stores the bytes on a present meta
+    /// without the `+1` or the stamp.
     /// `mirroring` decides only whether a committed value's copy goes to the
     /// wired ext-mirror sender: [`ExtMirroring::Skip`] runs the path a store
-    /// with no sender runs. Nothing else in the store differs between the
-    /// three.
-    async fn store_values_with(
+    /// with no sender runs. `hold_fence` is
+    /// [`ExternalValueStore::store_values_unless_held`]'s, or the recovery
+    /// rewrite's (the store's `recovery_hold_fence`), and `None` from the
+    /// other two, which then send exactly as before. Nothing else in the
+    /// store differs between the four, but where each value's owned copy
+    /// comes from ([`ExtStoreData`]): the store paths copy the caller's
+    /// borrowed bytes once, and the recovery rewrite stores the adapter's own
+    /// allocation, uncopied.
+    async fn store_values_with<D: ExtStoreData>(
         &self,
-        values: &[(&[u8; 32], &[u8])],
+        values: &[(&[u8; 32], D)],
         verified: bool,
         mirroring: ExtMirroring,
+        mode: ExtStoreMode,
+        hold_fence: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<(), ServiceError> {
         if values.is_empty() {
             return Ok(());
@@ -3552,7 +3864,7 @@ impl ValkeyExternalValueStore {
         use futures::stream::{StreamExt, TryStreamExt};
         let store_futures: Vec<_> = values
             .iter()
-            .map(|&(hash, data)| {
+            .map(|(hash, data)| {
                 let hash_hex = sha256_to_hex(hash);
                 let meta_key = self.keys.ext_meta(&hash_hex);
                 let data_key = self.keys.ext_data(&hash_hex);
@@ -3575,17 +3887,19 @@ impl ValkeyExternalValueStore {
                     // whose owner can carry the mirror's byte charge, so the
                     // charge taken after the commit lives exactly as long as this
                     // memory; the ARGV's handle is a refcount bump, not a second
-                    // copy. With no sender it is a plain copy and the path is the
-                    // pre-Task hot path verbatim.
+                    // copy. With no sender it is a plain copy of borrowed bytes
+                    // and the path is the pre-Task hot path verbatim, or, for
+                    // the recovery rewrite's owned bytes (which never mirror),
+                    // the adapter's allocation itself, a refcount bump.
                     //
                     // `benches/ext_mirror_enqueue.rs` (`enqueue_once`) measures
                     // the same two `ExtMirrorSender` helpers this path calls.
                     let mirror_copy: Option<crate::checkpoint::ExtMirrorCopy> = ext_mirror_sender
                         .as_ref()
-                        .map(|sender| sender.copy_value(data));
+                        .map(|sender| sender.copy_value(data.as_slice()));
                     let data_owned = match &mirror_copy {
                         Some(copy) => copy.bytes().clone(),
-                        None => bytes::Bytes::copy_from_slice(data),
+                        None => data.owned_bytes(),
                     };
                     // The payload rides as `Value::Bytes`, never a `String`. Two
                     // reasons, both load-bearing: the blob is arbitrary binary (NUL
@@ -3597,9 +3911,15 @@ impl ValkeyExternalValueStore {
                     // payload.
                     // ARGV[2] is the script's verified flag: `"1"` arms its heal
                     // of a wrong-typed or wrong-length existing data key.
+                    // ARGV[3] is its mode: `"recover"` keeps a present meta's
+                    // count and stamp (fetch-on-miss's rewrite).
                     let argv: Vec<fred::types::Value> = vec![
                         fred::types::Value::Bytes(data_owned),
                         fred::types::Value::from(if verified { "1" } else { "0" }),
+                        fred::types::Value::from(match mode {
+                            ExtStoreMode::Store => "store",
+                            ExtStoreMode::Recover => "recover",
+                        }),
                     ];
                     // b.bhb: classified, not wrapped `Internal` directly. This is a
                     // real round-trip and `store_values` itself runs no retry loop
@@ -3647,14 +3967,29 @@ impl ValkeyExternalValueStore {
                     // connection can run this twice: a second `ref_count` increment, a leak only,
                     // which the reference-count reconciler drains (`ext_store_value.lua`). The
                     // stamp returned is then the second run's, the one the meta holds.
-                    let (_ref_count, last_store_ms): (i64, String) = EXT_STORE_VALUE_SCRIPT
-                        .evalsha_with_reload::<(i64, String), _, _>(
+                    //
+                    // Under a restore's or a fetch-on-miss rewrite's hold
+                    // write fence the script goes
+                    // through `evalsha_with_fenced_reload`, which checks the
+                    // fence before this value's first `EVALSHA` and before a
+                    // `NOSCRIPT` reload's `SCRIPT LOAD` and re-send; `None`
+                    // sends exactly as `evalsha_with_reload`.
+                    let (_ref_count, last_store_ms): (i64, String) =
+                        evalsha_with_fenced_reload::<(i64, String), _, _>(
+                            &EXT_STORE_VALUE_SCRIPT,
                             client.pool.next(),
                             vec![meta_key, data_key],
                             argv,
+                            hold_fence,
                         )
                         .await
                         .map_err(|e| {
+                            let e = match e {
+                                FencedEvalError::Held => {
+                                    return ServiceError::Unavailable(HOLD_FENCE_UNSENT.to_owned());
+                                }
+                                FencedEvalError::Fred(e) => e,
+                            };
                             // A store write refusal (`-OOM` and its three
                             // siblings) refused this script's first write, so
                             // this value was not stored: `UNAVAILABLE` "nothing
@@ -3718,15 +4053,30 @@ impl ValkeyExternalValueStore {
 #[async_trait]
 impl ExternalValueStore for ValkeyExternalValueStore {
     async fn store_values(&self, values: &[(&[u8; 32], &[u8])]) -> Result<(), ServiceError> {
-        self.store_values_with(values, false, ExtMirroring::Send)
+        self.store_values_with(values, false, ExtMirroring::Send, ExtStoreMode::Store, None)
             .await
+    }
+
+    async fn store_values_unless_held(
+        &self,
+        values: &[(&[u8; 32], &[u8])],
+        hold_fence: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), ServiceError> {
+        self.store_values_with(
+            values,
+            false,
+            ExtMirroring::Send,
+            ExtStoreMode::Store,
+            hold_fence,
+        )
+        .await
     }
 
     async fn store_verified_values(
         &self,
         values: &[(&[u8; 32], &[u8])],
     ) -> Result<(), ServiceError> {
-        self.store_values_with(values, true, ExtMirroring::Send)
+        self.store_values_with(values, true, ExtMirroring::Send, ExtStoreMode::Store, None)
             .await
     }
 
@@ -3769,17 +4119,6 @@ impl ExternalValueStore for ValkeyExternalValueStore {
     async fn read_batch(
         &self,
         hashes: &[[u8; 32]],
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
-        // Forward to the counter-aware path with `None` so existing
-        // callers (and the trait default implementation) see byte-
-        // identical behaviour — the recovery counter is purely additive.
-        self.read_batch_with_recovery_counter(hashes, None).await
-    }
-
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
     ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
         if hashes.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -3838,38 +4177,21 @@ impl ExternalValueStore for ValkeyExternalValueStore {
 
         let mut result = std::collections::HashMap::with_capacity(fetch_results.len());
         for (hash, hash_hex, meta_state, data) in fetch_results {
-            match (data, meta_state) {
-                (Some(d), _) => {
+            match data {
+                Some(d) => {
                     // Hot path — zero adapter / singleflight work. SDD
                     // SR-3.2 explicitly bounds the recovery work to the
-                    // miss arms below.
+                    // miss arm below.
                     result.insert(hash, d.to_vec());
                 }
-                (None, MetaState::Missing) => {
-                    tracing::error!(
-                        hash = %hash_hex,
-                        "external value meta not found during diff reconstruction"
-                    );
-                    let original = ServiceError::from(ExternalValueError::MetaNotFound {
-                        hash_hex: hash_hex.clone(),
-                    });
+                // A miss: an unknown hash (ERROR) or the meta without data a
+                // DR restore's recount leaves (DEBUG, ERROR only when the
+                // fetch fails and is not transient), as `recover_miss` logs it.
+                None => {
                     let recovered = self
-                        .try_recover_via_checkpoint(&hash_hex, &hash, original, recovery_counter)
+                        .recover_miss(&hash_hex, &hash, meta_state, &charge_nothing)
                         .await?;
-                    result.insert(hash, recovered);
-                }
-                (None, MetaState::Present) => {
-                    tracing::error!(
-                        hash = %hash_hex,
-                        "external value data not found during diff reconstruction"
-                    );
-                    let original = ServiceError::from(ExternalValueError::DataNotFound {
-                        hash_hex: hash_hex.clone(),
-                    });
-                    let recovered = self
-                        .try_recover_via_checkpoint(&hash_hex, &hash, original, recovery_counter)
-                        .await?;
-                    result.insert(hash, recovered);
+                    result.insert(hash, recovered.to_vec());
                 }
             }
         }
@@ -3891,6 +4213,88 @@ impl ExternalValueStore for ValkeyExternalValueStore {
             .copied()
             .collect();
         Ok(ExtValueProbe { found, missing })
+    }
+
+    async fn probe_value_lengths(
+        &self,
+        hashes: &[[u8; 32]],
+    ) -> Result<ExtValueLengths, ServiceError> {
+        // One `STRLEN` per data key, and an `EXISTS` for one that reads 0,
+        // the hashes probed concurrently on the data pool (b.wsx's
+        // `stored_len_and_presence`). No value byte is read.
+        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
+        let probes = hashes.iter().map(|hash| {
+            let key = self.keys.ext_data(&sha256_to_hex(hash));
+            async move {
+                crate::storage::ext_backup::stored_len_and_presence(&self.client, &origin, &key)
+                    .await
+                    .map(|found| (*hash, found))
+                    .map_err(|e| map_fred_err_for_grpc(origin, "STRLEN ext_data", e))
+            }
+        });
+        let probed = futures::future::try_join_all(probes).await?;
+        let mut out = ExtValueLengths::default();
+        for (hash, (len, present)) in probed {
+            if present {
+                out.lengths.insert(hash, len);
+            } else {
+                out.missing.push(hash);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn read_value_range(
+        &self,
+        hash: &[u8; 32],
+        start: u64,
+        len: usize,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        if len == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
+        let key = self.keys.ext_data(&sha256_to_hex(hash));
+        // A start past this platform's address space is past every value it
+        // could hold: clamped, it reads short, which the caller reads as
+        // missing.
+        let start = usize::try_from(start).unwrap_or(usize::MAX - len);
+        let range: Option<bytes::Bytes> = self
+            .client
+            .pool
+            .getrange(key.as_str(), start, start.saturating_add(len - 1))
+            .await
+            .map_err(|e| map_fred_err_for_grpc(origin, "GETRANGE ext_data", e))?;
+        Ok(range.unwrap_or_default())
+    }
+
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        // `HEXISTS ext_meta ref_count` only tells an unknown hash from a
+        // meta without data — in the log line, the recovery counter's `meta`
+        // label and the error the adapter's failure carries — through
+        // `recover_miss`, the miss arm `read_batch` shares, so the meta
+        // without data a DR restore leaves logs DEBUG here too; the bytes
+        // come from the checkpoint adapter, never from a whole-value `GET`,
+        // and are handed back as the adapter's allocation, uncopied, with
+        // `on_fetched`'s charge held across their write-back.
+        let origin = FredErrOrigin::client(&self.client, POOL_LABEL_DATA);
+        let hash_hex = sha256_to_hex(hash);
+        let meta_exists: bool = self
+            .client
+            .pool
+            .hexists(self.keys.ext_meta(&hash_hex), "ref_count")
+            .await
+            .map_err(|e| map_fred_err_for_grpc(origin, "HEXISTS ext_meta ref_count", e))?;
+        let meta = if meta_exists {
+            MetaState::Present
+        } else {
+            MetaState::Missing
+        };
+        self.recover_miss(&hash_hex, hash, meta, on_fetched).await
     }
 
     async fn enqueue_retirement_attempt(
@@ -5597,23 +6001,24 @@ fn service_error_kind_label(e: &ServiceError) -> &'static str {
 /// loop marks progress at every wake-up and after every step and member of a
 /// pass, and the ticker renews only while the last mark is younger than
 /// [`GC_PROGRESS_STALL_AFTER`] (20 s). So the leader refreshes the key
-/// mid-pass, however long a progressing GC pass, orphan sweep, reconciler or
-/// backup-repair pass runs (all four gate on the same key with the same
-/// `leader`, and the GC loop keeps marking progress beside the other three),
+/// mid-pass, however long a progressing GC pass, orphan sweep, reconciler,
+/// backup-repair or checkpoint clean-up pass runs (all five gate on the same
+/// key with the same `leader`, and the GC loop keeps marking progress beside
+/// the other four),
 /// and a non-leader
 /// takes a same-version lock over once its TTL is at or below
 /// [`GC_LEADER_TAKEOVER_BELOW_MS`] (a higher version only when it has no TTL):
 /// failover takes about 20 s after the leader's last refresh. That holds for
 /// a leader whose loop died while the process lives on (a panic): the ticker
 /// stops with the loop, the end is logged at ERROR at once, and the orphan
-/// sweep's, reconciler's and backup repair's own calls come minutes apart, too
-/// rarely to keep
+/// sweep's, reconciler's, backup repair's and checkpoint clean-up's own calls
+/// come minutes apart, too rarely to keep
 /// the key from a peer. It holds for a loop that is wedged without ending (a
 /// pass that awaits forever) too: the ticker stops renewing
 /// [`GC_PROGRESS_STALL_AFTER`] after the last progress (one WARN), so a peer
 /// takes over about 40 s after it; the wedged replica's orphan sweep,
-/// reconciler and backup-repair passes then lose the key mid-pass as they did before the
-/// ticker existed. An older build's lock is taken over at once. The key
+/// reconciler, backup-repair and checkpoint clean-up passes then lose the key
+/// mid-pass as they did before the ticker existed. An older build's lock is taken over at once. The key
 /// therefore never lapses while any process of this build with a running,
 /// progressing GC loop can reach the store; the only lapse is every such
 /// process losing the store for the TTL (or every one's loop dying or
@@ -5625,8 +6030,9 @@ fn service_error_kind_label(e: &ServiceError) -> &'static str {
 /// finds a peer holding the key changes nothing about a pass already running.
 ///
 /// `leader` must be the process-wide identity the orphan sweep, the
-/// reconciler and the backup repair also hold: the four tasks share `le:gc:leader` and ride one
-/// leadership through the script's refresh branch.
+/// reconciler, the backup repair and the checkpoint clean-up also hold: the
+/// five tasks share `le:gc:leader` and ride one leadership through the
+/// script's refresh branch.
 ///
 /// **Out-of-memory wake-up (b.pa1).** The loop also ends its sleep when
 /// `client`'s store out-of-memory signal wakes it — at most once per
@@ -5640,7 +6046,8 @@ fn service_error_kind_label(e: &ServiceError) -> &'static str {
 ///
 /// Returns a `JoinHandle` that can be awaited during shutdown: it awaits the
 /// loop, stops the refresh ticker as soon as the loop ends, completes once
-/// both have stopped, and re-raises a panic from either.
+/// both have stopped, and re-raises a panic from either. Aborting it aborts
+/// the loop and the ticker too.
 pub fn spawn_gc_task(
     store: std::sync::Arc<dyn ExternalValueStore>,
     client: ValkeyClient,
@@ -5735,7 +6142,12 @@ pub fn spawn_gc_task(
     // stopped as soon as it ends — on `cancel`, or early if it panicked — so
     // this replica stops refreshing the lock and a peer takes it over once its
     // TTL falls to the takeover threshold. A panic in either task is re-raised
-    // here so the shutdown join still reports it.
+    // here so the shutdown join still reports it. Both inner tasks are held as
+    // abort-on-drop handles, so aborting the returned handle (a
+    // disaster-recovery hold, SDD SR-6.2) aborts the loop and the ticker with
+    // it rather than detaching them.
+    let gc_loop = tokio_util::task::AbortOnDropHandle::new(gc_loop);
+    let refresh = tokio_util::task::AbortOnDropHandle::new(refresh);
     tokio::spawn(async move {
         let gc_loop = gc_loop.await;
         refresh_cancel.cancel();
@@ -5773,8 +6185,8 @@ pub fn spawn_gc_task(
 /// it, a leader whose pass outlived [`LEADER_LOCK_TTL_MS`] would let
 /// `le:gc:leader` lapse, and an older build, which acquires only an absent
 /// key, could then lead. The verdict is not used here — the loop, the orphan
-/// sweep, the reconciler and the backup repair each still gate their next pass
-/// on their own call
+/// sweep, the reconciler, the backup repair and the checkpoint clean-up each
+/// still gate their next pass on their own call
 /// — and a takeover is logged and counted inside [`try_acquire_gc_leader`]
 /// like any other.
 ///
@@ -6125,9 +6537,10 @@ pub async fn acquire_gc_leader_lock(
 /// Try to acquire, refresh or take over the GC leader lock `le:gc:leader`
 /// (SDD §11.3) with the [`LEADER_LOCK_TTL_MS`] (30 s) TTL. Returns
 /// `Ok(true)` if `leader` now holds the lock, `Ok(false)` if another marked
-/// process does. The GC loop, the orphan sweep, the reconciler and the
-/// external-value backup repair (`checkpoint::ext_backup_repair`) all gate on
-/// it, with one process-wide `leader`.
+/// process does. The GC loop, the orphan sweep, the reconciler, the
+/// external-value backup repair (`checkpoint::ext_backup_repair`) and the
+/// checkpoint clean-up (`checkpoint::cleanup`) all gate on it, with one
+/// process-wide `leader`.
 ///
 /// The value is protocol-marked ([`LeaderIdentity::gc_lock_value`]), and the
 /// script ([`acquire_gc_leader_lock`], `scripts/gc_leader_acquire.lua`) takes
@@ -6138,7 +6551,8 @@ pub async fn acquire_gc_leader_lock(
 /// [`GC_PASS_INTERVAL`] from the refresh ticker [`spawn_gc_task`] runs beside
 /// its GC loop, independent of any pass and only while that loop runs and
 /// makes progress ([`GC_PROGRESS_STALL_AFTER`]), and again before each GC,
-/// orphan-sweep, reconciler and backup-repair pass. So the leader refreshes the key
+/// orphan-sweep, reconciler, backup-repair and checkpoint clean-up pass. So the
+/// leader refreshes the key
 /// mid-pass, and the key never lapses while any process of this build with a
 /// running, progressing GC loop can reach the store: while it stays marked an
 /// older build, which only acquires an absent key, starts no new GC,
@@ -6201,25 +6615,31 @@ pub(crate) async fn try_acquire_gc_leader(
 
 /// Generic leader-lock acquire/refresh against an arbitrary lock key
 /// (b.w29). Wraps [`LEADER_ACQUIRE_OR_REFRESH_SCRIPT`], the plain CAS of
-/// `le:checkpoint:leader` and `le:presence:sweeper:leader`. `le:gc:leader`
+/// `le:checkpoint:leader`, `le:presence:sweeper:leader` and the DR Job lease
+/// (`KeySchema::dr_job_lease`, released with
+/// [`release_leader_lock_if_held`]). `le:gc:leader`
 /// does not use it: it carries a protocol-marked value and its own takeover
 /// script ([`try_acquire_gc_leader`]). The locks are
 /// deliberately separate keys so the maintenance loops can land on different
 /// replicas in steady state. See [`KeySchema::presence_sweeper_leader_lock`]
 /// and [`KeySchema::checkpoint_leader_lock`].
 ///
-/// Writes, and recognises as "already ours", `leader`'s
-/// [`LeaderIdentity::lock_value`] — never the bare service label, so two
-/// processes sharing a label never both lead. On a claim or a refresh the
-/// key's TTL becomes `ttl_ms`; every production caller passes
-/// [`LEADER_LOCK_TTL_MS`], tests a shorter one.
+/// Writes, and recognises as "already ours", `lock_value`: the holder's
+/// [`LeaderIdentity::lock_value`] for the presence lock and for the DR Job
+/// lease (`crate::dr::job::lease`, the same value
+/// [`release_leader_lock_if_held`] compares), and its marked
+/// [`LeaderIdentity::checkpoint_lock_value`] for the checkpoint lock (b.g65)
+/// — never the bare service label, so two processes sharing a label never
+/// both lead. On a claim or a refresh the key's TTL becomes `ttl_ms`: every
+/// production caller passes [`LEADER_LOCK_TTL_MS`], except the DR Job lease,
+/// which passes its own `JOB_LEASE_TTL` (also 30 s); tests pass a shorter one.
 ///
 /// `lock_key` must be a fully-qualified Valkey key (i.e. the
 /// `KeySchema::*_leader_lock` accessor output, NOT a bare suffix).
 pub async fn try_acquire_leader_lock(
     client: &ValkeyClient,
     lock_key: &str,
-    leader: &LeaderIdentity,
+    lock_value: &str,
     ttl_ms: u64,
 ) -> Result<bool, fred::error::Error> {
     // `acquire_maintenance` bumps `valkey_pool_in_use{pool="maintenance"}`
@@ -6227,7 +6647,7 @@ pub async fn try_acquire_leader_lock(
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let lua_client = maint_pool.next();
     let lua_keys = vec![lock_key.to_owned()];
-    let lua_argv = vec![leader.lock_value(), ttl_ms.to_string()];
+    let lua_argv = vec![lock_value.to_owned(), ttl_ms.to_string()];
 
     // A command timeout is counted here; callers only log the returned error.
     // b.zt3 re-send audit: fred keeps its default write attempts here, so a lost
@@ -6241,11 +6661,12 @@ pub async fn try_acquire_leader_lock(
 }
 
 /// Refresh-only extension of a leader lock this process already holds
-/// (b.s5y). Returns `true` iff the lock's value is still `leader`'s
-/// [`LeaderIdentity::lock_value`] and its TTL was extended to `ttl_ms`;
+/// (b.s5y). Returns `true` iff the lock's value is still `lock_value` (the
+/// value the acquire wrote) and its TTL was extended to `ttl_ms`;
 /// `false` if the key has lapsed or is owned by another process — in which
 /// case the key is NOT touched. Every production caller passes
-/// [`LEADER_LOCK_TTL_MS`], tests a shorter one.
+/// [`LEADER_LOCK_TTL_MS`], except the DR Job lease, which passes its own
+/// `JOB_LEASE_TTL` (also 30 s); tests pass a shorter one.
 ///
 /// Deliberately distinct from [`try_acquire_leader_lock`]: this one never
 /// claims an unset key. The caller is a tick already mutating shared durable
@@ -6258,7 +6679,7 @@ pub async fn try_acquire_leader_lock(
 pub async fn refresh_leader_lock_if_held(
     client: &ValkeyClient,
     lock_key: &str,
-    leader: &LeaderIdentity,
+    lock_value: &str,
     ttl_ms: u64,
 ) -> Result<bool, fred::error::Error> {
     // Same maintenance-pool routing as the acquire probe: the refresh is
@@ -6266,13 +6687,48 @@ pub async fn refresh_leader_lock_if_held(
     let (maint_pool, _maint_token) = client.acquire_maintenance();
     let lua_client = maint_pool.next();
     let lua_keys = vec![lock_key.to_owned()];
-    let lua_argv = vec![leader.lock_value(), ttl_ms.to_string()];
+    let lua_argv = vec![lock_value.to_owned(), ttl_ms.to_string()];
 
     // A command timeout is counted here; callers only log the returned error.
     // b.zt3 re-send audit: fred keeps its default write attempts here, so a lost
     // connection can run this twice: it re-asserts the same holder's lease,
     // harmless (script header).
     let result: i64 = LEADER_REFRESH_IF_HELD_SCRIPT
+        .evalsha_with_reload::<i64, _, _>(lua_client, lua_keys, lua_argv)
+        .await
+        .inspect_err(|e| FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(e))?;
+    Ok(result == 1)
+}
+
+/// Delete a lease this process holds (compare-and-delete). Returns `true` iff
+/// the key held `leader`'s [`LeaderIdentity::lock_value`] and was deleted;
+/// `false` if it had lapsed or another process holds it — in which case the
+/// key is NOT touched.
+///
+/// The release half of [`try_acquire_leader_lock`] and
+/// [`refresh_leader_lock_if_held`]. Its one caller is the disaster recovery
+/// Job's lease (`KeySchema::dr_job_lease`, `crate::dr::job`), released on
+/// every exit after it was taken, so a replacement Job acquires at once
+/// instead of one lease TTL later.
+///
+/// `lock_key` must be a fully-qualified Valkey key (a `KeySchema` accessor's
+/// output, NOT a bare suffix).
+pub async fn release_leader_lock_if_held(
+    client: &ValkeyClient,
+    lock_key: &str,
+    leader: &LeaderIdentity,
+) -> Result<bool, fred::error::Error> {
+    // The same maintenance-pool routing as the acquire and refresh probes.
+    let (maint_pool, _maint_token) = client.acquire_maintenance();
+    let lua_client = maint_pool.next();
+    let lua_keys = vec![lock_key.to_owned()];
+    let lua_argv = vec![leader.lock_value()];
+
+    // A command timeout is counted here; callers only log the returned error.
+    // b.zt3 re-send audit: fred keeps its default write attempts here, so a
+    // lost connection can run this twice: the second run finds the key gone
+    // (or another holder's value) and writes nothing.
+    let result: i64 = LEADER_RELEASE_IF_HELD_SCRIPT
         .evalsha_with_reload::<i64, _, _>(lua_client, lua_keys, lua_argv)
         .await
         .inspect_err(|e| FredErrOrigin::client(client, POOL_LABEL_MAINTENANCE).observe_error(e))?;
@@ -6339,7 +6795,11 @@ pub(crate) async fn recon_claim_expired(
 
 /// Drop members from a `{recon}` ZSET — the caller's acknowledgement that it
 /// finished acting on them (deleted the orphan, collected or spared the blob),
-/// or that they healed and are no longer candidates.
+/// or that they healed and are no longer candidates. On the dead-object set
+/// one caller removes members it did not act on: the accept-loss Job, only
+/// members its own run added, at a stop on a lost layer found complete
+/// (`dr::job::execute::discard`, D2; see
+/// `KeySchema::checkpoint_reconcile_dead`).
 ///
 /// A no-op on an empty slice so callers need no guard. `ZREM` is
 /// idempotent-on-missing, so a duplicate retire from two replicas costs
@@ -6430,6 +6890,54 @@ pub(crate) async fn recon_register(
             .inspect_err(|e| FredErrOrigin::client(client, POOL_LABEL_DATA).observe_error(e))?;
     }
     Ok(())
+}
+
+/// The members of `members` that a `{recon}` ZSET does not hold, in the
+/// order given: one `ZMSCORE` per [`RECON_REGISTER_CHUNK`] members, on the
+/// data pool, like [`recon_register`]. Writes nothing.
+///
+/// Its caller is the accept-loss Job (`dr::job::execute::discard`, D1),
+/// which reads this right before its [`recon_register`] to learn which
+/// members its own registration adds. A read before the `ZADD NX`, rather
+/// than the script's own answer, because a register whose reply was lost
+/// and that ran again (fred's re-send on a dropped connection, or the Job's
+/// retry of the step) answers "already present" for a member its first run
+/// added.
+pub(crate) async fn recon_absent(
+    client: &ValkeyClient,
+    zset_key: &str,
+    members: &[String],
+) -> Result<Vec<String>, fred::error::Error> {
+    let mut absent = Vec::new();
+    for chunk in members.chunks(RECON_REGISTER_CHUNK) {
+        // A command timeout is counted here; callers only log the returned
+        // error.
+        let scores: Vec<Option<f64>> =
+            client
+                .pool
+                .next()
+                .zmscore(zset_key, chunk.to_vec())
+                .await
+                .inspect_err(|e| FredErrOrigin::client(client, POOL_LABEL_DATA).observe_error(e))?;
+        if scores.len() != chunk.len() {
+            return Err(fred::error::Error::new(
+                fred::error::ErrorKind::Parse,
+                format!(
+                    "ZMSCORE of {} members answered {} scores",
+                    chunk.len(),
+                    scores.len()
+                ),
+            ));
+        }
+        absent.extend(
+            chunk
+                .iter()
+                .zip(scores)
+                .filter(|(_, score)| score.is_none())
+                .map(|(member, _)| member.clone()),
+        );
+    }
+    Ok(absent)
 }
 
 /// `ZCARD` of a `{recon}` ZSET — the backlog gauge's input.
@@ -7460,15 +7968,64 @@ enum ExtMirroring {
     Skip,
 }
 
+/// Which store `ext_store_value.lua` runs (its ARGV[3]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtStoreMode {
+    /// The pre-flight store: the set-if-absent data write, `+1` and the
+    /// stamp. Every store path but the recovery rewrite.
+    Store,
+    /// The recovery rewrite ([`ExtRecoveryRewrite::store_recovered_values`]):
+    /// on a present meta only the set-if-absent data write — no `+1`, no
+    /// stamp; on an absent meta, [`Self::Store`].
+    Recover,
+}
+
+/// The bytes of one value [`ValkeyExternalValueStore::store_values_with`]
+/// stores, and where the store's owned copy of them comes from: borrowed bytes
+/// (every store path's) are copied once; owned bytes (the recovery rewrite's,
+/// the checkpoint adapter's own allocation) are the store's copy as they are,
+/// so a restored value is never held twice.
+trait ExtStoreData: Sync {
+    /// The bytes.
+    fn as_slice(&self) -> &[u8];
+    /// The store's owned copy of them.
+    fn owned_bytes(&self) -> bytes::Bytes;
+}
+
+impl ExtStoreData for &[u8] {
+    fn as_slice(&self) -> &[u8] {
+        self
+    }
+
+    fn owned_bytes(&self) -> bytes::Bytes {
+        bytes::Bytes::copy_from_slice(self)
+    }
+}
+
+impl ExtStoreData for bytes::Bytes {
+    fn as_slice(&self) -> &[u8] {
+        self
+    }
+
+    fn owned_bytes(&self) -> bytes::Bytes {
+        self.clone()
+    }
+}
+
 /// The store-specific step of [`recover_ext_value_via_checkpoint`], which
 /// [`ValkeyExternalValueStore`] and [`MockExternalValueStore`] implement.
 #[async_trait]
 trait ExtRecoveryRewrite: Send + Sync {
     /// Rewrite bytes fetch-on-miss recovery just read from the checkpoint
-    /// adapter. Every store effect is exactly [`ExternalValueStore::store_values`]'s
-    /// — the set-if-absent data write, the `+1` on the count, the
-    /// `last_store_ms` stamp, the `-OOM` refusal and the error mapping — but
-    /// no copy goes to the ext mirror and no `M_ext` byte charge is taken.
+    /// adapter. On a meta that exists it writes the bytes (set-if-absent) and
+    /// nothing else: the count already stands for every object referencing
+    /// the value — after a DR restore it is the restore Job's exact recount
+    /// (`storage::ext_reconcile`) — so a `+1` would be a permanent leak. On an
+    /// absent meta every store effect is exactly
+    /// [`ExternalValueStore::store_values`]'s — the set-if-absent data write,
+    /// the `+1` on the count, the `last_store_ms` stamp. Either way the
+    /// `-OOM` refusal and the error mapping are `store_values`', but no copy
+    /// goes to the ext mirror and no `M_ext` byte charge is taken.
     ///
     /// Why: the bytes came from the backup store, which already holds them, so
     /// a mirror copy would be a redundant PUT the adapter answers 412, while
@@ -7483,31 +8040,57 @@ trait ExtRecoveryRewrite: Send + Sync {
     /// the backup repair re-sends it when that copy is lost. A recovered value
     /// gets no worker confirmation; the repair's existence check confirms it.
     /// SDD §22.17.
+    ///
+    /// The bytes are the adapter's own allocation, which the store keeps as
+    /// its copy rather than copying them again.
     async fn store_recovered_values(
         &self,
-        values: &[(&[u8; 32], &[u8])],
+        values: &[(&[u8; 32], bytes::Bytes)],
     ) -> Result<(), ServiceError>;
 }
 
 #[async_trait]
 impl ExtRecoveryRewrite for ValkeyExternalValueStore {
+    /// Fenced by the store's recovery hold fence
+    /// ([`ValkeyExternalValueStore::with_recovery_hold_fence`]): after a hold
+    /// or stale-verdict entry the rewrite sends nothing and answers
+    /// `Unavailable(`[`HOLD_FENCE_UNSENT`]`)`.
     async fn store_recovered_values(
         &self,
-        values: &[(&[u8; 32], &[u8])],
+        values: &[(&[u8; 32], bytes::Bytes)],
     ) -> Result<(), ServiceError> {
-        self.store_values_with(values, false, ExtMirroring::Skip)
-            .await
+        self.store_values_with(
+            values,
+            false,
+            ExtMirroring::Skip,
+            ExtStoreMode::Recover,
+            self.recovery_hold_fence.as_ref(),
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl ExtRecoveryRewrite for MockExternalValueStore {
-    /// The mock has no mirror, so this is its `store_values`.
+    /// The mock has no mirror. Its `store_values` on an absent entry; on an
+    /// entry that exists (a meta without data included) it fills absent
+    /// bytes and keeps the count, as the script's recover mode does.
     async fn store_recovered_values(
         &self,
-        values: &[(&[u8; 32], &[u8])],
+        values: &[(&[u8; 32], bytes::Bytes)],
     ) -> Result<(), ServiceError> {
-        self.store_values_with(values, false);
+        let mut state = self.inner.lock().unwrap();
+        for (hash, data) in values {
+            state
+                .store
+                .entry(**hash)
+                .and_modify(|(stored, _rc)| {
+                    if stored.is_none() {
+                        *stored = Some(data.to_vec());
+                    }
+                })
+                .or_insert_with(|| (Some(data.to_vec()), 1));
+        }
         Ok(())
     }
 }
@@ -7525,7 +8108,10 @@ impl ExtRecoveryRewrite for MockExternalValueStore {
 ///   so a subscribe storm against a freshly recovered layer costs one adapter
 ///   call and one rewrite per hash.
 /// - `Ok(Some(bytes))` → rewrite through `store.store_recovered_values`, tick
-///   `recovered`, bump `recovery_counter`, return the bytes.
+///   `recovered`, return the bytes. A rewrite that fails — a store error, or
+///   its hold write fence closed after a hold or stale-verdict entry
+///   (`Unavailable(HOLD_FENCE_UNSENT)`) — returns its `Err` with nothing
+///   ticked.
 /// - `Ok(None)` (`adapter_miss`), `Permanent` (`adapter_permanent`) and any
 ///   other variant (`adapter_other` — `get_ext_blob` never returns them) →
 ///   `Err(original_error)`.
@@ -7533,7 +8119,19 @@ impl ExtRecoveryRewrite for MockExternalValueStore {
 ///   the client retries.
 ///
 /// Every consulted outcome ticks `live_edit_checkpoint_ext_recovery_total` with
-/// the label in parentheses above and logs it at debug.
+/// the `result` label in parentheses above and the `meta` label `meta` names
+/// (`present` for a meta without data, `absent` for an unknown hash), and logs
+/// it at debug.
+///
+/// The recovered bytes are the adapter's own allocation (the singleflight's
+/// shared [`bytes::Bytes`]), handed to the rewrite as the store's copy and
+/// returned as they are: never copied here.
+///
+/// `on_fetched` ([`OnFetched`]) is called with the recovered length as soon
+/// as the singleflight answers bytes, before the rewrite; its top-up is held
+/// until the rewrite returns, and dropped with it on a rewrite error or when
+/// the caller drops this future. Each coalesced waiter calls its own hook, so
+/// waiters that share one allocation each charge it (the safe direction).
 #[allow(clippy::too_many_arguments)]
 async fn recover_ext_value_via_checkpoint(
     store: &(dyn ExtRecoveryRewrite + '_),
@@ -7542,9 +8140,10 @@ async fn recover_ext_value_via_checkpoint(
     metrics: Option<&SharedMetrics>,
     hash_hex: &str,
     hash: &[u8; 32],
+    meta: MetaState,
     original_error: ServiceError,
-    recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-) -> Result<Vec<u8>, ServiceError> {
+    on_fetched: OnFetched<'_>,
+) -> Result<bytes::Bytes, ServiceError> {
     let Some(checkpoint_store) = checkpoint_store else {
         // No adapter wired: the original error surfaces with no counter tick
         // (the metric counts "consulted the adapter" outcomes only, so
@@ -7562,6 +8161,10 @@ async fn recover_ext_value_via_checkpoint(
 
     match fetch_result {
         Ok(Some(bytes)) => {
+            // The caller's charge for the fetched length, held while the
+            // bytes are, through the rewrite: an RAII guard, so the `?` below
+            // and a dropped future repay it too.
+            let fetched_charge = on_fetched(bytes.len() as u64);
             // Rewrite into Valkey before returning so a follow-up
             // `read_batch` for the same hash hits Valkey alone. The data half
             // of the store's per-hash script is `SET NX`, so whichever
@@ -7570,54 +8173,53 @@ async fn recover_ext_value_via_checkpoint(
             // upload, which replaces it only if its length differs. This is
             // an unverified store, so it never heals. This path is entered
             // only from the `(None, _)` arms of `read_batch`, i.e. only when `GET
-            // ext_data` found no key at all, so the `NX` writes here exactly as
-            // an unconditional `SET` would. The bytes are not re-hashed: the
+            // ext_data` found no key at all, and from `recover_value`, whose
+            // caller asks only for hashes its length probe found not stored,
+            // so the `NX` writes here exactly as an unconditional `SET` would,
+            // but for a copy another restore or upload stored since, which it
+            // leaves standing.
+            // The bytes are not re-hashed: the
             // adapter holds the first copy a store mirrored, which a gated
             // upload verified, or which predates the gate or was admitted
             // under `LIVE_EDIT_EXT_VALUE_VERIFY=observe` — see
-            // `scripts/ext_store_value.lua`. Its `ref_count` increment is a
-            // plain `+1`, and what that does to the count depends on which
-            // half was missing (SDD §22.17.4):
+            // `scripts/ext_store_value.lua`, whose recover mode this runs.
+            // What it does to the count depends on which half was missing
+            // (SDD §22.17.4):
             //
-            // - Meta gone too (`MetaNotFound`, the normal case: the GC deletes
-            //   meta and data together when the count reaches 0). The meta is
-            //   recreated at 1 while the L live objects that reference the
-            //   hash each still owe one release: exact for L = 1, a deficit of
-            //   L − 1 for L ≥ 2 — an over-release still standing, which the
+            // - Meta gone too (`MetaNotFound`: the GC deletes meta and data
+            //   together when the count reaches 0). A plain `+1` and the
+            //   `last_store_ms` stamp, as every store: the meta is recreated
+            //   at 1 while the L live objects that reference the hash each
+            //   still owe one release: exact for L = 1, a deficit of L − 1
+            //   for L ≥ 2 — an over-release still standing, which the
             //   reference-count reconciler confirms and reports but never
-            //   repairs (`storage::ext_reconcile`, the deficit arm).
-            // - Meta present, data gone (`DataNotFound`, which atomic create
-            //   and delete make impossible; logged as an integrity error).
-            //   The `+1` lands on a live count and no release is ever owed for
-            //   it — a leak, in the same class as the failed-commit increment
-            //   (SDD §11.1, §11.3). The reconciler's surplus arm drains it out
-            //   of band — hours later, and only while the pass is enabled, so
-            //   it is a backstop rather than this path's release accounting.
-            //
-            // The rewrite also re-stamps `last_store_ms`, which is what keeps
-            // the reconciler from repairing against a recovery still in flight.
+            //   repairs (`storage::ext_reconcile`, the deficit arm). The stamp
+            //   is what keeps the reconciler from repairing against a
+            //   recovery still in flight.
+            // - Meta present, data gone (`DataNotFound`: the meta without
+            //   data a DR restore's recount leaves for a value only the
+            //   backup store holds, `storage::ext_reconcile`). The bytes are
+            //   stored and the count kept as it stands, with no stamp: it
+            //   already counts every object referencing the hash, and a `+1`
+            //   would be owed by no commit and released by none.
             //
             // Not `store_values`: these bytes came from the backup store, so
             // the rewrite sends no mirror copy and takes no `M_ext` charge.
-            let pair: [(&[u8; 32], &[u8]); 1] = [(hash, bytes.as_ref())];
+            // The adapter's allocation is the store's copy (a refcount bump,
+            // no copy) and the answer, so the value is held once.
+            let pair: [(&[u8; 32], bytes::Bytes); 1] = [(hash, bytes.clone())];
             store.store_recovered_values(&pair).await?;
+            drop(pair);
+            drop(fetched_charge);
             tracing::debug!(
                 hash = %hash_hex,
                 adapter_status = "recovered",
                 "ext-value recovery via checkpoint adapter succeeded"
             );
             if let Some(m) = metrics {
-                m.inc_ext_recovery("recovered");
+                m.inc_ext_recovery(metrics::EXT_RECOVERY_RECOVERED, meta.label());
             }
-            // Subtask t3.fgj.zc.p6.78: bump the caller-provided recovery
-            // counter so the version-diff build can emit a single INFO log line per
-            // batch including the object_id (not in scope here). Every other
-            // arm leaves it untouched, so the count is exactly the number of
-            // hashes reconstructed via the adapter during this call.
-            if let Some(c) = recovery_counter {
-                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            Ok(bytes.to_vec())
+            Ok(bytes)
         }
         Ok(None) => {
             tracing::debug!(
@@ -7626,7 +8228,7 @@ async fn recover_ext_value_via_checkpoint(
                 "ext-value recovery via checkpoint adapter returned None"
             );
             if let Some(m) = metrics {
-                m.inc_ext_recovery("adapter_miss");
+                m.inc_ext_recovery(metrics::EXT_RECOVERY_ADAPTER_MISS, meta.label());
             }
             Err(original_error)
         }
@@ -7638,7 +8240,7 @@ async fn recover_ext_value_via_checkpoint(
                 "ext-value recovery via checkpoint adapter returned Transient"
             );
             if let Some(m) = metrics {
-                m.inc_ext_recovery("adapter_transient");
+                m.inc_ext_recovery(metrics::EXT_RECOVERY_ADAPTER_TRANSIENT, meta.label());
             }
             Err(ServiceError::Unavailable(format!(
                 "checkpoint adapter transient failure during ext-value recovery: {source}"
@@ -7652,7 +8254,7 @@ async fn recover_ext_value_via_checkpoint(
                 "ext-value recovery via checkpoint adapter returned Permanent"
             );
             if let Some(m) = metrics {
-                m.inc_ext_recovery("adapter_permanent");
+                m.inc_ext_recovery(metrics::EXT_RECOVERY_ADAPTER_PERMANENT, meta.label());
             }
             Err(original_error)
         }
@@ -7669,7 +8271,7 @@ async fn recover_ext_value_via_checkpoint(
                 "ext-value recovery via checkpoint adapter returned unexpected variant"
             );
             if let Some(m) = metrics {
-                m.inc_ext_recovery("adapter_other");
+                m.inc_ext_recovery(metrics::EXT_RECOVERY_ADAPTER_OTHER, meta.label());
             }
             Err(original_error)
         }
@@ -7703,8 +8305,10 @@ pub struct MockExternalValueStore {
 }
 
 struct MockState {
-    /// hash → (data, ref_count)
-    store: std::collections::HashMap<[u8; 32], (Vec<u8>, i64)>,
+    /// hash → (data, ref_count). `None` data is the meta without data a DR
+    /// restore's recount leaves for a value whose bytes only the backup
+    /// store holds ([`MockExternalValueStore::seed_meta_without_data_for_test`]).
+    store: std::collections::HashMap<[u8; 32], (Option<Vec<u8>>, i64)>,
     /// Pending release set. Members are `ExtRelease::member()` strings, not
     /// bare hashes (b.qpf) — that is what makes two owed decrements for one
     /// hash distinct here exactly as they are in Valkey. Each maps to its
@@ -7822,7 +8426,7 @@ impl MockExternalValueStore {
     /// Mock-side twin of [`ValkeyExternalValueStore::try_recover_via_checkpoint`]:
     /// both delegate to [`recover_ext_value_via_checkpoint`], so the recovery
     /// policy — singleflight, rewrite, error classification, logs, metric
-    /// labels, recovery counting — is one body. `checkpoint_store` is passed in
+    /// labels — is one body. `checkpoint_store` is passed in
     /// rather than read here: the caller clones it out under the mock's mutex
     /// and drops the guard first, because the rewrite re-enters the mock's
     /// store body (`store_recovered_values`), which takes the same mutex.
@@ -7830,10 +8434,11 @@ impl MockExternalValueStore {
         &self,
         hash_hex: &str,
         hash: &[u8; 32],
+        meta: MetaState,
         original_error: ServiceError,
         checkpoint_store: Option<&Arc<dyn CheckpointStore>>,
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
-    ) -> Result<Vec<u8>, ServiceError> {
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
         recover_ext_value_via_checkpoint(
             self,
             checkpoint_store.cloned(),
@@ -7841,16 +8446,57 @@ impl MockExternalValueStore {
             self.metrics.as_ref(),
             hash_hex,
             hash,
+            meta,
             original_error,
-            recovery_counter,
+            on_fetched,
         )
         .await
+    }
+
+    /// The mock's miss of `hash`, as the real store answers it: the meta
+    /// state for the recovery counter, and the error an unrestored miss
+    /// surfaces — `DataNotFound` for a meta without data, `MetaNotFound` for
+    /// an absent entry.
+    fn miss_of(hash_hex: &str, meta_present: bool) -> (MetaState, ServiceError) {
+        let hash_hex = hash_hex.to_owned();
+        if meta_present {
+            (
+                MetaState::Present,
+                ServiceError::from(ExternalValueError::DataNotFound { hash_hex }),
+            )
+        } else {
+            (
+                MetaState::Missing,
+                ServiceError::from(ExternalValueError::MetaNotFound { hash_hex }),
+            )
+        }
     }
 
     /// Inspect the current ref_count for a hash. Returns `None` if not stored.
     pub fn ref_count(&self, hash: &[u8; 32]) -> Option<i64> {
         let state = self.inner.lock().unwrap();
         state.store.get(hash).map(|(_, rc)| *rc)
+    }
+
+    /// **Test-only.** Put `hash` in the mock as a meta without data with
+    /// `ref_count` `count`: the shape a DR restore's recount leaves for a
+    /// value whose bytes only the backup store holds
+    /// (`storage::ext_reconcile`). Replaces any entry for `hash`. Compiled
+    /// only for tests and the `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_meta_without_data_for_test(&self, hash: &[u8; 32], count: i64) {
+        let mut state = self.inner.lock().unwrap();
+        state.store.insert(*hash, (None, count));
+    }
+
+    /// Whether the mock holds `hash`'s bytes (`false` for a meta without
+    /// data, and for an absent hash).
+    pub fn has_data(&self, hash: &[u8; 32]) -> bool {
+        let state = self.inner.lock().unwrap();
+        state
+            .store
+            .get(hash)
+            .is_some_and(|(data, _)| data.is_some())
     }
 
     /// Test-only inspector: report the number of in-flight per-hash
@@ -7981,17 +8627,18 @@ impl MockExternalValueStore {
         }
     }
 
-    /// The body of the mock's `store_values` and `store_recovered_values`
-    /// (`verified` false) and `store_verified_values` (`verified` true),
-    /// modelling the real store's
+    /// The body of the mock's `store_values` (`verified` false) and
+    /// `store_verified_values` (`verified` true), modelling the real store's
     /// `ext_store_value.lua` (`SET data NX` + `HINCRBY meta ref_count 1`): an
-    /// existing entry keeps its first-stored bytes and only its count is
+    /// existing entry keeps its first-stored bytes (an entry without bytes,
+    /// a meta without data, gets `data`) and only its count is
     /// incremented; a new entry stores `data` with a count of 1. When
     /// `verified`, an existing entry whose bytes differ in LENGTH from `data`
     /// is replaced with `data` (still one increment) — the script's verified
     /// heal. Same-length bytes are kept: the script does no byte compare and
     /// neither does the mock. The script's other heal trigger, a data key that
     /// is not a string, has no counterpart here: the mock holds only bytes.
+    /// (`store_recovered_values` models the script's recover mode itself.)
     ///
     /// The mock deliberately does NOT model the script's third effect, the
     /// `last_store_ms` stamp. Nothing reads it through this trait: the
@@ -8008,12 +8655,16 @@ impl MockExternalValueStore {
                 .store
                 .entry(*hash)
                 .and_modify(|(stored, rc)| {
-                    if verified && stored.len() != data.len() {
-                        *stored = data.to_vec();
+                    match stored {
+                        None => *stored = Some(data.to_vec()),
+                        Some(bytes) if verified && bytes.len() != data.len() => {
+                            *bytes = data.to_vec();
+                        }
+                        Some(_) => {}
                     }
                     *rc += 1;
                 })
-                .or_insert_with(|| (data.to_vec(), 1));
+                .or_insert_with(|| (Some(data.to_vec()), 1));
         }
     }
 }
@@ -8046,7 +8697,7 @@ impl ExternalValueStore for MockExternalValueStore {
         let state = self.inner.lock().unwrap();
         let mut results = Vec::with_capacity(hashes.len());
         for hash in hashes {
-            if let Some((data, _)) = state.store.get(*hash) {
+            if let Some((Some(data), _)) = state.store.get(*hash) {
                 results.push((**hash, data.clone()));
             }
         }
@@ -8056,18 +8707,6 @@ impl ExternalValueStore for MockExternalValueStore {
     async fn read_batch(
         &self,
         hashes: &[[u8; 32]],
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
-        // Forward to the counter-aware path with `None` so the mock
-        // mirrors the production `ValkeyExternalValueStore` shape — the
-        // recovery counter is purely additive and existing test callers
-        // see byte-identical behaviour.
-        self.read_batch_with_recovery_counter(hashes, None).await
-    }
-
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&std::sync::atomic::AtomicUsize>,
     ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
         if hashes.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -8081,36 +8720,70 @@ impl ExternalValueStore for MockExternalValueStore {
         let (mut result, misses, checkpoint_store) = {
             let state = self.inner.lock().unwrap();
             let mut hits = std::collections::HashMap::with_capacity(hashes.len());
-            let mut misses: Vec<[u8; 32]> = Vec::new();
+            // Each miss with whether its meta is present (an entry without
+            // bytes: a meta without data).
+            let mut misses: Vec<([u8; 32], bool)> = Vec::new();
             for hash in hashes {
-                if let Some((data, _)) = state.store.get(hash) {
-                    hits.insert(*hash, data.clone());
-                } else {
-                    misses.push(*hash);
+                match state.store.get(hash) {
+                    Some((Some(data), _)) => {
+                        hits.insert(*hash, data.clone());
+                    }
+                    Some((None, _)) => misses.push((*hash, true)),
+                    None => misses.push((*hash, false)),
                 }
             }
             (hits, misses, state.checkpoint_store.clone())
         };
 
-        for hash in misses {
+        for (hash, meta_present) in misses {
             let hash_hex = sha256_to_hex(&hash);
-            // In the mock, missing from store means meta not found.
-            let original = ServiceError::from(ExternalValueError::MetaNotFound {
-                hash_hex: hash_hex.clone(),
-            });
+            // As the real store: an absent entry is `MetaNotFound`, a meta
+            // without data `DataNotFound`.
+            let (meta, original) = Self::miss_of(&hash_hex, meta_present);
             let recovered = self
                 .try_recover_via_checkpoint(
                     &hash_hex,
                     &hash,
+                    meta,
                     original,
                     checkpoint_store.as_ref(),
-                    recovery_counter,
+                    &charge_nothing,
                 )
                 .await?;
-            result.insert(hash, recovered);
+            result.insert(hash, recovered.to_vec());
         }
 
         Ok(result)
+    }
+
+    /// `read_batch`'s answer for the one hash, with the caller's
+    /// `on_fetched` threaded into the shared recovery policy, so the mock
+    /// holds its charge across the rewrite as the real store does.
+    async fn recover_value(
+        &self,
+        hash: &[u8; 32],
+        on_fetched: OnFetched<'_>,
+    ) -> Result<bytes::Bytes, ServiceError> {
+        // The lock is dropped before the recovery, whose rewrite takes it.
+        let (meta_present, checkpoint_store) = {
+            let state = self.inner.lock().unwrap();
+            match state.store.get(hash) {
+                Some((Some(data), _)) => return Ok(bytes::Bytes::from(data.clone())),
+                Some((None, _)) => (true, state.checkpoint_store.clone()),
+                None => (false, state.checkpoint_store.clone()),
+            }
+        };
+        let hash_hex = sha256_to_hex(hash);
+        let (meta, original) = Self::miss_of(&hash_hex, meta_present);
+        self.try_recover_via_checkpoint(
+            &hash_hex,
+            hash,
+            meta,
+            original,
+            checkpoint_store.as_ref(),
+            on_fetched,
+        )
+        .await
     }
 
     async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
@@ -8121,10 +8794,10 @@ impl ExternalValueStore for MockExternalValueStore {
         let mut probe = ExtValueProbe::default();
         for hash in hashes {
             match state.store.get(hash) {
-                Some((data, _)) => {
+                Some((Some(data), _)) => {
                     probe.found.insert(*hash, data.clone());
                 }
-                None => probe.missing.push(*hash),
+                Some((None, _)) | None => probe.missing.push(*hash),
             }
         }
         Ok(probe)
@@ -12157,7 +12830,8 @@ mod tests {
 /// b.9qd — the `recon_claim_expired.lua` protocol, against a live Valkey.
 ///
 /// These sit in-crate rather than under `tests/integration/` because
-/// [`recon_claim_expired`], [`recon_retire`] and [`recon_backlog`] are
+/// [`recon_claim_expired`], [`recon_retire`], [`recon_backlog`] and
+/// [`recon_absent`] (the accept-loss Job's read before its registration) are
 /// `pub(crate)`: the ZSETs are an internal coordination detail of the
 /// checkpoint reconciliation pass, not a storage-layer API, and widening their
 /// visibility to reach them from an integration binary would be a worse trade
@@ -12176,7 +12850,7 @@ mod recon_zset_protocol_tests {
 
     use fred::interfaces::SortedSetsInterface;
 
-    use super::{recon_backlog, recon_claim_expired, recon_retire};
+    use super::{recon_absent, recon_backlog, recon_claim_expired, recon_retire};
     use crate::storage::test_support::TestValkey;
 
     /// The `{recon}`-tagged key under test. Any key works — the script takes
@@ -12334,8 +13008,9 @@ mod recon_zset_protocol_tests {
     /// remainder simply waits for the next pass.
     ///
     /// The bound is what stops a store that has accumulated candidates for
-    /// months from turning one pass into an unbounded delete storm while
-    /// holding the checkpoint leader lease.
+    /// months from turning one claim into an unbounded delete storm: the
+    /// clean-up pass acts batch by batch, testing its deadline and its gate
+    /// between them.
     #[tokio::test]
     async fn expired_members_return_oldest_first_and_respect_the_limit() {
         let tv = TestValkey::setup().await;
@@ -12376,6 +13051,51 @@ mod recon_zset_protocol_tests {
         );
     }
 
+    /// Mixed versions (b.g65): the claim script is unchanged, and a member the
+    /// new clean-up re-dated (`recon_fence::recon_redate`, `ZADD XX GT` to
+    /// the Valkey clock) reads to it — an older build's claim included — as a
+    /// later first sighting: it is not claimed again until its NEW score has
+    /// aged past the grace. A later claim is an under-delete, the safe
+    /// direction; a re-date could never make a member claimable sooner.
+    #[tokio::test]
+    async fn a_re_dated_member_is_claimed_only_once_its_new_score_has_aged_past_the_grace() {
+        let tv = TestValkey::setup().await;
+        let k = key(&tv);
+        let _: () = tv
+            .client()
+            .pool
+            .zadd(&k, None, None, false, false, (1_000.0, "re-dated"))
+            .await
+            .expect("seeding must succeed");
+        let grace = Duration::from_secs(60);
+        assert_eq!(
+            recon_claim_expired(tv.client(), &k, grace, 100, &[])
+                .await
+                .expect("claim must succeed"),
+            vec!["re-dated".to_string()],
+            "precondition: an ancient member is claimable"
+        );
+
+        crate::storage::recon_fence::recon_redate(tv.client(), &k, &["re-dated".to_string()])
+            .await
+            .expect("re-date must succeed");
+
+        assert!(
+            recon_claim_expired(tv.client(), &k, grace, 100, &[])
+                .await
+                .expect("claim must succeed")
+                .is_empty(),
+            "re-dated to now, it is not claimable until a grace has passed"
+        );
+        assert!(
+            !recon_claim_expired(tv.client(), &k, Duration::ZERO, 100, &[])
+                .await
+                .expect("claim must succeed")
+                .is_empty(),
+            "and it is still a member: a re-date moves a score, it never removes"
+        );
+    }
+
     /// [`recon_retire`] is the caller's acknowledgement; it is a no-op on an
     /// empty slice and idempotent on a member that is already gone.
     #[tokio::test]
@@ -12407,6 +13127,58 @@ mod recon_zset_protocol_tests {
             .await
             .expect("retiring an already-absent member must succeed: two replicas acting on the same member is idempotent by design");
         assert_eq!(members(&tv, &k).await, vec!["b".to_string()]);
+    }
+
+    /// [`recon_absent`] returns exactly the members the set does not hold,
+    /// in the order given, and writes nothing. The query spans two
+    /// [`super::RECON_REGISTER_CHUNK`]-sized `ZMSCORE`s, with present and
+    /// missing members on each side of the boundary, so a chunk's answer
+    /// that is dropped or misaligned shows.
+    #[tokio::test]
+    async fn absent_returns_exactly_the_missing_members_in_the_order_given_across_chunks() {
+        let tv = TestValkey::setup().await;
+        let k = tv.key_schema().checkpoint_reconcile_dead();
+        let total = super::RECON_REGISTER_CHUNK + 44;
+        // Every third member present; queried in descending order, so the
+        // answer's order is the query's and not the set's.
+        let queried: Vec<String> = (0..total).rev().map(|i| i.to_string()).collect();
+        let present: Vec<(f64, String)> = (0..total)
+            .filter(|i| i % 3 == 0)
+            .map(|i| (0.0, i.to_string()))
+            .collect();
+        let _: () = tv
+            .client()
+            .pool
+            .zadd(&k, None, None, false, false, present.clone())
+            .await
+            .expect("seeding must succeed");
+        let expected: Vec<String> = (0..total)
+            .rev()
+            .filter(|i| i % 3 != 0)
+            .map(|i| i.to_string())
+            .collect();
+        assert!(
+            expected
+                .iter()
+                .any(|m| queried[..super::RECON_REGISTER_CHUNK].contains(m))
+                && expected
+                    .iter()
+                    .any(|m| queried[super::RECON_REGISTER_CHUNK..].contains(m)),
+            "fixture: missing members in both chunks"
+        );
+
+        let absent = recon_absent(tv.client(), &k, &queried)
+            .await
+            .expect("ZMSCORE must succeed");
+
+        assert_eq!(absent, expected);
+        assert_eq!(
+            recon_backlog(tv.client(), &k)
+                .await
+                .expect("backlog must succeed"),
+            present.len() as u64,
+            "the read adds nothing"
+        );
     }
 
     /// [`recon_backlog`] is the gauge's input: the live `ZCARD`, and `0` on a
@@ -12453,7 +13225,6 @@ mod recon_zset_protocol_tests {
 /// in-memory refcount cannot stand in for.
 #[cfg(test)]
 mod ext_recovery_policy_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use fred::interfaces::{HashesInterface, KeysInterface};
@@ -12623,14 +13394,15 @@ mod ext_recovery_policy_tests {
         [byte; 32]
     }
 
-    /// Every `live_edit_checkpoint_ext_recovery_total{result}` cell, in
-    /// [`LABELS`] order. All five are seeded, so absence panics.
+    /// Every `live_edit_checkpoint_ext_recovery_total{result}` cell, summed
+    /// over its `meta` label, in [`LABELS`] order. All five are seeded, so
+    /// absence panics.
     fn recovery_cells(metrics: &Metrics) -> Vec<(&'static str, u64)> {
         let text = render(metrics);
         LABELS
             .iter()
             .map(|result| {
-                let v = sample_value(
+                let v = crate::observability::metrics::test_util::sample_sum(
                     &text,
                     "live_edit_checkpoint_ext_recovery_total",
                     &[("result", result)],
@@ -12649,16 +13421,14 @@ mod ext_recovery_policy_tests {
     }
 
     /// The contract for one adapter outcome, checked against what a store's
-    /// `read_batch_with_recovery_counter` returned for a hash it had no data
-    /// for: `original` is the error the store would have surfaced with no
-    /// adapter wired.
+    /// `read_batch` returned for a hash it had no data for: `original` is the
+    /// error the store would have surfaced with no adapter wired.
     fn assert_outcome(
         store: &str,
         adapter: Adapter,
         hash: &[u8; 32],
         result: Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError>,
         original: &ServiceError,
-        recovery_counter: &AtomicUsize,
         metrics: &Metrics,
     ) {
         match adapter {
@@ -12689,11 +13459,6 @@ mod ext_recovery_policy_tests {
             }
         }
         assert_eq!(
-            recovery_counter.load(Ordering::Relaxed),
-            usize::from(matches!(adapter, Adapter::Hit)),
-            "{store}/{adapter:?}: the caller's recovery counter moves on success only"
-        );
-        assert_eq!(
             recovery_cells(metrics),
             only_cell(label(adapter)),
             "{store}/{adapter:?}: exactly one `{}` tick and nothing else",
@@ -12709,8 +13474,8 @@ mod ext_recovery_policy_tests {
         Adapter::Other,
     ];
 
-    /// The mock store, every adapter outcome: result, error mapping, recovery
-    /// counter, and exactly one tick on the outcome's `result` label.
+    /// The mock store, every adapter outcome: result, error mapping, and
+    /// exactly one tick on the outcome's `result` label.
     #[tokio::test]
     async fn mock_store_recovery_maps_every_adapter_outcome_and_ticks_its_one_label() {
         for adapter in ADAPTERS {
@@ -12722,14 +13487,9 @@ mod ext_recovery_policy_tests {
             let original = ServiceError::from(ExternalValueError::MetaNotFound {
                 hash_hex: sha256_to_hex(&hash),
             });
-            let counter = AtomicUsize::new(0);
 
-            let result = mock
-                .read_batch_with_recovery_counter(&[hash], Some(&counter))
-                .await;
-            assert_outcome(
-                "mock", adapter, &hash, result, &original, &counter, &metrics,
-            );
+            let result = mock.read_batch(&[hash]).await;
+            assert_outcome("mock", adapter, &hash, result, &original, &metrics);
             if matches!(adapter, Adapter::Hit) {
                 assert_eq!(
                     mock.ref_count(&hash),
@@ -12778,79 +13538,356 @@ mod ext_recovery_policy_tests {
             let original = ServiceError::from(ExternalValueError::MetaNotFound {
                 hash_hex: sha256_to_hex(&hash),
             });
-            let counter = AtomicUsize::new(0);
 
-            let result = store
-                .read_batch_with_recovery_counter(&[hash], Some(&counter))
-                .await;
-            assert_outcome(
-                "valkey", adapter, &hash, result, &original, &counter, &metrics,
+            let result = store.read_batch(&[hash]).await;
+            assert_outcome("valkey", adapter, &hash, result, &original, &metrics);
+        }
+    }
+
+    // ── The meta-without-data shape's readers ─────────────────────────────
+    //
+    // A DR restore's recount (`storage::ext_reconcile::recount_authoritative`)
+    // leaves `le:ext:meta:{h}` with an exact `ref_count` and no data for a
+    // value whose bytes only the backup store holds; the module header of
+    // `storage::ext_reconcile` audits every reader of that pair. The readers
+    // pinned here: fetch-on-miss (R-fom, CHANGED: it keeps the count), the
+    // GC's decrement (R-GC) and a client upload's pre-flight store (R-store),
+    // both unchanged.
+
+    /// A `MakeWriter` capturing a JSON subscriber's output, for the ERROR
+    /// check below (the `tests` module's capture is private to it).
+    #[derive(Clone)]
+    struct JsonLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for JsonLog {
+        type Writer = JsonLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for JsonLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The real store's two entry points that take a miss through
+    /// `recover_miss`: `read_batch`, the trait's whole-value read (the
+    /// default `recover_value` for test doubles), and `recover_value`, the
+    /// catch-up's fetch-on-miss of one value (`storage::ompf_payload`). Each
+    /// R-fom test below runs over both, so the two cannot log a miss or
+    /// rewrite it differently.
+    #[derive(Clone, Copy, Debug)]
+    enum Entry {
+        ReadBatch,
+        RecoverValue,
+    }
+
+    const ENTRIES: [Entry; 2] = [Entry::ReadBatch, Entry::RecoverValue];
+
+    /// `entry` on `&[hash]` under a JSON subscriber scoped to the call: its
+    /// result and the message of every ERROR it logged.
+    async fn miss_errors(
+        store: &ValkeyExternalValueStore,
+        entry: Entry,
+        hash: [u8; 32],
+    ) -> (
+        Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError>,
+        Vec<String>,
+    ) {
+        use tracing::instrument::WithSubscriber;
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(JsonLog(Arc::clone(&buf)))
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let call = async {
+            match entry {
+                Entry::ReadBatch => store.read_batch(&[hash]).await,
+                Entry::RecoverValue => store
+                    .recover_value(&hash, &super::charge_nothing)
+                    .await
+                    .map(|bytes| std::collections::HashMap::from([(hash, bytes.to_vec())])),
+            }
+        };
+        let result = call.with_subscriber(subscriber).await;
+        let text = String::from_utf8(buf.lock().unwrap().clone()).expect("UTF-8 log output");
+        let errors = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON event"))
+            .filter(|event| event["level"] == "ERROR")
+            .map(|event| event["fields"]["message"].as_str().unwrap_or("").to_owned())
+            .collect();
+        (result, errors)
+    }
+
+    /// `hash_hex`'s meta, every field.
+    async fn meta_fields(
+        tv: &TestValkey,
+        hash_hex: &str,
+    ) -> std::collections::HashMap<String, String> {
+        tv.client()
+            .pool
+            .hgetall(tv.key_schema().ext_meta(hash_hex))
+            .await
+            .expect("HGETALL ext_meta must succeed")
+    }
+
+    /// Stage `hash_hex` as a meta without data with `fields` (the recount's
+    /// shape is `ref_count` alone).
+    async fn seed_meta_without_data(tv: &TestValkey, hash_hex: &str, fields: &[(&str, &str)]) {
+        let _: () = tv
+            .client()
+            .pool
+            .hset(tv.key_schema().ext_meta(hash_hex), fields.to_vec())
+            .await
+            .expect("HSET ext_meta must succeed");
+    }
+
+    /// **R-fom (PD-6).** A recovered rewrite on the real store goes through
+    /// `store_recovered_values`, whose per-hash script runs in its recover
+    /// mode. On a meta that exists with no data it stores the bytes and
+    /// changes nothing else: the count stays what it was (2, the recount's
+    /// exact count) and no stamp is written, in both shapes a present meta
+    /// can have — the recount's (`ref_count` alone) and a stored value whose
+    /// data alone was lost (its stamp kept as it was). The miss logs no
+    /// ERROR. The data is back, so the next read is a Valkey hit. All of it
+    /// holds through both [`ENTRIES`]: `read_batch`, the trait's whole-value
+    /// read, and the catch-up's `recover_value`.
+    ///
+    /// Fail-on-old (in-place perturbations, each red then green once
+    /// restored): `ext_store_value.lua`'s recover branch paying the old
+    /// `+1` and a fresh stamp reads a count of 3; `recover_value` logging
+    /// an ERROR before every fetch, as it did before it shared
+    /// `recover_miss`, fails its entry's no-ERROR check. The control at the
+    /// end proves the capture sees the arm's ERROR on each entry: with the
+    /// adapter missing, the arm's ERROR names the failed fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn valkey_store_recovered_rewrite_keeps_a_present_metas_count_and_stamp_and_logs_no_error(
+    ) {
+        for entry in ENTRIES {
+            for (shape, fields) in [
+                ("the recount's meta", vec![("ref_count", "2")]),
+                (
+                    "a stored value whose data was lost",
+                    vec![("ref_count", "2"), ("last_store_ms", "1700000000000")],
+                ),
+            ] {
+                let tv = TestValkey::setup().await;
+                let metrics = Arc::new(metrics_scrape_only("b21r-valkey-refcount"));
+                let store =
+                    ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone())
+                        .with_checkpoint_store(scripted(Adapter::Hit))
+                        .with_metrics(Arc::clone(&metrics));
+                let hash = test_hash(0x62);
+                let hash_hex = sha256_to_hex(&hash);
+                seed_meta_without_data(&tv, &hash_hex, &fields).await;
+                let before = meta_fields(&tv, &hash_hex).await;
+
+                let (result, errors) = miss_errors(&store, entry, hash).await;
+
+                let map = result
+                    .unwrap_or_else(|e| panic!("{entry:?}/{shape}: the miss must recover: {e:?}"));
+                assert_eq!(
+                    map.get(&hash).map(Vec::as_slice),
+                    Some(RECOVERED_BYTES),
+                    "{entry:?}/{shape}: the recovered bytes are returned"
+                );
+                assert_eq!(
+                    meta_fields(&tv, &hash_hex).await,
+                    before,
+                    "{entry:?}/{shape}: the recovered rewrite keeps the count and the stamp as \
+                     they were"
+                );
+                assert!(
+                    errors.is_empty(),
+                    "{entry:?}/{shape}: an expected first read after a restore logs no ERROR: \
+                     {errors:?}"
+                );
+                assert_eq!(
+                    recovery_cells(&metrics),
+                    only_cell("recovered"),
+                    "{entry:?}/{shape}: one `recovered` tick"
+                );
+                let data: Option<Vec<u8>> = tv
+                    .client()
+                    .pool
+                    .get(tv.key_schema().ext_data(&hash_hex))
+                    .await
+                    .expect("GET ext_data must succeed");
+                assert_eq!(
+                    data.as_deref(),
+                    Some(RECOVERED_BYTES),
+                    "{entry:?}/{shape}: the rewrite restored ext_data, so the next read is a \
+                     Valkey hit"
+                );
+            }
+
+            // Control: the same shape with the backup store missing the value
+            // logs the arm's one ERROR, so the capture above could see one.
+            let tv = TestValkey::setup().await;
+            let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone())
+                .with_checkpoint_store(scripted(Adapter::Miss));
+            let hash = test_hash(0x63);
+            seed_meta_without_data(&tv, &sha256_to_hex(&hash), &[("ref_count", "2")]).await;
+            let (result, errors) = miss_errors(&store, entry, hash).await;
+            assert!(
+                result.is_err(),
+                "{entry:?}/control: a missed fetch fails the read"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|m| m.contains("the backup store could not supply it")),
+                "{entry:?}/control: the arm's ERROR for a value no store could supply is \
+                 captured: {errors:?}"
             );
         }
     }
 
-    /// A recovered rewrite on the real store goes through
-    /// `store_recovered_values`, whose per-hash script (the one `store_values`
-    /// runs) increments `ref_count` — so recovering a hash whose
-    /// `ext_meta` survived (only `ext_data` was lost) leaves `ref_count` one
-    /// higher than before. That `+1` is the known, reconciler-drained leak the
-    /// recovery path documents; this pins that it is exactly one, and that the
-    /// data is back.
+    /// **R-fom, a transient fetch.** A meta without data whose fetch the
+    /// backup store answers `Transient` fails the read `UNAVAILABLE`, which
+    /// the client retries, and logs no ERROR: only a fetch that could not
+    /// supply the value is an integrity ERROR. A `Permanent` answer, the
+    /// control, logs the arm's ERROR, so the capture could see one. Both
+    /// [`ENTRIES`] behave alike.
+    ///
+    /// Fail-on-old (in-place perturbations, each red then green once
+    /// restored): with `recover_miss`'s meta-present arm logging the ERROR
+    /// for every failed fetch, the transient case logs it on both entries;
+    /// with `recover_value` logging an ERROR before every fetch, as it did
+    /// before it shared `recover_miss`, its entry logs it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn valkey_store_recovered_rewrite_adds_exactly_one_ref_count() {
-        let tv = TestValkey::setup().await;
-        let metrics = Arc::new(metrics_scrape_only("b21r-valkey-refcount"));
-        let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone())
-            .with_checkpoint_store(scripted(Adapter::Hit))
-            .with_metrics(Arc::clone(&metrics));
-        let hash = test_hash(0x62);
-        let hash_hex = sha256_to_hex(&hash);
-        store
-            .store_values(&[(&hash, RECOVERED_BYTES)])
-            .await
-            .expect("store_values must succeed for setup");
-        let ref_count = |tv: &TestValkey| {
-            let key = tv.key_schema().ext_meta(&hash_hex);
-            let pool = tv.client().pool.clone();
-            async move {
-                let v: Option<String> = pool
-                    .hget(&key, "ref_count")
-                    .await
-                    .expect("HGET ref_count must succeed");
-                v.map(|s| s.parse::<i64>().expect("ref_count is numeric"))
-            }
-        };
-        assert_eq!(ref_count(&tv).await, Some(1), "precondition: one reference");
+    async fn valkey_store_transient_fetch_of_a_meta_without_data_is_unavailable_and_logs_no_error()
+    {
+        for entry in ENTRIES {
+            let tv = TestValkey::setup().await;
+            let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone())
+                .with_checkpoint_store(scripted(Adapter::Transient));
+            let hash = test_hash(0x67);
+            seed_meta_without_data(&tv, &sha256_to_hex(&hash), &[("ref_count", "2")]).await;
 
-        let _: () = tv
-            .client()
-            .pool
-            .del(tv.key_schema().ext_data(&hash_hex))
-            .await
-            .expect("DEL ext_data must succeed");
-        let map = store
+            let (result, errors) = miss_errors(&store, entry, hash).await;
+
+            assert!(
+                matches!(result, Err(ServiceError::Unavailable(_))),
+                "{entry:?}: a transient fetch fails the read UNAVAILABLE, got {result:?}"
+            );
+            assert!(
+                errors.is_empty(),
+                "{entry:?}: a transient fetch logs no ERROR: {errors:?}"
+            );
+
+            // Control: a permanent answer logs the arm's ERROR.
+            let tv = TestValkey::setup().await;
+            let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone())
+                .with_checkpoint_store(scripted(Adapter::Permanent));
+            let hash = test_hash(0x68);
+            seed_meta_without_data(&tv, &sha256_to_hex(&hash), &[("ref_count", "2")]).await;
+            let (result, errors) = miss_errors(&store, entry, hash).await;
+            assert!(
+                result.is_err(),
+                "{entry:?}/control: a permanent answer fails the read"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|m| m.contains("the backup store could not supply it")),
+                "{entry:?}/control: the arm's ERROR is captured: {errors:?}"
+            );
+        }
+    }
+
+    /// **R-fom, the mock's parity.** The mock's recovered rewrite on a meta
+    /// without data fills the bytes and keeps the count, as the script's
+    /// recover mode does on the real store.
+    #[tokio::test]
+    async fn mock_store_recovered_rewrite_keeps_a_present_metas_count() {
+        let mock = MockExternalValueStore::new().with_checkpoint_store(scripted(Adapter::Hit));
+        let hash = test_hash(0x64);
+        mock.seed_meta_without_data_for_test(&hash, 2);
+
+        let map = mock
             .read_batch(&[hash])
             .await
             .expect("the DataNotFound miss must recover");
-        assert_eq!(map.get(&hash).map(Vec::as_slice), Some(RECOVERED_BYTES));
 
-        assert_eq!(
-            ref_count(&tv).await,
-            Some(2),
-            "the recovered rewrite increments ref_count exactly once"
+        assert_eq!(map.get(&hash).map(Vec::as_slice), Some(RECOVERED_BYTES));
+        assert_eq!(mock.ref_count(&hash), Some(2), "the count is kept");
+        assert!(mock.has_data(&hash), "and the bytes are filled");
+    }
+
+    /// **R-GC.** The GC's decrement of a meta without data at 1: the count
+    /// reaches 0, the decrement reads the absent data's length as 0 and
+    /// deletes both keys — one value deleted, 0 bytes freed, which is
+    /// accurate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gc_of_a_meta_without_data_deletes_it_and_frees_nothing() {
+        let tv = TestValkey::setup().await;
+        let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone());
+        let hash = test_hash(0x65);
+        let hash_hex = sha256_to_hex(&hash);
+        seed_meta_without_data(&tv, &hash_hex, &[("ref_count", "1")]).await;
+        store
+            .schedule_release(&[ExtRelease::retirement(hash, 1)])
+            .await
+            .expect("enqueueing the release must succeed");
+
+        let batch = store
+            .process_pending(&GcPolicy::IMMEDIATE, &mut GcPassState::new())
+            .await
+            .expect("the GC pass must succeed");
+
+        assert_eq!((batch.deleted, batch.freed_bytes), (1, 0));
+        assert!(
+            meta_fields(&tv, &hash_hex).await.is_empty(),
+            "the meta is deleted at 0"
         );
-        assert_eq!(recovery_cells(&metrics), only_cell("recovered"));
+        let data: bool = tv
+            .client()
+            .pool
+            .exists(tv.key_schema().ext_data(&hash_hex))
+            .await
+            .expect("EXISTS ext_data must succeed");
+        assert!(!data, "and no data key exists");
+    }
+
+    /// **R-store.** A client upload's pre-flight store of a value held as a
+    /// meta without data at N writes the bytes, pays its `+1` (N + 1) and
+    /// stamps the meta: the shape becomes an ordinary stored value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_values_on_a_meta_without_data_writes_the_bytes_and_pays_its_increment() {
+        let tv = TestValkey::setup().await;
+        let store = ValkeyExternalValueStore::new(tv.client().clone(), tv.key_schema().clone());
+        let hash = test_hash(0x66);
+        let hash_hex = sha256_to_hex(&hash);
+        seed_meta_without_data(&tv, &hash_hex, &[("ref_count", "3")]).await;
+
+        store
+            .store_values(&[(&hash, RECOVERED_BYTES)])
+            .await
+            .expect("the pre-flight store must succeed");
+
+        let meta = meta_fields(&tv, &hash_hex).await;
+        assert_eq!(meta.get("ref_count").map(String::as_str), Some("4"));
+        assert!(
+            meta.get("last_store_ms")
+                .is_some_and(|s| s.parse::<u64>().is_ok()),
+            "stamped: {meta:?}"
+        );
         let data: Option<Vec<u8>> = tv
             .client()
             .pool
             .get(tv.key_schema().ext_data(&hash_hex))
             .await
             .expect("GET ext_data must succeed");
-        assert_eq!(
-            data.as_deref(),
-            Some(RECOVERED_BYTES),
-            "the rewrite restored ext_data, so the next read is a Valkey hit"
-        );
+        assert_eq!(data.as_deref(), Some(RECOVERED_BYTES));
     }
 
     /// `checkpoint_ext_mirror_bytes{state}` as `(queued, in_flight)`; both
@@ -12979,5 +14016,308 @@ mod ext_recovery_policy_tests {
             "one store, one copy"
         );
         assert_eq!(mirror_dropped(&metrics), 0, "nothing was dropped");
+    }
+}
+
+/// D1 (w6r1): the charge a catch-up's restore takes for the bytes of a value
+/// fetched longer than its declared size ([`OnFetched`]) is held from the
+/// fetch until the value's write-back returns, and given back on an error.
+/// Driven through `storage::ompf_payload::restore_in_batches` against a store
+/// whose restore runs the shared recovery policy
+/// ([`recover_ext_value_via_checkpoint`]) and whose write-back
+/// ([`ExtRecoveryRewrite::store_recovered_values`]) reads the budget as it
+/// starts. The fill's own hook is pinned in `storage::ompf_payload`'s tests.
+#[cfg(test)]
+mod restore_excess_charge_tests {
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use super::*;
+    use crate::checkpoint::adapters::InMemoryCheckpointStore;
+    use crate::storage::diff_read::RestoreLayout;
+    use crate::storage::memory_budget::{MemoryBudget, CATCHUP_PAYLOAD_SERIES};
+    use crate::storage::ompf_payload::{
+        restore_charge_bytes, restore_in_batches, RestoredLength, EXT_RESTORE_CHARGE_CENTI,
+    };
+
+    /// The charge a catch-up passes for a restored value: the restore-only
+    /// `EXT_RESTORE_CHARGE_CENTI`.
+    const CHARGE_CENTI: u64 = EXT_RESTORE_CHARGE_CENTI;
+
+    /// The size the layout declares for the value.
+    const DECLARED: u64 = 1_000;
+
+    /// The bytes the backup store answers for it: 64 KiB, far more than
+    /// declared, as an upload accepted under
+    /// `LIVE_EDIT_EXT_VALUE_VERIFY=observe` with an understated size leaves.
+    const FETCHED: usize = 64 << 10;
+
+    /// The restore's error when the write-back fails.
+    const WRITE_BACK_FAILED: &str = "scripted write-back failure";
+
+    /// What `restore_in_batches` answers: each value's length to lay it out
+    /// at.
+    type Restored = Result<std::collections::HashMap<[u8; 32], RestoredLength>, ServiceError>;
+
+    /// A [`MockExternalValueStore`] whose restore runs the shared recovery
+    /// policy over `adapter`, with this store as its rewrite: the rewrite
+    /// records `budget`'s over-commit as it starts, then fails when
+    /// `fail_write_back` and otherwise stores into the mock.
+    struct WriteBackWatchingStore {
+        mock: MockExternalValueStore,
+        adapter: Arc<dyn CheckpointStore>,
+        singleflight: ExtRecoverySingleflight,
+        budget: Arc<MemoryBudget>,
+        fail_write_back: bool,
+        overcommit_at_write_back: StdMutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl ExtRecoveryRewrite for WriteBackWatchingStore {
+        async fn store_recovered_values(
+            &self,
+            values: &[(&[u8; 32], bytes::Bytes)],
+        ) -> Result<(), ServiceError> {
+            self.overcommit_at_write_back
+                .lock()
+                .expect("overcommit_at_write_back")
+                .push(self.budget.overcommit_bytes());
+            if self.fail_write_back {
+                return Err(ServiceError::Unavailable(WRITE_BACK_FAILED.to_owned()));
+            }
+            ExtRecoveryRewrite::store_recovered_values(&self.mock, values).await
+        }
+    }
+
+    #[async_trait]
+    impl ExternalValueStore for WriteBackWatchingStore {
+        async fn store_values(&self, values: &[(&[u8; 32], &[u8])]) -> Result<(), ServiceError> {
+            self.mock.store_values(values).await
+        }
+
+        async fn store_verified_values(
+            &self,
+            values: &[(&[u8; 32], &[u8])],
+        ) -> Result<(), ServiceError> {
+            self.mock.store_verified_values(values).await
+        }
+
+        fn ext_value_verify(&self) -> ExtValueVerify<'_> {
+            self.mock.ext_value_verify()
+        }
+
+        async fn load_values(
+            &self,
+            hashes: &[&[u8; 32]],
+        ) -> Result<Vec<([u8; 32], Vec<u8>)>, ServiceError> {
+            self.mock.load_values(hashes).await
+        }
+
+        async fn read_batch(
+            &self,
+            hashes: &[[u8; 32]],
+        ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, ServiceError> {
+            self.mock.read_batch(hashes).await
+        }
+
+        async fn probe_values(&self, hashes: &[[u8; 32]]) -> Result<ExtValueProbe, ServiceError> {
+            self.mock.probe_values(hashes).await
+        }
+
+        async fn recover_value(
+            &self,
+            hash: &[u8; 32],
+            on_fetched: OnFetched<'_>,
+        ) -> Result<bytes::Bytes, ServiceError> {
+            let hash_hex = sha256_to_hex(hash);
+            let original = ServiceError::from(ExternalValueError::DataNotFound {
+                hash_hex: hash_hex.clone(),
+            });
+            recover_ext_value_via_checkpoint(
+                self,
+                Some(Arc::clone(&self.adapter)),
+                &self.singleflight,
+                None,
+                &hash_hex,
+                hash,
+                MetaState::Present,
+                original,
+                on_fetched,
+            )
+            .await
+        }
+
+        async fn enqueue_retirement_attempt(
+            &self,
+            object_id: &str,
+            attempt: &str,
+            releases: &[ExtRelease],
+            send_by: std::time::Instant,
+        ) -> Result<ReleaseAttemptOutcome, ServiceError> {
+            self.mock
+                .enqueue_retirement_attempt(object_id, attempt, releases, send_by)
+                .await
+        }
+
+        async fn process_pending(
+            &self,
+            policy: &GcPolicy,
+            state: &mut GcPassState,
+        ) -> Result<GcBatchResult, ServiceError> {
+            self.mock.process_pending(policy, state).await
+        }
+
+        fn ext_release_gate(&self) -> Option<&Arc<ExtReleaseGate>> {
+            self.mock.ext_release_gate()
+        }
+    }
+
+    /// One value, a meta without data in the store, whose backup copy is
+    /// [`FETCHED`] bytes, restored by `restore_in_batches` from a layout
+    /// declaring [`DECLARED`] bytes for it on a 64 MiB catch-up payload
+    /// budget: the store, the budget and the restore's answer.
+    async fn restore_over_declared(
+        fail_write_back: bool,
+    ) -> (WriteBackWatchingStore, Arc<MemoryBudget>, Restored) {
+        let hash = [0xD1; 32];
+        let adapter = InMemoryCheckpointStore::new();
+        adapter
+            .put_ext_blob(
+                &sha256_to_hex(&hash),
+                bytes::Bytes::from(vec![0x5A; FETCHED]),
+            )
+            .await
+            .expect("seed the backup store");
+        let budget = Arc::new(MemoryBudget::with_series(
+            64 << 10,
+            Arc::new(StdMutex::new(None)),
+            &CATCHUP_PAYLOAD_SERIES,
+        ));
+        let store = WriteBackWatchingStore {
+            mock: MockExternalValueStore::new(),
+            adapter: Arc::new(adapter),
+            singleflight: ExtRecoverySingleflight::new(),
+            budget: Arc::clone(&budget),
+            fail_write_back,
+            overcommit_at_write_back: StdMutex::new(Vec::new()),
+        };
+        store.mock.seed_meta_without_data_for_test(&hash, 1);
+        let layout = RestoreLayout::restore_for_test([(hash, DECLARED)]);
+        let restored = restore_in_batches(
+            &store,
+            &layout,
+            CHARGE_CENTI,
+            budget.total_bytes(),
+            |bytes| {
+                let budget = Arc::clone(&budget);
+                async move {
+                    budget.reserve(bytes, None).await.map_err(|_| {
+                        ServiceError::Internal("an idle budget refused the reservation".into())
+                    })
+                }
+            },
+        )
+        .await;
+        (store, budget, restored)
+    }
+
+    /// The over-commit the excess charge of the over-declared value takes:
+    /// the charge of its fetched bytes less that of its declared size, in the
+    /// budget's whole KiB.
+    fn excess_kib_bytes() -> u64 {
+        let excess = restore_charge_bytes(FETCHED as u64, CHARGE_CENTI)
+            - restore_charge_bytes(DECLARED, CHARGE_CENTI);
+        excess.div_ceil(1024) * 1024
+    }
+
+    /// w6r1, held: a value whose backup copy is longer than its layout
+    /// declares (here 64 KiB against 1,000 B) is charged, beyond its share
+    /// for the declared size, the charge of its bytes over that size as a
+    /// forced top-up held while the bytes are: as its write-back starts, the
+    /// budget's over-commit is exactly that excess charge (at `CHARGE_CENTI`,
+    /// in whole KiB). Once the restore has returned it is all given back, and
+    /// the value is answered at its fetched length, restored.
+    ///
+    /// Fails without the change (in-place perturbation): with
+    /// `restore_in_batches` passing `&charge_nothing` instead of its excess
+    /// hook, the over-commit at the write-back is 0.
+    #[tokio::test]
+    async fn an_over_declared_values_excess_charge_is_held_until_its_write_back() {
+        let (store, budget, restored) = restore_over_declared(false).await;
+        let restored = restored.expect("the value restores");
+        let excess = excess_kib_bytes();
+        assert!(
+            excess > 0 && excess < budget.total_bytes(),
+            "fixture self-check: an excess charge the budget does not clamp"
+        );
+        assert_eq!(
+            *store
+                .overcommit_at_write_back
+                .lock()
+                .expect("overcommit_at_write_back"),
+            vec![excess],
+            "as its write-back starts, the bytes beyond the declared size are charged"
+        );
+        assert_eq!(
+            restored.values().copied().collect::<Vec<_>>(),
+            vec![RestoredLength {
+                len: FETCHED as u64,
+                restored: true,
+            }],
+            "the value is laid out at its fetched length"
+        );
+        assert!(
+            store.mock.has_data(&[0xD1; 32]),
+            "the value is written back"
+        );
+        assert_eq!(
+            (
+                budget.reserved_bytes(),
+                budget.overcommit_bytes(),
+                budget.waiters()
+            ),
+            (0, 0, 0),
+            "the share and the excess charge are given back"
+        );
+    }
+
+    /// w6r1, the error path: when the over-declared value's write-back fails
+    /// after its fetch, the restore fails with the write-back's error, and
+    /// the excess charge — taken at the fetch, held at the write-back's start
+    /// — is given back with the batch's share: nothing of the budget is held
+    /// afterwards.
+    ///
+    /// Fails without the change (in-place perturbation): with the policy's
+    /// top-up leaked (`std::mem::forget`) instead of dropped on the
+    /// write-back's error, the over-commit stays at the excess charge.
+    #[tokio::test]
+    async fn an_over_declared_values_excess_charge_is_given_back_when_its_write_back_fails() {
+        let (store, budget, restored) = restore_over_declared(true).await;
+        match restored {
+            Err(ServiceError::Unavailable(message)) => {
+                assert_eq!(message, WRITE_BACK_FAILED, "the write-back's error");
+            }
+            other => panic!("the write-back's error, nothing else: {other:?}"),
+        }
+        assert_eq!(
+            *store
+                .overcommit_at_write_back
+                .lock()
+                .expect("overcommit_at_write_back"),
+            vec![excess_kib_bytes()],
+            "fixture self-check: the excess charge was held as the write-back started"
+        );
+        assert!(
+            !store.mock.has_data(&[0xD1; 32]),
+            "fixture self-check: nothing was written back"
+        );
+        assert_eq!(
+            (
+                budget.reserved_bytes(),
+                budget.overcommit_bytes(),
+                budget.waiters()
+            ),
+            (0, 0, 0),
+            "the excess charge and the share are given back on the error"
+        );
     }
 }

@@ -43,6 +43,11 @@ PATH_BEFORE = rb'(?<![A-Za-z0-9._+/~-])'
 PATH_AFTER = rb'(?![A-Za-z0-9._+~-])'
 # Standard system prefixes hold compilers and build tools on every machine; they name no machine.
 SYSTEM_ROOTS = {'/', '/usr', '/usr/local', '/bin', '/opt'}
+# A PEM certificate with its encoded body, whether a file such as gRPC's roots.pem or one compiled into a binary. The
+# package trusts the CA PEM its host supplies or the system store and never carries certificates of its own: a bundled
+# store keeps trusting roots the host has revoked. Parser constants naming the markers carry no body and do not match.
+CERTIFICATE_PEM = re.compile(rb'-----BEGIN (?:TRUSTED |X509 )?CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]{64,}?'
+                             rb'-----END (?:TRUSTED |X509 )?CERTIFICATE-----')
 
 
 def version(path=None):
@@ -87,8 +92,9 @@ def commit_time():
     return int(value)
 
 
-def archive_root(release_version, profile, platform):
-    return f'ovlive-{release_version}-{profile}-{platforms.get(platform).name}'
+def archive_root(release_version, profile, platform, configuration='release'):
+    suffix = '-debug' if configuration == 'debug' else ''
+    return f'ovlive-{release_version}-{profile}-{platforms.get(platform).name}{suffix}'
 
 
 def _mode(name, platform):
@@ -140,7 +146,7 @@ def manifest(package, record, head, tag, dirty):
                                                    mode=f'{_mode(name, platform):04o}')
     result = dict(
         schema_version=1, product='ovlive', version=release_version,
-        archive_root=archive_root(release_version, profile, platform), extension_folder=EXTENSION_FOLDER,
+        archive_root=archive_root(release_version, profile, platform, record['configuration']), extension_folder=EXTENSION_FOLDER,
         platform=platform, configuration=record['configuration'], usd_profile=profile, sanitizer='none',
         abi_version=abi.group(1).lower(), git_head=head, git_tag=tag, dirty=dirty,
         source_fingerprint=fingerprint(),
@@ -190,11 +196,13 @@ def _info(name, kind, mode, mtime, size=0):
     return info
 
 
-def create(package, output_dir, *, allow_dirty=False, extract_to=None):
-    """Archive a validated `release` stage of this host's platform reproducibly, then check the archive; return its path."""
+def create(package, output_dir, *, allow_dirty=False, extract_to=None, configuration='release'):
+    """Archive a validated stage of the requested configuration reproducibly, then check it; return its path."""
     package, output_dir = Path(package), Path(output_dir)
     record = build.validate_stage(package, ROOT, expected_platform=platforms.host().name,
-                                  expected_configuration='release')
+                                  expected_configuration=configuration)
+    if configuration not in ('release', 'debug'):
+        raise ValueError('Unsupported archive configuration')
     release_version = version()
     head, tags, dirty = git_head(), git_tags(), git_dirty()
     releases = sorted(tag for tag in tags if re.fullmatch(r'v\d+\.\d+\.\d+', tag))
@@ -344,11 +352,11 @@ def _verify(archive, root, extract_to, forbidden, *, made=False):
             raise ValueError('Unrecognized release manifest')
         _path_free(record)
         if (record.get('schema_version') != 1 or record.get('product') != 'ovlive'
-                or record.get('extension_folder') != EXTENSION_FOLDER or record.get('configuration') != 'release'
+                or record.get('extension_folder') != EXTENSION_FOLDER or record.get('configuration') not in ('release', 'debug')
                 or not platforms.supported(record.get('platform')) or record.get('archive_root') != root
                 or not re.fullmatch(r'\d+\.\d+\.\d+', str(record.get('version')))
                 or record.get('usd_profile') not in build.USD_PROFILES
-                or archive_root(record['version'], record['usd_profile'], record['platform']) != root):
+                or archive_root(record['version'], record['usd_profile'], record['platform'], record['configuration']) != root):
             raise ValueError('The release manifest does not match the archive name ' + archive.name)
         files = record['files']
         platform = record['platform']
@@ -373,6 +381,9 @@ def _verify(archive, root, extract_to, forbidden, *, made=False):
             if found:
                 raise ValueError(f'Release archive member {name} names a path of the build machine: '
                                  + found.group(1).decode(errors='replace'))
+            if CERTIFICATE_PEM.search(data):
+                raise ValueError(f'Release archive member {name} carries a PEM certificate; the package trusts the '
+                                 'host-supplied CA PEM or the system store only')
             if info.mode != _mode(name.split('/', 1)[1], platform):
                 _reject(name, f'mode {info.mode:04o}')
         bom = reader.extractfile(members[f'{root}/{EXTENSION_FOLDER}/share/omni_usd_live/BOM.json']).read()
@@ -394,6 +405,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     create_parser = commands.add_parser('create', help='archive a validated release stage')
+    create_parser.add_argument('--configuration', choices=('release', 'debug'), default='release')
     create_parser.add_argument('--package', type=Path, required=True, help='<target-dir>/usd/omniverse/live')
     create_parser.add_argument('--output-dir', type=Path, required=True)
     create_parser.add_argument('--allow-dirty', action='store_true',
@@ -409,7 +421,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == 'create':
-            path = create(args.package, args.output_dir, allow_dirty=args.allow_dirty, extract_to=args.extract_to)
+            path = create(args.package, args.output_dir, allow_dirty=args.allow_dirty, extract_to=args.extract_to,
+                          configuration=args.configuration)
             print(f'{path.name}: {build._hash(path)}')
         elif args.against is not None:
             members, fields, identical = compare(args.archive, args.against, args.extract_to,

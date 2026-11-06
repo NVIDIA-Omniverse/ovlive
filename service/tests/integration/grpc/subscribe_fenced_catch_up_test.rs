@@ -32,7 +32,7 @@
 //! | Reader cap | a catch-up whose flight sleeps past `reader_wait_max(L)` ends `UNAVAILABLE` before content under `reason="fenced_read_wait_cap"`, while the flight goes on for a later one; the reader-wait histogram observes the read attempt only (defer-13) |
 //! | Capacity | the flight's slot, fenced-permit and memory waits are charged to each attached catch-up and refuse it `catchup_capacity` before content, with a status naming all three waits (defer-16 (ii)), on one `FlightRead` budget charge with no deadline; waiting for memory holds no fence; a `RETRY_AFTER` sleep keeps the flight's slot, frees its permit and memory, and is not charged |
 //! | Build turn | a catch-up queued for its build turn whose stream registration is killed by the multiplexer's hard cap ends before content without waiting for its turn |
-//! | Sizing (code review r2) | an early-out `TOO_LARGE` sizes the flight from the fence key's stored `bpi`; a registered flight suppresses the probe; a flight that leaves the registry after an early-out answer is probed for at the next attach, the one lookup that decides the size; a rollback-mode replay handing over on an early-out probes at the attach, its slot given back; an absent, wrong-typed or failed probe falls back to the fitted bytes per item and the catch-up is still served; a mid-read abort sizes from its own tallies and sends no probe |
+//! | Sizing (code review r2) | an early-out `TOO_LARGE` sizes the flight from the fence key's stored `bpi`; a registered flight suppresses the probe; a flight that leaves the registry after an early-out answer is probed for at the next attach, the one lookup that decides the size; an in-window reconnect answered an early-out probes at the attach, its slot given back; an absent, wrong-typed or failed probe falls back to the fitted bytes per item and the catch-up is still served; a mid-read abort sizes from its own tallies and sends no probe |
 //! | Readers under writers (T14, INV-9) | a catch-up and a checkpoint assembly of the layer complete — served at a proven cut, written, no `fence_broken` read — while a writer commits continuously on the fast path, the cached structural route or the uncacheable WATCH fallback, each fenced read held open far longer than the writer's commit gap; the writer records its fence waits on its own path |
 //! | Cancellation and failure (SR-7.4) | a catch-up ended by its client in the predecessor wait, the flight's slot, fenced-permit or memory wait, a `RETRY_AFTER` sleep, the read, the turn queue or its build turn; by shutdown in the read and in its build turn; by its session's deletion in a `RETRY_AFTER` sleep and in its build turn; and by the fenced read gate closing (`ValkeyClient::quit`'s step) while its flight waits for a permit, with the shutdown token untouched — and one whose shared read or build fails — leaves every slot, fenced and atomic permit and the memory budget at full capacity (`reserved == 0 && overcommit == 0`), no flight and no build registered, and no live reader lease once leases lapse; graceful shutdown with a flight reading under its fence releases the lease before `ValkeyClient::quit` closes the pools |
 //!
@@ -40,30 +40,33 @@
 //! `storage::snapshot_flights_test`; the regimes at the fenced cut and the
 //! sequence regression on the fenced path in `subscribe_regimes_test.rs`; the
 //! structural double-apply regression on the fenced path in
-//! `subscribe_proven_read_test.rs`; the rollback replay's hand-over and a shared
-//! read's `NotFound` recovery in `subscribe_capacity_budget_test.rs`.
+//! `subscribe_proven_read_test.rs`; a shared read's `NotFound` recovery in
+//! `subscribe_capacity_budget_test.rs`.
 //!
 //! # Holding a flight still
 //!
 //! A flight is held where a test needs it by holding what it waits for: the
 //! catch-up slot, the fenced read permit, the whole memory budget, a staged
 //! writers' gap on the fence key (the acquire answers `RETRY_AFTER gap`), the
-//! fan-out's delay seam (holding the read open between grant and release), a
-//! flight the test registers itself and never drives, or a catch-up parked
-//! inside its build turn (`CatchUpBuildTurnSeam`). Where a test must show a
-//! wait is NOT charged, it spends real time past the capacity budget
-//! ([`SPEND`]) — a spend, never a synchronisation: the outcome is the same
-//! however long it runs past.
+//! fan-out's hold seam (parking the read's first fenced command between grant
+//! and release until the test's step under the read has happened, then
+//! released — on drop too), a flight the test registers itself and never
+//! drives, or a catch-up parked inside its build turn
+//! (`CatchUpBuildTurnSeam`). A read held that way has its lease lengthened
+//! (`lengthen_fence_leases`, at least twice the client's command timeout), so
+//! a renewal starved by a loaded runner cannot end the held attempt and let
+//! its retry run unheld; what the flight sizes from the fence (its capacity,
+//! its wait cap) stays production-sized. Each held read's lease is checked on
+//! the store once it is parked (`assert_fence_lease_lengthened`). Where a
+//! test must show a wait is NOT charged, it spends real time past the
+//! capacity budget ([`SPEND`], [`READ_SPEND`]) — a spend, never a
+//! synchronisation: the outcome is the same however long it runs past.
 //!
-//! Three tests rest on a window instead, each seconds wide against steps that
-//! take milliseconds, and each fails loudly, never green, if a step misses it:
-//! the joinability test's late joiner must attach inside the [`HOLD`] its
-//! flight's read is held open (else its one-epoch assertion fails), the
-//! left-flight sizing test's layer loss must land inside the [`HOLD`] its
-//! joined flight's read is held open (else that read succeeds and its
-//! recovery assertion fails), and the reader-cap test's gap must end between
-//! the first catch-up's cap and the second's ([`CAP_MARGIN`] after one,
-//! [`OFFSET`] − [`CAP_MARGIN`] before the other).
+//! One test rests on a window instead, seconds wide against steps that take
+//! milliseconds, and fails loudly, never green, if a step misses it: the
+//! reader-cap test's gap must end between the first catch-up's cap and the
+//! second's ([`CAP_MARGIN`] after one, [`OFFSET`] − [`CAP_MARGIN`] before the
+//! other).
 //!
 //! # A second, silent activation condition
 //!
@@ -84,14 +87,15 @@
 //! (20 s) per catch-up drain, [`LAPSE_BUDGET`] (15 s) for a lease to lapse and
 //! [`CAP_BUDGET`] (60 s) for a catch-up that must end at `reader_wait_max(L)`.
 //! The healthy path pays none of them. Paid on purpose: [`SPEND`] (1.5 s) in the
-//! two-wave and burst tests, [`SHORT_BUDGET_MS`] (300 ms) where a refusal is
-//! the event under test, [`HOLD`] (2 s) where a read is held open, a staged
-//! writers' gap of [`SHORT_GAP_MS`] (2.5 s) where a flight must sleep, and the
-//! reader-cap test's real `reader_wait_max(L)` (~27 s) plus [`CAP_MARGIN`] —
-//! about 31 s, the longest test here.
+//! two-wave and burst tests, [`READ_SPEND`] (1 s) inside the joinability
+//! test's held read, [`SHORT_BUDGET_MS`] (300 ms) where a refusal is the event
+//! under test, a staged writers' gap of [`SHORT_GAP_MS`] (2.5 s) where a
+//! flight must sleep, and the reader-cap test's real `reader_wait_max(L)`
+//! (~27 s) plus [`CAP_MARGIN`] — about 31 s, the longest test here. A held
+//! read costs only as long as the step under it takes.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -137,7 +141,8 @@ use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, SetField, StructCommand};
 
 use crate::common::owned_delta::delta_to_ompf_bytes;
 use crate::storage::snapshot_read_support::{
-    error_reply_script, read_too_large, ProxyAction, ProxyRule, ScriptReplyProxy,
+    error_reply_script, lengthened_lease, read_too_large, HeldCommand, ProxyAction, ProxyRule,
+    ScriptCalls, ScriptReplyProxy,
 };
 
 use super::helpers::{
@@ -171,7 +176,11 @@ const SETTLE: Duration = Duration::from_secs(10);
 /// One budget for a whole catch-up drain, however many messages it holds.
 const DRAIN: Duration = Duration::from_secs(20);
 
-/// Bound on a lease nobody releases lapsing: one lease (~2.2 s) plus slack.
+/// Bound on a lease that is normally released at once lapsing instead: one
+/// lease plus slack — a production lease (~2.0 s at this ceiling, its
+/// `4·(rtt99 + Q)` floor) or a lengthened one
+/// (`lengthen_fence_leases`, at least twice the command timeout; every
+/// fixture that sets it asserts that it stays below this).
 const LAPSE_BUDGET: Duration = Duration::from_secs(15);
 
 /// Bound on a catch-up that must end at `reader_wait_max(L)` (~27 s here).
@@ -194,9 +203,18 @@ const SPEND: Duration = Duration::from_millis(1_500);
 /// A capacity budget no wait here runs out of.
 const ROOMY_BUDGET_MS: u64 = 60_000;
 
-/// How long the fan-out's delay seam holds a read open between its grant and
-/// its release (renewals keep the ~2.2 s lease live through it).
-const HOLD: Duration = Duration::from_secs(2);
+/// How long the joinability test keeps its held read open once the late
+/// joiner has joined it: past [`SHORT_BUDGET_MS`], so a read charged to its
+/// waiters would refuse them. A spend, not a window: no step lands inside it.
+const READ_SPEND: Duration = Duration::from_secs(1);
+
+/// The size of the largest read any test here holds with its lease
+/// lengthened: the flight the left-flight sizing test registers itself.
+/// Every other held read is of the fixture's small layer.
+const LARGEST_HELD_READ: LayerSize = LayerSize {
+    items: 1_000,
+    bytes: 77_777,
+};
 
 /// A staged writers' gap a flight sleeps through and then reads.
 const SHORT_GAP_MS: i64 = 2_500;
@@ -303,8 +321,7 @@ type SubStream = Pin<Box<dyn Stream<Item = Result<SubscribeReadLayerResponse, St
 
 /// One above-ceiling layer on a fresh key prefix, a client of [`Shape`] with a
 /// metrics registry installed on both it and the service, and a service over
-/// that client (snapshot mode; a test flips `catchup_snapshot_enabled` before
-/// subscribing).
+/// that client.
 struct Fx {
     tv: TestValkey,
     client: ValkeyClient,
@@ -379,7 +396,6 @@ impl Fx {
         let layer_store = Arc::new(LayerStore::new(client.clone(), keys.clone(), 4096));
         let recovery = build_disabled_recovery_hook(Arc::clone(&layer_store), Arc::clone(metrics));
         LiveEditService {
-            catchup_snapshot_enabled: true,
             session_store: Arc::new(SessionStore::new(client.clone(), keys.clone())),
             layer_store,
             snapshot_flights: SnapshotFlights::new(client.clone(), keys),
@@ -496,13 +512,47 @@ impl Fx {
         injector
     }
 
-    /// Hold the fixture flight's fenced read open for [`HOLD`] between its
-    /// grant and its release.
-    fn hold_next_fenced_read(&self) {
-        self.injector().push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-            HOLD,
+    /// A fresh injector on the fixture's client that lengthens every fenced
+    /// read's lease from now on (`lengthen_fence_leases`), after asserting
+    /// [`LAPSE_BUDGET`] outlasts the lengthened lease of the largest read any
+    /// test here holds under it ([`LARGEST_HELD_READ`]); a lease only grows
+    /// with its read's size, so every smaller read's lapses inside it too.
+    fn lengthened_injector(&self) -> Arc<ObjectSnapshotReadFaultInjector> {
+        let lengthened = lengthened_lease(&self.client, LARGEST_HELD_READ);
+        assert!(
+            LAPSE_BUDGET > lengthened,
+            "fixture: LAPSE_BUDGET ({LAPSE_BUDGET:?}) must outlast a lengthened lease \
+             ({lengthened:?} at {LARGEST_HELD_READ:?})"
         );
+        let injector = self.injector();
+        injector.lengthen_fence_leases(true);
+        injector
+    }
+
+    /// Hold the next fenced read on the fixture's client — a flight's, or a
+    /// checkpoint assembly's — between its grant and its release, on its
+    /// first fenced command, with its lease lengthened
+    /// ([`Self::lengthened_injector`]), until the test releases it or drops
+    /// the guard.
+    fn hold_next_fenced_read(&self) -> HeldCommand {
+        HeldCommand::new(
+            self.lengthened_injector()
+                .push_hold_at(first_fenced_command()),
+        )
+    }
+
+    /// Wait until the read `hold` holds has parked on it, and assert its
+    /// lease is the lengthened one: the lever is on the injector the
+    /// client has now.
+    async fn held(&self, hold: &HeldCommand, what: &str) {
+        hold.parked_within(SETTLE, what).await;
+        live_edit::storage::test_support::assert_fence_lease_lengthened(
+            self.tv.client(),
+            self.keys(),
+            self.oid,
+            &self.client,
+        )
+        .await;
     }
 
     // ── Holding what a flight waits for ─────────────────────────────────────
@@ -919,6 +969,11 @@ async fn await_condition<F: FnMut() -> bool>(mut condition: F, what: &str) {
     }
 }
 
+/// The first command of the next fenced fan-out on the fixture's client.
+fn first_fenced_command() -> ObjectSnapshotReadFaultTarget {
+    ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0)
+}
+
 /// `reader_wait_max(L)` for `size` on `client`'s coefficients.
 fn reader_wait_max(client: &ValkeyClient, size: LayerSize) -> Duration {
     CappedFenceWait::new(client, 0, SnapshotReadConsumer::Catchup).cap(size)
@@ -1171,21 +1226,27 @@ async fn a_burst_of_more_joiners_than_slots_shares_one_epoch_builds_in_turn_and_
 /// release, with its pin read first, is served at the cut — not refused as a
 /// sequence regression (Spec SDD SR-6.2; Task 6 PM review r2, defer-16 (i)).
 ///
-/// The first joiner's read is held open for [`HOLD`] between its grant and its
-/// release — far past the [`SHORT_BUDGET_MS`] budget, which the read, being
-/// work, is not charged against. While it is held, a second brand-new joiner
-/// reads its header (P), parks before its proven read holding no slot (it
-/// found the flight registered, so it takes none), and is released to attach:
-/// no commit can land during the epoch, so its P equals the cut. A writer
+/// The first joiner's read is held between its grant and its release. While
+/// it is held, a second brand-new joiner reads its header (P), parks before
+/// its proven read holding no slot (it found the flight registered, so it
+/// takes none), and is released to attach: no commit can land during the
+/// epoch, so its P equals the cut. Once it has joined, the held read stays
+/// open [`READ_SPEND`] more — past the [`SHORT_BUDGET_MS`] budget, which the
+/// read, being work, is not charged against — and is released. A writer
 /// started during the read commits after the release; both joiners are served
 /// the cut and then that commit, exactly once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_joiner_attaching_between_grant_and_release_with_its_pin_read_first_is_served_not_refused(
 ) {
     within_test_budget(async {
+        assert!(
+            READ_SPEND > Duration::from_millis(SHORT_BUDGET_MS),
+            "fixture: the read outlasts the joiners' capacity budget"
+        );
         let mut fx = Fx::new("fenced-join-reading", Shape::new(2, SHORT_BUDGET_MS)).await;
-        fx.hold_next_fenced_read();
+        let hold = fx.hold_next_fenced_read();
         let mut first = fx.join("first").await;
+        fx.held(&hold, "the first joiner's flight's read").await;
         await_condition(
             || fx.registered() == Some((true, FlightState::Reading)),
             "the first joiner's flight holds its fence and reads",
@@ -1219,6 +1280,13 @@ async fn a_joiner_attaching_between_grant_and_release_with_its_pin_read_first_is
         tokio::time::timeout(SETTLE, seam.arrive_at_pre_full_state())
             .await
             .expect("release the late joiner");
+        await_condition(
+            || fx.roles("joined_read") == 1,
+            "the late joiner joins the held read",
+        )
+        .await;
+        tokio::time::sleep(READ_SPEND).await;
+        hold.release();
 
         assert_eq!(recv_served(&mut first, fx.oid, "first").await, cut);
         assert_eq!(
@@ -1672,30 +1740,24 @@ async fn a_catch_up_queued_for_its_build_turn_whose_stream_hits_the_hard_cap_end
 // tests read that size from the registry (`SnapshotFlights::lookup`) while the
 // test holds the fenced permit, so the flight has not yet acquired and the
 // size is still the creator's. The fixture's client runs through a proxy that
-// counts the probe's `EVALSHA` (`snapshot_fence_probe.lua`, preloaded so the
-// count is one per probe) and, for the failed-probe case, answers it with an
-// error.
+// counts the probe's calls (`snapshot_fence_probe.lua`'s `EVALSHA`s, less the
+// sends a `NOSCRIPT` reload repeats, so the count is one per probe whatever the
+// store's script cache holds) and, for the failed-probe case, answers each
+// send with an error.
 
 /// The bytes per item a fence key here stores: far from the fitted value, so
 /// a size computed from it is told apart from the fitted one.
 const STORED_BPI: f64 = 100.0;
 
-/// Called on every fence probe the proxy sees, as it passes through.
+/// Called on every fence probe send the proxy sees, as it passes through.
 type OnProbe = Arc<dyn Fn() + Send + Sync>;
 
-/// A client-to-store proxy rule matching the fence probe's `EVALSHA`: each one
-/// is counted on `probes` and reported to `on_probe`, and answered with an
-/// error when `fail`, else forwarded.
-fn probe_rule(probes: Arc<AtomicUsize>, fail: bool, on_probe: Option<OnProbe>) -> ProxyRule {
-    let sha = probe_sha();
+/// A client-to-store proxy rule matching the fence probe's `EVALSHA`: each
+/// call is counted on `probes`, each send is reported to `on_probe` and
+/// answered with an error when `fail`, else forwarded.
+fn probe_rule(probes: Arc<ScriptCalls>, fail: bool, on_probe: Option<OnProbe>) -> ProxyRule {
     Arc::new(move |args: &[Vec<u8>]| {
-        let evalsha = args
-            .first()
-            .is_some_and(|a| a.eq_ignore_ascii_case(b"EVALSHA"));
-        if !evalsha || args.get(1).map(Vec::as_slice) != Some(sha.as_bytes()) {
-            return None;
-        }
-        probes.fetch_add(1, Ordering::SeqCst);
+        probes.see(args)?;
         if let Some(on_probe) = &on_probe {
             on_probe();
         }
@@ -1703,26 +1765,24 @@ fn probe_rule(probes: Arc<AtomicUsize>, fail: bool, on_probe: Option<OnProbe>) -
     })
 }
 
-/// A fixture whose client runs through a [`probe_rule`] proxy, with the probe
-/// script preloaded on the store. Returns the fixture, the proxy (kept alive
-/// for the test) and the probe count.
+/// A fixture whose client runs through a [`probe_rule`] proxy. Returns the
+/// fixture, the proxy (kept alive for the test) and the probe count.
 async fn proxied_fx(
     layer: &str,
     shape: Shape,
     fail: bool,
-) -> (Fx, ScriptReplyProxy, Arc<AtomicUsize>) {
+) -> (Fx, ScriptReplyProxy, Arc<ScriptCalls>) {
     proxied_fx_observing(layer, shape, fail, None).await
 }
 
-/// [`proxied_fx`], with `on_probe` called on every probe.
+/// [`proxied_fx`], with `on_probe` called on every probe send.
 async fn proxied_fx_observing(
     layer: &str,
     shape: Shape,
     fail: bool,
     on_probe: Option<OnProbe>,
-) -> (Fx, ScriptReplyProxy, Arc<AtomicUsize>) {
-    use fred::interfaces::LuaInterface;
-    let probes = Arc::new(AtomicUsize::new(0));
+) -> (Fx, ScriptReplyProxy, Arc<ScriptCalls>) {
+    let probes = Arc::new(ScriptCalls::new(probe_sha()));
     let proxy = ScriptReplyProxy::start(
         crate::storage::snapshot_read_support::test_valkey_addr(),
         probe_rule(Arc::clone(&probes), fail, on_probe),
@@ -1731,16 +1791,6 @@ async fn proxied_fx_observing(
     // The proxy's URL carries `TEST_VALKEY_URL`'s database path, so the
     // fixture's client reads the database its `TestValkey` writes.
     let fx = Fx::with_url(layer, shape, Some(proxy.url())).await;
-    let _: String = fx
-        .tv
-        .client()
-        .pool
-        .next()
-        .script_load(include_str!(
-            "../../../src/storage/scripts/snapshot_fence_probe.lua"
-        ))
-        .await
-        .expect("preloading the probe script must succeed");
     (fx, proxy, probes)
 }
 
@@ -1780,7 +1830,7 @@ async fn an_early_out_catch_up_sizes_its_flight_from_the_fence_keys_stored_bpi()
             stored,
             "the flight is sized e × the stored bpi"
         );
-        assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe sized it");
+        assert_eq!(probes.calls(), 1, "one probe sized it");
         drop(permit);
         recv_served(&mut stream, fx.oid, "sized").await;
         drop(stream);
@@ -1837,7 +1887,7 @@ async fn a_catch_up_finding_the_flight_registered_after_its_atomic_read_sends_no
             "fixture: the catch-up's atomic read answered TOO_LARGE"
         );
         assert_eq!(
-            probes.load(Ordering::SeqCst),
+            probes.calls(),
             0,
             "a flight registered when the answer came suppresses the probe"
         );
@@ -1901,18 +1951,17 @@ async fn lose_layer_state(fx: &Fx) {
 /// The catch-up is held inside its atomic read (the snapshot lane stalled)
 /// while the test registers a flight; freed, its early-out answer arrives
 /// with that flight registered, so it joins it and sends no probe. The
-/// flight's read is held under its fence ([`HOLD`]) while the layer's state
-/// is lost, so the read answers `NotFound` and the flight leaves the
-/// registry. The catch-up recovers the layer (a restore) and attaches again:
-/// the registry misses, so it probes then — once — and creates the next
+/// flight's read is held under its fence until the layer's state is lost,
+/// so the read answers `NotFound` and the flight leaves the registry. The
+/// catch-up recovers the layer (a restore) and attaches again: the registry
+/// misses, so it probes then — once — and creates the next
 /// flight. Sizing from the earlier answer with no probe at the miss was the
 /// defect: a flight that left between the answer and the attach was
 /// succeeded unprobed. The probe count is the regression's pin. The size
 /// check only confirms consistency: the restore wiped the old fence key,
 /// `bpi` included, so the probe answers with no `bpi` and the flight is
 /// sized `e` (from the catch-up's own answer) × the fitted bytes per item —
-/// the size the old code also lands on here, unprobed. The test also rests
-/// on the [`HOLD`] window (the loss, one `UNLINK`, must land inside it).
+/// the size the old code also lands on here, unprobed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_next_attach() {
     within_test_budget(async {
@@ -1941,12 +1990,10 @@ async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_n
             "the catch-up is inside its atomic read",
         )
         .await;
-        fx.hold_next_fenced_read();
-        let held = fx.hold_flight(LayerSize {
-            items: 1_000,
-            bytes: 77_777,
-        });
+        let hold = fx.hold_next_fenced_read();
+        let held = fx.hold_flight(LARGEST_HELD_READ);
         live_edit::storage::test_support::release_all(stalls).await;
+        fx.held(&hold, "the joined flight's read").await;
         await_condition(
             || {
                 fx.roles("joined_read") == 1
@@ -1958,7 +2005,7 @@ async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_n
         assert_eq!(
             (
                 fx.reads("atomic", "too_large") - too_large_before,
-                probes.load(Ordering::SeqCst)
+                probes.calls()
             ),
             (1, 0),
             "fixture: the catch-up's early-out answer came with the flight registered, so no \
@@ -1976,6 +2023,7 @@ async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_n
         );
         drop(held);
         lose_layer_state(&fx).await;
+        hold.release();
 
         let permit = tokio::time::timeout(SETTLE, permit)
             .await
@@ -1990,7 +2038,7 @@ async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_n
         )
         .await;
         assert_eq!(
-            probes.load(Ordering::SeqCst),
+            probes.calls(),
             1,
             "the attach that found no flight registered probed the fence key (the regression's \
              pin: the old code sized the next flight from the earlier answer, unprobed)"
@@ -2013,13 +2061,13 @@ async fn a_catch_up_whose_flight_left_after_its_early_out_answer_probes_at_its_n
     .await;
 }
 
-/// A rollback-mode in-window replay whose per-commit atomic read answers an
-/// early-out `TOO_LARGE` hands over to the layer's shared fenced read and
-/// probes for the stored `bpi` at that attach (post-completion review F17):
-/// after giving its catch-up slot back, never while holding it. The flight is
-/// sized `e × stored bpi` from that one probe.
+/// An in-window reconnect whose atomic read answers an early-out `TOO_LARGE`
+/// goes on to the layer's shared fenced read and probes for the stored `bpi`
+/// at that attach (post-completion review F17): after giving its catch-up
+/// slot back, never while holding it. The flight is sized `e × stored bpi`
+/// from that one probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_replay_handing_over_on_an_early_out_probes_at_the_attach_with_its_slot_given_back(
+async fn an_in_window_reconnect_answered_an_early_out_probes_at_the_attach_with_its_slot_given_back(
 ) {
     within_test_budget(async {
         const SLOTS: usize = 2;
@@ -2038,19 +2086,18 @@ async fn a_rollback_replay_handing_over_on_an_early_out_probes_at_the_attach_wit
                 }
             })
         };
-        let (mut fx, _proxy, probes) = proxied_fx_observing(
-            "fenced-size-replay",
+        let (fx, _proxy, probes) = proxied_fx_observing(
+            "fenced-size-in-window",
             Shape::new(SLOTS, ROOMY_BUDGET_MS),
             false,
             Some(on_probe),
         )
         .await;
-        fx.svc.catchup_snapshot_enabled = false;
         let have_version = fx.seq().await;
         fx.commit(101).await;
         fx.commit(102).await;
         // The commits probe the fence on their own path; count from here.
-        let probes_before = probes.load(Ordering::SeqCst);
+        let probes_before = probes.calls();
         gate.set(Arc::clone(&fx.client.catchup_gate))
             .unwrap_or_else(|_| panic!("the gate is recorded once"));
         fx.store_bpi(&STORED_BPI.to_string()).await;
@@ -2062,26 +2109,29 @@ async fn a_rollback_replay_handing_over_on_an_early_out_probes_at_the_attach_wit
         );
         let held = fx.hold_fenced_permit().await;
 
-        let mut stream = fx.subscribe(fx.oid, have_version, "replayer").await;
+        let mut stream = fx.subscribe(fx.oid, have_version, "reconnector").await;
         assert_eq!(
             flight_size_while_held(&fx).await,
             stored,
-            "the hand-over's flight is sized e × the stored bpi"
+            "the reconnect's flight is sized e × the stored bpi"
         );
         assert_eq!(
-            probes.load(Ordering::SeqCst) - probes_before,
+            probes.calls() - probes_before,
             1,
             "one probe sized the flight"
         );
-        assert_eq!(
-            free_at_probe.lock().expect("probe record").clone(),
-            vec![SLOTS],
-            "the one probe was sent at the attach, with the replay's slot already given back"
+        // One entry per send: a send answered `NOSCRIPT` and its repeat after
+        // the reload are the one probe, both sent at the same attach.
+        let free = free_at_probe.lock().expect("probe record").clone();
+        assert!(
+            !free.is_empty() && free.iter().all(|&available| available == SLOTS),
+            "the one probe was sent at the attach, with the reconnect's slot already given back \
+             (free slots at each send: {free:?}, of {SLOTS})"
         );
         drop(held);
-        recv_served(&mut stream, fx.oid, "replayer").await;
+        recv_served(&mut stream, fx.oid, "reconnector").await;
         drop(stream);
-        fx.assert_idle("after the hand-over").await;
+        fx.assert_idle("after the reconnect").await;
     })
     .await;
 }
@@ -2139,11 +2189,7 @@ async fn a_probe_with_no_bpi_sizes_the_flight_from_the_fitted_bpi_and_the_catch_
         fitted,
         "{probe:?}: the flight is sized from the fitted bytes per item"
     );
-    assert_eq!(
-        probes.load(Ordering::SeqCst),
-        1,
-        "{probe:?}: one probe was sent"
-    );
+    assert_eq!(probes.calls(), 1, "{probe:?}: one probe was sent");
     if matches!(probe, Probe::WrongType) {
         let _: i64 = fx
             .tv
@@ -2247,11 +2293,7 @@ async fn a_mid_read_too_large_sizes_its_flight_from_its_tallies_and_sends_no_pro
             tallied,
             "the flight is sized from the answer's tallies"
         );
-        assert_eq!(
-            probes.load(Ordering::SeqCst),
-            0,
-            "a mid-read abort sends no probe"
-        );
+        assert_eq!(probes.calls(), 0, "a mid-read abort sends no probe");
         drop(permit);
         recv_served(&mut stream, fx.oid, "mid-read").await;
         drop(stream);
@@ -2281,7 +2323,8 @@ enum At {
     MemoryWait,
     /// Its flight sleeps out a staged writers' gap.
     RetryAfterSleep,
-    /// Its flight reads under the fence, held open by the delay seam.
+    /// Its flight reads under the fence, its first fenced command held on
+    /// the seam until the catch-up's ending is counted.
     Reading,
     /// Read, registered, and queued for its build turn behind a holder parked
     /// in the flight's turn (one slot: no extra build).
@@ -2302,7 +2345,10 @@ enum Ending {
 /// under its own reason, and once the test lets go of what it held (and any
 /// holder catch-up has finished) every catch-up slot, fenced and atomic
 /// permit and the memory budget are back at full capacity, no flight or build
-/// is left, and no reader lease outlives its lease.
+/// is left, and no reader lease outlives its lease. Ended in the read
+/// ([`At::Reading`]), it ended mid-read, not after being served: its
+/// flight's held read never verified, and the dropped lease was released,
+/// not left to lapse.
 async fn a_catch_up_ended_at(at: At, ending: Ending) {
     let slots = match at {
         At::Predecessor | At::SlotWait | At::TurnQueue => 1,
@@ -2319,6 +2365,8 @@ async fn a_catch_up_ended_at(at: At, ending: Ending) {
     let size = fx.size_with(None).await;
     let (mut held_slot, mut held_flight, mut held_permit, mut held_memory, mut holder) =
         (None, None, None, None, None);
+    // `At::Reading`'s read, held until its catch-up's ending is counted.
+    let mut held_read = None;
     match at {
         At::Predecessor => {
             holder = Some(fx.join("holder").await);
@@ -2336,7 +2384,7 @@ async fn a_catch_up_ended_at(at: At, ending: Ending) {
         At::FencedPermitWait => held_permit = Some(fx.hold_fenced_permit().await),
         At::MemoryWait => held_memory = Some(fx.hold_memory().await),
         At::RetryAfterSleep => fx.stage_gap(FAR_MS, size).await,
-        At::Reading => fx.hold_next_fenced_read(),
+        At::Reading => held_read = Some(fx.hold_next_fenced_read()),
         At::TurnQueue => {
             held_permit = Some(fx.hold_fenced_permit().await);
             holder = Some(fx.join("holder").await);
@@ -2383,6 +2431,8 @@ async fn a_catch_up_ended_at(at: At, ending: Ending) {
             .await
         }
         At::Reading => {
+            let hold = held_read.as_ref().expect("armed above");
+            fx.held(hold, "the subject's flight's read").await;
             await_condition(
                 || fx.registered() == Some((true, FlightState::Reading)),
                 "the subject's flight reads under its fence",
@@ -2457,6 +2507,30 @@ async fn a_catch_up_ended_at(at: At, ending: Ending) {
         }
     }
 
+    if at == At::Reading {
+        // The catch-up ended mid-read, not after being served: its flight's
+        // read, held all along, was dropped with its only waiter — no fenced
+        // read verified — and the dropped lease was released, its reader
+        // field removed (a lapse would leave the field in place).
+        assert_eq!(
+            fx.reads("fenced", "ok"),
+            0,
+            "{what}: the flight's held read never completed"
+        );
+        let released = async {
+            while !fx.readers().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(SETTLE, released)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{what}: the dropped read's lease was not released within {SETTLE:?}")
+            });
+    }
+    // The ending under the held read is counted: let the read go (a no-op if
+    // the ended catch-up dropped it, its only waiter).
+    drop(held_read);
     drop((held_slot, held_flight, held_permit, held_memory));
     if let Some(seam) = &seam {
         seam.release_all();
@@ -2552,10 +2626,11 @@ async fn a_shutdown_while_a_flight_reads_under_its_fence_releases_the_lease_befo
         const HELD_BACK: Duration = Duration::from_secs(600);
 
         let fx = Fx::new("fenced-shutdown-release", Shape::new(2, ROOMY_BUDGET_MS)).await;
-        fx.injector().push_delay_at(
-            ObjectSnapshotReadFaultTarget::nth_command(ObjectSnapshotReader::FencedFanout, 0),
-            HELD_BACK,
-        );
+        // The lease is lengthened, so the held read keeps it however late a
+        // renewal lands: a lost lease would retry the read unheld, and serve
+        // the subscription before the shutdown under test.
+        fx.lengthened_injector()
+            .push_delay_at(first_fenced_command(), HELD_BACK);
         let mut subject = fx.join("subject").await;
         await_condition(
             || fx.registered() == Some((true, FlightState::Reading)),
@@ -2567,6 +2642,13 @@ async fn a_shutdown_while_a_flight_reads_under_its_fence_releases_the_lease_befo
             1,
             "fixture: the flight's read holds a lease on the fence"
         );
+        live_edit::storage::test_support::assert_fence_lease_lengthened(
+            fx.tv.client(),
+            fx.keys(),
+            fx.oid,
+            &fx.client,
+        )
+        .await;
 
         fx.svc.shutdown.cancel();
         let status = first_status(&mut subject, "the shutdown").await;
@@ -2705,9 +2787,11 @@ async fn a_shared_read_that_fails_ends_every_attached_catch_up_before_content_an
 /// The blob of the external value a failing build resolves.
 const EXT_BLOB: &[u8] = b"fenced-test-external-value-blob";
 
-/// An external-value store that fails every `read_batch*` and `probe_values`
+/// An external-value store that fails every `read_batch` and `probe_values`
 /// read once armed, and is otherwise [`MockExternalValueStore`]: a catch-up
-/// build resolving the layer's external value then fails.
+/// build resolving the layer's external value then fails. The catch-up
+/// payload's length probe, ranged read and restore are left to the trait's
+/// defaults, which read through these two, so they fail with them.
 struct FailingExtStore {
     inner: MockExternalValueStore,
     failing: AtomicBool,
@@ -2757,17 +2841,6 @@ impl live_edit::storage::external_values::ExternalValueStore for FailingExtStore
     ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, live_edit::error::ServiceError> {
         self.check()?;
         self.inner.read_batch(hashes).await
-    }
-
-    async fn read_batch_with_recovery_counter(
-        &self,
-        hashes: &[[u8; 32]],
-        recovery_counter: Option<&AtomicUsize>,
-    ) -> Result<std::collections::HashMap<[u8; 32], Vec<u8>>, live_edit::error::ServiceError> {
-        self.check()?;
-        self.inner
-            .read_batch_with_recovery_counter(hashes, recovery_counter)
-            .await
     }
 
     async fn probe_values(
@@ -2936,19 +3009,24 @@ impl WriterPath {
 /// T14 (INV-9): readers of a layer above the atomic-read ceiling complete
 /// while a writer commits continuously on `path`. A brand-new subscriber
 /// joins through `handle_subscribe_read_layer` and a checkpoint assembly reads
-/// the layer, each through a fenced read whose window the fan-out's delay seam
-/// holds open for [`HOLD`] — far longer than the gap between two of the
-/// writer's commits. The catch-up is served at its cut and ends with its
-/// caught-up ack, the assembly is written (a proven cut), neither consumer
-/// records a `fence_broken` read, and the writer records at least one fence
-/// wait, on its own path's backend and conflict cell: the writer waited at
-/// the fence rather than breaking the reads.
+/// the layer, each through a fenced read the fan-out's hold seam keeps open,
+/// its lease lengthened, until the writer has been refused at its fence at
+/// least once more (`update_layer_conflicts_total{kind="snapshot_fence_wait"}`
+/// on the writer's path moved). The catch-up is served at its cut and ends
+/// with its caught-up ack, the assembly is written (a proven cut), neither
+/// consumer records a `fence_broken` read, and the writer records at least
+/// one fence wait, on its own path's backend and conflict cell: the writer
+/// waited at the fence rather than breaking the reads. The checkpoint read is
+/// held the same way: staging the fence key's size, which suits the
+/// checkpoint read elsewhere, would also size the catch-up's flight here.
 ///
 /// Without the writer side of the fence — the update script's step 1d for
 /// the fast and structural paths, the WATCH path's fence handling (B6) for the
-/// fallback — the writer's commits land during each hold, every release finds
-/// the header moved, and the catch-up ends `UNAVAILABLE` after
-/// `FENCE_READ_ATTEMPTS` broken reads (and the assembly with an error).
+/// fallback — the writer is never refused: its commits land during the held
+/// catch-up read, and the test's wait for a refusal under that read fails
+/// (released anyway, the read's release would find the header moved and,
+/// with the writer still committing, end the catch-up `UNAVAILABLE` after
+/// `FENCE_READ_ATTEMPTS` broken reads).
 async fn readers_complete_under_a_writer_on(path: WriterPath) {
     use std::sync::atomic::AtomicU64;
 
@@ -3001,28 +3079,64 @@ async fn readers_complete_under_a_writer_on(path: WriterPath) {
     )
     .await;
 
-    // The catch-up: its flight's fenced read held open for HOLD.
-    fx.hold_next_fenced_read();
+    // The writer's refused attempts so far, on its own path.
+    let refused_now = || -> f64 {
+        path.paths()
+            .iter()
+            .map(|p| {
+                fx.metric(
+                    "live_edit_update_layer_conflicts_total",
+                    &[("path", p), ("kind", "snapshot_fence_wait")],
+                )
+            })
+            .sum()
+    };
+    // Hold the read `hold` holds until the writer has been refused at its
+    // fence once more, then let it go. The baseline is read once the read is
+    // parked under its granted fence, so a refusal counted under an earlier
+    // read cannot meet the condition for this one.
+    let until_the_writer_is_refused = |hold: HeldCommand, who: &'static str| {
+        let fx = &fx;
+        async move {
+            fx.held(&hold, who).await;
+            let refused_before = refused_now();
+            await_condition(
+                || refused_now() > refused_before,
+                &format!("{path:?}: the writer is refused at {who}'s fence"),
+            )
+            .await;
+            hold.release();
+        }
+    };
+
+    // The catch-up: its flight's fenced read held until the writer is
+    // refused under it.
+    let hold = fx.hold_next_fenced_read();
     let mut joiner = fx.join("t14-joiner").await;
+    until_the_writer_is_refused(hold, "the catch-up").await;
     let cut = recv_served(&mut joiner, fx.oid, "t14-joiner").await;
 
-    // The checkpoint assembly: its fenced read held open for HOLD too.
-    fx.hold_next_fenced_read();
+    // The checkpoint assembly: its fenced read held the same way.
+    let hold = fx.hold_next_fenced_read();
     let checkpoints = InMemoryCheckpointStore::new();
-    let decision = tokio::time::timeout(
-        DRAIN,
-        assemble_layer_checkpoint(
-            &fx.client,
-            fx.keys(),
-            fx.oid,
-            &checkpoints,
-            SERVICE,
-            &mut NoLeaseToKeep,
+    let mut no_lease = NoLeaseToKeep;
+    let (decision, ()) = tokio::join!(
+        tokio::time::timeout(
+            DRAIN,
+            assemble_layer_checkpoint(
+                &fx.client,
+                fx.keys(),
+                fx.oid,
+                &checkpoints,
+                SERVICE,
+                &mut no_lease,
+            ),
         ),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("{path:?}: the assembly did not finish within {DRAIN:?}"))
-    .unwrap_or_else(|e| panic!("{path:?}: the assembly must not fail; got {e:?}"));
+        until_the_writer_is_refused(hold, "the assembly"),
+    );
+    let decision = decision
+        .unwrap_or_else(|_| panic!("{path:?}: the assembly did not finish within {DRAIN:?}"))
+        .unwrap_or_else(|e| panic!("{path:?}: the assembly must not fail; got {e:?}"));
     let snap_seq = match decision {
         AssemblyDecision::Written(outcome) => outcome.snap_seq,
         other => panic!("{path:?}: the assembly must write a proven generation; got {other:?}"),
@@ -3082,16 +3196,7 @@ async fn readers_complete_under_a_writer_on(path: WriterPath) {
         "{path:?}: the writer waited at the fence (backend {})",
         path.backend()
     );
-    let refused: f64 = path
-        .paths()
-        .iter()
-        .map(|p| {
-            fx.metric(
-                "live_edit_update_layer_conflicts_total",
-                &[("path", p), ("kind", "snapshot_fence_wait")],
-            )
-        })
-        .sum();
+    let refused = refused_now();
     assert!(
         refused >= 1.0,
         "{path:?}: the writer's refused attempts are counted on its path {:?}",

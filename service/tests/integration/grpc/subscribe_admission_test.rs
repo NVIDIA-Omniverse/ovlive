@@ -29,19 +29,26 @@
 //
 //   2. **A stalled reader is torn down, and the tear-down is delivered.** The
 //      outer `tx.send` now races server shutdown, session deletion,
-//      `tx.closed()` and `OUTER_SEND_DEADLINE`. The terminal status goes into a
-//      channel slot reserved before the subscription sent anything, so a
-//      server-driven tear-down can never degrade into a bare EOS — which the
+//      `tx.closed()`, the subscription's live-delivery hold and
+//      `OUTER_SEND_DEADLINE`. The terminal status goes into the response
+//      queue's status slot, reserved before the subscription sent anything, so
+//      a server-driven tear-down can never degrade into a bare EOS — which the
 //      Kit client reads as gRPC `OK` and does not retry
 //      (its retry policy retries only DEADLINE_EXCEEDED, UNAVAILABLE,
-//      RESOURCE_EXHAUSTED and INTERNAL).
+//      RESOURCE_EXHAUSTED and INTERNAL). Since b.ntm the data still queued is
+//      dropped first, so the status is the next message a client that resumes
+//      reading gets, and the memory the queue held is released at the ending
+//      (SDD §12.6).
 //
 //   3. **The clean ending is exactly one case.** `client_disconnect` sends no
 //      trailer because there is nobody to send it to. Every other ending —
 //      slow-reader deadline, inner watchdog, shutdown (`UNAVAILABLE`), session
 //      deletion (`NOT_FOUND`), a session found missing from the live store
-//      (`UNAVAILABLE`), any backend failure — delivers its status, in every
-//      phase: admission, catch-up, delivery and the idle wait (b.e1h).
+//      (`UNAVAILABLE`), a disaster-recovery hold (`UNAVAILABLE` `SERVICE_HELD`,
+//      or `UPSTREAM_UNAVAILABLE` for a stale hold verdict), any backend
+//      failure — delivers its status, in every phase: admission, catch-up,
+//      delivery and the idle wait (b.e1h; the hold's idle-wait and JoinSession
+//      endings are `hold_ending_test.rs`).
 //
 // ── Wait budget ──────────────────────────────────────────────────────────────
 //
@@ -61,20 +68,22 @@
 //   * `TEST_OUTER_SEND_DEADLINE` (300 ms) — the shrunk `OUTER_SEND_DEADLINE`.
 //   * `TEST_ADMISSION_WAIT_MS` (300 ms) — the shrunk admission wait.
 //   * `MID_DELIVERY_SEND_DEADLINE` (20 s) — an `OUTER_SEND_DEADLINE` override
-//     that is RAISED rather than shrunk, local to the three mid-delivery tests
-//     (`cancellation_mid_delivery`) and the three in-window replay tests
-//     (`cancellation_mid_in_window_replay`). Payable in full: the exit those
-//     tests assert on is racing it.
+//     that is RAISED rather than shrunk, local to the five mid-delivery tests
+//     (`cancellation_mid_delivery`). Payable in full: the exit those tests
+//     assert on is racing it.
 //   * `STALL_SEND_DEADLINE` (30 s) — the other raised override, local to
-//     `a_stalled_live_send_is_counted_at_once_and_its_wait_recorded_when_the_reader_resumes`,
-//     which keeps a send parked while it checks the stall counter. NOT
-//     payable: nothing in that test awaits the deadline, and the resumed
-//     drain that ends the stall is bounded by `DRAIN_DEADLINE`.
+//     `a_stalled_live_send_is_counted_at_once_and_its_wait_recorded_when_the_reader_resumes`
+//     and to
+//     `an_in_window_catch_up_to_a_reader_that_is_not_reading_stalls_as_catchup_holding_no_slot`,
+//     each of which keeps a send parked while it checks the stall counter.
+//     NOT payable: nothing in either test awaits the deadline; the live one's
+//     resumed drain is bounded by `DRAIN_DEADLINE`, and the catch-up one ends
+//     its stall by dropping its client.
 //   * `STALL_HELD` (1.5 s) — the one sleep, in the same test: a lower bound on
 //     how long its send stays parked, paid in full.
 //   * `PARKED_WAIT_MS` (60 s) — the raised admission wait local to
 //     `a_client_that_disconnects_while_queued_for_admission_leaves_no_waiting_work`
-//     and to the two queued-refusal logging tests (`queued_refusal_logs`).
+//     and to the five queued-refusal logging tests (`queued_refusal_logs`).
 //     Inventoried here because a per-test constant is exactly what goes
 //     unnoticed in this arithmetic, but NOT payable: in each test the only
 //     await on the waiter it governs is a `timeout(SETTLE_DEADLINE, …)` join
@@ -86,25 +95,26 @@
 //     the slot wait of a catch-up queued behind a parked one, and every await
 //     on that catch-up is itself bounded by `SETTLE_DEADLINE`.
 //
-// The heaviest tests are the three mid-delivery ones
-// (`shutdown_mid_delivery_ends_the_stream_unavailable` and its deletion and
-// session-absence twins): one catch-up drain (≤ 4 messages at
-// `SETTLE_DEADLINE`) 20 s + one condition poll 5 s + one `next_ok` 5 s +
-// `MID_DELIVERY_SEND_DEADLINE` 20 s + one full drain (`DRAIN_DEADLINE`) 20 s +
-// four condition polls 20 s ≈ 90 s at every budget's full value; the
-// shutdown and session-absence ones — the endings a client retries — add
-// their retry's catch-up, under one more `DRAIN_DEADLINE` (20 s), for ≈ 110 s
-// — inside nextest's 120 s hang-killer, where a SIGKILL would print nothing.
+// The heaviest tests are the five mid-delivery ones
+// (`shutdown_mid_delivery_ends_the_stream_unavailable` and its deletion,
+// session-absence, hold and stale-hold-verdict twins): one catch-up drain
+// (≤ 4 messages at `SETTLE_DEADLINE`) 20 s + one condition poll 5 s + one
+// `next_ok` 5 s + `MID_DELIVERY_SEND_DEADLINE` 20 s + one full drain
+// (`DRAIN_DEADLINE`) 20 s + four condition polls 20 s ≈ 90 s at every
+// budget's full value; the shutdown and session-absence ones drive the
+// client's retry to convergence (`Cause::drives_its_retry_to_convergence`),
+// adding its catch-up under one more `DRAIN_DEADLINE` (20 s), for ≈ 110 s —
+// inside nextest's 120 s hang-killer, where a SIGKILL would print nothing.
+// The deletion and the two hold twins skip the retry and stay at ≈ 90 s.
 // Next heaviest, both ≈ 65 s,
 // are `a_reconnect_after_a_slow_reader_teardown_converges_with_no_lost_commits`
 // (two catch-up drains + one full drain + one condition poll) and
 // `a_client_that_disconnects_while_queued_for_admission_leaves_no_waiting_work`
-// (two catch-up drains + four condition polls + one bounded join); then the
-// three in-window replay tests, ≈ 60 s (one `next_ok` 5 s +
-// `MID_DELIVERY_SEND_DEADLINE` 20 s + one full drain 20 s + three condition
-// polls 15 s). The
-// rendezvous-driven tests — the three mid-catch-up ones (whose two extra
-// release polls, the catch-up slot and the admitted gauge, add 10 s) and the
+// (two catch-up drains + four condition polls + one bounded join). The
+// rendezvous-driven tests — the four mid-catch-up ones (whose two extra
+// release polls, the catch-up slot and the admitted gauge, add 10 s), the
+// four mid in-window catch-up ones (four rendezvous 20 s + one `next_ok`
+// 5 s + one full drain 20 s + three condition polls 15 s ≈ 60 s) and the
 // tracker-drain one, which adds its `SUBSCRIPTION_DRAIN_BUDGET` (5 s), two
 // more condition polls (its reader's busy gauge and its reader's read, 10 s)
 // and a pool quit the client bounds itself (a few seconds at most) — sit at
@@ -122,9 +132,10 @@
 //
 // Several tests here drive a test seam — `outer_send_deadline_for_test` (the
 // slow-reader tests), the stream multiplexer's fault queue (the backend-failure
-// test), `catch_up_chunk_seam_for_test` (the mid-catch-up cancellation) and
+// test), `catch_up_chunk_seam_for_test` (the mid-catch-up cancellations) and
 // `catch_up_state_read_seam_for_test` (the concurrent-catch-up tests, which
-// park a catch-up holding its slot) — and all four exist only under the
+// park a catch-up holding its slot, and the mid in-window catch-up ones) —
+// and all four exist only under the
 // **`test-fault-injection`** cargo
 // feature. Without it the fields are compiled out, `build_admission_service`
 // silently ignores whatever [`Seams`] carried, and each of those tests would run
@@ -170,14 +181,16 @@ use live_edit::observability::metrics::{
     HEAD_CHECK_RESULTS, HEAD_CHECK_RESULT_ERROR, HEAD_CHECK_RESULT_GAP, HEAD_CHECK_RESULT_NO_GAP,
     KEEPALIVE_RESULTS, KEEPALIVE_RESULT_FAILED, KEEPALIVE_RESULT_OK, OVERFLOW_BOUNDS,
     OVERFLOW_BOUND_BYTES, OVERFLOW_BOUND_ENTRIES, REAUTH_RESULTS, REAUTH_RESULT_FAILED,
-    REAUTH_RESULT_OK, STREAM_EXIT_CLIENT_DISCONNECT, STREAM_EXIT_ERROR,
-    STREAM_EXIT_FENCED_READ_WAIT_CAP, STREAM_EXIT_REASONS, STREAM_EXIT_SESSION_ABSENT,
-    STREAM_EXIT_SESSION_CANCEL, STREAM_EXIT_SHUTDOWN, STREAM_EXIT_SLOW_READER_DEADLINE,
-    STREAM_EXIT_STREAM_GAP, WAKE_OUTCOMES, WAKE_OUTCOME_ERROR, WAKE_OUTCOME_OK,
+    REAUTH_RESULT_OK, STREAM_EXIT_CLIENT_DISCONNECT, STREAM_EXIT_DELIVERY_BUDGET,
+    STREAM_EXIT_ERROR, STREAM_EXIT_FENCED_READ_WAIT_CAP, STREAM_EXIT_REASONS,
+    STREAM_EXIT_SESSION_ABSENT, STREAM_EXIT_SESSION_CANCEL, STREAM_EXIT_SHUTDOWN,
+    STREAM_EXIT_SLOW_READER_DEADLINE, STREAM_EXIT_STREAM_GAP, WAKE_OUTCOMES, WAKE_OUTCOME_ERROR,
+    WAKE_OUTCOME_OK,
 };
 #[cfg(feature = "test-fault-injection")]
 use live_edit::observability::metrics::{
-    DELIVERY_LAG_STAGE_ENQUEUED, SEND_PHASE_CATCHUP, SEND_PHASE_LIVE,
+    DELIVERY_LAG_STAGE_ENQUEUED, SEND_PHASE_CATCHUP, SEND_PHASE_LIVE, STREAM_EXIT_HELD,
+    STREAM_EXIT_STALE_VERDICT,
 };
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::external_values::MockExternalValueStore;
@@ -187,9 +200,11 @@ use live_edit::storage::session::SessionStore;
 
 use crate::common::owned_delta::delta_to_ompf_bytes;
 use crate::common::refusal_detail::{
-    assert_no_refusal_detail, assert_refusal_detail, assert_shutdown_status,
+    assert_no_refusal_detail, assert_refusal_detail, assert_service_held, assert_shutdown_status,
+    assert_upstream_unavailable,
 };
 use live_edit::error::{refusal_metadata, refusal_reason, CAPACITY_RETRY_DELAY};
+use live_edit::grpc::graceful_shutdown::HoldCause;
 use oodf_ffi::{CommandDiffChangeSection, OwnedDelta, StructCommand};
 
 use super::helpers::*;
@@ -221,13 +236,13 @@ const TEST_ADMISSION_WAIT_MS: u64 = 300;
 #[cfg(feature = "test-fault-injection")]
 const PARKED_CATCH_UP_BUDGET_MS: u64 = 60_000;
 
-/// Delivery capacity of the `SubscribeReadLayer` response channel.
+/// Delivery capacity of the `SubscribeReadLayer` response queue
+/// (`grpc::response_queue::RESPONSE_QUEUE_DATA_SLOTS`).
 ///
-/// The channel is built with **33**: 32 for data plus one reserved with an
-/// `OwnedPermit` for the terminal trailer before any data is sent. The tests
-/// that count buffered messages assert against this number, never 33 — a data
-/// message landing in the 33rd slot is the starvation this reservation exists
-/// to prevent.
+/// The queue holds **32** data messages and, apart from them, a status slot
+/// reserved for the terminal trailer before any data is sent. The tests that
+/// count buffered messages assert against this number — a data message in the
+/// status slot is the starvation this reservation exists to prevent.
 /// Gated with its users: every test that counts delivery slots drives the
 /// `outer_send_deadline_for_test` seam (module header).
 #[cfg(feature = "test-fault-injection")]
@@ -491,7 +506,6 @@ fn build_admission_service(
     ));
 
     let svc = LiveEditService {
-        catchup_snapshot_enabled: false,
         session_store,
         layer_store,
         ext_value_store: Arc::new(MockExternalValueStore::new()),
@@ -821,6 +835,29 @@ async fn await_condition<F: FnMut() -> bool>(mut condition: F, what: &str) {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// b.ntm (T8): wait for the live-delivery ledger and the catch-up payload
+/// budget to be back to zero — no relay copy or queued entry charged, nothing
+/// pending release, no subscription's hold registered, no catch-up page's
+/// share held — once every subscription of the fixture has ended. A leaked
+/// hold or charge would count against the replica's live-delivery budget for
+/// good, and end healthy subscriptions for bytes nobody holds.
+async fn await_delivery_memory_released(fx: &AdmissionFixture, what: &str) {
+    let ledger = fx.client().stream_mux.delivery_ledger();
+    let payload = &fx.client().catchup_payload_budget;
+    await_condition(
+        || {
+            ledger.holds() == 0
+                && ledger.charged_bytes() == 0
+                && ledger.exempt_bytes() == 0
+                && ledger.pending_release_bytes() == 0
+                && payload.reserved_bytes() == 0
+                && payload.overcommit_bytes() == 0
+        },
+        what,
+    )
+    .await;
 }
 
 /// One drained subscription: every `Ok` message in arrival order, the terminal
@@ -1321,6 +1358,16 @@ async fn admission_and_stream_exit_label_values_export_at_zero_before_any_event(
         ("live_edit_stream_mux_bind_refusals_total", &[][..]),
         ("live_edit_stream_mux_poison_keys_total", &[][..]),
         ("live_edit_valkey_consumer_unblocked_retries_total", &[][..]),
+        // The delivery budgets' series (b.ntm): the live-delivery budget's
+        // overshoot counter, and the catch-up payload budget's reserved and
+        // over-commit gauges, each read against a budget gauge from the
+        // first scrape.
+        (
+            "live_edit_subscriber_delivery_budget_overshoots_total",
+            &[][..],
+        ),
+        ("live_edit_catchup_payload_budget_reserved_bytes", &[][..]),
+        ("live_edit_catchup_payload_budget_overcommit_bytes", &[][..]),
     ] {
         assert_eq!(
             sample_value(&rendered, name, labels),
@@ -1478,11 +1525,20 @@ async fn admission_and_stream_exit_label_values_export_at_zero_before_any_event(
     );
     assert_eq!(
         STREAM_EXIT_REASONS.len(),
-        11,
-        "the exit vocabulary is slow_reader_deadline / inner_watchdog / session_cancel / \
-         session_absent / shutdown / client_disconnect / reader_capacity / catchup_capacity / \
-         fenced_read_wait_cap / stream_gap / error; got {STREAM_EXIT_REASONS:?}"
+        14,
+        "the exit vocabulary is slow_reader_deadline / delivery_budget / inner_watchdog / \
+         session_cancel / session_absent / shutdown / held / stale_verdict / client_disconnect \
+         / reader_capacity / catchup_capacity / fenced_read_wait_cap / stream_gap / error; got \
+         {STREAM_EXIT_REASONS:?}"
     );
+    // And `delivery_budget` (b.ntm): the live-delivery budget ends the
+    // subscription holding the most undelivered updates, rarely, and at once
+    // on several layers when it does, so its series must exist first.
+    assert!(
+        STREAM_EXIT_REASONS.contains(&STREAM_EXIT_DELIVERY_BUDGET),
+        "`{STREAM_EXIT_DELIVERY_BUDGET}` missing from {STREAM_EXIT_REASONS:?}"
+    );
+    assert_eq!(STREAM_EXIT_DELIVERY_BUDGET, "delivery_budget");
     for expected in [
         ADMISSION_RESULT_ADMITTED,
         ADMISSION_RESULT_REFUSED_SATURATED,
@@ -1578,12 +1634,14 @@ async fn stall_until_slow_reader_teardown(
 /// **Data messages can never consume the slot reserved for the terminal
 /// trailer.**
 ///
-/// The response channel is built with 33 and one permit is reserved before the
-/// subscription sends anything, so data has 32. A resumed reader must therefore
-/// find at most 32 buffered data messages and then the trailer — never 33 data
-/// messages and a clean EOS, which is what a 32-capacity channel plus a
-/// best-effort trailer produces, and which the Kit client reads as gRPC `OK` and
-/// does not retry.
+/// The response queue holds 32 data messages and, apart from them, a status
+/// slot reserved before the subscription sends anything. The slow-reader
+/// tear-down fires exactly because all 32 data slots are full, and its status
+/// still goes out: a resumed reader finds the `UNAVAILABLE` trailer — never a
+/// clean EOS, which is what a full 32-slot queue plus a best-effort trailer
+/// produces, and which the Kit client reads as gRPC `OK` and does not retry.
+/// The 32 queued data messages are dropped at the ending (b.ntm, SDD §12.6), so
+/// the status is all the resumed reader gets.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reserved_trailer_slot_is_never_consumed_by_data_messages() {
@@ -1609,22 +1667,22 @@ async fn the_reserved_trailer_slot_is_never_consumed_by_data_messages() {
     )
     .await;
 
-    // Now drain everything the channel is holding.
-    let drained = drain_to_end(&mut stream, "a torn-down subscription").await;
-    let data = drained.messages.len();
-
-    assert_eq!(
-        data, OUTER_CHANNEL_DELIVERY_SLOTS,
-        "the subscription buffered {data} data messages, more than the \
-         {OUTER_CHANNEL_DELIVERY_SLOTS} delivery slots the response channel reserves for them. \
-         The 33rd slot belongs to the terminal trailer and is taken with an `OwnedPermit` before \
-         any data is sent; a data message in it means the reservation is gone and a server-driven \
-         tear-down can end as a bare EOS"
-    );
+    // The tear-down fired on a full queue: a send parked behind the 32 data
+    // slots for the whole deadline, counted as a live-phase stall. Without
+    // this the queue never filled and the test would assert nothing about the
+    // reserved slot.
     assert!(
-        data > 0,
-        "nothing was buffered, so the channel never filled and this test asserts nothing about \
-         the reserved slot"
+        read_send_stalls(&metrics, SEND_PHASE_LIVE) >= 1,
+        "fixture self-check: a live send found every data slot full"
+    );
+
+    // Now drain everything the queue is holding.
+    let drained = drain_to_end(&mut stream, "a torn-down subscription").await;
+    assert_eq!(
+        drained.messages.len(),
+        0,
+        "the slow-reader ending must drop the {OUTER_CHANNEL_DELIVERY_SLOTS} queued data messages \
+         before its status"
     );
     let status = drained.terminal.expect(
         "the stream ended without a terminal status. A slow-reader tear-down that ends in EOS is \
@@ -1686,6 +1744,13 @@ async fn slow_reader_teardown_releases_slot_and_permit_while_the_client_is_still
         "the torn-down subscription's admission permit is released",
     )
     .await;
+    // And its delivery memory (b.ntm), with the client still away: the
+    // queued backlog was dropped at the ending, not left for the client.
+    await_delivery_memory_released(
+        &fx,
+        "a slow-reader teardown releases its delivery memory while the client is still away",
+    )
+    .await;
 
     // The load-bearing end-to-end check: a fresh subscription is admitted onto
     // the cap-of-one pod, with the previous client still holding its undrained
@@ -1715,12 +1780,14 @@ async fn slow_reader_teardown_releases_slot_and_permit_while_the_client_is_still
 /// that commit — read off the layer stream, but never enqueued — must not
 /// count. Nor may any of the later commits the subscription never reached.
 ///
-/// The expected count is taken from what the channel actually buffered, not
-/// derived from the write count: every complete relayed commit (a content
-/// header plus its whole body) the resumed reader drains is exactly one
-/// delivery. The teardown is observed first (`slow_reader_deadline`), and the
-/// exit is recorded after the subscription's delivery tally has dropped, so the
-/// count read afterwards is final.
+/// The expected count is the commits that fit the queue, not the write count:
+/// [`COMMITS_TO_FILL_THE_CHANNEL`] relayed commits (a content header plus one
+/// body chunk each) fill its 32 data slots, and each was enqueued whole. The
+/// ending drops them unread (b.ntm), so they are no longer drained to be
+/// counted here; they were delivered to the queue all the same, and count.
+/// The teardown is observed first (`slow_reader_deadline`), and the exit is
+/// recorded after the subscription's delivery tally has dropped, so the count
+/// read afterwards is final.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_commit_whose_send_never_completes_is_not_counted_as_a_subscriber_update() {
@@ -1746,41 +1813,11 @@ async fn a_commit_whose_send_never_completes_is_not_counted_as_a_subscriber_upda
     )
     .await;
     let drained = drain_to_end(&mut stream, "a torn-down subscription").await;
-
-    // Walk the backlog: a content header opens a delivery, its body chunks
-    // complete it.
-    let mut complete = 0u64;
-    let mut owed: Option<u64> = None;
-    for msg in &drained.messages {
-        match &msg.response_type {
-            Some(subscribe_read_layer_response::ResponseType::Header(h)) => {
-                assert!(
-                    owed.is_none(),
-                    "a header arrived before the previous body completed"
-                );
-                if h.total_size == 0 {
-                    complete += 1;
-                } else {
-                    owed = Some(h.total_size);
-                }
-            }
-            Some(subscribe_read_layer_response::ResponseType::Chunk(c)) => {
-                let left = owed.expect("a chunk arrived with no header open") - c.data.len() as u64;
-                if left == 0 {
-                    complete += 1;
-                    owed = None;
-                } else {
-                    owed = Some(left);
-                }
-            }
-            None => panic!("a response carried no payload"),
-        }
-    }
-    assert_eq!(
-        complete, COMMITS_TO_FILL_THE_CHANNEL as u64,
-        "precondition: the stalled channel buffered exactly the commits that fit, so the next \
-         commit's send is the one that parked"
+    assert!(
+        drained.messages.is_empty() && drained.terminal.is_some(),
+        "fixture self-check: the ending dropped the queued commits and left only its status"
     );
+    let complete = COMMITS_TO_FILL_THE_CHANNEL as u64;
 
     let counted = sample_value(
         &render(&metrics),
@@ -1870,15 +1907,20 @@ async fn join_latency_is_observed_for_an_admitted_subscription_and_not_for_a_ref
     drop(held);
 }
 
-/// A client that resumes reading gets its backlog **in order**, and then the
-/// `UNAVAILABLE` trailer as the last item — never a clean EOS.
+/// T9 (b.ntm), `slow_reader_deadline`: a client that resumes reading after the
+/// tear-down gets **only** the `UNAVAILABLE` trailer — never a clean EOS, and
+/// none of the backlog that was queued for it, which the ending dropped — and
+/// what that backlog held was released at the ending, while the client was
+/// still away: the live-delivery ledger is back to zero, every relay copy and
+/// queued entry charge repaid, and the subscription's hold gone, before the
+/// client reads anything.
 ///
-/// This is the half of the contract the release test above cannot see: the
-/// tear-down happened while the client was away, and the status was nevertheless
-/// waiting for it when it came back.
+/// Before b.ntm the resumed reader drained its queued backlog first; the
+/// discard makes the status the next message, so the client reconnects and
+/// catches up the same stretch in one step (`docs/api/docs/streams.md`).
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_resumed_reader_drains_its_backlog_in_order_then_the_unavailable_trailer() {
+async fn a_resumed_reader_after_a_slow_reader_teardown_gets_only_the_unavailable_trailer() {
     let fx = AdmissionFixture::setup(1, None).await;
     let (svc, metrics) = build_admission_service(
         &fx,
@@ -1908,33 +1950,36 @@ async fn a_resumed_reader_drains_its_backlog_in_order_then_the_unavailable_trail
         "the subscription is fully torn down before the client resumes reading",
     )
     .await;
+    // Released at the ending, with the client still away: the relay copies
+    // and queued-entry charges the dropped backlog held, and the hold.
+    let ledger = fx.client().stream_mux.delivery_ledger();
+    await_condition(
+        || ledger.holds() == 0 && ledger.charged_bytes() == 0,
+        "the dropped backlog's live-delivery charges and the subscription's hold are released \
+         before the client reads anything",
+    )
+    .await;
 
-    let drained = drain_to_end(&mut stream, "a resumed reader's backlog").await;
-    let sequences = drained.header_sequences();
-
-    assert!(
-        sequences.len() >= 2,
-        "expected at least two buffered update headers to compare; got {sequences:?}"
-    );
-    let mut sorted = sequences.clone();
-    sorted.sort_unstable();
+    let drained = drain_to_end(&mut stream, "a resumed reader's queue").await;
     assert_eq!(
-        sequences, sorted,
-        "the buffered backlog was delivered out of order: {sequences:?}. The response channel is \
-         FIFO and the reserved trailer slot must not reorder what is already queued"
+        drained.header_sequences(),
+        Vec::<u64>::new(),
+        "the resumed reader got queued updates after a server-driven ending; the ending drops \
+         them, so its status is the next message"
+    );
+    assert!(
+        drained.messages.is_empty(),
+        "nothing but the status may reach the resumed reader"
     );
 
     let status = drained.terminal.expect(
-        "the resumed reader drained its backlog and then got a clean end-of-stream. gRPC reads \
-         that as OK; the Kit client's retry policy does not retry OK, so a \
-         server-driven tear-down would end the subscription permanently. The terminal status must \
-         be enqueued into the reserved slot at tear-down time, not attempted afterwards",
+        "the resumed reader got a clean end-of-stream. gRPC reads that as OK; the Kit client's \
+         retry policy does not retry OK, so a server-driven tear-down would end the subscription \
+         permanently. The terminal status must be enqueued into the reserved slot at tear-down \
+         time, not attempted afterwards",
     );
     assert_eq!(status.code(), Code::Unavailable, "got {status:?}");
-    assert_eq!(
-        drained.after_terminal, 0,
-        "data was delivered AFTER the terminal status; the trailer must be the last item"
-    );
+    assert_eq!(drained.after_terminal, 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2264,6 +2309,7 @@ async fn a_disconnected_client_is_the_clean_ending_and_still_releases_its_slot()
         0,
         "an ended subscription must leave graceful shutdown's enrollment registry"
     );
+    await_delivery_memory_released(&fx, "a client disconnect releases its delivery memory").await;
 }
 
 /// A failure raised from inside the subscription task delivers its status too.
@@ -2374,12 +2420,30 @@ enum Cause {
     /// The session itself is left in the store, so a retry converges.
     /// `session_cancel_cause_test.rs` drives the real cancellers.
     AbsentFromStore,
+    /// The disaster-recovery hold ending for a fleet hold
+    /// (`end_streams_for_hold(Held)`, SDD SR-6.3): it cancels every enrolled
+    /// stream's own shutdown token with the cause recorded first, and shuts
+    /// nothing down.
+    Held,
+    /// The hold ending for a stale hold verdict
+    /// (`end_streams_for_hold(StaleVerdict)`, SDD SR-6.5).
+    StaleVerdict,
 }
+
+/// The incident the [`Cause::Held`] hold names.
+#[cfg(feature = "test-fault-injection")]
+const HOLD_INCIDENT: &str = "20261013t1708-a3f9";
 
 #[cfg(feature = "test-fault-injection")]
 impl Cause {
     /// Every cause, for the "the others stay at zero" checks.
-    const ALL: [Cause; 3] = [Cause::Shutdown, Cause::Deletion, Cause::AbsentFromStore];
+    const ALL: [Cause; 5] = [
+        Cause::Shutdown,
+        Cause::Deletion,
+        Cause::AbsentFromStore,
+        Cause::Held,
+        Cause::StaleVerdict,
+    ];
 
     fn fire(self, svc: &LiveEditService, session_id: &str) {
         let session_token = || {
@@ -2392,16 +2456,22 @@ impl Cause {
             Cause::Shutdown => svc.shutdown.cancel(),
             Cause::Deletion => session_token().cancel_deleted(),
             Cause::AbsentFromStore => session_token().cancel_absent_from_store(),
+            Cause::Held => svc.shutdown.end_streams_for_hold(HoldCause::Held {
+                incident: Some(HOLD_INCIDENT.to_owned()),
+            }),
+            Cause::StaleVerdict => svc.shutdown.end_streams_for_hold(HoldCause::StaleVerdict),
         }
     }
 
-    /// The status the client must receive: `UNAVAILABLE` for a shutdown or a
-    /// session missing from the live store, which it retries (where the retry
-    /// lands is the ingress's choice; a restorable session is recovered at
-    /// its setup); `NOT_FOUND` for a deletion, which it does not.
+    /// The status the client must receive: `UNAVAILABLE` for a shutdown, a
+    /// session missing from the live store or a hold, which it retries (where
+    /// the retry lands is the ingress's choice; a restorable session is
+    /// recovered at its setup); `NOT_FOUND` for a deletion, which it does not.
     fn code(self) -> Code {
         match self {
-            Cause::Shutdown | Cause::AbsentFromStore => Code::Unavailable,
+            Cause::Shutdown | Cause::AbsentFromStore | Cause::Held | Cause::StaleVerdict => {
+                Code::Unavailable
+            }
             Cause::Deletion => Code::NotFound,
         }
     }
@@ -2413,6 +2483,25 @@ impl Cause {
             Cause::AbsentFromStore => {
                 "session is missing from the live store; retry so it can be recovered"
             }
+            Cause::Held => "service is offline for disaster recovery (incident 20261013t1708-a3f9)",
+            Cause::StaleVerdict => {
+                "this replica lost contact with the backing store and stopped serving until it \
+                 restarts; retry"
+            }
+        }
+    }
+
+    /// Assert the refusal detail `status` must carry for this cause, decoded
+    /// as a client decodes it: the shutdown, hold and stale-verdict endings
+    /// carry their reason and retry hint; a deletion's or a missing session's
+    /// carries none.
+    #[track_caller]
+    fn assert_detail(self, status: &Status) {
+        match self {
+            Cause::Shutdown => assert_shutdown_status(status),
+            Cause::Held => assert_service_held(status, Some(HOLD_INCIDENT)),
+            Cause::StaleVerdict => assert_upstream_unavailable(status),
+            Cause::Deletion | Cause::AbsentFromStore => assert_no_refusal_detail(status),
         }
     }
 
@@ -2422,6 +2511,8 @@ impl Cause {
             Cause::Shutdown => STREAM_EXIT_SHUTDOWN,
             Cause::Deletion => STREAM_EXIT_SESSION_CANCEL,
             Cause::AbsentFromStore => STREAM_EXIT_SESSION_ABSENT,
+            Cause::Held => STREAM_EXIT_HELD,
+            Cause::StaleVerdict => STREAM_EXIT_STALE_VERDICT,
         }
     }
 
@@ -2439,11 +2530,21 @@ impl Cause {
     fn is_retried(self) -> bool {
         self.code() == Code::Unavailable
     }
+
+    /// Whether a test of this cause drives the client's retry to convergence
+    /// (on a fresh, unheld service): every retried ending but a hold's. A
+    /// hold's retry is the same convergence on a replica that is not held —
+    /// which the shutdown twin already shows — so the hold twins skip it
+    /// rather than pay its `DRAIN_DEADLINE` against the hang-killer.
+    fn drives_its_retry_to_convergence(self) -> bool {
+        self.is_retried() && !matches!(self, Cause::Held | Cause::StaleVerdict)
+    }
 }
 
-/// A shutdown, a deletion or a session found missing from the live store that
-/// lands **mid-delivery** ends the stream with its own status — `UNAVAILABLE`,
-/// `NOT_FOUND` or `UNAVAILABLE` — never cleanly.
+/// A shutdown, a deletion, a session found missing from the live store or a
+/// hold that lands **mid-delivery** ends the stream with its own status —
+/// `UNAVAILABLE`, `NOT_FOUND`, `UNAVAILABLE` or the hold's `UNAVAILABLE` — never
+/// cleanly.
 ///
 /// An aborted delivery leaves the client holding a truncated OMPF sequence;
 /// presenting that as `OK` leaves the Kit client stuck in initial sync, never
@@ -2599,6 +2700,7 @@ async fn cancellation_mid_delivery_ends_the_stream_with_its_status(cause: Cause)
         cause.code()
     );
     assert_eq!(status.message(), cause.message());
+    cause.assert_detail(&status);
     await_condition(
         || read_stream_exit(&metrics, cause.exit_reason()) == 1,
         "the exit is classified under the cause's reason",
@@ -2622,12 +2724,26 @@ async fn cancellation_mid_delivery_ends_the_stream_with_its_status(cause: Cause)
         "a subscription ended by its cause leaves live_edit_subscriber_admitted",
     )
     .await;
+    // The messages the client read still hold their relay copies' slices
+    // (kept for the retry below), so only the hold, the pending credit and
+    // the catch-up payload budget are checked here.
+    let ledger = fx.client().stream_mux.delivery_ledger();
+    await_condition(
+        || {
+            ledger.holds() == 0
+                && ledger.pending_release_bytes() == 0
+                && fx.client().catchup_payload_budget.reserved_bytes() == 0
+        },
+        &format!("{cause:?} mid-delivery releases the subscription's hold"),
+    )
+    .await;
 
-    if cause.is_retried() {
+    if cause.drives_its_retry_to_convergence() {
         // The client retries the `UNAVAILABLE` — on a service that is not
         // shutting down, with a fresh token map — from the last commit it
-        // received whole, and the in-window catch-up delivers every commit
-        // after it: nothing that was in flight when the cause landed is lost.
+        // received whole, and the in-window catch-up sends one coalesced diff
+        // based there that carries every commit after it: nothing that was in
+        // flight when the cause landed is lost.
         let mut last_whole = None;
         let mut owed: Option<(u64, u64)> = None;
         for msg in std::iter::once(&resumed).chain(drained.messages.iter()) {
@@ -2670,10 +2786,9 @@ async fn cancellation_mid_delivery_ends_the_stream_with_its_status(cause: Cause)
         .await
         .expect("the retry must be admitted — the ended subscription released its permit")
         .into_inner();
-        // One deadline over the whole replay, which is up to a backlog's worth
-        // of messages (module header, § Wait budget).
+        // One deadline over the whole catch-up (module header, § Wait budget).
         let (recovered, ack) = tokio::time::timeout(DRAIN_DEADLINE, async {
-            let mut recovered = Vec::new();
+            let mut recovered: Vec<(u64, Vec<u8>)> = Vec::new();
             loop {
                 let item = retried
                     .next()
@@ -2687,9 +2802,8 @@ async fn cancellation_mid_delivery_ends_the_stream_with_its_status(cause: Cause)
                 if header.total_size == 0 {
                     return (recovered, header);
                 }
-                recovered.push(header.sequence_num);
-                let mut seen = 0;
-                while seen < header.total_size {
+                let mut body = Vec::new();
+                while (body.len() as u64) < header.total_size {
                     let item = retried
                         .next()
                         .await
@@ -2697,22 +2811,56 @@ async fn cancellation_mid_delivery_ends_the_stream_with_its_status(cause: Cause)
                         .unwrap_or_else(|s| panic!("the retry's catch-up failed: {s:?}"));
                     match item.response_type {
                         Some(subscribe_read_layer_response::ResponseType::Chunk(c)) => {
-                            seen += c.data.len() as u64
+                            body.extend_from_slice(&c.data)
                         }
                         other => panic!("expected a body chunk, got {other:?}"),
                     }
                 }
+                recovered.push((header.sequence_num, body));
             }
         })
         .await
         .unwrap_or_else(|_| {
             panic!("the retry's catch-up did not finish within {DRAIN_DEADLINE:?}")
         });
+        let [(sequence, body)] = recovered.as_slice() else {
+            panic!(
+                "the in-window catch-up must send ONE coalesced diff; got content at sequences \
+                 {:?}",
+                recovered.iter().map(|(s, _)| *s).collect::<Vec<_>>()
+            )
+        };
         assert_eq!(
-            recovered,
-            ((last_whole + 1)..=server_sequence).collect::<Vec<_>>(),
-            "the in-window catch-up must deliver every commit after the last one the client \
-             received whole, in order"
+            *sequence, server_sequence,
+            "the coalesced diff is at the layer's sequence"
+        );
+        let delta = oodf_ffi::parse_delta(
+            live_edit::domain::ompf::OmpfContainer::parse(body)
+                .expect("the coalesced diff is an OMPF container")
+                .delta_bytes,
+        )
+        .expect("the coalesced diff carries an OODF delta");
+        assert_eq!(
+            delta.base_version, last_whole,
+            "the coalesced diff is based at the last commit the client received whole"
+        );
+        let carried: std::collections::BTreeSet<u64> = delta
+            .struct_commands
+            .iter()
+            .filter_map(|command| match command {
+                StructCommand::DiffChangeSection(c) => Some(c.section_id),
+                _ => None,
+            })
+            .collect();
+        // Commit `n` (section `n`) landed at sequence `n + 1`, so the commits
+        // after `last_whole` are sections `last_whole..=BACKLOG_COMMITS`.
+        let missed: Vec<u64> = (last_whole..=BACKLOG_COMMITS)
+            .filter(|section| !carried.contains(section))
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "the coalesced diff must carry every section committed after sequence {last_whole}; \
+             missing {missed:?}"
         );
         assert_eq!(ack.sequence_num, server_sequence);
         drop(retried);
@@ -2746,47 +2894,65 @@ async fn session_absence_mid_delivery_ends_the_stream_unavailable() {
     cancellation_mid_delivery_ends_the_stream_with_its_status(Cause::AbsentFromStore).await;
 }
 
-/// A shutdown, a deletion or a session found missing from the live store that
-/// lands while a **reconnecting** subscriber is being sent its in-window
-/// backlog ends the stream with the cause's own status — code, message and
-/// exit reason — before the caught-up ack, and never through the re-bootstrap
-/// path.
+/// A fleet hold mid-delivery ends the stream `UNAVAILABLE` `SERVICE_HELD`
+/// naming the incident, `reason=held` — never `shutdown` — which the client
+/// retries after its retry delay. (The retry's convergence is the shutdown
+/// twin's.)
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_mid_delivery_ends_the_stream_service_held() {
+    cancellation_mid_delivery_ends_the_stream_with_its_status(Cause::Held).await;
+}
+
+/// A stale hold verdict mid-delivery ends the stream `UNAVAILABLE`
+/// `UPSTREAM_UNAVAILABLE`, `reason=stale_verdict`, which the client retries.
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_hold_verdict_mid_delivery_ends_the_stream_upstream_unavailable() {
+    cancellation_mid_delivery_ends_the_stream_with_its_status(Cause::StaleVerdict).await;
+}
+
+/// A shutdown, a deletion, a session found missing from the live store or a
+/// hold that lands while a **reconnecting** subscriber is being sent its
+/// in-window catch-up ends the stream with the cause's own status — code,
+/// message and exit reason — before the caught-up ack, and never through the
+/// re-bootstrap path.
 ///
 /// This is the path every Kit client takes when it reconnects in window after
 /// a rolling restart: a resume cursor `(object_id, have_version)` whose next
-/// commit is still retained, served by the legacy per-commit replay
-/// (`catchup_snapshot_enabled = false`, as this file's services are built).
-/// That replay computes every commit's diff first, under its one catch-up
-/// slot, then releases the slot and sends the computed diffs in order. Each
-/// send races the tokens, and a failed send's status is the subscription's
-/// ending, returned as-is. The replay must not read it as a failed state read:
-/// a deletion's `NOT_FOUND` taken for "the old object's state is gone" would go
-/// to `handle_deleted_and_rebootstrap`, which — the mapping still naming this
+/// commit is still retained, served by `catch_up_in_window`'s one coalesced
+/// diff based at `have_version`. Each send of that diff races the tokens, and
+/// a failed send's status is the subscription's ending, returned as-is. The
+/// catch-up must not read it as a failed state read: a deletion's `NOT_FOUND`
+/// taken for "the old object's state is gone" would go to
+/// `handle_deleted_and_rebootstrap`, which — the mapping still naming this
 /// object — ends `NOT_FOUND "layer '…' state was lost and could not be
 /// recovered"` under `reason=error`. Asserting the exact message and reason is
 /// what rules that out.
 ///
-/// Established like the mid-delivery tests: a backlog three channels deep, and
-/// the token fired just after the first replayed message arrives, which is the
-/// per-commit header for `have_version + 1` — the positive evidence that the
-/// in-window replay, and not a coalesced or full-state catch-up, is running.
-/// The same raised `OUTER_SEND_DEADLINE` keeps the slow-reader timer out of the
-/// race.
+/// Established by two rendezvous rather than by racing a timer: the
+/// pre-coalesced park point of `CatchUpStateReadSeam`, which only
+/// `catch_up_in_window` reaches — the positive evidence that the in-window
+/// regime, and not the out-of-window or a full-state catch-up, is serving
+/// this reconnect — and then `CatchUpChunkSeam`, which parks the delivery
+/// after its content header is away and before its body. The cause fires while
+/// the subscriber is parked there, so its next send is the first to see it.
 #[cfg(feature = "test-fault-injection")]
-async fn cancellation_mid_in_window_replay_ends_with_its_status(cause: Cause) {
-    /// As `cancellation_mid_delivery_ends_the_stream_with_its_status`'s.
-    const MID_DELIVERY_SEND_DEADLINE: Duration = Duration::from_secs(20);
-    /// Commits the reconnecting subscriber has missed: three channels' worth,
-    /// two messages each, so the replay still owes most of them when the token
-    /// fires.
-    const BACKLOG_COMMITS: u64 = COMMITS_TO_FILL_THE_CHANNEL as u64 * 3;
+async fn cancellation_mid_in_window_catch_up_ends_with_its_status(cause: Cause) {
+    use live_edit::grpc::subscribe::{CatchUpChunkSeam, CatchUpStateReadSeam};
+
+    /// Commits the reconnecting subscriber has missed.
+    const MISSED_COMMITS: u64 = 3;
 
     let fx = AdmissionFixture::setup(1, None).await;
+    let state_read = Arc::new(CatchUpStateReadSeam::new_before_coalesced());
+    let chunk = Arc::new(CatchUpChunkSeam::new());
     let (svc, metrics) = build_admission_service(
         &fx,
         Arc::new(AllowAllPermissions),
         Seams {
-            outer_send_deadline: Some(MID_DELIVERY_SEND_DEADLINE),
+            catch_up_state_read: Some(Arc::clone(&state_read)),
+            catch_up_chunk: Some(Arc::clone(&chunk)),
             ..Default::default()
         },
     );
@@ -2798,9 +2964,10 @@ async fn cancellation_mid_in_window_replay_ends_with_its_status(cause: Cause) {
         .await
         .expect("the new layer's header must read")
         .sequence_num;
-    for section_id in 1..=BACKLOG_COMMITS {
+    for section_id in 1..=MISSED_COMMITS {
         apply_unique_update(&svc, &session_id, "layer-in-window", object_id, section_id).await;
     }
+    let server_sequence = have_version + MISSED_COMMITS;
 
     // The reconnect, holding the position it had before the backlog.
     let mut stream = handle_subscribe_read_layer(
@@ -2816,48 +2983,67 @@ async fn cancellation_mid_in_window_replay_ends_with_its_status(cause: Cause) {
     .await
     .expect("the reconnect must be admitted")
     .into_inner();
-    let first = next_ok(&mut stream, "the in-window replay's first commit").await;
+
+    // Rendezvous 1: the in-window regime's own park point, before its read.
+    // Bounded, because a reconnect served by any other regime never arrives.
+    tokio::time::timeout(
+        SETTLE_DEADLINE,
+        state_read.wait_until_parked_pre_coalesced(),
+    )
+    .await
+    .expect(
+        "the reconnect never parked at the pre-coalesced point, which only the in-window \
+             regime reaches: the fixture must select `catch_up_in_window`",
+    );
+    tokio::time::timeout(SETTLE_DEADLINE, state_read.arrive_at_pre_coalesced())
+        .await
+        .expect("the parked reconnect must accept its release");
+
+    // Rendezvous 2: the delivery parks after its content header is away.
+    tokio::time::timeout(SETTLE_DEADLINE, chunk.wait_until_parked())
+        .await
+        .expect("the in-window catch-up never parked at the catch-up chunk seam");
+    let first = next_ok(&mut stream, "the in-window catch-up's content header").await;
     match &first.response_type {
         Some(subscribe_read_layer_response::ResponseType::Header(h)) => {
             assert_eq!(
-                h.sequence_num,
-                have_version + 1,
-                "fixture self-check: the reconnect must be sent its per-commit replay from \
-                 have_version + 1 (the in-window regime), computed and then sent; got {h:?}"
+                (h.object_id, h.sequence_num),
+                (object_id, server_sequence),
+                "fixture self-check: the reconnect's content is the one coalesced diff, at the \
+                 layer's sequence; got {h:?}"
             );
-            assert!(h.total_size > 0, "a replayed commit carries content");
+            assert!(h.total_size > 0, "the coalesced diff carries content");
         }
-        other => panic!("expected the first replayed commit's header, got {other:?}"),
+        other => panic!("expected the coalesced diff's header, got {other:?}"),
     }
 
+    // The cause lands in the window; the subscriber cannot progress until the
+    // release below, so its next send is the first to see it.
     cause.fire(&svc, &session_id);
+    tokio::time::timeout(SETTLE_DEADLINE, chunk.release())
+        .await
+        .expect("the parked subscriber must accept its release");
 
-    let drained = drain_to_end(&mut stream, "an in-window replay ended mid-way").await;
+    let drained = drain_to_end(&mut stream, "an in-window catch-up ended mid-way").await;
     let status = drained.terminal.clone().unwrap_or_else(|| {
         panic!(
-            "{cause:?} landing mid in-window replay ended the stream CLEANLY; the client holds a \
-             partial replay and no caught-up ack"
+            "{cause:?} landing mid in-window catch-up ended the stream CLEANLY; the client holds \
+             a content header with no body and no caught-up ack"
         )
     });
     assert_eq!(
-        read_stream_exit(&metrics, STREAM_EXIT_SLOW_READER_DEADLINE),
-        0,
-        "the stream exited on the slow-reader timer, not on the {cause:?}: an already-parked \
-         send aged past {MID_DELIVERY_SEND_DEADLINE:?} between the establishing receive and the \
-         token firing — a scheduling stall, not an ending defect"
-    );
-    assert_eq!(
         status.code(),
         cause.code(),
-        "{cause:?} mid in-window replay must end {:?}; got {status:?}",
+        "{cause:?} mid in-window catch-up must end {:?}; got {status:?}",
         cause.code()
     );
     assert_eq!(
         status.message(),
         cause.message(),
         "the send's status must be the ending verbatim; a `state was lost` message means the \
-         replay took it for a failed state read and went through the re-bootstrap path"
+         catch-up took it for a failed state read and went through the re-bootstrap path"
     );
+    cause.assert_detail(&status);
     await_condition(
         || read_stream_exit(&metrics, cause.exit_reason()) == 1,
         "the exit is classified under the cause's reason",
@@ -2872,66 +3058,66 @@ async fn cancellation_mid_in_window_replay_ends_with_its_status(cause: Cause) {
         "a re-bootstrap's terminal NOT_FOUND is counted `error`; this exit must not be"
     );
 
-    // Nothing but per-commit replay reached the client, in order, and it
-    // stopped short: no caught-up ack, and no full-state re-bootstrap header
-    // (which would carry the layer's current sequence).
-    let mut replayed = vec![have_version + 1];
-    for msg in &drained.messages {
-        if let Some(subscribe_read_layer_response::ResponseType::Header(h)) = &msg.response_type {
-            assert!(
-                h.total_size > 0,
-                "a caught-up ack was delivered after the {cause:?}; the cursor must not advance \
-                 over a truncated replay"
-            );
-            replayed.push(h.sequence_num);
-        }
-    }
-    let last = *replayed.last().expect("at least the first commit");
-    assert_eq!(
-        replayed,
-        ((have_version + 1)..=last).collect::<Vec<_>>(),
-        "the client must have received consecutive per-commit replay only"
-    );
+    // Nothing reached the client after the content header: no body, no
+    // caught-up ack (the cursor must not advance over a truncated catch-up),
+    // and no re-bootstrap's full-state header.
+    let headers: Vec<_> = drained
+        .messages
+        .iter()
+        .filter_map(|msg| match &msg.response_type {
+            Some(subscribe_read_layer_response::ResponseType::Header(h)) => Some(*h),
+            _ => None,
+        })
+        .collect();
     assert!(
-        last < have_version + BACKLOG_COMMITS,
-        "fixture self-check: the {cause:?} must land with replayed commits still owed"
+        headers.is_empty(),
+        "no header may follow the {cause:?} — neither a caught-up ack nor a re-bootstrap's \
+         content; got {headers:?}"
     );
 
     await_condition(
         || read_pool_in_use(&metrics, "subscriber_pool") == 0,
-        "the ended replay idles its stream reader",
+        "the ended catch-up idles its stream reader",
     )
     .await;
     await_condition(
         || fx.client().subscriber_admission.available_permits() == 1,
-        "the ended replay releases its admission permit",
+        "the ended catch-up releases its admission permit",
     )
     .await;
 }
 
-/// A shutdown mid in-window replay ends `UNAVAILABLE "server shutting down"`,
-/// `reason=shutdown`, before the caught-up ack.
+/// A shutdown mid in-window catch-up ends `UNAVAILABLE "server shutting
+/// down"`, `reason=shutdown`, before the caught-up ack.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_mid_in_window_replay_ends_the_stream_unavailable() {
-    cancellation_mid_in_window_replay_ends_with_its_status(Cause::Shutdown).await;
+async fn shutdown_mid_in_window_catch_up_ends_the_stream_unavailable() {
+    cancellation_mid_in_window_catch_up_ends_with_its_status(Cause::Shutdown).await;
 }
 
-/// A deletion mid in-window replay ends `NOT_FOUND "session was deleted"`,
+/// A deletion mid in-window catch-up ends `NOT_FOUND "session was deleted"`,
 /// `reason=session_cancel`, without re-bootstrapping.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_deletion_mid_in_window_replay_ends_not_found_without_rebootstrap() {
-    cancellation_mid_in_window_replay_ends_with_its_status(Cause::Deletion).await;
+async fn session_deletion_mid_in_window_catch_up_ends_not_found_without_rebootstrap() {
+    cancellation_mid_in_window_catch_up_ends_with_its_status(Cause::Deletion).await;
 }
 
-/// A session found missing from the live store mid in-window replay ends
+/// A session found missing from the live store mid in-window catch-up ends
 /// `UNAVAILABLE`, `reason=session_absent`, before the caught-up ack and
 /// without re-bootstrapping.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn session_absence_mid_in_window_replay_ends_unavailable_without_rebootstrap() {
-    cancellation_mid_in_window_replay_ends_with_its_status(Cause::AbsentFromStore).await;
+async fn session_absence_mid_in_window_catch_up_ends_unavailable_without_rebootstrap() {
+    cancellation_mid_in_window_catch_up_ends_with_its_status(Cause::AbsentFromStore).await;
+}
+
+/// A fleet hold mid in-window catch-up ends `UNAVAILABLE` `SERVICE_HELD`,
+/// `reason=held`, before the caught-up ack and without re-bootstrapping.
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_mid_in_window_catch_up_ends_service_held_without_rebootstrap() {
+    cancellation_mid_in_window_catch_up_ends_with_its_status(Cause::Held).await;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3355,6 +3541,10 @@ async fn a_permanent_backend_failure_mid_stream_delivers_unavailable_and_release
         "the failed subscription releases its admission permit",
     )
     .await;
+    // The messages the client read hold their relay copies' slices until
+    // dropped, as a transport's encoded frames would not.
+    drop(drained.messages);
+    await_delivery_memory_released(&fx, "a backend failure releases its delivery memory").await;
 
     let (next_session, next_object) =
         create_session_and_layer_for(&fx, &svc, "f4f-backend-next", "layer-next").await;
@@ -3378,11 +3568,12 @@ async fn a_permanent_backend_failure_mid_stream_delivers_unavailable_and_release
 // Cancellation landing inside the full-state catch-up
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A shutdown, a deletion or a session found missing from the live store that
-/// lands **mid full-state catch-up** ends the stream with its own status —
-/// `UNAVAILABLE`, `NOT_FOUND` or `UNAVAILABLE` — leaves the client's cursor
-/// where it was, and releases everything; after a retried ending, a retry then
-/// converges.
+/// A shutdown, a deletion, a session found missing from the live store or a
+/// hold that lands **mid full-state catch-up** ends the stream with its own
+/// status — `UNAVAILABLE`, `NOT_FOUND`, `UNAVAILABLE` or the hold's
+/// `UNAVAILABLE` — leaves the client's cursor
+/// where it was, and releases everything; after a shutdown or a missing
+/// session, a retry then converges.
 ///
 /// The window this opens is the one the round-1 suite could not reach. Its
 /// sibling `cancellation_mid_delivery_ends_the_stream_with_its_status` ends a
@@ -3394,11 +3585,13 @@ async fn a_permanent_backend_failure_mid_stream_delivers_unavailable_and_release
 /// that promised `total_size` bytes it never received.
 ///
 /// The interleaving is a rendezvous, not wall-clock luck: `CatchUpChunkSeam`
-/// parks the chunk loop after the first `send_or_disconnect` returns `Ok`. The
-/// first message `chunk_ompf_for_stream` yields is the content **header**
-/// (`src/grpc/streaming.rs:65`), so at the park the client has been told a size
-/// and a sequence and has received none of the body — the sharpest form of the
-/// window, and exactly the state a clean end would misreport.
+/// parks the chunk loop after its first send returns `Ok`. The first message
+/// `chunk_pages_for_stream` yields is the content **header**, so at the park
+/// the header is queued and none of the body is — the sharpest form of the
+/// window, and exactly the state a clean end would misreport. The client
+/// reads nothing until the subscription has ended, so it also checks the
+/// discard (b.ntm): the queued header is dropped at the ending, and the
+/// client's first message is the status.
 ///
 /// **One content-delivering subscription while the seam is installed.** Each of
 /// the seam's two `Barrier`s is 2-party, so a second arrival parks forever
@@ -3429,14 +3622,10 @@ async fn cancellation_mid_catch_up_truncates_with_its_status(cause: Cause) {
     }
     const SERVER_SEQUENCE: u64 = 1 + 3;
 
-    // `object_id = 0` is a BRAND-NEW subscribe, which is what routes catch-up
-    // through `send_full_state` → `deliver_catch_up_content` — the loop the seam
-    // is installed on. Passing the current `object_id` with `sequence_num = 0`
-    // would select the legacy in-window replay instead (this file's services run
-    // with `catchup_snapshot_enabled = false`), whose sends go through
-    // `send_per_commit_payload`, which deliberately carries no seam, and the
-    // rendezvous below would time out rather than fail on anything this test is
-    // about.
+    // `object_id = 0` is a BRAND-NEW subscribe: the full-state catch-up, sent
+    // through `deliver_catch_up_content` — the loop the seam is installed on.
+    // The in-window reconnect's cancellation is
+    // `cancellation_mid_in_window_catch_up_ends_with_its_status`'s.
     let mut stream = handle_subscribe_read_layer(
         &svc,
         subscribe_request(&session_id, "layer-catchup", 0, 0, "client-catchup"),
@@ -3486,6 +3675,18 @@ async fn cancellation_mid_catch_up_truncates_with_its_status(cause: Cause) {
         .await
         .expect("the parked subscriber must accept its release");
 
+    // The client reads nothing until the subscription has ended: the exit is
+    // recorded after the tail enqueued the status, so from here what the
+    // client finds is what the ending left it.
+    await_condition(
+        || read_stream_exit(&metrics, cause.exit_reason()) == 1,
+        "the exit is classified under the cause's reason",
+    )
+    .await;
+    for other in cause.other_reasons() {
+        assert_eq!(read_stream_exit(&metrics, other), 0, "{other}");
+    }
+
     let drained = drain_to_end(&mut stream, "a catch-up ended mid-delivery").await;
     let status = drained.terminal.unwrap_or_else(|| {
         panic!(
@@ -3502,18 +3703,15 @@ async fn cancellation_mid_catch_up_truncates_with_its_status(cause: Cause) {
         cause.code()
     );
     assert_eq!(status.message(), cause.message());
-    await_condition(
-        || read_stream_exit(&metrics, cause.exit_reason()) == 1,
-        "the exit is classified under the cause's reason",
-    )
-    .await;
-    for other in cause.other_reasons() {
-        assert_eq!(read_stream_exit(&metrics, other), 0, "{other}");
-    }
+    cause.assert_detail(&status);
 
     // The cursor did not advance: the caught-up ack is the ONLY thing that tells
     // a client it is up to date, and it must not have been sent. (`send_ack_header`
-    // is the only producer of a `total_size == 0` header.)
+    // is the only producer of a `total_size == 0` header.) Nor does the client
+    // get the content queued before the ending (b.ntm, SDD §12.6): the seam
+    // parked after the first content message was queued, and a server-driven
+    // ending drops the data still queued before its status, so the status is
+    // the next message a client that had not read yet gets.
     assert!(
         !drained.messages.iter().any(|msg| matches!(
             &msg.response_type,
@@ -3524,9 +3722,10 @@ async fn cancellation_mid_catch_up_truncates_with_its_status(cause: Cause) {
          never got, and those edits are then lost with no error anywhere"
     );
     assert!(
-        !drained.messages.is_empty(),
-        "fixture self-check: the seam parks only after a message is away, so the client must \
-         have received at least the content header"
+        drained.messages.is_empty(),
+        "the {cause:?} ending left {} queued message(s) ahead of its status; a server-driven \
+         ending discards the data still queued, so the status is the next message",
+        drained.messages.len()
     );
 
     await_condition(
@@ -3561,10 +3760,18 @@ async fn cancellation_mid_catch_up_truncates_with_its_status(cause: Cause) {
         "the ended catch-up leaves live_edit_subscriber_admitted",
     )
     .await;
+    await_delivery_memory_released(
+        &fx,
+        &format!(
+            "{cause:?} mid-catch-up releases the catch-up's pages and the subscription's hold"
+        ),
+    )
+    .await;
 
-    if !cause.is_retried() {
+    if !cause.drives_its_retry_to_convergence() {
         // A deleted session has nothing to converge to; the client does not
-        // retry `NOT_FOUND`.
+        // retry `NOT_FOUND`. A hold's retry converges as the shutdown's does
+        // (`Cause::drives_its_retry_to_convergence`).
         return;
     }
 
@@ -3620,6 +3827,15 @@ async fn session_absence_mid_catch_up_truncates_with_unavailable_and_a_retry_con
     cancellation_mid_catch_up_truncates_with_its_status(Cause::AbsentFromStore).await;
 }
 
+/// A fleet hold mid-catch-up ends `UNAVAILABLE` `SERVICE_HELD`,
+/// `reason=held`, with no caught-up ack. (The retry's convergence is the
+/// shutdown twin's.)
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hold_mid_catch_up_truncates_with_service_held() {
+    cancellation_mid_catch_up_truncates_with_its_status(Cause::Held).await;
+}
+
 /// **The shutdown sequence's bounded subscription drain covers a subscription
 /// parked in its catch-up**, the subscription's stream reader and admission
 /// permit are back by the time the drain finishes, and the pool quit that
@@ -3653,7 +3869,9 @@ async fn the_bounded_subscription_drain_covers_a_subscription_parked_in_its_catc
     use live_edit::grpc::subscribe::CatchUpChunkSeam;
     use live_edit::grpc::transport::drain_stream_tasks;
 
-    /// The drain's bound here — `main.rs` uses the per-task shutdown budget.
+    /// The drain's bound here — the post-server shutdown sequence uses the
+    /// per-task shutdown budget, or less when its shared pre-`quit()`
+    /// deadline is nearer.
     /// Unreachable on the healthy path.
     const SUBSCRIPTION_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
@@ -4204,95 +4422,170 @@ async fn a_send_that_runs_out_the_slow_reader_deadline_is_a_counted_stall_with_i
     assert_eq!(read_send_stalls(&metrics, SEND_PHASE_CATCHUP), 0);
 }
 
-/// **A rollback-mode in-window replay to a reader that is not reading stalls
-/// under `phase="catchup"`, never `live`.**
+/// **An in-window catch-up to a reader that is not reading stalls under
+/// `phase="catchup"`, never `live`, holding no catch-up slot while it is
+/// stalled.**
 ///
-/// The replay (`catchup_snapshot_enabled = false`, as this file's services are
-/// built) sends each missed commit as a header and a body, so 20 missed
-/// commits are 40 messages for 32 data slots: the seventeenth commit's header
-/// stalls and the shrunk deadline ends the subscription. The drained backlog's
-/// first header — the commit after the reconnect's position, with content — is
-/// the fixture's evidence that this was the per-commit replay.
+/// The reconnect's catch-up is one coalesced diff, sent as a content header
+/// and its body in 1 MiB chunks (`chunk_ompf_for_stream`). The missed commits
+/// carry `STALL_COMMITS` inline values of `STALL_VALUE_BYTES` each, so the
+/// diff is well over 32 MiB: its header and 31 chunks fill the 32 data slots
+/// and the next chunk's send finds none free. With the outer send deadline
+/// raised that send stays parked, so the stall is counted and its wait not yet
+/// recorded.
+///
+/// While it is parked the catch-up holds no catch-up slot — the slot covered
+/// its reads and its build and was given back before its first send — so, at a
+/// limit of ONE concurrent catch-up, a second subscription on another layer
+/// still catches up. Then the stalled client goes away; the parked send ends
+/// and records its wait, and nothing was ever counted under `live`.
 #[cfg(feature = "test-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_rollback_mode_in_window_replay_to_a_reader_that_is_not_reading_stalls_as_catchup() {
-    const MISSED_COMMITS: u64 = COMMITS_TO_FILL_THE_CHANNEL as u64 + 4;
+async fn an_in_window_catch_up_to_a_reader_that_is_not_reading_stalls_as_catchup_holding_no_slot() {
+    /// Raised above production's 5 s so the parked send outlasts the checks.
+    const STALL_SEND_DEADLINE: Duration = Duration::from_secs(30);
+    /// Commits the reconnect has missed, each one section with one inline
+    /// value, each upload under the service's 10 MiB `max_layer_size`.
+    const STALL_COMMITS: u64 = 4;
+    const STALL_VALUE_BYTES: usize = 9 * 1024 * 1024;
 
-    let fx = AdmissionFixture::setup(1, None).await;
+    // Two subscriptions, one catch-up slot.
+    let fx = AdmissionFixture::setup_full(2, None, TEST_ADMISSION_WAIT_MS, 1).await;
     let (svc, metrics) = build_admission_service(
         &fx,
         Arc::new(AllowAllPermissions),
         Seams {
-            outer_send_deadline: Some(TEST_OUTER_SEND_DEADLINE),
+            outer_send_deadline: Some(STALL_SEND_DEADLINE),
             ..Default::default()
         },
     );
-    assert!(
-        !svc.catchup_snapshot_enabled,
-        "fixture: this file's services run the rollback-mode catch-up"
-    );
     let (session_id, object_id) =
-        create_session_and_layer_for(&fx, &svc, "s7j-replay-stall", "layer-replay-stall").await;
+        create_session_and_layer_for(&fx, &svc, "s7j-catchup-stall", "layer-catchup-stall").await;
     let have_version = svc
         .layer_store
         .read_object_header(object_id)
         .await
         .expect("the new layer's header must read")
         .sequence_num;
-    for section_id in 1..=MISSED_COMMITS {
-        apply_unique_update(
-            &svc,
-            &session_id,
-            "layer-replay-stall",
-            object_id,
+    for section_id in 1..=STALL_COMMITS {
+        let mut delta = incremental_diff_change_section(section_id);
+        delta.set_fields = crate::common::owned_delta::delta_with_set_field_inline(
             section_id,
+            "payload",
+            vec![section_id as u8; STALL_VALUE_BYTES],
+            1,
         )
-        .await;
+        .set_fields;
+        let ompf_bytes = delta_to_ompf_bytes(&delta, &[]);
+        // The upload in 1 MiB chunks, as a client sends it: one 9 MiB chunk
+        // would exceed gRPC's 4 MiB decoded-message limit.
+        let mut requests = vec![UpdateLayerRequest {
+            message_type: Some(update_layer_request::MessageType::Header(
+                UpdateLayerHeader {
+                    session_id: session_id.clone(),
+                    layer_name: "layer-catchup-stall".to_owned(),
+                    object_id,
+                    timestamp_microseconds_since_epoch: section_id * 10,
+                    client_id: "writer".to_owned(),
+                    operation_id: String::new(),
+                },
+            )),
+        }];
+        requests.extend(
+            ompf_bytes
+                .chunks(1024 * 1024)
+                .map(|chunk| UpdateLayerRequest {
+                    message_type: Some(update_layer_request::MessageType::Chunk(
+                        live_edit::grpc::proto::UpdateLayerChunk {
+                            data: chunk.to_vec(),
+                        },
+                    )),
+                }),
+        );
+        let stream = streaming_update(requests);
+        handle_update_layer(&svc, make_request(stream))
+            .await
+            .unwrap_or_else(|e| panic!("the {STALL_VALUE_BYTES}-byte commit failed: {e}"));
     }
 
     // The reconnect, which then reads nothing.
-    let mut stream = handle_subscribe_read_layer(
+    let stream = handle_subscribe_read_layer(
         &svc,
         subscribe_request(
             &session_id,
-            "layer-replay-stall",
+            "layer-catchup-stall",
             object_id,
             have_version,
-            "client-replay-stall",
+            "client-catchup-stall",
         ),
     )
     .await
     .expect("the reconnect must be admitted")
     .into_inner();
     await_condition(
-        || read_stream_exit(&metrics, STREAM_EXIT_SLOW_READER_DEADLINE) == 1,
-        "the replay's stalled send runs out the deadline",
+        || read_send_stalls(&metrics, SEND_PHASE_CATCHUP) >= 1,
+        "the catch-up send that finds every data slot full is counted as a catchup stall when \
+         it begins",
     )
     .await;
+    assert_eq!(
+        read_send_wait_count(&metrics, SEND_PHASE_CATCHUP),
+        0,
+        "precondition: the stalled send is still parked, and its wait is recorded only when it \
+         ends"
+    );
+    assert_eq!(
+        read_catchup_gauge(&metrics, "live_edit_subscribe_catchups_inflight"),
+        0,
+        "a catch-up stalled in its delivery holds no catch-up slot"
+    );
+    assert_eq!(
+        fx.client().catchup_gate.available(),
+        1,
+        "the one catch-up slot is free while the catch-up is stalled"
+    );
 
-    let drained = drain_to_end(&mut stream, "the stalled replay").await;
-    match drained
-        .messages
-        .first()
-        .and_then(|m| m.response_type.as_ref())
-    {
-        Some(subscribe_read_layer_response::ResponseType::Header(h)) => assert!(
-            h.sequence_num == have_version + 1 && h.total_size > 0,
-            "fixture self-check: the reconnect was sent the per-commit replay from \
-             have_version + 1; got {h:?}"
+    // A second catch-up, at the limit of one, is admitted and completes while
+    // the first is stalled: nothing waits behind a slow client.
+    let (other_session, other_object) =
+        create_session_and_layer_for(&fx, &svc, "s7j-catchup-other", "layer-catchup-other").await;
+    let mut other = handle_subscribe_read_layer(
+        &svc,
+        subscribe_request(
+            &other_session,
+            "layer-catchup-other",
+            0,
+            0,
+            "client-catchup-other",
         ),
-        other => panic!("expected the replay's first header, got {other:?}"),
-    }
-
-    let stalls = read_send_stalls(&metrics, SEND_PHASE_CATCHUP);
-    assert!(
-        stalls >= 1,
-        "the replay's send that found the channel full is a catchup stall"
+    )
+    .await
+    .expect("the second subscription must be admitted")
+    .into_inner();
+    let other_ack = drain_catch_up(&mut other).await;
+    assert_eq!(
+        other_ack.object_id, other_object,
+        "the second catch-up completes while the first is stalled"
     );
     assert_eq!(
         read_send_wait_count(&metrics, SEND_PHASE_CATCHUP),
+        0,
+        "precondition: the first catch-up's send is still parked"
+    );
+
+    // The stalled client goes away: its parked send ends and records its wait.
+    drop(stream);
+    drop(other);
+    await_condition(
+        || read_stream_exit(&metrics, STREAM_EXIT_CLIENT_DISCONNECT) == 2,
+        "both subscriptions record their client_disconnect exits",
+    )
+    .await;
+    let stalls = read_send_stalls(&metrics, SEND_PHASE_CATCHUP);
+    assert_eq!(
+        read_send_wait_count(&metrics, SEND_PHASE_CATCHUP),
         stalls,
-        "each catchup stall recorded its wait when the deadline ended it"
+        "every counted catchup stall has ended, so each recorded its wait exactly once"
     );
     assert_eq!(
         (
@@ -4300,7 +4593,12 @@ async fn a_rollback_mode_in_window_replay_to_a_reader_that_is_not_reading_stalls
             read_send_wait_count(&metrics, SEND_PHASE_LIVE),
         ),
         (0, 0),
-        "a replay is catch-up content, never a live delivery"
+        "a catch-up is catch-up content, never a live delivery"
+    );
+    assert_eq!(
+        read_stream_exit(&metrics, STREAM_EXIT_SLOW_READER_DEADLINE),
+        0,
+        "the raised deadline never fired"
     );
 }
 
@@ -4637,8 +4935,8 @@ async fn a_waiter_cap_refusal_logs_one_warn_at_the_admission_stage() {
 }
 
 /// A queued waiter refused by `fire` — which cancels one token — gets
-/// `code`/`message`, records `result="cancelled"`, and logs one line at
-/// `stage=admission` at `level`.
+/// `code`/`message` and the refusal detail `assert_detail` checks, records
+/// `result="cancelled"`, and logs one line at `stage=admission` at `level`.
 ///
 /// The waiter runs in its own task (it has to be parked while the test fires
 /// the token), so the capture wraps that task's future: the line is emitted
@@ -4648,6 +4946,7 @@ async fn queued_refusal_logs_one_line_at_the_admission_stage(
     level: &str,
     code: Code,
     message: &str,
+    assert_detail: impl FnOnce(&Status),
 ) {
     /// Long enough that the waiter cannot refuse itself as saturated first.
     const PARKED_WAIT_MS: u64 = 60_000;
@@ -4695,17 +4994,16 @@ async fn queued_refusal_logs_one_line_at_the_admission_stage(
     let status = expect_err_status(result, "a waiter whose token fired was admitted");
     assert_eq!(status.code(), code, "got {status:?}");
     assert_eq!(status.message(), message);
-    // A shutdown refusal carries the shutdown retry hint; a session's
-    // deletion or absence is not a load-shedding refusal and carries none.
-    if message == "server shutting down" {
-        assert_shutdown_status(&status);
-    } else {
-        assert_no_refusal_detail(&status);
-    }
+    assert_detail(&status);
     assert_eq!(
         read_admission(&metrics, ADMISSION_RESULT_CANCELLED),
         1,
         "the refusal records `result=\"cancelled\"` — the request went away, not the capacity"
+    );
+    assert_eq!(
+        read_admission(&metrics, ADMISSION_RESULT_ADMITTED),
+        1,
+        "only the holder was admitted"
     );
     assert_eq!(
         read_admission(&metrics, ADMISSION_RESULT_REFUSED_SATURATED),
@@ -4747,6 +5045,7 @@ async fn a_queued_subscribe_whose_session_is_deleted_is_refused_not_found_and_lo
         "INFO",
         Code::NotFound,
         "session was deleted",
+        assert_no_refusal_detail,
     )
     .await;
 }
@@ -4768,6 +5067,7 @@ async fn a_queued_subscribe_whose_session_goes_missing_is_refused_unavailable_an
         "WARN",
         Code::Unavailable,
         "session is missing from the live store; retry so it can be recovered",
+        assert_no_refusal_detail,
     )
     .await;
 }
@@ -4784,8 +5084,117 @@ async fn a_queued_subscribe_on_a_shutting_down_replica_is_refused_unavailable_an
         "INFO",
         Code::Unavailable,
         "server shutting down",
+        assert_shutdown_status,
     )
     .await;
+}
+
+/// The incident the admission-stage hold tests' hold names.
+const ADMISSION_HOLD_INCIDENT: &str = "20261014t0930-b7c1";
+
+/// A queued waiter whose enrolled token the **fleet hold** cancels is refused
+/// `UNAVAILABLE` `SERVICE_HELD` naming the incident — mapped by its token's
+/// cause, not as a shutdown — records `result="cancelled"`, and logs one INFO
+/// line at `stage=admission`: a hold ends every stream on every replica, and
+/// is reported once on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_subscribe_on_a_held_replica_is_refused_service_held_and_logs_one_info() {
+    queued_refusal_logs_one_line_at_the_admission_stage(
+        |svc, _session| {
+            svc.shutdown.end_streams_for_hold(HoldCause::Held {
+                incident: Some(ADMISSION_HOLD_INCIDENT.to_owned()),
+            })
+        },
+        "INFO",
+        Code::Unavailable,
+        "service is offline for disaster recovery (incident 20261014t0930-b7c1)",
+        |status| assert_service_held(status, Some(ADMISSION_HOLD_INCIDENT)),
+    )
+    .await;
+}
+
+/// A queued waiter whose enrolled token the hold ending cancels for a **stale
+/// hold verdict** is refused `UNAVAILABLE` `UPSTREAM_UNAVAILABLE` and logs one
+/// WARN line at `stage=admission`: losing the store is a dependency outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_subscribe_on_a_replica_with_a_stale_hold_verdict_is_refused_and_logs_one_warn() {
+    queued_refusal_logs_one_line_at_the_admission_stage(
+        |svc, _session| svc.shutdown.end_streams_for_hold(HoldCause::StaleVerdict),
+        "WARN",
+        Code::Unavailable,
+        "this replica lost contact with the backing store and stopped serving until it \
+         restarts; retry",
+        assert_upstream_unavailable,
+    )
+    .await;
+}
+
+/// A subscribe arriving **after the hold ending ran**, on a pod with a free
+/// slot, is refused before any task is spawned: its enrollment is born
+/// cancelled carrying the hold's cause (the never-cleared `held` flag), so
+/// admission refuses it Trailers-Only `UNAVAILABLE` `SERVICE_HELD` — counted
+/// under `result="cancelled"` and never under any stream exit reason, with no
+/// slot or permit taken, and one INFO line at `stage=admission`. Without the
+/// flag it would be admitted onto the free slot and served during the hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscribe_after_a_hold_is_refused_service_held_before_any_task_is_spawned() {
+    let fx = AdmissionFixture::setup(1, None).await;
+    let (svc, metrics) =
+        build_admission_service(&fx, Arc::new(AllowAllPermissions), Seams::default());
+    let (session, object) =
+        create_session_and_layer_for(&fx, &svc, "hold-refused-late", "layer-refused").await;
+    assert_eq!(
+        fx.client().subscriber_admission.available_permits(),
+        1,
+        "fixture self-check: the slot is free, so only the hold can refuse"
+    );
+
+    svc.shutdown.end_streams_for_hold(HoldCause::Held {
+        incident: Some(ADMISSION_HOLD_INCIDENT.to_owned()),
+    });
+    let (result, captured) = super::log_capture::capture(handle_subscribe_read_layer(
+        &svc,
+        subscribe_request(&session, "layer-refused", object, 0, "client-refused"),
+    ))
+    .await;
+
+    let status = expect_err_status(
+        result,
+        "a subscribe after the hold ending was admitted onto a free slot",
+    );
+    assert_service_held(&status, Some(ADMISSION_HOLD_INCIDENT));
+    assert!(
+        !svc.shutdown.begun().is_cancelled() && !svc.shutdown.is_cancelled(),
+        "precondition: the refusal came from the hold, not from a shutdown"
+    );
+    assert_eq!(read_admission(&metrics, ADMISSION_RESULT_CANCELLED), 1);
+    assert_eq!(read_admission(&metrics, ADMISSION_RESULT_ADMITTED), 0);
+    for &reason in STREAM_EXIT_REASONS {
+        assert_eq!(
+            read_stream_exit(&metrics, reason),
+            0,
+            "a subscription refused at admission is never a stream exit; `{reason}` counted one"
+        );
+    }
+    assert_eq!(
+        svc.subscription_tracker.len(),
+        0,
+        "the refusal must come before the subscription task is spawned"
+    );
+    assert_eq!(
+        fx.client().subscriber_admission.available_permits(),
+        1,
+        "a refused subscribe must not take a permit"
+    );
+    assert_one_refusal_line(
+        &captured,
+        "INFO",
+        "UNAVAILABLE",
+        &status,
+        &session,
+        "layer-refused",
+        "client-refused",
+    );
 }
 
 /// A subscribe arriving **after shutdown began**, on a pod with a free slot, is
@@ -5082,7 +5491,9 @@ fn read_catchup_waits(metrics: &Metrics, result: &str) -> u64 {
 /// A catch-up queued behind the limit ends by its cause, exactly as every
 /// other wait does — a session deletion (`NOT_FOUND`, `session_cancel`), a
 /// session found missing from the live store (`UNAVAILABLE`,
-/// `session_absent`), the replica shutting down (`UNAVAILABLE`, `shutdown`)
+/// `session_absent`), the replica shutting down (`UNAVAILABLE`, `shutdown`),
+/// a fleet hold (`UNAVAILABLE` `SERVICE_HELD`, `held`), a stale hold verdict
+/// (`UNAVAILABLE` `UPSTREAM_UNAVAILABLE`, `stale_verdict`)
 /// or the client going away (`client_disconnect`) — without ever taking the
 /// slot, delivering nothing, recording its slot wait as `cancelled`, and
 /// returning its admission at once.
@@ -5154,6 +5565,7 @@ async fn a_queued_catch_up_ends_on(ending: QueuedEnding) {
                 .expect("must end with a status, not a clean close");
             assert_eq!(status.code(), cause.code(), "{ending:?}: {status:?}");
             assert_eq!(status.message(), cause.message(), "{ending:?}");
+            cause.assert_detail(&status);
             assert!(
                 drained.messages.is_empty(),
                 "a queued catch-up delivers nothing"
@@ -5203,8 +5615,9 @@ async fn a_queued_catch_up_ends_on(ending: QueuedEnding) {
         .await
         .expect("release the holder");
     match ending {
-        QueuedEnding::Token(Cause::Shutdown) => {
-            let drained = drain_to_end(&mut holder, "the holder after shutdown").await;
+        // A shutdown or a hold ends every enrolled stream, the holder too.
+        QueuedEnding::Token(Cause::Shutdown | Cause::Held | Cause::StaleVerdict) => {
+            let drained = drain_to_end(&mut holder, "the holder after shutdown or a hold").await;
             assert_eq!(drained.terminal.map(|s| s.code()), Some(Code::Unavailable));
         }
         _ => {
@@ -5235,6 +5648,18 @@ async fn a_queued_catch_up_ends_unavailable_when_its_session_goes_missing_from_t
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_queued_catch_up_ends_unavailable_when_the_replica_shuts_down() {
     a_queued_catch_up_ends_on(QueuedEnding::Token(Cause::Shutdown)).await;
+}
+
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_catch_up_ends_service_held_when_the_fleet_is_held() {
+    a_queued_catch_up_ends_on(QueuedEnding::Token(Cause::Held)).await;
+}
+
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_queued_catch_up_ends_upstream_unavailable_when_the_hold_verdict_goes_stale() {
+    a_queued_catch_up_ends_on(QueuedEnding::Token(Cause::StaleVerdict)).await;
 }
 
 #[cfg(feature = "test-fault-injection")]

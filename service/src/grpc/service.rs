@@ -141,15 +141,6 @@ pub struct LiveEditService {
     pub shutdown: GracefulShutdown,
     pub metrics: SharedMetrics,
     pub service_label: String,
-    /// Late-join / catch-up snapshot switch, hoisted from
-    /// [`Config::catchup_snapshot_enabled`](crate::config::Config::catchup_snapshot_enabled)
-    /// (SDD §12.3 catch-up regimes). `true` (the default) routes eligible
-    /// catch-up through the corrected late-join snapshot path; `false` selects
-    /// byte-identical legacy catch-up behavior. Read by `SubscribeReadLayer`
-    /// (`subscribe.rs`) to choose the catch-up entrypoint; wired per-knob rather
-    /// than via a whole `Config` reference, matching `max_layer_size` /
-    /// `service_label`.
-    pub catchup_snapshot_enabled: bool,
     /// Short-TTL positive cache of `session_id → base_path` (b.jr8
     /// mediums). Invalidated on local `DeleteSession` and on
     /// `le:session:deleted` pub/sub receipt, so the staleness ceiling is
@@ -217,16 +208,14 @@ pub struct LiveEditService {
     pub snapshot_flights: SnapshotFlights,
     /// Test-only synchronization seam for `run_catch_up` (b.fdy). When
     /// `Some`, the in-window regime of `run_catch_up` pauses between
-    /// `read_object_header` and the in-window stream read (snapshot mode's
-    /// point read, rollback mode's paged replay read) long
+    /// `read_object_header` and the in-window point read long
     /// enough for a test to fire a `create_layer` overwrite while the
     /// subscriber is parked at the seam. This is the only way to deterministically
-    /// exercise the literal `catch_up_in_window` mid-window `Deleted`
-    /// variant (`src/grpc/subscribe.rs:345`) — its sibling steady-state
-    /// handler (`subscribe.rs:504`) is already covered by the b.q2f
+    /// exercise `catch_up_in_window`'s `deleted`-sentinel re-bootstrap — its
+    /// sibling steady-state `Deleted` handler is already covered by the b.q2f
     /// pool-saturation test, but both funnel through the same
-    /// `shutdown_and_release → handle_deleted_and_rebootstrap → catch_up_brand_new`
-    /// chain, so the literal path had no direct regression
+    /// `handle_deleted_and_rebootstrap → catch_up_brand_new`
+    /// chain, so the in-window path had no direct regression
     /// test until this seam landed.
     ///
     /// **Test-only.** Production call sites never populate this — it is
@@ -254,11 +243,10 @@ pub struct LiveEditService {
     /// Test-only synchronization seam inside `deliver_catch_up_content`'s chunk
     /// loop (b.f4f).
     ///
-    /// That loop serves the full-state, in-window-snapshot and out-of-window
-    /// regimes. It is NOT the only chunk loop on the subscribe path — the legacy
-    /// in-window replay chunks inside `send_per_commit_payload` — so a test running
-    /// with `LIVE_EDIT_CATCHUP_SNAPSHOT_ENABLED=false` on an in-window
-    /// reconnect never reaches this seam.
+    /// That loop serves every catch-up regime: full-state, in-window and
+    /// out-of-window. It is NOT the only chunk loop on the subscribe path — the
+    /// steady state's per-commit sends chunk inside `send_per_commit_payload` —
+    /// so a live update never reaches this seam.
     ///
     /// When `Some`, `deliver_catch_up_content` parks immediately after handing
     /// its **first** chunk to `send_or_disconnect`, so a test can cancel the
@@ -325,13 +313,10 @@ pub struct LiveEditService {
     /// the state read whose result it serves — before the read permit, the
     /// atomic read (or the attach to the object's shared fenced-read flight)
     /// and the stream registration at its cut — at either the Regime 1
-    /// (`pre-full-state`) or Regime 2 (`pre-coalesced`) position — or, in
-    /// rollback mode's Regime 2 per-commit replay, after its first per-commit
-    /// read and before the next (`between-replay-computes`, a two-phase park
-    /// the test releases; empty commits take no read and are skipped) —
-    /// selected by the constructor used
-    /// (`CatchUpStateReadSeam::new_before_full_state` / `new_before_coalesced` /
-    /// `new_between_replay_computes`). A fourth point (b.yuo,
+    /// (`pre-full-state`) or Regime 2 (`pre-coalesced`) position — selected by
+    /// the constructor used
+    /// (`CatchUpStateReadSeam::new_before_full_state` / `new_before_coalesced`).
+    /// A third point (b.yuo,
     /// `new_before_ext_probe`) parks the first catch-up build of any regime
     /// after its state read and before it reads any external-value blob, so a
     /// test can stage the stale-miss race. Every point holds the catch-up

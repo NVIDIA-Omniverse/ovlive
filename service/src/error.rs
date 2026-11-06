@@ -93,7 +93,9 @@ impl From<DeltaError> for ServiceError {
             | DeltaError::TimeSampleNegativeZeroTime { .. }
             | DeltaError::SelfParenting { .. }
             | DeltaError::DuplicateSiblingName { .. }
-            | DeltaError::SectionTreeTooDeep { .. } => {
+            | DeltaError::SectionTreeTooDeep { .. }
+            | DeltaError::CreateWithoutTopLevelSection
+            | DeltaError::RemovesLastTopLevelSection => {
                 ServiceError::InvalidArgument(format!("delta error: {e}"))
             }
         }
@@ -397,8 +399,9 @@ pub enum ServiceError {
     /// [`ServiceError::Unavailable`] is converted into a detailed refusal in
     /// exactly one place: the `CreateLayer` / `UpdateLayer` pre-commit choke
     /// point (`grpc::layer`'s `refused_before_commit`), which gives an
-    /// `UNAVAILABLE` status with no detail, raised before the call's commit
-    /// started, [`refusal_reason::UPSTREAM_UNAVAILABLE`]
+    /// `UNAVAILABLE` status with no detail, raised before any part of the
+    /// call's commit took effect (before its commit marker),
+    /// [`refusal_reason::UPSTREAM_UNAVAILABLE`]
     /// ([`RefusalDetail::upstream_unavailable`]) with its message unchanged.
     /// It works on the outgoing `Status`, not on this enum, so no in-process
     /// consumer ever sees the converted value. `Display` equals
@@ -407,6 +410,14 @@ pub enum ServiceError {
     /// in-process consumer that branches on `Unavailable` treats it the same,
     /// except the in-process retry loops, which do not retry it: each of its
     /// producers is a refusal that is not retried in-process.
+    ///
+    /// Not every detailed `UNAVAILABLE` passes through here. The hold gate
+    /// (`grpc::hold`) refuses LiveService RPCs before the auth interceptor
+    /// and any handler run, so it builds each refusal's `Status` directly,
+    /// for every RPC, the uploads included: [`refusal_reason::SERVICE_HELD`]
+    /// while the fleet is held, and [`refusal_reason::UPSTREAM_UNAVAILABLE`]
+    /// on a replica whose hold verdict went stale (SDD SR-6.5). Neither is
+    /// ever a `ServiceError`, nor a conversion of one.
     #[error("unavailable: {message}")]
     UnavailableWithDetail {
         /// The wire message, as [`ServiceError::Unavailable`] would carry it.
@@ -532,18 +543,18 @@ impl From<ServiceError> for tonic::Status {
 /// wait". On `CreateLayer` and `UpdateLayer` an `UNAVAILABLE` carrying this
 /// `ErrorInfo` means: this call applied nothing; a re-send is safe unless an
 /// earlier attempt of the same write is still in doubt — then use
-/// `operation_id`. Every `UNAVAILABLE` such a call is refused with before its
-/// commit started carries a detail —
+/// `operation_id`. Every `UNAVAILABLE` on such a call that the server knows
+/// was refused before any part of its commit took effect carries a detail —
 /// [`UPSTREAM_UNAVAILABLE`](refusal_reason::UPSTREAM_UNAVAILABLE) when no more
-/// specific reason applies — so one a replica of this build answers without it
-/// comes from a write whose commit had started, and the client cannot assume
-/// it applied nothing. During a rolling upgrade a replica of an earlier build
-/// answers some pre-commit refusals without the detail too; read as outcome
-/// unknown, that answer is weaker but never wrong (SDD §18.1, *Rolling
-/// upgrade*). On every other RPC an `UNAVAILABLE` without the detail keeps its
-/// plain meaning. This contract covers `UNAVAILABLE` only; a refusal detail on
-/// any other code means what that code's refusal states, and carries no
-/// `RetryInfo` — today:
+/// specific reason applies — so one a replica of this build answers without
+/// it comes from a write whose commit may have taken effect, and the client
+/// cannot assume it applied nothing. During a rolling upgrade a replica of an
+/// earlier build answers some pre-commit refusals without the detail too;
+/// read as outcome unknown, that answer is weaker but never wrong (SDD §18.1,
+/// *Rolling upgrade*). On every other RPC an `UNAVAILABLE` without the detail
+/// keeps its plain meaning. This contract covers `UNAVAILABLE` only; a
+/// refusal detail on any other code means what that code's refusal states,
+/// and carries no `RetryInfo` — today:
 /// - the two refusals of a chained `UpdateLayer`
 ///   (`UpdateLayerRequest.chained_header`), `ABORTED`
 ///   [`PREDECESSOR_NOT_COMMITTED`](refusal_reason::PREDECESSOR_NOT_COMMITTED)
@@ -657,19 +668,39 @@ pub mod refusal_reason {
     /// keepalive intervals. The participant has already left, and peers saw
     /// one `PeerLeft`; a client that is still alive rejoins.
     pub const CLIENT_KEEPALIVE_TIMEOUT: &str = "CLIENT_KEEPALIVE_TIMEOUT";
-    /// **Client contract.** On `UNAVAILABLE`, and only on `CreateLayer` /
-    /// `UpdateLayer`: the call was refused before its commit was sent,
-    /// because a dependency it needed was unavailable — the backing store not
-    /// serving (still loading its data after a restart, busy running a long
-    /// script) or failing at the connection level, the auth backend, or the
-    /// backup store during a lazy restore. This call applied nothing. No
-    /// metadata; `RetryInfo` drawn from
+    /// **Client contract.** On `UNAVAILABLE`, in two cases. No metadata;
+    /// `RetryInfo` drawn from
     /// [`UPSTREAM_UNAVAILABLE_RETRY_DELAY`](super::UPSTREAM_UNAVAILABLE_RETRY_DELAY),
-    /// a minimum wait — the client keeps its own backoff. A write that fails
-    /// after its commit started (retry exhaustion, overtaken, a `CreateLayer`
-    /// commit-stage refusal, an outcome-unknown answer after an internal
-    /// retry) never carries it.
+    /// a minimum wait — the client keeps its own backoff.
+    ///
+    /// - On `CreateLayer` / `UpdateLayer`: the call was refused before any
+    ///   part of its commit took effect, because a dependency it needed was
+    ///   unavailable — the backing store not serving (still loading its data
+    ///   after a restart, busy running a long script), failing at the
+    ///   connection level, or moving its data between nodes (a failover or a
+    ///   slot move), the auth backend, or the backup store during a lazy
+    ///   restore. This call applied nothing. A write that fails once its
+    ///   commit may have taken effect (retry exhaustion, overtaken, a
+    ///   `CreateLayer` that had started replacing a layer, a `CreateLayer`
+    ///   commit that may have run, an outcome-unknown answer after an
+    ///   internal retry) never carries it.
+    /// - On any RPC, as a refusal or as the ending of a `SubscribeReadLayer` /
+    ///   `JoinSession` stream: the replica lost contact with the backing store
+    ///   it reads the disaster-recovery hold from, so it stopped serving
+    ///   until it restarts (SDD SR-6.5). A refused call applied nothing; the
+    ///   client retries, and the retry reaches another replica or this one
+    ///   after its restart.
     pub const UPSTREAM_UNAVAILABLE: &str = "UPSTREAM_UNAVAILABLE";
+    /// **Client contract.** On `UNAVAILABLE`, on any RPC, as a refusal or as
+    /// the ending of a `SubscribeReadLayer` / `JoinSession` stream: the
+    /// service is held for disaster recovery, and every replica refuses every
+    /// call until an operator restores the backing store or accepts its loss
+    /// and the hold clears (SDD SR-6). The message names the incident
+    /// ([`service_held_message`](super::service_held_message)). A refused call
+    /// applied nothing. No metadata; `RetryInfo` drawn from
+    /// [`SERVICE_HELD_RETRY_DELAY`](super::SERVICE_HELD_RETRY_DELAY), a
+    /// minimum wait — the client keeps its own backoff.
+    pub const SERVICE_HELD: &str = "SERVICE_HELD";
 }
 
 /// **Client contract.** The `google.rpc.ErrorInfo` `metadata` keys a refusal
@@ -683,7 +714,10 @@ pub mod refusal_metadata {
     pub const SATURATED: &str = "saturated";
     /// The admission queue is full.
     pub const WAITER_CAP: &str = "waiter_cap";
-    /// The upload budget cannot hold the upload's content right now.
+    /// The upload budget cannot hold the upload's content right now, and the
+    /// upload could not run beyond it in the replica's one overflow slot
+    /// instead (the slot is taken or wanted by another upload, or the upload
+    /// is a chained `UpdateLayer`).
     pub const GROWTH: &str = "growth";
     /// On [`CATCHUP_CAPACITY`](super::refusal_reason::CATCHUP_CAPACITY): what
     /// the catch-up waited for — [`SLOT`] or [`READ_PERMIT`]. Absent when the
@@ -854,6 +888,64 @@ pub const UPSTREAM_UNAVAILABLE_RETRY_DELAY: RetryDelayRange = RetryDelayRange::n
     std::time::Duration::from_secs(3),
 );
 
+/// The retry delay of [`refusal_reason::SERVICE_HELD`]: `[30 s, 35 s)`. A
+/// minimum wait; the client keeps its own backoff and waits
+/// max(`retry_delay`, backoff).
+///
+/// The floor is SDD SR-6.1's 30 s: a hold lasts until an operator restores the
+/// store or accepts the loss, so a client retrying faster only adds refusals.
+/// The 5 s span randomizes the delay per response, as every refusal's is, so
+/// the clients one hold refused do not come back in one step; it matches the
+/// 0–5 s spread of the fleet's restarts when the hold clears (SDD SR-6.4).
+pub const SERVICE_HELD_RETRY_DELAY: RetryDelayRange = RetryDelayRange::new(
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(35),
+);
+
+/// The most characters of the hold marker's incident a
+/// [`refusal_reason::SERVICE_HELD`] message renders ([`service_held_message`]):
+/// 64.
+///
+/// The incident is written by an operator (or a Job) into the hold marker, and
+/// nothing upstream bounds its length. It travels in every `SERVICE_HELD`
+/// status message, which goes out as the `grpc-message` header; an oversized
+/// one could exceed a client's or a proxy's header limit, and that client
+/// would then never see the `SERVICE_HELD` reason at all. 64 characters hold
+/// an incident id of the SDD SR-4.1 shape (`20261013t1708-a3f9`, about 18)
+/// with room to spare; a longer one is cut there and marked with `…`.
+pub const SERVICE_HELD_INCIDENT_MAX_CHARS: usize = 64;
+
+/// The message of every [`refusal_reason::SERVICE_HELD`] refusal and ending:
+/// `service is offline for disaster recovery (incident <incident>)`.
+///
+/// The incident comes from the hold marker, which an operator may write
+/// without one, so it is optional: a missing or blank incident renders as
+/// `incident unknown`. Since an operator wrote it, it is rendered safely:
+/// surrounding whitespace is trimmed, each control character is replaced by
+/// `U+FFFD` (`�`), and at most [`SERVICE_HELD_INCIDENT_MAX_CHARS`] characters
+/// are kept, cut on a character boundary, with `…` appended when anything was
+/// cut. Never panics on any incident.
+pub fn service_held_message(incident: Option<&str>) -> String {
+    match incident
+        .map(str::trim)
+        .filter(|incident| !incident.is_empty())
+    {
+        Some(incident) => {
+            let mut chars = incident.chars();
+            let mut rendered: String = chars
+                .by_ref()
+                .take(SERVICE_HELD_INCIDENT_MAX_CHARS)
+                .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                .collect();
+            if chars.next().is_some() {
+                rendered.push('…');
+            }
+            format!("service is offline for disaster recovery (incident {rendered})")
+        }
+        None => "service is offline for disaster recovery (incident unknown)".to_owned(),
+    }
+}
+
 /// A refusal's detail: the `google.rpc.ErrorInfo` reason and metadata, and,
 /// when the refusal carries a retry hint, the range its `google.rpc.RetryInfo`
 /// delay is drawn from when the status is built.
@@ -911,17 +1003,42 @@ impl RefusalDetail {
         )
     }
 
-    /// The detail of a `CreateLayer` / `UpdateLayer` refused before its commit
-    /// because a dependency was unavailable:
+    /// The detail of a `CreateLayer` / `UpdateLayer` refused before any part
+    /// of its commit took effect, because a dependency was unavailable, and of
+    /// every refusal and stream ending of a replica that lost contact with the
+    /// store it reads the disaster-recovery hold from (SDD SR-6.5):
     /// [`refusal_reason::UPSTREAM_UNAVAILABLE`],
-    /// [`UPSTREAM_UNAVAILABLE_RETRY_DELAY`]. Attached only by the uploads'
-    /// pre-commit choke point (`grpc::layer`'s `refused_before_commit`; see
-    /// [`ServiceError::UnavailableWithDetail`]).
+    /// [`UPSTREAM_UNAVAILABLE_RETRY_DELAY`]. On an upload that reached its
+    /// handler it is attached only by the pre-commit choke point
+    /// (`grpc::layer`'s `refused_before_commit`; see
+    /// [`ServiceError::UnavailableWithDetail`]); the streaming RPCs attach it
+    /// when the hold ending ended them for a stale verdict
+    /// (`grpc::graceful_shutdown::HoldCause::StaleVerdict`). The hold gate
+    /// (`grpc::hold`), which refuses before any handler runs, refuses every
+    /// RPC of a stale replica with it, the uploads included, once its
+    /// stale-verdict state is set (SDD SR-6.5).
     pub fn upstream_unavailable() -> Self {
         Self::new(
             refusal_reason::UPSTREAM_UNAVAILABLE,
             Some(UPSTREAM_UNAVAILABLE_RETRY_DELAY),
         )
+    }
+
+    /// The detail of every refusal and stream ending while the service is held
+    /// for disaster recovery: [`refusal_reason::SERVICE_HELD`],
+    /// [`SERVICE_HELD_RETRY_DELAY`]. Build the status through
+    /// [`Self::service_held_status`], which adds the message naming the
+    /// incident.
+    pub fn service_held() -> Self {
+        Self::new(refusal_reason::SERVICE_HELD, Some(SERVICE_HELD_RETRY_DELAY))
+    }
+
+    /// The status of every refusal and stream ending while the service is held
+    /// for disaster recovery (SDD SR-6.1, SR-6.3): `UNAVAILABLE` with
+    /// [`service_held_message`] for `incident` — `incident unknown` when the
+    /// hold marker names none — carrying [`Self::service_held`].
+    pub fn service_held_status(incident: Option<&str>) -> Status {
+        Self::service_held().unavailable(service_held_message(incident))
     }
 
     /// The detail of a delta refused for carrying more entries than one delta
@@ -2082,6 +2199,7 @@ mod tests {
             "CLIENT_KEEPALIVE_TIMEOUT"
         );
         assert_eq!(refusal_reason::UPSTREAM_UNAVAILABLE, "UPSTREAM_UNAVAILABLE");
+        assert_eq!(refusal_reason::SERVICE_HELD, "SERVICE_HELD");
         assert_eq!(
             [
                 refusal_reason::PREDECESSOR_NOT_COMMITTED,
@@ -2160,6 +2278,7 @@ mod tests {
                 STORE_WRITE_REFUSED_RETRY_DELAY,
                 CLIENT_KEEPALIVE_TIMEOUT_RETRY_DELAY,
                 UPSTREAM_UNAVAILABLE_RETRY_DELAY,
+                SERVICE_HELD_RETRY_DELAY,
             ),
             (
                 RetryDelayRange::new(Duration::ZERO, Duration::from_millis(100)),
@@ -2167,6 +2286,8 @@ mod tests {
                 RetryDelayRange::new(Duration::from_secs(2), Duration::from_secs(6)),
                 RetryDelayRange::new(Duration::ZERO, Duration::from_millis(100)),
                 RetryDelayRange::new(Duration::from_secs(1), Duration::from_secs(3)),
+                // SDD SR-6.1: a 30 s minimum wait, spread over 5 s.
+                RetryDelayRange::new(Duration::from_secs(30), Duration::from_secs(35)),
             ),
             "the documented retry_delay ranges"
         );
@@ -2182,6 +2303,7 @@ mod tests {
             STORE_WRITE_REFUSED_RETRY_DELAY,
             CLIENT_KEEPALIVE_TIMEOUT_RETRY_DELAY,
             UPSTREAM_UNAVAILABLE_RETRY_DELAY,
+            SERVICE_HELD_RETRY_DELAY,
         ] {
             let mut distinct = std::collections::BTreeSet::new();
             let midpoint = range.min + (range.max - range.min) / 2;
@@ -2387,6 +2509,144 @@ mod tests {
                 metadata: Vec::new(),
                 retry_delay: Some(UPSTREAM_UNAVAILABLE_RETRY_DELAY),
             }
+        );
+    }
+
+    // ── The disaster-recovery hold (SDD SR-6.1) ─────────────────────────────
+
+    /// The hold's detail: `SERVICE_HELD`, no metadata, its own `[30 s, 35 s)`
+    /// range — not the upstream or capacity range, so the hold's hint can
+    /// change apart from theirs.
+    #[test]
+    fn refusal_detail_service_held_is_the_held_reason_and_range() {
+        assert_eq!(
+            RefusalDetail::service_held(),
+            RefusalDetail {
+                reason: refusal_reason::SERVICE_HELD,
+                metadata: Vec::new(),
+                retry_delay: Some(SERVICE_HELD_RETRY_DELAY),
+            }
+        );
+    }
+
+    /// The status every hold refusal and ending carries, as a client decodes
+    /// it: `UNAVAILABLE`, the message naming the incident, an `ErrorInfo`
+    /// `SERVICE_HELD` in the service's domain with no metadata, and a
+    /// `RetryInfo` delay inside `[30 s, 35 s)`.
+    #[test]
+    fn service_held_status_is_unavailable_naming_the_incident_with_the_held_detail() {
+        let status = RefusalDetail::service_held_status(Some("20261013t1708-a3f9"));
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        assert_eq!(
+            status.message(),
+            "service is offline for disaster recovery (incident 20261013t1708-a3f9)"
+        );
+        assert_eq!(
+            error_info(&status),
+            (
+                "SERVICE_HELD".to_owned(),
+                REFUSAL_DETAIL_DOMAIN.to_owned(),
+                Vec::new()
+            )
+        );
+        let delay = status
+            .get_details_retry_info()
+            .and_then(|r| r.retry_delay)
+            .expect("a SERVICE_HELD status carries a RetryInfo delay");
+        assert!(
+            SERVICE_HELD_RETRY_DELAY.min <= delay && delay < SERVICE_HELD_RETRY_DELAY.max,
+            "{delay:?} outside {SERVICE_HELD_RETRY_DELAY:?}"
+        );
+    }
+
+    /// The marker is operator-written and may name no incident (defer-2): a
+    /// missing, empty or whitespace-only incident renders `incident unknown`,
+    /// on the status as on the bare message, and never panics.
+    #[test]
+    fn service_held_message_renders_a_missing_or_blank_incident_as_unknown() {
+        const UNKNOWN: &str = "service is offline for disaster recovery (incident unknown)";
+        for incident in [None, Some(""), Some("   "), Some("\t\n \r")] {
+            assert_eq!(service_held_message(incident), UNKNOWN, "{incident:?}");
+            let status = RefusalDetail::service_held_status(incident);
+            assert_eq!(status.message(), UNKNOWN, "{incident:?}");
+            assert_eq!(error_info(&status).0, "SERVICE_HELD", "{incident:?}");
+        }
+    }
+
+    /// Surrounding whitespace is trimmed; whitespace inside is kept.
+    #[test]
+    fn service_held_message_trims_surrounding_whitespace_only() {
+        assert_eq!(
+            service_held_message(Some("  inc 42 \n")),
+            "service is offline for disaster recovery (incident inc 42)"
+        );
+    }
+
+    /// A control character inside the incident is replaced by `U+FFFD`, one
+    /// for one, so an operator's stray newline or escape cannot reach the
+    /// `grpc-message` header raw.
+    #[test]
+    fn service_held_message_replaces_each_control_character_with_the_replacement_character() {
+        assert_eq!(
+            service_held_message(Some("a\nb\u{7}c\u{1b}[0m")),
+            "service is offline for disaster recovery (incident a\u{FFFD}b\u{FFFD}c\u{FFFD}[0m)"
+        );
+    }
+
+    /// The cap is 64 characters: an incident of exactly 64 is kept whole with
+    /// no `…`; one of 65 keeps its first 64, then `…`.
+    #[test]
+    fn service_held_message_keeps_64_characters_and_marks_a_cut_with_an_ellipsis() {
+        assert_eq!(SERVICE_HELD_INCIDENT_MAX_CHARS, 64);
+        let exact = "x".repeat(64);
+        assert_eq!(
+            service_held_message(Some(&exact)),
+            format!("service is offline for disaster recovery (incident {exact})"),
+            "an incident at the cap is not cut and carries no ellipsis"
+        );
+        let over = format!("{exact}y");
+        assert_eq!(
+            service_held_message(Some(&over)),
+            format!("service is offline for disaster recovery (incident {exact}…)"),
+            "an incident one over the cap keeps its first 64 characters, then `…`"
+        );
+        let long = "z".repeat(10_000);
+        let message = service_held_message(Some(&long));
+        assert_eq!(
+            message,
+            format!(
+                "service is offline for disaster recovery (incident {}…)",
+                "z".repeat(64)
+            ),
+            "an oversized incident is bounded whatever its length"
+        );
+    }
+
+    /// The cap counts characters, not bytes, and cuts on a character
+    /// boundary: 64 three-byte characters are kept whole; 65 keep the first
+    /// 64, then `…` — never half a character, and never a panic.
+    #[test]
+    fn service_held_message_cuts_a_multi_byte_incident_on_a_character_boundary() {
+        let exact = "火".repeat(64);
+        assert_eq!(exact.len(), 192, "precondition: 64 characters, 192 bytes");
+        assert_eq!(
+            service_held_message(Some(&exact)),
+            format!("service is offline for disaster recovery (incident {exact})")
+        );
+        let over = format!("{exact}é");
+        assert_eq!(
+            service_held_message(Some(&over)),
+            format!("service is offline for disaster recovery (incident {exact}…)")
+        );
+        // A mix whose 64th character ends past byte 64: a byte cut would land
+        // inside a character.
+        let mixed = format!("{}{}", "a".repeat(63), "éé");
+        assert_eq!(
+            service_held_message(Some(&mixed)),
+            format!(
+                "service is offline for disaster recovery (incident {}é…)",
+                "a".repeat(63)
+            )
         );
     }
 

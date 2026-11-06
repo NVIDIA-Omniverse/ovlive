@@ -1,11 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 [core]
+# Start with the schema extensions (order -100): the bootstrap's checks and the `live` resolver and
+# file-format registration must run before other extensions use USD, because OpenUSD fixes its
+# URI-resolver dispatch at the first resolver use. Apps such as Kit 111's editor use USD from
+# order-0 extensions before this one would otherwise start, and `live://` layers then never load.
+order = -100
 reloadable = false
 
 [package]
 title = "Live Services"
-version = "0.1.0"
+version = "0.2.0"
 description = "Live Services plugin lifecycle adapter; host supplies authentication and session policy."
 category = "Internal"
 

@@ -98,9 +98,11 @@
 //     `Transaction::update_hash_slot` writes a `ClusterHash::Custom(slot)` onto
 //     every queued command *including* the keyless `MULTI`, and `EXEC` goes to
 //     the connection the transaction chose.
-//   - The four WATCHed sites — `SessionStore::create_once`,
-//     `LayerStore::update_layer_once_watch`, `LayerStore::write_restored_object`
-//     and the DR residue wipe in `checkpoint::residue` — do not use
+//   - The WATCHed sites — `SessionStore::create_once`,
+//     `LayerStore::update_layer_once_watch`, `LayerStore::write_restored_object`,
+//     the DR residue wipe in `checkpoint::residue`, and the restore Job's
+//     writes (`storage::layer::dr_restore`'s batch, header and clear-flags
+//     transactions, `storage::dr_write`'s mapping compare-and-sets) — do not use
 //     `Transaction`. They send `MULTI` / `CLIENT ID` / `EXEC` as slot-pinned
 //     `CustomCommand`s inside a fred `Pipeline` (`storage::watched_txn`),
 //     because a `Transaction` replays the whole `MULTI … EXEC` onto a

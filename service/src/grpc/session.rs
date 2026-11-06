@@ -22,16 +22,16 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use fred::clients::SubscriberClient;
-use fred::interfaces::{EventInterface, PubsubInterface, SetsInterface};
+use fred::interfaces::{EventInterface, PubsubInterface};
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status};
 
 use crate::checkpoint::{SessionRecoveryHook, SessionRecoveryOutcome};
 use crate::observability::metrics::{SharedMetrics, PUBSUB_RELAY_SESSION_DELETED};
 use crate::presence::{DrainEnd, PubsubRelayReceiver};
-use crate::storage::client::{FredErrOrigin, ValkeyClient, POOL_LABEL_DATA};
+use crate::storage::client::{FredErrOrigin, POOL_LABEL_DATA};
 use crate::storage::keys::KeySchema;
-use crate::storage::session::{GhostMember, SessionMeta, SessionStore};
+use crate::storage::session::{GhostMember, GhostRetirement, SessionMeta, SessionStore};
 
 use super::auth_helpers::{
     check_read_permission_allowing_path_not_found, check_write_permission, extract_token,
@@ -201,10 +201,13 @@ pub fn session_absent_status() -> Status {
 /// 5. Insert a CancellationToken for the new session.
 ///
 /// Deadline-drop contract (b.yis sub-item 4, see `metrics_layer.rs`):
-/// non-idempotent. `SessionStore::create` commits path_index inside MULTI,
-/// then HSETs session_meta outside (different Cluster slot). A future drop
-/// between EXEC and HSET leaves an orphan path_index entry that
-/// `SessionStore::list` opportunistically cleans up on next read.
+/// non-idempotent. `SessionStore::create` commits both index members inside
+/// MULTI, then writes session_meta outside (different Cluster slot) through a
+/// script that refuses a vetoed id. A future drop between EXEC and the
+/// metadata write leaves both members with no metadata — a ghost the next
+/// `ListSessions` of the base path vetoes and removes. A drop after the write
+/// was sent leaves either a complete session or, if a walk vetoed the id
+/// first, that same ghost.
 ///
 /// **Failure logging.** Wrapper over [`create_session_inner`]; every non-OK
 /// return emits exactly one completion line through
@@ -497,26 +500,32 @@ async fn delete_session_inner(
 /// 2. Check read permission on the base path.
 /// 3. List sessions via [`SessionStore::list`] — returns both present sessions
 ///    and **ghost members** whose `session_meta` HGETALL came back empty.
-/// 4. For each ghost, orchestrate the recovery-aware cleanup decision via
-///    [`reconcile_ghost_members`]: invoke
-///    [`SessionRecoveryHook::try_recover_session`] to discriminate between a
-///    recovery candidate and a truly-orphaned member. On `Recovered` /
+/// 4. For each ghost, run [`reconcile_ghost_members`]: invoke
+///    [`SessionRecoveryHook::try_recover_session`] first. On `Recovered` /
 ///    `AlreadyPresent`, re-issue [`SessionStore::get_session_meta`] and
-///    append the recovered session to the response. On `NoCheckpoint` (the
-///    truly-orphaned-or-disabled-hook arm), SREM the member from both
-///    `path_index` and `path_names_index` — preserving today's
-///    opportunistic-cleanup behaviour for the non-recovery case. On
-///    `Error(_)`, log warn and skip the member from the response without
-///    SREM, conservatively deferring to the orphan sweep / next walk.
+///    append the recovered session to the response. On `NoCheckpoint`, or a
+///    recovery whose re-read finds nothing, retire the ghost through
+///    [`SessionStore::retire_ghost_member`]: veto the id, and only once it is
+///    vetoed (or found carrying the session deletion marker, which no
+///    metadata write gets past) release both its index members; a `PRESENT`
+///    veto means a
+///    `CreateSession` completed the id meanwhile, and the session is
+///    re-read and listed. On `Error(_)`, or any retirement failure, log a
+///    warning and keep both members for the next walk.
+/// 5. When `list` found `path_index` members the names index does not list
+///    (an empty names index included), remove the stale ones with
+///    [`SessionStore::reconcile_path_index`] (best effort).
+///
+/// **Guarantee:** a walk never removes the index members of a session that
+/// `CreateSession` answered OK for, so such a session stays listed and keeps
+/// its name reserved.
 ///
 /// **Recovery-aware contract (Epic `t1.fgj.7v`, SDD SR-2.7).** This is the
 /// one RPC that bypasses [`crate::grpc::session_cache::SessionBasePathCache::get_base_path`]
 /// (the choke point wired by the sibling Subtask for the six per-session_id
 /// handlers). Recovery is wired here directly. The `Arc<SessionRecoveryHook>`
 /// on [`LiveEditService`] short-circuits to `NoCheckpoint` when
-/// `checkpoint_enabled=false`, which preserves "SREM every ghost
-/// unconditionally" — the legacy behaviour customers depending on
-/// `checkpoint_enabled=false` still see.
+/// `checkpoint_enabled=false`, so there every ghost goes straight to the veto.
 ///
 /// **Failure logging.** Wrapper over [`list_sessions_inner`]; every non-OK
 /// return emits exactly one completion line through
@@ -595,27 +604,47 @@ async fn list_sessions_inner(
     }
 
     // List sessions from storage. `list` returns both `present` (live
-    // sessions) and `ghosts` (path-index members whose `HGETALL` came back
-    // empty). `list` itself no longer SREMs — that decision is recovery-aware
-    // and lives in `reconcile_ghost_members` below.
+    // sessions) and `ghosts` (names members whose `HGETALL` came back empty).
+    // `list` itself removes nothing — what happens to a ghost is decided in
+    // `reconcile_ghost_members` below.
     ctx.at(RpcStage::Storage);
     let result = svc.session_store.list(base_path).await?;
     let mut sessions = result.present;
 
     // Reconcile ghosts: for each empty-HGETALL member, decide between
-    // recovery (preserve + append) and SREM-as-orphan (today's behaviour
-    // for the no-checkpoint / disabled-hook case). See helper docstring
-    // for the full state machine.
+    // recovery (keep + append) and the veto-then-release retirement. See the
+    // helper's docstring for the full state machine.
     let recovered = reconcile_ghost_members(
         &svc.session_recovery,
         &svc.session_store,
-        &svc.valkey,
-        &svc.key_schema,
         base_path,
         result.ghosts,
     )
     .await;
     sessions.extend(recovered);
+
+    // Stale `path_index` members (no names member carries them): what an older
+    // build's two-command clean-up left. Best effort, and only when `list`
+    // found a `path_index` member its names read did not list.
+    if result.path_index_excess {
+        match svc.session_store.reconcile_path_index(base_path).await {
+            Ok(0) => tracing::debug!(
+                base_path = %base_path,
+                "path_index held an id the names read did not list, but no stale member was \
+                 found (a session committed between the reads)"
+            ),
+            Ok(removed) => tracing::info!(
+                base_path = %base_path,
+                removed,
+                "removed stale path_index members that no names member carries"
+            ),
+            Err(e) => tracing::warn!(
+                base_path = %base_path,
+                error = %e,
+                "stale path_index reconcile failed; the next ListSessions retries it"
+            ),
+        }
+    }
 
     let proto_sessions = sessions
         .into_iter()
@@ -636,52 +665,55 @@ async fn list_sessions_inner(
 /// (Epic `t1.fgj.7v`, SDD SR-2.7).
 ///
 /// A "ghost" is a `path_names_index` member whose `HGETALL le:{sid}:sess`
-/// returned empty during [`SessionStore::list`]. Before session-recovery this
-/// was unambiguously a true orphan and `list` SREM'd it inline. Now, the
-/// member may be either:
+/// returned empty during [`SessionStore::list`]. It may be:
 ///
 /// 1. A **recovery candidate** — a session-checkpoint exists for this
 ///    `session_id` and would restore the missing `session_meta`. Recovery
-///    preserves the path-index member; the caller re-reads
+///    keeps the members; this helper re-reads
 ///    [`SessionStore::get_session_meta`] and appends the restored session
 ///    to the response.
-/// 2. A **true orphan** — no checkpoint exists (or checkpointing is
-///    disabled). The member is SREM'd from both `path_index` and
-///    `path_names_index`, matching today's opportunistic-cleanup behaviour.
-/// 3. A **transient failure** — recovery returned `Error(_)`. The member is
-///    NOT SREM'd; we conservatively defer to the orphan sweep / next walk.
+/// 2. A **`CreateSession` in flight** — its names commit landed and its
+///    metadata write has not yet. The recovery probe runs first, and its
+///    latency usually lets the write land; the veto below settles the rest.
+/// 3. An **id nothing will complete** — no checkpoint exists (or
+///    checkpointing is disabled) and no create is in flight.
+/// 4. A **transient failure** — recovery returned `Error(_)`. Both members
+///    are kept; the next walk retries.
 ///
-/// The disabled-hook case (legacy `checkpoint_enabled=false` deployments and
-/// any future tests that construct a hook in disabled mode) flows through
-/// arm 2 — [`SessionRecoveryHook::try_recover_session`] returns
-/// `NoCheckpoint` without admission churn or store calls, and this helper
-/// SREMs the member exactly as the pre-recovery code did. This preserves
-/// the `path-index opportunistic SREM` invariant the parent Task body pins.
+/// Cases 2 and 3 cannot be told apart by a read, so on `NoCheckpoint` (or a
+/// recovery whose re-read finds nothing) this helper calls
+/// [`SessionStore::retire_ghost_member`], which atomically vetoes the id while
+/// its metadata is absent and only then releases both members. A create's
+/// metadata write refuses a vetoed id, so exactly one side wins: `PRESENT`
+/// (the create, or a recovery, completed the id; the session is re-read and
+/// listed) or `VETOED` (the id can never complete, and its members go). An id
+/// carrying the session deletion marker answers `DELETED` without a veto, and
+/// its members go too: the metadata write refuses a marked id as well. A walk
+/// therefore never removes the members of a session `CreateSession` answered
+/// OK for, and a late-landing walk command is harmless. A retirement failure
+/// keeps both members and logs a warning; the next walk repeats the veto,
+/// which is idempotent.
 ///
-/// Returns the list of [`SessionMeta`] for ghosts that recovered
-/// successfully (i.e. `Recovered` / `AlreadyPresent` followed by a non-empty
-/// `get_session_meta`). Ghosts that fell through to SREM or failed transiently
-/// are excluded from the response.
+/// The disabled-hook case (`checkpoint_enabled=false` deployments and any
+/// tests that construct a hook in disabled mode) flows through the veto —
+/// [`SessionRecoveryHook::try_recover_session`] returns `NoCheckpoint`
+/// without admission churn or store calls.
 ///
-/// **Cluster safety**: the SREMs share the `{hex(base_path)}` hash tag with
-/// the `SMEMBERS` that produced the members (both `path_index` and
-/// `path_names_index` are derived from the same `KeySchema` helpers and
-/// carry the same hash tag), so no new cross-slot operation is introduced.
+/// Returns the [`SessionMeta`] of every ghost found to be a session: recovered
+/// (`Recovered` / `AlreadyPresent` followed by a non-empty
+/// `get_session_meta`), or completed before the veto (`PRESENT` followed by a
+/// non-empty `get_session_meta`). Every other ghost is excluded from the
+/// response.
+///
+/// **Cluster safety**: the veto runs on the id's `{session_id}` slot and the
+/// release on the `{hex(base_path)}` slot the `SMEMBERS` read, each one
+/// single-slot script; no cross-slot operation is introduced.
 async fn reconcile_ghost_members(
     recovery: &Arc<SessionRecoveryHook>,
     session_store: &SessionStore,
-    valkey: &ValkeyClient,
-    keys: &KeySchema,
     base_path: &str,
     ghosts: Vec<GhostMember>,
 ) -> Vec<SessionMeta> {
-    if ghosts.is_empty() {
-        return Vec::new();
-    }
-
-    let path_names_key = keys.path_names_index(base_path);
-    let path_index_key = keys.path_index(base_path);
-
     let mut recovered = Vec::with_capacity(ghosts.len());
 
     for ghost in ghosts {
@@ -692,12 +724,10 @@ async fn reconcile_ghost_members(
                 // the same retry shape: a peer replica (or a previous
                 // admission-mutex holder on this replica) restored the
                 // session; we re-read and append. On a `Recovered` →
-                // `Ok(None)` race (DeleteSession committed between
-                // recovery and our re-read), fall through to the
-                // SREM-as-orphan arm — the path-index is the eventually-
-                // consistent source of truth and `DeleteSession` already
-                // SREM'd the legacy path_index entry on its own commit
-                // path; we just clean up the names-set composite.
+                // `Ok(None)` race (DeleteSession committed between recovery
+                // and our re-read, having removed the members itself), the
+                // ghost is retired like any other: the veto finds the
+                // metadata absent.
                 match session_store.get_session_meta(&ghost.sid).await {
                     Ok(Some(meta)) => {
                         recovered.push(meta);
@@ -706,38 +736,44 @@ async fn reconcile_ghost_members(
                         tracing::debug!(
                             session_id = %ghost.sid,
                             base_path = %base_path,
-                            "ghost recovered but session_meta missing on re-read (race with DeleteSession); SREMing as orphan",
+                            "ghost recovered but session_meta missing on re-read (race with \
+                             DeleteSession); retiring it",
                         );
-                        srem_ghost_member(valkey, &path_names_key, &path_index_key, &ghost).await;
+                        if let Some(meta) = retire_ghost(session_store, base_path, &ghost).await {
+                            recovered.push(meta);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
                             session_id = %ghost.sid,
                             base_path = %base_path,
                             error = %e,
-                            "ghost recovered but get_session_meta re-read failed; skipping member from response (no SREM)",
+                            "ghost recovered but get_session_meta re-read failed; skipping member \
+                             from response (members kept)",
                         );
                     }
                 }
             }
             SessionRecoveryOutcome::NoCheckpoint => {
-                // Truly-orphaned member (or checkpointing disabled). SREM
-                // from both indices — preserves the pre-recovery
-                // opportunistic-cleanup behaviour exactly.
-                srem_ghost_member(valkey, &path_names_key, &path_index_key, &ghost).await;
+                // No checkpoint (or checkpointing disabled): either a create
+                // still in flight or an id nothing will complete. The veto
+                // decides which.
+                if let Some(meta) = retire_ghost(session_store, base_path, &ghost).await {
+                    recovered.push(meta);
+                }
             }
             SessionRecoveryOutcome::Error(err) => {
-                // Conservative: do NOT SREM on a transient or permanent
+                // Conservative: keep both members on a transient or permanent
                 // recovery-side error. The member is excluded from the
                 // response (we have no `session_meta` to populate the
-                // proto), but the path-index keeps the member so the next
-                // walk retries. Permanent errors are rare and best handled
-                // by the orphan sweep with full operator visibility.
+                // proto), but the names index keeps it so the next walk
+                // retries.
                 tracing::warn!(
                     session_id = %ghost.sid,
                     base_path = %base_path,
                     error = %err,
-                    "session recovery failed for ghost member; skipping (no SREM, next walk will retry)",
+                    "session recovery failed for ghost member; skipping (members kept, next walk \
+                     will retry)",
                 );
             }
         }
@@ -746,41 +782,60 @@ async fn reconcile_ghost_members(
     recovered
 }
 
-/// Issue the two SREMs that retire a truly-orphaned ghost member from both
-/// the legacy `path_index` and the authoritative `path_names_index`.
+/// Retire one ghost through [`SessionStore::retire_ghost_member`] and return
+/// its metadata when the veto found the id to be a session after all.
 ///
-/// Errors on either SREM are logged but not surfaced — the indices may
-/// already have been cleaned by a peer sweeper or a concurrent
-/// `DeleteSession`. The post-fix b.91j C-7 contract treats either entry
-/// being absent as a benign race. A command timeout is still counted on
-/// `valkey_errors_total{pool="data", kind="command_timeout"}`.
-async fn srem_ghost_member(
-    valkey: &ValkeyClient,
-    path_names_key: &str,
-    path_index_key: &str,
+/// - `Present` → re-read the metadata and return it, so the session is listed.
+///   A re-read that finds nothing (a `DeleteSession` in between) or fails
+///   lists nothing; the members stay for that delete or the next walk.
+/// - `Retired` → the id is vetoed (or carries the deletion marker) and both
+///   members are released (DEBUG log).
+/// - A failure → both members kept, WARN; the next walk repeats the veto.
+async fn retire_ghost(
+    session_store: &SessionStore,
+    base_path: &str,
     ghost: &GhostMember,
-) {
-    let pool = &valkey.pool;
-    let origin = FredErrOrigin::client(valkey, POOL_LABEL_DATA);
-    if let Err(e) = pool
-        .srem::<(), _, _>(path_names_key, ghost.composite_member.clone())
-        .await
-    {
-        origin.observe_error(&e);
-        tracing::warn!(
-            session_id = %ghost.sid,
-            member = %ghost.composite_member,
-            error = %e,
-            "failed to SREM orphaned path_names_index entry",
-        );
-    }
-    if let Err(e) = pool.srem::<(), _, _>(path_index_key, &ghost.sid).await {
-        origin.observe_error(&e);
-        tracing::warn!(
-            session_id = %ghost.sid,
-            error = %e,
-            "failed to SREM orphaned path_index entry",
-        );
+) -> Option<SessionMeta> {
+    match session_store.retire_ghost_member(base_path, ghost).await {
+        Ok(GhostRetirement::Present) => match session_store.get_session_meta(&ghost.sid).await {
+            Ok(Some(meta)) => Some(meta),
+            Ok(None) => {
+                tracing::debug!(
+                    session_id = %ghost.sid,
+                    base_path = %base_path,
+                    "ghost's metadata appeared before the veto but is gone on re-read (race with \
+                     DeleteSession); not listing it",
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id = %ghost.sid,
+                    base_path = %base_path,
+                    error = %e,
+                    "ghost's metadata appeared before the veto but the re-read failed; skipping \
+                     it from the response (members kept)",
+                );
+                None
+            }
+        },
+        Ok(GhostRetirement::Retired) => {
+            tracing::debug!(
+                session_id = %ghost.sid,
+                base_path = %base_path,
+                "retired a ghost session id (vetoed, or deleted) and released its index members",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %ghost.sid,
+                base_path = %base_path,
+                error = %e,
+                "failed to retire a ghost names member; keeping it (the next walk retries)",
+            );
+            None
+        }
     }
 }
 
@@ -959,7 +1014,8 @@ pub async fn acquire_session_cancel(
         Ok(resolved) => resolved,
         // Elapsed: the recovery future is dropped, which releases the hook's
         // admission entry and abandons its checkpoint fetch. A drop between
-        // the apply's two transactions leaves only the path-index half, the
+        // the apply's two steps (Step A's transaction and the record step's
+        // script) leaves only the path-index half, the
         // partial state that apply is ordered to self-heal from (SR-2.7). No
         // evidence either way, so cancel nothing (as on a transient error,
         // below).
@@ -2068,24 +2124,41 @@ mod tests {
     // above:
     //
     //   - Recovery-hook-disabled (checkpoint_enabled=false) fallback
-    //     -> SREM ghosts unconditionally (today's behaviour).
-    //   - All members present -> no recovery attempts, no SREMs.
-    //   - Ghost with checkpoint -> Recovered, member preserved, re-read
+    //     -> every ghost is vetoed and both its members released.
+    //   - All members present -> no recovery attempts, no store writes.
+    //   - Ghost with checkpoint -> Recovered, members kept, re-read
     //     `session_meta` appended to the response.
-    //   - Ghost without checkpoint -> SREM as today; metric ticks
+    //   - Ghost without checkpoint -> vetoed and released; metric ticks
     //     `not_recoverable`.
-    //   - Mixed ghost set (recoverable + truly-orphaned + Transient-error) ->
-    //     response includes recovered; SREMs no-checkpoint only; warn logged
-    //     for transient.
+    //   - Mixed ghost set (recoverable + id nothing completes +
+    //     Transient-error) -> response includes recovered; only the
+    //     no-checkpoint ghost is retired; the errored one keeps its members and
+    //     gets no veto.
     //   - Empty path-index -> no recovery probes, response empty.
-    //   - Ghost with Permanent error -> preserved (not SREM'd), excluded from
-    //     response, warn logged.
-    //   - Recovered -> Ok(None) race (recovery commits then DeleteSession runs
-    //     before re-read) -> fall through to SREM as if NoCheckpoint.
-    //   - Cluster slot safety: deferred to Task 7 `t2.fgj.7v.o7` per Subtask
-    //     body. The SREMs share the `{hex(base_path)}` hash tag with the
-    //     SMEMBERS that produced the members, so no new cross-slot operation
-    //     is introduced; verified by inspection at the call site.
+    //   - Ghost with Permanent error -> members kept, excluded from response.
+    //   - `SessionStore::retire_ghost_member` directly: `VETOED` releases both
+    //     members and is idempotent; `PRESENT` writes nothing.
+    //   - b.2tu: a `CreateSession` between its names commit and its metadata
+    //     write (staged with `SessionStore::with_post_commit_hook_for_test`)
+    //     racing the walk, and a recovery landing between the walk's read and
+    //     its veto. Whichever of the metadata write and the veto lands first
+    //     wins, and a session `CreateSession` answered OK for is never
+    //     removed.
+    //   - Not covered, for want of a seam: the `Recovered -> Ok(None)` arm
+    //     (DeleteSession between the recovery and the re-read; it retires the
+    //     ghost through the same `retire_ghost` as `NoCheckpoint`), and
+    //     `retire_ghost`'s `Present` -> `get_session_meta` -> `Ok(None)` arm
+    //     (a DeleteSession between the veto and the re-read; it lists
+    //     nothing). Nor is the handler's arm for a failed
+    //     `reconcile_path_index`: a wrong-typed names key fails `list` first,
+    //     and a wrong-typed `path_index` reads as no excess, so the reconcile
+    //     is never reached. The walk's other failure paths (a
+    //     refused veto, a refused release, an unreadable `path_index`) are in
+    //     `tests/integration/storage/b_2tu_tests.rs`.
+    //   - Cluster slot safety: the veto runs on the `{session_id}` slot and the
+    //     release on the `{hex(base_path)}` slot, each one single-slot script;
+    //     `tests/integration/storage/b_2tu_tests.rs` runs all four session
+    //     scripts on a cluster (`b_2tu_session_scripts_run_on_a_cluster`).
     use crate::checkpoint::adapters::in_memory::InMemoryCheckpointStore;
     use crate::checkpoint::session_payload::SessionCheckpoint;
     use crate::checkpoint::store::{
@@ -2094,12 +2167,14 @@ mod tests {
     use crate::checkpoint::SessionRecoveryHook;
     use crate::config::Config;
     use crate::observability::metrics::{metrics_scrape_only, SharedMetrics};
-    use crate::storage::session::SessionStore;
-    use crate::storage::test_support::TestValkey;
+    use crate::storage::keys::SESSION_META_VETO_TTL_MS;
+    use crate::storage::session::{PostCommitHook, SessionStore};
+    use crate::storage::test_support::{release_all, ConnStall, TestValkey};
     use async_trait::async_trait;
     use bytes::Bytes;
-    use fred::interfaces::{HashesInterface, SetsInterface};
+    use fred::interfaces::{HashesInterface, KeysInterface, SetsInterface};
     use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::time::Duration;
 
     /// Distinguishing label so test-only metric reads do not collide with
     /// hooks built in another `tokio::test` running concurrently.
@@ -2129,7 +2204,6 @@ mod tests {
 
     fn test_config(enabled: bool) -> Config {
         Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -2211,6 +2285,10 @@ mod tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs: super::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: enabled,
             checkpoint_adapter: crate::checkpoint::CheckpointAdapter::InMemory,
@@ -2331,7 +2409,7 @@ mod tests {
     /// Test-only `CheckpointStore` whose `get_session_checkpoint` returns a
     /// classified error on demand. The recovery hook surfaces the error
     /// verbatim through `SessionRecoveryOutcome::Error`, which the
-    /// reconcile helper must classify as "skip, do not SREM".
+    /// reconcile helper must classify as "skip, keep both members, no veto".
     struct ClassifiedErrorStore {
         err: fn() -> CheckpointError,
     }
@@ -2416,13 +2494,12 @@ mod tests {
     }
 
     // ─── Test 1 — Recovery-hook-disabled (checkpoint_enabled=false) ──────
-    // Pins the backward-compat invariant: when checkpointing is disabled,
-    // `try_recover_session` short-circuits to `NoCheckpoint` and the
-    // reconcile helper SREMs every ghost — exactly today's behaviour for
-    // `checkpoint_enabled=false` deployments and any future test that
-    // builds a hook in disabled mode.
+    // When checkpointing is disabled, `try_recover_session` short-circuits to
+    // `NoCheckpoint`, and the reconcile helper retires every ghost: it vetoes
+    // the id (the veto key is written with its TTL) and only then releases
+    // both index members.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconcile_disabled_hook_srems_every_ghost() {
+    async fn reconcile_disabled_hook_vetoes_and_releases_every_ghost() {
         let tv = TestValkey::setup().await;
         let base_path = "/disabled-stage";
         let sid_orphan = format!("ghost-{}", uuid::Uuid::new_v4());
@@ -2442,21 +2519,14 @@ mod tests {
         let hook = build_hook(&tv, store, metrics.clone(), false);
         let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
 
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            base_path,
-            result.ghosts,
-        )
-        .await;
+        let recovered =
+            reconcile_ghost_members(&hook, &session_store, base_path, result.ghosts).await;
         assert!(
             recovered.is_empty(),
             "disabled hook surfaces no recovered sessions",
         );
 
-        // Both indices have been SREM'd of the ghost member.
+        // Both index members have been released.
         let path_index_members: Vec<String> = tv
             .client()
             .pool
@@ -2465,7 +2535,7 @@ mod tests {
             .expect("SMEMBERS path_index");
         assert!(
             !path_index_members.contains(&sid_orphan),
-            "ghost MUST be SREM'd from path_index on disabled-hook path"
+            "ghost MUST be released from path_index on disabled-hook path"
         );
 
         let path_names_members: Vec<String> = tv
@@ -2477,8 +2547,11 @@ mod tests {
         let composite = KeySchema::path_name_member("ghost-name", &sid_orphan);
         assert!(
             !path_names_members.contains(&composite),
-            "ghost MUST be SREM'd from path_names_index on disabled-hook path"
+            "ghost MUST be released from path_names_index on disabled-hook path"
         );
+        // ...and only after the id was vetoed, so no late metadata write can
+        // complete it.
+        assert_vetoed(&tv, &sid_orphan).await;
 
         // Disabled hook short-circuits without ticking any cell.
         assert_eq!(metric_value(&metrics, "restored"), 0);
@@ -2499,15 +2572,7 @@ mod tests {
         let hook = build_hook(&tv, store, metrics.clone(), true);
         let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
 
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            "/empty",
-            Vec::new(),
-        )
-        .await;
+        let recovered = reconcile_ghost_members(&hook, &session_store, "/empty", Vec::new()).await;
         assert!(recovered.is_empty());
 
         // No metric cell ticked.
@@ -2525,7 +2590,8 @@ mod tests {
     // ─── Test 3 — Ghost with checkpoint -> Recovered, member preserved ───
     // Seeds a session-checkpoint, surfaces the ghost from `list`, drives
     // reconcile, asserts the session is materialised + appended to
-    // `recovered`, and asserts the path-index member is NOT SREM'd.
+    // `recovered`, and asserts both index members are kept (no veto, no
+    // release).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_ghost_with_checkpoint_recovers_and_preserves_member() {
         let tv = TestValkey::setup().await;
@@ -2554,15 +2620,8 @@ mod tests {
         assert_eq!(result.present.len(), 0, "no live sessions before recovery");
         assert_eq!(result.ghosts.len(), 1);
 
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            base_path,
-            result.ghosts,
-        )
-        .await;
+        let recovered =
+            reconcile_ghost_members(&hook, &session_store, base_path, result.ghosts).await;
 
         assert_eq!(recovered.len(), 1, "Recovered ghost must be appended");
         assert_eq!(recovered[0].session_id, sid);
@@ -2581,8 +2640,8 @@ mod tests {
             .expect("HGET name");
         assert_eq!(stored_name.as_deref(), Some("recover-name"));
 
-        // Member MUST NOT have been SREM'd from either index — recovery
-        // is the "preserve" path.
+        // Neither member may have been released — recovery is the "keep"
+        // path, which never reaches the veto or the release.
         let path_index_members: Vec<String> = tv
             .client()
             .pool
@@ -2610,12 +2669,12 @@ mod tests {
         assert_eq!(metric_value(&metrics, "error"), 0);
     }
 
-    // ─── Test 4 — Ghost without checkpoint -> SREM + `not_recoverable` tick
-    // Pins today's opportunistic-cleanup behaviour on the no-checkpoint
-    // arm; metric ticks `not_recoverable` (harmonised vocabulary with
-    // Epic 1).
+    // ─── Test 4 — Ghost without checkpoint -> veto + release, `not_recoverable`
+    // The no-checkpoint arm retires the ghost (veto, then both members
+    // released); the metric ticks `not_recoverable` (harmonised vocabulary
+    // with Epic 1).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconcile_ghost_without_checkpoint_srems_and_ticks_not_recoverable() {
+    async fn reconcile_ghost_without_checkpoint_vetoes_releases_and_ticks_not_recoverable() {
         let tv = TestValkey::setup().await;
         let base_path = "/no-cp";
         let sid = format!("no-cp-{}", uuid::Uuid::new_v4());
@@ -2628,21 +2687,15 @@ mod tests {
         let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
 
         let result = session_store.list(base_path).await.expect("list");
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            base_path,
-            result.ghosts,
-        )
-        .await;
+        let recovered =
+            reconcile_ghost_members(&hook, &session_store, base_path, result.ghosts).await;
         assert!(
             recovered.is_empty(),
             "no checkpoint -> no recovered session"
         );
 
-        // Both indices SREM'd of the ghost.
+        // Both index members released, after the veto.
+        assert_vetoed(&tv, &sid).await;
         let path_index_members: Vec<String> = tv
             .client()
             .pool
@@ -2662,10 +2715,10 @@ mod tests {
         assert_eq!(metric_value(&metrics, "restored"), 0);
     }
 
-    // ─── Test 5 — Mixed ghost set: recoverable + truly-orphan + transient
-    // Asserts the response contains the recovered session, the
-    // truly-orphan member is SREM'd, and the transient-error member is
-    // preserved (not SREM'd).
+    // ─── Test 5 — Mixed ghost set: recoverable + no checkpoint + transient
+    // Asserts the response contains the recovered session, the no-checkpoint
+    // ghost is retired, and the transient-error ghost keeps its members and
+    // gets no veto.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_mixed_ghosts_handles_each_arm_correctly() {
         // We can't easily mix all three arms against a single
@@ -2688,19 +2741,12 @@ mod tests {
         let hook_a = build_hook(&tv_a, in_mem_a, metrics_a.clone(), true);
         let session_store_a = SessionStore::new(tv_a.client().clone(), tv_a.key_schema().clone());
         let result_a = session_store_a.list(base_a).await.expect("list a");
-        let recovered_a = reconcile_ghost_members(
-            &hook_a,
-            &session_store_a,
-            tv_a.client(),
-            tv_a.key_schema(),
-            base_a,
-            result_a.ghosts,
-        )
-        .await;
+        let recovered_a =
+            reconcile_ghost_members(&hook_a, &session_store_a, base_a, result_a.ghosts).await;
         assert_eq!(recovered_a.len(), 1);
         assert_eq!(recovered_a[0].session_id, sid_a);
 
-        // Arm B: truly-orphan ghost (no checkpoint, hook enabled).
+        // Arm B: a ghost no checkpoint restores (hook enabled).
         let tv_b = TestValkey::setup().await;
         let base_b = "/mixed-b";
         let sid_b = format!("mix-b-{}", uuid::Uuid::new_v4());
@@ -2710,15 +2756,8 @@ mod tests {
         let hook_b = build_hook(&tv_b, store_b, metrics_b.clone(), true);
         let session_store_b = SessionStore::new(tv_b.client().clone(), tv_b.key_schema().clone());
         let result_b = session_store_b.list(base_b).await.expect("list b");
-        let recovered_b = reconcile_ghost_members(
-            &hook_b,
-            &session_store_b,
-            tv_b.client(),
-            tv_b.key_schema(),
-            base_b,
-            result_b.ghosts,
-        )
-        .await;
+        let recovered_b =
+            reconcile_ghost_members(&hook_b, &session_store_b, base_b, result_b.ghosts).await;
         assert!(recovered_b.is_empty());
         let path_index_b: Vec<String> = tv_b
             .client()
@@ -2726,7 +2765,10 @@ mod tests {
             .smembers(tv_b.key_schema().path_index(base_b))
             .await
             .expect("SMEMBERS b");
-        assert!(!path_index_b.contains(&sid_b), "no-checkpoint ghost SREM'd");
+        assert!(
+            !path_index_b.contains(&sid_b),
+            "no-checkpoint ghost released"
+        );
 
         // Arm C: transient-error ghost (store returns Transient).
         let tv_c = TestValkey::setup().await;
@@ -2742,20 +2784,14 @@ mod tests {
         let hook_c = build_hook(&tv_c, transient_store, metrics_c.clone(), true);
         let session_store_c = SessionStore::new(tv_c.client().clone(), tv_c.key_schema().clone());
         let result_c = session_store_c.list(base_c).await.expect("list c");
-        let recovered_c = reconcile_ghost_members(
-            &hook_c,
-            &session_store_c,
-            tv_c.client(),
-            tv_c.key_schema(),
-            base_c,
-            result_c.ghosts,
-        )
-        .await;
+        let recovered_c =
+            reconcile_ghost_members(&hook_c, &session_store_c, base_c, result_c.ghosts).await;
         assert!(
             recovered_c.is_empty(),
             "transient -> excluded from response"
         );
-        // Transient -> preserved (not SREM'd) so next walk retries.
+        // Transient -> both members kept, and no veto written, so the next
+        // walk retries the recovery.
         let path_index_c: Vec<String> = tv_c
             .client()
             .pool
@@ -2764,8 +2800,9 @@ mod tests {
             .expect("SMEMBERS c");
         assert!(
             path_index_c.contains(&sid_c),
-            "transient-error ghost MUST NOT be SREM'd; next walk retries"
+            "transient-error ghost MUST keep its path_index member; next walk retries"
         );
+        assert_no_veto(&tv_c, &sid_c).await;
         assert_eq!(metric_value(&metrics_c, "error"), 1);
     }
 
@@ -2784,15 +2821,8 @@ mod tests {
         assert!(result.present.is_empty());
         assert!(result.ghosts.is_empty());
 
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            "/totally-empty",
-            result.ghosts,
-        )
-        .await;
+        let recovered =
+            reconcile_ghost_members(&hook, &session_store, "/totally-empty", result.ghosts).await;
         assert!(recovered.is_empty());
 
         // No metric ticked, no admission entry created.
@@ -2803,7 +2833,7 @@ mod tests {
         assert_eq!(hook.admission_len(), 0);
     }
 
-    // ─── Test 7 — Permanent error: ghost preserved (not SREM'd), excluded
+    // ─── Test 7 — Permanent error: both members kept, no veto, excluded
     // from response, metric ticks `error`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_permanent_error_skips_member_without_srem() {
@@ -2823,15 +2853,8 @@ mod tests {
         let session_store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
 
         let result = session_store.list(base_path).await.expect("list");
-        let recovered = reconcile_ghost_members(
-            &hook,
-            &session_store,
-            tv.client(),
-            tv.key_schema(),
-            base_path,
-            result.ghosts,
-        )
-        .await;
+        let recovered =
+            reconcile_ghost_members(&hook, &session_store, base_path, result.ghosts).await;
         assert!(recovered.is_empty(), "permanent -> excluded from response");
 
         let path_index: Vec<String> = tv
@@ -2842,7 +2865,7 @@ mod tests {
             .expect("SMEMBERS path_index");
         assert!(
             path_index.contains(&sid),
-            "permanent-error ghost MUST NOT be SREM'd; defer to orphan sweep"
+            "permanent-error ghost MUST keep its path_index member; the next walk retries"
         );
         let path_names: Vec<String> = tv
             .client()
@@ -2852,79 +2875,636 @@ mod tests {
             .expect("SMEMBERS path_names_index");
         assert!(
             path_names.contains(&KeySchema::path_name_member("perm-name", &sid)),
-            "permanent-error ghost composite MUST NOT be SREM'd"
+            "permanent-error ghost MUST keep its names member"
         );
+        assert_no_veto(&tv, &sid).await;
 
         assert_eq!(metric_value(&metrics, "error"), 1);
     }
 
-    // ─── Test 8 — Recovered -> Ok(None) race -> SREM as orphan.
+    // ─── Test 8 — `SessionStore::retire_ghost_member`, driven directly ────
     //
-    // Direct unit-test of [`srem_ghost_member`] — the dispatch target for
-    // the `Recovered -> Ok(None)` arm of [`reconcile_ghost_members`] (the
-    // race where DeleteSession commits between the recovery's
-    // session_meta write and the reconcile re-read; see helper match-arm
-    // at the call site). The arm is not reachable end-to-end in a unit
-    // test without a fault-injection seam on `SessionRecoveryHook`
-    // (admission + apply run synchronously inside the helper, so we
-    // cannot interpose a DEL between them). The next-best discipline is
-    // to assert the SREM target is correct: both indices SREM the
-    // composite + bare session_id, and the call is idempotent under
-    // the "either index may already be cleaned" benign race.
-    //
-    // The full end-to-end race is covered by Task 7's `t2.fgj.7v.o7`
-    // integration test, per Subtask body's deferral.
-    //
-    // Inspection invariants pinned by this test:
-    //   1. `path_names_index` SREM uses the `name\0session_id` composite.
-    //   2. `path_index` SREM uses the bare `session_id`.
-    //   3. The helper is tolerant of either index being absent.
+    // The retirement every ghost the walk gives up goes through (the
+    // `NoCheckpoint` arm and the `Recovered -> Ok(None)` arm alike):
+    //   1. `VETOED` → the veto is written, then both members are released —
+    //      the `path_index` member by the bare `session_id`, the names member
+    //      by its `name\0session_id` composite. A second run is a no-op that
+    //      answers `Retired` again (the veto is refreshed, the release finds
+    //      nothing).
+    //   2. `PRESENT` → the id has metadata: nothing is written, no veto, both
+    //      members kept.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn srem_ghost_member_clears_both_indices_and_is_idempotent() {
+    async fn retire_ghost_member_vetoes_then_releases_both_members_and_is_idempotent() {
         let tv = TestValkey::setup().await;
         let base_path = "/race-stage";
         let sid = format!("race-{}", uuid::Uuid::new_v4());
-
-        // Seed the ghost in both indices.
         seed_ghost(&tv, base_path, "race-name", &sid).await;
-
-        let composite = KeySchema::path_name_member("race-name", &sid);
         let ghost = GhostMember {
             name: "race-name".to_string(),
             sid: sid.clone(),
-            composite_member: composite.clone(),
+            composite_member: KeySchema::path_name_member("race-name", &sid),
         };
-        let path_names_key = tv.key_schema().path_names_index(base_path);
-        let path_index_key = tv.key_schema().path_index(base_path);
+        let store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
 
-        // Drive the SREM helper directly.
-        super::srem_ghost_member(tv.client(), &path_names_key, &path_index_key, &ghost).await;
-
-        // Both indices SREM'd of the ghost.
-        let path_index_members: Vec<String> = tv
-            .client()
-            .pool
-            .smembers(&path_index_key)
+        let retired = store
+            .retire_ghost_member(base_path, &ghost)
             .await
-            .expect("SMEMBERS path_index");
-        assert!(
-            !path_index_members.contains(&sid),
-            "path_index member MUST be removed by srem_ghost_member"
-        );
-        let path_names_members: Vec<String> = tv
-            .client()
-            .pool
-            .smembers(&path_names_key)
-            .await
-            .expect("SMEMBERS path_names_index");
-        assert!(
-            !path_names_members.contains(&composite),
-            "path_names_index composite MUST be removed by srem_ghost_member"
+            .expect("retire_ghost_member must succeed on a healthy store");
+        assert_eq!(retired, GhostRetirement::Retired);
+        assert_vetoed(&tv, &sid).await;
+        assert_eq!(
+            index_members(&tv, base_path, "race-name", &sid).await,
+            (false, false),
+            "a retired ghost loses both its path_index and its names member"
         );
 
-        // Idempotency: calling again is safe (either index may already
-        // be cleaned by a peer sweeper — preserves the "log-and-continue"
-        // contract on missing-member SREM).
-        super::srem_ghost_member(tv.client(), &path_names_key, &path_index_key, &ghost).await;
+        let again = store
+            .retire_ghost_member(base_path, &ghost)
+            .await
+            .expect("a repeated retirement must succeed");
+        assert_eq!(
+            again,
+            GhostRetirement::Retired,
+            "retiring an id whose members are already gone is a no-op that answers Retired"
+        );
+        assert_vetoed(&tv, &sid).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_ghost_member_answers_present_and_writes_nothing_for_a_complete_session() {
+        let tv = TestValkey::setup().await;
+        let base_path = "/present-stage";
+        let store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+        let sid = store
+            .create("present-name", base_path, "present-user")
+            .await
+            .expect("fixture session creation must succeed");
+        let ghost = GhostMember {
+            name: "present-name".to_string(),
+            sid: sid.clone(),
+            composite_member: KeySchema::path_name_member("present-name", &sid),
+        };
+
+        let retired = store
+            .retire_ghost_member(base_path, &ghost)
+            .await
+            .expect("retire_ghost_member must succeed on a healthy store");
+        assert_eq!(
+            retired,
+            GhostRetirement::Present,
+            "an id with metadata is a session, never a ghost to retire"
+        );
+        assert_no_veto(&tv, &sid).await;
+        assert_eq!(
+            index_members(&tv, base_path, "present-name", &sid).await,
+            (true, true),
+            "PRESENT writes nothing: both members stay"
+        );
+    }
+
+    // ─── b.2tu — the walk racing a CreateSession or a recovery ───────────
+    //
+    // A `CreateSession` writes its two index members in its commit and its
+    // metadata after it; the walk reads a names member with no metadata as a
+    // ghost. Both now settle on the id's `{session_id}` slot: the create's
+    // metadata write (`session_meta_write.lua`) refuses a vetoed id, and the
+    // walk's veto (`session_meta_veto.lua`) answers `PRESENT` once metadata
+    // exists. The create is parked between its commit and its metadata write
+    // with `SessionStore::with_post_commit_hook_for_test` ([`PausedCreate`]);
+    // the walk is driven as its two halves, `SessionStore::list` and then
+    // `reconcile_ghost_members`, so either side can be made to land first.
+    // Every walk here runs with a disabled recovery hook (`NoCheckpoint`, no
+    // store calls), so the veto is the walk's first command after its read.
+
+    /// Bound on every wait in the b.2tu race tests: a parked create reaching
+    /// its hook, a walker command reaching its stalled connection, a create
+    /// finishing. Unreachable on a healthy store; well inside nextest's 120 s
+    /// hang-killer.
+    const RACE_BUDGET: Duration = Duration::from_secs(20);
+
+    /// Poll interval for the waits bounded by [`RACE_BUDGET`].
+    const RACE_POLL: Duration = Duration::from_millis(5);
+
+    /// Assert `session_id` carries the metadata veto: `1`, with a TTL in
+    /// (0, [`SESSION_META_VETO_TTL_MS`]].
+    async fn assert_vetoed(tv: &TestValkey, session_id: &str) {
+        let key = tv.key_schema().session_meta_veto(session_id);
+        let value: Option<String> = tv.client().pool.get(&key).await.expect("GET veto");
+        assert_eq!(
+            value.as_deref(),
+            Some("1"),
+            "{session_id} must carry the metadata veto"
+        );
+        let pttl: i64 = tv.client().pool.pttl(&key).await.expect("PTTL veto");
+        assert!(
+            pttl > 0 && pttl <= SESSION_META_VETO_TTL_MS as i64,
+            "the veto must carry its TTL, at most {SESSION_META_VETO_TTL_MS} ms; got {pttl}"
+        );
+    }
+
+    /// Assert `session_id` carries no metadata veto.
+    async fn assert_no_veto(tv: &TestValkey, session_id: &str) {
+        let found: i64 = tv
+            .client()
+            .pool
+            .exists(tv.key_schema().session_meta_veto(session_id))
+            .await
+            .expect("EXISTS veto");
+        assert_eq!(found, 0, "{session_id} must carry no metadata veto");
+    }
+
+    /// Whether `base_path`'s `path_index` holds `session_id`, and whether its
+    /// names index holds `name\0session_id`.
+    async fn index_members(
+        tv: &TestValkey,
+        base_path: &str,
+        name: &str,
+        session_id: &str,
+    ) -> (bool, bool) {
+        let in_index: bool = tv
+            .client()
+            .pool
+            .sismember(tv.key_schema().path_index(base_path), session_id)
+            .await
+            .expect("SISMEMBER path_index");
+        let in_names: bool = tv
+            .client()
+            .pool
+            .sismember(
+                tv.key_schema().path_names_index(base_path),
+                KeySchema::path_name_member(name, session_id),
+            )
+            .await
+            .expect("SISMEMBER path_names_index");
+        (in_index, in_names)
+    }
+
+    /// Whether `session_id` has metadata.
+    async fn has_meta(tv: &TestValkey, session_id: &str) -> bool {
+        let found: i64 = tv
+            .client()
+            .pool
+            .exists(tv.key_schema().session_meta(session_id))
+            .await
+            .expect("EXISTS session_meta");
+        found == 1
+    }
+
+    /// A post-commit hook ([`SessionStore::with_post_commit_hook_for_test`])
+    /// that parks the store's FIRST `finish_create` — after its names commit,
+    /// before its metadata write — until [`Self::release`], and records every
+    /// attempt's `session_id`. Later attempts pass straight through.
+    #[derive(Clone, Default)]
+    struct PausedCreate {
+        ids: Arc<std::sync::Mutex<Vec<String>>>,
+        paused: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl PausedCreate {
+        fn hook(&self) -> PostCommitHook {
+            use futures::FutureExt;
+            let gate = self.clone();
+            Arc::new(move |session_id: String| {
+                let gate = gate.clone();
+                async move {
+                    let first = {
+                        let mut ids = gate.ids.lock().unwrap();
+                        ids.push(session_id);
+                        ids.len() == 1
+                    };
+                    if first {
+                        gate.paused.notify_one();
+                        gate.release.notified().await;
+                    }
+                }
+                .boxed()
+            })
+        }
+
+        /// Wait for the first attempt to park; returns its `session_id`.
+        async fn wait_paused(&self) -> String {
+            tokio::time::timeout(RACE_BUDGET, self.paused.notified())
+                .await
+                .expect("the create never reached its metadata write");
+            self.ids.lock().unwrap()[0].clone()
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+
+        /// Every attempt's `session_id` that reached `finish_create`, in order.
+        fn attempts(&self) -> Vec<String> {
+            self.ids.lock().unwrap().clone()
+        }
+    }
+
+    /// A hook in disabled mode: `try_recover_session` answers `NoCheckpoint`
+    /// without a store call, so a walk's first command after its read is the
+    /// veto.
+    fn disabled_hook(tv: &TestValkey) -> Arc<SessionRecoveryHook> {
+        build_hook(
+            tv,
+            Arc::new(InMemoryCheckpointStore::new()),
+            make_metrics(),
+            false,
+        )
+    }
+
+    /// b.2tu I1 — a walk that read a `CreateSession` as a ghost reaches its
+    /// veto only after the create wrote its metadata and answered OK: the veto
+    /// finds the metadata (`PRESENT`), writes nothing, and the walk lists the
+    /// session. Both members stay, so the name stays reserved.
+    ///
+    /// Pre-fix the walk `SREM`ed both members of the completed session: it
+    /// vanished from ListSessions and a second session could take its name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_ghost_completed_by_its_create_before_the_veto_is_kept_and_listed() {
+        const NAME: &str = "b2tu-i1";
+        const BASE_PATH: &str = "/b2tu-i1";
+        let tv = TestValkey::setup().await;
+        let gate = PausedCreate::default();
+        let creator = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+            .with_post_commit_hook_for_test(gate.hook());
+        let walker = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+
+        // The walk reads while the create is parked, then lets it finish.
+        let (created, (paused_id, listed)) = tokio::join!(
+            tokio::time::timeout(RACE_BUDGET, creator.create(NAME, BASE_PATH, "b2tu-user")),
+            async {
+                let paused_id = gate.wait_paused().await;
+                let listed = walker.list(BASE_PATH).await.expect("the walk's list");
+                gate.release();
+                (paused_id, listed)
+            }
+        );
+        let session_id = created
+            .expect("the create did not finish within the budget")
+            .expect("the create must answer OK: nothing vetoed it");
+        assert_eq!(session_id, paused_id, "no retry: one attempt, this id");
+        assert_eq!(gate.attempts(), vec![session_id.clone()]);
+        assert!(
+            listed.present.is_empty(),
+            "the parked create has no metadata yet"
+        );
+        assert_eq!(
+            listed
+                .ghosts
+                .iter()
+                .map(|g| g.sid.as_str())
+                .collect::<Vec<_>>(),
+            vec![session_id.as_str()],
+            "the walk read the parked create as a ghost"
+        );
+
+        // The walk's veto now runs against the completed session.
+        let kept =
+            reconcile_ghost_members(&disabled_hook(&tv), &walker, BASE_PATH, listed.ghosts).await;
+
+        assert_eq!(
+            kept.iter()
+                .map(|m| (m.session_id.as_str(), m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(session_id.as_str(), NAME)],
+            "the veto found the metadata, so the walk lists the session"
+        );
+        assert_no_veto(&tv, &session_id).await;
+        assert_eq!(
+            index_members(&tv, BASE_PATH, NAME, &session_id).await,
+            (true, true),
+            "the walk must keep both members of a session CreateSession answered OK for"
+        );
+        let duplicate = walker.create(NAME, BASE_PATH, "b2tu-user").await;
+        assert!(
+            matches!(duplicate, Err(ServiceError::AlreadyExists(_))),
+            "the completed session still holds its name; got {duplicate:?}"
+        );
+    }
+
+    /// b.2tu I2 — a walk that vetoes a parked `CreateSession` before its
+    /// metadata write wins: the walk releases both members, the create's
+    /// metadata write is refused, and the create retries under a new id and
+    /// answers OK with it. The vetoed id never gets metadata, and exactly one
+    /// listed session holds the name.
+    ///
+    /// Pre-fix the late metadata `HSET` landed on the id whose members the
+    /// walk had removed, and the create answered OK with that unlisted id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_session_vetoed_by_a_walk_before_its_metadata_write_retries_under_a_new_id() {
+        const NAME: &str = "b2tu-i2";
+        const BASE_PATH: &str = "/b2tu-i2";
+        let tv = TestValkey::setup().await;
+        let gate = PausedCreate::default();
+        let creator = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+            .with_post_commit_hook_for_test(gate.hook());
+        let walker = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+        let hook = disabled_hook(&tv);
+
+        // The whole walk runs while the create is parked.
+        let (created, (paused_id, ghost_ids, kept, after_walk)) = tokio::join!(
+            tokio::time::timeout(RACE_BUDGET, creator.create(NAME, BASE_PATH, "b2tu-user")),
+            async {
+                let paused_id = gate.wait_paused().await;
+                let listed = walker.list(BASE_PATH).await.expect("the walk's list");
+                let ghost_ids: Vec<String> = listed.ghosts.iter().map(|g| g.sid.clone()).collect();
+                let kept = reconcile_ghost_members(&hook, &walker, BASE_PATH, listed.ghosts).await;
+                let after_walk = (
+                    index_members(&tv, BASE_PATH, NAME, &paused_id).await,
+                    has_meta(&tv, &paused_id).await,
+                );
+                gate.release();
+                (paused_id, ghost_ids, kept, after_walk)
+            }
+        );
+        assert_eq!(
+            ghost_ids,
+            vec![paused_id.clone()],
+            "the walk read the parked create as a ghost"
+        );
+        assert!(kept.is_empty(), "the walk retired the ghost: {kept:?}");
+        assert_eq!(
+            after_walk,
+            ((false, false), false),
+            "the walk released both members of the vetoed id, which had no metadata"
+        );
+        assert_vetoed(&tv, &paused_id).await;
+
+        let session_id = created
+            .expect("the create did not finish within the budget")
+            .expect("a vetoed metadata write retries under a new id into an OK");
+        assert_ne!(
+            session_id, paused_id,
+            "the vetoed id can never complete, so the OK carries the retry's id"
+        );
+        assert_eq!(
+            gate.attempts(),
+            vec![paused_id.clone(), session_id.clone()],
+            "exactly one retry"
+        );
+        assert!(
+            !has_meta(&tv, &paused_id).await,
+            "the vetoed id's metadata write must have been refused"
+        );
+
+        let listed = walker.list(BASE_PATH).await.expect("list");
+        assert_eq!(
+            listed
+                .present
+                .iter()
+                .map(|m| (m.session_id.as_str(), m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(session_id.as_str(), NAME)],
+            "the retry's session is listed"
+        );
+        assert!(
+            listed.ghosts.is_empty(),
+            "nothing is left half-made: {listed:?}"
+        );
+        let holders: Vec<String> = tv
+            .client()
+            .pool
+            .smembers::<Vec<String>, _>(tv.key_schema().path_names_index(BASE_PATH))
+            .await
+            .expect("SMEMBERS names")
+            .into_iter()
+            .filter(|m| KeySchema::split_path_name_member(m).is_some_and(|(n, _)| n == NAME))
+            .collect();
+        assert_eq!(
+            holders,
+            vec![KeySchema::path_name_member(NAME, &session_id)],
+            "exactly one names member holds the name, and it is the returned session's"
+        );
+    }
+
+    /// b.2tu I3 — a walk whose veto is stalled on its own connection, and so
+    /// reaches the store only after the parked create completed, finds the
+    /// metadata (`PRESENT`) and keeps the session.
+    ///
+    /// The walker runs on a second client ([`TestValkey`] `walker_tv`, used
+    /// with `tv`'s key schema so it reads and writes the same keys), whose
+    /// data pool is stalled after its `list` and before its veto is sent, so
+    /// the create's own client stays free. The create is released only once
+    /// the veto's bytes have reached a stalled connection, and the stall is
+    /// released only once the create has written its metadata and answered.
+    ///
+    /// Pre-fix the walker's `SREM`s, held the same way, landed after the
+    /// create completed and removed both members of a session it had answered
+    /// OK for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reconcile_walk_whose_veto_lands_after_the_create_completed_keeps_the_session() {
+        const NAME: &str = "b2tu-i3";
+        const BASE_PATH: &str = "/b2tu-i3";
+        let tv = TestValkey::setup().await;
+        let walker_tv = TestValkey::setup().await;
+        let gate = PausedCreate::default();
+        let creator = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+            .with_post_commit_hook_for_test(gate.hook());
+        let walker = SessionStore::new(walker_tv.client().clone(), tv.key_schema().clone());
+        let hook = disabled_hook(&tv);
+
+        let (created, (paused_id, kept)) = tokio::join!(
+            tokio::time::timeout(RACE_BUDGET, creator.create(NAME, BASE_PATH, "b2tu-user")),
+            async {
+                let paused_id = gate.wait_paused().await;
+                let listed = walker.list(BASE_PATH).await.expect("the walk's list");
+                assert_eq!(
+                    listed.ghosts.len(),
+                    1,
+                    "the walk read the parked create as a ghost"
+                );
+
+                let stalls = walker_tv.stall_data_pool().await;
+                let baselines = net_in_each(&stalls).await;
+                let reconcile = reconcile_ghost_members(&hook, &walker, BASE_PATH, listed.ghosts);
+                tokio::pin!(reconcile);
+                let staged = tokio::select! {
+                    kept = &mut reconcile => Err(kept),
+                    () = wait_for_new_bytes(&stalls, &baselines) => Ok(()),
+                };
+                if let Err(kept) = staged {
+                    release_all(stalls).await;
+                    panic!("the walk finished before its veto reached the stall: {kept:?}");
+                }
+
+                // The veto waits behind the stall; let the create finish.
+                gate.release();
+                let deadline = tokio::time::Instant::now() + RACE_BUDGET;
+                while !has_meta(&tv, &paused_id).await {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the released create never wrote its metadata"
+                    );
+                    tokio::time::sleep(RACE_POLL).await;
+                }
+                release_all(stalls).await;
+                let kept = tokio::time::timeout(RACE_BUDGET, reconcile)
+                    .await
+                    .expect("the walk did not finish within the budget");
+                (paused_id, kept)
+            }
+        );
+        let session_id = created
+            .expect("the create did not finish within the budget")
+            .expect("the create must answer OK: its write landed before any veto");
+        assert_eq!(session_id, paused_id);
+        assert_eq!(
+            kept.iter()
+                .map(|m| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![session_id.as_str()],
+            "the late veto answered PRESENT, so the walk lists the session"
+        );
+        assert_no_veto(&tv, &session_id).await;
+        assert_eq!(
+            index_members(&tv, BASE_PATH, NAME, &session_id).await,
+            (true, true),
+            "a walk command landing late must not remove the members of a completed session"
+        );
+        let listed = SessionStore::new(tv.client().clone(), tv.key_schema().clone())
+            .list(BASE_PATH)
+            .await
+            .expect("list");
+        assert_eq!(
+            listed
+                .present
+                .iter()
+                .map(|m| m.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![session_id.as_str()],
+            "the session is still listed"
+        );
+    }
+
+    /// `tot-net-in` of each stalled connection.
+    async fn net_in_each(stalls: &[ConnStall]) -> Vec<u64> {
+        let mut out = Vec::with_capacity(stalls.len());
+        for stall in stalls {
+            out.push(
+                stall
+                    .net_in()
+                    .await
+                    .expect("a stalled connection must be open"),
+            );
+        }
+        out
+    }
+
+    /// Return once any stalled connection has read bytes past its baseline
+    /// (a command reached it). Panics past [`RACE_BUDGET`].
+    async fn wait_for_new_bytes(stalls: &[ConnStall], baselines: &[u64]) {
+        let deadline = tokio::time::Instant::now() + RACE_BUDGET;
+        loop {
+            if net_in_each(stalls).await != baselines {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no command reached a stalled connection within the budget"
+            );
+            tokio::time::sleep(RACE_POLL).await;
+        }
+    }
+
+    /// b.2tu I5 — a recovery (a peer replica's, say) that lands between this
+    /// walk's read and its veto: the veto finds the metadata Step B wrote
+    /// (`PRESENT`), so the walk keeps both members and lists the restored
+    /// session. The walk's own hook is disabled (`NoCheckpoint`), so only the
+    /// veto stands between it and a release.
+    ///
+    /// Pre-fix the walk `SREM`ed both members of the just-restored session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_ghost_recovered_between_the_read_and_the_veto_is_kept_and_listed() {
+        const NAME: &str = "b2tu-i5";
+        const BASE_PATH: &str = "/b2tu-i5";
+        let tv = TestValkey::setup().await;
+        let sid = format!("b2tu-i5-{}", uuid::Uuid::new_v4());
+        seed_ghost(&tv, BASE_PATH, NAME, &sid).await;
+        let in_mem = Arc::new(InMemoryCheckpointStore::new());
+        seed_checkpoint(
+            &in_mem,
+            &sample_session_checkpoint(&sid, NAME, BASE_PATH, "b2tu-user", 7),
+        )
+        .await;
+        let peer = build_hook(&tv, in_mem, make_metrics(), true);
+        let store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+
+        let listed = store.list(BASE_PATH).await.expect("the walk's list");
+        assert_eq!(listed.ghosts.len(), 1, "the walk reads the ghost");
+        let outcome = peer.try_recover_session(&sid).await;
+        assert!(
+            matches!(outcome, SessionRecoveryOutcome::Recovered),
+            "the peer's recovery must restore the session; got {outcome:?}"
+        );
+
+        let kept =
+            reconcile_ghost_members(&disabled_hook(&tv), &store, BASE_PATH, listed.ghosts).await;
+
+        assert_eq!(
+            kept.iter()
+                .map(|m| (m.session_id.as_str(), m.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(sid.as_str(), NAME)],
+            "the veto found the restored metadata, so the walk lists the session"
+        );
+        assert_no_veto(&tv, &sid).await;
+        assert_eq!(
+            index_members(&tv, BASE_PATH, NAME, &sid).await,
+            (true, true),
+            "the walk must keep both members of the restored session"
+        );
+    }
+
+    /// b.2tu item 10 — `CreateSession`'s metadata write and the session
+    /// checkpoint applier's Step B write the same four fields, so a recovered
+    /// session's metadata is shaped exactly like a created one's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn created_and_recovered_session_metadata_carry_the_same_four_fields() {
+        let tv = TestValkey::setup().await;
+        let store = SessionStore::new(tv.client().clone(), tv.key_schema().clone());
+        let created = store
+            .create("fields-created", "/fields", "fields-user")
+            .await
+            .expect("fixture session creation must succeed");
+
+        let recovered = format!("fields-{}", uuid::Uuid::new_v4());
+        seed_ghost(&tv, "/fields", "fields-recovered", &recovered).await;
+        let in_mem = Arc::new(InMemoryCheckpointStore::new());
+        seed_checkpoint(
+            &in_mem,
+            &sample_session_checkpoint(&recovered, "fields-recovered", "/fields", "fields-user", 9),
+        )
+        .await;
+        let outcome = build_hook(&tv, in_mem, make_metrics(), true)
+            .try_recover_session(&recovered)
+            .await;
+        assert!(
+            matches!(outcome, SessionRecoveryOutcome::Recovered),
+            "the recovery must restore the session; got {outcome:?}"
+        );
+
+        let mut fields = Vec::new();
+        for sid in [&created, &recovered] {
+            let hash: std::collections::HashMap<String, String> = tv
+                .client()
+                .pool
+                .hgetall(tv.key_schema().session_meta(sid))
+                .await
+                .expect("HGETALL session_meta");
+            let mut names: Vec<String> = hash.into_keys().collect();
+            names.sort();
+            fields.push(names);
+        }
+        let want: Vec<String> = ["base_path", "created_at", "created_by", "name"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(
+            fields[0], want,
+            "CreateSession writes exactly the four fields"
+        );
+        assert_eq!(
+            fields[1], want,
+            "Step B writes the same four fields as CreateSession"
+        );
     }
 }

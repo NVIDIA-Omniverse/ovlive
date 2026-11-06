@@ -47,6 +47,13 @@ mod b_v6d_operation_id_test;
 /// `test-fault-injection` inside the module.
 mod b_yuo_catch_up_miss_test;
 mod capabilities_test;
+/// b.ntm — a catch-up's payload end to end with a real external-value store:
+/// the container byte-identical to `serialize`, values read only with
+/// `STRLEN` and bounded `GETRANGE`s (the `MONITOR` feed), an observe-mode
+/// value served as stored, the catch-up payload budget's refusal before
+/// content, its waits' exits and its release, and the stalled-holder ending
+/// under contention (the latter under `test-fault-injection`).
+mod catchup_payload_test;
 /// b.pav scope (a) — chained `UpdateLayer` writes through the real handler and
 /// a real server: chain order across replicas, the chain gate's exits, its
 /// deadline margin, refusals, metrics and completion line, `no_wait`,
@@ -66,6 +73,11 @@ mod create_layer_test;
 mod cross_replica_delete_session_test;
 mod delete_layer_stream_grace_test;
 mod delete_session_test;
+/// b.ntm — the live-delivery budget end to end: the subscription holding the
+/// most undelivered relay bytes is ended `delivery_budget` while its siblings
+/// keep delivering, a resuming client gets only the status, and its retry
+/// catches up; and the ledger is back to zero after every ending.
+mod delivery_budget_test;
 /// b.21r — `live_subscriber_updates_total` and the SubscribeReadLayer half of
 /// `live_edit_join_latency_seconds`, driven through real subscriptions and read
 /// off the production exporter.
@@ -89,6 +101,13 @@ mod ext_release_gate_test;
 /// blob survives a later bad upload of its hash, a correct upload heals a
 /// truncated blob stored before the check, and `observe` stores and counts.
 mod ext_value_integrity_test;
+/// SDD §5.1 — the production server's per-connection HTTP/2 limits on the
+/// wire: the connection is closed with GOAWAY `ENHANCE_YOUR_CALM` after
+/// exactly 10,240 streams h2 reset for a protocol error, and the advertised
+/// SETTINGS carry the pinned frame size and no stream limit. Load-bearing
+/// because tonic's builder default removes the reset limit, leaving any peer
+/// able to make the service reset streams without end (RUSTSEC-2024-0003).
+mod h2_connection_limits_test;
 /// SDD §5.1 — an HTTP/2 connection to or from the service survives hundreds of
 /// presence-sized DATA frames left unread, on the client side (several unread
 /// `JoinSession` streams on one tonic channel) and on the service side (a
@@ -96,6 +115,15 @@ mod ext_value_integrity_test;
 /// connection with GOAWAY `ENHANCE_YOUR_CALM` after about 100–160 such frames,
 /// killing every stream on it.
 mod h2_small_frame_budget_test;
+/// SDD SR-6.3, SR-6.5 — the disaster-recovery hold ends every live
+/// `SubscribeReadLayer` and `JoinSession` at once, each by its own cause
+/// (`SERVICE_HELD`, or `UPSTREAM_UNAVAILABLE` for a stale hold verdict),
+/// without starting a shutdown or cancelling a session token, and a stream
+/// arriving after it is born cancelled with the same cause. Load-bearing
+/// because the client's retry follows the reason: a hold ended as a shutdown
+/// would send every client back within 100 ms instead of after 30 s, into a
+/// fleet that refuses it.
+mod hold_ending_test;
 /// SDD SR-4 — the JoinSession presence lifecycle: index-first registration,
 /// the lease keeper from registration to teardown, and the fenced teardown on
 /// every exit. Load-bearing because a lease that lapses under a slow replay
@@ -103,6 +131,14 @@ mod h2_small_frame_budget_test;
 mod join_lifecycle_test;
 mod join_session_cleanup_test;
 mod join_session_test;
+/// kl-retire F4/F5 — a JoinSession's own store work (its registration steps,
+/// its `PeerMessage` publish) ends at its stream's ending, and its teardown's
+/// unregister gives up within one command timeout, `NOSCRIPT` reload
+/// included. Load-bearing because the disaster-recovery hold's after-entry
+/// bound counts a join's work at entry, and its teardown as giving up within
+/// `5T + 1 s`, then fred's 45 s write wait
+/// (`dr::hold::join_teardown_write_bound`, `5T + 1 s + 45 s`).
+mod join_store_work_ending_test;
 mod jr8_chunk_count_test;
 mod jr8_disconnect_test;
 mod jr8_session_cache_test;
@@ -218,7 +254,7 @@ mod session_tokens_sweep_test;
 /// restart.
 mod shutdown_ending_test;
 /// b.xje — an early live subscriber, a new joiner and an in-window reconnector
-/// all end with the server's sibling order, in both catch-up modes, across
+/// all end with the server's sibling order, across
 /// appends, a stale-parent move, a Kit-shaped reorder of all of a prim's child
 /// prims among its interleaved attributes, and a stale partial reorder that
 /// names a deleted prim and a repeat and misses a peer's newer create.
@@ -285,6 +321,21 @@ mod subscribe_test;
 mod update_layer_recovery_arm_test;
 mod update_layer_test;
 mod upload_admission_test;
+/// b.vna — a receiving upload whose content the upload budget cannot hold
+/// beside an in-budget processing charge runs in the free overflow slot and
+/// commits, instead of being refused partway through its body; with the slot
+/// held, or for a chained `UpdateLayer`, it is still refused `growth`. Its
+/// cases park a holder at the `CreateLayer` pre-commit hook, so it exists only
+/// under `test-fault-injection`.
+#[cfg(feature = "test-fault-injection")]
+mod upload_receive_slot_test;
+/// b.h4r — uploads parked at admission, each holding a full stream window of
+/// unread content, leave their connection's other streams flowing (a unary
+/// `Ping` and another session's upload complete), and the service's
+/// small-frame budget follows the larger connection window. Load-bearing
+/// because a parked upload otherwise stalls its client's other calls, presence
+/// and subscribe streams included, for the whole admission wait.
+mod upload_window_test;
 /// b.xd1 — `CreateLayer` / `UpdateLayer` refused before the commit marker
 /// for a dependency outage answer `UNAVAILABLE` `UPSTREAM_UNAVAILABLE` (this
 /// call applied nothing) at every pre-commit site, and every `UNAVAILABLE`

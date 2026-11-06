@@ -11,30 +11,59 @@ captured one-spec edits.
 
 Commands that meet a changed graph follow the Live Edit service's rules: a
 Create, Delete or Move of a missing target is skipped; field and sample data
-for a missing section is kept as orphan data that is never projected; a Create
-at an occupied (parent, name) slot deletes the occupant's subtree first; a
-Create of a live identity is an invalid argument; a Move to a missing parent,
-into its own subtree or onto an ancestor's name deletes the moved subtree, and
-a Move onto any other occupied name deletes the occupant first. Equal old and
-new parents in a Move select a rename under the stored parent, without a
-sibling-name check, so two siblings can share one name and path; the (parent,
-name) slot then resolves to the lower identity.
+for a missing section is kept apart as orphan data that is never projected
+(see `adopt_orphans` below); a Create at an occupied slot deletes the
+occupant's subtree first; a Create of a live identity is an invalid argument;
+a Move to a missing parent, into its own subtree or onto an ancestor's slot
+deletes the moved subtree, and a Move onto any other occupied slot deletes the
+occupant first. A slot is a name within one child list of a parent, so it
+matches one derived path, as Kit's applier matches on the SdfPath: a prim and
+a property of one name hold distinct slots and coexist. ovlive's reader
+applies this rule; a service that matches on (parent, name) alone differs
+(design section 10). Equal old and new parents in a Move select a rename under
+the stored parent: a rename to the section's own name changes nothing, and a
+rename onto another occupied slot deletes the lowest other occupant with its
+listed subtree first, as Nucleus and Kit's applier do (`rename_cascade`).
+Later field and sample data for a deleted occupant's ID is orphan data, which
+a later birth of that ID takes only under `adopt_orphans`, as after any other
+Delete. With `rename_cascade` false the model
+follows the Live Edit service as deployed, whose rename has no sibling-name
+check, so two siblings can share one slot and path; the slot then resolves to
+the lower identity. The rename rule is independent of the Reorder rule below.
 
-A Reorder replaces the parent's entire stored children list with its list,
-verbatim and across every child list (the service ignores childrenListId). A
-listed ID that is not a live section, or whose parent is another section, is an
-invalid argument with the service's status text. A child the list omits stays a
-section but is unlisted: it and its subtree are unreachable, so the projected
-state, like the service's catch-up walk over stored children, omits them. A
-later Reorder that lists it, or a Move, makes it reachable again. With
-`per_list`, the model follows a service that orders the list per child list
-instead: it applies the list exactly as USD's SdfApplyListOrdering does to each
-child list, as a reader applies a delivered Reorder, ignoring listed IDs that
-are not current children and every repeat after an ID's first occurrence, so no
-child becomes unlisted. A Delete
-walks listed children only, like the service's cascade over stored children
-lists: an unlisted descendant of a deleted section stays as a stranded row whose
-parent is missing, unreachable with its subtree until a Move gives it a parent.
+A Reorder ignores childrenListId and orders each child list of the parent on
+its own, within the positions that list holds among the parent's children,
+exactly as USD's SdfApplyListOrdering does, as the service from 0.2.0-rc.16
+and ovlive's reader apply it: a listed ID that is not a current listed child
+of the parent, and every repeat after an ID's first occurrence, is ignored, so
+no child becomes unlisted. A Reorder that names no such child changes nothing.
+Otherwise it replaces the parent's children list, so a stale listing of a
+section another Move took elsewhere leaves it.
+
+With `verbatim`, the model follows Live Edit 0.1.x instead (design section
+20): the list replaces the parent's entire stored children list verbatim and
+across every child list. A listed ID that is not a live section, whose parent
+is another section, or that repeats is an invalid argument with the service's
+status text. A child the list omits stays a section but is unlisted: it and
+its subtree are unreachable, so the projected state, like the service's
+catch-up walk over stored children, omits them. A later Reorder that lists it,
+or a Move, makes it reachable again. A per-list Reorder ignores an unlisted
+child and keeps it unlisted, as the service ignores a row its list lost. A
+Delete walks listed children only, like the service's cascade over stored
+children lists: an unlisted descendant of a deleted section stays as a
+stranded row whose parent is missing, unreachable with its subtree until a
+Move gives it a parent.
+
+With `adopt_orphans`, the model follows the deployed service, which keys
+field and sample rows by section ID alone: a later Create of a missing
+section's ID, or a diff that restates it, takes its orphan data as the new
+section's fields. A fresh snapshot, or a resume diff from before the
+orphaning, carries them; a reader that applied the orphan records before the
+Create holds none, and neither does a resumer whose cursor falls between the
+orphaning and the Create. Without it, orphan data is never projected, as
+ovlive's reader applies it and as the service is to drop it; every projected
+state then equals one in which the orphan records were dropped. An adopted child-list field is outside this
+profile and is rejected as unsupported.
 """
 import copy
 import re
@@ -177,7 +206,7 @@ def validate(nodes, spend, unlisted=frozenset()):
         other = None if stranded else paths.get(path)
         if other is not None and (nodes[other]["parent"], nodes[other]["name"]) != (node["parent"], node["name"]):
             reject("destination path collision")
-        # Same-parent, same-name siblings share a path: the service's rename has no sibling-name check.
+        # Same-parent, same-name siblings share a path: a service whose rename has no sibling-name check keeps them.
         if not stranded:
             paths.setdefault(path, identity)
         path_bytes += len(path.encode("utf-8"))
@@ -205,10 +234,17 @@ def descends(nodes, identity, ancestor):
     return False
 
 
-def occupant(nodes, parent, name, mover):
-    """The service resolves a (parent, name) slot to its lowest live identity."""
+def slot_kind(spec_type):
+    """The child list a spec type belongs to: attributes and relationships share the property list."""
+    return ATTRIBUTE if spec_type == RELATIONSHIP else spec_type
+
+
+def occupant(nodes, parent, spec_type, name, mover):
+    """A slot, a name within one child list of a parent, resolves to its lowest live identity."""
+    kind = slot_kind(spec_type)
     return min((identity for identity, node in nodes.items()
-                if identity != mover and node["parent"] == parent and node["name"] == name), default=None)
+                if identity != mover and node["parent"] == parent and node["name"] == name
+                and slot_kind(node["type"]) == kind), default=None)
 
 
 def hidden(nodes, unlisted):
@@ -326,11 +362,15 @@ class Model:
     def orphans(self):
         """Field/sample data committed for missing sections, keyed by section ID.
 
-        Reference policy, service behavior unknown: orphan data for a retired
-        identity stays apart when a Create reuses that identity; the new
-        section starts with no fields and never projects the orphans.
+        A Create that reuses the identity starts with no fields unless the
+        update applies with `adopt_orphans`, which moves the identity's orphan
+        data onto the new section.
         """
         return copy.deepcopy(self._orphans)
+
+    def forget_orphans(self):
+        """Drop the orphan data, which a subscriber that joins from a snapshot or catch-up diff never holds."""
+        self._orphans = {}
 
     @property
     def history(self):
@@ -353,13 +393,16 @@ class Model:
     def source_format(self):
         return self._source_format
 
-    def apply(self, data, sequence=None, *, delivered=False, per_list=False):
+    def apply(self, data, sequence=None, *, delivered=False, verbatim=False, adopt_orphans=False,
+              rename_cascade=True):
         """Apply one update. A `delivered` update is one a reader receives: the service never commits a Create of
         a live identity, so a delivered one repeats a commit the reader holds (a catch-up without a proven stable
-        cut delivers again the commits its snapshot folded in) and changes nothing. A delivered Reorder orders each
-        child list it names exactly as USD's SdfApplyListOrdering does, ignoring non-children and repeats after an
-        ID's first occurrence. `per_list` applies a Reorder as a service that orders the list per child list does:
-        as a delivered one."""
+        cut delivers again the commits its snapshot folded in) and changes nothing. A Reorder orders each child
+        list it names exactly as USD's SdfApplyListOrdering does, ignoring non-children and repeats after an ID's
+        first occurrence. `verbatim` commits a Reorder as Live Edit 0.1.x does, `adopt_orphans` commits a section
+        birth as the deployed service does, and a false `rename_cascade` commits a same-parent rename onto an
+        occupied name as the deployed service does, keeping both siblings (module docstring); a delivered update
+        ignores all three, as a reader applies it."""
         try:
             # An empty upload is an empty delta that still consumes a sequence (service SDD §8.4).
             delta = decode(data) if data else Delta()
@@ -384,6 +427,8 @@ class Model:
                   if type(v) is TimeSamples) for node in self._nodes.values()) +
               sum(len(fields) for fields in self._orphans.values()))
         reset = delta.is_diff and not delta.base_version
+        verbatim, adopt_orphans = verbatim and not delivered, adopt_orphans and not delivered
+        rename_cascade = rename_cascade or delivered
         nodes = {1: root()} if reset else copy.deepcopy(self._nodes)
         orphans = {} if reset else copy.deepcopy(self._orphans)
         unlisted = set() if reset else set(self._unlisted)
@@ -414,6 +459,13 @@ class Model:
                 unlisted.discard(identity)
             stale.difference_update({pair for pair in stale if pair[0] in doomed or pair[1] in doomed})
 
+        def adopt(identity):
+            """The orphan data a birth of `identity` takes as its fields, under `adopt_orphans`."""
+            fields = orphans.pop(identity, {}) if adopt_orphans else {}
+            if any(key in CHILD_FIELDS for key in fields):
+                reject("adopted child-list field outside graph oracle profile")
+            return fields
+
         def target(identity):
             """Live fields, or the orphan store for a missing section."""
             return nodes[identity]["fields"] if identity in nodes else orphans.setdefault(identity, {})
@@ -437,7 +489,7 @@ class Model:
                         reject("cannot delete root", "malformed")
                     nodes.pop(command.section, None)
                 else:
-                    fields = nodes.get(command.section, {}).get("fields", {})
+                    fields = nodes[command.section]["fields"] if command.section in nodes else adopt(command.section)
                     nodes[command.section] = dict(id=command.section, parent=command.parent, type=command.spec_type,
                                                   name=command.name, order=command.order, path="", fields=fields)
             # A retracted section's list is gone; a restated parent lists the section.
@@ -462,11 +514,12 @@ class Model:
                         duplicate_section(command.section)
                     if command.parent not in nodes:
                         continue
-                    replaced = occupant(nodes, command.parent, command.name, command.section)
+                    replaced = occupant(nodes, command.parent, command.spec_type, command.name, command.section)
                     if replaced is not None:
                         cascade(replaced)
                     nodes[command.section] = dict(id=command.section, parent=command.parent, type=command.spec_type,
-                                                  name=command.name, order=next_order(nodes, command.parent), path="", fields={})
+                                                  name=command.name, order=next_order(nodes, command.parent), path="",
+                                                  fields=adopt(command.section))
                     mark(command.section)
                 elif command.tag == 2:
                     if command.section in nodes:
@@ -477,18 +530,32 @@ class Model:
                         continue
                     if command.old_parent == command.parent:
                         # Equal command parents select a rename under the stored parent.
+                        if node["name"] == command.name:
+                            continue
+                        if rename_cascade:
+                            replaced = occupant(nodes, node["parent"], node["type"], command.name, command.section)
+                            if replaced is not None:
+                                cascade(replaced)
+                                if command.section not in nodes:
+                                    continue  # A stale listing in the occupant's subtree named the section.
                         mark(command.section)
                         node["name"] = command.name
                         mark(command.section)
                     elif command.parent not in nodes or descends(nodes, command.parent, command.section):
                         cascade(command.section)
                     else:
-                        replaced = occupant(nodes, command.parent, command.name, command.section)
+                        replaced = occupant(nodes, command.parent, node["type"], command.name, command.section)
                         if replaced is not None and descends(nodes, command.section, replaced):
                             cascade(command.section)
                         else:
                             if replaced is not None:
                                 cascade(replaced)
+                                if command.section not in nodes:
+                                    continue  # A stale listing in the occupant's subtree named the section.
+                                if command.parent not in nodes:
+                                    # A stale listing in the occupant's subtree named the new parent.
+                                    cascade(command.section)
+                                    continue
                             mark(command.section)
                             # Only the carried old parent's list drops the section; the
                             # new parent's list gains it unless it already names it.
@@ -510,12 +577,13 @@ class Model:
                     for position, identity in enumerate(listed):
                         spend(1)
                         if identity in seen:
-                            if delivered or per_list:
+                            if not verbatim:
                                 continue  # USD's list ordering keeps an ID's first occurrence.
                             reorder_rejected(f"ReorderChildren({parent}) lists section_id {identity} "
                                              "more than once in children_list")
                         seen.add(identity)
-                        if (delivered or per_list) and (identity not in nodes or nodes[identity]["parent"] != parent):
+                        if not verbatim and (identity not in nodes or nodes[identity]["parent"] != parent
+                                             or identity in unlisted):
                             continue
                         positions[identity] = position
                         if identity not in nodes:
@@ -524,14 +592,17 @@ class Model:
                         if nodes[identity]["parent"] != parent:
                             reorder_rejected(f"ReorderChildren({parent}) listed section_id {identity} "
                                              f"whose actual parent_id is {nodes[identity]['parent']}")
-                    if parent not in nodes:
-                        continue  # The list names only stranded rows, which stay unreachable.
+                    if parent not in nodes or not (verbatim or positions):
+                        # The list names only stranded rows, which stay unreachable, or, per child list, no listed
+                        # child: the service changes nothing, a stale listing included.
+                        continue
                     before = groups(nodes, unlisted)
-                    siblings = sorted((identity for identity, node in nodes.items() if node["parent"] == parent),
+                    siblings = sorted((identity for identity, node in nodes.items() if node["parent"] == parent
+                                       and (verbatim or identity not in unlisted)),
                                       key=lambda identity: nodes[identity]["order"])
                     spend(len(siblings))
-                    if delivered or per_list:
-                        # A reader orders each child list the Reorder names on its own, as USD applies a
+                    if not verbatim:
+                        # Each child list the Reorder names is ordered on its own, as USD applies a
                         # partial order, within the positions that list holds among the parent's children.
                         named = sorted(positions, key=positions.get)
                         slots, orders = {}, {}
@@ -546,7 +617,6 @@ class Model:
                                 placed[position] = identity
                         for order, identity in enumerate(placed):
                             nodes[identity]["order"] = order
-                        unlisted.difference_update(siblings)
                     else:
                         # The service stores the list verbatim as the entire children list;
                         # omitted children keep their rows but become unlisted.

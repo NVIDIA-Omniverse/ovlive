@@ -141,8 +141,8 @@ use live_edit::storage::test_support::{rewrite_out_of_band, OutOfBandChange, Tes
 use live_edit::storage::watched_txn::WatchWindowHook;
 
 use crate::common::owned_delta::{
-    delta_to_ompf_bytes, delta_with_new_field_names, delta_with_set_field_inline, empty_delta,
-    reset_delta,
+    delta_to_ompf_bytes, delta_with_diff_change_section, delta_with_new_field_names,
+    delta_with_set_field_inline, empty_delta,
 };
 use crate::common::refusal_detail::assert_refusal_error;
 use crate::grpc::log_capture::capture;
@@ -641,6 +641,21 @@ fn create_section(parent_id: u64, section_id: u64, name: &str) -> OwnedDelta {
 /// which rewrites `WORLD`'s section row and so carries its pre-image digest.
 fn rename_world(name: &str) -> OwnedDelta {
     structural(vec![move_cmd(WORLD, ROOT, ROOT, name)])
+}
+
+/// The one top-level section [`clearing_reset`] restates: an id the seeded
+/// tree and every test's creates leave free.
+const RESET_TOP: u64 = 80;
+
+/// A whole-layer reset carrying `source_format` that clears everything the
+/// object holds and restates only a fresh top-level section, [`RESET_TOP`]. A
+/// reset leaving the layer no top-level section is refused (SDD §9.7), so a
+/// reset of these rooted fixtures restates one.
+fn clearing_reset(source_format: &str) -> OwnedDelta {
+    OwnedDelta {
+        source_format: source_format.to_owned(),
+        ..delta_with_diff_change_section(ROOT, RESET_TOP, "ResetTop", 1, 0)
+    }
 }
 
 /// A delta the domain refuses while planning: a `CreateSection` of `WORLD`,
@@ -1305,7 +1320,7 @@ async fn structural_reset_stale_ticks_on_the_reset_path() {
         Arc::new(Mutex::new(None)),
     ));
 
-    fx.update(reset_delta("usda"))
+    fx.update(clearing_reset("usda"))
         .await
         .expect("the reset's retry must commit");
 
@@ -2089,7 +2104,7 @@ async fn structural_reset_cache_diverged_ticks_on_the_reset_path() {
         .expect("the warm-up must commit");
     rewrite_out_of_band(&fx.tv, fx.oid, world_renamed_out_of_band("OutOfBand")).await;
 
-    fx.update(reset_delta("usda"))
+    fx.update(clearing_reset("usda"))
         .await
         .expect("the reset's retry must reload and commit");
 
@@ -2441,7 +2456,7 @@ fn knob_flip_history() -> Vec<KnobCommit> {
             None,
         ),
         knob_commit(Lua, "a field", world_field(2), "fast", None),
-        knob_commit(Txn, "a reset", reset_delta("usdc"), WATCH, None),
+        knob_commit(Txn, "a reset", clearing_reset("usdc"), WATCH, None),
         knob_commit(
             Lua,
             "a create under the root after the reset",
@@ -2452,14 +2467,14 @@ fn knob_flip_history() -> Vec<KnobCommit> {
         knob_commit(
             LuaWatchStructural,
             "a reset",
-            reset_delta("usda"),
+            clearing_reset("usda"),
             WATCH,
             None,
         ),
         knob_commit(
             Lua,
             "a reset",
-            reset_delta("usdc"),
+            clearing_reset("usdc"),
             RESET,
             Some(("repaired", 1)),
         ),

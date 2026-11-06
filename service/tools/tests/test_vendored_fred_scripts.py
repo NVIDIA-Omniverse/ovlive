@@ -830,7 +830,7 @@ class VendoredTreeRecordTests(unittest.TestCase):
     `vendor/fred-<version>.SHA256SUMS`, lists every file of the published
     crate with its digest. Every listed file the patch does not edit must
     still have that digest in the tree, every file it edits must not, and
-    no file it adds may be listed; the added files are the six NVIDIA files,
+    no file it adds may be listed; the added files are the seven NVIDIA files,
     and each starts with NVIDIA's Apache-2.0 header. Reads only committed
     files, with no network.
     """
@@ -841,7 +841,7 @@ class VendoredTreeRecordTests(unittest.TestCase):
     #: The files NVIDIA wrote, which the patch adds.
     NVIDIA_FILES = tuple(
         "src/live_edit/{}.rs".format(name)
-        for name in ("abandon", "ask", "liveness", "mod", "pool", "retention")
+        for name in ("abandon", "ask", "liveness", "mod", "pool", "redirect", "retention")
     )
     #: The upstream files fred's patch edits: SOURCE.md § License counts them.
     EDITED_COUNT = 23

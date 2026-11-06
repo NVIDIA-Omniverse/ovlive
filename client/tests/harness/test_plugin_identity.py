@@ -92,10 +92,10 @@ class PluginIdentityTests(unittest.TestCase):
         for name in ("flatbuffers.h", "base.h", "stl_emulation.h"):
             path = flatbuffers / name
             path.write_text("synthetic pinned header " + name)
-            headers[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-        provenance = {"flatbuffers": {"package": "synthetic", "version": "1", "headers": headers}}
-        (self.root / "source/live/wire/schema").mkdir(parents=True, exist_ok=True)
-        (self.root / "source/live/wire/schema/provenance.json").write_text(json.dumps(provenance))
+            headers["include/flatbuffers/" + name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        record = self.root / "source/live/wire/third_party/flatbuffers/provenance.json"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(json.dumps({"package": "synthetic", "version": "1", "files": headers}))
         dependencies = [("plugin", self.plugin), ("plug_info", self.plug_info), ("load_probe", load_probe),
                         ("diagnostics_sample", self.sample), ("diagnostic_log_tests", formatter), ("participant_sample", participant), ("participant_tests", participant_tests)]
         dependencies += [("public_header", header_dir / name) for name in ("Live.h", "LiveUsd.h")]

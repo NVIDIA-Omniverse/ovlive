@@ -48,7 +48,7 @@ use oodf_ffi::{
     OwnedDelta, SetField, StructCommand, TimeSample as OodfTimeSample,
 };
 
-use crate::common::owned_delta::{delta_with_set_field_inline, reset_delta};
+use crate::common::owned_delta::{delta_with_set_field_inline, reset_delta, with_root};
 /// Mirror of the module-private `storage::layer::EMPTY_HEADER_SENTINEL`; shared
 /// via `tests/common` so every module asserting it holds one literal.
 use crate::common::EMPTY_HEADER_SENTINEL_MSG;
@@ -1860,8 +1860,10 @@ async fn update_layer_delete_section_slow_path_actually_deletes() {
     let session_id = create_test_session(&tv).await;
     let oid = create_test_layer(&ls, &session_id, "slowpath-delete-layer").await;
 
-    // First: create a section (slow-path update, persists the section).
-    let create_delta = OwnedDelta {
+    // First: create a section (slow-path update, persists the section), beside
+    // the layer's root section, which the delete below leaves: an update
+    // leaving the layer no top-level section is refused (SDD §9.7).
+    let create_delta = with_root(OwnedDelta {
         struct_commands: vec![StructCommand::CreateSection(CommandCreateSection {
             parent_id: 0,
             section_id: 42,
@@ -1869,7 +1871,7 @@ async fn update_layer_delete_section_slow_path_actually_deletes() {
             section_type: 1,
         })],
         ..Default::default()
-    };
+    });
     ls.update_layer_relayed(
         &session_id,
         "slowpath-delete-layer",
@@ -1885,9 +1887,8 @@ async fn update_layer_delete_section_slow_path_actually_deletes() {
     let before = read_object_state_for_test(tv.client(), tv.key_schema(), &oid.to_string())
         .await
         .expect("read_object_state_for_test must succeed");
-    assert_eq!(
-        before.sections.len(),
-        1,
+    assert!(
+        before.sections.contains_key(&42),
         "setup failed: section was not created"
     );
 
@@ -1918,11 +1919,11 @@ async fn update_layer_delete_section_slow_path_actually_deletes() {
 
     assert_eq!(after.sequence_num, seq);
     assert_eq!(
-        after.sections.len(),
-        0,
-        "DeleteSection must actually remove the section; fast-path misroute \
-         would silently no-op because apply_delete_section returns early \
-         when state.sections is empty. Remaining sections: {:?}",
+        after.sections.keys().copied().collect::<Vec<_>>(),
+        vec![1],
+        "DeleteSection must actually remove the section, leaving only the root; a \
+         fast-path misroute would silently no-op because apply_delete_section returns \
+         early when state.sections is empty. Remaining sections: {:?}",
         after.sections
     );
     // Tombstone must be written for diff reconstruction.
@@ -1991,8 +1992,18 @@ async fn update_layer_mixed_struct_and_field_slow_path_persists_both() {
 /// fast-path against an empty header-derived state — no tombstones, no
 /// field deletes would be emitted, and pre-existing sections/fields would
 /// linger in storage.
+///
+/// The reset is the empty one, carrying no struct command: a struct command
+/// would send it down the slow path on its own (`lua::is_fast_path`), so a
+/// reset carrying one would not depend on the reset branch. An empty reset is
+/// refused on a layer with a top-level section (SDD §9.7), so the seeded
+/// section hangs under a parent with no row: the layer has no top-level
+/// section to lose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_layer_reset_delta_slow_path_rebuilds_state() {
+    /// A parent id no section holds.
+    const MISSING_PARENT: u64 = 99;
+
     let tv = TestValkey::setup().await;
     let ls = layer_store(&tv);
     let session_id = create_test_session(&tv).await;
@@ -2001,13 +2012,16 @@ async fn update_layer_reset_delta_slow_path_rebuilds_state() {
     // Seed pre-existing state: one section + one field. This is the state
     // that must be torn down by the reset. We use a mixed delta (struct
     // command + field) so that `apply_delete_section` (slow path) can walk
-    // it down on the reset.
+    // it down on the reset. A `DiffChangeSection` under a missing parent
+    // stores its row (a `CreateSection` there would be skipped), as an orphan
+    // rather than a top-level section.
     let seed_delta = OwnedDelta {
-        struct_commands: vec![StructCommand::CreateSection(CommandCreateSection {
-            parent_id: 0,
+        struct_commands: vec![StructCommand::DiffChangeSection(CommandDiffChangeSection {
+            parent_id: MISSING_PARENT,
             section_id: 11,
             section_name: "Seed".to_owned(),
             section_type: 1,
+            section_order: 0,
         })],
         set_fields: vec![SetField {
             section_id: 11,

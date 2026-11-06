@@ -106,14 +106,31 @@ class CiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '32 KiB'):
             ci.read_config(path)
 
-    def make_plan(self, profile='presubmit', output='output'):
+    def make_plan(self, profile='presubmit', output='output', configuration=None):
         config = self.config()
+        if configuration is not None:
+            config['configuration'] = configuration
         native = dict(platform=ci.platforms.host().name, commands=[['cmake', '-DBUILD_TESTING=OFF', '-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON',
                                  '-DLIVE_DEPENDENCY_ROOT=/synthetic/deps', '-DLIVE_ENABLE_SANITIZERS=OFF',
                                  '-DLIVE_BUILD_PYTHON=ON']], tools={'python': '/synthetic/sdk/python'},
                       sdks=config['sdks'])
         with patch.object(ci.build, 'plan', return_value=native), patch.object(ci.test, 'fingerprint', return_value='source'):
             return ci.plan(config, self.root / output, profile, 42, 2)
+
+    def test_windows_debug_plan_preserves_configuration_through_archive(self):
+        with patch.object(ci.platforms, 'host', return_value=ci.platforms.PLATFORMS['windows-x86_64']):
+            record = self.make_plan(configuration='debug')
+        steps = {step['name']: step['command'] for step in record['steps']}
+        for name in ('notices', 'package-stage'):
+            self.assertEqual(steps[name][steps[name].index('--config') + 1], 'debug')
+        self.assertIn('--configuration', steps['package-archive'])
+        self.assertEqual(steps['package-archive'][-1], 'debug')
+        self.assertTrue(Path(steps['package-archive-native'][3]).parent.name.endswith('-windows-x86_64-debug'))
+        self.assertEqual(record['excluded_suites'], list(ci.DEBUG_EXCLUDED_SUITES))
+        self.assertEqual(record['suites'], [suite for suite in ci.BASE_SUITES if suite not in ci.DEBUG_EXCLUDED_SUITES]
+                         + ['uri', 'python-reference'])
+        with self.assertRaisesRegex(ValueError, 'Windows stock-25.11'):
+            self.make_plan(configuration='debug')
 
     def test_fixed_profiles_include_required_work_and_never_reuse_output(self):
         kinds = {'presubmit': 'none', 'asan': 'address', 'nightly': 'none', 'tsan': 'thread'}
@@ -124,6 +141,7 @@ class CiTests(unittest.TestCase):
                 record = self.make_plan(profile)
             sanitized = kinds[profile] != 'none'
             self.assertTrue(set(ci.BASE_SUITES) <= set(record['suites']))
+            self.assertEqual(record['excluded_suites'], [])
             self.assertIn('lock-noalloc', record['suites'])
             self.assertEqual('python-reference' in record['suites'], not sanitized)
             self.assertEqual('uri' in record['suites'], not sanitized)
@@ -262,8 +280,9 @@ class CiTests(unittest.TestCase):
         self.assertEqual(summary['reason'], 'Dependency identity changed: diagnostic_schema_identity')
 
     def test_unsanitized_profiles_build_archive_and_load_the_release(self):
-        archive_steps = ['package-stage', 'package-archive', 'package-archive-native', 'package-archive-python']
-        root = 'ovlive-0.1.0-stock-25.11-linux-x86_64'
+        archive_steps = ['package-stage', 'package-samples', 'package-archive', 'package-archive-native',
+                         'package-archive-python']
+        root = f'ovlive-{ci.archive.version()}-stock-25.11-linux-x86_64'
         for profile in ('presubmit', 'nightly', 'asan', 'tsan'):
             with patch.object(ci.platforms, 'host', return_value=ci.platforms.PLATFORMS['linux-x86_64']), \
                  patch.object(ci.shutil, 'which', return_value='/synthetic/setarch'):
@@ -272,7 +291,7 @@ class CiTests(unittest.TestCase):
             if profile in {'asan', 'tsan'}:
                 self.assertEqual(sorted(set(archive_steps) & set(names)), [])
                 continue
-            self.assertEqual(names[-5:], ['package-python', *archive_steps])
+            self.assertEqual(names[-6:], ['package-python', *archive_steps])
             steps = {step['name']: step for step in record['steps']}
             output = Path(record['output'])
             config = record['config']
@@ -285,6 +304,17 @@ class CiTests(unittest.TestCase):
                 self.assertEqual(stage[stage.index(flag) + 1], value, flag)
             self.assertIn('--grpc-cpp-plugin=' + config['tools']['grpc_cpp_plugin'], stage)
             self.assertEqual(steps['package-stage']['timeout_ms'], 1800000)
+            # The package writer campaign runs the stage's samples beside the build's writer drivers.
+            self.assertEqual(steps['package-samples']['command'],
+                             [ci.sys.executable, '-B', str(ci.ROOT / 'tools/live/test.py'), '--suite', 'writer-fuzz',
+                              '--seed', str(record['seed']), '--artifact-dir', str(output / 'package-tests'),
+                              '--writer-fuzz-profile', 'package', '--timeout-ms', '900000',
+                              '--plugin-driver', str(output / 'build/live_plugin_driver'),
+                              '--scene-transport-driver', str(output / 'build/live_scene_transport_driver'),
+                              '--reference-python', config['tools']['reference_python'],
+                              '--reference-openssl', config['tools']['reference_openssl'],
+                              '--staged-package', str(output / 'release-stage/usd/omniverse/live')])
+            self.assertEqual(steps['package-samples']['timeout_ms'], 1200000)
             self.assertEqual(steps['package-archive']['command'][2:],
                              [str(ci.ROOT / 'tools/release/archive.py'), 'create',
                               '--package', str(output / 'release-stage/usd/omniverse/live'),
@@ -293,10 +323,45 @@ class CiTests(unittest.TestCase):
             folder = str(output / 'release-check' / root / 'omni_usd_live')
             self.assertEqual(steps['package-archive-native']['command'][2:],
                              [str(ci.ROOT / 'tests/native/plugin/package.py'), folder,
-                              str(output / 'build/live_plugin_load_probe'), str(ci.ROOT)])
+                              str(output / 'build/live_plugin_load_probe'), str(ci.ROOT),
+                              config['sdks']['dependency_root']])
             self.assertEqual(steps['package-archive-python']['command'],
                              ['/synthetic/sdk/python', '-B', str(ci.ROOT / 'tests/native/python/package.py'),
                               folder, config['sdks']['usd_root']])
+
+    def test_package_samples_run_is_the_package_campaign_on_the_built_stage(self):
+        record = self.make_plan('nightly')
+        build = Path(record['output']) / 'build'
+        stage = str(Path(record['output']) / 'release-stage/usd/omniverse/live')
+        identity = dict(path=stage, manifest_sha256='a' * 64)
+        run = self.root / 'package-run'
+        run.mkdir()
+        manifest = dict(staged_package_identity=identity)
+        replay = dict(master_seed=42, clients=1, suites=['writer-fuzz'], source_fingerprint='source',
+                      writer_fuzz_profile='package', staged_package=stage, staged_package_identity=identity)
+        outputs = {}
+        for key, path_key, name, boundary in ci.NATIVE_IDENTITIES:
+            if key not in {'plugin_identity', 'scene_transport_identity'}:
+                continue
+            artifact = str((build / ci.build_artifact(ci.platforms.host().name, name)).resolve())
+            manifest[key] = replay[key] = outputs[(artifact, boundary)] = dict(boundary=boundary, artifact=artifact)
+            replay[path_key] = artifact
+        with patch.object(ci.test, 'native_identity', side_effect=lambda path, boundary: outputs[(str(path), boundary)]):
+            (run / 'replay.json').write_text(json.dumps(replay))
+            ci.verify_package_samples(record, manifest, run)
+            for changed in (dict(replay, writer_fuzz_profile='ci'), dict(replay, master_seed=43),
+                            dict(replay, staged_package=str(self.root / 'other')),
+                            dict(replay, staged_package_identity=dict(identity, manifest_sha256='b' * 64)),
+                            dict(replay, suites=['writer-fuzz', 'foundation'])):
+                (run / 'replay.json').write_text(json.dumps(changed))
+                with self.subTest(changed=changed), self.assertRaisesRegex(ValueError, 'Package campaign'):
+                    ci.verify_package_samples(record, manifest, run)
+            (run / 'replay.json').write_text(json.dumps(replay))
+            with self.assertRaisesRegex(ValueError, 'Package campaign'):
+                ci.verify_package_samples(record, dict(manifest, staged_package_identity=None), run)
+            for key in ('plugin_identity', 'scene_transport_identity'):
+                with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'package campaign candidate'):
+                    ci.verify_package_samples(record, {k: v for k, v in manifest.items() if k != key}, run)
 
     def test_tsan_profile_wraps_instrumented_steps_in_setarch(self):
         wrapped = {'contracts', 'uri-native', 'stack-dump', 'package-native'}

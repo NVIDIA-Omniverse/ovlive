@@ -41,7 +41,8 @@
 //! line and returns. So the module compiles and passes everywhere, and CI's
 //! `test-cluster:` job — which sets
 //! `LIVE_EDIT_TEST_CLUSTER_URL=redis-cluster://127.0.0.1:7000` and runs the
-//! unfiltered workspace suite — is what actually executes the bodies. Locally,
+//! tests `test_support::CLUSTER_GATED_FILTERSET` selects by name, this module's
+//! among them — is what actually executes the bodies. Locally,
 //! `bash scripts/dev-valkey.sh cluster-up` brings the same 3-shard cluster up
 //! (Linux-only: it relies on Docker `--network host`).
 //!
@@ -267,7 +268,7 @@ async fn cluster_fixture_inner(
     readers: u32,
     provider: Option<Arc<dyn fred::types::config::CredentialProvider>>,
 ) -> Option<TestValkey> {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); \
              run `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run this"
@@ -439,9 +440,9 @@ fn object_ids_on_distinct_shards(tv: &TestValkey, want: usize) -> Vec<(u64, Serv
 // single-node client to its bound slot's primary); and fred caches the
 // `CLIENT ID` of the connection when it connects, so `connection_ids()` names
 // the exact socket without sending a command — which, on a reader parked in
-// `XREAD BLOCK`, would interrupt the read (`Blocking::Interrupt`). `CLIENT LIST
-// ID` then confirms `cmd=xread` on that id — the "parked" barrier and the
-// non-vacuity check at once.
+// `XREAD BLOCK`, would wait out the read's BLOCK (the readers run fred's
+// default `Blocking::Block`). `CLIENT LIST ID` then confirms `cmd=xread` on
+// that id — the "parked" barrier and the non-vacuity check at once.
 
 /// The one stream reader's connection to `node`.
 struct ReservedConsumerSlot {
@@ -799,6 +800,15 @@ async fn cluster_subscriber_delivers_live_updates_across_shards() {
 
     assert_still_healthy(&consumer_a, &metrics, "cross-shard consumer A");
     assert_still_healthy(&consumer_b, &metrics, "cross-shard consumer B");
+    // b.ntm (T14): the slot-bound readers of both shards charge one
+    // live-delivery ledger, the replica's; each entry's queued charge is
+    // repaid as its consumer receives it, so with both entries received and
+    // dropped nothing is left charged.
+    assert_eq!(
+        tv.client().stream_mux.delivery_ledger().charged_bytes(),
+        0,
+        "every entry offered on either shard was received and released"
+    );
 
     drop(consumer_a);
     drop(consumer_b);
@@ -1081,14 +1091,16 @@ async fn cluster_subscriber_cursor_survives_connection_loss() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// `CLIENT UNBLOCK <id> ERROR` against the exact connection a slot-bound reader
-/// is parked on — the interrupt fred's `Blocking::Interrupt` sends — makes its
-/// `XREAD` fail `-UNBLOCKED`. A cluster reader is a single-node client to its
-/// slot's owner (b.azh), so the reply comes back on its one connection; the
-/// reader must take its cheap re-plan path (counted on
-/// `valkey_consumer_unblocked_retries_total`), keep the subscription, and
-/// deliver what is appended next. (The two-node facade twin, which also pins
-/// that a command queued behind the read interrupts it, runs without a
-/// cluster in `stream_mux_reader_connect_test.rs`.)
+/// is parked on — what an operator or another client on the store can send;
+/// the service itself sends none, its readers running fred's default
+/// `Blocking::Block` (b.9sh) — makes its `XREAD` fail `-UNBLOCKED`. A cluster
+/// reader is a single-node client to its slot's owner (b.azh), so the reply
+/// comes back on its one connection; the reader must take its cheap re-plan
+/// path (counted on `valkey_consumer_unblocked_retries_total`), keep the
+/// subscription, and deliver what is appended next. (The two-node facade
+/// twin runs without a cluster in `stream_mux_reader_connect_test.rs`, beside
+/// the pin that a command behind a reader's timed-out read opens no second
+/// connection.)
 ///
 /// The single-node twin is `stream_mux_test::a_client_unblock_on_a_reader_is_replanned_without_loss`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

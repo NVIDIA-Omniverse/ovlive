@@ -49,6 +49,10 @@
 //! (renewal periods, wait caps) from the same [`coefficients`] and the size a
 //! verdict carries ([`FenceLease::size`], [`AcquireVerdict::RetryAfter`]), so
 //! the two sides agree. No timing constant is chosen anywhere else (SR-5.7).
+//! The one exception is test-only and compiled out of release builds: a lease
+//! a test lengthens is acquired, renewed and released under a block with a
+//! longer lease and every other script limit unchanged ([`acquire_fence`]; the
+//! [`cost`] module docs).
 //!
 //! # Pool
 //!
@@ -84,6 +88,14 @@
 //! against the store's `TIME`, and the keys carry a `PEXPIRE`. A drop outside
 //! any runtime spawns nothing and leaves the same backstops.
 //!
+//! Each spawned cleanup gives up within one command timeout
+//! (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`) of its spawn: the intent's `HDEL`
+//! is one command, and the lease's release is cut at that timeout as a whole,
+//! its `NOSCRIPT` reload (`SCRIPT LOAD`, then the `EVALSHA` again) included
+//! (`storage::client::cut_at_command_timeout`). A cut release is a failed one:
+//! the lease lapses at its deadline. The disaster-recovery hold's after-entry
+//! bound counts each at one command timeout (`dr::hold::hold_write_bound`).
+//!
 //! The spawned cleanup is tracked on the client
 //! (`ValkeyClient::spawn_fence_guard_cleanup`), and `ValkeyClient::quit`
 //! waits for every one, bounded, before it closes the pools. So a guard that
@@ -97,14 +109,16 @@
 //! Every lease release — [`FenceLease::release`] and the guard's spawned
 //! release alike — ends with one DEBUG event, `snapshot fence lease`, on the
 //! target [`LEASE_TRACE_TARGET`] (`live_edit::snapshot_fence_lease`), written
-//! after the release script answers, on success and on error. It is
+//! after the release script answers, on success and on error, or after the
+//! guard's release is cut (# Guards). It is
 //! measurement-only: the validation tooling unions these events across
 //! replicas to judge the writers' share of wall-clock time per epoch–gap
 //! cycle (Spec SDD SR-5.5). Its fields:
 //!
 //! - `object_id`; `kind` (`started_epoch` / `joined_epoch`); `cut`;
 //! - `outcome`: `verified`, `broken`, `not_found`, or `error` when the call
-//!   failed or its reply was malformed;
+//!   failed, its reply was malformed, or (the guard's release only) it was
+//!   cut at the command timeout;
 //! - `via`: `release` (an explicit [`FenceLease::release`]) or `drop` (the
 //!   guard's best-effort release). A failed explicit release logs `error`,
 //!   and the guard's re-release then logs a second event with the same
@@ -136,13 +150,13 @@ use std::borrow::Cow;
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use fred::interfaces::HashesInterface;
+use fred::interfaces::{ClientLike, HashesInterface};
 use fred::types::scripts::Script;
 use fred::types::Value;
 
 use crate::error::ServiceError;
 use crate::storage::client::{
-    map_transient_fred_err, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
+    cut_at_command_timeout, map_transient_fred_err, FredErrOrigin, ValkeyClient, POOL_LABEL_DATA,
 };
 use crate::storage::keys::KeySchema;
 
@@ -229,6 +243,57 @@ static INTENT_RENEW_SCRIPT: LazyLock<Script> =
 /// (`LIVE_EDIT_SNAPSHOT_ATOMIC_READ_MAX_ITEMS`).
 pub fn coefficients(client: &ValkeyClient) -> FenceCoefficients {
     FenceCoefficients::recorded(client.snapshot_atomic_read_max_items)
+}
+
+/// The block a fenced reader's lease is acquired, renewed and released under:
+/// [`coefficients`]`(client)`. Release builds have no other.
+#[cfg(not(any(test, feature = "test-fault-injection")))]
+fn lease_coefficients(client: &ValkeyClient) -> FenceCoefficients {
+    coefficients(client)
+}
+
+/// The block a fenced reader's lease is acquired, renewed and released under:
+/// [`coefficients`]`(client)`, or, while the client's fault injector
+/// lengthens fence leases
+/// ([`crate::storage::diff_read::ObjectSnapshotReadFaultInjector::lengthen_fence_leases`]),
+/// that block with its lease raised to at least [`lengthened_lease_floor`]
+/// ([`FenceCoefficients::with_lease_at_least`]; the `cost` module docs'
+/// test-only exception).
+///
+/// Costs one lock of the injector slot and one `AtomicBool` load, and
+/// allocates nothing; the floor's arithmetic runs only while the lever is
+/// on.
+#[cfg(any(test, feature = "test-fault-injection"))]
+fn lease_coefficients(client: &ValkeyClient) -> FenceCoefficients {
+    let recorded = coefficients(client);
+    if client.object_snapshot_read_faults.fence_leases_lengthened() {
+        recorded.with_lease_at_least(lengthened_lease_floor(client).as_secs_f64() * 1_000.0)
+    } else {
+        recorded
+    }
+}
+
+/// The least lease a fenced read on `client` acquires while its fault injector
+/// lengthens fence leases: twice the data pool's command timeout
+/// (`LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS`), the pool every fence script runs
+/// on. Its renewals then come every half timeout or later, and a renewal sent
+/// on schedule has three quarters of the lease, at least 1.5 timeouts, to
+/// land in. Tests size their own waits from this rather than restating the
+/// factor.
+///
+/// # Panics
+///
+/// When the data pool has no command timeout (zero): no lease is then long
+/// enough for a stalled command, so there is no floor to give.
+#[cfg(any(test, feature = "test-fault-injection"))]
+pub fn lengthened_lease_floor(client: &ValkeyClient) -> Duration {
+    let command_timeout = client.pool.next().perf_config().default_command_timeout;
+    assert!(
+        !command_timeout.is_zero(),
+        "lengthened fence leases need a data-pool command timeout to size against; this client \
+         has none"
+    );
+    2 * command_timeout
 }
 
 /// A random 128-bit token in lowercase hex: one per fenced read, one per
@@ -436,6 +501,18 @@ pub enum IntentRenewVerdict {
 /// the script uses the fence key's stored size instead whenever it has one,
 /// and writes the estimate only on the grant that creates a fresh key. Runs on
 /// the data pool. Writes nothing unless it grants.
+///
+/// The script gets the block of `lease_coefficients(client)`, and a grant
+/// keeps it in its [`FenceLease`], so the lease's renewals, its release
+/// (explicit or on drop) and its [`FenceLease::renew_interval`] all use the
+/// block it was granted under. In release builds that block is
+/// [`coefficients`]`(client)`. In test builds, while the client's fault
+/// injector lengthens fence leases, it is the test-only lengthened block (the
+/// [`cost`] module docs), which gives the lease at least
+/// `lengthened_lease_floor(client)` and leaves every other limit the scripts
+/// compute unchanged. The readers size their hooks, wait caps and capacity
+/// from [`coefficients`] and the verdict's size, so the lever moves none of
+/// them.
 pub async fn acquire_fence(
     client: &ValkeyClient,
     keys: &KeySchema,
@@ -444,7 +521,7 @@ pub async fn acquire_fence(
 ) -> Result<AcquireVerdict, ServiceError> {
     const OP: &str = "EVALSHA snapshot_fence_acquire";
     let oid = object_id.to_string();
-    let coefficients = coefficients(client);
+    let coefficients = lease_coefficients(client);
     let token = mint_token();
     let fence_key = keys.obj_snapshot_fence(&oid);
     let header_key = keys.obj_header(&oid);
@@ -547,6 +624,9 @@ pub struct FenceLease {
     kind: GrantKind,
     /// The layer size the grant computed its limits from.
     size: LayerSize,
+    /// The block the grant was given ([`acquire_fence`]): every renewal and
+    /// release of this lease passes it, so the scripts see one block per
+    /// lease even when a test lengthens it.
     coefficients: FenceCoefficients,
     /// The replica's wall clock (µs since the Unix epoch) immediately before
     /// the acquire `EVALSHA` was sent. Measurement only: carried into the
@@ -592,7 +672,11 @@ impl FenceLease {
     }
 
     /// Every limit for [`Self::size`], from the same coefficients the scripts
-    /// were given.
+    /// were given. On a lease a test lengthened ([`acquire_fence`]),
+    /// `lease_ms` and the renewal period are the lengthened ones, and
+    /// `hold_ms`, `epoch_ms`, `reader_wait_max_ms` and `key_linger_ms` carry
+    /// the lengthening too, so size anything else from [`coefficients`];
+    /// every other limit is production-sized.
     pub fn timing(&self) -> FenceTiming {
         self.coefficients.timing(self.size)
     }
@@ -725,9 +809,15 @@ impl Drop for FenceLease {
 /// The one release call site, shared by [`FenceLease::release`] and the
 /// guard's drop.
 ///
+/// On the drop path (`via` [`ReleaseVia::Drop`]) the whole call, its
+/// `NOSCRIPT` reload included, is cut at one command timeout, read from the
+/// connection it runs on; a cut answers `Unavailable` (module docs,
+/// # Guards). The explicit release is not cut.
+///
 /// It ends by writing the measurement-only `snapshot fence lease` DEBUG event
 /// on [`LEASE_TRACE_TARGET`] (module docs, # Measurement event), after the
-/// release `EVALSHA` returns, on success and on error: `trace` carries the
+/// release `EVALSHA` returns, on success and on error, or after the cut
+/// (outcome `error`): `trace` carries the
 /// grant's object, kind, cut and acquire bracket, `via` the path that
 /// released, and the release bracket is read around the `EVALSHA` here. The
 /// brackets are the replica's wall clock and never inform a fence decision;
@@ -755,18 +845,46 @@ async fn release_lease(
     script_argv.push(measured.items.to_string());
     script_argv.push(measured.bytes.to_string());
     script_argv.extend(coefficients.script_argv());
+    let conn = client.pool.next();
+    let script_keys = vec![fence_key.to_owned(), header_key.to_owned()];
     let release_sent_unix_us = unix_now_us();
-    let reply = FENCE_RELEASE_SCRIPT
-        .evalsha_with_reload::<Value, _, _>(
-            client.pool.next(),
-            vec![fence_key.to_owned(), header_key.to_owned()],
-            script_argv,
-        )
-        .await;
+    // The guard's drop-path release is a clean-up whose owner is gone, so it
+    // is cut at one command timeout, its `NOSCRIPT` reload included (module
+    // docs, # Guards). An explicit release is not: its caller's own bound
+    // covers it, and its failure re-arms the drop path.
+    //
+    // The drop path's cut is boxed. Only the guard's spawned clean-up takes
+    // it, but this function's future is inlined, through the fenced read and
+    // the structural cache's cold start, into the `UpdateLayer` structural
+    // route's future, which an upload holds whole, at the size of its largest
+    // state, whichever path it takes. Unboxed, the cut's state (the call and
+    // a timer, larger than the call alone) would be that largest state.
+    let reply = match via {
+        ReleaseVia::Release => Some(
+            FENCE_RELEASE_SCRIPT
+                .evalsha_with_reload::<Value, _, _>(conn, script_keys, script_argv)
+                .await,
+        ),
+        ReleaseVia::Drop => {
+            Box::pin(cut_at_command_timeout(
+                conn.perf_config().default_command_timeout,
+                FENCE_RELEASE_SCRIPT.evalsha_with_reload::<Value, _, _>(
+                    conn,
+                    script_keys,
+                    script_argv,
+                ),
+            ))
+            .await
+        }
+    };
     let release_replied_unix_us = unix_now_us();
     let verdict = match reply {
-        Err(e) => Err(data_pool_err(client, OP, e)),
-        Ok(reply) => {
+        None => Err(ServiceError::Unavailable(format!(
+            "{OP} cut at the Valkey command timeout (LIVE_EDIT_VALKEY_COMMAND_TIMEOUT_MS), its \
+             NOSCRIPT reload included"
+        ))),
+        Some(Err(e)) => Err(data_pool_err(client, OP, e)),
+        Some(Ok(reply)) => {
             let reply = reply.into_array();
             let verdict = match verdict_word(&reply).as_deref() {
                 Some("VERIFIED") if reply.len() == 1 => Some(ReleaseVerdict::Verified),
@@ -934,6 +1052,10 @@ pub async fn register_intent(
     script_argv.push(token.clone());
     script_argv.push(estimate.items.to_string());
     script_argv.push(estimate.bytes.to_string());
+    // The recorded block, never a lease's lengthened one (`acquire_fence`):
+    // this is a writer's script, on no reader's renew or release path. It
+    // reads the fence key without writing it and sizes only the intent's
+    // `intent_ttl(L)`, which the lengthening leaves unchanged.
     script_argv.extend(coefficients(client).script_argv());
     let reply: Value = match INTENT_REGISTER_SCRIPT
         .evalsha_with_reload::<Value, _, _>(
@@ -1079,8 +1201,9 @@ impl Drop for WriterIntent {
     }
 }
 
-/// The one intent `HDEL`, shared by [`WriterIntent::clear`] and the guard's
-/// drop.
+/// The one intent `HDEL`, shared by [`WriterIntent::clear`], the guard's drop
+/// and the tail of the renewal task (`writer::IntentRenewal`, which cuts it
+/// at one command timeout).
 async fn clear_intent(
     client: &ValkeyClient,
     intent_key: &str,

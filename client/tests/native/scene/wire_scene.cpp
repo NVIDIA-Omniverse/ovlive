@@ -492,11 +492,12 @@ void perListReorder() {
     check(inspect(base) == before,"reorder mutated retained original owner");
 }
 void duplicateSiblingProjection() {
-    context = "duplicate sibling names from a same-parent rename";
-    Batch start; start.metadata.commands = {create(2,1,"P"),create(3,2,"A"),create(4,2,"B"),create(5,4,"Child")};
-    start.field(4,TfToken("value"),VtValue(4)); const auto base = candidate({},start);
-    Batch rename; rename.metadata.commands = {move(4,2,2,"A")}; // Equal parents: rename B onto the occupied name A.
-    const auto shadowed = candidate(base,rename);
+    context = "duplicate sibling names from a catch-up of a store that keeps both";
+    // A service without the rename cascade stores two siblings with one name, and a catch-up diff restates both.
+    Batch start; start.metadata.isDiff = true; start.metadata.baseVersion = 0;
+    start.metadata.commands = {diff(2,1,"P",0),diff(3,2,"A",0),diff(4,2,"A",1),diff(5,4,"Child",0)};
+    start.field(4,TfToken("value"),VtValue(4));
+    const auto shadowed = delivered({},start);
     indexed(shadowed,3,"/P/A",SdfSpecTypePrim);
     check(shadowed->pathForSection(4).IsEmpty() && shadowed->pathForSection(5).IsEmpty(),"shadowed sibling or descendant has a path");
     check(!shadowed->data()->Has(SdfPath("/P/A"),TfToken("value")) && !shadowed->data()->HasSpec(SdfPath("/P/A/Child")),
@@ -516,6 +517,96 @@ void duplicateSiblingProjection() {
     const auto replaced = candidate(shadowed,replace);
     gone(replaced,3); indexed(replaced,4,"/P/A",SdfSpecTypePrim);
     check(replaced->pathForSection(6).IsEmpty() && replaced->sectionCount() == 5,"second duplicate was projected");
+    // So does a rename onto the shared name: the renamed section joins the survivor, which the lower ID owns.
+    Batch onto; onto.metadata.commands = {create(6,2,"C"),move(6,2,2,"A")};
+    const auto renamed = candidate(shadowed,onto);
+    gone(renamed,3); indexed(renamed,4,"/P/A",SdfSpecTypePrim); indexed(renamed,5,"/P/A/Child",SdfSpecTypePrim);
+    check(renamed->pathForSection(6).IsEmpty() && renamed->sectionCount() == 5,"renamed duplicate was projected");
+    // A rename of either duplicate to the name they share changes nothing.
+    for (const uint64_t id : {3, 4}) {
+        Batch same; same.metadata.commands = {move(id,2,2,"A")};
+        const auto unchanged = candidate(shadowed,same);
+        check(inspect(unchanged) == inspect(shadowed) && unchanged->sectionCount() == shadowed->sectionCount(),
+              "a rename to the section's own name changed the scene");
+    }
+}
+// A same-parent rename onto an occupied name deletes the occupant with its listed subtree, then renames, as a
+// Create at that name does; every batch policy applies it alike.
+void renameCascade() {
+    context = "same-parent rename onto an occupied name";
+    Batch start; start.metadata.commands = {create(2,1,"P"),create(3,2,"A"),create(4,3,"Child"),create(5,2,"B"),
+        create(6,5,"Kept"),create(7,1,"Q")};
+    start.field(4,TfToken("value"),VtValue(4)); start.field(5,TfToken("value"),VtValue(5));
+    const auto base = candidate({},start); const auto before = inspect(base);
+    Batch rename; rename.metadata.commands = {move(5,2,2,"A")};
+    const auto renamed = candidate(base,rename);
+    gone(renamed,3); gone(renamed,4); check(!renamed->data()->HasSpec(SdfPath("/P/A/Child")),"occupant's subtree remains");
+    indexed(renamed,5,"/P/A",SdfSpecTypePrim); indexed(renamed,6,"/P/A/Kept",SdfSpecTypePrim);
+    field(renamed,"/P/A",TfToken("value"),VtValue(5)); field(renamed,"/P",SdfChildrenKeys->PrimChildren,tokens({"A"}));
+    check(renamed->sectionCount() == 5 && renamed->pathCount() == 5,"rename kept the occupant's sections or paths");
+    for (const auto policy : {WireSceneBatchPolicy::Delivered, WireSceneBatchPolicy::PendingReplay})
+        check(inspect(buildSceneCandidate(base,rename.bytes(),{},nullptr,policy)) == inspect(renamed),
+              "a delivered or replayed rename differs from an ordinary one");
+    // The occupant's later records are orphan data.
+    Batch late; late.field(3,TfToken("value"),VtValue(9));
+    check(inspect(candidate(renamed,late)) == inspect(renamed),"a record of the replaced occupant became visible");
+    // A rename to the section's own name changes nothing, nor does a rename to a free name delete anything.
+    Batch same; same.metadata.commands = {move(3,2,2,"A")};
+    check(inspect(candidate(base,same)) == before,"a rename to the section's own name changed the scene");
+    Batch unoccupied; unoccupied.metadata.commands = {move(5,2,2,"C")};
+    const auto moved = candidate(base,unoccupied);
+    indexed(moved,3,"/P/A",SdfSpecTypePrim); indexed(moved,5,"/P/C",SdfSpecTypePrim);
+    // A rename acts under the stored parent: after a peer moved A from P to Q, a captured rename naming P renames
+    // it under Q and replaces Q's occupant there, not P's.
+    { Batch peer; peer.metadata.commands = {move(3,2,7,"A"),create(8,7,"Taken"),create(9,2,"Taken")};
+      const auto movedByPeer = candidate(base,peer);
+      Batch captured; captured.metadata.commands = {move(3,2,2,"Taken")};
+      const auto stored = candidate(movedByPeer,captured);
+      indexed(stored,3,"/Q/Taken",SdfSpecTypePrim); indexed(stored,4,"/Q/Taken/Child",SdfSpecTypePrim);
+      gone(stored,8); indexed(stored,9,"/P/Taken",SdfSpecTypePrim); }
+    // An occupant is a sibling, so neither holds the other by stored parent; a stale listing can put one in the
+    // other's listed subtree. A is stored at the root while Q's list still names it.
+    Batch stale; stale.metadata.commands = {move(3,2,7,"A"),move(3,2,1,"A")};
+    const auto staleBase = candidate(base,stale);
+    indexed(staleBase,3,"/A",SdfSpecTypePrim);
+    // Renaming A onto Q deletes Q's listed subtree, which holds A: both leave.
+    { Batch up; up.metadata.commands = {move(3,1,1,"Q")};
+      const auto both = candidate(staleBase,up);
+      gone(both,3); gone(both,4); gone(both,7); indexed(both,2,"/P",SdfSpecTypePrim);
+      field(both,"/",SdfChildrenKeys->PrimChildren,tokens({"P"})); }
+    // Renaming Q onto A deletes only A, which Q's listed subtree holds, and Q takes the name.
+    { Batch down; down.metadata.commands = {move(7,1,1,"A")};
+      const auto onlyOccupant = candidate(staleBase,down);
+      gone(onlyOccupant,3); gone(onlyOccupant,4); indexed(onlyOccupant,7,"/A",SdfSpecTypePrim);
+      Batch dropQ; dropQ.metadata.commands = {erase(7,1)};
+      check(candidate(onlyOccupant,dropQ)->sectionCount() == onlyOccupant->sectionCount() - 1,
+            "deleting the renamed section deleted another section"); }
+    // A Move to another parent meets the same stale listing: moving A to the root as Q, with the command naming P as
+    // its old parent, deletes Q's listed subtree, which holds A, so both leave and the update applies.
+    { context = "cross-parent move onto an occupant whose listed subtree holds the section";
+      Batch across; across.metadata.commands = {move(3,2,1,"Q")};
+      const auto both = candidate(staleBase,across);
+      gone(both,3); gone(both,4); gone(both,7); indexed(both,2,"/P",SdfSpecTypePrim);
+      field(both,"/",SdfChildrenKeys->PrimChildren,tokens({"P"}));
+      for (const auto policy : {WireSceneBatchPolicy::Delivered, WireSceneBatchPolicy::PendingReplay})
+          check(inspect(buildSceneCandidate(staleBase,across.bytes(),{},nullptr,policy)) == inspect(both),
+                "a delivered or replayed cross-parent Move differs from an ordinary one"); }
+    // The occupant's listed subtree can hold the new parent instead: B is stored at the root while Q's list still
+    // names it, and Q is stored under B. Moving A into B as Q deletes Q's listed subtree, which holds B, so the
+    // Move's new parent is missing and A is deleted with its subtree, as a Move to a missing parent is.
+    { context = "cross-parent move onto an occupant whose listed subtree holds the new parent";
+      Batch loop; loop.metadata.commands = {move(5,2,7,"B"),move(5,2,1,"B"),move(7,1,5,"Q")};
+      const auto loopBase = candidate(base,loop);
+      indexed(loopBase,5,"/B",SdfSpecTypePrim); indexed(loopBase,7,"/B/Q",SdfSpecTypePrim);
+      Batch into; into.metadata.commands = {move(3,2,5,"Q")};
+      const auto none = candidate(loopBase,into);
+      gone(none,3); gone(none,4); gone(none,5); gone(none,6); gone(none,7); indexed(none,2,"/P",SdfSpecTypePrim);
+      field(none,"/",SdfChildrenKeys->PrimChildren,tokens({"P"}));
+      check(none->sectionCount() == 2,"a section moved under a deleted parent remains");
+      for (const auto policy : {WireSceneBatchPolicy::Delivered, WireSceneBatchPolicy::PendingReplay})
+          check(inspect(buildSceneCandidate(loopBase,into.bytes(),{},nullptr,policy)) == inspect(none),
+                "a delivered or replayed cross-parent Move differs from an ordinary one"); }
+    check(inspect(base) == before,"rename mutated retained original owner");
 }
 void fieldsAndSamples() {
     context = "field precedence, notifications and sample phases";
@@ -604,7 +695,7 @@ void serviceConflictRules() {
     check(inspect(apply({create(6,99,"C")})) == inspect(base),"create under a missing parent changed the scene");
     // A Delete's carried parent is bookkeeping, not a precondition.
     missing(apply({erase(3,4)}),3,"/P/A");
-    // Create at an occupied (parent, name) deletes the occupant's subtree first.
+    // Create into an occupied slot deletes the occupant's subtree first.
     const auto replaced = apply({create(6,1,"Q")});
     indexed(replaced,6,"/Q",SdfSpecTypePrim); gone(replaced,4); gone(replaced,5);
     // Local content never creates a live identity. A delivered Create of one repeats a commit the scene
@@ -629,12 +720,12 @@ void serviceConflictRules() {
     // parents select the rule, which then acts on the stored parent.
     { Batch peer; peer.metadata.commands = {move(3,2,4,"A")}; const auto movedByPeer = candidate(base,peer);
       auto replay = [&](std::vector<Command> commands) { Batch batch; batch.metadata.commands = std::move(commands); return candidate(movedByPeer,batch); };
-      // Move(S, old=P, new=P) is a rename under the stored parent Q, without a sibling-name check.
+      // Move(S, old=P, new=P) is a rename under the stored parent Q, replacing an occupant there.
       { const auto renamed = replay({move(3,2,2,"N2")});
         indexed(renamed,3,"/Q/N2",SdfSpecTypePrim); check(!renamed->data()->HasSpec(SdfPath("/P/N2")),"rename used the command parent"); field(renamed,"/Q",SdfChildrenKeys->PrimChildren,tokens({"B","N2"})); }
-      { const auto duplicate = replay({move(3,2,2,"B")});
-        indexed(duplicate,3,"/Q/B",SdfSpecTypePrim); check(duplicate->pathForSection(5).IsEmpty(),"higher duplicate identity was projected");
-        check(duplicate->sectionCount() == base->sectionCount(),"same-parent rename deleted the occupant"); }
+      { const auto occupied = replay({move(3,2,2,"B")});
+        indexed(occupied,3,"/Q/B",SdfSpecTypePrim); gone(occupied,5);
+        check(occupied->sectionCount() == base->sectionCount() - 1,"same-parent rename kept the occupant"); }
       // Move(S, old=P, new=Q) takes the cross-parent path: occupancy applies at Q, and S keeps its slot there.
       { const auto moved = replay({move(3,2,4,"A2")});
         indexed(moved,3,"/Q/A2",SdfSpecTypePrim); field(moved,"/Q",SdfChildrenKeys->PrimChildren,tokens({"B","A2"})); }
@@ -670,6 +761,62 @@ void serviceConflictRules() {
     // A ghost retraction of a section the client never held is a no-op.
     Batch ghost; ghost.metadata.isDiff = true; ghost.metadata.baseVersion = 1; ghost.metadata.commands = {erase(99,0,true)};
     check(inspect(candidate(base,ghost)) == inspect(base),"missing diff deletion changed the scene");
+}
+void typedSlots() {
+    context = "a slot is a name within one child list";
+    // /P{2} holds prim A{3} and attribute x{6}; /Q{4} holds prim B{5} and attribute C{7}.
+    Batch start; start.metadata.commands = {create(2,1,"P"),create(3,2,"A"),create(4,1,"Q"),create(5,4,"B"),
+        create(6,2,"x",SdfSpecTypeAttribute),create(7,4,"C",SdfSpecTypeAttribute)};
+    start.field(3,TfToken("value"),VtValue(3)); start.field(6,SdfFieldKeys->Default,VtValue(6));
+    const auto base = candidate({},start);
+    auto commands = [](std::vector<Command> list) { Batch batch; batch.metadata.commands = std::move(list); return batch; };
+    auto apply = [&](std::vector<Command> list) { return candidate(base,commands(std::move(list))); };
+    // The full scene after Creates into both kinds of slot: a prim where a property is named and the reverse.
+    auto created = [&](const WireScenePtr& scene) {
+        indexed(scene,3,"/P/A",SdfSpecTypePrim); indexed(scene,8,"/P.A",SdfSpecTypeAttribute);
+        indexed(scene,6,"/P.x",SdfSpecTypeAttribute); indexed(scene,9,"/P/x",SdfSpecTypePrim);
+        field(scene,"/P",SdfChildrenKeys->PrimChildren,tokens({"A","x"}));
+        field(scene,"/P",SdfChildrenKeys->PropertyChildren,tokens({"x","A"}));
+        field(scene,"/P/A",TfToken("value"),VtValue(3)); field(scene,"/P.x",SdfFieldKeys->Default,VtValue(6));
+        check(scene->sectionCount() == 9,"a Create into the other kind's slot replaced its occupant");
+    };
+    const std::vector<Command> creates = {create(8,2,"A",SdfSpecTypeAttribute),create(9,2,"x")};
+    const auto both = apply(creates); created(both);
+    // A same-list Create still replaces the occupant, and attributes and relationships share the property list.
+    { const auto prim = apply({create(10,2,"A")}); gone(prim,3); indexed(prim,10,"/P/A",SdfSpecTypePrim);
+      indexed(prim,6,"/P.x",SdfSpecTypeAttribute);
+      const auto rel = apply({create(10,2,"x",SdfSpecTypeRelationship)}); gone(rel,6);
+      indexed(rel,10,"/P.x",SdfSpecTypeRelationship); indexed(rel,3,"/P/A",SdfSpecTypePrim); }
+    // Moves into the other kind's slot keep both: prim A into Q as C, attribute x into Q as B.
+    { const auto moved = apply({move(3,2,4,"C"),move(6,2,4,"B")});
+      indexed(moved,3,"/Q/C",SdfSpecTypePrim); indexed(moved,7,"/Q.C",SdfSpecTypeAttribute);
+      indexed(moved,6,"/Q.B",SdfSpecTypeAttribute); indexed(moved,5,"/Q/B",SdfSpecTypePrim);
+      check(moved->sectionCount() == base->sectionCount(),"a Move into the other kind's slot replaced its occupant"); }
+    // Moves into the same kind's slot replace the occupant: prim A onto prim B, attribute x onto attribute C.
+    { const auto moved = apply({move(3,2,4,"B"),move(6,2,4,"C")});
+      indexed(moved,3,"/Q/B",SdfSpecTypePrim); indexed(moved,6,"/Q.C",SdfSpecTypeAttribute); gone(moved,5); gone(moved,7); }
+    // A rename onto the other kind's name keeps both; onto its own kind's name it replaces the occupant.
+    { const auto renamed = apply({move(3,2,2,"x"),move(7,4,4,"B")});
+      indexed(renamed,3,"/P/x",SdfSpecTypePrim); indexed(renamed,6,"/P.x",SdfSpecTypeAttribute);
+      indexed(renamed,7,"/Q.B",SdfSpecTypeAttribute); indexed(renamed,5,"/Q/B",SdfSpecTypePrim);
+      check(renamed->sectionCount() == base->sectionCount(),"a rename onto the other kind's name replaced its occupant");
+      const auto cascaded = apply({create(8,2,"y",SdfSpecTypeAttribute),move(8,2,2,"x")});
+      gone(cascaded,6); indexed(cascaded,8,"/P.x",SdfSpecTypeAttribute); indexed(cascaded,3,"/P/A",SdfSpecTypePrim); }
+    // The rule holds when a pending intent replays over a peer update and for a delivered update.
+    { const auto peer = apply({move(5,4,2,"B")}); // A peer moves prim B under P, beside A.
+      const auto intent = commands(creates).bytes();
+      const auto replayed = buildReplayedScene(peer,{intent});
+      indexed(replayed,8,"/P.A",SdfSpecTypeAttribute); indexed(replayed,3,"/P/A",SdfSpecTypePrim);
+      indexed(replayed,9,"/P/x",SdfSpecTypePrim); indexed(replayed,6,"/P.x",SdfSpecTypeAttribute);
+      indexed(replayed,5,"/P/B",SdfSpecTypePrim);
+      created(delivered(base,commands(creates))); }
+    // A late joiner's snapshot restates both siblings of one name and builds the same scene.
+    { Batch snapshot; snapshot.metadata.isDiff = true;
+      snapshot.metadata.commands = {diff(2,1,"P",0),diff(4,1,"Q",1),diff(3,2,"A",0),diff(6,2,"x",1,SdfSpecTypeAttribute),
+          diff(8,2,"A",2,SdfSpecTypeAttribute),diff(9,2,"x",3),diff(5,4,"B",0),diff(7,4,"C",1,SdfSpecTypeAttribute)};
+      snapshot.field(3,TfToken("value"),VtValue(3)); snapshot.field(6,SdfFieldKeys->Default,VtValue(6));
+      const auto joined = candidate({},snapshot);
+      check(inspect(joined) == inspect(both),"a late joiner's scene differs from the live reader's"); created(joined); }
 }
 void conflictsAndLimits() {
     context = "atomic graph conflicts and scene quotas";
@@ -1054,7 +1201,7 @@ int main(int argc, char** argv) {
         // Every build checks its incremental derivation against a whole-scene one.
         setWireSceneDerivationCheck(true);
         std::cout << "master_seed=" << seed << " scenario=wire-scene" << std::endl;
-        topology(); sectionEnumeration(); deletionDiffAndOrdering(); wholeListReorder(); perListReorder(); usdListOrderingDifferential(seed); fieldsAndSamples(); authoredChildren(); serviceConflictRules(); duplicateSiblingProjection(); conflictsAndLimits(); wideDeletion(); shuffledCreates(seed);
+        topology(); sectionEnumeration(); deletionDiffAndOrdering(); wholeListReorder(); perListReorder(); usdListOrderingDifferential(seed); fieldsAndSamples(); authoredChildren(); serviceConflictRules(); typedSlots(); duplicateSiblingProjection(); renameCascade(); conflictsAndLimits(); wideDeletion(); shuffledCreates(seed);
         variantNamesAndNestedTargets(); lateQuotaFailuresAndOwnership(); histories(seed); sampleApplication(); sampleHistories(seed); largeSingleAttributeSamples(); concurrentOldOwner(); context = "host projection"; hostProjectionTests(); hostProjectionAllocationTests();
         context = "host layer state"; hostLayerStateTests();
         std::cout << "independent wire scene graph/fields/ordering/retention contracts passed" << std::endl; return 0;

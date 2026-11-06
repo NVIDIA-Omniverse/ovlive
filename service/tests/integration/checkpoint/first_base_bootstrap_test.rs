@@ -23,6 +23,8 @@
 //! (b.vn6 — the POST-PUT half of the delete race, its fast-path reap and that
 //! reap's two abort-before-delete arms, the pre-PUT liveness re-check, and the
 //! refusal's reap-dependent log level) follow TEST-B under their own banners.
+//! Beside case 3 sits the tracker's abort token (SDD SR-6.2): a run parked in
+//! its PUT ends at the cancel, and a later spawn does nothing.
 //!
 //! ## What is under test
 //!
@@ -137,6 +139,7 @@ use fred::interfaces::{
 };
 use ordered_float::OrderedFloat;
 
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use live_edit::checkpoint::adapters::InMemoryCheckpointStore;
@@ -876,6 +879,84 @@ async fn bootstrap_base_meta_carries_the_header_identity_and_declines_a_commit_s
 }
 
 // =============================================================================
+// Case 1c — the clean-up fence before the PUT (b.g65).
+// =============================================================================
+
+/// The bootstrap publishes through the backup clean-up's fence, which runs
+/// BEFORE the PUT (b.g65, R2/R7; decider obligation (a) for this producer).
+/// With `le:ckpt:{recon}:rearm` holding a string the fence cannot record its
+/// re-arm, so it fails closed: the run defers (`DeferredCleanup`, counted on
+/// its own `deferred_cleanup` cell), the adapter is never written and no
+/// cursor is stamped. Once the fence is clear, a later run writes the base.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_whose_cleanup_fence_refuses_writes_nothing_and_a_later_run_writes_the_base() {
+    use fred::interfaces::KeysInterface;
+    let enabled = derive_bootstrap_enabled(&all_gates_on_config());
+    assert!(enabled, "the fence is reached only under the enabled gate");
+    let in_memory = Arc::new(InMemoryCheckpointStore::new());
+    let fx = bootstrap_fixture(Arc::clone(&in_memory) as Arc<dyn CheckpointStore>, enabled).await;
+    let state = seed_state(9);
+    let oid = fx.create_layer("first-base-fence-layer", &state).await;
+    let rearm = fx.tv.key_schema().checkpoint_reconcile_rearm();
+    let _: () = fx
+        .tv
+        .client()
+        .pool
+        .set(&rearm, "not-a-zset", None, None, false)
+        .await
+        .expect("poisoning :rearm must succeed");
+
+    let outcome = fx
+        .bootstrap
+        .run_once(oid, state.clone(), BootstrapTarget::CreationBase)
+        .await;
+    fx.drain().await;
+
+    assert_eq!(outcome, BootstrapOutcome::DeferredCleanup);
+    assert!(
+        fx.store
+            .list_layer_checkpoints(oid)
+            .await
+            .expect("list_layer_checkpoints must succeed")
+            .is_empty(),
+        "the fence ran before the PUT and refused it: nothing was written"
+    );
+    let deferred: f64 = fx
+        .base_bootstrap_cells()
+        .iter()
+        .filter(|((outcome, _), _)| outcome == "deferred_cleanup")
+        .map(|(_, v)| *v)
+        .sum();
+    assert_eq!(deferred, 1.0, "its own deferral cell, ticked once");
+    assert_eq!(
+        fx.header_field(oid, "last_checkpoint_seq").await,
+        None,
+        "no cursor stamp for a base that was not written"
+    );
+
+    let _: i64 = fx
+        .tv
+        .client()
+        .pool
+        .del(&rearm)
+        .await
+        .expect("DEL :rearm must succeed");
+    fx.bootstrap
+        .run_once(oid, state, BootstrapTarget::CreationBase)
+        .await;
+    fx.drain().await;
+    assert_eq!(
+        fx.store
+            .list_layer_checkpoints(oid)
+            .await
+            .expect("list_layer_checkpoints must succeed")
+            .len(),
+        1,
+        "with the fence clear the base is written"
+    );
+}
+
+// =============================================================================
 // Case 2 — assembler parity.
 // =============================================================================
 
@@ -1015,6 +1096,9 @@ async fn bootstrap_base_is_semantically_identical_to_the_assembler_base_for_the_
         ),
         live_edit::checkpoint::assembler::AssemblyDecision::LeaseLost => {
             panic!("the assembler was handed a keeper that never loses its lease; got LeaseLost")
+        }
+        live_edit::checkpoint::assembler::AssemblyDecision::DeferredCleanup => {
+            panic!("the clean-up fence deferred the PUT, but no clean-up runs in this fixture")
         }
         live_edit::checkpoint::assembler::AssemblyDecision::ShuttingDown => {
             panic!("the assembler was handed a keeper that never shuts down; got ShuttingDown")
@@ -1228,6 +1312,10 @@ impl CheckpointStore for SlowLayerPutStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.inner.delete_ext_blob(hash_hex).await
     }
@@ -1334,6 +1422,47 @@ async fn bootstrap_does_no_synchronous_work_on_the_create_layer_commit_path() {
         "after closing and draining the SHARED TaskTracker the bootstrap PUT must have completed \
          exactly once — a 0 means the task was dropped or spawned onto a tracker graceful \
          shutdown never joins"
+    );
+}
+
+/// The abort token the bootstraps share with the session-checkpoint dispatch
+/// (SDD SR-6.2, "Abort token for trackers"): a run parked inside its base
+/// `PUT` — a long tracked task, the shape a disaster-recovery hold finds —
+/// ends at the token's cancel without the `PUT` ever being released, so the
+/// tracker drains and no base lands; and a bootstrap spawned after the cancel
+/// spawns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_abort_token_ends_an_in_flight_run_and_later_spawns_do_nothing() {
+    let cfg = all_gates_on_config();
+    let enabled = derive_bootstrap_enabled(&cfg);
+    assert!(enabled, "the abort case must run under the enabled gate");
+    let parked = crate::dr::hold_support::ParkedStore::parking_layer_puts(Arc::new(
+        InMemoryCheckpointStore::new(),
+    ));
+    let fx = bootstrap_fixture(Arc::clone(&parked) as Arc<dyn CheckpointStore>, enabled).await;
+    let abort = CancellationToken::new();
+    let bootstrap = fx.bootstrap.clone().with_abort_token(abort.clone());
+
+    let state = seed_state(9);
+    let oid = fx.create_layer("first-base-abort-layer", &state).await;
+    bootstrap.spawn_creation_base(oid, state.clone());
+    parked.layer_put.entered("the bootstrap's base PUT").await;
+
+    abort.cancel();
+    fx.drain().await;
+
+    assert!(
+        fx.store
+            .list_layer_checkpoints(oid)
+            .await
+            .expect("list_layer_checkpoints must succeed")
+            .is_empty(),
+        "the aborted run's PUT never reached the store"
+    );
+    bootstrap.spawn_creation_base(oid, state);
+    assert!(
+        fx.tracker.is_empty(),
+        "a bootstrap spawned after the abort spawns nothing"
     );
 }
 
@@ -1694,6 +1823,10 @@ impl CheckpointStore for CountingLayerPutStore {
         self.inner.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.inner.delete_ext_blob(hash_hex).await
     }
@@ -1887,6 +2020,10 @@ impl CheckpointStore for FailingBasePutStore {
 
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         self.inner.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -3233,6 +3370,17 @@ struct HeaderKillingPutStore {
     fail_sidecar_reads: bool,
     /// `(client, header_key)`, installed by [`Self::arm`].
     kill: std::sync::OnceLock<(ValkeyClient, String)>,
+    /// When set, `le:ckpt:{recon}:tomb` is poisoned with a Valkey string
+    /// inside the PUT, after the generation is durable — case 17's second
+    /// arm. Poisoning it before the PUT would fail the clean-up fence's
+    /// re-arm first (b.g65), which reads `:tomb` before every PUT and defers
+    /// the publish, so the reap would never run.
+    poison_tomb_after_put: std::sync::OnceLock<String>,
+    /// `le:ckpt:{recon}:deleting`, installed by [`Self::arm`]: each delete
+    /// records whether its base stem was already announced there (b.g65, N2:
+    /// every deleter announces before it deletes).
+    deleting_key: std::sync::OnceLock<String>,
+    announced_at_delete: std::sync::Mutex<Vec<bool>>,
 }
 
 impl HeaderKillingPutStore {
@@ -3244,7 +3392,26 @@ impl HeaderKillingPutStore {
             fail_deletes: false,
             fail_sidecar_reads: false,
             kill: std::sync::OnceLock::new(),
+            poison_tomb_after_put: std::sync::OnceLock::new(),
+            deleting_key: std::sync::OnceLock::new(),
+            announced_at_delete: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// For each delete, whether its base stem was announced on
+    /// `le:ckpt:{recon}:deleting` when the delete was called.
+    fn announced_at_delete(&self) -> Vec<bool> {
+        self.announced_at_delete
+            .lock()
+            .expect("announced-at-delete mutex")
+            .clone()
+    }
+
+    /// Arm [`Self::poison_tomb_after_put`] with the tombstone key.
+    fn poison_tomb_after_put(&self, tomb_key: String) {
+        self.poison_tomb_after_put
+            .set(tomb_key)
+            .expect("the tombstone poison is armed once");
     }
 
     /// Same, but every generation delete fails — the arm that proves the
@@ -3275,6 +3442,9 @@ impl HeaderKillingPutStore {
             ))
             .map_err(|_| ())
             .expect("HeaderKillingPutStore::arm must be called exactly once");
+        let _ = self
+            .deleting_key
+            .set(tv.key_schema().checkpoint_reconcile_deleting());
     }
 
     fn put_calls(&self) -> usize {
@@ -3315,6 +3485,13 @@ impl CheckpointStore for HeaderKillingPutStore {
             .unlink(vec![header_key.clone()])
             .await
             .expect("UNLINK obj:hdr from inside the PUT must succeed");
+        if let Some(tomb_key) = self.poison_tomb_after_put.get() {
+            let _: () = client
+                .pool
+                .set(tomb_key, "not-a-zset", None, None, false)
+                .await
+                .expect("poisoning the tombstone key from inside the PUT must succeed");
+        }
 
         Ok(handle)
     }
@@ -3324,6 +3501,19 @@ impl CheckpointStore for HeaderKillingPutStore {
         handle: CheckpointHandle,
     ) -> Result<(), CheckpointError> {
         self.delete_calls.fetch_add(1, Ordering::AcqRel);
+        if let (Some((client, _)), Some(deleting)) = (self.kill.get(), self.deleting_key.get()) {
+            use fred::interfaces::SortedSetsInterface;
+            let stem = format!("{}.{}", handle.object_id, handle.snap_seq);
+            let score: Option<f64> = client
+                .pool
+                .zscore(deleting, stem)
+                .await
+                .expect("ZSCORE :deleting from inside the delete must succeed");
+            self.announced_at_delete
+                .lock()
+                .expect("announced-at-delete mutex")
+                .push(score.is_some());
+        }
         if self.fail_deletes {
             return Err(CheckpointError::Transient {
                 source: "injected generation-delete failure \
@@ -3391,6 +3581,10 @@ impl CheckpointStore for HeaderKillingPutStore {
 
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         self.inner.ext_blob_exists(hash_hex).await
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -3579,8 +3773,15 @@ async fn bootstrap_refuses_the_stamp_and_reaps_the_base_when_the_header_dies_dur
         killer.delete_calls(),
         1,
         "the fast-path reap must delete the generation it just wrote — exactly one delete, for \
-         the just-written handle and nothing else (older generations belong to the reconciliation \
-         pass, which holds the lease this path does not)"
+         the just-written handle and nothing else (older generations belong to the checkpoint \
+         clean-up's dead-object phase)"
+    );
+    assert_eq!(
+        killer.announced_at_delete(),
+        vec![true],
+        "b.g65 (N2): the reap announced the base's stem on le:ckpt:{{recon}}:deleting before it \
+         deleted it, in the same run that recorded its hashes, so a clean-up walk that listed the \
+         base and then reads its sidecar absent can explain the absence"
     );
     let handles = fx
         .store
@@ -3930,7 +4131,10 @@ enum ReapStep {
 /// Valkey string, so the sink's script comes back `WRONGTYPE` from `fred`; the
 /// same technique the reconciliation pass's twin
 /// (`reap_leaves_the_orphan_in_place_when_a_record_before_delete_step_fails`)
-/// uses, which is what makes the two files' claims comparable.
+/// uses, which is what makes the two files' claims comparable. The poison
+/// lands inside the PUT, once the generation is durable: the clean-up fence
+/// reads `:tomb` before every PUT (b.g65), so a poison planted earlier fails
+/// the fence and defers the publish, and the reap is never reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bootstrap_reap_deletes_nothing_when_a_step_before_the_delete_fails() {
     for step in [ReapStep::SidecarRead, ReapStep::TombstoneRecord] {
@@ -3952,13 +4156,7 @@ async fn bootstrap_reap_deletes_nothing_when_a_step_before_the_delete_fails() {
 
         let tomb_key = fx.tv.key_schema().checkpoint_reconcile_tombstones();
         if step == ReapStep::TombstoneRecord {
-            let _: () = fx
-                .tv
-                .client()
-                .pool
-                .set(&tomb_key, "not-a-zset", None, None, false)
-                .await
-                .expect("poisoning the tombstone key must succeed");
+            killer.poison_tomb_after_put(tomb_key.clone());
         }
 
         let state = seed_state_with_ext(74, hash, payload.len() as u64);
@@ -4000,9 +4198,8 @@ async fn bootstrap_reap_deletes_nothing_when_a_step_before_the_delete_fails() {
         assert_eq!(
             handles.len(),
             1,
-            "{step:?}: so the generation survives whole, for the reconciliation pass's \
-             dead-object phase to reclaim under the leader lease this path does not hold. \
-             Got {handles:?}"
+            "{step:?}: so the generation survives whole, for the checkpoint clean-up's \
+             dead-object phase to reclaim behind its liveness re-check. Got {handles:?}"
         );
         assert!(
             !fx.tv

@@ -24,7 +24,6 @@ limitations under the License.
 */}}
 {{- include "live-edit-service.renamedValueChecks" . }}
 {{- $valkeyAuthMode := include "live-edit-service.valkeyAuthMode" . -}}
-{{- $accessTokenSidecar := eq (include "live-edit-service.accessTokenSidecarEnabled" .) "true" -}}
 {{- if and (eq $valkeyAuthMode "accessTokenFile") (not .Values.serviceIdentity.accessTokenFile.enabled) -}}
 {{- fail "valkey.credentials.accessTokenFile.enabled=true requires serviceIdentity.accessTokenFile.enabled=true — the token provisioner under serviceIdentity.accessTokenFile.provisionerSidecar (or your own volume) supplies the Valkey token file; enable it and have the provisioner also write the backing-store token to valkey.credentials.accessTokenFile.path" -}}
 {{- end }}
@@ -47,19 +46,61 @@ limitations under the License.
   shutdown.streamEndMaxWindowSecs, or 0 when shutdown.streamEndRate is 0
   (every stream ends at once). The service logs the same minimum at startup
   as min_termination_grace_secs.
+
+  The settings are read from the rendered ConfigMap, so the check computes
+  with exactly the digits the binary receives: configmap.yaml runs each one
+  through the nonNegativeInteger helper (and `required` where a value must be
+  set), so a value that is not a whole number fails there, naming its key,
+  before any arithmetic here. The grace itself goes through the same helper.
+
+  Debugging note: the `include` below evaluates templates/configmap.yaml
+  right here, so a `required`/`fail` error raised by *that* template is
+  reported at this line in deployment.yaml — e.g.
+  `--set observability.tracing.enabled=true` without an endpoint fails at
+  `deployment.yaml:<this line>` even though the `required` lives in
+  configmap.yaml. The error MESSAGE stays correct and names the real value;
+  read the message, not the reported location. The same rendered text is
+  hashed into the `checksum/config` pod annotation below.
 */}}
-{{- $shutdown := .Values.shutdown -}}
-{{- $deadlineSecs := div (add (int64 .Values.rpc.deadlineMs) 999) 1000 -}}
-{{- $streamEndWindowSecs := int64 $shutdown.streamEndMaxWindowSecs -}}
-{{- if eq (int64 $shutdown.streamEndRate) 0 -}}
+{{- $settings := include (print $.Template.BasePath "/configmap.yaml") . -}}
+{{- /*
+  fromYaml does not fail on invalid YAML: it returns a map holding only an
+  "Error" key. The ConfigMap stops parsing when a free-text value carries a
+  `"` or `\` into a double-quoted row (e.g. observability.logging.level), so
+  name the template and the parse error here rather than failing later on a
+  nil `.data`.
+*/ -}}
+{{- $parsedSettings := fromYaml $settings -}}
+{{- if hasKey $parsedSettings "Error" -}}
+{{- fail (printf "templates/configmap.yaml does not render as valid YAML, usually because a text value contains a \" or a \\: %s" (get $parsedSettings "Error")) -}}
+{{- end -}}
+{{- $env := $parsedSettings.data -}}
+{{- $timeoutSecs := index $env "LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS" -}}
+{{- $overallBudgetSecs := index $env "LIVE_EDIT_SHUTDOWN_OVERALL_BUDGET_SECS" -}}
+{{- $deadlineSecs := div (add (int64 (index $env "LIVE_EDIT_RPC_DEADLINE_MS")) 999) 1000 -}}
+{{- $streamEndWindowSecs := int64 (index $env "LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS") -}}
+{{- if eq (index $env "LIVE_EDIT_SHUTDOWN_STREAM_END_RATE") "0" -}}
 {{- $streamEndWindowSecs = 0 -}}
 {{- end -}}
-{{- $minGrace := add (int64 $shutdown.timeoutSecs) (max $deadlineSecs $streamEndWindowSecs) 6 (int64 $shutdown.overallBudgetSecs) 6 -}}
-{{- if lt (int64 .Values.terminationGracePeriodSeconds) $minGrace -}}
-{{- fail (printf "terminationGracePeriodSeconds (%v) is below the %d s a graceful shutdown can take with these settings: shutdown.timeoutSecs (%v) + max(ceil(rpc.deadlineMs / 1000) (%d), shutdown.streamEndMaxWindowSecs (%d; 0 when shutdown.streamEndRate is 0)) + 6 + shutdown.overallBudgetSecs (%v) + 6. Raise terminationGracePeriodSeconds to at least %d, or lower those settings" .Values.terminationGracePeriodSeconds $minGrace $shutdown.timeoutSecs $deadlineSecs $streamEndWindowSecs $shutdown.overallBudgetSecs $minGrace) -}}
+{{- $minGrace := add (int64 $timeoutSecs) (max $deadlineSecs $streamEndWindowSecs) 6 (int64 $overallBudgetSecs) 6 -}}
+{{- $grace := include "live-edit-service.nonNegativeInteger" (dict "key" "terminationGracePeriodSeconds" "value" .Values.terminationGracePeriodSeconds "hint" "seconds") -}}
+{{- if lt (int64 $grace) $minGrace -}}
+{{- fail (printf "terminationGracePeriodSeconds (%s) is below the %d s a graceful shutdown can take with these settings: shutdown.timeoutSecs (%s) + max(ceil(rpc.deadlineMs / 1000) (%d), shutdown.streamEndMaxWindowSecs (%d; 0 when shutdown.streamEndRate is 0)) + 6 + shutdown.overallBudgetSecs (%s) + 6. Raise terminationGracePeriodSeconds to at least %d, or lower those settings" $grace $minGrace $timeoutSecs $deadlineSecs $streamEndWindowSecs $overallBudgetSecs $minGrace) -}}
 {{- end -}}
 {{- if and (eq (lower .Values.checkpoint.adapter) "storageapi") (not .Values.serviceIdentity.accessTokenFile.enabled) -}}
 {{- fail "checkpoint.adapter=StorageApi requires serviceIdentity.accessTokenFile.enabled=true — the StorageApi checkpoint adapter authenticates with a service-identity token file (LIVE_EDIT_SERVICE_TOKEN_FILE, set from checkpoint.credentials.accessTokenFile.path only when that flag is true), and the service refuses to start without it; enable serviceIdentity.accessTokenFile and either configure its provisionerSidecar or supply the token file at checkpoint.credentials.accessTokenFile.path through your own volumes / volumeMounts, or choose another checkpoint.adapter" -}}
+{{- end }}
+{{- /*
+  shareProcessNamespace widens what every container in the pod can reach, so
+  only an unquoted true turns it on: a quoted "false" is a non-empty string,
+  truthy in a template, so a value that is not a boolean fails the render
+  rather than being read either way. Absent or null is false: that is what a
+  `helm upgrade --reuse-values` from a release before the value existed
+  passes.
+*/}}
+{{- $shareProcessNamespace := .Values.shareProcessNamespace -}}
+{{- if not (or (kindIs "invalid" $shareProcessNamespace) (kindIs "bool" $shareProcessNamespace)) -}}
+{{- fail (printf "shareProcessNamespace must be true or false, unquoted (got %#v)" $shareProcessNamespace) -}}
 {{- end }}
 
 apiVersion: apps/v1
@@ -88,9 +129,9 @@ spec:
     rollingUpdate:
       {{- toYaml .Values.strategy.rollingUpdate | nindent 6 }}
   {{- if kindIs "invalid" .Values.minReadySeconds }}
-  minReadySeconds: {{ add (int64 .Values.shutdown.timeoutSecs) (int64 .Values.shutdown.streamEndMaxWindowSecs) 5 }}
+  minReadySeconds: {{ add (int64 (index $env "LIVE_EDIT_SHUTDOWN_TIMEOUT_SECS")) (int64 (index $env "LIVE_EDIT_SHUTDOWN_STREAM_END_MAX_WINDOW_SECS")) 5 }}
   {{- else }}
-  minReadySeconds: {{ int64 .Values.minReadySeconds }}
+  minReadySeconds: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "minReadySeconds" "value" .Values.minReadySeconds "hint" "seconds, null to derive it") }}
   {{- end }}
   selector:
     matchLabels:
@@ -124,132 +165,14 @@ spec:
              silently override the rollout trigger if the passthrough rendered
              second. Rendering the chart's stamp last keeps it authoritative.
 
-          Debugging note: the `include` on the line below evaluates
-          templates/configmap.yaml right here, so a `required`/`fail` error raised
-          by *that* template is reported at this line in deployment.yaml — e.g.
-          `--set observability.tracing.enabled=true` without an endpoint fails at
-          `deployment.yaml:<this line>` even though the `required` lives in
-          configmap.yaml. The error MESSAGE stays correct and names the real
-          value; read the message, not the reported location.
+          The hashed text is `$settings`, templates/configmap.yaml rendered once
+          at the top of this file for the termination-grace check (see the
+          debugging note there for where its errors are reported).
         */}}
-        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/config: {{ $settings | sha256sum }}
       labels:
         {{- $podLabels := mergeOverwrite (dict) (include "live-edit-service.labels" . | fromYaml) (.Values.podLabels | default dict) (include "live-edit-service.selectorLabels" . | fromYaml) (dict "app.kubernetes.io/component" "server") }}
-        {{- if and .Values.serviceAccount.annotations (hasKey .Values.serviceAccount.annotations "azure.workload.identity/client-id") }}
-        {{- $_ := set $podLabels "azure.workload.identity/use" "true" }}
-        {{- end }}
+        {{- include "live-edit-service.workloadIdentityPodLabel" (dict "root" . "labels" $podLabels) }}
         {{- toYaml $podLabels | nindent 8 }}
     spec:
-      {{- include "live-edit-service.imagePullSecrets" ( dict "images" (list .Values.image) "global" .Values) | nindent 6 }}
-      serviceAccountName: {{ include "live-edit-service.serviceAccountName" . }}
-      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
-      securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
-      containers:
-        - name: {{ .Chart.Name }}
-          securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - name: grpc
-              containerPort: {{ .Values.service.grpc.port }}
-              protocol: TCP
-            - name: metrics
-              containerPort: {{ .Values.service.metrics.port }}
-              protocol: TCP
-          envFrom:
-          - configMapRef:
-              name: {{ include "live-edit-service.fullname" . }}-settings
-          env:
-            - name: LIVE_EDIT_VALKEY_URL
-              {{- if .Values.valkey.url.value }}
-              value: {{ .Values.valkey.url.value | quote }}
-              {{- else if .Values.valkey.url.valueFrom }}
-              valueFrom:
-                {{- toYaml .Values.valkey.url.valueFrom | nindent 16 }}
-              {{- else }}
-              {{- if not .Values.envSecretName }}
-              {{- fail "LIVE_EDIT_VALKEY_URL falls back to a Kubernetes Secret (envSecretName, key valkey-url) when neither valkey.url.value nor valkey.url.valueFrom is set, but envSecretName is empty. Set valkey.url.value / valkey.url.valueFrom (passwordless / non-secret URL), or set envSecretName to the Secret holding key valkey-url." -}}
-              {{- end }}
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.envSecretName }}
-                  key: valkey-url
-              {{- end }}
-            {{- if .Values.serviceIdentity.accessTokenFile.enabled }}
-            - name: LIVE_EDIT_SERVICE_TOKEN_FILE
-              value: "{{ .Values.checkpoint.credentials.accessTokenFile.path }}"
-            - name: LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS
-              {{- /* Plain digits whatever the size: see the integer-row note in configmap.yaml. */}}
-              value: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.credentials.accessTokenFile.pollIntervalSecs" "value" .Values.checkpoint.credentials.accessTokenFile.pollIntervalSecs "hint" "seconds") }}"
-            {{- end }}
-            {{- if .Values.serviceIdentity.clientCredentials.enabled }}
-            - name: LIVE_EDIT_SERVICE_TOKEN_CLIENT_CREDENTIALS_ENABLED
-              value: "true"
-            {{- end }}
-          {{- with .Values.startupProbe }}
-          startupProbe:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
-          {{- /*
-            The server's resources go through live-edit-service.serverResources:
-            .Values.resources as set, except that an unset memory request is
-            derived from the memory limit (70%), and a set one above the limit
-            fails the render.
-          */}}
-          resources:
-            {{- include "live-edit-service.serverResources" . | nindent 12 }}
-          {{- /*
-            The service sizes every memory budget from its memory limit once,
-            at startup, so a memory resize must restart the container: an
-            in-place resize defaults to NotRequired, which would change the
-            limit under a process still sized for the old one. CPU keeps the
-            default (no restart). Rendered only on Kubernetes 1.27 and later:
-            in-place resize and the resizePolicy field do not exist before
-            1.27, so an older cluster has no resize to guard against and does
-            not know the field.
-          */}}
-          {{- if semverCompare ">=1.27-0" .Capabilities.KubeVersion.Version }}
-          resizePolicy:
-            - resourceName: memory
-              restartPolicy: RestartContainer
-          {{- end }}
-          {{- if or .Values.volumeMounts $accessTokenSidecar }}
-          volumeMounts:
-            {{- with .Values.volumeMounts }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-            {{- if $accessTokenSidecar }}
-            {{- include "live-edit-service.accessTokenVolumeMount" . | nindent 12 }}
-            {{- end }}
-          {{- end }}
-        {{- if $accessTokenSidecar }}
-        {{- include "live-edit-service.accessTokenSidecar" . | nindent 8 }}
-        {{- end }}
-      {{- if or .Values.volumes $accessTokenSidecar }}
-      volumes:
-        {{- with .Values.volumes }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-        {{- if $accessTokenSidecar }}
-        {{- include "live-edit-service.accessTokenVolume" . | nindent 8 }}
-        {{- end }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "live-edit-service.podSpec" (dict "root" . "workload" "server") | nindent 6 }}

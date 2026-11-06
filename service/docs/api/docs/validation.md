@@ -50,19 +50,30 @@ Delta rules are checked after authorization, once the upload is parsed, and befo
 | `CommandReorderChildren` list length | At most 100,000 ids in one list. |
 | Section, field and move names (`section_name`, `new_name`, `key_name`) | At most 4,096 bytes, no control characters. |
 | `TimeSample.time` | Finite: NaN and ±infinity are refused. `-0.0` is accepted as the time `0.0` ({ref}`below <live-edit-api-validation-time-zero>`). |
-| `CreateSection`, `MoveSection`, `DiffChangeSection` | A section cannot be its own parent. `parent_id` `0` is the root and always valid. |
-| `DiffChangeSection` rename of an existing section | Refused when another sibling already holds the new `(parent_id, section_name)`. |
+| `CreateSection`, `MoveSection`, `DiffChangeSection` | A section cannot be its own parent. `parent_id` `0` makes the section a top-level, root section and is always valid. |
+| `DiffChangeSection` of an existing section | Refused when it would give the section the name of a sibling of the same kind, including by changing its kind ({ref}`below <live-edit-api-validation-sibling-names>`). |
 | `CommandReorderChildren` | Within the length limit, never refused for the ids it names: ids that are not current children are ignored, and a repeated id counts once. An empty list changes nothing. |
 | Section-tree depth | At most 10,000 sections from the root after the delta applies. |
+| Root section, `CreateLayer` | Content that leaves sections, fields or time samples must leave at least one section whose `parent_id` is `0` ({ref}`below <live-edit-api-validation-root>`). |
+| Root section, `UpdateLayer` | A delta may not remove a layer's last section whose `parent_id` is `0`, by deleting or moving it, or by a reset that does not recreate one. |
 | `SetField.set_order` | At most 2^53 − 1. |
-
-Two siblings can still share a name, because a `MoveSection` rename under the same parent is never checked.
-Where they do, a name conflict always resolves to the sibling with the lowest `section_id`.
 
 Each `SetField` advances its layer's running set order by its `set_order` plus one, and each commit advances the sequence number by one.
 A layer whose running set order or sequence number would pass 2^53 − 1 refuses every further update with `INTERNAL`, message `internal error`, and applies nothing; other layers are unaffected.
 Keep `set_order` values small: timestamp-sized values can use up a layer within a few updates.
 To recover, replace the layer with `CreateLayer`: the new object starts its set order again at zero.
+
+(live-edit-api-validation-root)=
+### The layer's root section
+
+A layer's root section is a section whose `parent_id` is `0`; USD readers map it to the layer's pseudo-root `/`.
+Content that leaves a root section of its own is kept as sent.
+A `CreateLayer` whose content leaves no section, field or time sample, including a header with no chunks, creates the layer holding only the root section: `section_id` 1, `parent_id` 0, empty name, `section_type` 7, no fields.
+Readers receive it when they subscribe.
+Build under section 1: outside a reset, a later `CreateSection` of section 1 is refused `INVALID_ARGUMENT` as a duplicate, and a `DiffChangeSection` of it changes it in place.
+
+During a rolling upgrade or after a rollback, a replica of an earlier version gives a layer created from empty content no root section, and accepts the two root-section requests the table above refuses.
+To be sure of the root then, send it in your `CreateLayer` content.
 
 (live-edit-api-validation-time-zero)=
 ### Time samples at `-0.0`
@@ -88,6 +99,21 @@ Every metadata value is a decimal integer.
 The limits apply to each upload, not to a layer: a layer can grow past them through further updates.
 Match the reason, not the message text.
 During a rolling upgrade, a replica of an earlier version refuses the same delta `INVALID_ARGUMENT` without these reasons.
+
+(live-edit-api-validation-sibling-names)=
+## Siblings with the same name
+
+Creating, renaming or moving a spec onto a name that a sibling of the same kind already uses deletes that sibling and everything under it.
+When the same-kind sibling at a move's destination is an ancestor of the moved spec, the moved spec is deleted instead.
+A kind here is a USD spec type, with attributes and relationships counted as one kind.
+So specs of different kinds with the same name, such as a prim and a property or a prim and a variant set, do not collide, while an attribute and a relationship with the same name do.
+Renaming a section to the name it already has changes nothing.
+A `DiffChangeSection` of an existing section is refused instead ({ref}`Delta content <live-edit-api-validation-delta>`).
+
+A layer written by an earlier version of the service can hold two siblings of the same kind with one name.
+The service keeps both, and a catch-up delivers both.
+Each later edit that collides with them deletes only the one with the lowest `section_id`.
+During a rolling upgrade or after a rollback, a replica of an earlier version keeps both siblings when a section is renamed onto an occupied name, and treats specs of different kinds with the same name as colliding.
 
 (live-edit-api-validation-external-values)=
 ## External values

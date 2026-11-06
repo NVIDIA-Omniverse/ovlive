@@ -50,9 +50,19 @@
 //! ([`Rig::wait_until_stored_before_now`]), so "older than the gate" is an
 //! event, not a sleep; the age-gate test sets an old stamp outright.
 //!
-//! **What this file does not cover:** the clean-up fence (b.g65 adds it to both
-//! upload sites), and the collect's clear of the field, which is a
-//! `checkpointer` unit test (it needs the reconciliation harness).
+//! **The checkpoint clean-up's fence at both upload sites (b.g65)** is the last
+//! section: the repair's re-send and a mirror worker's upload each run the
+//! writer re-arm before the PUT, skip it (`collect_fenced`) when the collect
+//! deleted the value's copy inside the writer's window, and a confirmation whose
+//! existence check or upload answered before the collect's delete-and-clear is
+//! declined. The recording store stages that delete-and-clear right after it
+//! answers ([`RepairStore::stage_collect_after_answer`]). The section ends with
+//! the same-millisecond tie, stamped outright: a clear in the caller's
+//! reliance-start millisecond declines the confirmation, and the next pass
+//! confirms the copy it finds.
+//!
+//! **What this file does not cover:** the collect's own clear of the field,
+//! which is a `checkpointer` unit test (it needs the reconciliation harness).
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -82,7 +92,7 @@ use live_edit::observability::metrics::{
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::ext_backup::{
     confirm_ext_backup, parse_backed_up_in, read_ext_value_bytes, valkey_time_ms, ExtBackupMarks,
-    ExtValueRead, BACKED_UP_IN_FIELD, EXT_VALUE_READ_CHUNK_BYTES,
+    ExtValueRead, BACKED_UP_IN_FIELD, BACKUP_CLEARED_MS_FIELD, EXT_VALUE_READ_CHUNK_BYTES,
 };
 use live_edit::storage::external_values::{
     acquire_gc_leader_lock, ext_content_hash, ExternalValueStore, GcLeaderAcquire,
@@ -138,6 +148,16 @@ enum CollectAt {
 
 /// A collection of one hash (the GC's `DEL meta data`) the store stages.
 struct StagedCollect {
+    at: CollectAt,
+    hash_hex: String,
+    client: ValkeyClient,
+    keys: KeySchema,
+}
+
+/// The checkpoint collect's delete of a value's backup copy, with its
+/// post-delete step (`clear_ext_backup`, b.g65 R5), staged to land right after
+/// the store answered a writer — the interleaving b.g65's N6 closes.
+struct StagedClear {
     at: CollectAt,
     hash_hex: String,
     client: ValkeyClient,
@@ -212,6 +232,9 @@ struct RepairStore {
     fail_after_absent: Mutex<Option<String>>,
     /// How many checks have answered absent (`Ok(false)`).
     absent_answers: AtomicUsize,
+    /// A collect delete and clear staged AFTER a check answered or an upload
+    /// landed ([`Self::stage_collect_after_answer`]).
+    clear: Mutex<Option<StagedClear>>,
 }
 
 impl RepairStore {
@@ -229,7 +252,49 @@ impl RepairStore {
             collect: Mutex::new(None),
             fail_after_absent: Mutex::new(None),
             absent_answers: AtomicUsize::new(0),
+            clear: Mutex::new(None),
         })
+    }
+
+    /// Stage the checkpoint collect's delete of `hash_hex`'s copy and its
+    /// post-delete step (`clear_ext_backup`: `backed_up_in` withdrawn,
+    /// `backup_cleared_ms` stamped) to run once, right AFTER the store answered
+    /// that hash's existence check ([`CollectAt::Check`]) or took its upload
+    /// ([`CollectAt::Upload`]) — so the writer is about to confirm a copy that
+    /// no longer exists.
+    fn stage_collect_after_answer(&self, at: CollectAt, hash_hex: &str, tv: &TestValkey) {
+        *self.clear.lock().expect("never poisoned") = Some(StagedClear {
+            at,
+            hash_hex: hash_hex.to_owned(),
+            client: tv.client().clone(),
+            keys: tv.key_schema().clone(),
+        });
+    }
+
+    /// Run the staged delete and clear when it is due here, once.
+    async fn clear_if_due(&self, at: CollectAt, hash_hex: &str) {
+        let staged = {
+            let mut slot = self.clear.lock().expect("never poisoned");
+            match slot.as_ref() {
+                Some(s) if s.at == at && s.hash_hex == hash_hex => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(s) = staged {
+            self.inner
+                .inner
+                .delete_ext_blob(hash_hex)
+                .await
+                .expect("the staged collect's delete succeeds");
+            let live =
+                live_edit::storage::ext_backup::clear_ext_backup(&s.client, &s.keys, hash_hex)
+                    .await
+                    .expect("the staged collect's post-delete step succeeds");
+            assert!(
+                live,
+                "fixture: the value is still in Valkey when its copy is deleted"
+            );
+        }
     }
 
     /// Put `bytes` in the backup store directly, as an earlier copy would
@@ -354,7 +419,12 @@ impl CheckpointStore for RepairStore {
         if matches!(answer, Ok(false)) {
             self.absent_answers.fetch_add(1, Ordering::SeqCst);
         }
+        self.clear_if_due(CollectAt::Check, hash_hex).await;
         answer
+    }
+
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.inner.verify_list_route().await
     }
 
     async fn put_ext_blob(&self, hash_hex: &str, bytes: Bytes) -> Result<(), CheckpointError> {
@@ -371,7 +441,11 @@ impl CheckpointStore for RepairStore {
             });
         }
         self.collect_if_due(CollectAt::Upload, hash_hex).await;
-        self.inner.put_ext_blob(hash_hex, bytes).await
+        let landed = self.inner.put_ext_blob(hash_hex, bytes).await;
+        if landed.is_ok() {
+            self.clear_if_due(CollectAt::Upload, hash_hex).await;
+        }
+        landed
     }
 
     // ── Verbatim forwarding, method by method ────────────────────────────
@@ -552,7 +626,11 @@ struct Rig {
 
 impl Rig {
     async fn new(store: Arc<RepairStore>, budget_bytes: u64) -> Self {
-        let tv = TestValkey::setup().await;
+        Self::on(TestValkey::setup().await, store, budget_bytes)
+    }
+
+    /// [`Self::new`] on the fixture `tv` (a cluster's, say).
+    fn on(tv: TestValkey, store: Arc<RepairStore>, budget_bytes: u64) -> Self {
         let metrics: SharedMetrics = Arc::new(crate::common::metrics_scrape_only(SERVICE_LABEL));
         let (sender, rx) = ext_mirror_channel(
             64,
@@ -696,11 +774,17 @@ impl Rig {
                 newest = newest.max(ms);
             }
         }
+        self.wait_until_clock_past(newest).await;
+    }
+
+    /// Wait until Valkey's clock reads a later millisecond than `ms`, so a pass
+    /// started now reads a reliance start after it.
+    async fn wait_until_clock_past(&self, ms: u64) {
         let deadline = Instant::now() + WAIT_BUDGET;
-        while self.now_ms().await <= newest {
+        while self.now_ms().await <= ms {
             assert!(
                 Instant::now() < deadline,
-                "Valkey's clock never passed {newest}"
+                "Valkey's clock never passed {ms}"
             );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
@@ -1021,7 +1105,7 @@ async fn a_value_confirmed_under_this_store_is_neither_checked_nor_uploaded() {
         .await
         .expect("stored values carry a stamp");
     assert!(
-        confirm_ext_backup(rig.client(), rig.keys(), &v.hex, STORE_ID, &stamp)
+        confirm_ext_backup(rig.client(), rig.keys(), &v.hex, STORE_ID, &stamp, None)
             .await
             .expect("the confirm script runs"),
         "fixture: confirmed"
@@ -1055,9 +1139,16 @@ async fn values_confirmed_under_another_store_identity_are_all_checked_again() {
     for v in [&held, &missing] {
         let stamp = rig.stamp(&v.hex).await.expect("stamped");
         assert!(
-            confirm_ext_backup(rig.client(), rig.keys(), &v.hex, OTHER_STORE_ID, &stamp)
-                .await
-                .expect("the confirm script runs"),
+            confirm_ext_backup(
+                rig.client(),
+                rig.keys(),
+                &v.hex,
+                OTHER_STORE_ID,
+                &stamp,
+                None
+            )
+            .await
+            .expect("the confirm script runs"),
             "fixture: confirmed under the other store"
         );
     }
@@ -1194,6 +1285,60 @@ async fn metas_with_no_fields_or_a_garbled_confirmation_are_checked_and_confirme
     );
 }
 
+/// R-repair: the DR restore Job's recount leaves a meta with no data for a
+/// value whose bytes only the backup store holds (`ref_count` alone, no
+/// stamp, no confirmation; `storage::ext_reconcile`'s reader audit). The
+/// repair finds it owed and checks it once: with the copy held it is
+/// confirmed with no upload (`already_stored`, `backed_up_in` written, no
+/// stamp added); with no copy it is `value_gone` — Valkey holds no bytes to
+/// send — nothing is uploaded and the meta is left intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recount_meta_without_data_is_confirmed_when_its_copy_is_held_and_value_gone_when_not() {
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let held = value(40, KIB as usize);
+    let gone = value(41, KIB as usize);
+    for v in [&held, &gone] {
+        rig.set_meta_field(&v.hex, "ref_count", "1".to_owned())
+            .await;
+    }
+    rig.store.seed(&held.hex, &held.bytes).await;
+    rig.wait_until_stored_before_now(&[&held, &gone]).await;
+
+    let summary = rig.pass(&rig.repair(timing())).await;
+
+    assert_eq!(
+        (
+            summary.owed_seen,
+            summary.already_stored,
+            summary.value_gone,
+            summary.resent
+        ),
+        (2, 1, 1, 0),
+        "{summary:?}"
+    );
+    assert!(rig.store.uploaded().is_empty(), "nothing is uploaded");
+    assert_confirmed_under(
+        rig.confirmation(&held.hex).await.as_deref(),
+        STORE_ID,
+        "held",
+    );
+    assert_eq!(rig.stamp(&held.hex).await, None, "no stamp is added");
+    assert_eq!(
+        rig.confirmation(&gone.hex).await,
+        None,
+        "gone: not confirmed"
+    );
+    assert_eq!(
+        rig.meta_field(&gone.hex, "ref_count").await.as_deref(),
+        Some("1"),
+        "gone: the meta is left intact"
+    );
+    assert!(
+        !rig.exists(rig.keys().ext_data(&gone.hex)).await,
+        "gone: and no data is written"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Collection mid-pass, and the confirm script (T8, T9)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1255,7 +1400,7 @@ async fn the_confirm_script_writes_only_on_an_existing_meta_carrying_the_callers
     let (client, keys) = (rig.client(), rig.keys());
     let absent = value(40, KIB as usize);
     assert!(
-        !confirm_ext_backup(client, keys, &absent.hex, STORE_ID, "1760000000000")
+        !confirm_ext_backup(client, keys, &absent.hex, STORE_ID, "1760000000000", None)
             .await
             .expect("the confirm script runs"),
         "an absent meta declines"
@@ -1275,7 +1420,7 @@ async fn the_confirm_script_writes_only_on_an_existing_meta_carrying_the_callers
         .expect("a decimal stamp");
     let stale = (stamp - 1).to_string();
     assert!(
-        !confirm_ext_backup(client, keys, &v.hex, STORE_ID, &stale)
+        !confirm_ext_backup(client, keys, &v.hex, STORE_ID, &stale, None)
             .await
             .expect("the confirm script runs"),
         "a stale stamp declines"
@@ -1284,7 +1429,7 @@ async fn the_confirm_script_writes_only_on_an_existing_meta_carrying_the_callers
 
     let before = rig.now_ms().await;
     assert!(
-        confirm_ext_backup(client, keys, &v.hex, STORE_ID, &stamp.to_string())
+        confirm_ext_backup(client, keys, &v.hex, STORE_ID, &stamp.to_string(), None)
             .await
             .expect("the confirm script runs")
     );
@@ -1300,11 +1445,16 @@ async fn the_confirm_script_writes_only_on_an_existing_meta_carrying_the_callers
         "the stamp is untouched"
     );
 
-    assert!(
-        confirm_ext_backup(client, keys, &v.hex, OTHER_STORE_ID, &stamp.to_string())
-            .await
-            .expect("the confirm script runs")
-    );
+    assert!(confirm_ext_backup(
+        client,
+        keys,
+        &v.hex,
+        OTHER_STORE_ID,
+        &stamp.to_string(),
+        None
+    )
+    .await
+    .expect("the confirm script runs"));
     assert_confirmed_under(
         rig.confirmation(&v.hex).await.as_deref(),
         OTHER_STORE_ID,
@@ -1321,9 +1471,11 @@ async fn the_confirm_scripts_empty_stamp_confirms_only_a_stampless_meta_that_exi
     let rig = Rig::new(RepairStore::new(), 1 << 20).await;
     let (client, keys) = (rig.client(), rig.keys());
     let absent = value(42, KIB as usize);
-    assert!(!confirm_ext_backup(client, keys, &absent.hex, STORE_ID, "")
-        .await
-        .expect("the confirm script runs"));
+    assert!(
+        !confirm_ext_backup(client, keys, &absent.hex, STORE_ID, "", None)
+            .await
+            .expect("the confirm script runs")
+    );
     assert!(
         !rig.exists(keys.ext_meta(&absent.hex)).await,
         "the empty stamp never creates a meta"
@@ -1332,7 +1484,7 @@ async fn the_confirm_scripts_empty_stamp_confirms_only_a_stampless_meta_that_exi
     let stamped = value(43, KIB as usize);
     rig.store_unmirrored(&[&stamped]).await;
     assert!(
-        !confirm_ext_backup(client, keys, &stamped.hex, STORE_ID, "")
+        !confirm_ext_backup(client, keys, &stamped.hex, STORE_ID, "", None)
             .await
             .expect("the confirm script runs"),
         "a stamped meta declines the empty stamp"
@@ -1343,13 +1495,20 @@ async fn the_confirm_scripts_empty_stamp_confirms_only_a_stampless_meta_that_exi
     rig.set_meta_field(&stampless.hex, "ref_count", "1".to_owned())
         .await;
     assert!(
-        !confirm_ext_backup(client, keys, &stampless.hex, STORE_ID, "1760000000000")
-            .await
-            .expect("the confirm script runs"),
+        !confirm_ext_backup(
+            client,
+            keys,
+            &stampless.hex,
+            STORE_ID,
+            "1760000000000",
+            None
+        )
+        .await
+        .expect("the confirm script runs"),
         "a stampless meta declines a stamp"
     );
     assert!(
-        confirm_ext_backup(client, keys, &stampless.hex, STORE_ID, "")
+        confirm_ext_backup(client, keys, &stampless.hex, STORE_ID, "", None)
             .await
             .expect("the confirm script runs")
     );
@@ -1620,6 +1779,137 @@ async fn a_non_leader_runs_no_pass_and_publishes_zero_owed() {
     assert!(rig.store.checked().is_empty(), "no pass ran");
     assert!(rig.store.uploaded().is_empty());
     assert_eq!(rig.confirmation(&v.hex).await, None);
+}
+
+/// The wait between passes in [`a_cancel_landing_with_an_elapsed_interval_starts_no_further_pass`]:
+/// long enough that the canceller's deadline, half of it after the last
+/// probe before the repair parks, sits a full half-interval before the
+/// repair's.
+const RACE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// How many times that test runs the race. An unbiased wait takes the elapsed
+/// interval over the cancel half the time, so it survives every run with
+/// probability 2⁻¹⁶.
+const RACE_RUNS: usize = 16;
+
+/// A value the owed gauge never takes from the repair in that test (a
+/// non-leader publishes 0): the test plants it, so a later 0 shows another
+/// pass ran.
+const OWED_SENTINEL: u64 = 7_777;
+
+/// **Regression: once the cancel fires, an interval that has also elapsed
+/// starts no further pass.** The wait between passes is biased toward the
+/// cancel; unbiased, `select!` picks among ready arms at random and half the
+/// time runs one more pass after the shutdown asked it to stop.
+///
+/// Each run makes both arms ready before the repair task is next polled. On a
+/// current-thread runtime the repair, a non-leader (a peer holds
+/// `le:gc:leader`, so each pass is one lock round trip and publishes 0 on the
+/// owed gauge), runs its first pass and parks in its wait. Once the test sees
+/// that, it spawns a canceller that sleeps to half an interval after the last
+/// probe that still found the gauge unpublished. The repair parked after that
+/// probe, so the canceller's deadline is before the repair's however long the
+/// first pass took. The test then blocks the runtime's one thread past the
+/// interval's end, so the next driver turn fires both timers at once, the
+/// canceller's first, by deadline: the canceller runs, cancels, and the repair
+/// is polled with its cancel and its interval both ready. The test planted
+/// [`OWED_SENTINEL`] on the gauge before that, so a further pass shows as the
+/// gauge back at 0.
+///
+/// About 4 s: [`RACE_RUNS`] runs, each blocking its thread for
+/// [`RACE_INTERVAL`] and a little more. The block is the point of the test
+/// (it is what lets both timers elapse before the repair is polled), not a
+/// wait for another task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_landing_with_an_elapsed_interval_starts_no_further_pass() {
+    use crate::storage::snapshot_read_support::on_current_thread;
+
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let peer = LeaderIdentity::new("peer-replica", "peer-instance");
+    let verdict = acquire_gc_leader_lock(
+        rig.client(),
+        &rig.keys().gc_leader_lock(),
+        &peer,
+        LEADER_LOCK_TTL_MS,
+        GC_LEADER_TAKEOVER_BELOW_MS,
+    )
+    .await
+    .expect("the peer takes the lock");
+    assert!(matches!(verdict, GcLeaderAcquire::Acquired), "{verdict:?}");
+
+    for run in 0..RACE_RUNS {
+        let repair = rig.repair(ExtBackupRepairTiming {
+            interval: RACE_INTERVAL,
+            ..timing()
+        });
+        let metrics = Arc::clone(&rig.metrics);
+        on_current_thread(move || async move {
+            let owed = || {
+                sample_value(
+                    &render(&metrics),
+                    "live_edit_checkpoint_ext_backup_owed",
+                    &[("service", SERVICE_LABEL)],
+                )
+            };
+            metrics.record_checkpoint_ext_backup_owed(OWED_SENTINEL, SERVICE_LABEL);
+
+            let cancel = CancellationToken::new();
+            let task = spawn_ext_backup_repair(
+                repair,
+                LeaderIdentity::new(SERVICE_LABEL, "instance-a"),
+                cancel.clone(),
+            );
+
+            // The first pass publishes 0. On this one thread the repair ran
+            // from that publish into its wait in the same poll, so it is
+            // parked there now, its interval running. It parked after the
+            // last probe that found the gauge unpublished: `parked_after`.
+            let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
+            let mut parked_after = tokio::time::Instant::now();
+            loop {
+                let probe = tokio::time::Instant::now();
+                if owed() == Some(0.0) {
+                    break;
+                }
+                parked_after = probe;
+                assert!(
+                    probe < deadline,
+                    "run {run}: the first pass never published"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            metrics.record_checkpoint_ext_backup_owed(OWED_SENTINEL, SERVICE_LABEL);
+
+            // Due before the repair's interval ends, which is at least a whole
+            // interval after `parked_after`.
+            let canceller = tokio::spawn({
+                let cancel = cancel.clone();
+                async move {
+                    tokio::time::sleep_until(parked_after + RACE_INTERVAL / 2).await;
+                    cancel.cancel();
+                }
+            });
+            // Its first poll registers its timer before the thread blocks.
+            tokio::task::yield_now().await;
+
+            // Hold the runtime's thread past the end of the interval: both
+            // timers elapse with neither task polled.
+            std::thread::sleep(RACE_INTERVAL + Duration::from_millis(30));
+
+            tokio::time::timeout(WAIT_BUDGET, task)
+                .await
+                .unwrap_or_else(|_| panic!("run {run}: the repair stops on its cancel"))
+                .expect("the repair task does not panic");
+            canceller.await.expect("the canceller does not panic");
+            assert_eq!(
+                owed(),
+                Some(OWED_SENTINEL as f64),
+                "run {run}: the repair ran another pass after its cancel, though its interval \
+                 and the cancel were ready together"
+            );
+        })
+        .await;
+    }
 }
 
 /// T14: the replica holding `le:gc:leader` runs the pass and publishes its
@@ -2939,4 +3229,580 @@ async fn a_leaders_pass_whose_walk_fails_publishes_no_owed_reading() {
         "a pass whose walk failed publishes nothing"
     );
     assert!(rig.store.checked().is_empty(), "no value was checked");
+}
+
+/// b.hyw — the meta walk's error item, by whether the walk walked every
+/// primary (`orphan_sweep::KeyspaceWalkError::every_primary_walked`, policy
+/// 3): a walk that may have missed metas (a store fault, a primary left
+/// unwalked, and since b.87a an unproven pin whose routing table was out of
+/// date) ends the pass with nothing to publish; a walk that walked every
+/// primary but could not prove a node's ownership, with the table matching
+/// its map, counts as complete. Driven through `storage::scan_guard`'s walk
+/// seam, keyed by the meta walk's pattern (which carries the test's prefix),
+/// so the module needs `test-fault-injection`.
+#[cfg(feature = "test-fault-injection")]
+mod meta_walk_faults {
+    use super::*;
+
+    use live_edit::storage::scan_guard::{arm_walk_fault_for_test, WalkFault};
+
+    use crate::storage::scan_guard_test::{
+        cluster_fixture, less_its_last_slot, map_primaries, myself_reply,
+    };
+
+    /// A meta walk whose first `SCAN` step fails on every attempt (a store
+    /// fault: no meta read) ends the pass `Valkey` on `SCAN ext:meta`,
+    /// carrying the step's own error, with no value checked: its count would
+    /// miss every meta, so the leader publishes nothing for it
+    /// (`a_leaders_pass_whose_walk_fails_publishes_no_owed_reading` pins
+    /// the publish for a failed pass).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_whose_meta_walk_fails_a_step_ends_valkey_and_checks_nothing() {
+        let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+        let v = value(195, KIB as usize);
+        rig.store_unmirrored(&[&v]).await;
+        rig.wait_until_stored_before_now(&[&v]).await;
+        let _armed = arm_walk_fault_for_test(
+            &rig.keys().ext_meta_scan_pattern(),
+            WalkFault::StepError {
+                step: 0,
+                times: u32::MAX,
+            },
+        );
+
+        let ended = tokio::time::timeout(
+            WAIT_BUDGET,
+            rig.repair(timing()).run_pass(&CancellationToken::new()),
+        )
+        .await
+        .expect("the pass ends within the budget");
+
+        match ended {
+            Err(PassError::Valkey { op, source }) => {
+                assert_eq!(op, "SCAN ext:meta");
+                assert_eq!(*source.kind(), fred::error::ErrorKind::IO, "{source}");
+                assert!(
+                    source
+                        .details()
+                        .contains("test seam: step 0 of a SCAN walk failed before it was sent"),
+                    "the step's own error: {source}"
+                );
+            }
+            other => panic!("a failed meta walk ends the pass, got {other:?}"),
+        }
+        assert!(rig.store.checked().is_empty(), "no value was checked");
+    }
+
+    /// On a real multi-shard cluster, with the first primary's start
+    /// `CLUSTER NODES` reply forged (the walk seam's read 0):
+    ///
+    /// - an open slot on its own line: the walk reads every meta and ends
+    ///   with an error item saying it walked every primary but could not
+    ///   prove the node's ownership, and the pass still completes, counting
+    ///   every meta (its owed count stands, so the leader publishes it);
+    /// - one slot fewer (`NotOwner`): the first primary is left unwalked, so
+    ///   metas may be missed, and the pass ends `Valkey` on `SCAN ext:meta`,
+    ///   a `Cluster` error (nothing published).
+    ///
+    /// **Cluster-gated**: skips (a `SKIP:` line) when
+    /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset; CI's `test-cluster:` job runs
+    /// it, with `test-fault-injection`.
+    ///
+    /// Fail-on-old (not run in this sandbox, which has no cluster): with the
+    /// walk arm's `if e.every_primary_walked()` guard removed, the open-slot
+    /// pass ends `Valkey` like the `NotOwner` one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_meta_walk_counts_a_pass_whose_walk_walked_every_primary_and_fails_one_that_skipped_a_primary(
+    ) {
+        let Some(tv) = cluster_fixture().await else {
+            return;
+        };
+        let primaries = map_primaries(&tv).await;
+        let first_slots = primaries[0].slots.clone();
+        let rig = Rig::on(tv, RepairStore::new(), 1 << 20);
+        let values: Vec<Value> = (196..202).map(|tag| value(tag, KIB as usize)).collect();
+        let refs: Vec<&Value> = values.iter().collect();
+        rig.store_unmirrored(&refs).await;
+        rig.wait_until_stored_before_now(&refs).await;
+        let pattern = rig.keys().ext_meta_scan_pattern();
+
+        let armed = arm_walk_fault_for_test(
+            &pattern,
+            WalkFault::ClusterNodesReply {
+                read: 0,
+                reply: myself_reply(
+                    &first_slots,
+                    "[42->-0000000000000000000000000000000000000002]",
+                ),
+            },
+        );
+        let summary = rig.pass(&rig.repair(timing())).await;
+        drop(armed);
+        assert_eq!(
+            (summary.metas, summary.owed_seen),
+            (values.len() as u64, values.len() as u64),
+            "open slot: every meta was read and counted: {summary:?}"
+        );
+
+        let armed = arm_walk_fault_for_test(
+            &pattern,
+            WalkFault::ClusterNodesReply {
+                read: 0,
+                reply: myself_reply(&less_its_last_slot(&first_slots), ""),
+            },
+        );
+        let ended = tokio::time::timeout(
+            WAIT_BUDGET,
+            rig.repair(timing()).run_pass(&CancellationToken::new()),
+        )
+        .await
+        .expect("the pass ends within the budget");
+        drop(armed);
+        match ended {
+            Err(PassError::Valkey { op, source }) => {
+                assert_eq!(op, "SCAN ext:meta");
+                assert_eq!(*source.kind(), fred::error::ErrorKind::Cluster, "{source}");
+            }
+            other => panic!("NotOwner: the pass publishes nothing, got {other:?}"),
+        }
+        println!(
+            "CLUSTER-GATED RAN: cluster_meta_walk_counts_a_pass_whose_walk_walked_every_primary_and_fails_one_that_skipped_a_primary"
+        );
+    }
+
+    /// b.87a, on a real multi-shard cluster: the first primary's start
+    /// `CLUSTER NODES` reply (the walk seam's read 0) has no myself line, so
+    /// that pin's ownership is unproven and the walk compares its map with
+    /// the routing table its pins came from.
+    ///
+    /// - Control, the unusable line alone: the table matches the map, so the
+    ///   walk counts as having walked every primary, and the pass completes,
+    ///   counting every meta.
+    /// - With that comparison (check 0) forged to differ
+    ///   (`TablePartitionDiffers`): the table was out of date, so the pin may
+    ///   have read a node that does not serve its primary; the walk loses
+    ///   coverage and the pass ends `Valkey` on `SCAN ext:meta`, a `Cluster`
+    ///   error carrying the out-of-date table (nothing published).
+    ///
+    /// **Cluster-gated**: skips (a `SKIP:` line) when
+    /// `LIVE_EDIT_TEST_CLUSTER_URL` is unset; CI's `test-cluster:` job runs
+    /// it, with `test-fault-injection`.
+    ///
+    /// Fail-on-old (stated, not run in this sandbox, which has no cluster):
+    /// with `StaleTable` left out of `scan_guard::loses_coverage`'s
+    /// coverage-losing reasons (and `check_table`'s `coverage_lost = true`
+    /// dropped with it), the forged pass completes like the control.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_meta_walk_fails_a_pass_whose_walk_found_its_routing_table_stale() {
+        let Some(tv) = cluster_fixture().await else {
+            return;
+        };
+        let rig = Rig::on(tv, RepairStore::new(), 1 << 20);
+        let values: Vec<Value> = (202..208).map(|tag| value(tag, KIB as usize)).collect();
+        let refs: Vec<&Value> = values.iter().collect();
+        rig.store_unmirrored(&refs).await;
+        rig.wait_until_stored_before_now(&refs).await;
+        let pattern = rig.keys().ext_meta_scan_pattern();
+        let unusable = || WalkFault::ClusterNodesReply {
+            read: 0,
+            reply: String::new(),
+        };
+
+        let armed = arm_walk_fault_for_test(&pattern, unusable());
+        let summary = rig.pass(&rig.repair(timing())).await;
+        drop(armed);
+        assert_eq!(
+            (summary.metas, summary.owed_seen),
+            (values.len() as u64, values.len() as u64),
+            "control, the unusable line alone: every meta was read and counted: {summary:?}"
+        );
+
+        let armed = [
+            arm_walk_fault_for_test(&pattern, unusable()),
+            arm_walk_fault_for_test(&pattern, WalkFault::TablePartitionDiffers { check: 0 }),
+        ];
+        let ended = tokio::time::timeout(
+            WAIT_BUDGET,
+            rig.repair(timing()).run_pass(&CancellationToken::new()),
+        )
+        .await
+        .expect("the pass ends within the budget");
+        drop(armed);
+        match ended {
+            Err(PassError::Valkey { op, source }) => {
+                assert_eq!(op, "SCAN ext:meta");
+                assert_eq!(*source.kind(), fred::error::ErrorKind::Cluster, "{source}");
+                assert!(
+                    source.details().contains("out of date"),
+                    "the out-of-date table is the walk's answer: {source}"
+                );
+            }
+            other => panic!("a stale table: the pass publishes nothing, got {other:?}"),
+        }
+        println!(
+            "CLUSTER-GATED RAN: cluster_meta_walk_fails_a_pass_whose_walk_found_its_routing_table_stale"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// b.g65 — the checkpoint clean-up's fence at both upload sites
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Record `hash_hex` on `key` (a `{recon}` ZSET) at `score_ms`.
+async fn zadd_recon(rig: &Rig, key: String, score_ms: u64, hash_hex: &str) {
+    use fred::interfaces::SortedSetsInterface;
+    let _: () = rig
+        .client()
+        .pool
+        .zadd(key, None, None, false, false, (score_ms as f64, hash_hex))
+        .await
+        .expect("ZADD {recon}");
+}
+
+/// Make `le:ckpt:{recon}:rearm` a string, so every writer re-arm (the fence)
+/// answers a real `WRONGTYPE`.
+async fn poison_rearm(rig: &Rig) {
+    let _: () = rig
+        .client()
+        .pool
+        .set(
+            rig.keys().checkpoint_reconcile_rearm(),
+            "not-a-zset",
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("SET :rearm");
+}
+
+/// `live_edit_checkpoint_ext_mirror_errors_total`.
+fn mirror_errors(rig: &Rig) -> u64 {
+    sample_value(
+        &rig.render(),
+        "live_edit_checkpoint_ext_mirror_errors_total",
+        &[],
+    )
+    .unwrap_or(0.0) as u64
+}
+
+/// b.wsx T10 on b.g65's fence: the collect licensed the delete of an owed
+/// value's backup copy inside the repair's reliance window (`:collected`
+/// scored after the pass read Valkey), so the re-send does NOT upload — that
+/// would resurrect a collected copy — and counts `collect_fenced`; the value
+/// stays owed. The re-send's fence still re-armed the hash, so a collect that
+/// commits afterwards refuses to delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_inside_a_collects_window_is_collect_fenced_and_re_arms_the_value() {
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let v = value(40, 4 * KIB as usize);
+    rig.store_unmirrored(&[&v]).await;
+    rig.wait_until_stored_before_now(&[&v]).await;
+    zadd_recon(
+        &rig,
+        rig.keys().checkpoint_reconcile_tombstones(),
+        1,
+        &v.hex,
+    )
+    .await;
+    let before = rig.now_ms().await;
+    zadd_recon(
+        &rig,
+        rig.keys().checkpoint_reconcile_collected(),
+        before,
+        &v.hex,
+    )
+    .await;
+
+    let summary = rig.pass(&rig.repair(timing())).await;
+
+    assert_eq!(
+        (summary.collect_fenced, summary.resent, summary.owed),
+        (1, 0, 1),
+        "{summary:?}"
+    );
+    assert_eq!(rig.repair_count("collect_fenced"), 1);
+    assert!(rig.store.uploaded().is_empty(), "nothing was uploaded");
+    assert_eq!(rig.confirmation(&v.hex).await, None);
+
+    // `t0` one grace after `before - 1`, so the delete threshold is
+    // `before - 1`.
+    let verdicts = live_edit::storage::recon_fence::recon_ext_commit(
+        rig.client(),
+        rig.keys(),
+        before - 1 + 60_000,
+        Duration::from_secs(60),
+        std::slice::from_ref(&v.hex),
+    )
+    .await
+    .expect("commit");
+    assert_eq!(
+        verdicts,
+        vec![live_edit::storage::recon_fence::CommitVerdict::Rearmed],
+        "the re-send's re-arm makes a collect committing afterwards refuse the delete"
+    );
+}
+
+/// b.g65 (Issue item 2): a re-send whose fence cannot be checked (a Valkey
+/// error) is NOT uploaded — fail closed — and counts `resend_failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resend_whose_fence_errors_uploads_nothing_and_is_resend_failed() {
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let v = value(41, 4 * KIB as usize);
+    rig.store_unmirrored(&[&v]).await;
+    rig.wait_until_stored_before_now(&[&v]).await;
+    poison_rearm(&rig).await;
+
+    let summary = rig.pass(&rig.repair(timing())).await;
+
+    assert_eq!(
+        (summary.resend_failed, summary.resent),
+        (1, 0),
+        "{summary:?}"
+    );
+    assert_eq!(rig.repair_count("resend_failed"), 1);
+    assert!(
+        rig.store.uploaded().is_empty(),
+        "nothing was uploaded unfenced"
+    );
+}
+
+/// T19's fence rows, refusal: a mirror worker whose fence finds the value's
+/// copy collected inside its window skips the upload and counts
+/// `dropped{reason="collect_fenced"}`; nothing is confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mirror_upload_inside_a_collects_window_is_skipped_as_collect_fenced() {
+    let mut rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let cancel = CancellationToken::new();
+    let workers = rig.start_workers(1, &cancel);
+    let v = value(42, 4 * KIB as usize);
+    let now = rig.now_ms().await;
+    zadd_recon(
+        &rig,
+        rig.keys().checkpoint_reconcile_collected(),
+        now,
+        &v.hex,
+    )
+    .await;
+
+    rig.mirrored()
+        .store_values(&[(&v.hash, v.bytes.as_slice())])
+        .await
+        .expect("store_values succeeds");
+    wait_for("the copy is dropped as collect_fenced", || {
+        rig.dropped("collect_fenced") == 1
+    })
+    .await;
+    shut_down(cancel, workers).await;
+
+    assert!(rig.store.uploaded().is_empty(), "the copy was not uploaded");
+    assert_eq!(rig.confirmation(&v.hex).await, None);
+    rig.assert_budget_whole("after the dropped copy");
+}
+
+/// T19's fence rows, error: a mirror worker whose fence cannot be checked
+/// uploads anyway (the copy is the item's whole purpose), confirms it, and
+/// counts the fence error on `checkpoint_ext_mirror_errors_total`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mirror_upload_whose_fence_errors_uploads_anyway_and_counts_the_error() {
+    let mut rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    poison_rearm(&rig).await;
+    let cancel = CancellationToken::new();
+    let workers = rig.start_workers(1, &cancel);
+    let v = value(43, 4 * KIB as usize);
+
+    rig.mirrored()
+        .store_values(&[(&v.hash, v.bytes.as_slice())])
+        .await
+        .expect("store_values succeeds");
+    wait_confirmed(&rig, &v.hex).await;
+    shut_down(cancel, workers).await;
+
+    assert_eq!(rig.store.uploaded(), vec![v.hex.clone()], "uploaded anyway");
+    assert_eq!(mirror_errors(&rig), 1, "the fence error is counted once");
+    assert_eq!(rig.dropped("collect_fenced"), 0);
+}
+
+/// N6 (a), the repair: its existence check answers that the backup store
+/// holds the copy, then the collect deletes that copy and runs its post-delete
+/// step, then the repair confirms. The confirmation relies on the copy since
+/// the pass read Valkey — before the clear — so it is DECLINED: no value reads
+/// as backed up with no copy. The next pass checks the value again, re-sends
+/// it and confirms it. Before b.g65 the confirm script compared no clear time
+/// and wrote `backed_up_in` here, for a day until the audit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repair_confirmation_whose_check_answered_before_the_collects_delete_is_declined() {
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let v = value(44, 4 * KIB as usize);
+    rig.store_unmirrored(&[&v]).await;
+    rig.store.seed(&v.hex, &v.bytes).await;
+    rig.wait_until_stored_before_now(&[&v]).await;
+    rig.store
+        .stage_collect_after_answer(CollectAt::Check, &v.hex, &rig.tv);
+
+    rig.pass(&rig.repair(timing())).await;
+
+    assert_eq!(
+        rig.store.checked(),
+        vec![v.hex.clone()],
+        "fixture: checked once"
+    );
+    assert!(
+        rig.store.held(&v.hex).await.is_none(),
+        "fixture: the copy was deleted"
+    );
+    let cleared_ms: u64 = rig
+        .meta_field(&v.hex, BACKUP_CLEARED_MS_FIELD)
+        .await
+        .expect("fixture: the clear stamped the meta")
+        .parse()
+        .expect("backup_cleared_ms is decimal ms");
+    assert_eq!(
+        rig.confirmation(&v.hex).await,
+        None,
+        "the confirmation of a copy deleted after the check answered is declined"
+    );
+
+    // The next pass relies on the copy from its own Valkey clock read; a read
+    // in the clear's millisecond would decline its confirmation too (the tie
+    // `a_confirmation_whose_reliance_starts_in_the_clears_millisecond_is_declined_and_the_next_pass_confirms_the_copy`
+    // pins), so wait until that clock is past the clear, as it is for any
+    // later pass.
+    rig.wait_until_clock_past(cleared_ms).await;
+    let summary = rig.pass(&rig.repair(timing())).await;
+    assert_eq!(summary.resent, 1, "the next pass re-sends it: {summary:?}");
+    assert_confirmed_under(
+        rig.confirmation(&v.hex).await.as_deref(),
+        STORE_ID,
+        "the re-sent copy",
+    );
+}
+
+/// N6 (b), the mirror: a worker's upload lands, then the collect deletes that
+/// copy and runs its post-delete step, then the worker confirms. The
+/// confirmation relies on the copy since the item's store stamp — before the
+/// clear — so it is DECLINED. A second value through the same single worker
+/// is confirmed, which shows the first item's confirm has already run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mirror_confirmation_whose_upload_landed_before_the_collects_delete_is_declined() {
+    let mut rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let cancel = CancellationToken::new();
+    let workers = rig.start_workers(1, &cancel);
+    let (first, second) = (value(45, 4 * KIB as usize), value(46, 4 * KIB as usize));
+    rig.store
+        .stage_collect_after_answer(CollectAt::Upload, &first.hex, &rig.tv);
+
+    let mirrored = rig.mirrored();
+    for v in [&first, &second] {
+        mirrored
+            .store_values(&[(&v.hash, v.bytes.as_slice())])
+            .await
+            .expect("store_values succeeds");
+    }
+    wait_confirmed(&rig, &second.hex).await;
+    shut_down(cancel, workers).await;
+
+    assert_eq!(
+        rig.store.uploaded(),
+        vec![first.hex.clone(), second.hex.clone()],
+        "fixture: one worker, in order"
+    );
+    assert!(
+        rig.store.held(&first.hex).await.is_none(),
+        "fixture: the copy was deleted"
+    );
+    assert_eq!(
+        rig.confirmation(&first.hex).await,
+        None,
+        "the confirmation of a copy deleted after its upload landed is declined"
+    );
+}
+
+/// The same-millisecond tie, made deterministic (b.g65): the collect's clear
+/// stamps `backup_cleared_ms` from Valkey's clock in whole milliseconds, and a
+/// caller can read the same millisecond as its reliance start (the collect's
+/// heal does so a few round trips after its own clear). The tie DECLINES the
+/// confirmation (`backup_cleared_ms >= reliance start`): the caller may have
+/// seen a copy the delete removed in that millisecond. So `backed_up_in` stays
+/// empty and the value stays owed, and the next backup-repair pass, whose
+/// reliance start is a later millisecond, finds the copy and confirms it with
+/// no upload. Nothing reads as backed up with no copy, and the value is not
+/// left owed for good.
+///
+/// The stamp is written outright, equal to a Valkey reading taken as the
+/// caller's reliance start, so the tie happens on every run rather than when
+/// two round trips happen to share a millisecond.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmation_whose_reliance_starts_in_the_clears_millisecond_is_declined_and_the_next_pass_confirms_the_copy(
+) {
+    let rig = Rig::new(RepairStore::new(), 1 << 20).await;
+    let v = value(47, 4 * KIB as usize);
+    rig.store_unmirrored(&[&v]).await;
+    rig.store.seed(&v.hex, &v.bytes).await;
+    rig.wait_until_stored_before_now(&[&v]).await;
+    let stamp = rig
+        .stamp(&v.hex)
+        .await
+        .expect("stored values carry a stamp");
+    let reliance_start = rig.now_ms().await;
+    rig.set_meta_field(&v.hex, BACKUP_CLEARED_MS_FIELD, reliance_start.to_string())
+        .await;
+    let marks = ExtBackupMarks::new(
+        rig.client().clone(),
+        rig.keys().clone(),
+        STORE_ID.to_owned(),
+        Some(Arc::clone(&rig.metrics)),
+    );
+
+    marks.confirm(&v.hex, &stamp, reliance_start).await;
+
+    assert_eq!(
+        rig.confirmation(&v.hex).await,
+        None,
+        "a confirmation whose reliance starts in the clear's millisecond is declined"
+    );
+    assert_eq!(
+        rig.mark_failed("confirm"),
+        0,
+        "a decline is an answer, not a failure"
+    );
+    assert!(
+        !confirm_ext_backup(
+            rig.client(),
+            rig.keys(),
+            &v.hex,
+            STORE_ID,
+            &stamp,
+            Some(reliance_start),
+        )
+        .await
+        .expect("the confirm script runs"),
+        "and the script answers that it wrote nothing"
+    );
+
+    // The next pass reads Valkey's clock as its reliance start; wait until that
+    // clock is past the clear, as it is for any later pass.
+    rig.wait_until_clock_past(reliance_start).await;
+    let summary = rig.pass(&rig.repair(timing())).await;
+
+    assert_eq!(
+        rig.store.checked(),
+        vec![v.hex.clone()],
+        "the value stayed owed, so the pass checked it"
+    );
+    assert_eq!(
+        (summary.already_stored, summary.resent, summary.owed),
+        (1, 0, 0),
+        "the pass found the copy and confirmed it: {summary:?}"
+    );
+    assert!(
+        rig.store.uploaded().is_empty(),
+        "the copy is still there, so nothing is uploaded"
+    );
+    assert_confirmed_under(
+        rig.confirmation(&v.hex).await.as_deref(),
+        STORE_ID,
+        "the copy the next pass found",
+    );
 }

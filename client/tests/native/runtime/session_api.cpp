@@ -108,6 +108,48 @@ void validationAndOfflineQueueOwnership()
         assert(std::memcmp(&older, &before, sizeof(older)) == 0);
     }
 
+    {
+        // Merge-owner admission: a join that did not opt in is UNSUPPORTED, an opted-in join that is not READY is
+        // UNAVAILABLE, and neither schedules a callback. A 1.0 caller's options end before flags.
+        std::atomic<unsigned> ownerEvents{0};
+        auto flagged = options; flagged.flags = OMNI_USD_LIVE_JOIN_MERGE_OWNER | 2;
+        OmniUsdLiveSession opted = 0, prefixed = 0;
+        assert(omniUsdLiveJoinSession(uri.c_str(), &flagged, &ownerEvents, joined, &opted) == OMNI_USD_LIVE_INVALID_ARGUMENT && !opted);
+        flagged.flags = OMNI_USD_LIVE_JOIN_MERGE_OWNER;
+        assert(omniUsdLiveJoinSession(uri.c_str(), &flagged, &ownerEvents, joined, &opted) == OMNI_USD_LIVE_OK && opted);
+        auto older = options; older.struct_size = offsetof(OmniUsdLiveJoinOptions, flags); older.flags = 0xFFFFFFFFu;
+        assert(omniUsdLiveJoinSession(uri.c_str(), &older, &ownerEvents, joined, &prefixed) == OMNI_USD_LIVE_OK && prefixed);
+        older.struct_size = offsetof(OmniUsdLiveJoinOptions, flags) + 1;
+        OmniUsdLiveSession split = 0;
+        assert(omniUsdLiveJoinSession(uri.c_str(), &older, &ownerEvents, joined, &split) == OMNI_USD_LIVE_INVALID_ARGUMENT && !split);
+        const auto ignored = [](void* user, OmniUsdLiveResult, const OmniUsdLiveSessionEvent*) {
+            ++*static_cast<std::atomic<unsigned>*>(user);
+        };
+        OmniUsdLiveRequest owner = 99;
+        assert(omniUsdLiveRequestMergeOwner(prefixed, OMNI_USD_LIVE_MERGE_OWNER_CLAIM, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_UNSUPPORTED && !owner);
+        assert(omniUsdLiveRequestMergeOwner(session, OMNI_USD_LIVE_MERGE_OWNER_VERIFY, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_UNSUPPORTED && !owner);
+        assert(omniUsdLiveRequestMergeOwner(opted, OMNI_USD_LIVE_MERGE_OWNER_CLAIM, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_UNAVAILABLE && !owner);
+        assert(omniUsdLiveRequestMergeOwner(opted, 0, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_INVALID_ARGUMENT && !owner);
+        assert(omniUsdLiveRequestMergeOwner(opted, 4, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_INVALID_ARGUMENT && !owner);
+        assert(omniUsdLiveRequestMergeOwner(opted, OMNI_USD_LIVE_MERGE_OWNER_CLAIM, &ownerEvents, nullptr, &owner) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+        assert(omniUsdLiveRequestMergeOwner(opted, OMNI_USD_LIVE_MERGE_OWNER_CLAIM, &ownerEvents, ignored, nullptr) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+        assert(omniUsdLiveRequestMergeOwner(endpoint, OMNI_USD_LIVE_MERGE_OWNER_CLAIM, &ownerEvents, ignored, &owner) == OMNI_USD_LIVE_INVALID_HANDLE && !owner);
+        auto view = record<OmniUsdLiveMergeOwner>(); view.epoch = 7; view.held = 1;
+        assert(omniUsdLiveGetMergeOwner(opted, &view) == OMNI_USD_LIVE_OK);
+        assert(!view.supported && !view.held && !view.owned && view.epoch == 0 && view.struct_size == sizeof(view));
+        view.struct_size = sizeof(uint32_t);
+        assert(omniUsdLiveGetMergeOwner(opted, &view) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+        view = record<OmniUsdLiveMergeOwner>(); view.abi_version = UINT32_C(0x20000);
+        assert(omniUsdLiveGetMergeOwner(opted, &view) == OMNI_USD_LIVE_UNSUPPORTED);
+        view = record<OmniUsdLiveMergeOwner>();
+        assert(omniUsdLiveGetMergeOwner(endpoint, &view) == OMNI_USD_LIVE_INVALID_HANDLE);
+        assert(omniUsdLiveGetMergeOwner(opted, nullptr) == OMNI_USD_LIVE_INVALID_ARGUMENT);
+        assert(omniUsdLiveLeaveSession(opted, 3000) == OMNI_USD_LIVE_OK);
+        assert(omniUsdLiveLeaveSession(prefixed, 3000) == OMNI_USD_LIVE_OK);
+        assert(omniUsdLiveGetMergeOwner(opted, &view) == OMNI_USD_LIVE_INVALID_HANDLE);
+        assert(ownerEvents == 0);
+    }
+
     OmniUsdLiveRequest request = 99;
     assert(omniUsdLiveSendMessage(session, nullptr, 1, &completions, accepted, &request) == OMNI_USD_LIVE_INVALID_ARGUMENT && !request);
     assert(omniUsdLiveSendMessage(endpoint, nullptr, 0, &completions, accepted, &request) == OMNI_USD_LIVE_INVALID_HANDLE && !request);

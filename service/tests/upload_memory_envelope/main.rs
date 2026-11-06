@@ -317,8 +317,7 @@ use live_edit::observability::metrics::{
 };
 use live_edit::storage::commit_charge::{CommitCharge, ObjectStateNeed, RepairTransient};
 use live_edit::storage::connection_buffers::{
-    at_rest_bound_bytes, PoolSizes, Topology, BACKCHANNEL_BYTES, GENERAL_LIMITS,
-    IDLE_CONNECTION_BYTES, READER_LIMITS,
+    at_rest_bound_bytes, PoolSizes, Topology, GENERAL_LIMITS, IDLE_CONNECTION_BYTES, READER_LIMITS,
 };
 use live_edit::storage::diff_read::{
     read_object_snapshot_slim, read_object_snapshot_slim_with_ceilings, SlimSnapshotReadConsumer,
@@ -1348,7 +1347,8 @@ enum Base {
     /// [`Base::Children`]'s `SECTION` with this many children, and beside it
     /// [`SECOND_SECTION`], an empty root-level section: a base where an edit
     /// under the empty section lists no long children list (the planning
-    /// clone's fit basis).
+    /// clone's fit basis), and one whose `SECTION` an update can delete
+    /// while a top-level section stays (SDD §9.7).
     ChildrenAndEmptySection(usize),
     /// [`inline_value_base_delta`]: `SECTION` with [`INLINE_VALUE_ROWS`]
     /// inline values of [`INLINE_VALUE_LEN`] bytes and
@@ -6082,10 +6082,15 @@ fn rekey_section_and_birth(section_id: u64) -> OwnedDelta {
 /// The cached route's plan report rows: `(name, base, delta)`.
 fn cached_cold_report_rows() -> Vec<(&'static str, Base, OwnedDelta)> {
     vec![
-        // (iii): delete a section holding 5,000 descendants.
+        // (iii): delete a section holding 5,000 descendants. The base keeps
+        // the empty top-level `SECOND_SECTION` beside it as an anchor: an
+        // update that leaves a layer no top-level section is refused (SDD
+        // §9.7). So the base holds one section more than the row's records
+        // before that rule, and the layer keeps it after the delete; the
+        // deleted subtree is the same 5,001 sections.
         (
             "b26e-delete-5k-descendants",
-            Base::Children(DENSE / 4),
+            Base::ChildrenAndEmptySection(DENSE / 4),
             OwnedDelta {
                 struct_commands: vec![StructCommand::DeleteSection(CommandDeleteSection {
                     parent_id: 0,
@@ -7252,8 +7257,12 @@ const UG2_CHAIN: usize = 9_000;
 ///   empty [`SECOND_SECTION`], whose check walks those 20,000 down;
 /// - `ug2-reset-20k` / `ug2-reset-prim-2500`: a reset to one section of
 ///   20,000 children, and of the 2,500-prim harness layer (fields included);
-/// - `ug2-delete-20k` / `ug2-delete-fields-20k`: deleting `SECTION`, which
-///   cascades to its 20,000 children, or purges its 20,000 field rows;
+/// - `ug2-delete-20k` / `ug2-delete-fields-20k`: deleting a top-level
+///   section, which cascades to its 20,000 children (`SECTION`), or purges
+///   its 20,000 field rows ([`SECOND_SECTION`]), beside an empty top-level
+///   section that stays as an anchor: an update that leaves a layer no
+///   top-level section is refused (SDD §9.7). Each base holds one empty
+///   section more than these rows' records before that rule;
 /// - `ug2-fields-20k` / `ug2-samples-20k`: one new child and 20,000 new
 ///   fields, or time samples, on `SECTION`;
 /// - `ug2-overwrite-fields-20k`: one new child and an overwrite of each of
@@ -7271,10 +7280,10 @@ fn ug2_fit_cases() -> Vec<(&'static str, FitBase, OwnedDelta)> {
         struct_commands: vec![create_section(0, SECTION, "base".to_owned())],
         ..Default::default()
     };
-    let delete_section = OwnedDelta {
+    let delete_section = |section_id: u64| OwnedDelta {
         struct_commands: vec![StructCommand::DeleteSection(CommandDeleteSection {
             parent_id: 0,
-            section_id: SECTION,
+            section_id,
         })],
         ..Default::default()
     };
@@ -7314,15 +7323,22 @@ fn ug2_fit_cases() -> Vec<(&'static str, FitBase, OwnedDelta)> {
             FitBase::Plain(Base::HarnessPrims(2_500)),
             reset,
         ),
+        // The two deletes keep an empty top-level anchor (SDD §9.7; the list
+        // above): `SECOND_SECTION` beside the deleted `SECTION`, and
+        // `SECTION`, with no fields of its own, beside the deleted
+        // `SECOND_SECTION` and its 20,000 field rows.
         (
             "ug2-delete-20k",
-            FitBase::Plain(Base::Children(DENSE)),
-            delete_section.clone(),
+            FitBase::Plain(Base::ChildrenAndEmptySection(DENSE)),
+            delete_section(SECTION),
         ),
         (
             "ug2-delete-fields-20k",
-            FitBase::Plain(Base::Fields(DENSE)),
-            delete_section,
+            FitBase::Plain(Base::SplitFields {
+                keep: 0,
+                doomed: DENSE,
+            }),
+            delete_section(SECOND_SECTION),
         ),
         (
             "ug2-fields-20k",
@@ -10298,8 +10314,12 @@ fn field_dense_calls(fields: usize, calls: usize) -> Vec<Fixture> {
 }
 
 /// `calls` uploads of one external value of `len` bytes each, distinct per
-/// call (so no call finds its value already stored).
-fn one_blob_calls(len: usize, calls: usize) -> Vec<Fixture> {
+/// call (so no call finds its value already stored), on `path`: a
+/// `CreateLayer` also creates the `SECTION` the value hangs off
+/// ([`own_section`]), since a create that leaves value rows but no top-level
+/// section is refused (SDD §9.7). So a create carries one section more than
+/// the case's records before that rule.
+fn one_blob_calls(path: Path, len: usize, calls: usize) -> Vec<Fixture> {
     (0..calls)
         .map(|call| {
             let blob = blobs(1, len, call as u8 ^ 0xa5).remove(0);
@@ -10307,6 +10327,7 @@ fn one_blob_calls(len: usize, calls: usize) -> Vec<Fixture> {
                 "one-blob",
                 Feeds::Ext,
                 OwnedDelta {
+                    struct_commands: own_section(path),
                     set_fields: vec![external_field("blob0".to_owned(), &blob, 1)],
                     ..Default::default()
                 },
@@ -10349,8 +10370,16 @@ fn post_release_case(spec: &str) -> PostReleaseCase {
     let (path, route, calls) = match kind {
         "watch-field-dense" => (Path::UpdateSlow, Route::Watch, field_dense_calls(size, n)),
         "fast-field-dense" => (Path::UpdateFast, Route::Default, field_dense_calls(size, n)),
-        "fast-blob" => (Path::UpdateFast, Route::Default, one_blob_calls(size, n)),
-        "create-blob" => (Path::Create, Route::Default, one_blob_calls(size, n)),
+        "fast-blob" => (
+            Path::UpdateFast,
+            Route::Default,
+            one_blob_calls(Path::UpdateFast, size, n),
+        ),
+        "create-blob" => (
+            Path::Create,
+            Route::Default,
+            one_blob_calls(Path::Create, size, n),
+        ),
         "fast-value-heavy" => (Path::UpdateFast, Route::Default, value_heavy_calls(n)),
         "cold-children" => (
             Path::UpdateSlow,
@@ -10569,16 +10598,16 @@ const _: () = assert!(DENSE > GENERAL_LIMITS.in_flight_commands);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OneWarmFigures {
     /// What the clients keep with one warm connection each:
-    /// `touched × clustered_client_bound(P) + (general − touched) × (P ×
-    /// IDLE_CONNECTION_BYTES + BACKCHANNEL_BYTES)`. The untouched clients'
-    /// term lets each one's connections and backchannel be replaced by fresh
-    /// ones once.
+    /// `touched × clustered_client_bound(P) + (general − touched) × P ×
+    /// IDLE_CONNECTION_BYTES`. The untouched clients' term lets each one's
+    /// connections be replaced by fresh ones once. No client holds a
+    /// backchannel between syncs (b.9sh, vendored fred change 11).
     bound: u64,
 }
 
 impl OneWarmFigures {
     fn of(general: usize, touched: usize, primaries: usize) -> Self {
-        let untouched_client = primaries * IDLE_CONNECTION_BYTES + BACKCHANNEL_BYTES;
+        let untouched_client = primaries * IDLE_CONNECTION_BYTES;
         let bound = touched as u64 * clustered_client_bound(primaries) as u64
             + ((general - touched) * untouched_client) as u64;
         Self { bound }
@@ -10587,16 +10616,17 @@ impl OneWarmFigures {
 
 /// Test 11c's bound (pure, runs everywhere), checked here because 11c itself
 /// runs only on CI's cluster: at test 11c's pools (G = 5 general clients at a
-/// pool of 1, of which 2 are loaded), `2 × clustered_client_bound(P) + 3 ×
-/// (P × IDLE_CONNECTION_BYTES + BACKCHANNEL_BYTES)` is 1,159,168 B on 2
-/// primaries, 1,200,128 B on 3 (CI's cluster) and 1,241,088 B on 4.
+/// pool of 1, of which 2 are loaded), `2 × clustered_client_bound(P) + 3 × P ×
+/// IDLE_CONNECTION_BYTES` is 1,077,248 B on 2 primaries, 1,118,208 B on 3
+/// (CI's cluster) and 1,159,168 B on 4: 5 × 16,384 B less than when each
+/// client counted a stored `CLUSTER SLOTS` backchannel (b.9sh).
 #[test]
 fn one_warm_per_touched_client_bound_counts_the_cases_clients_b26e() {
     let mut config = common::test_config();
     config.valkey_pool_size = 1;
     let general = PoolSizes::from_config(&config).general_clients();
     assert_eq!(general, 5, "test 11c's general clients at a pool of 1");
-    for (primaries, bound) in [(2, 1_159_168), (3, 1_200_128), (4, 1_241_088)] {
+    for (primaries, bound) in [(2, 1_077_248), (3, 1_118_208), (4, 1_159_168)] {
         assert_eq!(
             OneWarmFigures::of(general, UPLOAD_PATH_TOUCHED_CLIENTS, primaries).bound,
             bound,
@@ -10627,7 +10657,7 @@ fn one_warm_per_touched_client_bound_counts_the_cases_clients_b26e() {
 /// every connection warm (V1), and nothing once the sweep runs as built.
 ///
 /// Its bytes: after every call the heap is at most [`OneWarmFigures::bound`]
-/// above the reference (1,200,128 B on 3 primaries), and the plateau holds
+/// above the reference (1,118,208 B on 3 primaries), and the plateau holds
 /// from call 3 on, which fail with the connection buffer limits reverted or
 /// their wiring removed (a 65,536-slot queue per touched connection).
 ///
@@ -10887,8 +10917,9 @@ async fn await_reader_parked_on(
 /// its read limit, it keeps at most its class limits: an in-flight queue of
 /// `READER_LIMITS.in_flight_commands` slots, its write buffer, a read buffer
 /// under `READER_LIMITS.kept_read_bytes()` (256 KiB, a quarter of one XREAD
-/// reply target), and a backchannel's two 8 KiB buffers — `171,520 + 256 KiB
-/// + 16,384` bytes, computed from the constants.
+/// reply target), and no backchannel (the readers run fred's default
+/// `Blocking::Block`, b.9sh) — `171,520 + 256 KiB` bytes, computed from the
+/// constants.
 ///
 /// One reader, one subscription. The same 4 MiB value-heavy commit runs once
 /// before the subscription starts (so the data and txn connections, which
@@ -10985,22 +11016,22 @@ async fn stream_reader_keeps_at_most_its_class_limits_after_a_relay_far_above_it
 /// What test 12 and its cluster variant allow a stream reader to keep: one
 /// connection at the reader class limits — its in-flight queue, its write
 /// buffer and a read buffer under `READER_LIMITS.kept_read_bytes()` (within
-/// one XREAD reply target) — and its backchannel's two 8 KiB buffers,
+/// one XREAD reply target) — and no backchannel (b.9sh: the readers run
+/// fred's default `Blocking::Block`, so none opens a `CLIENT UNBLOCK` one),
 /// computed from the constants.
 fn reader_class_bound() -> i64 {
     (READER_LIMITS.kept_queue_bytes()
         + READER_LIMITS.kept_write_bytes()
-        + READER_LIMITS.kept_read_bytes()
-        + BACKCHANNEL_BYTES) as i64
+        + READER_LIMITS.kept_read_bytes()) as i64
 }
 
 /// Test 12's bound (pure, runs everywhere): [`reader_class_bound`] is one
-/// reader connection and its backchannel, `171,520 + 256 KiB + 16,384` bytes
-/// at the 64 KiB reader read limit — so the cluster variant, which cannot run
-/// here, asserts against the same figure the standalone test does.
+/// reader connection and nothing else, `171,520 + 256 KiB` bytes at the
+/// 64 KiB reader read limit — so the cluster variant, which cannot run here,
+/// asserts against the same figure the standalone test does.
 #[test]
-fn stream_reader_class_bound_is_one_connection_and_its_backchannel_b26e() {
-    assert_eq!(reader_class_bound(), 171_520 + 262_144 + 16_384);
+fn stream_reader_class_bound_is_one_connection_b26e() {
+    assert_eq!(reader_class_bound(), 171_520 + 262_144);
 }
 
 /// Base layers [`cluster_stream_reader_retargeted_to_another_primary_keeps_one_connection_b26e`]
@@ -11072,8 +11103,8 @@ async fn expect_relay(consumer: &LayerStreamConsumer, seq: u64, len: usize) {
 /// reader whose only subscription moves from an object whose stream is on
 /// primary A to one on primary B retargets — the old client is retired with
 /// its connection and buffers, and the new one holds one connection, to B —
-/// and keeps at most [`reader_class_bound`] (`171,520 + 256 KiB + 16,384`
-/// bytes) once it has delivered an entry far above its read limit on each.
+/// and keeps at most [`reader_class_bound`] (`171,520 + 256 KiB` bytes) once
+/// it has delivered an entry far above its read limit on each.
 ///
 /// One reader, pools of 1, a client built by the production `connect`.
 /// Before the reference: the same 4 MiB value-heavy commit on each object
@@ -11090,7 +11121,7 @@ async fn expect_relay(consumer: &LayerStreamConsumer, seq: u64, len: usize) {
 ///
 /// Runs only with `LIVE_EDIT_TEST_CLUSTER_URL` (CI's `test-cluster:` job);
 /// prints a `SKIP:` line otherwise. Its bound is checked everywhere by
-/// `stream_reader_class_bound_is_one_connection_and_its_backchannel_b26e`.
+/// `stream_reader_class_bound_is_one_connection_b26e`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cluster_stream_reader_retargeted_to_another_primary_keeps_one_connection_b26e() {
     let _serial = measure_lock().await;
@@ -12002,17 +12033,16 @@ async fn a_single_connection_client_stays_warm_so_repeated_replies_allocate_no_n
     client.quit().await;
 }
 
-/// The cluster URL variable the cluster-gated tests below read
-/// (`tests/integration/storage/mod.rs` names it the same, and CI's
+/// The cluster URL variable the cluster-gated tests below read (CI's
 /// `test-cluster:` job sets it).
-const CLUSTER_URL_VAR: &str = "LIVE_EDIT_TEST_CLUSTER_URL";
+const CLUSTER_URL_VAR: &str = live_edit::storage::test_support::TEST_CLUSTER_URL_VAR;
 
 /// For a cluster-gated test: `LIVE_EDIT_TEST_CLUSTER_URL`, or `None`, with a
 /// `SKIP:` line printed, when the variable is unset or not a
 /// `redis-cluster://` URL. A set but unreachable cluster fails the test that
 /// connects to it.
 fn cluster_url(test: &str) -> Option<String> {
-    let Ok(url) = std::env::var(CLUSTER_URL_VAR) else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: {test}: {CLUSTER_URL_VAR} not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run it"
@@ -12097,16 +12127,19 @@ fn tag_per_primary(member: &fred::clients::Client) -> Vec<String> {
 }
 
 /// What a clustered general client keeps once drained, with `primaries`
-/// connections: one warm connection at the general class limits, every other
-/// connection at the idle shape (an 8 KiB read buffer, no queue, no write
-/// buffer), and its `CLUSTER SLOTS` backchannel's two 8 KiB buffers —
-/// `505,856 + (P − 1) × 8,192 + 16,384`, computed from the constants.
+/// connections and no sync running: one warm connection at the general class
+/// limits and every other connection at the idle shape (an 8 KiB read buffer,
+/// no queue, no write buffer) — `505,856 + (P − 1) × 8,192`, computed from the
+/// constants. No backchannel: the vendored fred drops the connection a sync
+/// opens for `CLUSTER SLOTS` when the sync ends (b.9sh, change 11), so a
+/// client holds one only while a sync runs. `at_rest_bound_bytes`' c term
+/// still counts that connection for every client, as the peak of a
+/// cluster-wide resync; a heap measured with no sync running never holds it.
 fn clustered_client_bound(primaries: usize) -> i64 {
     (GENERAL_LIMITS.kept_queue_bytes()
         + GENERAL_LIMITS.kept_write_bytes()
         + GENERAL_LIMITS.kept_read_bytes()
-        + (primaries - 1) * FRESH_BUFFER_BYTES
-        + BACKCHANNEL_BYTES) as i64
+        + (primaries - 1) * FRESH_BUFFER_BYTES) as i64
 }
 
 /// GETs per primary in tests 17 and 19: the general in-flight limit (256). A
@@ -12214,9 +12247,10 @@ fn the_warm_connection(report: &[ConnectionReport]) -> Option<&ConnectionReport>
 /// reports a skipped sweep and every connection warm.
 ///
 /// Its bytes: the heap is at most [`clustered_client_bound`] above the
-/// reference taken before the traffic (538,624 B on three primaries), formula
-/// (B)'s per-client term: one warm connection at the class limits, the others
-/// at the idle shape, and the `CLUSTER SLOTS` backchannel. That bound alone
+/// reference taken before the traffic (522,240 B on three primaries), formula
+/// (B)'s per-client term less its c term, which counts a sync's `CLUSTER
+/// SLOTS` connection only while a sync runs: one warm connection at the class
+/// limits and the others at the idle shape. That bound alone
 /// does not tell one warm connection from several at these limits; the report
 /// does.
 ///
@@ -12465,12 +12499,13 @@ const SYNC_RESIDUE_LIMIT: i64 = 4_096;
 /// table owns its strings, so no `CLUSTER SLOTS` reply outlives its sync. On
 /// a pool-1 clustered client from the production builder, with the
 /// reference taken after connect and one router pass, [`SYNCS`] topology
-/// syncs (`sync_cluster`), each followed by a `PING` (a router pass, which
-/// cuts the backchannel the sync used), leave the heap less than
-/// [`SYNC_RESIDUE_LIMIT`] above the reference. Without the copy at the end of
-/// `ClusterRouting::rebuild`, each sync's reply allocation stays pinned by
-/// the routing state, connection keys and the next backchannel's server, one
-/// or more allocations of at least 8,192 B.
+/// syncs (`sync_cluster`), each followed by a `PING` (a router pass), leave
+/// the heap less than [`SYNC_RESIDUE_LIMIT`] above the reference. Each sync's
+/// `CLUSTER SLOTS` connection, its read buffer with it, is dropped when the
+/// sync ends (b.9sh, vendored fred change 11). Without the copy at the end of
+/// `ClusterRouting::rebuild`, each sync's reply allocation stays pinned past
+/// that drop by the routing state, connection keys and the next sync's
+/// connection's server, one or more allocations of at least 8,192 B.
 ///
 /// Runs only with `LIVE_EDIT_TEST_CLUSTER_URL` (CI's `test-cluster:` job);
 /// prints a `SKIP:` line otherwise. The copy itself is covered everywhere by

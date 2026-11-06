@@ -75,7 +75,8 @@
 //!   (`router/clustered.rs:405-498`) sends that query on the new connection
 //!   `connect_any` (`:359-397`) opened for it (`:471-476`), and waits on the
 //!   reply, under fred's `internal_command_timeout`, as long as the test holds
-//!   it;
+//!   it (the vendored fred drops that connection when the sync ends, change
+//!   11, so every sync opens one: none is stored for the next to reuse);
 //! - stalls ([`ProxyAction::Stall`]) or holds the replies of
 //!   ([`ProxyAction::HoldReplies`]) one marked `GET` on one node, or holds
 //!   A's `-ASK` reply to one marked command behind a gate
@@ -198,8 +199,10 @@
 //!   fred's default 0, which the service leaves unset.
 //! - The documented exceptions, which still wait on one connection while
 //!   another may hold fed frames: the flush before a `CLIENT UNBLOCK` under
-//!   `Blocking::Interrupt` (`write_command`, and its copy in `ask::follow`),
-//!   and fred's stock close, bounded at 5 s, in `drop_connection` (after a
+//!   `Blocking::Interrupt` (`write_command`, and its copy in `ask::follow`;
+//!   unreachable in the service, whose clients all run fred's default
+//!   `Blocking::Block` since b.9sh, so no test reaches it), and fred's stock
+//!   close, bounded at 5 s, in `drop_connection` (after a
 //!   read error or end of file) and `disconnect_all`.
 //! - That every flush runs each connection's flush to its own end
 //!   (`join_all`, not stock's `try_join_all`), so a fast error on one never
@@ -234,8 +237,8 @@
 //! Every wait in a test runs under that test's one deadline,
 //! [`SCENARIO_BUDGET`] (60 s) from its first line, connects included; the
 //! hold window ([`HOLD_WINDOW`], 5 s) is one of those waits. After the
-//! deadline comes only the fixtures' drop: each purge round trip bounded at
-//! 5 s and each client's quit at 10 s. Inside nextest's 120 s hang-killer. A
+//! deadline comes only the fixtures' drop: each purge `UNLINK` and each wait
+//! for the walk's next key bounded at 5 s, and each client's quit at 10 s. Inside nextest's 120 s hang-killer. A
 //! healthy run takes well under a second for (R) and (S); waits out one
 //! [`F3_SLOW_BOUND`] for F3, T4 and T5, two for T1 and, through the window
 //! in which A must stay unjudged, for T2, T3 and T6; and waits out the 2 s
@@ -2200,7 +2203,7 @@ async fn on_node<R: fred::types::FromValue>(
 #[ignore = "ci: test-cluster-disruptive; disruptive, CLIENT PAUSE suspends a whole cluster node"]
 async fn fed_frame_flush_disruptive_a_write_fed_behind_a_reconnect_to_a_paused_node_lands_before_the_pause_ends(
 ) {
-    let Ok(url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster-disruptive:` job \

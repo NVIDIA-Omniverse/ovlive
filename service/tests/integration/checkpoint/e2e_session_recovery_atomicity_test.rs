@@ -20,24 +20,25 @@
 //! # What this file pins
 //!
 //! Task 5's recovery applier (`apply_session_checkpoint`,
-//! `src/checkpoint/session.rs`) splits into two independently-atomic
-//! MULTI/EXEC transactions per SR-2.7:
+//! `src/checkpoint/session.rs`) splits into two independently-atomic steps
+//! per SR-2.7:
 //!
 //! - **Step A** — path-index SADDs on the `{hex(base_path)}` slot
 //!   (`le:path:{hex(base_path)}` legacy session-id set +
-//!   `le:path:{hex(base_path)}:names` composite set).
+//!   `le:path:{hex(base_path)}:names` composite set), one MULTI/EXEC.
 //! - **Step B** — session-scoped HSET + SETs + SADDs on the
 //!   `{session_id}` slot (`le:{sid}:sess`, `le:{sid}:layer:{hex(name)}`,
-//!   `le:{sid}:layers`).
+//!   `le:{sid}:layers`); on-access recovery sends it as one script,
+//!   `session_record_restore.lua`.
 //!
 //! Epic AC #3 asserts that a mid-step failure between Step A and Step B
 //! leaves the path-index half fully committed (Step A is internally
-//! atomic) AND the session-scope half fully absent (Step B's MULTI/EXEC
-//! never reached EXEC). The "ghost-but-functional" failure mode — session-
-//! scope half present without path-index — is the unrecoverable variant
-//! SR-2.7's ordering exists to prevent; the opposite shape (path-index
-//! members pointing at a missing session) is recoverable because
-//! `ListSessions`' opportunistic-cleanup walk reconciles ghost members.
+//! atomic) AND the session-scope half fully absent (the injected Step B
+//! fault fires before Step B is sent). The "ghost-but-functional" failure
+//! mode — session-scope half present without path-index — is the
+//! unrecoverable variant SR-2.7's ordering exists to prevent; the opposite
+//! shape (path-index members pointing at a missing session) is recoverable
+//! because `ListSessions`' ghost walk reconciles ghost members.
 //!
 //! Three scenarios:
 //!
@@ -333,7 +334,7 @@ async fn assert_path_names_carries_expected_composite(
 
 /// Assert every Step B target key (`le:{sid}:sess`, `le:{sid}:layer:{hex(name)}`,
 /// `le:{sid}:layers`) is absent in the live keyspace. Pins the
-/// "Step B's MULTI/EXEC never reached EXEC" invariant.
+/// "Step B was never sent" invariant.
 async fn assert_session_scope_absent(
     harness: &CheckpointHarness,
     session_id: &str,
@@ -349,11 +350,10 @@ async fn assert_session_scope_absent(
         .expect("EXISTS session_meta probe must succeed");
     assert!(
         !session_meta_exists,
-        "Step B session-meta hash MUST be absent post-Step-B-failure — its \
-         HSET was queued inside the same MULTI/EXEC that the injection \
-         aborted, so the EXEC never ran. EXISTS=1 here means the injection \
-         seam fired AFTER the MULTI/EXEC committed (per-step seam \
-         placement regression)."
+        "Step B session-meta hash MUST be absent post-Step-B-failure — the \
+         injection fires before Step B is sent, so Step B was never sent. \
+         EXISTS=1 here means the injection seam fired AFTER Step B ran \
+         (per-step seam placement regression)."
     );
 
     let layers_index_key = harness.tv.key_schema().layers_index(session_id);
@@ -468,7 +468,7 @@ async fn step_b_session_scope_failure_leaves_path_index_landed_and_no_session_st
     // SDD §18.1 transient-error contract).
     let mut queue: VecDeque<CheckpointError> = VecDeque::new();
     queue.push_back(CheckpointError::Transient {
-        source: "injected: simulated Step B EXEC failure for AC #3".into(),
+        source: "injected: simulated Step B failure for AC #3".into(),
     });
     set_apply_step_fault_injector_for_test(ApplyStep::StepB, queue);
 
@@ -510,7 +510,7 @@ async fn step_b_session_scope_failure_leaves_path_index_landed_and_no_session_st
     )
     .await;
 
-    // Step B never reached EXEC: every session-scope key absent.
+    // Step B was never sent: every session-scope key absent.
     assert_session_scope_absent(&harness, &session_id, LAYER_NAME).await;
 
     // Recovery-metric: `error{scope=session}` ticked by exactly 1; all
@@ -617,7 +617,7 @@ async fn recovery_retry_after_step_b_failure_converges() {
     // ── First RPC: Step B injected to fail ──────────────────────────────
     let mut queue: VecDeque<CheckpointError> = VecDeque::new();
     queue.push_back(CheckpointError::Transient {
-        source: "injected: first attempt Step B EXEC failure".into(),
+        source: "injected: first attempt Step B failure".into(),
     });
     set_apply_step_fault_injector_for_test(ApplyStep::StepB, queue);
 
@@ -784,8 +784,8 @@ async fn recovery_retry_after_step_b_failure_converges() {
 /// writes. Even though Step A's SADDs may leave path-index members
 /// pointing at a non-existent session (the "ghost-but-functional"
 /// failure mode's mirror image), reconciliation is owned by
-/// `ListSessions`' opportunistic-cleanup walk (SDD §7.13) and the
-/// orphan-sweep — NOT by the applier.
+/// `ListSessions`' ghost walk (SDD §7.13) and a retried recovery — NOT by
+/// the applier.
 ///
 /// This scenario is the "scenario 1 plus end-state pinning" — scenario 1
 /// asserts the post-Step-B-failure shape immediately; this scenario
@@ -859,7 +859,7 @@ async fn partial_step_b_failure_does_not_corrupt_existing_path_index() {
 
     let mut queue: VecDeque<CheckpointError> = VecDeque::new();
     queue.push_back(CheckpointError::Transient {
-        source: "injected: Step B EXEC failure for no-corrupt scenario".into(),
+        source: "injected: Step B failure for no-corrupt scenario".into(),
     });
     set_apply_step_fault_injector_for_test(ApplyStep::StepB, queue);
 
@@ -983,7 +983,7 @@ async fn partial_step_b_failure_does_not_corrupt_existing_path_index() {
 
     // Session-scope keys still absent on the second observation —
     // doubles as a sanity-check that the Step B inject didn't
-    // accidentally fire post-MULTI/EXEC.
+    // accidentally fire after Step B was sent.
     assert_session_scope_absent(&harness, &session_id, LAYER_NAME).await;
 
     clear_apply_step_fault_injectors_for_test();

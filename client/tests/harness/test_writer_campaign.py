@@ -14,9 +14,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tools.live.test_support import ProcessResult, write_json
 from tools.live.writer_campaign import (LONG_ROTATION_TIMEOUT_MS, LONG_ROTATIONS, OBSERVER_PEAK, PROFILES, SCENARIOS,
-                                        SOAK_PAUSE_MS, SOAK_ROTATIONS, SOAK_TIMEOUT_MS, admit_client, case_passed,
-                                        generate, observe_workload, replay_context, validate_case, verify_context,
-                                        verify_summary)
+                                        SOAK_PAUSE_MS, SOAK_ROTATIONS, SOAK_TIMEOUT_MS, STREAM_AGE_PERIODS,
+                                        STREAM_AGE_TIMEOUTS_MS, admit_client, case_passed, generate, observe_workload,
+                                        replay_context, validate_case, verify_context, verify_summary)
 from tools.live.writer_fuzz import artifact_bytes, execute
 
 
@@ -42,7 +42,7 @@ def runner(command, *, output, environment, **kwargs):
 
 class WriterCampaignTests(unittest.TestCase):
     def test_profiles_require_fixed_varying_seeds_populations_and_all_scenarios(self):
-        for profile, count, seeds, maximum, long in (('ci', 14, 2, 8, 0), ('nightly', 37, 4, 32, 1)):
+        for profile, count, seeds, maximum, long in (('ci', 23, 2, 8, 0), ('nightly', 62, 4, 32, 1)):
             with self.subTest(profile=profile):
                 plan = generate(profile, 42)
                 self.assertEqual(plan, generate(profile, 42))
@@ -57,12 +57,18 @@ class WriterCampaignTests(unittest.TestCase):
                 for case in rotations:
                     self.assertEqual((case['seed'], case['clients'], case['steps'], case['timeout_ms']),
                                      (plan['seeds'][len(PROFILES[profile]['fixed_seeds'])], 4, LONG_ROTATIONS, LONG_ROTATION_TIMEOUT_MS))
+                # So does the stream-age case, once per ci and nightly campaign.
+                ages = [case for case in plan['cases'] if case['scenario'] == 'stream-age']
+                self.assertEqual([(case['seed'], case['clients'], case['steps'], case['timeout_ms']) for case in ages],
+                                 [(plan['seeds'][len(PROFILES[profile]['fixed_seeds'])], 4, STREAM_AGE_PERIODS[profile],
+                                   STREAM_AGE_TIMEOUTS_MS[profile])])
                 self.assertTrue(all('timeout_ms' not in case for case in plan['cases']
-                                    if case['scenario'] != 'long-rotations'))
+                                    if case['scenario'] not in ('long-rotations', 'stream-age')))
                 for seed in plan['seeds']:
                     cases = [case for case in plan['cases'] if case['seed'] == seed]
-                    self.assertEqual({case['scenario'] for case in cases} - {'long-rotations', 'soak'},
-                                     set(SCENARIOS) - {'long-rotations', 'soak'})
+                    self.assertEqual({case['scenario'] for case in cases} - {'long-rotations', 'soak', 'stream-age'},
+                                     set(SCENARIOS) - {'long-rotations', 'soak', 'stream-age', 'staged-samples',
+                                                       'staged-samples-reduction'})
                     self.assertEqual(max(case['clients'] for case in cases), maximum)
                     for case in cases:
                         validate_case(case)
@@ -89,6 +95,56 @@ class WriterCampaignTests(unittest.TestCase):
                 validate_case(changed)
         self.assertFalse(any(case['scenario'] == 'soak' for profile in ('ci', 'nightly')
                              for case in generate(profile, 42)['cases']))
+
+    def test_package_profile_runs_the_staged_samples_at_fixed_and_varying_seeds_and_one_reduction_self_test(self):
+        from tools.live.writer_campaign import (STAGED_PROFILES, STAGED_REDUCTION_CLIENTS, STAGED_REDUCTION_ROUNDS,
+                                                STAGED_REDUCTION_TIMEOUT_MS)
+        plan = generate('package', 42)
+        self.assertEqual(plan, generate('package', 42))
+        self.assertEqual(STAGED_PROFILES, ('package',))
+        options = PROFILES['package']
+        # The self-test runs once, on the first fixed seed, with its own watchdog.
+        self.assertEqual([(case['scenario'], case['clients'], case['steps'], case['seed'], case.get('timeout_ms'))
+                          for case in plan['cases']],
+                         [('staged-samples', options['graph_clients'], options['sample_rounds'], 42, None),
+                          ('staged-samples-reduction', STAGED_REDUCTION_CLIENTS, STAGED_REDUCTION_ROUNDS, 42,
+                           STAGED_REDUCTION_TIMEOUT_MS),
+                          ('staged-samples', options['graph_clients'], options['sample_rounds'], plan['seeds'][1],
+                           None)])
+        self.assertLess(STAGED_REDUCTION_TIMEOUT_MS, options['campaign_timeout_ms'])
+        # The watchdog is at least twice the 300 s that a windows-x86_64 stock-25.11 runner overran (about 330 s), and
+        # the campaign's watchdog never ends a case that is still inside its own.
+        self.assertGreaterEqual(STAGED_REDUCTION_TIMEOUT_MS, 2 * 300_000)
+        self.assertGreater(options['campaign_timeout_ms'],
+                           sum(case.get('timeout_ms', options['case_timeout_ms']) for case in plan['cases']))
+        self.assertLessEqual(STAGED_REDUCTION_CLIENTS + OBSERVER_PEAK['staged-samples-reduction'],
+                             options['max_client_processes'])
+        self.assertEqual(plan['seeds'][0], 42)
+        self.assertEqual(len(set(plan['seeds'])), 2)
+        self.assertNotEqual(plan['seeds'], generate('package', 43)['seeds'])
+        # The two samples, then a fresh observer or the diagnostics sample, fit the client budget.
+        self.assertLessEqual(options['graph_clients'] + OBSERVER_PEAK['staged-samples'], options['max_client_processes'])
+        for case in plan['cases']:
+            validate_case(case)
+        # No campaign without a stage runs either case.
+        self.assertFalse(any(case['scenario'].startswith('staged-samples') for profile in ('ci', 'nightly', 'soak')
+                             for case in generate(profile, 42)['cases']))
+
+    def test_stream_age_cases_cross_many_age_limits_within_their_token_supply(self):
+        from tools.live import writer_campaign as campaign
+        # The limit is the recorded 240-minute ingress stream timeout; every second period reaches it.
+        self.assertEqual((campaign.STREAM_AGE_MAX_MS, 2 * campaign.STREAM_AGE_STEP_MS), (14_400_000, 14_400_000))
+        for profile, periods in STREAM_AGE_PERIODS.items():
+            with self.subTest(profile=profile):
+                scale = campaign.stream_age_scale(periods)
+                self.assertTrue(scale['thresholds'])
+                self.assertLess(scale['warmup'], periods // 2)
+                self.assertEqual(scale['slope'], profile == 'nightly')
+                # The tokens cover the first one and one refresh per expiry.
+                self.assertGreater(campaign.STREAM_AGE_MAX_GENERATIONS, 1 + periods // 2)
+                self.assertLess(STREAM_AGE_TIMEOUTS_MS[profile], PROFILES[profile]['campaign_timeout_ms'])
+        self.assertGreaterEqual(campaign.STREAM_AGE_HARNESS_PERIODS // 2, 2)
+        self.assertFalse(campaign.STREAM_AGE_HARNESS['thresholds'] or campaign.STREAM_AGE_HARNESS['slope'])
 
     def test_soak_gauges_cover_every_gauge_the_diagnostic_schema_defines(self):
         from tools.live import writer_campaign as campaign
@@ -127,13 +183,67 @@ class WriterCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'without a kind or state'):
             campaign.soak_gauges({'table': [{'current': 0}]})
 
+    def test_rss_growth_fits_each_thread_count_and_bounds_each_step(self):
+        from unittest import mock
+        from tools.live import writer_campaign as campaign
+        mib = 1024 * 1024
+        # 300 samples of a writer warmed up at 68 threads, as the Windows stream-age case's second half.
+        def series(step_at=None, threads=70, step=0, leak=0, leak_from=0):
+            points = []
+            for index in range(300):
+                after = step_at is not None and index >= step_at
+                value = 100 * mib + (step if after else 0) + leak * max(0, index - leak_from)
+                points.append((300 + index, value, threads if after else 68))
+            return points
+        with mock.patch.multiple(campaign, SOAK_EXTRA_THREADS=4, SOAK_RSS_THREAD_BYTES=mib):
+            flat = campaign.rss_growth(series(), 68)
+            self.assertEqual((flat['failures'], [segment['samples'] for segment in flat['segments']]), ([], [300]))
+            # A step at a permitted thread increase, with the 64 KiB granule that follows it, passes; the segment
+            # after it is too short to fit and is bounded by its growth.
+            settled = series(step_at=250, step=int(0.6 * mib))
+            settled[-25:] = [(step, value + 65536, threads) for step, value, threads in settled[-25:]]
+            stepped = campaign.rss_growth(settled, 68)
+            self.assertEqual(stepped['failures'], [])
+            self.assertEqual([(s['samples'], s['threads'], s['slope'] is None) for s in stepped['segments']],
+                             [(250, 68, False), (50, 70, True)])
+            # A steady leak inside a fitted segment fails on its slope.
+            leak = campaign.rss_growth(series(leak=campaign.SOAK_RSS_SLOPE_BYTES), 68)
+            self.assertEqual(len(leak['failures']), 1)
+            self.assertIn('slope', leak['failures'][0])
+            # So does a leak in a segment too short to fit, on its growth.
+            short = campaign.rss_growth(series(step_at=250, step=int(0.6 * mib), leak=48 * 1024, leak_from=250), 68)
+            self.assertEqual(len(short['failures']), 1)
+            self.assertIn('growth', short['failures'][0])
+            # A step larger than the per-thread allowance of the threads it added fails.
+            large = campaign.rss_growth(series(step_at=250, step=2 * mib + 600 * 1024), 68)
+            self.assertEqual(len(large['failures']), 1)
+            self.assertIn('2 added threads', large['failures'][0])
+            # A half that opens inside a burst of two pool threads, which commits 0.3 MiB before they retire, passes
+            # (writer 1 of the Windows stream-age case in release-candidate run 40837518792): the burst's threads
+            # above the fewest any sample holds count as added. A leak inside such a burst still fails on its growth.
+            def opening(leak=0):
+                return [(300 + index, 100 * mib + min(index, 60) * (5 * 1024 + leak), 70 if index <= 60 else 68)
+                        for index in range(300)]
+            burst = campaign.rss_growth(opening(), 71)
+            self.assertEqual(burst['failures'], [])
+            self.assertEqual([(s['samples'], s['threads']) for s in burst['segments']], [(61, 70), (239, 68)])
+            leaking = campaign.rss_growth(opening(leak=48 * 1024), 71)
+            self.assertEqual(len(leaking['failures']), 1)
+            self.assertIn('2 added threads', leaking['failures'][0])
+            # A thread increase beyond SOAK_EXTRA_THREADS fails, whatever the memory does.
+            many = campaign.rss_growth(series(step_at=250, threads=73), 68)
+            self.assertEqual(len(many['failures']), 50)
+            self.assertIn('more than 68 + 4', many['failures'][0])
+
     def test_soak_thresholds_and_cadence_are_frozen(self):
         from tools.live import writer_campaign as campaign
         # Frozen after the 200-rotation calibration; changing one is a reviewed test change. Windows allows a few
-        # on-demand worker threads and their handles.
+        # on-demand worker threads and twice as many handles, whose count also moves without a thread change.
         extra = 4 if sys.platform == 'win32' else 0
         self.assertEqual((campaign.SOAK_RSS_RATIO, campaign.SOAK_RSS_SLACK_BYTES, campaign.SOAK_RSS_SLOPE_BYTES,
-                          campaign.SOAK_EXTRA_THREADS, campaign.SOAK_EXTRA_FILES), (1.10, 8 * 1024 * 1024, 2048, extra, extra))
+                          campaign.SOAK_RSS_MIN_SEGMENT, campaign.SOAK_EXTRA_THREADS, campaign.SOAK_EXTRA_FILES,
+                          campaign.SOAK_RSS_THREAD_BYTES),
+                         (1.10, 8 * 1024 * 1024, 2048, 200, extra, 2 * extra, 1024 * 1024 if extra else 0))
         # gRPC's iomgr timer threads only grow, by timing, so they have an absolute bound of their own.
         self.assertEqual((campaign.GRPC_TIMER_THREAD, campaign.SOAK_MAX_GRPC_TIMER_THREADS), ('grpc_global_tim', 4))
         for scale, rotations in ((campaign.soak_scale(), SOAK_ROTATIONS), (campaign.SOAK_HARNESS, 8)):
@@ -176,29 +286,47 @@ class WriterCampaignTests(unittest.TestCase):
                               runner=timed)
         verify_summary(plan, summary)
         self.assertEqual(observed.pop('long-rotations'), LONG_ROTATION_TIMEOUT_MS)
+        self.assertEqual(observed.pop('stream-age'), STREAM_AGE_TIMEOUTS_MS['nightly'])
         self.assertEqual(set(observed.values()), {PROFILES['nightly']['case_timeout_ms']})
 
     def test_execution_context_is_complete_and_type_sensitive(self):
-        context = dict(source='source', plugin={'version': 1}, scene={'version': 2}, reference={'python': 'test'}, sanitizer={})
+        context = dict(source='source', plugin={'version': 1}, scene={'version': 2}, reference={'python': 'test'},
+                       sanitizer={}, package=None)
         arguments = dict(source='source', candidate={'version': 1}, driver='plugin', reference={'python': 'test'}, sanitizer={})
         verify_context(context, **arguments)
         for key in context:
             changed = dict(context)
             del changed[key]
             with self.subTest(key=key), self.assertRaises(ValueError): verify_context(changed, **arguments)
+        # The staged package a package campaign records is part of its identity.
+        stage = {'path': '/stage', 'manifest_sha256': 'a' * 64}
+        verify_context(dict(context, package=stage), **arguments, package=stage)
+        for recorded, actual in ((None, stage), (stage, None), (stage, dict(stage, manifest_sha256='b' * 64))):
+            with self.subTest(recorded=recorded, actual=actual), self.assertRaises(ValueError):
+                verify_context(dict(context, package=recorded), **arguments, package=actual)
         context['plugin']['version'] = True
         with self.assertRaises(ValueError): verify_context(context, **arguments)
 
     def test_common_replay_requires_all_dependency_records(self):
         recipe = dict(source_fingerprint='a' * 64, plugin_identity={'version': 1},
-                      scene_transport_identity={'version': 1}, reference_identity={'python': 'test'}, sanitizer_runtime={})
+                      scene_transport_identity={'version': 1}, reference_identity={'python': 'test'}, sanitizer_runtime={},
+                      writer_fuzz_profile='ci', staged_package_identity=None)
         self.assertEqual(replay_context(recipe)['plugin'], {'version': 1})
-        for key in recipe:
+        for key in set(recipe) - {'writer_fuzz_profile', 'staged_package_identity'}:
             for mode in ('missing', 'null', 'wrong-type'):
                 changed = dict(recipe)
                 if mode == 'missing': del changed[key]
                 else: changed[key] = None if mode == 'null' else []
                 with self.subTest(key=key, mode=mode), self.assertRaises(ValueError): replay_context(changed)
+        # Only the package campaign records a stage, and it must.
+        stage = {'path': '/stage', 'manifest_sha256': 'a' * 64}
+        self.assertEqual(replay_context(dict(recipe, writer_fuzz_profile='package',
+                                             staged_package_identity=stage))['package'], stage)
+        for changed in ({key: value for key, value in recipe.items() if key != 'staged_package_identity'},
+                        dict(recipe, staged_package_identity=stage), dict(recipe, writer_fuzz_profile='package'),
+                        dict(recipe, writer_fuzz_profile='package', staged_package_identity={}),
+                        dict(recipe, writer_fuzz_profile='package', staged_package_identity=[])):
+            with self.subTest(changed=changed), self.assertRaises(ValueError): replay_context(changed)
 
     def run_campaign(self, injected=runner):
         plan = generate('ci', 42)
@@ -214,7 +342,7 @@ class WriterCampaignTests(unittest.TestCase):
         plan, result = self.run_campaign()
         verify_summary(plan, result)
         self.assertTrue(result['passed'] and result['complete'])
-        self.assertEqual(len({r['command'][-1] for r in result['results']}), 14)
+        self.assertEqual(len({r['command'][-1] for r in result['results']}), 23)
 
     def test_first_failure_stops_campaign_without_retry_or_passing_partial_coverage(self):
         for failure in ('crash', 'timeout', 'cleanup', 'truncated', 'missing', 'skipped', 'empty', 'other-case', 'budget'):
@@ -274,8 +402,9 @@ class WriterCampaignTests(unittest.TestCase):
 
     def test_actual_generated_workload_cannot_fall_back_to_fixture_defaults(self):
         for name in SCENARIOS:
-            case = next(case for case in generate('soak' if name == 'soak' else 'nightly', 42)['cases']
-                        if case['scenario'] == name)
+            profile = dict(soak='soak', **{'staged-samples': 'package',
+                                           'staged-samples-reduction': 'package'}).get(name, 'nightly')
+            case = next(case for case in generate(profile, 42)['cases'] if case['scenario'] == name)
             original = completed(case)
             self.assertTrue(case_passed(case, original))
             for key, value in (('seed', case['seed'] + 1), ('clients', case['clients'] + 1),

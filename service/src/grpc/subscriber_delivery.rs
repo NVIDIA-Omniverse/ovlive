@@ -27,10 +27,11 @@
 //!    `live_edit_subscriber_backlog_bytes`, sampled by the subscription task as
 //!    each live delivery finishes enqueuing, so the reader's offer path is
 //!    untouched.
-//! 2. **The response channel** — 32 data slots between the subscription task
-//!    and tonic (`grpc::subscribe`; a 33rd slot is reserved for the trailer).
-//!    The `enqueued` stage of `live_edit_subscriber_delivery_lag_seconds` is
-//!    the commit's age when its last message goes onto this channel. A send
+//! 2. **The response queue** — 32 data slots between the subscription task
+//!    and tonic (`grpc::response_queue`; a status slot apart from them is
+//!    reserved for the trailer). The `enqueued` stage of
+//!    `live_edit_subscriber_delivery_lag_seconds` is the commit's age when its
+//!    last message goes onto this queue. A send
 //!    that finds every data slot full is a stall ([`SendStall`]):
 //!    `live_edit_subscriber_send_stalls_total` counts it and
 //!    `live_edit_subscriber_send_wait_seconds` records how long it waited.
@@ -72,17 +73,18 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
 use tokio::time::{Instant, Sleep};
 use tonic::Status;
 
 use super::proto::SubscribeReadLayerResponse;
+use super::response_queue::{ResponseReceiver, ResponseSender};
 use crate::domain::time::now_micros;
 use crate::observability::metrics::{
     Metrics, SharedMetrics, DELIVERY_LAG_STAGE_ENQUEUED, DELIVERY_LAG_STAGE_TRANSPORT,
     SEND_PHASE_CATCHUP, SEND_PHASE_LIVE,
 };
 use crate::storage::notifications::BacklogDepth;
+use crate::storage::stream_mux::delivery_ledger::{PipelineEntry, QueuedPage, TakeClock};
 
 /// Observations a window holds before it is published at once: the live
 /// deliveries a [`DeliveryTally`] holds, and the stamped messages a
@@ -150,24 +152,42 @@ pub struct Outbound {
     /// The commit stamp (microseconds since the UNIX epoch) of the live
     /// delivery this item ends, or `None`.
     pub commit_end: Option<i64>,
+    /// What this item holds in the live-delivery and catch-up budgets'
+    /// accounting, released when the response stream takes it or when it is
+    /// dropped unsent (a cleared queue, a disconnect): a live delivery's
+    /// pipeline entry, on its last message, or a catch-up page's queued
+    /// bytes. `None` on every other item.
+    pub release: Option<OutboundRelease>,
 }
 
 impl Outbound {
-    /// An item no lag is measured for.
+    /// An item no lag is measured for, holding nothing.
     pub fn unstamped(item: Result<SubscribeReadLayerResponse, Status>) -> Self {
         Self {
             item,
             commit_end: None,
+            release: None,
         }
     }
+}
+
+/// What an [`Outbound`] holds until it is taken or dropped.
+#[derive(Debug)]
+pub enum OutboundRelease {
+    /// A live delivery's entry in the subscription's live-delivery pipeline
+    /// (`storage::stream_mux::delivery_ledger`), on the delivery's last
+    /// message.
+    Live(PipelineEntry),
+    /// A catch-up page's bytes counted in the response queue, for the
+    /// stalled-holder ending under catch-up memory contention.
+    CatchUpPage(QueuedPage),
 }
 
 /// What a send to the response channel carries, for the stall accounting's
 /// `phase` and for the [`Outbound`] stamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendKind {
-    /// Catch-up content or an ack, including a re-bootstrap's and a
-    /// rollback-mode in-window replay's. Never stamped.
+    /// Catch-up content or an ack, including a re-bootstrap's. Never stamped.
     CatchUp,
     /// A steady-state live delivery. `commit_end` is the stamp of the message
     /// that ends the delivery, and `None` on its earlier chunks.
@@ -213,12 +233,11 @@ pub(crate) struct SendStall<'a> {
 }
 
 impl<'a> SendStall<'a> {
-    /// `Some` only when `tx` has no free permit. On the response channel that
-    /// means its 32 data slots are full: the trailer's slot was reserved when
-    /// the channel was created, and `Sender::capacity` counts only permits
-    /// still available.
+    /// `Some` only when `tx` has no free data slot: its 32 data slots are
+    /// full. The status slot is apart from them, reserved when the queue was
+    /// made, and never counted here.
     pub(crate) fn begin<T>(
-        tx: &mpsc::Sender<T>,
+        tx: &ResponseSender<T>,
         metrics: &'a Metrics,
         phase: &'static str,
     ) -> Option<Self> {
@@ -241,10 +260,18 @@ impl Drop for SendStall<'_> {
     }
 }
 
-/// The response stream handed to tonic: the response channel's items,
+/// The response stream handed to tonic: the response queue's items,
 /// unchanged and in order, with the `transport` stage of
 /// `live_edit_subscriber_delivery_lag_seconds` measured as tonic's encoder
 /// polls each stamped item ([`Outbound::commit_end`]).
+///
+/// Each take is the moment an item leaves the subscription's accounting: its
+/// [`Outbound::release`] is dropped as it is yielded (a live delivery's entry
+/// leaves its live-delivery pipeline, a catch-up page leaves the queue's
+/// count), and the take is stamped on the subscription's hold, the clock the
+/// stalled catch-up holder ending reads. tonic encodes and drops an item in
+/// the poll that takes it, so its bytes — a relay copy's slice, a catch-up
+/// page and its budget share — are freed then.
 ///
 /// The lags go into a window that keeps only the largest, published as one
 /// observation at [`DELIVERY_TALLY_FLUSH_AT`] observations, on the stream's own
@@ -254,21 +281,30 @@ impl Drop for SendStall<'_> {
 /// hyper polls the stream again; the window is published then. Nothing is
 /// allocated per message.
 pub struct TransportLagStream {
-    rx: mpsc::Receiver<Outbound>,
+    rx: ResponseReceiver<Outbound>,
     metrics: SharedMetrics,
     window: MaxWindow,
     /// Created on the first window and re-armed for each later one.
     timer: Option<Pin<Box<Sleep>>>,
+    /// Stamps each take on the subscription's live-delivery hold, for the
+    /// stalled-holder ending; `None` outside a subscription.
+    takes: Option<TakeClock>,
 }
 
 impl TransportLagStream {
-    /// Wrap the response channel's receiver.
-    pub fn new(rx: mpsc::Receiver<Outbound>, metrics: SharedMetrics) -> Self {
+    /// Wrap the response queue's receiver; `takes` stamps each take on the
+    /// subscription's hold.
+    pub fn new(
+        rx: ResponseReceiver<Outbound>,
+        metrics: SharedMetrics,
+        takes: Option<TakeClock>,
+    ) -> Self {
         Self {
             rx,
             metrics,
             window: MaxWindow::default(),
             timer: None,
+            takes,
         }
     }
 
@@ -315,7 +351,18 @@ impl futures::Stream for TransportLagStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.rx.poll_recv(cx) {
-            Poll::Ready(Some(Outbound { item, commit_end })) => {
+            Poll::Ready(Some(Outbound {
+                item,
+                commit_end,
+                release,
+            })) => {
+                if let Some(takes) = &this.takes {
+                    takes.record_take();
+                }
+                // Taken: a live delivery's entry leaves its pipeline, a
+                // catch-up page leaves the queue's count. The message's own
+                // bytes are freed when tonic has encoded it.
+                drop(release);
                 if let Some(lag) = commit_end.and_then(|ts| commit_lag(now_micros(), ts)) {
                     this.observe(lag, cx);
                 }
@@ -1275,21 +1322,14 @@ mod tests {
 
     // ── SendStall ───────────────────────────────────────────────────────
 
-    /// A channel shaped like the response channel: 33 slots, one reserved for
-    /// the trailer before anything is sent, and `queued` data messages in it.
-    async fn response_channel(
-        queued: usize,
-    ) -> (mpsc::Sender<u8>, mpsc::Receiver<u8>, mpsc::OwnedPermit<u8>) {
-        let (tx, rx) = mpsc::channel(33);
-        let trailer = tx
-            .clone()
-            .reserve_owned()
-            .await
-            .expect("the receiver is alive");
+    /// A queue shaped like the response queue: 32 data slots and the status
+    /// slot apart from them, and `queued` data messages in it.
+    async fn response_channel(queued: usize) -> (ResponseSender<u8>, ResponseReceiver<u8>) {
+        let (tx, rx) = super::super::response_queue::response_queue(32);
         for _ in 0..queued {
-            tx.try_send(0).expect("a data slot is free");
+            tx.send(0).await.expect("a data slot is free");
         }
-        (tx, rx, trailer)
+        (tx, rx)
     }
 
     /// With all 32 data slots full, a send is a stall: counted the moment it
@@ -1298,7 +1338,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn send_stall_on_a_full_response_channel_counts_at_begin_and_records_its_wait_on_drop() {
         let metrics = crate::observability::metrics::metrics_scrape_only("stall");
-        let (tx, _rx, _trailer) = response_channel(32).await;
+        let (tx, _rx) = response_channel(32).await;
 
         let stall = SendStall::begin(&tx, &metrics, SEND_PHASE_LIVE)
             .expect("every data slot is full, so this send is a stall");
@@ -1336,7 +1376,7 @@ mod tests {
     #[tokio::test]
     async fn send_stall_with_a_free_data_slot_records_nothing() {
         let metrics = crate::observability::metrics::metrics_scrape_only("stall");
-        let (tx, _rx, _trailer) = response_channel(31).await;
+        let (tx, _rx) = response_channel(31).await;
 
         for phase in [SEND_PHASE_CATCHUP, SEND_PHASE_LIVE] {
             assert!(SendStall::begin(&tx, &metrics, phase).is_none(), "{phase}");
@@ -1363,17 +1403,18 @@ mod tests {
         Outbound {
             item: Ok(header(sequence_num)),
             commit_end: Some(commit_end),
+            release: None,
         }
     }
 
     fn transport_stream(
         capacity: usize,
-    ) -> (Arc<Metrics>, mpsc::Sender<Outbound>, TransportLagStream) {
+    ) -> (Arc<Metrics>, ResponseSender<Outbound>, TransportLagStream) {
         let metrics = Arc::new(crate::observability::metrics::metrics_scrape_only(
             "transport",
         ));
-        let (tx, rx) = mpsc::channel(capacity);
-        let stream = TransportLagStream::new(rx, Arc::clone(&metrics));
+        let (tx, rx) = super::super::response_queue::response_queue(capacity);
+        let stream = TransportLagStream::new(rx, Arc::clone(&metrics), None);
         (metrics, tx, stream)
     }
 

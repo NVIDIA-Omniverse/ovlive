@@ -197,6 +197,10 @@ impl CheckpointStore for CountingCheckpointStore {
         self.delegate.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
+    }
+
     async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
         self.delegate.delete_ext_blob(hash_hex).await
     }
@@ -357,11 +361,12 @@ async fn two_replicas_only_leader_writes_per_tick() {
     );
 
     // ── Wait for the leader lock to be acquired ─────────────────────────
-    // The lock value is the winning replica's `LeaderIdentity::lock_value()`
-    // (the shared LEADER_ACQUIRE_OR_REFRESH_SCRIPT used by GC + presence
-    // sweepers stores whatever lock value the acquiring process passes).
-    let lock_a = leader_a.lock_value();
-    let lock_b = leader_b.lock_value();
+    // The lock value is the winning replica's
+    // `LeaderIdentity::checkpoint_lock_value()` (the shared
+    // LEADER_ACQUIRE_OR_REFRESH_SCRIPT stores whatever lock value the
+    // acquiring process passes; the checkpoint loop passes its marked one).
+    let lock_a = leader_a.checkpoint_lock_value();
+    let lock_b = leader_b.checkpoint_lock_value();
     let lock_key = keys.checkpoint_leader_lock();
     let pool = tv.client().pool.clone();
     let lock_key_for_poll = lock_key.clone();
@@ -495,7 +500,7 @@ async fn two_replicas_only_leader_writes_per_tick() {
         assert!(
             join_outcome.is_ok(),
             "checkpoint loop join must complete within 5 s of cancellation; \
-             a stuck shutdown would have wedged main.rs's drain budget too",
+             a stuck loop would run the shutdown sequence's join out to its per-task budget too",
         );
         join_outcome
             .expect("timeout already checked")

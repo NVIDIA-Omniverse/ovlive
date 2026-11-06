@@ -198,6 +198,26 @@ pub fn sha256_to_hex(hash: &[u8; 32]) -> String {
 /// recovery mostly runs after), and no longer; no TTL closes that case.
 pub const SESSION_DELETED_MARKER_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// Lifetime, in milliseconds, of a [`KeySchema::session_meta_veto`]: 24 hours,
+/// fixed and deliberately not configurable (like
+/// [`CREATE_LAYER_CLAIM_VETOED_TTL_MS`]).
+///
+/// The veto only has to outlive every `CreateSession` metadata write for its
+/// id that can still land. A write fred has not handed to its write buffer by
+/// the time its caller gives up (at the Valkey command timeout, or at the RPC
+/// deadline) is never written, and one it has handed over reaches the socket
+/// within the 45 s bound on a written frame (the vendored fred's change 9,
+/// SDD §15.3). So every such write is on the wire within one call's deadline
+/// plus the command timeout plus 45 s; a day is orders of magnitude past
+/// that. The cost is one
+/// short string key per vetoed id, for a day: one per ghost a `ListSessions`
+/// walk removes, and one per `CreateSession` attempt whose metadata write
+/// failed.
+///
+/// TTL is the veto's only removal path: nothing deletes it, not even
+/// `DeleteSession`.
+pub const SESSION_META_VETO_TTL_MS: u64 = 86_400_000;
+
 /// Lifetime, in milliseconds, of a [`KeySchema::create_layer_operation`]
 /// record: 24 hours, fixed and deliberately not configurable.
 ///
@@ -351,13 +371,24 @@ impl KeySchema {
     /// Pattern: `le:{sid}:sess:deleted`
     ///
     /// `SessionRecoveryHook::try_recover_session` reads it before it fetches a
-    /// session checkpoint and treats a present marker as "no checkpoint". It
+    /// session checkpoint and treats a present marker as "no checkpoint", and
+    /// its record step (`scripts/session_record_restore.lua`) reads it again
+    /// atomically with its writes and writes nothing when it exists. It
     /// closes the window between a `DeleteSession` removing the session from
     /// the live store and that session's checkpoint tombstone landing at the
     /// adapter (`SessionCheckpointWriter::enqueue_session_checkpoint_delete`
     /// runs off the hot path). Without the marker a lookup in that window
     /// finds the session absent, fetches the not-yet-deleted checkpoint and
     /// restores the session that was just deleted.
+    ///
+    /// `scripts/session_meta_write.lua` checks it too and writes nothing when
+    /// it exists, so a re-send of a `CreateSession`'s metadata write that
+    /// landed does not bring back a session another call deleted since.
+    /// `scripts/session_meta_veto.lua` checks it as well: with the metadata
+    /// absent and the marker present it writes no veto and answers `DELETED`,
+    /// so a `CreateSession` settle learns its write landed before the delete
+    /// (and answers `OK`), and the `ListSessions` walk releases the id's
+    /// members as it does a vetoed id's.
     ///
     /// The two cancellers that find a session missing from the store
     /// (`acquire_session_cancel` and the `session_tokens` sweeper) read it too,
@@ -378,6 +409,31 @@ impl KeySchema {
     /// metadata is gone.
     pub fn session_deleted_marker(&self, session_id: &str) -> String {
         format!("{}{{{session_id}}}:sess:deleted", self.prefix)
+    }
+
+    /// Session metadata veto: a plain string key, `1`, written with a TTL of
+    /// [`SESSION_META_VETO_TTL_MS`] by `scripts/session_meta_veto.lua` only
+    /// while [`Self::session_meta`] and [`Self::session_deleted_marker`] are
+    /// both absent.
+    ///
+    /// Pattern: `le:{sid}:sess:veto`
+    ///
+    /// `scripts/session_meta_write.lua`, the only writer of a `CreateSession`'s
+    /// metadata, refuses an id that carries it. The `ListSessions` ghost walk
+    /// vetoes an id before it removes the id's index members, and
+    /// `CreateSession` vetoes an id to settle a metadata write whose reply it
+    /// did not get; because the veto and the write are each one atomic script
+    /// on this slot, exactly one of them wins. So a walk never removes the
+    /// members of a session a `CreateSession` completed, and no late metadata
+    /// write completes an id a walk or a settle gave up.
+    ///
+    /// Inert to session recovery and the DR restore, whose record step (Step B)
+    /// writes the metadata without reading it. Removed by its TTL only: no command deletes
+    /// it, `DeleteSession` included. Matches no `SCAN` pattern and is not
+    /// checkpointed. Carries the `{session_id}` hash tag, so it shares the
+    /// metadata's Cluster slot.
+    pub fn session_meta_veto(&self, session_id: &str) -> String {
+        format!("{}{{{session_id}}}:sess:veto", self.prefix)
     }
 
     /// Sessions-by-path index set.
@@ -417,6 +473,24 @@ impl KeySchema {
             self.prefix,
             hex_encode(layer_name)
         )
+    }
+
+    /// `SCAN MATCH` pattern covering every [`Self::layer_mapping`] key of every
+    /// session: `le:{*}:layer:*`.
+    ///
+    /// The braces are the literal Cluster hash tag, so the session glob goes
+    /// INSIDE them, as in [`Self::ext_meta_scan_pattern`]. Kept beside the
+    /// builder it must track: a change to either without the other produces a
+    /// scan that silently matches nothing. It does not match
+    /// [`Self::layers_index`] (`…:layers`, no `:` after `layer`).
+    ///
+    /// Keyless, so its callers issue it through a walk of every primary: the
+    /// orphan sweep's mapping walk through `orphan_sweep::scan_keyspace` (a
+    /// coverage walk), and the DR restore Job's planning read
+    /// (`storage::dr_job`) through an agreeing pair of DR Job walks
+    /// (`storage::scan_guard::collect_keyspace_agreed`).
+    pub fn layer_mapping_scan_pattern(&self) -> String {
+        format!("{}{{*}}:layer:*", self.prefix)
     }
 
     /// Layers-in-session index set.
@@ -594,6 +668,26 @@ impl KeySchema {
     /// Pattern: `le:{oid}:obj:hdr`
     pub fn obj_header(&self, object_id: &str) -> String {
         format!("{}{{{object_id}}}:obj:hdr", self.prefix)
+    }
+
+    /// `SCAN MATCH` pattern covering every [`Self::obj_header`] key:
+    /// `le:{*}:obj:hdr`.
+    ///
+    /// The braces are the literal Cluster hash tag, so the object-id glob goes
+    /// INSIDE them, as in [`Self::ext_meta_scan_pattern`]. Kept beside the
+    /// builder it must track, for that accessor's reason.
+    ///
+    /// Keyless, so its callers issue it through a walk of every primary:
+    /// through `orphan_sweep::scan_keyspace` (a coverage walk), the orphan
+    /// sweep's object walk and the checkpoint loop's tick
+    /// (`checkpoint::checkpointer`); through the serving-process-guarded
+    /// `storage::scan_guard::KeyspaceWalk::start`, the periodic
+    /// reference-count reconcile pass's object walk
+    /// (`storage::ext_reconcile`); and through agreeing pairs of DR Job walks
+    /// (`storage::scan_guard::KeyspaceWalk::start_job`), the restore Job's
+    /// recount's object walk and its planning read (`storage::dr_job`).
+    pub fn obj_header_scan_pattern(&self) -> String {
+        format!("{}{{*}}:obj:hdr", self.prefix)
     }
 
     /// Section hash.
@@ -1294,8 +1388,9 @@ impl KeySchema {
     /// the teardown runs anyway, and the carrier is the only record of the
     /// obligation and of the attempts that may have paid it. It outlives its
     /// object by design. No TTL either, for the same reason the three
-    /// `le:ckpt:{recon}:*` carriers have none: an expiry would silently drop the
-    /// only record of an owed reclamation.
+    /// `le:ckpt:{recon}` work-list carriers (`:orphans`, `:tomb`, `:dead`)
+    /// have none: an expiry would silently drop the only record of an owed
+    /// reclamation.
     ///
     /// The exclusion is argued in full at [`Self::object_cleanup_keys`].
     ///
@@ -1443,18 +1538,34 @@ impl KeySchema {
     /// External value metadata hash.
     /// Pattern: `le:ext:meta:{hash_hex}`
     ///
-    /// Three fields:
+    /// Four fields:
     /// - `ref_count`: live objects referencing the hash;
     /// - `last_store_ms`: the Valkey-side millisecond timestamp of the most
     ///   recent pre-flight store, written by `scripts/ext_store_value.lua` and
     ///   read by `storage::ext_reconcile` and the backup repair;
     /// - `backed_up_in`: the backup confirmation, `<store id>:<ms>`, present
     ///   only once a backup store answered that it holds the bytes; written by
-    ///   `scripts/ext_backup_confirm.lua` and cleared by the checkpoint collect
-    ///   (`storage::ext_backup`). Its absence means the copy is owed.
+    ///   `scripts/ext_backup_confirm.lua` and cleared by the checkpoint
+    ///   collect's post-delete step (`scripts/ext_backup_clear.lua`). Its
+    ///   absence means the copy is owed;
+    /// - `backup_cleared_ms`: the Valkey-side millisecond time at which the
+    ///   checkpoint collect last deleted the value's backup copy, written by
+    ///   `scripts/ext_backup_clear.lua` in the same run as its `backed_up_in`
+    ///   clear, on an existing meta only, and overwritten by later clears.
+    ///   `scripts/ext_backup_confirm.lua` reads it to decline a confirmation
+    ///   whose upload or existence check started before that delete
+    ///   (`storage::ext_backup`).
     ///
     /// The GC deletes the whole hash, every field with it, when it collects
     /// the value.
+    ///
+    /// Outside a DR restore a meta never exists without its data. The restore
+    /// Job's authoritative recount (`storage::ext_reconcile`,
+    /// `scripts/ext_ref_count_set.lua`) sets `ref_count` alone, and creates a
+    /// meta with only `ref_count` for a value whose bytes only the backup
+    /// store holds: a meta without data, which fetch-on-miss or an upload
+    /// fills and the GC deletes at 0 (the readers of that shape are audited
+    /// in `storage::ext_reconcile`'s module header).
     ///
     /// The hash-hex string is wrapped in `{…}` so that `ext_meta` and
     /// `ext_data` for the same content hash share a Valkey Cluster slot.
@@ -1949,10 +2060,10 @@ impl KeySchema {
     /// the pattern and [`Self::ext_meta`] are one shape and a change to either
     /// without the other produces a scan that silently matches nothing.
     ///
-    /// Keyless, so its caller must issue it through the `is_clustered` fan-out
-    /// dispatch (`orphan_sweep::scan_keyspace`); a bare `SCAN` walks one
-    /// primary's slot range and would report a fraction of the blob keyspace as
-    /// the whole of it.
+    /// Keyless, so its callers must walk every primary with it
+    /// (`orphan_sweep::scan_keyspace`); a bare `SCAN` walks one primary's slot
+    /// range and would report a fraction of the blob keyspace as the whole of
+    /// it.
     pub fn ext_meta_scan_pattern(&self) -> String {
         format!("{}ext:meta:{{*}}", self.prefix)
     }
@@ -1977,9 +2088,10 @@ impl KeySchema {
     ///
     /// A short-TTL (30 s) lock that gates the external-value GC loop, the
     /// orphan sweep, the reference-count reconciler
-    /// (`storage::ext_reconcile`) and the external-value backup repair
-    /// (`checkpoint::ext_backup_repair`), so that normally one replica runs them at a
-    /// time (two can briefly overlap after a lock takeover; see below). The
+    /// (`storage::ext_reconcile`), the external-value backup repair
+    /// (`checkpoint::ext_backup_repair`) and the checkpoint clean-up
+    /// (`checkpoint::cleanup`, b.g65), so that normally one replica runs them at
+    /// a time (two can briefly overlap after a lock takeover; see below). The
     /// previous behavior (every replica sweeps every tick) caused N× load on
     /// Valkey from the SCAN+HGETALL passes that the orphan sweeper performs;
     /// the lock normally confines that work to a single replica.
@@ -1991,7 +2103,7 @@ impl KeySchema {
     /// `LeaderIdentity::gc_lock_value()` —
     /// `le-gc/<v>|<service_label>:<instance>`, unique per process, with the
     /// GC protocol version `v` (`leader_lease::GC_LEADER_PROTOCOL_VERSION`) —
-    /// and the four consumers in one process share that identity so they
+    /// and the five consumers in one process share that identity so they
     /// ride one leadership. Every build before the marker (0.1.0 through
     /// 0.2.0-rc.48) writes a bare value (`service_label:instance`, or the bare
     /// label in 0.1.0) through the plain CAS, which claims only an absent key
@@ -2016,7 +2128,8 @@ impl KeySchema {
     /// paused once it has made no progress for
     /// `external_values::GC_PROGRESS_STALL_AFTER`, 20 s;
     /// `external_values::spawn_gc_task`), and again before each GC,
-    /// orphan-sweep, reconciler and backup-repair pass. So the leader refreshes the key
+    /// orphan-sweep, reconciler, backup-repair and checkpoint clean-up pass. So
+    /// the leader refreshes the key
     /// mid-pass however long a progressing pass runs, a peer takes it over
     /// when the leader's refreshes stop (its loop died or stalled included),
     /// and the key never lapses while any process of this build with a
@@ -2036,13 +2149,17 @@ impl KeySchema {
     /// can lead again (a rollback).
     ///
     /// `le:checkpoint:leader` and `le:presence:sweeper:leader` keep the plain
-    /// CAS and unmarked value: the checkpoint lock is a correctness lock a
+    /// CAS with no takeover: the checkpoint lock is a correctness lock a
     /// takeover would break, and the presence sweeper renews mid-pass through
-    /// `LeaderLease`.
+    /// `LeaderLease`. The presence sweeper's value is unmarked; the checkpoint
+    /// lock's carries its own marker, `le-ckpt/<v>|…`
+    /// ([`Self::checkpoint_leader_lock`]), which the plain CAS compares like
+    /// any other value.
     ///
-    /// Four consumers, four independent intervals, one lease — the same shape
+    /// Five consumers, five independent intervals, one lease — the same shape
     /// SDD §22.7.2 argues for. The 30 s TTL is shorter than the orphan sweep's,
-    /// the reconciler's and the backup repair's cadences, and although the refresh ticker keeps a
+    /// the reconciler's, the backup repair's and the checkpoint clean-up's
+    /// cadences, and although the refresh ticker keeps a
     /// running pass's key alive while the holder's GC loop runs and makes
     /// progress, no lease can exclude a pass whose holder's refreshes stopped
     /// — they no longer reach the store, or the holder's GC loop died or
@@ -2058,7 +2175,13 @@ impl KeySchema {
     /// members are deterministic strings (so a second leader's `SADD` collapses
     /// into the first's). The backup repair is too: it never deletes, and a
     /// second leader's existence checks, uploads of content-addressed bytes and
-    /// stamp-guarded confirmations only repeat the first's.
+    /// stamp-guarded confirmations only repeat the first's. The checkpoint
+    /// clean-up is too: the collect's and the orphan reap's deletes are each
+    /// licensed by their own `{recon}` script, the dead-object reap's by its
+    /// liveness re-probe of the object (and its retire of a restored object
+    /// by a withdrawal of that object's announcements, which retires nothing
+    /// when it fails), deletes are idempotent, and its tombstones are
+    /// `ZADD NX`, so a second leader costs only load.
     ///
     /// Deliberately NOT hash-tagged with `{gc}`. The lock is read/written
     /// by exactly one command at a time and shares no transaction with
@@ -2075,6 +2198,59 @@ impl KeySchema {
     /// Pattern: `le:counter:object_id`
     pub fn counter_object_id(&self) -> String {
         format!("{}counter:object_id", self.prefix)
+    }
+
+    // ── Disaster recovery (hash tag: the object-id counter key) ─────────
+
+    /// The fleet hold marker (SDD SR-4.1): a HASH whose existence means the
+    /// fleet is held (`crate::dr::hold`).
+    ///
+    /// Pattern: `le:dr:held:{le:counter:object_id}`
+    ///
+    /// Its hash tag is the whole [`Self::counter_object_id`] key. That key
+    /// carries no tag of its own, so Valkey hashes all of it, and the marker
+    /// lands in the counter's Cluster slot. The hold poll's script
+    /// (`scripts/dr_hold_poll.lua`) runs on that slot, so it can read the
+    /// counter beside the marker in one atomic step; today it reads only the
+    /// marker.
+    ///
+    /// Fields (`storage::dr_hold::MARKER_FIELDS`):
+    /// - `incident` — the incident id an operator Job must name;
+    /// - `reason` — why the fleet is held;
+    /// - `evidence` — what the detector saw;
+    /// - `detected_at_ms` — the store's clock (`TIME`) when the hold was
+    ///   written, in milliseconds, never a pod's clock;
+    /// - `detected_by` — which process or detector wrote it.
+    ///
+    /// No TTL. Its only deleter is the restore or accept-loss Job's un-hold
+    /// script, `scripts/dr_unhold.lua` (through `storage::dr_hold::unhold`),
+    /// which deletes it atomically with its counter write (SR-4.2); a keyspace loss
+    /// can remove it too. No code in the service writes it yet; tests write it
+    /// through `storage::test_support::write_hold_marker` and remove it
+    /// through the test-only `storage::test_support::remove_hold_marker`.
+    pub fn dr_hold_marker(&self) -> String {
+        format!("{}dr:held:{{{}}}", self.prefix, self.counter_object_id())
+    }
+
+    /// The disaster recovery Job lease (SDD SR-9.1): a STRING whose value is
+    /// the holding Job's `LeaderIdentity::lock_value()`, so at most one
+    /// restore or accept-loss Job runs against the store at a time
+    /// (`crate::dr::job`).
+    ///
+    /// Pattern: `le:dr:job:{le:counter:object_id}`
+    ///
+    /// In the object-id counter's slot, beside [`Self::dr_hold_marker`], like
+    /// it hash-tagged with the whole counter key.
+    ///
+    /// Taken with `external_values::try_acquire_leader_lock` (the shared
+    /// acquire-or-refresh script) with a 30 s TTL, refreshed every 10 s by the
+    /// Job for its whole life with `refresh_leader_lock_if_held`, and deleted
+    /// on every exit after it was taken with `release_leader_lock_if_held`
+    /// (compare-and-delete). A Job that dies without releasing it leaves it to
+    /// lapse within the TTL. It is the one key a Job writes before its quiet
+    /// period ends: lease bookkeeping, not store data.
+    pub fn dr_job_lease(&self) -> String {
+        format!("{}dr:job:{{{}}}", self.prefix, self.counter_object_id())
     }
 
     // ── Presence keys (hash tag: {session_id}) ──────────────────────────
@@ -2207,9 +2383,20 @@ impl KeySchema {
     /// Checkpointer leader-election lock (SDD SR-2.1). A short-TTL (30 s)
     /// lock that gates the periodic checkpoint loop so only one replica writes
     /// a checkpoint per tick. Acquired via `try_acquire_leader_lock` once per
-    /// tick and renewed mid-tick through `storage::leader_lease::LeaderLease`;
-    /// its value is the holder's `LeaderIdentity::lock_value()`
-    /// (`service_label:instance`).
+    /// tick and renewed mid-tick through `storage::leader_lease::LeaderLease`.
+    ///
+    /// Its value is the holder's marked `LeaderIdentity::checkpoint_lock_value()`
+    /// (`le-ckpt/<v>|service_label:instance`, b.g65), still taken and refreshed
+    /// by the plain CAS with no takeover: an older build writes the bare
+    /// `service_label:instance`, so its equality CAS never matches a marked
+    /// value and it leads backups again only once the key lapses. The
+    /// checkpoint clean-up (`checkpoint::cleanup`) does not take this lock — it
+    /// runs on [`Self::gc_leader_lock`], so the backup loop never pauses for
+    /// it — but it reads this key at its pass start, at each phase start and
+    /// at each drain iteration, and runs only
+    /// while the value is marked with version 1 or more: an older build's
+    /// backup writers do not re-arm before their PUTs, which the clean-up's
+    /// delete rule depends on.
     ///
     /// Deliberately distinct from `gc_leader_lock()` and
     /// `presence_sweeper_leader_lock()`: each of the three maintenance loops
@@ -2247,6 +2434,22 @@ impl KeySchema {
     /// and the grace is a multiple of it. First sighting only registers; the
     /// second acts.
     ///
+    /// A publish heals its own candidate (b.g65): the re-arm every layer
+    /// publish runs before its adapter PUT (`scripts/recon_ext_rearm.lua`)
+    /// removes the stem's member here, unless it refuses that publish. Before
+    /// the orphan reap reads a claimed
+    /// stem's sidecar, its commit (`scripts/recon_orphan_commit.lua`) licenses
+    /// the reap only while the member is still here and announces the stem on
+    /// [`Self::checkpoint_reconcile_deleting`] in the same run, so a publish and
+    /// a reap of the same stem never both proceed.
+    ///
+    /// The orphan phase re-dates a member it claimed and could not finish for a
+    /// reason of its own to the current Valkey `TIME` (b.g65, D4;
+    /// `scripts/recon_redate.lua`, `ZADD XX GT`), so a run of candidates that
+    /// keep failing cannot hold the oldest-first claim's head. Later only: a
+    /// re-dated member is claimable later than its first sighting allows,
+    /// never earlier, and `XX` never re-creates a member a publish removed.
+    ///
     /// Hash-tagged `{recon}` so it shares a Cluster slot with
     /// [`Self::checkpoint_reconcile_tombstones`] — the pass touches both within
     /// one logical operation, and a future script that spans them stays
@@ -2281,6 +2484,15 @@ impl KeySchema {
     /// first recording its hashes is the unrecoverable direction. That
     /// asymmetry is why the ZADD-before-delete ordering is load-bearing.
     ///
+    /// The score is set by the first recording (`ZADD NX`) and afterwards only
+    /// ever moved **later**, never earlier: the collect re-dates a member it
+    /// defers (`ZADD XX GT` at the Valkey clock) when the value is still live
+    /// in Valkey or a writer re-armed it since the collect's snapshot, so the
+    /// claim serves the members behind it. A later score reads to any reader,
+    /// an older build's included, as a later first sighting, which only delays
+    /// a delete. Writers never re-score it: a publish naming a tombstoned hash
+    /// records its re-arm on [`Self::checkpoint_reconcile_rearm`] instead.
+    ///
     /// Shares the `{recon}` hash tag with
     /// [`Self::checkpoint_reconcile_orphans`] (see there).
     ///
@@ -2292,7 +2504,9 @@ impl KeySchema {
     /// Checkpoint-store dead-object ZSET (b.vn6). Sorted Set whose members are
     /// decimal `object_id` strings and whose score is the **Valkey-side**
     /// millisecond timestamp at which that object was first observed to have
-    /// DIED — i.e. the moment a delete path finished retiring it.
+    /// DIED — i.e. the moment a delete path killed it (`DeleteLayer`'s mapping
+    /// `DEL`, or the start of the overwrite clean-up once the overwrite has
+    /// unmapped it), or a refused cursor stamp observed its header gone.
     ///
     /// # Why it exists
     ///
@@ -2302,8 +2516,8 @@ impl KeySchema {
     /// layer that is still being checkpointed, and the orphan sweep only reaps
     /// *incomplete* stems, so a dead object's complete generations are never
     /// revisited by anything. This ZSET is the durable work list that closes
-    /// that leak — the reconciliation pass drains it, reaping every generation
-    /// of every object on it.
+    /// that leak — the checkpoint clean-up's dead-object phase drains it,
+    /// reaping every generation of every object on it.
     ///
     /// # The DR-safety predicate — read this before adding a producer
     ///
@@ -2313,9 +2527,22 @@ impl KeySchema {
     /// The producers, exhaustively — all of them route through
     /// `recon_register`, and all of them hold positive evidence of death:
     ///
-    /// - **The two delete paths.** `LayerStore::delete_layer_inner` (the
-    ///   DeleteLayer RPC) and the CreateLayer-overwrite cleanup, each at its
-    ///   success-only exit: the layer was deleted, by this call, just now.
+    /// - **The two delete paths**, each at the act that kills the object, with
+    ///   one more attempt later if that one did not land (b.g65):
+    ///   `LayerStore::delete_layer_inner` (the DeleteLayer RPC and the
+    ///   DeleteSession cascade) right after its unmap — its commit
+    ///   point: the layer was deleted, by this call, just now — and again at
+    ///   its success exit; and the CreateLayer-overwrite cleanup at its start,
+    ///   once the overwrite has unmapped the old object, and again after its
+    ///   teardown. So a delete stopped after its unmap (a failed step, a store
+    ///   refusal, the RPC deadline, a client cancel) still leaves the object
+    ///   registered. Registering before the header goes is safe because the
+    ///   dead-object phase defers a member whose header still stands unless
+    ///   its layer mapping names it (`superseded=1`, or no mapping names it).
+    /// - **Not the orphan sweep.** It retires objects on absence (no mapping,
+    ///   no create claim, no deletion marker), and that state cannot be told
+    ///   apart from a lost `{session_id}` slot whose backups lazy session
+    ///   recovery restores from, so it registers nothing.
     /// - **The four refused-stamp arms** (b.vn6). The checkpoint loop's periodic
     ///   snapshot, tail capture and chain-collapse re-base, plus the
     ///   creation-time base bootstrap. Each has just PUT a durable generation
@@ -2325,6 +2552,37 @@ impl KeySchema {
     ///   of the same quality as the delete paths', from the other side of the
     ///   race, and it is what re-arms a member the pass may already have retired
     ///   under a generation that landed after the sweep looked.
+    /// - **The restore Job's completion of an abandoned `DeleteSession`**
+    ///   (`dr::job::execute`). A session whose deletion marker
+    ///   (`le:{sid}:sess:deleted`) survived a state loss was deleted, so its
+    ///   surviving objects are dead; the marker is the evidence. The Job
+    ///   registers them before it wipes and unmaps them, so a Job killed
+    ///   after its unmap, whose re-run no longer finds them, has already
+    ///   registered them. Only with a backup store: without one there is
+    ///   nothing to reclaim.
+    /// - **The accept-loss Job's discards** (`dr::job::execute::discard`): a
+    ///   lost layer (no restorable backup and no survivor, or a surviving
+    ///   mapping to an object already on this set) and every surviving object
+    ///   of a lost session (no record, no deletion marker, no usable session
+    ///   backup). The evidence is the operator's confirmed accept-loss for
+    ///   the incident (`--confirm discard-lost-data`) together with the Job's
+    ///   own finding, at or after `T_safe` and behind the list-route canary
+    ///   and the contradiction check, that the object can never be mapped
+    ///   again. The one deliberate exception to "absence observed at a
+    ///   distance is not evidence" below: under the operator's second
+    ///   `--confirm discard-unconfirmed-data` (option E), a layer or session
+    ///   whose backup read ended in an error rather than an absence is
+    ///   registered too, the second confirm standing in for the finding.
+    ///   Registered before the wipe and the unmap, as above — the object of
+    ///   a lost layer with no survivor only after the Job read its header
+    ///   and found it not complete — and **on every adapter**, the disabled
+    ///   and in-memory ones included: there the members are never drained (a
+    ///   bounded leak), but the Job's counter floor reads this set, so a lost
+    ///   object's id is never issued again. Unreferenced listed backups are
+    ///   never registered, nor is a
+    ///   lost layer whose only backups are over the per-delta entry limit
+    ///   (it is only unmapped, its backups kept; the listed term of the
+    ///   counter floor covers its id).
     ///
     /// Note the shape a new producer must have: *an act or an atomic read that
     /// established the layer is gone*. Absence observed at a distance is not
@@ -2342,10 +2600,35 @@ impl KeySchema {
     /// is lost in a wipe, the pending reaps are simply forgotten. That is a
     /// storage leak, never a loss.
     ///
+    /// # Who removes members
+    ///
+    /// Two removers, both through `recon_retire`:
+    ///
+    /// - **The checkpoint clean-up's dead-object phase**, its consumer, once
+    ///   it has reaped every generation of the object, found none, or found
+    ///   the object restored.
+    /// - **The accept-loss Job** (`dr::job::execute::discard`, D2), only a
+    ///   member its own run added, and only at an AL9 stop: when the header
+    ///   re-read before a wipe finds a lost layer's object complete, the Job
+    ///   removes every member that run's `ZADD NX` added and has not wiped,
+    ///   that object included, before it exits 1. "Added" is read, not taken
+    ///   from the script's reply: the Job reads which members the set lacks
+    ///   right before its `ZADD NX` (`recon_absent`), since a register run
+    ///   twice (a re-send, a retried step) answers "present" for a member its
+    ///   first run added. So a member already on the set then — another
+    ///   producer's, such as a `DeleteLayer`'s — is never removed; one another
+    ///   producer adds between that read and the `ZADD NX` is removed with the
+    ///   Job's own. That is the leak direction (its reclamation is lost, or
+    ///   redone by the producer's later attempt); keeping a member the Job
+    ///   added is the loss direction, since the retry wipes a registered
+    ///   object whose mapping survives with no header read.
+    ///
     /// Same `ZADD NX` first-observation scoring as the two sibling `{recon}`
-    /// ZSETs — the score is pinned by the first writer and never refreshed —
-    /// and, like them, **no TTL**: an expiry would silently drop reclamation
-    /// work whose only record this is.
+    /// work lists — the score is pinned by the first writer and never
+    /// refreshed, except that the dead-object phase re-dates a member it
+    /// defers for a member-specific reason (`ZADD XX GT`, later only) so the
+    /// members behind it are reached — and, like them, **no TTL**: an expiry
+    /// would silently drop reclamation work whose only record this is.
     ///
     /// Shares the `{recon}` hash tag with
     /// [`Self::checkpoint_reconcile_orphans`] /
@@ -2354,6 +2637,108 @@ impl KeySchema {
     /// Pattern: `le:ckpt:{recon}:dead`
     pub fn checkpoint_reconcile_dead(&self) -> String {
         format!("{}ckpt:{{recon}}:dead", self.prefix)
+    }
+
+    /// Checkpoint-store writer re-arm ZSET (b.g65). Sorted Set whose members
+    /// are ext-blob `hash_hex` strings and whose score is the **Valkey-side**
+    /// millisecond time a backup writer last named the hash while it was a
+    /// member of [`Self::checkpoint_reconcile_tombstones`].
+    ///
+    /// Written by `scripts/recon_ext_rearm.lua` immediately before every
+    /// backup writer's adapter PUT — each base publish
+    /// (`checkpoint::put_guard`), the backup repair's re-send and the
+    /// ext-mirror worker's upload — with `ZADD GT` and only for hashes in the
+    /// tombstone ZSET. It records the re-arm beside the
+    /// tombstone rather than re-scoring it: an active layer publishes a base
+    /// about once a minute, inside one grace window, so re-scoring would keep
+    /// every tombstoned hash of every active layer unclaimable forever.
+    ///
+    /// Read by the collect's delete-time fence (`scripts/recon_ext_commit.lua`):
+    /// a hash re-armed after the collect's snapshot threshold is not deleted,
+    /// because its sidecar may be missing from the snapshot. Read again by the
+    /// settle (`scripts/recon_ext_settle.lua`), which keeps a deleted hash's
+    /// tombstone when a re-arm landed since the threshold.
+    ///
+    /// Unlike the three work lists it carries a TTL: `PEXPIRE` 24 h on every
+    /// `ZADD`, and the commit trims entries older than two grace windows. Its
+    /// entries are evidence against a delete, not owed work, so losing one
+    /// after a day with no writes loses nothing: no writer's reliance window
+    /// and no collect's snapshot spans that long.
+    ///
+    /// Pattern: `le:ckpt:{recon}:rearm`
+    pub fn checkpoint_reconcile_rearm(&self) -> String {
+        format!("{}ckpt:{{recon}}:rearm", self.prefix)
+    }
+
+    /// Checkpoint-store collected-hash ZSET (b.g65). Sorted Set whose members
+    /// are ext-blob `hash_hex` strings and whose score is the **Valkey-side**
+    /// millisecond time the collect licensed (and then settled) the delete of
+    /// that hash's backup copy.
+    ///
+    /// Written by the collect's delete-time fence
+    /// (`scripts/recon_ext_commit.lua`) **before** the adapter DELETE, and
+    /// re-dated by the settle (`scripts/recon_ext_settle.lua`) to the settle
+    /// time once the delete landed and the value was not live in Valkey; an
+    /// entry is removed when the collect re-puts the value from Valkey (the
+    /// heal). Read by every writer's re-arm (`scripts/recon_ext_rearm.lua`):
+    /// a publish, a backup-repair re-send or a mirror upload naming a hash
+    /// collected inside its own reliance window does not PUT, because its
+    /// copy or its sidecar may have been deleted under it. Read by the settle
+    /// for the heal of a kept hash whose earlier delete was never settled.
+    ///
+    /// Carries a TTL: `PEXPIRE` 24 h whenever the commit adds an entry (the
+    /// settle's `ZADD XX` re-date only moves an existing entry and sets none),
+    /// and the commit trims entries older than 24 h. A writer whose reliance
+    /// window is longer than that refuses rather than guess.
+    ///
+    /// Pattern: `le:ckpt:{recon}:collected`
+    pub fn checkpoint_reconcile_collected(&self) -> String {
+        format!("{}ckpt:{{recon}}:collected", self.prefix)
+    }
+
+    /// Checkpoint-store deletion-announcement ZSET (b.g65). Sorted Set whose
+    /// members are generation stems in the `le:ckpt:{recon}:orphans` spelling
+    /// (`<object_id>.<snap_seq>` for a base, `<object_id>.<to_seq>.tail` for a
+    /// tail) and whose score is the **Valkey-side** millisecond time a deleter
+    /// announced it was about to delete that stem's artifacts.
+    ///
+    /// Written by every production deleter of a base generation before it
+    /// deletes the generation's ext-refs sidecar, in the same script that
+    /// records the sidecar's hashes on [`Self::checkpoint_reconcile_tombstones`]
+    /// (`scripts/recon_tomb_record.lua`: the retention prune, the dead-object
+    /// reap and the base bootstrap's dead-base reap), and by the orphan reap's
+    /// commit (`scripts/recon_orphan_commit.lua`).
+    ///
+    /// Read by the collect: a sidecar its live-set walk listed and then read
+    /// absent is explained, and skipped, when its stem is announced here. Read
+    /// by every publish's re-arm (`scripts/recon_ext_rearm.lua`): a publish of
+    /// a stem announced within the last grace window does not PUT, and every
+    /// publish the re-arm does not refuse removes a stale announcement of its
+    /// own stem, so an old announcement never explains away the absence of a
+    /// new copy. The
+    /// dead-object reap announces a generation only after its pre-delete
+    /// liveness re-probe found the object dead, so a generation that re-probe
+    /// keeps is never announced. A base whose delete then fails stays
+    /// announced until the object's next re-probe, at most one pass later;
+    /// when that re-probe finds the object restored, the reap removes every
+    /// announcement of the object here before it retires the object — a
+    /// `ZSCAN … MATCH "<object_id>.*"` filtered to that object id, then a
+    /// plain `ZREM` — and retires nothing if either fails. With one clean-up
+    /// runner that bound is absolute. Two runners (only while `le:gc:leader`
+    /// changes hands) can leave a kept base announced until a later
+    /// announcement's trim or the key's expiry, when a restore lands inside
+    /// one runner's single round trip between its probe and its announcement
+    /// and that runner's delete then fails: part of the accepted
+    /// probe-to-delete restore race, whose other outcome deletes the restored
+    /// base.
+    ///
+    /// Carries a TTL: `PEXPIRE` 24 h on every `ZADD`, and its writers trim
+    /// entries older than two grace windows. An announcement is evidence for
+    /// one pass, not owed work.
+    ///
+    /// Pattern: `le:ckpt:{recon}:deleting`
+    pub fn checkpoint_reconcile_deleting(&self) -> String {
+        format!("{}ckpt:{{recon}}:deleting", self.prefix)
     }
 
     // ── Sorted set member formatters ──────────────────────────────────
@@ -3410,6 +3795,52 @@ mod tests {
         );
     }
 
+    /// The layer-mapping SCAN pattern puts its glob INSIDE the hash-tag braces
+    /// and matches what [`KeySchema::layer_mapping`] builds, and not the
+    /// session's layers index beside it.
+    #[test]
+    fn the_layer_mapping_scan_pattern_matches_the_keys_layer_mapping_builds() {
+        let ks = KeySchema::default();
+        let pattern = ks.layer_mapping_scan_pattern();
+        assert_eq!(pattern, "le:{*}:layer:*");
+
+        let key = ks.layer_mapping("s-1", "root.usda");
+        let (head, tail) = pattern
+            .split_once("{*}")
+            .expect("the pattern must carry the session glob inside the braces");
+        let tail = tail
+            .strip_suffix('*')
+            .expect("the pattern must end in the layer-name glob");
+        assert!(
+            key.starts_with(head) && key.contains(&format!("}}{tail}")),
+            "a real mapping key ({key}) must sit inside the pattern's literal head ({head:?}) \
+             and middle ({tail:?}), or the walks enumerate no mapping"
+        );
+        assert!(
+            !ks.layers_index("s-1").contains(tail),
+            "the layers index must not match the mapping pattern"
+        );
+    }
+
+    /// The object-header SCAN pattern puts its glob INSIDE the hash-tag braces
+    /// and matches what [`KeySchema::obj_header`] builds.
+    #[test]
+    fn the_obj_header_scan_pattern_matches_the_keys_obj_header_builds() {
+        let ks = KeySchema::default();
+        let pattern = ks.obj_header_scan_pattern();
+        assert_eq!(pattern, "le:{*}:obj:hdr");
+
+        let key = ks.obj_header("42");
+        let (head, tail) = pattern
+            .split_once('*')
+            .expect("the pattern must carry exactly one glob");
+        assert!(
+            key.starts_with(head) && key.ends_with(tail),
+            "a real header key ({key}) must sit inside the pattern's literal head ({head:?}) and \
+             tail ({tail:?}), or the walks enumerate no object"
+        );
+    }
+
     /// `ext_meta_hash_hex` is the strict inverse of `ext_meta`, and rejects
     /// anything else (b.yda).
     ///
@@ -3649,6 +4080,57 @@ mod tests {
     fn counter_object_id_returns_expected_key() {
         let ks = KeySchema::default();
         assert_eq!(ks.counter_object_id(), "le:counter:object_id");
+    }
+
+    /// The hold marker is tagged with the whole counter key, so it computes
+    /// the counter's Cluster slot under every prefix: the hold poll reads both
+    /// in one script on that slot (SDD SR-4.1). Slots are computed with fred's
+    /// own `redis_keyslot`, the function its router uses.
+    #[test]
+    fn dr_hold_marker_shares_the_object_id_counters_slot() {
+        let ks = KeySchema::default();
+        assert_eq!(ks.dr_hold_marker(), "le:dr:held:{le:counter:object_id}");
+        for prefix in [
+            "le:",
+            "test_abc:",
+            "test_0f3c9a2e-1b7d-4c55-9e0a-6d2b8f71c4a3:",
+        ] {
+            let ks = KeySchema::new(prefix);
+            let marker = ks.dr_hold_marker();
+            let counter = ks.counter_object_id();
+            assert!(marker.starts_with(prefix), "{marker} keeps the prefix");
+            assert_eq!(
+                fred::util::redis_keyslot(marker.as_bytes()),
+                fred::util::redis_keyslot(counter.as_bytes()),
+                "{marker} must share {counter}'s slot"
+            );
+        }
+        // Control: an untagged marker name would land elsewhere, so the
+        // equality above is the tag's doing.
+        let ks = KeySchema::default();
+        assert_ne!(
+            fred::util::redis_keyslot(b"le:dr:held:le:counter:object_id"),
+            fred::util::redis_keyslot(ks.counter_object_id().as_bytes()),
+        );
+    }
+
+    /// The DR Job lease is tagged like the hold marker, so it lands in the
+    /// counter's slot under every prefix, and it is a key of its own.
+    #[test]
+    fn dr_job_lease_shares_the_object_id_counters_slot() {
+        let ks = KeySchema::default();
+        assert_eq!(ks.dr_job_lease(), "le:dr:job:{le:counter:object_id}");
+        for prefix in ["le:", "test_abc:"] {
+            let ks = KeySchema::new(prefix);
+            let lease = ks.dr_job_lease();
+            assert!(lease.starts_with(prefix), "{lease} keeps the prefix");
+            assert_ne!(lease, ks.dr_hold_marker());
+            assert_eq!(
+                fred::util::redis_keyslot(lease.as_bytes()),
+                fred::util::redis_keyslot(ks.counter_object_id().as_bytes()),
+                "{lease} must share the counter's slot"
+            );
+        }
     }
 
     #[test]
@@ -4146,6 +4628,64 @@ mod tests {
     fn session_deleted_marker_ttl_is_seven_days() {
         assert_eq!(SESSION_DELETED_MARKER_TTL_SECS, 7 * 24 * 60 * 60);
         const _: () = assert!(SESSION_DELETED_MARKER_TTL_SECS >= 24 * 60 * 60);
+    }
+
+    /// b.2tu: the metadata veto is `<prefix>{sid}:sess:veto`. It carries the
+    /// session's hash tag — `session_meta_veto.lua` and
+    /// `session_meta_write.lua` each read it beside the metadata hash in one
+    /// script, so the two must share a Cluster slot — and it matches none of
+    /// the `SCAN` patterns the sweepers and the checkpoint loop walk (it is
+    /// removed by TTL only; a scanner that matched it would misread it).
+    ///
+    /// Ids shaped like the patterns' own segments are the adversarial case.
+    #[test]
+    fn session_meta_veto_carries_the_session_tag_and_matches_no_scan_pattern() {
+        let ks = KeySchema::default();
+        assert_eq!(ks.session_meta_veto("s1"), "le:{s1}:sess:veto");
+        assert_eq!(
+            KeySchema::new("test_abc:").session_meta_veto("s1"),
+            "test_abc:{s1}:sess:veto"
+        );
+
+        let ks = KeySchema::new("test_x:");
+        let prefix = ks.prefix();
+        let patterns = [
+            ks.layer_mapping_scan_pattern(),
+            ks.obj_header_scan_pattern(),
+            format!("{prefix}{{*}}:obj:extret"),
+            ks.ext_meta_scan_pattern(),
+        ];
+        // Control: each pattern matches the key family it exists for, so the
+        // negative assertions below cannot pass on a broken matcher.
+        for (pattern, key) in patterns.iter().zip([
+            ks.layer_mapping("s1", "root"),
+            ks.obj_header("42"),
+            ks.obj_ext_retire_carrier("42"),
+            ks.ext_meta("abcdef01"),
+        ]) {
+            assert!(
+                scan_glob_matches(pattern, &key),
+                "control: {pattern} must match {key}"
+            );
+        }
+
+        for sid in ["s1", "layer", "obj", "x:obj:hdr", "ext:meta", "42"] {
+            let veto = ks.session_meta_veto(sid);
+            assert_eq!(
+                fred::util::redis_keyslot(veto.as_bytes()),
+                fred::util::redis_keyslot(ks.session_meta(sid).as_bytes()),
+                "{veto} must share a slot with the metadata it vetoes"
+            );
+            assert_eq!(hash_tag_of(&veto), hash_tag_of(&ks.session_meta(sid)));
+            assert_ne!(veto, ks.session_meta(sid));
+            assert_ne!(veto, ks.session_deleted_marker(sid));
+            for pattern in &patterns {
+                assert!(
+                    !scan_glob_matches(pattern, &veto),
+                    "{veto} must match no scanner pattern, but {pattern} matches it"
+                );
+            }
+        }
     }
 
     #[test]

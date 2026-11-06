@@ -296,7 +296,7 @@ fn main_calls_startup_warning_after_config_load_and_before_first_info_line() {
 
     let init =
         first_code_line("init_tracing(").expect("main.rs must install the tracing subscriber");
-    let config = first_code_line("Config::from_env()").expect("main.rs must load the Config");
+    let config = first_code_line("Config::from_env_naming(").expect("main.rs must load the Config");
     let warn = first_code_line("config.log_test_only_auth_override_startup_warning()")
         .expect("main.rs must call Config::log_test_only_auth_override_startup_warning");
     let starting = first_code_line(r#"tracing::info!("live-edit starting")"#)

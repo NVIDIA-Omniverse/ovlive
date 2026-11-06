@@ -155,18 +155,20 @@ pub const RETIRE_ROUTER_WAIT: Duration = Duration::from_secs(5);
 
 /// How long [`retire`] gives the backchannel's close (`Backchannel::clear_router_state`) before it drops it.
 ///
-/// The close is one socket's: take the backchannel's async write lock, take the connection out, flush whatever is
-/// buffered on it, then shut it down — and fred puts no timeout on any of it (`ExclusiveConnection::disconnect`). On a
-/// healthy socket it takes well under a millisecond. It waits in two places:
+/// The close is one socket's, when the backchannel holds one: take the backchannel's async write lock, take the
+/// connection out, flush whatever is buffered on it, then shut it down — and fred puts no timeout on any of it
+/// (`ExclusiveConnection::disconnect`). On a healthy socket it takes well under a millisecond. It waits in two places:
 ///
 /// - **for the lock**, while another holder has it: the client's router (its cluster-state sync in
-///   `router/clustered.rs`, and the unblock of a blocked connection), or a backchannel command sent on the client
-///   (`CLIENT UNBLOCK`, `FUNCTION KILL`, and the like), which first `PING`s an existing backchannel connection with no
-///   timeout (`check_and_create_transport`).
-///   The live-edit service sends no backchannel command on a pool member's client, so in a retirement this wait is
-///   reachable only when the old router is still running as the release starts: [`retire`] got no `router`, or the
-///   router did not finish within [`RETIRE_ROUTER_WAIT`];
-/// - **in the flush**, when the peer stopped reading.
+///   `router/clustered.rs` looks for a stored connection, and the unblock of a blocked connection), or a backchannel
+///   command sent on the client (`CLIENT UNBLOCK`, `FUNCTION KILL`, and the like), which first `PING`s an existing
+///   backchannel connection with no timeout (`check_and_create_transport`).
+///   The live-edit service sends no backchannel command, and a cluster sync no longer stores the connection it opens
+///   for `CLUSTER SLOTS` ([`super::end_sync_backchannel`]), so a service client's backchannel holds no connection and
+///   a sync holds the lock only to find that out, doing no I/O under it. In a retirement the wait is therefore
+///   reachable only when the old router is still running as the release starts ([`retire`] got no `router`, or the
+///   router did not finish within [`RETIRE_ROUTER_WAIT`]), and is then that brief look;
+/// - **in the flush**, when the peer stopped reading. With no stored connection there is nothing to flush.
 ///
 /// A longer wait helps neither: a holder or a peer that is stuck stays stuck. So 1 s bounds a single socket close with
 /// ample margin, and the release task as a whole ends within [`RETIRE_ROUTER_WAIT`] plus this. What a close cut short
@@ -189,9 +191,13 @@ pub const RETIRE_BACKCHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 ///   or when the client's `ClientInner` drops — and a retired client's never drops, because its spare cell keeps it
 ///   (and the task holds a clone of it). Left running it would fetch credentials, and log failed refreshes, for the
 ///   life of the process;
-/// - its **backchannel connection**, which fred closes after a completed `QUIT` (`check_and_disconnect`) or when the
-///   next router starts (`clear_router_state`) — neither happens to a client whose `QUIT` did not complete and whose
-///   router was aborted, so the husk would keep a socket to a node, with its buffers, until the process exits.
+/// - its **backchannel connection**, when it holds one, which fred closes after a completed `QUIT`
+///   (`check_and_disconnect`) or when the next router starts (`clear_router_state`) — neither happens to a client
+///   whose `QUIT` did not complete and whose router was aborted, so the husk would keep a socket to a node, with its
+///   buffers, until the process exits. A live-edit service client holds none (a cluster sync drops the connection it
+///   opens, [`super::end_sync_backchannel`], and the service sends no backchannel command), so for it this step only
+///   clears the router-dependent state (the connection-id map and the blocked flag); it stays for any client that
+///   does hold one.
 ///
 /// `router` is the abort handle of the router the caller ended or aborted, when it has one. An abort takes effect
 /// only at the router's next await, and a router that has just connected re-arms the credential task with no await
@@ -210,12 +216,12 @@ pub const RETIRE_BACKCHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 ///   drop releases the lock with the backchannel holding no connection and drops the taken `ExclusiveConnection`,
 ///   whose socket the OS then closes; only the unflushed bytes of a socket nobody reads again are lost;
 /// - **cut short while waiting for the lock** (see [`RETIRE_BACKCHANNEL_CLOSE_TIMEOUT`] for the holders and when that
-///   can happen in a retirement): the drop just leaves the lock's queue and nothing is taken, so the backchannel
-///   connection stays on the client until the client is dropped. A client kept in a spare cell (a pool member's
-///   retired client) is never dropped before its `Pool`, so that one socket to a node, with its buffers, stays open
-///   until the pool's last clone drops — the leak this release exists to close, left as a known residual for the rare
-///   retirement whose old router outlived the wait. A client kept in no cell (a discarded fresh client, a `txn` slot's
-///   swapped-out client) keeps the socket only until its last clone drops, normally soon after its router ends.
+///   can happen in a retirement): the drop just leaves the lock's queue and nothing is taken, so a backchannel
+///   connection, if the client held one, stays on the client until the client is dropped. A client kept in a spare
+///   cell (a pool member's retired client) is never dropped before its `Pool`, so that one socket to a node, with its
+///   buffers, would stay open until the pool's last clone drops; a client kept in no cell (a discarded fresh client,
+///   a `txn` slot's swapped-out client) keeps it only until its last clone drops, normally soon after its router
+///   ends. A live-edit service client holds no backchannel connection, so for it this cut leaves no socket behind.
 pub fn retire(client: &Client, router: Option<AbortHandle>) {
   let inner = client.inner.clone();
   match tokio::runtime::Handle::try_current() {

@@ -16,6 +16,11 @@ limitations under the License.
 */ -}}
 
 {{- if .Values.serviceMonitor.enabled -}}
+{{- $extraRelabelings := .Values.serviceMonitor.metricRelabelings -}}
+{{- $emptyString := and (kindIs "string" $extraRelabelings) (empty $extraRelabelings) -}}
+{{- if not (or (kindIs "invalid" $extraRelabelings) (kindIs "slice" $extraRelabelings) $emptyString) -}}
+{{- fail (printf "serviceMonitor.metricRelabelings must be a list of relabeling rules (got %#v)" $extraRelabelings) -}}
+{{- end }}
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -35,6 +40,38 @@ spec:
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      {{- /*
+        The service labels its own series with `endpoint` (the RPC name) and
+        `service` (the pod name, or `serviceLabel`). The Prometheus Operator
+        adds target labels
+        with the same names (the scrape port's name and the Kubernetes
+        Service's name), and with honorLabels off Prometheus keeps the
+        target's values and moves the service's to `exported_endpoint` and
+        `exported_service`. These rules put the service's values back under
+        their own names and drop the `exported_*` copies. The `(.+)` match
+        leaves a series the service did not label that way, which has no
+        `exported_*` copy, with the operator's value. Metric relabeling runs
+        after that merge, so the restore works even where the Prometheus
+        resource forces honorLabels off. Rules from
+        serviceMonitor.metricRelabelings run after these, so they see the
+        restored labels.
+      */}}
+      metricRelabelings:
+        - sourceLabels: [exported_endpoint]
+          regex: "(.+)"
+          targetLabel: endpoint
+          replacement: "${1}"
+          action: replace
+        - sourceLabels: [exported_service]
+          regex: "(.+)"
+          targetLabel: service
+          replacement: "${1}"
+          action: replace
+        - regex: "exported_(endpoint|service)"
+          action: labeldrop
+        {{- with $extraRelabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
 {{- else -}}
 ### ServiceMonitor is disabled, see .Values.serviceMonitor.enabled
 {{- end }}

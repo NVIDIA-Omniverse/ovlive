@@ -30,12 +30,15 @@
 //! retirement of a replaced and a deleted object on a full store).
 //!
 //! Each site asserts: the answer and its message (which never starts with the
-//! overtaken prefix); on the upload stages (`ext_store`, `update_commit`) its
-//! retry hint — `STORE_WRITE_REFUSED` with metadata `condition` = the
-//! refusal's `reason` label and a `retry_delay` in `[2 s, 6 s)`, the client's
-//! "this call applied nothing" signal — and at `create_commit` its absence:
-//! every `CreateLayer` refusal answers plain `UNAVAILABLE` "… because
-//! <condition>; retry", with no nothing-applied claim (SDD §18.1); nothing
+//! overtaken prefix); on the upload stages (`ext_store`, `update_commit`), and
+//! at `create_commit` on `CreateLayer`'s writes before its commit marker (the
+//! object-id allocation, the counter repair writes, the materialization
+//! `EXEC`), its retry hint — `STORE_WRITE_REFUSED` with metadata `condition` =
+//! the refusal's `reason` label and a `retry_delay` in `[2 s, 6 s)`, the
+//! client's "this call applied nothing" signal — and on `CreateLayer`'s writes
+//! after the marker (the overwrite's `superseded` mark, a new layer's commit
+//! script) its absence: plain `UNAVAILABLE` "… because <condition>; retry",
+//! with no nothing-applied claim (SDD §18.1); nothing
 //! applied (the keys the write would have changed are unchanged); one attempt
 //! (the rule's hits — the update retry loop retries only `Aborted`, and a full
 //! store does not clear within its milliseconds); and the one metric cell. The
@@ -46,8 +49,17 @@
 //! | `update_commit` | the commit script, fast and structural mode (all four refusals on the fast path) |
 //! | `update_commit` | the WATCH path's discarded transaction: refused at `EXEC` time, and at queue time |
 //! | `ext_store` | the external-value pre-store |
-//! | `create_commit` | the object-id allocation, the materialization `EXEC` (both shapes), the overwrite's `superseded` mark, a new layer's commit script |
-//! | `create_commit` | the absent counter's repair writes: the unhooked `SET NX`, and through the checkpoint repair hook the `SET NX` (no counters sidecar; two per attempt) and the seed `EVAL` |
+//! | `create_commit`, hinted (before the marker) | the object-id allocation, the materialization `EXEC` (both shapes) |
+//! | `create_commit`, hinted (before the marker) | the absent counter's repair writes: the unhooked `SET NX`, and through the checkpoint repair hook the `SET NX` (no counters sidecar; two per attempt) and the seed `EVAL` |
+//! | `create_commit`, plain (after the marker) | the overwrite's `superseded` mark, a new layer's commit script |
+//!
+//! The hooked repair's other failures — its wait budget spent, an attempt
+//! that ends without reporting, a failure that is not a store write refusal —
+//! answer a plain `UNAVAILABLE` with no detail, which the `CreateLayer`
+//! handler answers carrying `UPSTREAM_UNAVAILABLE`; `checkpoint::counter_repair_test`
+//! pins them (`wait_budget_elapse_returns_unavailable_while_the_attempt_completes`,
+//! `repair_attempt_that_dies_without_reporting_self_heals_on_the_next_create_layer`,
+//! `repair_failure_surfaces_unavailable_without_minting_an_id`).
 //!
 //! Also: a commit script refused on attempt 2, after attempt 1's `EVALSHA`
 //! timed out, answers plain `UNAVAILABLE`, outcome unknown, without the hint;
@@ -65,9 +77,9 @@
 //! commit discarded for `-BUSY`, at `EXEC` time or at queue time, is retried
 //! and commits once. And a store write refusal at a mapper site — outside the
 //! counted upload sites — answers plain `UNAVAILABLE` naming the command and
-//! the condition, once and uncounted: `DeleteLayer`'s mapping `DEL` refused
-//! `-MISCONF` (the mapping intact) and `JoinSession`'s presence-index `SADD`
-//! refused `-NOREPLICAS`.
+//! the condition, once and uncounted: `DeleteLayer`'s unmap refused
+//! `-MISCONF` (the mapping and the layers-index member intact) and
+//! `JoinSession`'s presence-index `SADD` refused `-NOREPLICAS`.
 //!
 //! b.pa1 adds that an `-OOM`, at an upload site (the pre-store, and again once
 //! the request interval has passed) or at a mapper site (`CreateSession`'s
@@ -120,7 +132,7 @@ use live_edit::storage::external_values::{
 use live_edit::storage::keys::sha256_to_hex;
 use live_edit::storage::layer::{LayerStore, OPERATION_OVERTAKEN_MESSAGE};
 use live_edit::storage::lua::{
-    UpdateScriptMode, CREATE_LAYER_COMMIT_SCRIPT, UPDATE_LAYER_FAST_SCRIPT,
+    UpdateScriptMode, CREATE_LAYER_COMMIT_SCRIPT, LAYER_UNMAP_SCRIPT, UPDATE_LAYER_FAST_SCRIPT,
 };
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::store_oom::{OOM_COLLECTION_REQUEST_TTL, STORE_OOM_REQUEST_MIN_INTERVAL};
@@ -227,9 +239,11 @@ fn create_refusal_message(refusal: &Refusal) -> String {
     )
 }
 
-/// Assert `result` is a `CreateLayer` store refusal's answer: plain
-/// `UNAVAILABLE` with [`create_refusal_message`] and no retry hint — no
-/// `CreateLayer` commit-stage refusal carries one (SDD §18.1).
+/// Assert `result` is the answer of a `CreateLayer` store refusal after the
+/// call's commit marker (the overwrite's `superseded` mark, a commit run):
+/// plain `UNAVAILABLE` with [`create_refusal_message`] and no retry hint, its
+/// outcome unknown (SDD §18.1). A refusal before the marker answers
+/// [`assert_refused`]'s hinted refusal instead.
 #[track_caller]
 fn assert_create_refused<T: std::fmt::Debug>(result: &Result<T, ServiceError>, refusal: &Refusal) {
     match result {
@@ -920,10 +934,12 @@ async fn external_value_pre_store_refused_takes_no_mirror_charge_and_sends_nothi
 // CreateLayer
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// The object-id allocation refused: `UNAVAILABLE`, no id allocated, no
-/// mapping, one `create_commit` cell.
+/// The object-id allocation refused: it comes before `CreateLayer`'s commit
+/// marker, so `UNAVAILABLE` carrying `STORE_WRITE_REFUSED` (condition, retry
+/// hint) with the nothing-applied message; no id allocated, no mapping, one
+/// `create_commit` cell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_allocation_refused_out_of_memory_is_answered_unavailable() {
+async fn create_layer_allocation_refused_out_of_memory_is_answered_store_write_refused() {
     let armed = Arc::new(AtomicBool::new(false));
     // The allocation is the only script that names the object-id counter key.
     let counter_key: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
@@ -954,7 +970,7 @@ async fn create_layer_allocation_refused_out_of_memory_is_answered_unavailable()
     let result = fx.create(&store, "store-refusal-new").await;
     armed.store(false, Ordering::SeqCst);
 
-    assert_create_refused(&result, &OOM);
+    assert_refused(&result, &OOM);
     assert_eq!(fx.proxy.hits(), 1, "one attempt");
     let counter_after: Option<String> = fx
         .tv
@@ -975,8 +991,10 @@ async fn create_layer_allocation_refused_out_of_memory_is_answered_unavailable()
 // hook, `SET NX` when the adapter holds no counters sidecar, else the seed
 // script (`EVAL`, a conditional `SET` to the sidecar's id + the safety
 // margin). Each is one command whose only write Valkey refuses before it
-// runs, so a refusal leaves the counter absent: `UNAVAILABLE` with the
-// nothing-applied sentence, counted at `create_commit`, no in-process retry.
+// runs, so a refusal leaves the counter absent. The repair runs before
+// `CreateLayer`'s commit marker, so the answer is `UNAVAILABLE` carrying
+// `STORE_WRITE_REFUSED` (condition, retry hint) with the nothing-applied
+// sentence, counted at `create_commit`, no in-process retry.
 // A fresh test prefix holds no counter, so every test here starts absent.
 
 /// The sidecar's `max_object_id_observed` for the seed case.
@@ -1094,33 +1112,38 @@ async fn create_against_a_refused_counter_repair(
     (fx, result)
 }
 
-/// The hooked repair's answer: plain `UNAVAILABLE` whose message names the
-/// failed repair and ends with the refused write's sentence, with no retry
-/// hint — no `CreateLayer` commit-stage refusal carries one (SDD §18.1).
+/// The hooked repair's answer to a refused repair write: `UNAVAILABLE`
+/// carrying the refused write's `STORE_WRITE_REFUSED` detail (condition,
+/// retry hint), which every waiter on the attempt receives, with a message
+/// that names the failed repair and ends with the refused write's
+/// nothing-applied sentence.
 #[track_caller]
 fn assert_repair_refused(result: &Result<u64, ServiceError>) {
-    let message = match result {
-        Err(ServiceError::Unavailable(message)) => message,
-        other => panic!(
-            "a refused counter repair write must answer plain UNAVAILABLE, without a retry \
-             hint; got {other:?}"
+    let err = match result {
+        Err(err) => err,
+        Ok(other) => panic!(
+            "a refused counter repair write must answer UNAVAILABLE carrying \
+             STORE_WRITE_REFUSED; got Ok({other:?})"
         ),
     };
+    let message = assert_store_refusal_detail(err, &OOM);
     assert!(
         message.starts_with("object-id counter repair ")
-            && message.ends_with(&create_refusal_message(&OOM)),
+            && message.ends_with(&refusal_message(&OOM)),
         "the hooked repair answers UNAVAILABLE naming the repair, with the refused write's \
          sentence; got {message:?}"
     );
 }
 
-/// No adapter: the unhooked `SET NX` refused. The F5 answer word for word,
-/// one command, one `create_commit` cell, and no `unhooked_initialized` tick
-/// (nothing was initialized).
+/// No adapter: the unhooked `SET NX` refused. The hinted F5 answer word for
+/// word (`STORE_WRITE_REFUSED`: the repair is before `CreateLayer`'s commit
+/// marker), one command, one `create_commit` cell, and no
+/// `unhooked_initialized` tick (nothing was initialized).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_unhooked_counter_repair_refused_out_of_memory_is_answered_unavailable() {
+async fn create_layer_unhooked_counter_repair_refused_out_of_memory_is_answered_store_write_refused(
+) {
     let (fx, result) = create_against_a_refused_counter_repair(&["SET"], "NX", None).await;
-    assert_create_refused(&result, &OOM);
+    assert_refused(&result, &OOM);
     assert_eq!(
         fx.proxy.hits(),
         1,
@@ -1143,9 +1166,11 @@ async fn create_layer_unhooked_counter_repair_refused_out_of_memory_is_answered_
 /// sidecar: both `SET NX` writes refused — the seed routine's own (logged and
 /// dropped) and the attempt's postcondition write — each one command, so two
 /// commands and two `create_commit` ticks for one repair attempt, and the
-/// attempt books `failed`.
+/// attempt books `failed`. The attempt's own refused `SET NX` decides the
+/// answer: `STORE_WRITE_REFUSED`, its detail carried to the waiter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_hooked_counter_repair_without_a_sidecar_refused_is_answered_unavailable() {
+async fn create_layer_hooked_counter_repair_without_a_sidecar_refused_is_answered_store_write_refused(
+) {
     let (fx, result) = create_against_a_refused_counter_repair(&["SET"], "NX", Some(None)).await;
     assert_repair_refused(&result);
     assert_eq!(
@@ -1177,10 +1202,11 @@ async fn create_layer_hooked_counter_repair_without_a_sidecar_refused_is_answere
 }
 
 /// Through the checkpoint repair hook, an adapter holding a counters
-/// sidecar: the seed script refused. One `EVAL`, one `create_commit` tick, and
-/// the attempt books `failed`.
+/// sidecar: the seed script refused. One `EVAL`, one `create_commit` tick, the
+/// attempt books `failed`, and the waiter answers `STORE_WRITE_REFUSED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_hooked_counter_repair_seed_refused_out_of_memory_is_answered_unavailable() {
+async fn create_layer_hooked_counter_repair_seed_refused_out_of_memory_is_answered_store_write_refused(
+) {
     assert_eq!(
         SEED_ARG,
         (SIDECAR_MAX_OBJECT_ID + REPAIR_SAFETY_MARGIN).to_string(),
@@ -1211,7 +1237,9 @@ async fn create_layer_hooked_counter_repair_seed_refused_out_of_memory_is_answer
 }
 
 /// The materialization's transaction discarded, refused at `EXEC` time or at
-/// queue time: `UNAVAILABLE`, no header, no mapping, one `create_commit` cell.
+/// queue time: before `CreateLayer`'s commit marker, so `UNAVAILABLE` carrying
+/// `STORE_WRITE_REFUSED` (condition, retry hint) with the nothing-applied
+/// message; no header, no mapping, one `create_commit` cell.
 async fn create_layer_materialization_discarded(
     queue_time_refusal: Option<&'static str>,
     exec_reply: &'static str,
@@ -1226,7 +1254,7 @@ async fn create_layer_materialization_discarded(
     let result = fx.create(&store, "store-refusal-new").await;
     txn.disarm();
 
-    assert_create_refused(&result, &OOM);
+    assert_refused(&result, &OOM);
     assert_eq!(
         txn.multis(),
         1,
@@ -1253,13 +1281,14 @@ async fn create_layer_materialization_discarded(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_materialization_refused_out_of_memory_at_exec_is_answered_unavailable() {
+async fn create_layer_materialization_refused_out_of_memory_at_exec_is_answered_store_write_refused(
+) {
     create_layer_materialization_discarded(None, EXECABORT_OOM).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_materialization_refused_out_of_memory_at_queue_time_is_answered_unavailable()
-{
+async fn create_layer_materialization_refused_out_of_memory_at_queue_time_is_answered_store_write_refused(
+) {
     create_layer_materialization_discarded(Some(OOM.reply), EXECABORT_PREVIOUS_ERRORS).await;
 }
 
@@ -1619,18 +1648,26 @@ fn mapped_refusal_message(op: &str, refusal: &Refusal) -> String {
     )
 }
 
-/// DeleteLayer's first write, the mapping `DEL`, refused `-MISCONF`:
-/// `UNAVAILABLE`, the mapping intact (the `DEL` applied nothing and the
-/// cascade stopped there), one `DEL` sent.
+/// DeleteLayer's first write, its unmap (`layer_unmap.lua`, the one script
+/// that names the layer mapping in a delete), refused `-MISCONF`:
+/// `UNAVAILABLE` labelled `unmap layer`, the mapping and the layers-index
+/// member intact (the unmap applied nothing and the cascade stopped there),
+/// one unmap sent. The proxy answers the `EVALSHA` itself, so no `NOSCRIPT`
+/// reload can repeat it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_layer_whose_mapping_del_is_refused_misconf_answers_unavailable_once() {
+async fn delete_layer_whose_unmap_is_refused_misconf_answers_unavailable_once() {
     let armed = Arc::new(AtomicBool::new(false));
     let mapping_key: Arc<std::sync::Mutex<String>> = Arc::new(std::sync::Mutex::new(String::new()));
     let rule: ProxyRule = {
         let (armed, mapping_key) = (Arc::clone(&armed), Arc::clone(&mapping_key));
+        let unmap_sha = LAYER_UNMAP_SCRIPT.sha1().to_string();
         Arc::new(move |args: &[Vec<u8>]| {
             let key = mapping_key.lock().unwrap().clone();
-            (armed.load(Ordering::SeqCst) && command_name(args) == "DEL" && has_arg(args, &key))
+            let is_unmap = command_name(args) == "EVALSHA"
+                && args
+                    .get(1)
+                    .is_some_and(|a| String::from_utf8_lossy(a).eq_ignore_ascii_case(&unmap_sha));
+            (armed.load(Ordering::SeqCst) && is_unmap && has_arg(args, &key))
                 .then(|| ProxyAction::Eval(error_reply_script(MISCONF.reply)))
         })
     };
@@ -1657,13 +1694,10 @@ async fn delete_layer_whose_mapping_del_is_refused_misconf_answers_unavailable_o
 
     match &result {
         Err(ServiceError::Unavailable(message)) => {
-            assert_eq!(
-                message,
-                &mapped_refusal_message("DEL layer mapping", MISCONF)
-            );
+            assert_eq!(message, &mapped_refusal_message("unmap layer", MISCONF));
         }
         other => panic!(
-            "a DeleteLayer whose mapping DEL the store refused must answer plain UNAVAILABLE; \
+            "a DeleteLayer whose unmap the store refused must answer plain UNAVAILABLE; \
              pre-b.xd1 it answered INTERNAL; got {other:?}"
         ),
     }
@@ -1674,13 +1708,24 @@ async fn delete_layer_whose_mapping_del_is_refused_misconf_answers_unavailable_o
     assert_eq!(
         fx.proxy.hits(),
         1,
-        "one DEL: a store write refusal is not retried by the cascade's retry loop"
+        "one unmap: a store write refusal is not retried by the cascade's retry loop"
     );
     assert_eq!(
         fx.mapping("store-refusal-layer").await,
         Some(oid.to_string()),
         "the mapping still names the layer's object"
     );
+    let indexed: bool = fx
+        .tv
+        .client()
+        .pool
+        .sismember(
+            fx.tv.key_schema().layers_index(&fx.session_id),
+            live_edit::storage::keys::hex_encode("store-refusal-layer"),
+        )
+        .await
+        .expect("SISMEMBER layers index must succeed");
+    assert!(indexed, "the layers-index member stays");
     assert!(
         refused_cells(&fx.metrics).values().all(|v| *v == 0.0),
         "a mapper site's refusal is not counted"
@@ -2071,6 +2116,10 @@ mod through_the_handler {
         assert_counted_once(&fx.metrics, "ext_store", "out_of_memory");
     }
 
+    /// The server's reply to an `EVALSHA` of a script missing from its script
+    /// cache, staged here in place of a real `SCRIPT FLUSH`.
+    const NOSCRIPT: &str = "NOSCRIPT No matching script. Please use EVAL.";
+
     /// An `UpdateLayer` whose object was wiped: its first `update_layer`
     /// call finds it gone, the checkpoint recovery restores it, and the
     /// re-issued call's commit is refused out of memory on its first attempt.
@@ -2078,46 +2127,64 @@ mod through_the_handler {
     /// a lost reply whose commit may still land — the RPC answers plain
     /// `UNAVAILABLE`, outcome unknown, with no retry hint (SDD §18.1); when it
     /// took one, the refusal keeps its `STORE_WRITE_REFUSED` hint.
-    async fn reissue_refused(first_call_timed_out: bool) {
+    ///
+    /// The proxy refuses by the update script's calls, not its sends: a
+    /// `NOSCRIPT` reply (a concurrent test's `SCRIPT FLUSH` on the shared
+    /// server, or a store whose script cache starts empty) makes the client
+    /// load the script and send the same call again, so a send count would
+    /// refuse that repeat — the first call's own attempt — instead of the
+    /// re-issue. With `reload_on_noscript` the proxy answers the update
+    /// script's first send `NOSCRIPT` itself, so the client's real reload
+    /// runs on every run, before the first call's last attempt reaches the
+    /// store, and the run pins exactly one reload. Without it the variants
+    /// pass with or without a real reload: call 0 reloads when the store's
+    /// script cache misses the update script (a cold store, a concurrent
+    /// `SCRIPT FLUSH`), so the reload count is not asserted there.
+    async fn reissue_refused(first_call_timed_out: bool, reload_on_noscript: bool) {
+        use std::collections::VecDeque;
+
+        use crate::storage::snapshot_read_support::ScriptCalls;
         use live_edit::checkpoint::RecoveryHook;
 
-        // The update script's second EVALSHA — the re-issue's first — is
-        // refused; the first, the first call's last attempt, reaches the store
-        // and finds the object gone.
-        let sent = Arc::new(AtomicUsize::new(0));
+        // The update script's call 1 — the re-issue's first attempt — is
+        // refused; call 0, the first call's last attempt (all of it, however
+        // many sends a reload made it), reaches the store and finds the
+        // object gone.
+        let calls = Arc::new(ScriptCalls::new(
+            UPDATE_LAYER_FAST_SCRIPT.sha1().to_string(),
+        ));
         let rule: ProxyRule = {
-            let sent = Arc::clone(&sent);
-            let sha = UPDATE_LAYER_FAST_SCRIPT.sha1().to_string();
+            let calls = Arc::clone(&calls);
+            let noscript_staged = AtomicBool::new(false);
             Arc::new(move |args: &[Vec<u8>]| {
-                let is_update = command_name(args) == "EVALSHA"
-                    && args
-                        .get(1)
-                        .is_some_and(|a| String::from_utf8_lossy(a).eq_ignore_ascii_case(&sha));
-                (is_update && sent.fetch_add(1, Ordering::SeqCst) == 1)
-                    .then(|| ProxyAction::Eval(error_reply_script(OOM.reply)))
+                let before = calls.see(args)?;
+                if reload_on_noscript && !noscript_staged.swap(true, Ordering::SeqCst) {
+                    return Some(ProxyAction::Eval(error_reply_script(NOSCRIPT)));
+                }
+                (before == 1).then(|| ProxyAction::Eval(error_reply_script(OOM.reply)))
             })
         };
         let fx = Fx::new("store-refusal-rpc-reissue", rule).await;
-        let timed_out: Vec<fred::error::Error> = if first_call_timed_out {
-            vec![fred::error::Error::new(
+        let timed_out: VecDeque<fred::error::Error> = if first_call_timed_out {
+            VecDeque::from([fred::error::Error::new(
                 fred::error::ErrorKind::Timeout,
                 "synthetic lost reply",
-            )]
+            )])
         } else {
-            Vec::new()
+            VecDeque::new()
         };
+        let injected = Arc::new(std::sync::Mutex::new(timed_out));
         let store = Arc::new(
             fx.store(UpdateLayerBackend::Lua)
                 .with_update_layer_retry_max_attempts(2)
-                .with_lua_fred_error_injector_for_test(Arc::new(std::sync::Mutex::new(
-                    timed_out.into_iter().collect(),
-                ))),
+                .with_lua_fred_error_injector_for_test(Arc::clone(&injected)),
         );
         let oid = fx
             .create(&store, "store-refusal-layer")
             .await
             .expect("create_layer must succeed");
         let mut svc = build_service_with_layer_store(&fx.tv, Arc::clone(&store));
+        let metrics = crate::common::replace_metrics(&mut svc);
         let checkpoints = InMemoryCheckpointStore::new();
         crate::common::seed_layer_checkpoint(
             &checkpoints,
@@ -2129,6 +2196,7 @@ mod through_the_handler {
         .await;
         let mut cfg = crate::common::test_config();
         cfg.checkpoint_enabled = true;
+        cfg.service_label = crate::common::RECOVERY_SERVICE_LABEL.to_owned();
         svc.recovery = Arc::new(RecoveryHook::new(
             Arc::new(checkpoints) as Arc<dyn CheckpointStore>,
             Arc::clone(&svc.layer_store),
@@ -2136,7 +2204,11 @@ mod through_the_handler {
             Arc::clone(&svc.metrics),
         ));
         crate::common::wipe_object_keys(&fx.tv, oid).await;
-        let sent_before = sent.load(Ordering::SeqCst);
+        assert_eq!(
+            calls.calls(),
+            0,
+            "fixture: no update script call before the RPC, so the RPC's are calls 0 and 1"
+        );
 
         let status = update_status(
             &fx,
@@ -2146,11 +2218,33 @@ mod through_the_handler {
         )
         .await;
 
+        if first_call_timed_out {
+            assert!(
+                injected.lock().unwrap().is_empty(),
+                "fixture: the first call's attempt 1 took the injected timeout"
+            );
+        }
         assert_eq!(
-            sent.load(Ordering::SeqCst) - sent_before,
+            crate::common::recovery_metric(&metrics, "restored"),
+            1,
+            "the first call ended NOT_FOUND and the restore landed, so the refused call was the \
+             re-issue's"
+        );
+        assert_eq!(
+            calls.calls(),
             2,
             "the first call's last attempt and the re-issue's refused one"
         );
+        if reload_on_noscript {
+            // The staged send never reached the store, the re-issue's send
+            // was replaced by an `EVAL`, and a call reloads at most once, so
+            // no cache miss can add a second reload.
+            assert_eq!(
+                calls.reloads(),
+                1,
+                "the staged NOSCRIPT made call 0 reload, once"
+            );
+        }
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
         if first_call_timed_out {
             assert_eq!(
@@ -2176,12 +2270,28 @@ mod through_the_handler {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_layer_reissue_refused_after_a_one_attempt_first_call_keeps_the_hint() {
-        reissue_refused(false).await;
+        reissue_refused(false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_layer_reissue_refused_after_a_timed_out_first_call_attempt_is_plain() {
-        reissue_refused(true).await;
+        reissue_refused(true, false).await;
+    }
+
+    /// The first call's only attempt is answered `NOSCRIPT` and sent again
+    /// after the reload: the re-issue's attempt is still the one refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_layer_reissue_refused_after_a_one_attempt_first_call_reloaded_on_noscript_keeps_the_hint(
+    ) {
+        reissue_refused(false, true).await;
+    }
+
+    /// The first call's attempt 2 is answered `NOSCRIPT` and sent again after
+    /// the reload: the refusal is still attempt 3's, the re-issue's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_layer_reissue_refused_after_a_timed_out_first_call_reloaded_on_noscript_is_plain(
+    ) {
+        reissue_refused(true, true).await;
     }
 }
 
@@ -2316,8 +2426,9 @@ async fn store_write_refusal_disruptive_real_out_of_memory_is_answered_unavailab
 ///   its old object (unmapped, fenced); one orphan-sweep pass at grace 0 on
 ///   the full store re-runs the overwrite tail: `deleted` on the old stream,
 ///   the old header gone;
-/// - (b) a `DeleteLayer` on the full store completes: mapping and header
-///   gone, `deleted` on the stream;
+/// - (b) a `DeleteLayer` on the full store completes: mapping, layers-index
+///   member and header gone, `deleted` on the stream (its unmap writes only
+///   a `SREM` and a `DEL`, which the store does not refuse);
 /// - (c) a never-committed create (a new layer whose two commit runs were
 ///   injected to fail before their script ran) left an unmapped, unclaimed
 ///   object; the same pass vetoes it — the veto script's no-op `PEXPIRE`
@@ -2530,6 +2641,15 @@ async fn store_write_refusal_disruptive_full_store_still_wakes_and_retires_repla
         .get(tv.key_schema().layer_mapping(&session_id, DELETED_LAYER))
         .await
         .expect("GET of the layer mapping");
+    let member_after: bool = tv
+        .client()
+        .pool
+        .sismember(
+            tv.key_schema().layers_index(&session_id),
+            live_edit::storage::keys::hex_encode(DELETED_LAYER),
+        )
+        .await
+        .expect("SISMEMBER of the layers index");
     let deleted_after = (deleted_entries(deleted).await, header_exists(deleted).await);
     full.restore().await;
 
@@ -2549,6 +2669,10 @@ async fn store_write_refusal_disruptive_full_store_still_wakes_and_retires_repla
         "(b): DeleteLayer on a full store completes; got {delete_answer:?}"
     );
     assert_eq!(mapping_after, None, "(b): the mapping is gone");
+    assert!(
+        !member_after,
+        "(b): the unmap removed the layers-index member on the full store too"
+    );
     assert_eq!(
         deleted_after,
         (1, false),

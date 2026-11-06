@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import random
+import signal
 import tempfile
 import time
 import unittest
@@ -40,6 +41,24 @@ BACKLOG_UPDATES = 24
 # and the peer updates the lag test queues behind a held publication.
 LAG_WARNING = 8
 LAG_UPDATES = 16
+# The exit status of a writer process that kill_writer ends: SIGKILL's on POSIX and, on Windows, the exit code it
+# terminates the process with, which no writer exits with on its own (a failing writer exits 1, as does a process
+# that asyncio's kill() terminates).
+KILLED_RETURNCODE = 0xDEAD if os.name == 'nt' else -signal.SIGKILL
+
+
+async def kill_writer(process):
+    """End `process`, an asyncio subprocess, at once, as a crash does, and wait for it; it exits KILLED_RETURNCODE."""
+    if os.name == 'nt':
+        import _winapi
+        handle = _winapi.OpenProcess(0x0001, False, process.pid)  # PROCESS_TERMINATE
+        try:
+            _winapi.TerminateProcess(handle, KILLED_RETURNCODE)
+        finally:
+            _winapi.CloseHandle(handle)
+    else:
+        process.kill()
+    await asyncio.wait_for(process.wait(), 10)
 
 
 def find_key(value, key):
@@ -57,6 +76,13 @@ def find_key(value, key):
 
 
 class CompactSceneService(LiveService):
+    async def UpdateLayer(self, stream, context):
+        try:
+            return await super().UpdateLayer(stream, context)
+        finally:
+            self.state.ended["UpdateLayer"] += 1
+            self.state.wake()  # Tests synchronize on the service having no call in flight.
+
     def opaque(self, request):
         """Whether the layer's base payload is outside the root-field oracle,
         as a USD creation seed from Export or CreateNew is."""
@@ -2100,9 +2126,11 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         await self.peer({"initial": 41})
         driver = await self.start(mode="--file-format", extra=("--max-buffered=1",))
         base, updates = len(self.commits()), self.state.attempts["UpdateLayer"]
-        # The flush job fails its first allocation once: the transient
+        # The flush job fails its first allocation: the transient
         # RESOURCE_EXHAUSTED keeps a in the buffer, which then holds the quota.
-        faulted = await driver.command("direct-set-alloc-fault a 1")
+        # The fault stays armed, so a flush that a pending-byte release on the
+        # endpoint requests meanwhile defers the same way and a stays buffered.
+        faulted = await driver.command("direct-set-alloc-fault-held a 1")
         if not faulted["injection"]:
             # The thread-sanitizer driver has no replacement allocator to fail
             # an allocation, so it pins only the uninjected flush.
@@ -2119,10 +2147,9 @@ class SceneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((blocked["state"], blocked["status_result"], blocked["pending"], blocked["buffered"]),
                          (5, 13, 0, 1), blocked)
         self.assertEqual(self.state.attempts["UpdateLayer"], updates)
-        # The fault has cleared, but no record, publication, pending-byte
-        # release or save follows. The refused turn is the only event, and it
-        # retries the flush.
-        refused = await driver.command("direct-set-try b 2")
+        # The refused turn clears the fault in its own host job, so no flush runs
+        # before it: the flush its refusal requests is the one that admits a.
+        refused = await driver.command("direct-set-try-cleared b 2")
         self.assertEqual(refused["refused"], 13, refused)  # RESOURCE_EXHAUSTED
         self.assertEqual(refused["fields"], {"initial": 41, "a": 1})
         ready = await driver.command("await-buffered 0")

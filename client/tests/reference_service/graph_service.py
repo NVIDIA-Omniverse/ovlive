@@ -12,8 +12,8 @@ Reads follow the Live Edit service's default catch-up: a fresh subscriber gets
 one full snapshot, a resumer behind the latest sequence one coalesced diff based
 at its cursor, which includes the resumer's own acknowledged writes, and a
 cursor at or ahead of the latest sequence no content. Both cover only sections
-reachable from the root through stored children lists; a section a Reorder left
-unlisted is absent from a snapshot. Reference policy: a
+reachable from the root through stored children lists; a section a verbatim
+Reorder left unlisted is absent from a snapshot. Reference policy: a
 resume diff retracts an unlisted section the resumer held, where the service
 neither retracts nor restates it. Every
 catch-up ends with one caught-up header (total_size=0) at the latest sequence.
@@ -101,12 +101,25 @@ class GraphState(State):
         # list replacing the parent's whole children list and a non-child or repeat rejecting the update; or
         # "per_list", as its later line orders each child list the list names and ignores those IDs.
         self.reorder_rule = "verbatim"
-        # How many newest commits a fresh snapshot is acked below and delivered again after it: the service's
-        # catch-up acks its pin when it cannot prove a stable cut (live_edit_service sdd.md §12.3). A read filters
-        # the reader's own commits only above its open position, the latest commit when the request is handled, as
-        # the service's self-echo filter does (live_edit_service subscribe.rs is_self_echo). The service reads its
-        # pin after the request arrives, so it delivers again only commits made after the read opened; the cut
-        # reaches below that, so a reader applies held commits again, its own among them.
+        # How a committed same-parent rename onto an occupied name is stored: "cascade", as the client applies it
+        # and as Nucleus and Kit's applier do, deleting the occupant with its subtree; or "keep_both", as the
+        # deployed live edit service stores it, keeping two siblings with one name.
+        self.rename_rule = "cascade"
+        # Whether a section birth takes the field and sample data earlier updates committed for its missing ID, as
+        # the deployed service's ID-keyed rows do. The data keeps the sequence of the update that wrote it, so a
+        # fresh snapshot, or a resume diff from before the orphaning, carries it, and a resume diff from a cursor
+        # between the orphaning and the birth does not. By default that data is never projected, as ovlive's
+        # reader applies it and as the service is to drop it.
+        self.adopt_orphans = False
+        # How many newest commits a fresh snapshot is acked below and delivered again after it. The default, 0,
+        # models Live Edit 0.2.0: every catch-up is acked at exactly the cut its content holds and the read delivers
+        # only commits above that cut, so no edit arrives twice (service subscribe.rs deliver_catch_up_content). A
+        # positive value models a legacy Live Edit 0.1.x service, whose catch-up acks an earlier pin when it cannot
+        # prove a stable cut (service CHANGELOG 0.1.0, b.vd8). A read filters the reader's own commits only above
+        # its open position, the latest commit when the request is handled, as the service's self-echo filter does
+        # (service subscribe.rs is_self_echo). The 0.1.x service reads its pin after the request arrives, so it
+        # delivers again only commits made after the read opened; the cut reaches below that, so a reader applies
+        # held commits again, its own among them.
         self.unverified_cut = 0
         # How a subscriber receives an empty commit: "diff", as the service sends it, an empty diff based at the
         # previous sequence (live_edit_service diff_read.rs empty_commit_payload); "header", a header-only frame;
@@ -130,6 +143,11 @@ class GraphState(State):
         # operation ID, payload digest and monotonic arrival time.
         self.creates = []
         self.creates_dropped = 0
+
+    def commit_rules(self):
+        """The scene_graph_model.Model.apply options that commit an update under this service's rules."""
+        return {"verbatim": self.reorder_rule == "verbatim", "adopt_orphans": self.adopt_orphans,
+                "rename_cascade": self.rename_rule == "cascade"}
 
     def refuse_updates(self, count, *, error_info=True, domain=ERROR_DOMAIN, retry_delay_ms=None,
                        method="UpdateLayer"):
@@ -225,6 +243,14 @@ def _retained_snapshot(model):
 
 
 class GraphService(LiveService):
+    async def UpdateLayer(self, stream, context):
+        try:
+            return await super().UpdateLayer(stream, context)
+        finally:
+            self.state.ended["UpdateLayer"] += 1
+            async with self.state.changed:
+                self.state.changed.notify_all()  # Tests synchronize on the service having no call in flight.
+
     async def reject(self, method, attempt, context, kind, *, code=None, status_message=None, details=None):
         # FAILED_PRECONDITION means only an object/incarnation change, as on the
         # service. A graph outside this reference profile is a definitive
@@ -309,10 +335,12 @@ class GraphService(LiveService):
         model = copy.deepcopy(old.model) if old else graph.Model()
         before, before_format = (old.model.state, old.model.source_format) if old else ([], "")
         model.trim_history(retained - 1)  # Room for this update within the retained window.
-        model.apply(payload, sequence, per_list=self.state.reorder_rule == "per_list")
+        model.apply(payload, sequence, **self.state.commit_rules())
         versions = (old.versions if old else Versions()).advanced(
             before, model.state, sequence, before_source_format=before_format,
-            after_source_format=model.source_format)
+            after_source_format=model.source_format, orphans=model.orphans,
+            written={(field.section, field.key) for field in delta.fields},
+            written_samples={(sample.section, sample.time) for sample in delta.samples})
         erased = set(old.erased) if old else set()
         for field in delta.fields:
             (erased.add if field.value is None else erased.discard)((field.section, field.key))
@@ -411,10 +439,9 @@ class GraphService(LiveService):
             # With the whole incarnation retained, check the diff against the
             # exact state at the cursor; a mismatch is a reference defect.
             service = graph.Model()
-            for entry in layer.commits:
-                if entry.sequence > cursor:
-                    break
-                service.apply(entry.payload, entry.sequence, per_list=self.state.reorder_rule == "per_list")
+            later = [entry for entry in layer.commits if entry.sequence > cursor]
+            for entry in layer.commits[:len(layer.commits) - len(later)]:
+                service.apply(entry.payload, entry.sequence, **self.state.commit_rules())
             # The subscriber holds only the reachable state at its cursor.
             before = graph.Model()
             before.apply(snapshot(service.state, source_format=service.source_format))
@@ -423,8 +450,16 @@ class GraphService(LiveService):
             if any(command.tag == 6 and command.section not in held for command in wire.decode(payload).commands):
                 raise graph.GraphError("coalesced diff retracts a section the subscriber never held", "unsupported")
             before.apply(payload)
-            if snapshot(before.state, source_format=before.source_format) != layer.snapshot_bytes:
-                raise graph.GraphError("coalesced diff does not reproduce the latest graph", "unsupported")
+            # The service sends only rows written after the cursor, so the subscriber ends where the commits after
+            # it lead from the cursor's state without its orphan data: a section born later adopts only orphan
+            # data written after the cursor.
+            service.forget_orphans()
+            for entry in later:
+                service.apply(entry.payload, entry.sequence, **self.state.commit_rules())
+            if snapshot(before.state, source_format=before.source_format) != snapshot(
+                    service.state, source_format=service.source_format):
+                raise graph.GraphError("coalesced diff does not reproduce the subscriber's latest graph",
+                                       "unsupported")
         return payload
 
     async def SubscribeReadLayer(self, request, context):
@@ -445,7 +480,8 @@ class GraphService(LiveService):
                 fresh = object_id != layer.object_id or cursor == 0
                 if initial:
                     self.state.observe("reads", dict(backend=self.backend, attempt=attempt,
-                                                     object=request.object_id, cursor=cursor))
+                                                     object=request.object_id, cursor=cursor,
+                                                     writer=request.client_id))
                     try:
                         if fresh:
                             payload = (snapshot(layer.model.state, source_format=layer.model.source_format,
@@ -472,6 +508,7 @@ class GraphService(LiveService):
                                client_timestamp_us=acked.client_timestamp_us)]
                     terminator = self.caught_up(layer.object_id, acked.sequence)
                     latest = acked
+                    cut = acked.sequence  # The acked cut; an exact-cut read delivers nothing at or below it.
                 else:
                     entries = [entry for entry in layer.commits if entry.sequence > cursor]
                     if not entries:
@@ -483,6 +520,8 @@ class GraphService(LiveService):
                         # UNAVAILABLE and resubscribes from its cursor, the same
                         # status the service gives a reader more than 5 s behind.
                         await context.abort(grpc.StatusCode.UNAVAILABLE, "reader fell behind retained updates")
+                    if not self.state.unverified_cut and entries[0].sequence <= cut:
+                        raise AssertionError(f"exact-cut read acked at {cut} would deliver {entries[0].sequence}")
                     outgoing = entries
                 object_id, cursor = layer.object_id, latest.sequence
             if initial:
@@ -515,5 +554,5 @@ class GraphService(LiveService):
 
 
 class GraphServer(ReferenceServer):
-    def __init__(self, state, backend="A", *, credentials=None):
-        super().__init__(state, backend, credentials=credentials, service_factory=GraphService)
+    def __init__(self, state, backend="A", *, credentials=None, service_factory=GraphService):
+        super().__init__(state, backend, credentials=credentials, service_factory=service_factory)

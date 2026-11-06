@@ -33,6 +33,9 @@ struct LayerReadOptions {
     uint32_t timeoutMs = 0; // Zero keeps this stream attempt open until stopped.
     std::shared_ptr<DrainState> drain; // Optional private attachment pipeline.
     std::shared_ptr<LayerReadFlow> flow; // Optional owner pacing.
+    // The owner's unit of its endpoint's stream share, which the read's call
+    // rides on; without one the read reserves a unit for itself.
+    std::shared_ptr<StreamReservation> stream;
 };
 
 // Immutable shared delivery. Consumers may retain it for ordered application;

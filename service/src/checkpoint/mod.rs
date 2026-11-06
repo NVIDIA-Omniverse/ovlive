@@ -27,10 +27,14 @@
 //!   `assembler` (base snapshot at a proven cut), `tail_classify` /
 //!   `tail_capture` / `tail_codec` (tail generations), `chunked_base` (the
 //!   base artifact for a layer over one delta's entry limit, and its decoder),
-//!   `rebase` (chain collapse), `retention`, the DR-store reconciliation pass (in
-//!   `checkpointer`), and the counters sidecar (`counters` is its wire shape);
+//!   `rebase` (chain collapse), `retention`, and the counters sidecar
+//!   (`counters` is its wire shape); `cleanup` is the backup store's clean-up
+//!   task, its own task on the maintenance leader lock rather than part of
+//!   the loop, running the clean-up pass whose body lives in `checkpointer`;
 //!   `base_bootstrap` writes the creation-time base and the post-restore
-//!   re-base; `put_guard` skips PUTs for provably dead objects; `ext_mirror`
+//!   re-base; `put_guard` skips PUTs for provably dead objects and runs the
+//!   clean-up fence before every layer PUT (re-arming the hashes it names and
+//!   refusing while clean-up is deleting them or its stem); `ext_mirror`
 //!   mirrors external-value blobs within a byte budget, and
 //!   `ext_backup_repair` re-sends the copies it never confirmed; `session` / `session_payload` /
 //!   `session_writer` write session checkpoints on lifecycle events.
@@ -50,18 +54,21 @@ pub mod base_bootstrap;
 pub mod builder;
 pub mod checkpointer;
 pub mod chunked_base;
+pub mod cleanup;
 pub mod compose;
 pub mod counter_seed;
 pub mod counters;
 pub mod durability_guard;
 pub mod ext_backup_repair;
 pub mod ext_mirror;
+pub(crate) mod hold_fence;
 pub mod lineage;
 pub(crate) mod put_guard;
 pub mod rebase;
 pub mod recovery;
 pub(crate) mod residue;
 pub mod retention;
+pub mod seq_band;
 pub mod session;
 pub mod session_payload;
 pub mod session_recovery;
@@ -95,6 +102,7 @@ pub use checkpointer::{
     register_checkpoint_pacing_gauges_if_enabled, spawn_checkpoint_loop, CheckpointLoopConfig,
     TailCaptureConfig,
 };
+pub use cleanup::{spawn_checkpoint_cleanup, CollectHeal};
 pub use compose::{
     compose_from_artifacts, compose_lineage, ComposeError, ComposedLineage, ExtValuePart,
     RecordSite, TailSite,
@@ -111,8 +119,8 @@ pub use ext_mirror::{
     ExtMirrorItem, ExtMirrorReceiver, ExtMirrorReservation, ExtMirrorSender, ReserveRefusal,
 };
 pub use lineage::{
-    gather_restore_lineage, no_deadline, Exhaustion, GatheredLineage, GatheredTail, LineageBreak,
-    LineageSelection, StepDownRecord, NO_DEADLINE_HORIZON,
+    gather_restore_lineage, group_layer_generations, no_deadline, Exhaustion, GatheredLineage,
+    GatheredTail, LineageBreak, LineageSelection, StepDownRecord, NO_DEADLINE_HORIZON,
 };
 /// `pub`, not `pub(crate)`: SR-9.2's duplicate-leader test drives two
 /// CONCURRENT re-bases from the integration-test crate, which two checkpoint

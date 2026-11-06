@@ -395,7 +395,6 @@ mod recovery_tests {
 
     fn test_config(enabled: bool) -> Config {
         Config {
-            catchup_snapshot_enabled: false,
             port: 0,
             metrics_port: 0,
             valkey_url: String::new(),
@@ -477,6 +476,10 @@ mod recovery_tests {
             session_retry_max_attempts: 32,
             session_retry_initial_delay_ms: 1,
             pod_memory: crate::config::PodMemoryPlan::reference(),
+            dr_hold_poll_interval_ms: crate::config::DR_HOLD_POLL_INTERVAL_MS_DEFAULT,
+            dr_restore_parallelism: crate::config::DR_RESTORE_PARALLELISM_DEFAULT,
+            checkpoint_storage_api_not_found_cache_secs:
+                crate::config::CHECKPOINT_STORAGE_API_NOT_FOUND_CACHE_SECS_DEFAULT,
             session_tokens_sweep_interval_secs:
                 crate::grpc::session::SESSION_TOKENS_SWEEP_INTERVAL_SECS,
             checkpoint_enabled: enabled,
@@ -636,6 +639,10 @@ mod recovery_tests {
 
         async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
             self.inner.ext_blob_exists(hash_hex).await
+        }
+
+        async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+            self.inner.verify_list_route().await
         }
 
         async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
@@ -1121,6 +1128,10 @@ mod recovery_tests {
             }
             async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
                 self.inner.ext_blob_exists(hash_hex).await
+            }
+
+            async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+                self.inner.verify_list_route().await
             }
             async fn delete_ext_blob(&self, hash_hex: &str) -> Result<(), CheckpointError> {
                 self.inner.delete_ext_blob(hash_hex).await

@@ -13,7 +13,9 @@
 #include <array>
 #include <cassert>
 #include <condition_variable>
+#include <iterator>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <unordered_map>
 
@@ -28,6 +30,8 @@ uint64_t allocateSession() {
     return (UINT64_C(2) << 56) | n;
 }
 using Clock = std::chrono::steady_clock;
+// Merge-owner requests a session holds unanswered at once, internal re-claims included.
+constexpr size_t kMaxMergeOwnerRequests = 16;
 class Session final : public ScheduledOperation, public DispatchJob {
     enum Phase : unsigned { Start = 1, Read = 2, Write = 4, Finish = 8 };
     struct Message {
@@ -41,16 +45,24 @@ class Session final : public ScheduledOperation, public DispatchJob {
         grpc::ClientContext context;
         grpc::Status status;
         std::unique_ptr<grpc::ClientAsyncReaderWriter<rpc::JoinSessionRequest, rpc::JoinSessionResponse>> stream;
-        rpc::JoinSessionRequest header, keepaliveFrame;
+        rpc::JoinSessionRequest header, keepaliveFrame, ownerFrame;
         rpc::JoinSessionResponse incoming;
         SessionKeepalive keepalive;
         std::unique_ptr<CompletionTag> finishTag;
         std::shared_ptr<Message> active;
         uint64_t generation = 0, authGeneration = 0, authFailure = 0;
         Clock::time_point started{}, completed{}, written{}; // written: CQ receipt of the last write.
+        // A reconnect attempt's first-response deadline: max until the session has opened and once the attempt's
+        // Connected is validated. An attempt cancelled at it is timedOut.
+        Clock::time_point firstResponseDeadline = Clock::time_point::max();
         unsigned pending = 0, successful = 0; // Protected by session mutex.
         bool startDone = false, reading = false, writing = false, finishing = false, finished = false;
         bool broken = false, headerWritten = false, connected = false, issued = false, finishOk = false;
+        bool timedOut = false;
+        // mergeOwner: this attempt's Connected negotiated the lease; ownerWrite: the write in flight is a
+        // merge-owner frame.
+        bool mergeOwner = false, ownerWrite = false;
+        CallSlot slot; // On the session's stream reservation, from preparation until the attempt settles.
         explicit Attempt(PendingBytes bytes) : receiveReservation(std::move(bytes)) {}
     };
     struct Tag final : CompletionTag {
@@ -66,17 +78,36 @@ class Session final : public ScheduledOperation, public DispatchJob {
             owner->completed(attempt, phase, ok, received);
         }
     };
+    // What an answered merge-owner request delivers; filled before its completion runs.
+    struct OwnerReply {
+        OmniUsdLiveResult result = OMNI_USD_LIVE_OK;
+        uint32_t outcome = 0, supported = 0, held = 0;
+        uint64_t epoch = 0;
+        bool ownerPresent = false;
+        std::string owner, user;
+    };
+    // A merge-owner request bound to the connection (generation) it was issued on. A request with no Request is
+    // the session's own re-claim after a reconnect, which only produces its event.
+    struct OwnerRequest {
+        uint64_t id = 0, generation = 0;
+        uint32_t action = 0;
+        bool written = false;
+        std::shared_ptr<Request> request;
+        std::shared_ptr<OwnerReply> reply;
+        std::function<void()> completion;
+    };
 public:
     Runtime& runtime;
     const uint64_t handle, endpointHandle;
     const std::string uri, sessionId, app;
+    const bool mergeOwner_; // The join asked for the merge-owner lease.
     uint64_t subject = 0;
-    Session(Runtime& r, EndpointLease lease, uint64_t id, const LiveUri& parsed, std::string application, void* data,
-        OmniUsdLiveSessionCallback function, void (*afterPrepare)(void*, uint64_t) noexcept = nullptr,
-        void* afterPrepareContext = nullptr)
+    Session(Runtime& r, EndpointLease lease, std::shared_ptr<StreamReservation> stream, uint64_t id,
+        const LiveUri& parsed, std::string application, void* data, OmniUsdLiveSessionCallback function,
+        bool mergeOwner, void (*afterPrepare)(void*, uint64_t) noexcept = nullptr, void* afterPrepareContext = nullptr)
         : runtime(r), handle(id), endpointHandle(lease->handle), uri(parsed.canonical), sessionId(parsed.sessionId),
-          app(std::move(application)), endpoint_(std::move(lease)), user_(data), callback_(function),
-          messages_(r.options.values.max_pending_messages_per_session),
+          app(std::move(application)), mergeOwner_(mergeOwner), endpoint_(std::move(lease)), stream_(std::move(stream)),
+          user_(data), callback_(function), messages_(r.options.values.max_pending_messages_per_session),
           peers_({r.options.values.max_pending_messages_per_session, r.options.values.max_pending_bytes_per_endpoint,
                      kMaxUriBytes},
               r.options.values.peer_reconciliation_grace_ms),
@@ -177,6 +208,81 @@ public:
         messageRejected(size, OMNI_USD_LIVE_INTERNAL_ERROR);
         throw;
     }
+    std::shared_ptr<Request> requestMergeOwner(uint32_t action, void* user, OmniUsdLiveMergeOwnerCallback cb) {
+        if (!cb || action < OMNI_USD_LIVE_MERGE_OWNER_CLAIM || action > OMNI_USD_LIVE_MERGE_OWNER_VERIFY)
+            throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto refused = ownerAdmissionLocked();
+            if (refused != OMNI_USD_LIVE_OK) throw refused;
+        }
+        // Everything the answer needs is allocated before admission, so delivery never allocates.
+        auto reply = std::make_shared<OwnerReply>();
+        std::function<void()> completion = [reply, user, cb] {
+            if (reply->result != OMNI_USD_LIVE_OK) {
+                cb(user, reply->result, nullptr);
+                return;
+            }
+            auto event = ownerEvent(*reply);
+            cb(user, OMNI_USD_LIVE_OK, &event);
+        };
+        // The list node is spliced in under the mutex, which allocates nothing.
+        std::list<OwnerRequest> node(1);
+        auto& entry = node.front();
+        entry.action = action;
+        entry.reply = reply;
+        entry.completion = std::move(completion);
+        auto box = std::make_shared<std::atomic<uint64_t>>(0);
+        std::weak_ptr<Session> weak = self();
+        auto request = runtime.requests->create(endpointHandle, OMNI_USD_LIVE_OPERATION_JOIN, [weak, box] {
+            if (auto session = weak.lock()) session->cancelOwnerRequest(box->load(std::memory_order_acquire));
+        });
+        box->store(request->handle, std::memory_order_release);
+        entry.request = request;
+        OmniUsdLiveResult refused;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            refused = ownerAdmissionLocked();
+            if (refused == OMNI_USD_LIVE_OK) {
+                entry.id = ++ownerRequestId_;
+                entry.generation = generation_;
+                ownerRequests_.splice(ownerRequests_.end(), node);
+                if (action == OMNI_USD_LIVE_MERGE_OWNER_CLAIM) wantOwner_ = true;
+                if (action == OMNI_USD_LIVE_MERGE_OWNER_RELEASE) wantOwner_ = false;
+            }
+        }
+        if (refused != OMNI_USD_LIVE_OK) {
+            OmniUsdLiveRequestError error{};
+            error.result = refused;
+            request->finish(error, {});
+            (void)runtime.requests->release(request->handle);
+            throw refused;
+        }
+        wake();
+        return request;
+    }
+    OmniUsdLiveResult mergeOwnerView(OmniUsdLiveMergeOwner* out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!subject) return OMNI_USD_LIVE_INVALID_HANDLE;
+        out->supported = ownerSupported_;
+        out->held = ready_ && ownerHeld_;
+        out->owned = ready_ && ownerOwned_;
+        out->epoch = ownerEpoch_;
+        return OMNI_USD_LIVE_OK;
+    }
+    // The cancellation hook of a merge-owner request: an unanswered request settles CANCELLED, which suppresses
+    // its callback. A request already answered or dropped is not found.
+    void cancelOwnerRequest(uint64_t request) noexcept {
+        std::list<OwnerRequest> found;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto it = std::find_if(ownerRequests_.begin(), ownerRequests_.end(),
+                [&](const OwnerRequest& entry) { return entry.request && entry.request->handle == request; });
+            if (it == ownerRequests_.end()) return;
+            found.splice(found.end(), ownerRequests_, it);
+        }
+        finishOwner(found.front(), OMNI_USD_LIVE_CANCELLED);
+    }
     OmniUsdLiveResult close(uint32_t timeout) {
         const auto deadline = Clock::now() + std::chrono::milliseconds(timeout);
         std::shared_ptr<Attempt> call;
@@ -198,11 +304,13 @@ public:
     }
     void detach() {
         EndpointLease retired;
+        std::shared_ptr<StreamReservation> stream;
         uint64_t removed = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(stopped_ && !scheduled_ && !tags_);
             retired = std::move(endpoint_);
+            stream = std::move(stream_);
             removed = subject;
             subject = 0;
         }
@@ -214,6 +322,10 @@ public:
     }
     void expireKeepaliveForTest() noexcept {
         expireKeepalive_.store(true, std::memory_order_release);
+        wake();
+    }
+    void expireAttemptForTest() noexcept {
+        expireAttempt_.store(true, std::memory_order_release);
         wake();
     }
     OmniUsdLiveResult snapshot(OmniUsdLiveStatus* out) {
@@ -235,6 +347,9 @@ public:
     }
 private:
     EndpointLease endpoint_;
+    // The session's unit of the endpoint's stream share, which each join
+    // attempt rides on, one at a time, across every rejoin.
+    std::shared_ptr<StreamReservation> stream_;
     void* user_;
     OmniUsdLiveSessionCallback callback_;
     mutable std::mutex mutex_;
@@ -250,7 +365,13 @@ private:
     bool ready_ = false, opened_ = false, authWait_ = false, callbackDisabled_ = false, failureDelivered_ = false;
     OmniUsdLiveResult failure_ = OMNI_USD_LIVE_OK, transient_ = OMNI_USD_LIVE_OK;
     bool grpcPresent_ = false;
-    std::atomic<bool> expirePeers_{false}, expireKeepalive_{false};
+    std::atomic<bool> expirePeers_{false}, expireKeepalive_{false}, expireAttempt_{false};
+    // Merge-owner state, under mutex_: unanswered requests in issue order; the next request ID; the intent an
+    // accepted CLAIM sets and an accepted RELEASE clears; whether the latest Connection negotiated the lease;
+    // whether the service last named this connection, or anyone, as the holder; and the latest epoch it reported.
+    std::list<OwnerRequest> ownerRequests_;
+    uint64_t ownerRequestId_ = 0, ownerEpoch_ = 0;
+    bool wantOwner_ = false, ownerSupported_ = false, ownerHeld_ = false, ownerOwned_ = false;
     int32_t grpcCode_ = 0;
     uint64_t grpcGeneration_ = 0;
     Clock::time_point openDeadline_, retryAt_{}, authDeadline_;
@@ -306,6 +427,50 @@ private:
         if (closing_ || stopped_) return OMNI_USD_LIVE_CANCELLED;
         if (count_ >= messages_.size()) return OMNI_USD_LIVE_RESOURCE_EXHAUSTED;
         return OMNI_USD_LIVE_OK;
+    }
+    // Caller holds mutex_. A terminal failure, then Leave, then a join that did not opt in, then a join that is
+    // not READY, then a connection that did not negotiate the lease, then a full request list.
+    OmniUsdLiveResult ownerAdmissionLocked() const noexcept {
+        if (failure_ != OMNI_USD_LIVE_OK) return failure_;
+        if (closing_ || stopped_) return OMNI_USD_LIVE_CANCELLED;
+        if (!mergeOwner_) return OMNI_USD_LIVE_UNSUPPORTED;
+        if (!ready_) return OMNI_USD_LIVE_UNAVAILABLE;
+        if (!ownerSupported_) return OMNI_USD_LIVE_UNSUPPORTED;
+        if (ownerRequests_.size() >= kMaxMergeOwnerRequests) return OMNI_USD_LIVE_RESOURCE_EXHAUSTED;
+        return OMNI_USD_LIVE_OK;
+    }
+    static OmniUsdLiveSessionEvent ownerEvent(const OwnerReply& reply) noexcept {
+        OmniUsdLiveSessionEvent event{};
+        event.struct_size = sizeof(event);
+        event.abi_version = OMNI_USD_LIVE_ABI_VERSION;
+        event.kind = OMNI_USD_LIVE_EVENT_MERGE_OWNER;
+        event.result = OMNI_USD_LIVE_OK;
+        event.connection_id = reply.ownerPresent ? reply.owner.c_str() : nullptr;
+        event.user_name = reply.ownerPresent ? reply.user.c_str() : nullptr;
+        event.merge_owner_supported = reply.supported;
+        event.merge_owner_held = reply.held;
+        event.merge_owner_outcome = reply.outcome;
+        event.merge_owner_epoch = reply.epoch;
+        return event;
+    }
+    // Settles one removed merge-owner request; an internal re-claim has nothing to settle.
+    static void finishOwner(OwnerRequest& entry, OmniUsdLiveResult result) noexcept {
+        if (!entry.request) return;
+        if (result != OMNI_USD_LIVE_OK) entry.reply->result = result;
+        OmniUsdLiveRequestError error{};
+        error.result = entry.reply->result;
+        error.attempt_id = entry.generation;
+        entry.request->finish(error, std::move(entry.completion));
+    }
+    // Caller holds mutex_. Removes the requests bound to one connection, or every request when generation is zero.
+    std::list<OwnerRequest> takeOwnerRequestsLocked(uint64_t generation) noexcept {
+        std::list<OwnerRequest> taken;
+        for (auto it = ownerRequests_.begin(); it != ownerRequests_.end();) {
+            const auto next = std::next(it);
+            if (!generation || it->generation == generation) taken.splice(taken.end(), ownerRequests_, it);
+            it = next;
+        }
+        return taken;
     }
     void messageRejected(uint64_t bytes, OmniUsdLiveResult result) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -363,19 +528,23 @@ private:
         if (call) call->context.TryCancel();
     }
     void deliver(uint32_t kind, OmniUsdLiveResult result, const std::string& id, const std::string* user = nullptr,
-        const std::string* appName = nullptr, const std::string* bytes = nullptr) {
+        const std::string* appName = nullptr, const std::string* bytes = nullptr, uint32_t ownerOutcome = 0) {
         OmniUsdLiveSessionCallback callback;
+        OmniUsdLiveSessionEvent event{};
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (closing_ || callbackDisabled_) return;
             callback = callback_;
+            event.merge_owner_supported = ownerSupported_;
+            event.merge_owner_held = ready_ && ownerHeld_;
+            event.merge_owner_epoch = ownerEpoch_;
         }
         if (!callback) return;
-        OmniUsdLiveSessionEvent event{};
         event.struct_size = sizeof(event);
         event.abi_version = OMNI_USD_LIVE_ABI_VERSION;
         event.kind = kind;
         event.result = result;
+        event.merge_owner_outcome = ownerOutcome;
         event.connection_id = id.empty() ? nullptr : id.c_str();
         event.user_name = user ? user->c_str() : nullptr;
         event.app_name = appName ? appName->c_str() : nullptr;
@@ -421,11 +590,26 @@ private:
             connection_.swap(owned);
             call->connected = true;
             call->keepalive.connected(frame.connected().keepalive_interval_ms());
+            // Only a join that asked for the lease may see it negotiated; anything else ignores the field.
+            call->mergeOwner = mergeOwner_ && frame.connected().merge_owner();
+            std::list<OwnerRequest> reclaim;
+            if (call->mergeOwner) {
+                reclaim.emplace_back();
+                reclaim.front().generation = call->generation;
+                reclaim.front().action = OMNI_USD_LIVE_MERGE_OWNER_CLAIM;
+            }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 // Leave can win after step() inspected the completion batch.
                 // Do not announce readiness after its CLOSING publication.
                 if (closing_ || failure_ != OMNI_USD_LIVE_OK) return;
+                // A connection starts owning nothing; a join that still wants the lease claims it again.
+                ownerSupported_ = call->mergeOwner;
+                ownerHeld_ = ownerOwned_ = false;
+                if (call->mergeOwner && wantOwner_ && ownerRequests_.size() < kMaxMergeOwnerRequests) {
+                    reclaim.front().id = ++ownerRequestId_;
+                    ownerRequests_.splice(ownerRequests_.end(), reclaim);
+                }
                 ready_ = opened_ = true;
                 authWait_ = false;
                 attempts_ = 0;
@@ -460,7 +644,62 @@ private:
             }
             deliver(OMNI_USD_LIVE_EVENT_MESSAGE, OMNI_USD_LIVE_OK, message.connection_id(), nullptr, nullptr,
                 &message.data());
-        } else throw OmniUsdLiveResult(OMNI_USD_LIVE_MALFORMED_STREAM);
+        } else if (frame.has_merge_owner() && call->mergeOwner) {
+            consumeOwner(call, frame.merge_owner());
+        } else throw OmniUsdLiveResult(OMNI_USD_LIVE_MALFORMED_STREAM); // Arm 5 included, unless negotiated.
+    }
+    // Records the service's merge-owner state for this connection, settles the request it answers, and delivers it.
+    void consumeOwner(const std::shared_ptr<Attempt>& call, const rpc::MergeOwnerState& state) {
+        SessionPeers::validateText(state.owner_connection_id(), true, kMaxUriBytes);
+        SessionPeers::validateText(state.owner_user_name(), true, kMaxUriBytes);
+        const std::string owner = state.owner_connection_id(), user = state.owner_user_name();
+        // The answer's own copies, swapped into its reply without allocating.
+        std::string replyOwner = owner, replyUser = user;
+        const auto outcome = static_cast<uint32_t>(state.outcome());
+        // A connection that has broken holds nothing, even when an answer it had already received names it.
+        const bool held = !call->broken && !owner.empty() && owner == connection_;
+        // An owner change that leaves the lease free is claimed again while the join still wants it, as when the
+        // service drops this join's earlier connection after a reconnect's claim found it still holding.
+        std::list<OwnerRequest> reclaim;
+        if (!state.request_id() && owner.empty() && !call->broken) {
+            reclaim.emplace_back();
+            reclaim.front().generation = call->generation;
+            reclaim.front().action = OMNI_USD_LIVE_MERGE_OWNER_CLAIM;
+        }
+        std::list<OwnerRequest> answered;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (closing_ || failure_ != OMNI_USD_LIVE_OK) return;
+            ownerOwned_ = !owner.empty() && !call->broken;
+            ownerHeld_ = held;
+            ownerEpoch_ = state.epoch();
+            if (!reclaim.empty() && wantOwner_ && ownerRequests_.size() < kMaxMergeOwnerRequests &&
+                std::none_of(ownerRequests_.begin(), ownerRequests_.end(), [&](const OwnerRequest& e) {
+                return e.generation == call->generation && e.action == OMNI_USD_LIVE_MERGE_OWNER_CLAIM;
+            })) {
+                reclaim.front().id = ++ownerRequestId_;
+                ownerRequests_.splice(ownerRequests_.end(), reclaim);
+            }
+            if (state.request_id()) {
+                const auto it = std::find_if(ownerRequests_.begin(), ownerRequests_.end(), [&](const OwnerRequest& e) {
+                    return e.id == state.request_id() && e.generation == call->generation && e.written;
+                });
+                if (it != ownerRequests_.end()) answered.splice(answered.end(), ownerRequests_, it);
+            }
+        }
+        if (!answered.empty() && answered.front().request) {
+            auto& reply = *answered.front().reply;
+            reply.owner.swap(replyOwner);
+            reply.user.swap(replyUser);
+            reply.ownerPresent = !owner.empty();
+            reply.outcome = outcome;
+            reply.epoch = state.epoch();
+            reply.supported = 1;
+            reply.held = held;
+            finishOwner(answered.front(), OMNI_USD_LIVE_OK);
+        }
+        deliver(OMNI_USD_LIVE_EVENT_MERGE_OWNER, OMNI_USD_LIVE_OK, owner, owner.empty() ? nullptr : &user, nullptr,
+            nullptr, outcome);
     }
     bool authenticate(Clock::time_point now, Clock::time_point& next) {
         bool usable, failed, rejected;
@@ -532,11 +771,19 @@ private:
         header->set_user_application(app);
         // Every join opts in; only a Connected that reports an interval starts keepalives.
         header->set_client_keepalive(true);
+        // Only a join the host opted in asks for the merge-owner lease, so no other join can receive its frames.
+        header->set_merge_owner(mergeOwner_);
         call->header.set_allocated_header(header.get());
         (void)header.release();
         auto keepalive = std::make_unique<rpc::JoinSessionKeepalive>();
         call->keepaliveFrame.set_allocated_keepalive(keepalive.get());
         (void)keepalive.release();
+        if (mergeOwner_) {
+            auto owner = std::make_unique<rpc::MergeOwnerRequest>();
+            call->ownerFrame.set_allocated_merge_owner(owner.get());
+            (void)owner.release();
+        }
+        call->slot = stream_->open();
         call->stream = endpoint_->stub->PrepareAsyncJoinSession(&call->context, &runtime.queue());
         if (!call->stream) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
         auto tag = prepareTag(call, Start);
@@ -547,6 +794,11 @@ private:
             generation_ = call->generation;
             ++attempts_;
             call->started = Clock::now();
+            // The initial join is bounded by the open deadline; each reconnect attempt has as long for its
+            // Connected as an initial open has (design section 12).
+            if (opened_)
+                call->firstResponseDeadline = call->started +
+                    std::chrono::milliseconds(runtime.options.values.initial_open_timeout_ms);
             call->issued = true;
             runtime.diagnostics->startedRpc(OMNI_USD_LIVE_OPERATION_JOIN);
             call->stream->StartCall(submitTag(tag, *runtime.diagnostics));
@@ -558,18 +810,34 @@ private:
         call->reading = true;
         call->stream->Read(&call->incoming, submitTag(tag, *runtime.diagnostics));
     }
-    // Writes the header, else the FIFO head, else a due keepalive. A
-    // keepalive takes no request, FIFO slot or pending bytes, and it is never
+    // Writes the header, else this connection's oldest unwritten merge-owner
+    // request, else the FIFO head, else a due keepalive. A merge-owner request
+    // or keepalive takes no FIFO slot or pending bytes, and a keepalive is never
     // issued while another write is in flight or a message is queued.
     void write(const std::shared_ptr<Attempt>& call, Clock::time_point now) {
         std::shared_ptr<Message> message;
+        uint64_t ownerId = 0;
+        uint32_t ownerAction = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (closing_ || failure_ != OMNI_USD_LIVE_OK) return;
-            if (call->headerWritten && call->connected && count_) message = messages_[head_];
+            if (call->headerWritten && call->connected && call->mergeOwner)
+                for (auto& entry : ownerRequests_)
+                    if (entry.generation == call->generation && !entry.written) {
+                        entry.written = true;
+                        ownerId = entry.id;
+                        ownerAction = entry.action;
+                        break;
+                    }
+            if (!ownerId && call->headerWritten && call->connected && count_) message = messages_[head_];
+        }
+        if (ownerId) {
+            auto& request = *call->ownerFrame.mutable_merge_owner(); // Allocated with the attempt.
+            request.set_request_id(ownerId);
+            request.set_action(static_cast<rpc::MergeOwnerAction>(ownerAction));
         }
         bool keepalive = false;
-        if (call->headerWritten && !message) {
+        if (call->headerWritten && !message && !ownerId) {
             if (!call->connected) return;
             const bool expired = expireKeepalive_.load(std::memory_order_acquire);
             if (!call->keepalive.due(expired ? Clock::time_point::max() : now, false, false)) return;
@@ -578,9 +846,13 @@ private:
         }
         auto tag = prepareTag(call, Write);
         call->active = std::move(message);
+        call->ownerWrite = ownerId != 0;
         call->writing = true;
         // Chosen before submitTag: its release is the last access before completion.
-        const auto& frame = call->active ? call->active->frame : keepalive ? call->keepaliveFrame : call->header;
+        const auto& frame = call->active ? call->active->frame :
+            call->ownerWrite             ? call->ownerFrame :
+            keepalive                    ? call->keepaliveFrame :
+                                           call->header;
         call->stream->Write(frame, submitTag(tag, *runtime.diagnostics));
     }
     void finishTransport(const std::shared_ptr<Attempt>& call) {
@@ -590,10 +862,25 @@ private:
         call->finishing = true;
         call->stream->Finish(&call->status, submitTag(tag, *runtime.diagnostics));
     }
+    // A reconnect attempt the service accepted without sending its Connected by the attempt's first-response
+    // deadline is cancelled; it settles TIMEOUT and counts as a failed reconnect attempt (design section 12). A
+    // connected stream keeps no deadline however long it stays quiet.
+    void checkFirstResponse(Attempt& call, Clock::time_point now, Clock::time_point& next) {
+        const bool expired = expireAttempt_.exchange(false, std::memory_order_acq_rel);
+        if (call.connected || call.broken || call.finishing || call.finished ||
+            call.firstResponseDeadline == Clock::time_point::max())
+            return;
+        if (expired || now >= call.firstResponseDeadline) {
+            call.timedOut = call.broken = true;
+            call.context.TryCancel();
+        } else next = std::min(next, call.firstResponseDeadline);
+    }
     void settle(const std::shared_ptr<Attempt>& call) {
         auto result = call->finishOk ? classifyUnary(call->status.error_code(), false) :
                                        OmniUsdLiveResult(OMNI_USD_LIVE_INTERNAL_ERROR);
         if (result == OMNI_USD_LIVE_OK) result = OMNI_USD_LIVE_UNAVAILABLE;
+        // The cancellation this session issued at the first-response deadline is the attempt's timeout.
+        if (call->timedOut && result == OMNI_USD_LIVE_CANCELLED) result = OMNI_USD_LIVE_TIMEOUT;
         if (call->finishOk) runtime.auth->completed(*endpoint_, call->authGeneration, call->status.error_code());
         runtime.diagnostics->observeRpc(endpointHandle, OMNI_USD_LIVE_OPERATION_JOIN, result,
             static_cast<uint64_t>(
@@ -601,13 +888,22 @@ private:
             0, call->generation, call->finishOk, call->finishOk ? call->status.error_code() : 0, subject,
             call->generation, call->authGeneration, 0, handle);
         peers_.disconnected(call->generation);
+        call->slot.reset(); // Closed before a rejoin opens the next call on the reservation.
         bool closed, terminal;
+        std::list<OwnerRequest> dropped;
+        OmniUsdLiveResult droppedResult;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             call_.reset();
             ready_ = false;
+            ownerHeld_ = ownerOwned_ = false;
             closed = closing_;
             terminal = failure_ != OMNI_USD_LIVE_OK;
+            // Requests are never re-sent on a later connection.
+            dropped = takeOwnerRequestsLocked(call->generation);
+            droppedResult = terminal ? failure_ :
+                closed               ? OmniUsdLiveResult(OMNI_USD_LIVE_CANCELLED) :
+                                       OmniUsdLiveResult(OMNI_USD_LIVE_UNAVAILABLE);
             if (!terminal) {
                 grpcPresent_ = call->finishOk;
                 grpcCode_ = call->finishOk ? call->status.error_code() : 0;
@@ -615,6 +911,7 @@ private:
                 transient_ = result;
             }
         }
+        for (auto& entry : dropped) finishOwner(entry, droppedResult);
         // Failed write bytes remain at the FIFO head. Replaying a session
         // message is explicitly nondurable and may duplicate peer delivery.
         if (closed || terminal) return;
@@ -730,6 +1027,7 @@ private:
                     }
                 }
                 call->active.reset();
+                call->ownerWrite = false;
             }
             if (pending & Read) {
                 call->reading = false;
@@ -744,10 +1042,16 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 stopping = closing_ || failure_ != OMNI_USD_LIVE_OK;
             }
+            if (!stopping) checkFirstResponse(*call, now, next);
             // Remote EOF/failed Write already end the transport. Cancellation
             // here could replace the service's permission/auth status with
             // CANCELLED before Finish observes it. Local stop alone cancels.
-            if (stopping || call->broken) peers_.disconnected(call->generation);
+            if (stopping || call->broken) {
+                peers_.disconnected(call->generation);
+                // A connection that is ending holds nothing, from the moment it breaks.
+                std::lock_guard<std::mutex> lock(mutex_);
+                ownerHeld_ = ownerOwned_ = false;
+            }
             if (stopping) call->context.TryCancel();
             if (call->finished) {
                 size_t tags;
@@ -777,6 +1081,15 @@ private:
         if (stopping) {
             if (!call) {
                 notifyFailure();
+                std::list<OwnerRequest> dropped;
+                OmniUsdLiveResult droppedResult;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    dropped = takeOwnerRequestsLocked(0);
+                    droppedResult = failure_ != OMNI_USD_LIVE_OK ? failure_ :
+                                                                   OmniUsdLiveResult(OMNI_USD_LIVE_CANCELLED);
+                }
+                for (auto& entry : dropped) finishOwner(entry, droppedResult);
                 // Message payloads and peer metadata are destroyed only on this
                 // worker. No user callbacks can start after the close marker.
                 for (;;) {
@@ -813,7 +1126,12 @@ private:
                 return failure_ != OMNI_USD_LIVE_OK ? now : next;
             }
             if (now < retryAt_) next = std::min(next, retryAt_);
-            else startAttempt();
+            else {
+                startAttempt();
+                // A rejoin's deadline runs from its start, even while its transport has not answered at all.
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (call_) next = std::min(next, call_->firstResponseDeadline);
+            }
         }
         return next;
     }
@@ -868,8 +1186,9 @@ SessionRegistry::~SessionRegistry() {
     (void)waitForShutdown(Clock::time_point::max());
 }
 OmniUsdLiveSession SessionRegistry::join(const LiveUri& uri, std::string app, void* user,
-    OmniUsdLiveSessionCallback callback) {
-    if (!callback || !uri.layerName.empty()) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+    OmniUsdLiveSessionCallback callback, uint32_t flags) {
+    if (!callback || !uri.layerName.empty() || (flags & ~uint32_t(OMNI_USD_LIVE_JOIN_MERGE_OWNER)))
+        throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
     try {
         SessionPeers::validateText(app, false, kMaxUriBytes);
     } catch (OmniUsdLiveResult result) {
@@ -894,8 +1213,13 @@ OmniUsdLiveSession SessionRegistry::join(const LiveUri& uri, std::string app, vo
         afterPrepare = impl_->afterPrepare;
         afterPrepareContext = impl_->afterPrepareContext;
     }
-    auto session = std::make_shared<Session>(impl_->runtime, std::move(lease), id, uri, std::move(app), user, callback,
-        afterPrepare, afterPrepareContext);
+    // The join holds a unit of the endpoint's stream share for the session's
+    // life, across every rejoin; a full share refuses it before any RPC.
+    auto stream = lease->calls->reserveStream(OMNI_USD_LIVE_OPERATION_JOIN);
+    if (!stream) throw OmniUsdLiveResult(OMNI_USD_LIVE_RESOURCE_EXHAUSTED);
+    auto session = std::make_shared<Session>(impl_->runtime, std::move(lease), std::move(stream), id, uri,
+        std::move(app), user, callback, (flags & OMNI_USD_LIVE_JOIN_MERGE_OWNER) != 0, afterPrepare,
+        afterPrepareContext);
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (impl_->stopping) throw OmniUsdLiveResult(OMNI_USD_LIVE_BUSY);
@@ -937,11 +1261,24 @@ std::shared_ptr<Request> SessionRegistry::send(OmniUsdLiveSession id, const void
     if (!session) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_HANDLE);
     return session->send(bytes, size, user, callback);
 }
+std::shared_ptr<Request> SessionRegistry::requestMergeOwner(OmniUsdLiveSession id, uint32_t action, void* user,
+    OmniUsdLiveMergeOwnerCallback callback) {
+    auto session = impl_->find(id);
+    if (!session) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_HANDLE);
+    return session->requestMergeOwner(action, user, callback);
+}
+OmniUsdLiveResult SessionRegistry::mergeOwner(OmniUsdLiveSession id, OmniUsdLiveMergeOwner* out) {
+    auto session = impl_->find(id);
+    return session ? session->mergeOwnerView(out) : OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_HANDLE);
+}
 void SessionRegistry::expirePeersForTest(OmniUsdLiveSession id) noexcept {
     if (auto session = impl_->find(id)) session->expirePeersForTest();
 }
 void SessionRegistry::expireKeepaliveForTest(OmniUsdLiveSession id) noexcept {
     if (auto session = impl_->find(id)) session->expireKeepaliveForTest();
+}
+void SessionRegistry::expireAttemptForTest(OmniUsdLiveSession id) noexcept {
+    if (auto session = impl_->find(id)) session->expireAttemptForTest();
 }
 void SessionRegistry::setAfterPrepareForTest(void (*hook)(void*, uint64_t) noexcept, void* context) noexcept {
     std::lock_guard<std::mutex> lock(impl_->mutex);

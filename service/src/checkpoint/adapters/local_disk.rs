@@ -111,11 +111,11 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::super::store::{
-    parse_layer_artifact_filename, parse_layer_artifact_stem, CheckpointBlob, CheckpointError,
-    CheckpointHandle, CheckpointKind, CheckpointMeta, CheckpointStore, LayerArtifact,
-    LayerArtifactKind, ListedSidecarAbsent, LiveExtSet, MissingMetaCompanion, EXT_REFS_SUFFIX,
-    META_SUFFIX, OMPF_SUFFIX, SESSION_CHECKPOINT_SUFFIX, TAIL_META_SUFFIX, TAIL_SUFFIX,
-    TEMP_SUFFIX,
+    parse_layer_artifact_filename, parse_layer_artifact_stem, AbsentSidecar, CheckpointBlob,
+    CheckpointError, CheckpointHandle, CheckpointKind, CheckpointMeta, CheckpointStore,
+    LayerArtifact, LayerArtifactKind, ListedSidecarAbsent, LiveExtSet, MissingMetaCompanion,
+    EXT_REFS_SUFFIX, META_SUFFIX, OMPF_SUFFIX, SESSION_CHECKPOINT_SUFFIX, TAIL_META_SUFFIX,
+    TAIL_SUFFIX, TEMP_SUFFIX,
 };
 
 use super::{generation_sort_key, validate_generation_identity, validate_tail_put};
@@ -965,33 +965,39 @@ impl CheckpointStore for LocalDiskCheckpointStore {
         // b.s5y. The rule is: **the ext-refs sidecar must be visible no
         // later than the OMPF whose blobs it protects.**
         //
-        // The retention-prune cascade in `checkpointer::prune_old_generations`
-        // computes `prunable = pruned_hashes − live_hashes`, where the live
-        // set comes from `list_referenced_ext_hashes` — which enumerates
-        // `*.ext-refs.json`. Under duplicate leadership (two replicas holding
-        // the lock across a lapse, which no TTL can make impossible — one
-        // adapter call can outlive the lease) one replica can be mid-`put` for
-        // a new generation while the other runs the cascade. If the OMPF
+        // The reconciliation collect (`checkpointer::run_reconcile_collect`;
+        // the retention prune only tombstones) deletes the ext blobs whose
+        // tombstones aged and that no sidecar in its live set names, where
+        // the live set comes from `list_live_ext_set` — which enumerates
+        // `*.ext-refs.json`. The clean-up runs on its own task, and no lock
+        // keeps backup writers out of it (b.g65), so one replica can be
+        // mid-`put` for a new generation while the collect walks. If the OMPF
         // landed first, the in-flight generation's ext-refs would still be
         // invisible to the live set, so hashes only that generation
-        // references classify as prunable and the cascade deletes blobs a
-        // *durable* checkpoint points at — a checkpoint that restores with
-        // dangling ext-refs, i.e. silent unrecoverable data loss on a real DR
-        // restore.
+        // references would look unreferenced and the collect could delete
+        // blobs a *durable* checkpoint points at — a checkpoint that restores
+        // with dangling ext-refs, i.e. silent unrecoverable data loss on a
+        // real DR restore.
         //
         // Sidecar-first **shrinks** that window rather than closing it: the
         // generation is invisible to the live set only until the sidecar
         // lands, instead of until the OMPF lands. On this adapter the sidecar
         // is the first write, so the residual is a single `atomic_write`
-        // wide — but it is not zero, and the lease gate at the cascade's call
-        // site is what keeps a peer from entering it. See
-        // `checkpointer::prune_old_generations` for the precise residual.
+        // wide — but it is not zero. The collect does not rely on this
+        // ordering alone (b.g65): every producer re-arms the hashes its
+        // sidecar names immediately before the PUT (`checkpoint::put_guard`),
+        // and the collect's delete-time fence refuses a hash re-armed after
+        // the threshold its snapshot is anchored to, so a sidecar published
+        // while the walk runs cannot lose its hashes to a delete (SDD
+        // §22.17.3, §22.17.5). This ordering is what keeps the
+        // re-arm-to-visible gap within one publish; neither it nor the fence
+        // is to be removed on the strength of the other.
         //
         // The prior comment justified OMPF-first on the grounds that "a
         // dangling sidecar pointing at a missing OMPF is the more hazardous
         // failure mode". That is wrong for this adapter's actual sidecar
         // readers, of which there are exactly two:
-        //   - the cascade's live-set union (`list_referenced_ext_hashes`),
+        //   - the collect's live-set union (`list_live_ext_set`),
         //     which *wants* the extras — an unreferenced hash in the live set
         //     costs one deferred blob delete, nothing more; and
         //   - `read_ext_refs_sidecar`, which is addressed per-handle from
@@ -1512,7 +1518,7 @@ impl CheckpointStore for LocalDiskCheckpointStore {
     /// The walk itself lives in [`Self::list_live_ext_set`] (b.oya); this
     /// method is its projection onto the hash set.
     async fn list_referenced_ext_hashes(&self) -> Result<HashSet<String>, CheckpointError> {
-        Ok(self.list_live_ext_set().await?.hashes)
+        self.list_live_ext_set().await?.into_complete_hashes()
     }
 
     /// The live-set walk [`Self::list_referenced_ext_hashes`] documents, plus
@@ -1520,7 +1526,10 @@ impl CheckpointStore for LocalDiskCheckpointStore {
     /// pass [`parse_layer_artifact_filename`] accepts, of any kind — counted
     /// before the `.ext-refs.json` filter, so it equals what
     /// `list_layer_artifacts` would report from that pass (b.oya; see the
-    /// trait doc). A missing `layers/` directory yields `(∅, 0)`.
+    /// trait doc). A missing `layers/` directory yields `(∅, 0)`. The whole
+    /// listing is taken before any sidecar is read, and a listed sidecar that
+    /// then reads absent is reported in `absent` with whether the listing
+    /// named its `.ompf` (b.g65).
     ///
     /// Injects under the `list_referenced_ext_hashes` label: it is that
     /// method's walk, and the fault-injection tests target that label.
@@ -1533,8 +1542,15 @@ impl CheckpointStore for LocalDiskCheckpointStore {
             }
             Err(err) => return Err(io_to_permanent(err)),
         };
-        let mut hashes: HashSet<String> = HashSet::new();
+        // The listing first, whole: the same-request evidence (the artifact
+        // count, counted before the sidecar filter) and, since b.g65, which
+        // generations it named an `.ompf` for, which a sidecar that then
+        // reads absent is reported with.
         let mut listed_layer_artifacts: usize = 0;
+        let mut listed_bases: HashSet<(u64, u64)> = HashSet::new();
+        // Every `*.ext-refs.json` name is read, as before b.g65, with its
+        // generation when the name parses as one.
+        let mut sidecars: Vec<(Option<(u64, u64)>, PathBuf)> = Vec::new();
         loop {
             let entry = reader.next_entry().await.map_err(io_to_permanent)?;
             let Some(entry) = entry else { break };
@@ -1542,48 +1558,65 @@ impl CheckpointStore for LocalDiskCheckpointStore {
             let Some(name) = file_name.to_str() else {
                 continue;
             };
-            // The same-request evidence: counted in this very `read_dir`
-            // pass, before the sidecar filter.
-            if parse_layer_artifact_filename(name).is_some() {
+            let artifact = parse_layer_artifact_filename(name);
+            if let Some(artifact) = &artifact {
                 listed_layer_artifacts += 1;
+                if artifact.kind == LayerArtifactKind::Ompf {
+                    listed_bases.insert((artifact.object_id, artifact.snap_seq));
+                }
             }
             if !name.ends_with(".ext-refs.json") {
                 continue;
             }
-            let bytes = match tokio::fs::read(entry.path()).await {
+            let generation = artifact
+                .filter(|a| a.kind == LayerArtifactKind::ExtRefs)
+                .map(|a| (a.object_id, a.snap_seq));
+            sidecars.push((generation, entry.path()));
+        }
+        let mut hashes: HashSet<String> = HashSet::new();
+        let mut absent: Vec<AbsentSidecar> = Vec::new();
+        for (generation, path) in sidecars {
+            let bytes = match tokio::fs::read(&path).await {
                 Ok(b) => b,
-                // A sidecar the listdir just named that now reads absent is an
-                // inconsistency, never an empty sidecar (b.oya). Skipping it
-                // would drop its hashes from the live set, and the collect
-                // phase deletes every tombstoned blob that set does not name —
-                // an over-delete. The typed `ListedSidecarAbsent` `Transient`,
-                // naming the sidecar, never a partial set: the collect phase
-                // deletes nothing that pass, and decides by who holds the
-                // checkpoint lease whether the abort counts as a live-set
-                // failure — see `checkpointer::run_reconcile_collect`.
+                // A sidecar the listdir just named that now reads absent is
+                // never an empty sidecar: skipping it would drop its hashes
+                // from the live set, an over-delete. Reported, not skipped
+                // (b.g65): the collect decides on evidence whether it may
+                // skip it, and otherwise deletes nothing that pass. A name
+                // that parses as no generation cannot be explained by any
+                // evidence, so it fails the walk as the typed error.
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    return Err(CheckpointError::listed_sidecar_absent(
-                        ListedSidecarAbsent {
-                            artifact: entry.path().display().to_string(),
-                        },
-                    ));
+                    let Some((object_id, snap_seq)) = generation else {
+                        return Err(CheckpointError::listed_sidecar_absent(
+                            ListedSidecarAbsent {
+                                artifact: path.display().to_string(),
+                            },
+                        ));
+                    };
+                    absent.push(AbsentSidecar {
+                        object_id,
+                        snap_seq,
+                        base_listed: listed_bases.contains(&(object_id, snap_seq)),
+                        artifact: path.display().to_string(),
+                    });
+                    continue;
                 }
                 Err(err) => return Err(io_to_permanent(err)),
             };
             // Per SR-1.5 the sidecar is opaque at put time; parsing happens
             // here on demand. A malformed sidecar surfaces as `Permanent`
-            // (it cannot be retried into success), matching the InMemory
-            // adapter so the conformance harness sees consistent
+            // naming its path (it cannot be retried into success), matching
+            // the InMemory adapter so the conformance harness sees consistent
             // classification.
-            let parsed: ExtRefsSidecar =
-                serde_json::from_slice(&bytes).map_err(|err| CheckpointError::Permanent {
-                    source: Box::new(err),
-                })?;
+            let parsed: ExtRefsSidecar = serde_json::from_slice(&bytes).map_err(|err| {
+                CheckpointError::malformed_ext_refs_sidecar(path.display().to_string(), err)
+            })?;
             hashes.extend(parsed.ext_hashes);
         }
         Ok(LiveExtSet {
             hashes,
             listed_layer_artifacts,
+            absent,
         })
     }
 
@@ -1620,12 +1653,12 @@ impl CheckpointStore for LocalDiskCheckpointStore {
             Err(err) => return Err(io_to_permanent(err)),
         };
         // Malformed sidecar JSON classifies as `Permanent` per the trait
-        // contract — durable bytes will not parse on retry, so surface the
-        // error instead of silently dropping references for that handle.
-        let parsed: ExtRefsSidecar =
-            serde_json::from_slice(&bytes).map_err(|err| CheckpointError::Permanent {
-                source: Box::new(err),
-            })?;
+        // contract, naming the path — durable bytes will not parse on retry,
+        // so surface the error instead of silently dropping references for
+        // that handle.
+        let parsed: ExtRefsSidecar = serde_json::from_slice(&bytes).map_err(|err| {
+            CheckpointError::malformed_ext_refs_sidecar(path.display().to_string(), err)
+        })?;
         Ok(parsed.ext_hashes.into_iter().collect())
     }
 
@@ -1730,6 +1763,14 @@ impl CheckpointStore for LocalDiskCheckpointStore {
             }
         }
         Ok(removed)
+    }
+
+    /// `Ok(())` with no I/O: a listing here is a directory read of the same
+    /// filesystem every by-path read uses, so there is no separate listing
+    /// route to prove. A harness can fail it through the fault injector under
+    /// the label `verify_list_route`.
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.maybe_inject("verify_list_route")
     }
 }
 
@@ -3096,18 +3137,26 @@ mod tests {
         assert!(
             !err.is_listed_sidecar_absent(),
             "b.oya: a malformed sidecar is not the listed-sidecar-absent marker, so the collect \
-             phase counts it whoever holds the checkpoint lease; got {err:?}"
+             never reads it as an explainable absence; got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&bad.display().to_string()),
+            "b.g65 (C): the error names the malformed file by its path; got: {err}"
         );
     }
 
-    /// b.oya (decider S1) — a sidecar the listdir named that then reads
-    /// `NotFound` is `Transient`, naming the sidecar, never skipped.
+    /// b.oya (decider S1), b.g65 (N2) — a sidecar the listdir named that then
+    /// reads `NotFound` is never silently skipped: `list_referenced_ext_hashes`
+    /// fails `Transient`, naming the sidecar, and the live-set walk the collect
+    /// reads REPORTS it in `LiveExtSet::absent` — with whether the same
+    /// listing named its base's `.ompf` — so the collect decides on evidence.
     ///
     /// A dangling symlink makes the listed-then-absent state deterministic:
     /// `read_dir` names `7.1.ext-refs.json` and the read answers `NotFound`.
-    /// Skipping it would return a live set without that sidecar's hashes, and
-    /// the reconciliation collect deletes every tombstoned blob the live set
-    /// does not name. Pre-fix the walk `continue`d and answered `{"aa"}`.
+    /// Skipping it unreported would return a live set without that sidecar's
+    /// hashes, and the reconciliation collect deletes every tombstoned blob the
+    /// live set does not name. Two stems: `7.1` has no `.ompf` (an unfinished
+    /// publish), `8.1` is a complete base whose sidecar went.
     #[cfg(unix)]
     #[tokio::test]
     async fn list_referenced_ext_hashes_listed_sidecar_that_reads_absent_is_transient_naming_it() {
@@ -3124,39 +3173,75 @@ mod tests {
             .set_layer_sidecar(1, 1, sidecar_for(&["aa"]))
             .await
             .expect("sidecar 1");
+        store
+            .put_layer_checkpoint(8, 1, Bytes::from_static(b"o8"), test_meta())
+            .await
+            .expect("put 8");
         let layers_dir = root.path().join(NAMESPACE_DIR).join(LAYERS_SUBDIR);
-        crate::checkpoint::adapters::plant_dangling_sidecar(&layers_dir.join("7.1.ext-refs.json"));
+        let unfinished = layers_dir.join("7.1.ext-refs.json");
+        let listed_base = layers_dir.join("8.1.ext-refs.json");
+        crate::checkpoint::adapters::plant_dangling_sidecar(&unfinished);
+        crate::checkpoint::adapters::plant_dangling_sidecar(&listed_base);
 
         let err = match store.list_referenced_ext_hashes().await {
             Err(err) => err,
             Ok(hashes) => panic!(
-                "a listed sidecar that reads absent must fail the walk, never yield a live set \
-                 without its hashes; got Ok({hashes:?})"
+                "a listed sidecar that reads absent must fail the complete-set walk, never yield \
+                 a live set without its hashes; got Ok({hashes:?})"
             ),
         };
         assert!(
             matches!(err, CheckpointError::Transient { .. }),
-            "Transient, so the collect phase defers to the next pass; got {err:?}"
+            "Transient, so a caller retries on a later read; got {err:?}"
         );
         assert!(
             err.is_listed_sidecar_absent(),
-            "and typed as the listed-sidecar-absent marker, the one live-set failure the collect \
-             phase qualifies by who holds the checkpoint lease; got {err:?}"
+            "and typed as the listed-sidecar-absent marker; got {err:?}"
         );
+        // Either planted sidecar may be the one named: the walk reads them in
+        // `read_dir` order, and the first absence becomes the error.
+        let named = [&unfinished, &listed_base]
+            .into_iter()
+            .any(|path| err.to_string().contains(&path.display().to_string()));
         assert!(
-            err.to_string().contains("7.1.ext-refs.json"),
-            "the error must name the sidecar that read absent; got: {err}"
+            named,
+            "the error must name the sidecar that read absent, by its full path ({} or {}); got: \
+             {err}",
+            unfinished.display(),
+            listed_base.display()
         );
         // The reconciliation collect reads the walk through
-        // `list_live_ext_set`, so the marker has to survive there too — never
-        // a set, and never a count without its hashes.
-        match store.list_live_ext_set().await {
-            Err(err) => assert!(
-                err.is_listed_sidecar_absent(),
-                "list_live_ext_set must carry the same marker; got {err:?}"
-            ),
-            Ok(live) => panic!("list_live_ext_set must fail the walk too, never yield {live:?}"),
-        }
+        // `list_live_ext_set`, which reports each absence instead of failing.
+        let live = store
+            .list_live_ext_set()
+            .await
+            .expect("the live-set walk reports an absent sidecar rather than failing");
+        assert_eq!(
+            live.hashes,
+            ["aa".to_string()].into_iter().collect::<HashSet<_>>(),
+            "the readable sidecar's hashes, and only those"
+        );
+        let mut absent = live.absent.clone();
+        absent.sort_by_key(|a| a.object_id);
+        assert_eq!(
+            absent,
+            vec![
+                crate::checkpoint::store::AbsentSidecar {
+                    object_id: 7,
+                    snap_seq: 1,
+                    base_listed: false,
+                    artifact: unfinished.display().to_string(),
+                },
+                crate::checkpoint::store::AbsentSidecar {
+                    object_id: 8,
+                    snap_seq: 1,
+                    base_listed: true,
+                    artifact: listed_base.display().to_string(),
+                },
+            ],
+            "each absence is reported with its stem, its path and whether the same listing named \
+             its base's OMPF"
+        );
     }
 
     /// b.oya — a missing `layers/` directory is an empty store to the
@@ -4502,6 +4587,79 @@ mod tests {
         );
     }
 
+    /// b.g65 (decider obligation (a)): a LAYER put whose caller stops waiting
+    /// lands NOTHING afterwards. Each artifact is an awaited temp write and
+    /// then an awaited rename (`atomic_write`), so a put dropped during its
+    /// first temp write never renames anything into place: the write of the
+    /// temp file finishes on its blocking thread, and no final artifact
+    /// follows. (Unlike `put_ext_blob`, whose one blocking task owns the
+    /// bytes and finishes its rename after its caller stops waiting.) So no
+    /// layer publish can land after its clean-up fence's reliance window.
+    ///
+    /// The put is polled once with a 16 MiB sidecar — its first artifact — and
+    /// dropped; the test waits for that temp write to finish, then for a
+    /// further bounded interval in which no final artifact appears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_layer_put_dropped_mid_write_never_lands_an_artifact_afterwards() {
+        use std::time::Duration;
+        const SIDECAR_LEN: usize = 16 * 1024 * 1024;
+        let root = tempdir().expect("tempdir");
+        let store = LocalDiskCheckpointStore::new(root.path().to_path_buf()).expect("constructor");
+        let layers = root.path().join(NAMESPACE_DIR).join(LAYERS_SUBDIR);
+        let meta = CheckpointMeta {
+            sidecar_bytes: Some(Bytes::from(vec![b' '; SIDECAR_LEN])),
+            ..test_meta()
+        };
+
+        let first_poll = tokio::time::timeout(
+            Duration::ZERO,
+            store.put_layer_checkpoint(77, 3, Bytes::from_static(b"ompf"), meta),
+        )
+        .await;
+        assert!(
+            first_poll.is_err(),
+            "fixture: the put was still in flight when its caller stopped waiting"
+        );
+
+        let names = || -> Vec<(String, u64)> {
+            std::fs::read_dir(&layers)
+                .expect("read_dir layers")
+                .filter_map(Result::ok)
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        e.metadata().map(|m| m.len()).unwrap_or(0),
+                    )
+                })
+                .collect()
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !names()
+            .iter()
+            .any(|(name, len)| name.ends_with(".tmp") && *len == SIDECAR_LEN as u64)
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dropped put's temp write never finished: {:?}",
+                names()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for _ in 0..20 {
+            let finals: Vec<String> = names()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name.starts_with("77.3.") && !name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                finals.is_empty(),
+                "a layer put dropped mid-write landed {finals:?} after its caller stopped \
+                 waiting: a detached write"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Malformed sidecar: drop a non-JSON byte sequence at the canonical
     /// sidecar path and verify the per-handle reader classifies the parse
     /// failure as `Permanent`. Durable bytes will not parse on retry, so
@@ -4538,6 +4696,13 @@ mod tests {
             matches!(err, CheckpointError::Permanent { .. }),
             "malformed sidecar must classify as Permanent (durable bytes, no retry possible); got {:?}",
             err
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "ext-refs sidecar {} is malformed",
+                sidecar_path.display()
+            )),
+            "b.g65 (C): the error names the malformed file by its path; got: {err}"
         );
     }
 
@@ -6337,8 +6502,8 @@ mod tests {
     /// path-resolution error, with no fault-injection seam needed.
     ///
     /// **Deliberately not a cleared `+x` bit.** That was the first shape of this
-    /// case and it is not sound in CI: the pipeline's `rust:1.94-slim` container
-    /// runs as root, `CAP_DAC_OVERRIDE` bypasses the missing search bit outright,
+    /// case and it is not sound in CI: the test jobs' container (the CI deps
+    /// image) runs as root, `CAP_DAC_OVERRIDE` bypasses the missing search bit outright,
     /// and `metadata` would answer `Err(NotFound)` — collapsing this case into the
     /// preceding one, failing the precondition assert, and (because that panic
     /// precedes the mode restore) leaving a `0o600` directory the `TempDir`'s

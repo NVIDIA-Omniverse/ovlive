@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod allocator_purge;
 pub mod chain_gate;
 pub mod checkout;
 pub mod client;
@@ -21,6 +22,9 @@ pub mod commit_charge;
 pub mod connection_buffers;
 pub mod counters;
 pub mod diff_read;
+pub mod dr_hold;
+pub mod dr_job;
+pub mod dr_write;
 pub mod ext_backup;
 pub mod ext_index_audit;
 pub mod ext_reconcile;
@@ -38,17 +42,21 @@ pub mod member_replacement;
 pub mod memory_budget;
 pub mod no_refresh_credentials;
 pub mod notifications;
+pub mod ompf_payload;
 pub mod orphan_sweep;
 pub mod presence;
+pub mod recon_fence;
 pub mod relay_retention;
 pub mod retirement;
 pub mod retry;
 pub mod router_supervisor;
+pub mod scan_guard;
 pub mod session;
 pub mod snapshot_fence;
 pub mod snapshot_flights;
 pub mod store_memory;
 pub mod store_oom;
+pub mod stream_high_water;
 pub mod stream_mux;
 pub mod structural;
 pub mod structural_cache;

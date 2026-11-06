@@ -577,6 +577,10 @@ impl CheckpointStore for RecordingExtBackfillStore {
         self.delegate.ext_blob_exists(hash_hex).await
     }
 
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.delegate.verify_list_route().await
+    }
+
     async fn get_counters_sidecar(&self) -> Result<Option<Bytes>, CheckpointError> {
         self.delegate.get_counters_sidecar().await
     }

@@ -206,6 +206,10 @@ use live_edit::storage::watched_txn::{
 };
 use oodf_ffi::{CommandCreateSection, OwnedDelta, StructCommand};
 
+use crate::storage::acl_user_fixture::{
+    self, acl_command, acl_target_nodes, credentialed_url, AclUserGuard,
+};
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Budgets — see the module-level table for the arithmetic
 // ═════════════════════════════════════════════════════════════════════════════
@@ -256,7 +260,7 @@ pub(crate) const POOL_SIZE: u32 = 4;
 /// `TestValkey::setup_with_url` panics if the cluster is unreachable, so a
 /// configured-but-down cluster fails loudly rather than skipping.
 async fn cluster_fixture(valkey_pool_size: u32) -> Option<TestValkey> {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); \
              run `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run \
@@ -293,13 +297,8 @@ fn mock_ext_store() -> Arc<MockExternalValueStore> {
 // The `CLIENT ID`-denied fixture (T11)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Password for the ACL-restricted fixture. Fixed rather than generated: the
-/// user is unique per run and is deleted before the test returns, so the secret
-/// carries no meaning — the *username* is what must not collide.
-const ACL_FIXTURE_PASSWORD: &str = "bhb-acl-fixture-pw";
-
 /// `ACL SETUSER` arguments for a user that can do everything **except** run the
-/// `client` command family.
+/// `client` command family (`crate::storage::acl_user_fixture`).
 ///
 /// The single subtraction is the whole design of the fixture: `~*` `&*`
 /// `+@all` leave the user indistinguishable from `default` on every other axis,
@@ -310,114 +309,7 @@ const ACL_FIXTURE_PASSWORD: &str = "bhb-acl-fixture-pw";
 /// `Connection::cache_connection_id`) and the one queued inside a `MULTI`
 /// (rejected at queue time, so `EXEC` answers `EXECABORT`).
 fn acl_setuser_args(user: &str) -> Vec<String> {
-    vec![
-        "SETUSER".to_owned(),
-        user.to_owned(),
-        "on".to_owned(),
-        format!(">{ACL_FIXTURE_PASSWORD}"),
-        "~*".to_owned(),
-        "&*".to_owned(),
-        "+@all".to_owned(),
-        "-client".to_owned(),
-    ]
-}
-
-/// Send one `ACL` subcommand, optionally pinned to a single cluster node.
-///
-/// Pinning is mandatory on a cluster: ACL users are **per-node** state, not
-/// replicated by the cluster bus, so a `SETUSER` that lands on an arbitrary
-/// primary leaves the others rejecting the credential and the fixture's client
-/// fails to connect for a reason that has nothing to do with the mechanism
-/// under test.
-async fn acl_command(
-    client: &Client,
-    node: Option<&Server>,
-    args: Vec<String>,
-) -> Result<Value, fred::error::Error> {
-    let command = CustomCommand::new_static("ACL", None::<u16>, false);
-    match node {
-        Some(node) => {
-            client
-                .with_options(&pinned_to(node))
-                .custom::<Value, String>(command, args)
-                .await
-        }
-        None => client.custom::<Value, String>(command, args).await,
-    }
-}
-
-/// Every node the fixture must provision the ACL user on: all primaries of a
-/// clustered client, or `[None]` (unpinned) for a centralized one.
-fn acl_target_nodes(client: &Client) -> Vec<Option<Server>> {
-    if !client.is_clustered() {
-        return vec![None];
-    }
-    client
-        .cached_cluster_state()
-        .expect("a connected clustered client must have a cached CLUSTER SLOTS view")
-        .unique_primary_nodes()
-        .into_iter()
-        .map(Some)
-        .collect()
-}
-
-/// Deletes the fixture's ACL user on the way out — **including on a panic**,
-/// which is the whole reason this is a `Drop` impl rather than a call at the
-/// end of the test body. A leaked user would survive on the shared sandbox
-/// Valkey and, since it carries a password, would quietly change what a later
-/// run's `ACL SETUSER` is doing.
-///
-/// Holds the *control* fixture (the default-user connection that created the
-/// user) so the delete has a connection to run on regardless of what happened
-/// to the restricted one.
-struct AclUserGuard {
-    control: TestValkey,
-    nodes: Vec<Option<Server>>,
-    user: String,
-}
-
-impl Drop for AclUserGuard {
-    fn drop(&mut self) {
-        let client = self.control.client().pool.next().clone();
-        let nodes = self.nodes.clone();
-        let user = self.user.clone();
-        // Same two guards `TestValkey::drop` takes, for the same reasons: no
-        // ambient runtime, or a current-thread one, makes `block_in_place`
-        // unusable. Leaking the user is the lesser evil to panicking in a drop.
-        let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        if rt_handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
-            return;
-        }
-        tokio::task::block_in_place(|| {
-            rt_handle.block_on(async move {
-                for node in &nodes {
-                    let _ = acl_command(
-                        &client,
-                        node.as_ref(),
-                        vec!["DELUSER".to_owned(), user.clone()],
-                    )
-                    .await;
-                }
-            });
-        });
-    }
-}
-
-/// Rewrite `raw` so it authenticates as `user`.
-///
-/// `None` means the ambient URL cannot carry an injected credential and the
-/// caller must SKIP: either the scheme is not the one expected, or the URL
-/// already carries credentials — rewriting those would silently change which
-/// identity the control half of the fixture runs as, and the fixture's whole
-/// claim is that the two halves differ in exactly one respect.
-fn credentialed_url(raw: &str, scheme: &str, user: &str) -> Option<String> {
-    let rest = raw.strip_prefix(scheme)?;
-    if rest.contains('@') {
-        return None;
-    }
-    Some(format!("{scheme}{user}:{ACL_FIXTURE_PASSWORD}@{rest}"))
+    acl_user_fixture::acl_setuser_args(user, "-client")
 }
 
 /// A `TestValkey` whose every fred client authenticates as a user the store
@@ -3307,7 +3199,10 @@ async fn layer_in_doubt_recognises_its_own_commit_when_the_client_id_breaks_the_
 /// because on such a store the failure is not intermittent, it is **every
 /// connection, forever**:
 ///
-/// - **L2** reads fred's backchannel connection-id map, which fred fills from a
+/// - **L2** reads fred's backchannel connection-id map
+///   (`Backchannel::connection_ids`, which the router keeps for its own
+///   connections; no backchannel connection is involved, and none is stored
+///   since the vendored fred's change 11), which fred fills from a
 ///   handshake `CLIENT ID` whose failure `Connection::cache_connection_id`
 ///   swallows into `None`. The map is therefore permanently empty on a
 ///   perfectly healthy connection → `WatchFingerprint::Unnamed`. Read as "the
@@ -3540,7 +3435,7 @@ async fn a_store_that_refuses_client_id_disarms_both_layers_and_still_commits() 
 /// to itself, silently re-arming an L2 check that is reading nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cluster_a_store_that_refuses_client_id_disarms_both_layers_and_still_commits() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!(
             "SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured); run \
              `bash scripts/dev-valkey.sh cluster-up` or let CI's `test-cluster:` job run this"

@@ -11,11 +11,11 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tests/reference_service')]
-from tools.live import sanitizer, stack_dump
+from tools.live import build, platforms, sanitizer, stack_dump
 from tools.live.reference import identity as reference_identity
 from tools.live.test import artifact_names, fingerprint, native_identity
 from tools.live.test_support import run_process, write_json
-from tools.live.writer_campaign import canonical, case_passed, generate, verify_summary
+from tools.live.writer_campaign import PROFILES, STAGED_PROFILES, canonical, case_passed, generate, verify_summary
 from writer_history import read_json
 
 
@@ -72,12 +72,16 @@ def execute(plan, root, commands, environment, *, runner=run_process):
 def main():
     stack_dump.install()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--profile', choices=('ci', 'nightly', 'soak'), required=True)
+    parser.add_argument('--profile', choices=tuple(PROFILES), required=True)
     parser.add_argument('--plugin-driver', type=Path, required=True)
     parser.add_argument('--scene-driver', type=Path, required=True)
     parser.add_argument('--openssl', type=Path, required=True)
     parser.add_argument('--context', type=Path, required=True)
+    parser.add_argument('--staged-package', type=Path,
+                        help='the <target-dir>/usd/omniverse/live stage whose samples the package campaign runs')
     args = parser.parse_args()
+    if (args.staged_package is not None) != (args.profile in STAGED_PROFILES):
+        parser.error('--staged-package is required by, and only by, the package profile')
     root = Path(os.environ['LIVE_TEST_ARTIFACT_DIR']) / 'writer-fuzz'
     expected = read_json(args.context, limit=16 * 1024 * 1024)
 
@@ -85,7 +89,9 @@ def main():
         return dict(source=fingerprint(), plugin=native_identity(args.plugin_driver, 'plugin'),
                     scene=native_identity(args.scene_driver, 'scene_transport'),
                     reference=reference_identity(args.openssl),
-                    sanitizer=sanitizer.recorded(os.environ))
+                    sanitizer=sanitizer.recorded(os.environ),
+                    package=None if args.staged_package is None else
+                    build.stage_identity(args.staged_package, platforms.host().name))
 
     actual = context()
     if canonical(actual) != canonical(expected):
@@ -96,7 +102,8 @@ def main():
     command = [sys.executable, '-B', str(ROOT / 'tools/live/reference.py'), '--openssl', str(args.openssl)]
     commands = dict(plugin=[*command, '--plugin-driver', str(args.plugin_driver),
                            '--plugin-plug-info', dependencies['plug_info'],
-                           '--diagnostics-sample', dependencies['diagnostics_sample']],
+                           '--diagnostics-sample', dependencies['diagnostics_sample'],
+                           *([] if args.staged_package is None else ['--staged-package', str(args.staged_package)])],
                     scene=[*command, '--scene-transport-driver', str(args.scene_driver)])
     environment = dict(os.environ, PXR_PLUGINPATH_NAME='', PXR_AR_DEFAULT_SEARCH_PATH='', AR_DEFAULT_RESOLVER='')
     summary = execute(plan, root, commands, environment)

@@ -196,7 +196,7 @@
       "key": "Callback",
       "name": "callback_id",
       "kind": "UINT64",
-      "meaning": "Runtime-local auth/status callback registration handle; not a host address."
+      "meaning": "Runtime-local auth, status or diagnostic callback registration handle; not a host address."
     },
     {
       "key": "StructCommands",
@@ -220,7 +220,13 @@
       "key": "Limit",
       "name": "limit",
       "kind": "UINT64",
-      "meaning": "The live edit service's limit a refused delta exceeded: max_entries for DELTA_TOO_LARGE, the children list limit for CHILDREN_LIST_TOO_LONG."
+      "meaning": "Event-specific limit: for rpc_failed, the live edit service's limit a refused delta exceeded (max_entries for DELTA_TOO_LARGE, the children list limit for CHILDREN_LIST_TOO_LONG); for call_budget_exhausted, the endpoint's max_calls_per_endpoint."
+    },
+    {
+      "key": "Section",
+      "name": "section_id",
+      "kind": "UINT64",
+      "meaning": "A layer section's wire identity: correlation only, never a scene name."
     }
   ],
   "variants": {
@@ -557,6 +563,55 @@
       ],
       "optional": [],
       "meaning": "The sequences when the lag fell to half of apply_lag_warning_threshold or less; duration_ms is the interval since apply_lag_entered. Subject identifies the layer."
+    },
+    "section_replaced": {
+      "fields": [
+        "section_id",
+        "applied_sequence"
+      ],
+      "optional": [],
+      "meaning": "section_id is the replaced section; applied_sequence is the sequence of the peer commit whose Create replaced it. Subject identifies the layer; incident is zero."
+    },
+    "call_budget": {
+      "fields": [
+        "operation",
+        "reason",
+        "count",
+        "limit",
+        "queue_depth"
+      ],
+      "optional": [],
+      "meaning": "operation is the refused or waiting call's: OPEN for a layer read's stream reservation, JOIN for a session's, or the operation of a write, creation, finite request or Ping. reason: 1 the stream share was full, so the layer open or join was refused RESOURCE_EXHAUSTED before any RPC; 2 the call share had no free call, so the call waits on the client in FIFO order, recorded when waiting begins after the share last had a free call; 3 a call that never waits, a single-attempt request, was refused RESOURCE_EXHAUSTED; 4 a finite request waited for a call until its deadline and ended RESOURCE_EXHAUSTED without issuing. count is the calls then open on the endpoint, limit its max_calls_per_endpoint and queue_depth the calls waiting. Subject and incident are zero."
+    },
+    "cleanup_request": {
+      "fields": [
+        "result",
+        "duration_ms",
+        "reason",
+        "request_id"
+      ],
+      "optional": [],
+      "meaning": "A Cancel that timed out; request_id is the request handle. reason is the cleanup call: 1 UnregisterCallback, 2 Cancel, 3 ReleaseRequest, 4 LeaveSession, 5 UnregisterEndpoint. result is TIMEOUT and duration_ms the call's whole duration."
+    },
+    "cleanup_session": {
+      "fields": [
+        "result",
+        "duration_ms",
+        "reason",
+        "session_handle"
+      ],
+      "optional": [],
+      "meaning": "A LeaveSession that timed out; session_handle is the session handle. reason is the cleanup call: 1 UnregisterCallback, 2 Cancel, 3 ReleaseRequest, 4 LeaveSession, 5 UnregisterEndpoint. result is TIMEOUT and duration_ms the call's whole duration."
+    },
+    "cleanup_callback": {
+      "fields": [
+        "result",
+        "duration_ms",
+        "reason",
+        "callback_id"
+      ],
+      "optional": [],
+      "meaning": "An UnregisterCallback that timed out; callback_id is the auth, status or diagnostic callback handle. reason is the cleanup call: 1 UnregisterCallback, 2 Cancel, 3 ReleaseRequest, 4 LeaveSession, 5 UnregisterEndpoint. result is TIMEOUT and duration_ms the call's whole duration."
     }
   },
   "events": [
@@ -825,7 +880,7 @@
       "variants": [
         "shutdown_timeout"
       ],
-      "meaning": "Final or resumed runtime shutdown timed out; final runtime reference remains for CopyDiagnostics(0) and retry. Only shutdown wait TIMEOUT emits; nonfinal release and admission BUSY are metrics only. Callback/endpoint/request/session cleanup failures are outside this emitter scope."
+      "meaning": "Final or resumed runtime shutdown timed out; final runtime reference remains for CopyDiagnostics(0) and retry. Only shutdown wait TIMEOUT emits; nonfinal release and admission BUSY are metrics only. The other public cleanup calls report a timeout as cleanup_timeout."
     },
     {
       "code": 21,
@@ -1002,6 +1057,44 @@
         "apply_lag_exit"
       ],
       "meaning": "A lagging layer's applied sequence came within half of apply_lag_warning_threshold of its read sequence. The interval continues through RECONNECTING, AUTH_WAIT and BLOCKED; a layer that fails or closes while lagging records no exit. Contains numeric correlation only."
+    },
+    {
+      "code": 36,
+      "symbol": "OMNI_USD_LIVE_RECORD_SECTION_REPLACED",
+      "name": "section_replaced",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "section_replaced"
+      ],
+      "meaning": "A peer update applied to the layer's authoritative scene, and one of its Creates replaced, with its subtree, a section this client created: a section a Create of an intent this client admitted names, pending or committed. Once per replaced section; the scene still converges on the peer's commit, and the same application restores an implicit container's content, or an authored prim a peer's implicit container replaced, under the peer's section. Contains numeric correlation only; a USD warning on the host names the layer and the replaced section's path and says whether its content was restored."
+    },
+    {
+      "code": 37,
+      "symbol": "OMNI_USD_LIVE_RECORD_CALL_BUDGET_EXHAUSTED",
+      "name": "call_budget_exhausted",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "call_budget"
+      ],
+      "meaning": "An endpoint's call budget, max_calls_per_endpoint, had no room: a layer open or session join past its stream share was refused RESOURCE_EXHAUSTED before any RPC, or a call waits on the client for a free call instead of gRPC queueing it with its deadline running. Contains numeric correlation only."
+    },
+    {
+      "code": 38,
+      "symbol": "OMNI_USD_LIVE_RECORD_CLEANUP_TIMEOUT",
+      "name": "cleanup_timeout",
+      "default_severity": "WARN",
+      "severity_rule": "default",
+      "emission": "implemented",
+      "variants": [
+        "cleanup_request",
+        "cleanup_session",
+        "cleanup_callback"
+      ],
+      "meaning": "Cancel, LeaveSession or UnregisterCallback returned TIMEOUT after a nonzero timeout; the caller keeps ownership and retries. A zero-timeout poll that returns TIMEOUT, and every BUSY refusal, are counted in metrics only, as are ReleaseRequest and UnregisterEndpoint, which never time out. A diagnostic sink's unregistration records to history and metrics only, never to sinks. Contains numeric handles only."
     }
   ],
   "retired_event_codes": [
@@ -1359,6 +1452,28 @@
     {
       "name": "Complete",
       "value": 8
+    }
+  ],
+  "cleanup_calls": [
+    {
+      "name": "UnregisterCallback",
+      "value": 1
+    },
+    {
+      "name": "Cancel",
+      "value": 2
+    },
+    {
+      "name": "ReleaseRequest",
+      "value": 3
+    },
+    {
+      "name": "LeaveSession",
+      "value": 4
+    },
+    {
+      "name": "UnregisterEndpoint",
+      "value": 5
     }
   ],
   "operation_auth_wait_kinds": [

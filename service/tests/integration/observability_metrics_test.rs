@@ -28,9 +28,10 @@
 //     `Err(JoinError)` where `is_panic()` is true. Test: feed a synthetic
 //     panicked JoinError through `Metrics::inc_background_task_panic`
 //     directly and observe the counter. (The production code path —
-//     `report_background_task_result` in `src/main.rs` — is private to
-//     the binary crate and not callable from integration tests; the
-//     metric-side contract is what matters for operators.)
+//     `report_background_task_result`, a private fn in
+//     `src/grpc/transport.rs` that `run_post_server_sequence` calls on each
+//     join — is pinned by that module's unit tests; here the metric-side
+//     contract is what matters for operators.)
 
 use std::time::Duration;
 
@@ -43,6 +44,7 @@ use live_edit::observability::metrics::Metrics;
 use live_edit::storage::client::ValkeyClient;
 use live_edit::storage::keys::KeySchema;
 use live_edit::storage::notifications::{consume_layer_stream, StreamCursor};
+use live_edit::storage::test_support::connect_test_client_or_skip;
 
 /// Extract the set of values for `label` across all rendered series of
 /// `metric` in the Prometheus text exposition. Used by the pre-registration
@@ -85,19 +87,6 @@ fn test_config() -> Config {
     cfg.subscriber_pool_size = 1;
     cfg.valkey_reconnect_max_delay_ms = 500;
     cfg
-}
-
-async fn maybe_connect() -> Option<ValkeyClient> {
-    let cfg = test_config();
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        live_edit::storage::test_support::connect_test_client(&cfg),
-    )
-    .await
-    {
-        Ok(Ok(c)) => Some(c),
-        _ => None,
-    }
 }
 
 /// Read `live_edit_valkey_reconnects_total{pool}` from the rendered scrape
@@ -159,12 +148,13 @@ async fn kill_connection_by_id(killer: &ValkeyClient, victim_id: i64) -> i64 {
 /// increments into `valkey_reconnects_total{pool="data"}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_data_pool_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -246,12 +236,13 @@ async fn wait_for_reconnect_increment(
 /// only checks the registration step, not the hook).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_maintenance_pool_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -301,12 +292,13 @@ async fn reconnect_metric_increments_on_maintenance_pool_kill() {
 /// hook block exists and fires on a real reconnect.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_snapshot_pool_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -369,12 +361,13 @@ async fn reconnect_metric_increments_on_snapshot_pool_kill() {
 /// pub/sub connections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_subscriber_pool_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -429,12 +422,13 @@ async fn reconnect_metric_increments_on_subscriber_pool_kill() {
 /// would queue behind our own borrow.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_txn_pool_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -481,12 +475,13 @@ async fn reconnect_metric_increments_on_txn_pool_kill() {
 /// independently (the `subscriber` sibling test above guards the other half).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconnect_metric_increments_on_stream_reader_kill() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
-        return;
-    };
-    let Some(killer) = maybe_connect().await else {
-        eprintln!("SKIP: second Valkey connection not reachable");
+    // The two clients connect concurrently: one hang guard, not two.
+    let cfg = test_config();
+    let (client, killer) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(killer)) = (client, killer) else {
         return;
     };
 
@@ -502,9 +497,9 @@ async fn reconnect_metric_increments_on_stream_reader_kill() {
 
     let before = read_reconnects(&metrics, "subscriber_pool");
 
-    // The reader's read is still blocked on the server after its subscription
-    // left; `Blocking::Interrupt` makes CLIENT ID interrupt it rather than
-    // queue behind the XREAD BLOCK.
+    // The fixture leaves the reader idle (it ends the read the subscription
+    // left blocked), so CLIENT ID on its client is answered at once rather
+    // than queued behind an XREAD BLOCK (fred's default `Blocking::Block`).
     let victim_id: i64 = client
         .stream_mux
         .reader_client_for_test(0)
@@ -535,13 +530,14 @@ async fn reconnect_metric_increments_on_stream_reader_kill() {
 
 /// The `background_task_panics_total{task}` counter must tick when
 /// `Metrics::inc_background_task_panic` is called — this is the API
-/// surface the shutdown supervisor (`report_background_task_result` in
-/// `src/main.rs`) uses on panicked joins. Operators rely on this counter
-/// firing an alert when a background task unexpectedly dies.
+/// surface the shutdown join (`report_background_task_result`, called by
+/// `grpc::transport::run_post_server_sequence`) uses on panicked joins.
+/// Operators rely on this counter firing an alert when a background task
+/// unexpectedly dies.
 ///
-/// The shutdown supervisor itself is a `fn` in the binary crate
-/// (`main.rs`) and not callable from integration tests, so this test
-/// exercises the metric-side contract: given a panicked `JoinError`, the
+/// The join's reporting is a private fn in `grpc::transport`, whose unit
+/// tests drive it through the shutdown sequence; this test exercises the
+/// metric-side contract: given a panicked `JoinError`, the
 /// counter increments with the right label. If the implementation path
 /// misnames the task label or increments a different metric, operators
 /// get the wrong alert.
@@ -636,8 +632,15 @@ fn read_pool_in_use(metrics: &Metrics, pool: &str) -> i64 {
 /// inc → drop → observe dec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn valkey_pool_in_use_txn_ticks_up_while_held_and_down_on_drop() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    // `client2` holds the second concurrent txn slot below (pool_size=1, so
+    // one client cannot hold two). The two connect concurrently: one hang
+    // guard, not two.
+    let cfg = test_config();
+    let (client, client2) = tokio::join!(
+        connect_test_client_or_skip(&cfg),
+        connect_test_client_or_skip(&cfg)
+    );
+    let (Some(client), Some(client2)) = (client, client2) else {
         return;
     };
 
@@ -667,10 +670,7 @@ async fn valkey_pool_in_use_txn_ticks_up_while_held_and_down_on_drop() {
     );
 
     // A second concurrent acquire (pool_size=1 → this would block, so use
-    // a separate client for the parallel slot demonstration).
-    let client2 = maybe_connect()
-        .await
-        .expect("second connection must be reachable");
+    // the separate client for the parallel slot demonstration).
     client2
         .install_observability_hooks(std::sync::Arc::clone(&metrics))
         .await;
@@ -706,8 +706,7 @@ async fn valkey_pool_in_use_txn_ticks_up_while_held_and_down_on_drop() {
 /// test polls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn valkey_pool_in_use_subscriber_pool_ticks_up_and_down() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -808,8 +807,7 @@ async fn valkey_pool_in_use_subscriber_pool_ticks_up_and_down() {
 /// shows up as 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn valkey_pool_in_use_maintenance_ticks_up_and_down() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -888,8 +886,7 @@ async fn valkey_pool_in_use_maintenance_label_is_pre_registered() {
 /// shape as the maintenance pool, under its own label.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn valkey_pool_in_use_snapshot_ticks_up_and_down() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -960,8 +957,7 @@ async fn valkey_pool_in_use_snapshot_label_is_pre_registered() {
 /// metrics handle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn valkey_pool_in_use_without_metrics_hooks_installed_is_noop() {
-    let Some(client) = maybe_connect().await else {
-        eprintln!("SKIP: Valkey not reachable");
+    let Some(client) = connect_test_client_or_skip(&test_config()).await else {
         return;
     };
 
@@ -1405,7 +1401,7 @@ async fn valkey_txn_repair_ineffective_pre_initialises_its_state_proof_reason_se
 /// verdicts* a flat line would be read as evidence for; here the missing cell
 /// would only force the alert to be written four times.
 ///
-/// **Why the path vocabulary is four (b.f4t, b.h4m).** Both additions are on the
+/// **Why the path vocabulary grew past two (b.f4t, b.h4m).** Both additions are on the
 /// DR restore path and neither is redundant with the other:
 ///
 /// * `restore_residue_wipe` — the restore's pre-write residue wipe
@@ -1423,6 +1419,11 @@ async fn valkey_txn_repair_ineffective_pre_initialises_its_state_proof_reason_se
 /// Both must be seeded for exactly the same reason as the original two — the
 /// alert needs a series before the first incident, not at it.
 ///
+/// A fifth path, `dr_job`, is the restore Job's watched writes
+/// (`storage::layer::dr_restore`, `storage::dr_write`), seeded for the same
+/// reason; its `compensated` cell is unreachable too (the Job makes no
+/// compensating write).
+///
 /// **Why the vocabulary is five and not three.** The two `*_unavailable`
 /// dispositions report that a defence layer could not be *armed* on this
 /// backing store rather than that a `WATCH` was voided: `witness_unavailable`
@@ -1438,11 +1439,12 @@ async fn valkey_txn_repair_ineffective_pre_initialises_its_state_proof_reason_se
 /// that would have detected one was never armed".
 #[tokio::test]
 async fn storage_watch_voided_pre_initialises_its_full_path_disposition_matrix() {
-    const PATHS: [&str; 4] = [
+    const PATHS: [&str; 5] = [
         "update_layer",
         "create_session",
         "restore_residue_wipe",
         "restore_write_object",
+        "dr_job",
     ];
     const DISPOSITIONS: [&str; 5] = [
         "aborted_pre_exec",
@@ -1461,9 +1463,9 @@ async fn storage_watch_voided_pre_initialises_its_full_path_disposition_matrix()
     assert_eq!(
         paths, expected_paths,
         "live_edit_storage_watch_voided_total must pre-initialise exactly \
-         {{'update_layer', 'create_session', 'restore_residue_wipe', 'restore_write_object'}} — \
-         the four WATCHed sites, never a passthrough of anything caller-supplied (b.bhb, b.f4t, \
-         b.h4m); got {paths:?}"
+         {{'update_layer', 'create_session', 'restore_residue_wipe', 'restore_write_object', \
+         'dr_job'}} — the five WATCHed paths, never a passthrough of anything caller-supplied \
+         (b.bhb, b.f4t, b.h4m, the restore Job); got {paths:?}"
     );
 
     let dispositions =
@@ -2422,20 +2424,20 @@ async fn snapshot_read_type_error_total_pre_initialises_its_bounded_key_family_s
 
 /// b.y3m Epics 2–3 (Spec SDD SR-8.1, §17.1's seeding rule):
 /// `live_edit_snapshot_read_total` must pre-initialise exactly the cells the
-/// built read paths can emit, at zero, and no others — fifty-four series:
+/// built read paths can emit, at zero, and no others — fifty-three series:
 ///
-/// - `path="atomic"`: the five atomic consumers (catch-up, legacy per-commit,
-///   checkpoint, the structural cache's cold start, `structural_cache`, and its
-///   sampled audit, `structural_cache_audit`) × the five atomic outcomes
-///   (twenty-five);
-/// - `path="unfenced"`: the `structural_update` and ext-GC consumers × the
-///   four outcomes `ok`, `not_found`, `transient_error` and `permanent_error`
-///   (eight), plus `structural_update`'s `too_large` (nine) — the fan-out has
-///   no ceiling, but a structural `UpdateLayer`'s read stops before its next
-///   window when its upload charge cannot grow to cover it (b.26e); the ext-GC
-///   consumer, external-value clean-up's reference walk (b.fsz MR-D4), carries
-///   no allowance, so it has no `too_large` cell, and no unfenced read has a
-///   `fence_broken` one, because it holds no fence;
+/// - `path="atomic"`: the four atomic consumers (catch-up, checkpoint, the
+///   structural cache's cold start, `structural_cache`, and its sampled audit,
+///   `structural_cache_audit`) × the five atomic outcomes (twenty);
+/// - `path="unfenced"`: the `structural_update`, ext-GC and `dr_restore`
+///   consumers × the four outcomes `ok`, `not_found`, `transient_error` and
+///   `permanent_error` (twelve), plus `structural_update`'s `too_large`
+///   (thirteen) — the fan-out has no ceiling, but a structural `UpdateLayer`'s
+///   read stops before its next window when its upload charge cannot grow to
+///   cover it (b.26e); the ext-GC consumer, external-value clean-up's reference
+///   walk (b.fsz MR-D4), and the DR restore Job's report read (`dr_restore`)
+///   carry no allowance, so they have no `too_large` cell, and no unfenced read
+///   has a `fence_broken` one, because it holds no fence;
 /// - `path="fenced"`: the four consumers whose reads take the fence — the
 ///   catch-up consumer, through its shared fenced-read flight; the checkpoint
 ///   consumer, through the assembler's fenced read of a layer above the
@@ -2445,16 +2447,16 @@ async fn snapshot_read_type_error_total_pre_initialises_its_bounded_key_family_s
 ///   audit (`structural_cache_audit`), through the same hook, for a layer
 ///   above the plain limits with its above-ceiling switch on — × the five
 ///   fenced outcomes (twenty) — no `too_large`, because the fenced read has no
-///   ceiling. A rollback replay's per-commit read is never fenced (it hands
-///   its catch-up to a flight, counted under `catchup`).
+///   ceiling.
 ///
 /// Zero-seeding matters for the reason it does on the b.atj counter above: the
 /// `too_large` rate is the signal that layers are taking their above-ceiling
 /// path, and the fenced `fence_broken` and error cells are what an alert on a
 /// misbehaving fence evaluates; an alert over a cell that appears only at its
 /// first tick has no `increase` to evaluate before then. Seeding NO other cell
-/// matters just as much: the `structural_update` and ext-GC consumers never
-/// take the atomic path, the catch-up, checkpoint and both structural-cache
+/// matters just as much: the `structural_update`, ext-GC and `dr_restore`
+/// consumers never take the atomic path, the catch-up, checkpoint and both
+/// structural-cache
 /// consumers never take the unfenced one, and no consumer but catch-up,
 /// checkpoint and the structural cache's cold start and audit takes the fenced
 /// one, so a
@@ -2471,12 +2473,12 @@ async fn snapshot_read_total_pre_initialises_exactly_the_atomic_unfenced_and_fen
 
     const CONSUMERS: [&str; 7] = [
         "catchup",
-        "catchup_legacy_per_commit",
         "checkpoint",
         "structural_update",
         "ext_gc",
         "structural_cache",
         "structural_cache_audit",
+        "dr_restore",
     ];
     const PATHS: [&str; 3] = ["atomic", "fenced", "unfenced"];
     const OUTCOMES: [&str; 6] = [
@@ -2487,9 +2489,8 @@ async fn snapshot_read_total_pre_initialises_exactly_the_atomic_unfenced_and_fen
         "permanent_error",
         "fence_broken",
     ];
-    const ATOMIC_CONSUMERS: [&str; 5] = [
+    const ATOMIC_CONSUMERS: [&str; 4] = [
         "catchup",
-        "catchup_legacy_per_commit",
         "checkpoint",
         "structural_cache",
         "structural_cache_audit",
@@ -2501,7 +2502,7 @@ async fn snapshot_read_total_pre_initialises_exactly_the_atomic_unfenced_and_fen
         "transient_error",
         "permanent_error",
     ];
-    const UNFENCED_CONSUMERS: [&str; 2] = ["structural_update", "ext_gc"];
+    const UNFENCED_CONSUMERS: [&str; 3] = ["structural_update", "ext_gc", "dr_restore"];
     const UNFENCED_OUTCOMES: [&str; 5] = [
         "ok",
         "not_found",
@@ -2615,13 +2616,13 @@ async fn snapshot_read_total_pre_initialises_exactly_the_atomic_unfenced_and_fen
         .filter(|l| l.starts_with(&format!("{METRIC}{{")))
         .count();
     assert_eq!(
-        series, 54,
-        "exactly the twenty-five atomic, nine unfenced (structural_update's too_large included) \
+        series, 53,
+        "exactly the twenty atomic, thirteen unfenced (structural_update's too_large included) \
          and twenty fenced (catch-up, checkpoint, structural_cache and structural_cache_audit) \
-         cells may be seeded — a fifty-fifth is an atomic structural_update/ext-GC cell, an \
-         unfenced catch-up/checkpoint/structural_cache/structural_cache_audit cell, an unfenced \
-         ext-GC or fenced too_large, a fence_broken cell off the fenced path, or a fenced cell of \
-         a consumer that does not run the fenced read"
+         cells may be seeded — a fifty-fourth is an atomic structural_update/ext-GC/dr_restore \
+         cell, an unfenced catch-up/checkpoint/structural_cache/structural_cache_audit cell, an \
+         unfenced ext-GC or dr_restore too_large or a fenced one, a fence_broken cell off the \
+         fenced path, or a fenced cell of a consumer that does not run the fenced read"
     );
     assert!(
         label_value_set(&text, METRIC, "service").is_empty(),
@@ -2745,13 +2746,14 @@ async fn structural_cache_series_pre_initialise_every_outcome_and_reason_and_not
     use live_edit::observability::metrics as m;
 
     const OUTCOMES: [&str; 4] = ["hit", "repaired", "cold", "reload"];
-    const REASONS: [&str; 11] = [
+    const REASONS: [&str; 12] = [
         "identity",
         "regressed",
         "gap",
         "tombstone",
         "parse",
         "replay_err",
+        "collision_rule",
         "too_far",
         "too_large",
         "dangling_adopted",
@@ -3535,6 +3537,57 @@ async fn snapshot_read_window_fallback_total_pre_initialises_one_unlabelled_seri
     );
 
     metrics.inc_snapshot_read_window_fallback();
+    let ticked = render(&metrics);
+    assert_eq!(
+        series(&ticked).len(),
+        1,
+        "one increment must tick the one series and open no other; got {:?}",
+        series(&ticked)
+    );
+    assert_eq!(sample_value(&ticked, NAME, &[]), Some(1.0));
+}
+
+/// b.o2i: `live_edit_snapshot_read_index_incomplete_total` — snapshot read
+/// attempts whose round-1 index paging came back short of its count with no
+/// writer changing the object — must exist at zero on a fresh registry, as
+/// one unlabelled series (no `service` label, no other dimension), so an
+/// `increase(...) > 0` alert evaluates a present series from the first
+/// scrape; and `inc_snapshot_read_index_incomplete` must tick that one
+/// series, opening no other.
+#[tokio::test]
+async fn snapshot_read_index_incomplete_total_pre_initialises_one_unlabelled_series() {
+    const NAME: &str = "live_edit_snapshot_read_index_incomplete_total";
+    let series = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| {
+                line.strip_prefix(NAME)
+                    .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+            })
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let metrics = crate::common::metrics_scrape_only("test");
+    let text = render(&metrics);
+    assert_eq!(
+        series(&text).len(),
+        1,
+        "{NAME} must render exactly one series on a fresh registry; got {:?}",
+        series(&text)
+    );
+    assert_eq!(
+        sample_value(&text, NAME, &[]),
+        Some(0.0),
+        "{NAME} must read 0 on a fresh registry, not be absent"
+    );
+    assert!(
+        label_value_set(&text, NAME, "service").is_empty(),
+        "{NAME} carries no `service` label: a skipped member is a property of the backing \
+         store's serving process, not of the replica that met it"
+    );
+
+    metrics.inc_snapshot_read_index_incomplete();
     let ticked = render(&metrics);
     assert_eq!(
         series(&ticked).len(),

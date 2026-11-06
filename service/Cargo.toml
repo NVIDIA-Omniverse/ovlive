@@ -18,7 +18,7 @@
 # blame and keeps the diff minimal while still allowing sibling crates such as
 # `oodf-ffi` to live under the workspace root.
 [workspace]
-members = [".", "oodf-ffi", "capabilities-proto", "scaler"]
+members = [".", "oodf-ffi", "capabilities-proto", "scaler", "conformance_tests"]
 # The cargo-fuzz subcrate lives under `oodf-ffi/fuzz/`. It depends on
 # `libfuzzer-sys` which only builds on nightly, so we exclude it from the
 # stable workspace to keep `cargo build` / `cargo test` green without
@@ -33,7 +33,7 @@ exclude = ["oodf-ffi/fuzz", "vendor/fred-10.1.0"]
 
 [package]
 name = "live-edit"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
@@ -126,15 +126,22 @@ test-checkpoint-fault-injection = []
 # snapshot fan-out arena's dirty decay, read at startup from an environment
 # variable (`src/allocator.rs`, `FANOUT_ARENA_DECAY_OVERRIDE_ENV`), so one
 # release build with `--features test-support` can measure several decays.
-# Such a measurement build also carries everything above (fred's
+# It compiles in two test-only overrides too: the pod memory limit's cgroup
+# root, MEASUREMENT_POD_MEMORY_CGROUP_ROOT (`src/config/pod_memory.rs`), so a
+# test can start the binary on a fixture cgroup tree, and a Valkey key prefix
+# in place of `le:`, LIVE_EDIT_TEST_ONLY_KEY_PREFIX (`src/config/key_prefix.rs`),
+# so a test can run the binary against a shared test store under its own
+# prefix. Such a measurement build also carries everything above (fred's
 # retention-report counters and the crate's test-support seams, some on
 # measured paths), as `.gitlab-ci.yml` records at `test-release-stack-guard`,
 # so a re-measurement knows its binary is not the shipped one beyond the
-# override. `test-support` must therefore come only from the command line:
+# overrides. `test-support` must therefore come only from the command line:
 # `scripts/check-measurement-features.sh` fails if a manifest edge enables it
 # or the featureless workspace resolves it (CI's `measurement-features:fence`,
 # and `scripts/guard-tests.sh`), and the Dockerfile's measurement-feature gate
-# fails if the release binary carries the variable's name.
+# fails if the release binary carries any of the three variables' names
+# (MEASUREMENT_FANOUT_ARENA_DIRTY_DECAY_MS, MEASUREMENT_POD_MEMORY_CGROUP_ROOT,
+# LIVE_EDIT_TEST_ONLY_KEY_PREFIX).
 test-support = ["dep:libc", "fred/live-edit-retention-report"]
 # `jemalloc-profiling` compiles jemalloc's heap profiler into the service
 # binary for a diagnostic build. It carries no code of its own: once the
@@ -185,8 +192,9 @@ prost-types = "0.14"
 # 0.4.16, fails the supply-chain audit. See SDD §5.1.
 h2 = "0.4.19"
 
-# Async runtime
-tokio = { version = "1", features = ["full"] }
+# Async runtime. Floor 1.53.3: RUSTSEC-2026-0386 (`AsyncFd` I/O safety) is
+# patched from 1.53.3 on the 1.53 line and fails the supply-chain audit.
+tokio = { version = "1.53.3", features = ["full"] }
 
 # HTTP server (metrics endpoint)
 axum = "0.7"
@@ -501,7 +509,7 @@ http-body-util = "0.1"
 proptest = "1"
 temp-env = "0.3"
 tempfile = "3"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1.53.3", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-health = "0.14"
@@ -549,6 +557,16 @@ opentelemetry-proto = { version = "0.31", default-features = false, features = [
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# The RESP codec fred is built on, for the pure table in
+# `tests/integration/storage/b_myh_redirect_frame_test.rs`: it builds every
+# string-carrying RESP3 frame type (fred re-exports the frame but not
+# `VerbatimStringFormat`) and asks redis-protocol's own
+# `Resp3Frame::is_redirection`, the text rule the vendored fred's
+# `live_edit::redirect::is_redirection` keeps for error frames. Already in the
+# graph through fred with these features, so it adds nothing to build;
+# dev-only, so the release build and ATTRIBUTIONS.md never see the direct
+# edge. Keep the version on fred's.
+redis-protocol = { version = "6.0.0", features = ["bytes"] }
 
 # ── Benchmarks (b.9ft) ───────────────────────────────────────────────────────
 #
@@ -627,23 +645,11 @@ required-features = ["test-support"]
 tonic-prost-build = "0.14"
 
 # fred is built from a vendored copy of the published 10.1.0 crate with one
-# line-count-preserving patch file (`vendor/fred-10.1.0.patch`) carrying eight
-# changes: an `-ASK` redirect is followed to its target, with a pipelined
-# `ASKING` and the command on the target's connection; an `-ASK` redirect that
-# cannot be followed fails only its own command instead of ending the client's
-# router task; the unresponsive check
-# judges a connection's oldest outstanding command, with read progress and
-# evidence from peer connections, instead of its newest write, gives a fast
-# verdict its own error text and records where the stuck bytes sit; every
-# router wait on one connection's I/O is bounded; a RESP2 data reply shaped like
-# a pubsub frame reaches its command; the router flushes fed frames before it
-# waits and resyncs its command-queue counter at every receive; a `Pool`
-# member can be re-pointed to a fresh client; and opt-in limits on what a
-# connection keeps once its traffic drains — one warm connection per client
-# at its class limits, every other drained connection cut to a small idle
-# shape — which the service sets per connection class
-# (`src/storage/connection_buffers.rs`). This covers both the dependency and
-# the dev-dependency entries. Provenance, rationale, the drop and re-vendor
+# line-count-preserving patch file (`vendor/fred-10.1.0.patch`). The changes
+# it carries are listed in `vendor/fred-10.1.0.SOURCE.md` § The patch, the
+# numbered list after the quoted diff ("The patch carries these changes").
+# This covers both the dependency and the dev-dependency
+# entries. Provenance, rationale, the drop and re-vendor
 # procedures and the upstream issue text: `vendor/fred-10.1.0.SOURCE.md`.
 # The `fred:vendor-drift-check` CI job (`scripts/check-vendored-fred.sh`)
 # rebuilds the tree from crates.io and fails on any other difference.

@@ -22,7 +22,19 @@
 //! `UPSTREAM_UNAVAILABLE` in the service's domain, no metadata, and a
 //! `RetryInfo` delay in `[1 s, 3 s)`: the client's "this call applied
 //! nothing" signal. Every `UNAVAILABLE` from the marker on carries no detail,
-//! because the call's commit may have been sent.
+//! because the call's commit may have taken effect.
+//!
+//! `UpdateLayer`'s marker is set before its first commit attempt.
+//! `CreateLayer`'s is set by the store at the call's first client-visible
+//! write (b.4q2, `CreateCommitMarker`): before an overwrite fences the object
+//! it replaces, and after any commit run that did not fail with exactly
+//! `Routing` "Too many redirections." (the one failure that proves the script
+//! did not run). So the object-id allocation, the materialization, and a new
+//! layer's commit whose every run was refused by a redirect come before it
+//! and are hinted; any other commit-run failure, and every overwrite, is not.
+//! A store write refusal at one of those pre-marker writes carries its own
+//! `STORE_WRITE_REFUSED` detail instead, which the choke point keeps
+//! (`storage::store_write_refusal_test`).
 //!
 //! Store faults are staged with [`ScriptReplyProxy`]: the fixture's Valkey
 //! client — and so the service built on it — connects through the proxy, and
@@ -50,24 +62,41 @@
 //! | `create_layer_operation_record_read_refused_loading_*` | `CreateLayer` operation-record `GET` | hinted |
 //! | `create_layer_userinfo_unreachable_*` | `CreateLayer` userinfo | hinted |
 //! | `create_layer_ext_pre_store_refused_busy_*` | `CreateLayer` external-value pre-store | hinted |
-//! | `create_layer_object_id_allocation_refused_loading_*` | `CreateLayer` object-id allocation | plain |
+//! | `create_layer_object_id_allocation_refused_loading_*` | `CreateLayer` object-id allocation, inside the store's call but before its commit marker | hinted |
+//! | `fault_injected::create_layer_new_layer_whose_every_commit_run_was_refused_by_a_redirect_*` | `CreateLayer` new-layer commit, both runs failed `Routing` "Too many redirections." (no run's script ran) | hinted, carrying the commit's error |
+//! | `fault_injected::create_layer_new_layer_whose_redirected_commit_check_failed_too_*` | the same with the check after the one redirected run failed too | hinted, carrying the commit's error |
+//! | `fault_injected::create_layer_new_layer_whose_redirected_run_is_followed_by_a_write_attempts_exhausted_run_*` | `CreateLayer` new-layer commit, one redirected run and one "Too many failed write attempts." run (which may have landed) | plain, carrying the commit's error |
+//! | `fault_injected::create_layer_new_layer_whose_timed_out_run_is_followed_by_a_redirected_run_*` | `CreateLayer` new-layer commit, a timed-out run, then a redirected one: the marker, once set, stays set | plain, carrying the commit's error |
+//! | `fault_injected::create_layer_overwrite_whose_every_commit_run_was_refused_by_a_redirect_*` | `CreateLayer` overwrite commit, both runs redirected, with the old object fenced | plain, carrying the commit's error |
+//! | `fault_injected::create_layer_new_layer_replanned_onto_a_moved_mapping_*` | `CreateLayer` new-layer commit whose redirected first run's check finds the mapping moved by another create: the re-plan fences that object, and its two runs are redirected too | plain, carrying the commit's error |
 //! | `fault_injected::create_layer_overwrite_whose_commit_runs_failed_answers_plain_unavailable` | `CreateLayer` overwrite commit, both runs failed with a transient (`IO`) error with the old object fenced (the replacement can still complete after the answer) | plain, carrying the commit's error |
 //! | `fault_injected::create_layer_{overwrite, new_layer}_whose_commit_runs_failed_permanently_*` | `CreateLayer` commit, both runs failed with a permanent-class error (one the mapper alone answers `INTERNAL`) and the check still naming the expected value | plain, carrying the commit's error |
 //! | `fault_injected::create_layer_{overwrite, new_layer}_whose_permanent_commit_failure_check_failed_too_*` | `CreateLayer` commit, a run failed with a permanent-class error and the check after it failed too | plain, carrying the commit's error |
 //! | `fault_injected::create_layer_overwrite_wake_up_failed_*` | `CreateLayer` overwrite wake-up, after the commit point | OK — not a refusal |
-//! | `create_layer_commit_refused_out_of_memory_*` | `CreateLayer` new-layer commit script refused `-OOM` | plain |
+//! | `create_layer_commit_refused_out_of_memory_*` | `CreateLayer` new-layer commit script refused `-OOM`: a run failure other than the redirect refusal, so past the marker | plain |
 //! | `fault_injected::update_layer_loading_past_the_retry_budget_*` | `UpdateLayer` commit loop exhausted by `-LOADING` | plain |
 //! | `fault_injected::update_layer_tryagain_on_the_watch_past_the_retry_budget_*` | `UpdateLayer` commit loop (`WATCH` route) exhausted by `-TRYAGAIN` | plain |
 //! | `fault_injected::update_layer_tryagain_on_the_commit_script_past_the_retry_budget_*` | `UpdateLayer` commit loop (`lua` route) exhausted by `-TRYAGAIN` | plain |
 //! | `fault_injected::update_layer_recovery_reissue_pre_store_refused_busy_*` | `UpdateLayer` recovery re-issue's pre-store, after a two-attempt first call | plain |
 //!
 //! Every hinted refusal also asserts the call applied nothing: on
-//! `UpdateLayer` the layer's `seq` and stream length are unchanged, on
-//! `CreateLayer` no mapping was created and the object-id counter did not
-//! move. The `CreateLayer` commit give-up rows (`IO` and permanent-class,
-//! budget spent and check failed) share one scenario,
-//! `fault_injected::commit_failure_gave_up`, parameterised on the injected
-//! fault and on where the call gives up; each also asserts no run landed.
+//! `UpdateLayer` the layer's `seq` and stream length are unchanged; on
+//! `CreateLayer` no mapping was created and, where the refusal came before
+//! the allocation, the object-id counter did not move. The hinted commit
+//! rows allocated and materialized an object, which no mapping names (the
+//! orphan sweep's); they assert no mapping and no operation record instead.
+//! The `CreateLayer` commit give-up rows share one scenario,
+//! `fault_injected::commit_runs_failed`, parameterised on the fault injected
+//! into each run and on where the call gives up; each also asserts no run
+//! landed. The redirect-refusal rows, and the plain rows beside them, pin
+//! where the store sets its commit marker: they fail if the marker is set
+//! before the first run whatever its outcome (the hinted rows answer plain),
+//! or if an overwrite's runs are exempt like a new layer's (the overwrite and
+//! re-plan rows answer hinted).
+//!
+//! The materialization's own failures (a redirected or replayed `EXEC`) are
+//! hinted too; their handler tests are in `storage::b_cyu_txn_redirect_test`,
+//! whose proxy reaches them.
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -94,13 +123,14 @@ use live_edit::storage::layer::LayerStore;
 use live_edit::storage::lua::CREATE_LAYER_COMMIT_SCRIPT;
 use live_edit::storage::session::SessionStore;
 use live_edit::storage::test_support::TestValkey;
+use oodf_ffi::OwnedDelta;
 
 use super::helpers::{
     build_service, build_service_with_userinfo, make_create_data, make_request, make_update_data,
     streaming_create, streaming_update, AllowAllPermissions,
 };
 use crate::common::owned_delta::{
-    delta_to_ompf_bytes, delta_with_set_field_external, delta_with_set_field_inline,
+    delta_to_ompf_bytes, delta_with_set_field_external, delta_with_set_field_inline, with_root,
 };
 use crate::common::refusal_detail::{assert_no_refusal_detail, assert_upstream_unavailable};
 use crate::storage::snapshot_read_support::{
@@ -292,6 +322,21 @@ impl Fx {
         (mapping, counter)
     }
 
+    /// The session's `CreateLayer` operation record for [`OPERATION_ID`],
+    /// read directly.
+    async fn create_record(&self) -> Option<String> {
+        self.tv
+            .client()
+            .pool
+            .get(
+                self.tv
+                    .key_schema()
+                    .create_layer_operation(&self.session_id, OPERATION_ID),
+            )
+            .await
+            .expect("GET operation record must succeed")
+    }
+
     fn base_path_read(&self) -> impl Fn(&[Vec<u8>]) -> bool {
         let key = self.tv.key_schema().session_meta(&self.session_id);
         move |args: &[Vec<u8>]| {
@@ -356,7 +401,7 @@ fn create_header_for(fx: &Fx, layer: &str, operation_id: &str) -> CreateLayerReq
     }
 }
 
-/// One inline field.
+/// One inline field on section 1: an `UpdateLayer` body.
 fn field_payload() -> Vec<u8> {
     delta_to_ompf_bytes(
         &delta_with_set_field_inline(1, "upstream-field", vec![0x5E], 0),
@@ -364,19 +409,45 @@ fn field_payload() -> Vec<u8> {
     )
 }
 
-/// One field whose value is an external value, carried in the container.
+/// A `CreateLayer` body: the layer's root section, holding [`field_payload`]'s
+/// field. Content setting the field with no top-level section is refused
+/// (SDD §9.7).
+fn create_payload() -> Vec<u8> {
+    delta_to_ompf_bytes(
+        &with_root(delta_with_set_field_inline(
+            1,
+            "upstream-field",
+            vec![0x5E],
+            0,
+        )),
+        &[],
+    )
+}
+
+/// One field on section 1 whose value is an external value, carried in the
+/// container: an `UpdateLayer` body.
 fn external_payload() -> Vec<u8> {
     let blob: &[u8] = b"upstream-unavailable external value";
-    delta_to_ompf_bytes(
-        &delta_with_set_field_external(
-            1,
-            "upstream-external",
-            ext_content_hash(blob).to_vec(),
-            blob.len() as u64,
-            1,
-            0,
-        ),
-        &[blob],
+    delta_to_ompf_bytes(&external_field_delta(blob), &[blob])
+}
+
+/// A `CreateLayer` body: the layer's root section, holding
+/// [`external_payload`]'s field.
+fn create_external_payload() -> Vec<u8> {
+    let blob: &[u8] = b"upstream-unavailable external value";
+    delta_to_ompf_bytes(&with_root(external_field_delta(blob)), &[blob])
+}
+
+/// One field on section 1 whose value is `blob`, carried as the container's
+/// first external value.
+fn external_field_delta(blob: &[u8]) -> OwnedDelta {
+    delta_with_set_field_external(
+        1,
+        "upstream-external",
+        ext_content_hash(blob).to_vec(),
+        blob.len() as u64,
+        1,
+        0,
     )
 }
 
@@ -649,7 +720,7 @@ async fn create_layer_base_path_read_refused_loading_answers_upstream_unavailabl
         what: "base-path read",
         message_prefix: None,
     };
-    refused_create(&fx, &svc, staged, create_header(&fx, ""), field_payload()).await;
+    refused_create(&fx, &svc, staged, create_header(&fx, ""), create_payload()).await;
 }
 
 /// A re-send's operation-record read refused `-LOADING`: the hint, no
@@ -675,7 +746,7 @@ async fn create_layer_operation_record_read_refused_loading_answers_upstream_una
         &svc,
         staged,
         create_header(&fx, OPERATION_ID),
-        field_payload(),
+        create_payload(),
     )
     .await;
 }
@@ -692,7 +763,7 @@ async fn create_layer_userinfo_unreachable_answers_upstream_unavailable() {
     );
     let before = fx.create_surface().await;
 
-    let status = create_status(&svc, create_header(&fx, ""), field_payload()).await;
+    let status = create_status(&svc, create_header(&fx, ""), create_payload()).await;
 
     assert_upstream_unavailable(&status);
     assert_eq!(status.message(), "auth backend: auth service unreachable");
@@ -721,55 +792,61 @@ async fn create_layer_ext_pre_store_refused_busy_answers_upstream_unavailable() 
         &svc,
         staged,
         create_header(&fx, ""),
-        external_payload(),
+        create_external_payload(),
     )
     .await;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Safety negatives: refused from the commit on → no refusal detail
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// The object-id allocation — the first step of `CreateLayer`'s commit —
-/// refused `-LOADING`: a plain `UNAVAILABLE`, no detail. The allocation is
-/// past the commit marker, and a commit-stage failure never claims it applied
-/// nothing (SDD §18.1).
+/// The object-id allocation refused `-LOADING`: the hint, the allocator's
+/// message, no mapping, no object id allocated, no operation recorded. The
+/// allocation runs inside the store's call, but before its commit marker
+/// (`CreateCommitMarker`, set at the call's first client-visible write), and
+/// writes nothing a client can reach. Before b.4q2 the handler set its marker
+/// before handing the call to the store, and this answered a plain
+/// `UNAVAILABLE`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn create_layer_object_id_allocation_refused_loading_answers_plain_unavailable() {
+async fn create_layer_object_id_allocation_refused_loading_answers_upstream_unavailable() {
     let fx = Fx::new("upstream-create-allocation").await;
     let svc = build_service(&fx.tv, Arc::new(AllowAllPermissions));
     let counter_key = fx.tv.key_schema().counter_object_id();
 
     // The allocation is the only script the call sends that names the
     // object-id counter key (the counter exists, so no repair runs first).
-    fx.stage.arm(
-        move |args: &[Vec<u8>]| {
+    // `refused` asserts it was refused once: the allocation is not retried.
+    let staged = Staged {
+        matcher: move |args: &[Vec<u8>]| {
             is_command(args, "EVALSHA")
                 && args.iter().any(|a| a.as_slice() == counter_key.as_bytes())
         },
-        LOADING_REPLY,
-    );
-    let status = create_status(&svc, create_header(&fx, ""), field_payload()).await;
-    fx.stage.disarm();
-
+        reply: LOADING_REPLY,
+        what: "allocation",
+        message_prefix: Some("EVAL alloc_object_id failed"),
+    };
+    refused_create(
+        &fx,
+        &svc,
+        staged,
+        create_header(&fx, OPERATION_ID),
+        create_payload(),
+    )
+    .await;
     assert_eq!(
-        fx.proxy.hits(),
-        1,
-        "the allocation was refused once, and not retried"
+        fx.create_record().await,
+        None,
+        "the operation was not recorded"
     );
-    assert_plain_unavailable(&status);
-    assert!(
-        status.message().starts_with("EVAL alloc_object_id failed")
-            && status.message().contains(LOADING_REPLY),
-        "the allocator's plain message; got {status:?}"
-    );
-    assert_eq!(fx.create_surface().await.0, None, "no mapping created");
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Safety negatives: refused from the commit marker on → no refusal detail
+// ═════════════════════════════════════════════════════════════════════════════
+
 /// The new-layer commit script refused out of memory — the handler twin of
-/// `storage::store_write_refusal_test`'s `create_commit` sites: the
-/// `CreateLayer` commit stage's plain `UNAVAILABLE` "… ; retry", no detail
-/// (b.yvh: a `CreateLayer` commit-stage refusal is never hinted).
+/// `storage::store_write_refusal_test`'s `create_commit` sites after the
+/// commit marker (the overwrite's `superseded` mark, a new layer's commit
+/// script): a plain `UNAVAILABLE` "… ; retry", no detail.
+/// The refusal is a commit-run failure other than the redirect refusal, so
+/// the store set its commit marker after the run (`CreateCommitMarker`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_layer_commit_refused_out_of_memory_answers_plain_unavailable() {
     let fx = Fx::new("upstream-create-commit").await;
@@ -779,7 +856,7 @@ async fn create_layer_commit_refused_out_of_memory_answers_plain_unavailable() {
         script_call(CREATE_LAYER_COMMIT_SCRIPT.sha1().to_string()),
         OOM_REPLY,
     );
-    let status = create_status(&svc, create_header(&fx, ""), field_payload()).await;
+    let status = create_status(&svc, create_header(&fx, ""), create_payload()).await;
     fx.stage.disarm();
 
     assert_eq!(fx.proxy.hits(), 1, "the commit script was refused once");
@@ -891,9 +968,9 @@ mod fault_injected {
         assert_eq!(fx.update_surface().await, before, "nothing applied");
     }
 
-    /// The commit failure a give-up row injects on each of its call's runs,
-    /// before the script runs.
-    #[derive(Clone, Copy)]
+    /// The commit failure a give-up row injects into one of its call's runs,
+    /// before the script runs (`script_ran: false`).
+    #[derive(Clone, Copy, Debug)]
     enum CommitFault {
         /// A fred `IO` error: transient, so the mapper alone answers it
         /// `UNAVAILABLE`.
@@ -902,6 +979,18 @@ mod fault_injected {
         /// write refusal nor a wrong-type refusal, so the mapper alone would
         /// answer it `INTERNAL`.
         Permanent,
+        /// `Routing` "Too many redirections.": the `txn_pool`'s refusal of a
+        /// cluster redirect, the one run failure that proves the script did
+        /// not run (`is_txn_redirect_refusal`), so it leaves the store's
+        /// commit marker clear.
+        Redirected,
+        /// `Unknown` "Too many failed write attempts.": what a one-attempt
+        /// command re-written after its connection closed fails with, its
+        /// first write possibly landed. It sets the marker.
+        WriteAttemptsExhausted,
+        /// A fred `Timeout`: the run may still be on the wire. It sets the
+        /// marker.
+        Timeout,
     }
 
     impl CommitFault {
@@ -910,6 +999,9 @@ mod fault_injected {
             match self {
                 Self::Io => "upstream-unavailable: connection reset",
                 Self::Permanent => "upstream-unavailable: protocol violation",
+                Self::Redirected => "Too many redirections.",
+                Self::WriteAttemptsExhausted => "Too many failed write attempts.",
+                Self::Timeout => "upstream-unavailable: the commit run timed out",
             }
         }
 
@@ -917,6 +1009,9 @@ mod fault_injected {
             let kind = match self {
                 Self::Io => fred::error::ErrorKind::IO,
                 Self::Permanent => fred::error::ErrorKind::Protocol,
+                Self::Redirected => fred::error::ErrorKind::Routing,
+                Self::WriteAttemptsExhausted => fred::error::ErrorKind::Unknown,
+                Self::Timeout => fred::error::ErrorKind::Timeout,
             };
             fred::error::Error::new(kind, self.details())
         }
@@ -949,27 +1044,50 @@ mod fault_injected {
     }
 
     /// A `CreateLayer` of `layer` whose every commit run fails with `fault`
-    /// before its script runs, until the call gives up at `exit`; the call's
-    /// finisher, when it spawns one, has no budget, so nothing lands. Asserts
-    /// every injected fault was taken, that the check was refused exactly
-    /// when `exit` says so, and that no run landed (`layer`'s mapping did not
-    /// move). Returns the call's status.
+    /// before its script runs, until the call gives up at `exit`. Returns the
+    /// call's status ([`commit_runs_failed`]).
     async fn commit_failure_gave_up(
         name: &str,
         layer: &str,
         fault: CommitFault,
         exit: GiveUp,
     ) -> Status {
+        let runs = match exit {
+            GiveUp::BudgetSpent => vec![fault; 2],
+            GiveUp::CheckFailed => vec![fault],
+        };
+        commit_runs_failed(name, layer, &runs, exit, "").await.1
+    }
+
+    /// A `CreateLayer` of `layer`, carrying `operation_id` (empty for none),
+    /// whose commit runs fail with `runs` in order, each before its script
+    /// runs, until the call gives up at `exit` — two runs when the budget is
+    /// spent, one when the check after it fails too. The call's finisher,
+    /// when it spawns one, has no budget, so nothing lands. Asserts every
+    /// injected fault was taken, that the check was refused exactly when
+    /// `exit` says so, and that no run landed (`layer`'s mapping did not
+    /// move). Returns the fixture and the call's status.
+    async fn commit_runs_failed(
+        name: &str,
+        layer: &str,
+        runs: &[CommitFault],
+        exit: GiveUp,
+        operation_id: &str,
+    ) -> (Fx, Status) {
         use live_edit::storage::layer::CreateCommitFault;
 
+        assert_eq!(
+            runs.len(),
+            match exit {
+                GiveUp::BudgetSpent => 2,
+                GiveUp::CheckFailed => 1,
+            },
+            "a give-up row injects one fault per run its call makes"
+        );
         let fx = Fx::new(name).await;
-        let runs = match exit {
-            GiveUp::BudgetSpent => 2,
-            GiveUp::CheckFailed => 1,
-        };
         let faults: Arc<Mutex<VecDeque<CreateCommitFault>>> = Arc::new(Mutex::new(
-            (0..runs)
-                .map(|_| CreateCommitFault {
+            runs.iter()
+                .map(|fault| CreateCommitFault {
                     error: fault.error(),
                     script_ran: false,
                 })
@@ -988,7 +1106,7 @@ mod fault_injected {
             ),
         );
         let mapped_before = mapping_of(&fx, layer).await;
-        let request = create_header_for(&fx, layer, "");
+        let request = create_header_for(&fx, layer, operation_id);
         if exit == GiveUp::CheckFailed {
             // The check is the only `MGET` naming a commit claim.
             fx.stage.arm(
@@ -1002,12 +1120,13 @@ mod fault_injected {
             );
         }
 
-        let status = create_status(&svc, request, field_payload()).await;
+        let status = create_status(&svc, request, create_payload()).await;
         fx.stage.disarm();
 
         assert!(
             faults.lock().unwrap().is_empty(),
-            "precondition: each of the call's {runs} commit run(s) took an injected failure"
+            "precondition: each of the call's {} commit run(s) took an injected failure",
+            runs.len()
         );
         assert_eq!(
             fx.proxy.hits(),
@@ -1020,7 +1139,7 @@ mod fault_injected {
             mapped_before,
             "precondition: no run landed, so the mapping did not move"
         );
-        status
+        (fx, status)
     }
 
     /// A give-up row's answer: a plain `UNAVAILABLE` — no refusal detail, so
@@ -1031,10 +1150,250 @@ mod fault_injected {
     #[track_caller]
     fn assert_gave_up_plain_unavailable(status: &Status, fault: CommitFault) {
         assert_plain_unavailable(status);
+        assert_carries_commit_failure(status, fault);
+    }
+
+    /// The answer carries the commit's own failure, the message the mapper
+    /// gave it, `fault`'s details included.
+    #[track_caller]
+    fn assert_carries_commit_failure(status: &Status, fault: CommitFault) {
         assert!(
             status.message().starts_with(COMMIT_ERROR_PREFIX)
                 && status.message().contains(fault.details()),
             "the commit's own failure, its message kept; got {status:?}"
+        );
+    }
+
+    // ── The redirect refusal: where the store sets its commit marker ────────
+
+    /// A new layer whose two commit runs were both refused by a cluster
+    /// redirect (`Routing` "Too many redirections.", which proves neither
+    /// script ran) applied nothing: its object is materialized but unmapped,
+    /// and nothing it wrote is client-visible. The store's commit marker is
+    /// still clear, so the answer carries `UPSTREAM_UNAVAILABLE`, the commit's
+    /// message kept; no mapping, no operation record. Fails if the marker is
+    /// set before the first run whatever its outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_new_layer_whose_every_commit_run_was_refused_by_a_redirect_answers_upstream_unavailable(
+    ) {
+        let (fx, status) = commit_runs_failed(
+            "upstream-create-new-redirected",
+            NEW_LAYER,
+            &[CommitFault::Redirected, CommitFault::Redirected],
+            GiveUp::BudgetSpent,
+            OPERATION_ID,
+        )
+        .await;
+
+        assert_upstream_unavailable(&status);
+        assert_carries_commit_failure(&status, CommitFault::Redirected);
+        assert_eq!(mapping_of(&fx, NEW_LAYER).await, None, "no layer was made");
+        assert_eq!(fx.create_record().await, None, "no operation was recorded");
+    }
+
+    /// The same new layer with one redirected run whose check failed too:
+    /// whether a run landed is unknown only when one may have run, and the
+    /// redirect proves this one did not. Still hinted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_new_layer_whose_redirected_commit_check_failed_too_answers_upstream_unavailable(
+    ) {
+        let (fx, status) = commit_runs_failed(
+            "upstream-create-new-redirected-check",
+            NEW_LAYER,
+            &[CommitFault::Redirected],
+            GiveUp::CheckFailed,
+            OPERATION_ID,
+        )
+        .await;
+
+        assert_upstream_unavailable(&status);
+        assert_carries_commit_failure(&status, CommitFault::Redirected);
+        assert_eq!(mapping_of(&fx, NEW_LAYER).await, None, "no layer was made");
+        assert_eq!(fx.create_record().await, None, "no operation was recorded");
+    }
+
+    /// One redirected run, then a run that failed "Too many failed write
+    /// attempts." — a one-attempt command re-written after its connection
+    /// closed, whose first write may have landed: the second run sets the
+    /// marker, so the answer is plain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_new_layer_whose_redirected_run_is_followed_by_a_write_attempts_exhausted_run_answers_plain_unavailable(
+    ) {
+        let (_fx, status) = commit_runs_failed(
+            "upstream-create-new-redirected-then-written",
+            NEW_LAYER,
+            &[CommitFault::Redirected, CommitFault::WriteAttemptsExhausted],
+            GiveUp::BudgetSpent,
+            OPERATION_ID,
+        )
+        .await;
+
+        assert_gave_up_plain_unavailable(&status, CommitFault::WriteAttemptsExhausted);
+    }
+
+    /// A run that timed out (it may still be on the wire and land), then a
+    /// redirected one: the timed-out run set the marker, and a later redirect
+    /// refusal never clears it. Plain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_new_layer_whose_timed_out_run_is_followed_by_a_redirected_run_answers_plain_unavailable(
+    ) {
+        let (_fx, status) = commit_runs_failed(
+            "upstream-create-new-timed-out-then-redirected",
+            NEW_LAYER,
+            &[CommitFault::Timeout, CommitFault::Redirected],
+            GiveUp::BudgetSpent,
+            OPERATION_ID,
+        )
+        .await;
+
+        assert_plain_unavailable(&status);
+        assert!(
+            status.message().starts_with(COMMIT_ERROR_PREFIX),
+            "the commit's own failure; got {status:?}"
+        );
+    }
+
+    /// An overwrite whose two runs were both refused by a redirect: neither
+    /// script ran, but the call fenced the old object before its first run —
+    /// a client-visible write (an `UpdateLayer` of the fenced object is
+    /// refused, and the finisher or the orphan sweep can still complete the
+    /// replacement). The marker is set before the fence, so the answer is
+    /// plain. Fails if an overwrite's runs are exempt like a new layer's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_overwrite_whose_every_commit_run_was_refused_by_a_redirect_answers_plain_unavailable(
+    ) {
+        let (fx, status) = commit_runs_failed(
+            "upstream-create-over-redirected",
+            LAYER,
+            &[CommitFault::Redirected, CommitFault::Redirected],
+            GiveUp::BudgetSpent,
+            "",
+        )
+        .await;
+
+        assert_gave_up_plain_unavailable(&status, CommitFault::Redirected);
+        let superseded: Option<String> = fx
+            .tv
+            .client()
+            .pool
+            .hget(
+                fx.tv.key_schema().obj_header(&fx.object_id.to_string()),
+                "superseded",
+            )
+            .await
+            .expect("HGET superseded must succeed");
+        assert_eq!(
+            superseded.as_deref(),
+            Some("1"),
+            "precondition: the call fenced the old object before its first run"
+        );
+    }
+
+    /// A new layer whose first run was refused by a redirect, and whose check
+    /// then found the mapping moved by another create (staged in the
+    /// post-failed-run hook): the call re-plans onto that object, fencing it,
+    /// so the marker is set at the re-plan's first run, and the re-plan's two
+    /// redirected runs give up plain. Fails if the marker is keyed on the
+    /// call's first plan rather than on each run's `expected` mapping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_layer_new_layer_replanned_onto_a_moved_mapping_answers_plain_unavailable() {
+        use fred::clients::Client;
+        use futures::FutureExt;
+
+        use live_edit::storage::layer::CreateCommitFault;
+        use live_edit::storage::watched_txn::WatchWindowHook;
+
+        let fx = Fx::new("upstream-create-new-replanned").await;
+        // The object another create maps the layer to while this call's first
+        // run is being checked.
+        let other = store(&fx)
+            .create_layer(
+                &fx.session_id,
+                "upstream-replan-other",
+                CREATED_BY,
+                &ObjectState {
+                    sequence_num: 1,
+                    first_version: 1,
+                    source_format: "usda".to_owned(),
+                    ..Default::default()
+                },
+                Arc::new(MockExternalValueStore::new()),
+            )
+            .await
+            .expect("the other create must succeed");
+        let moved = Arc::new(AtomicBool::new(false));
+        let hook: WatchWindowHook = {
+            let key = fx.tv.key_schema().layer_mapping(&fx.session_id, NEW_LAYER);
+            let moved = Arc::clone(&moved);
+            Arc::new(move |client: &Client| {
+                let (key, moved) = (key.clone(), Arc::clone(&moved));
+                async move {
+                    let _: () = client
+                        .set(&key, other.to_string(), None, None, false)
+                        .await
+                        .expect("SET of the moved mapping must succeed");
+                    moved.store(true, Ordering::SeqCst);
+                }
+                .boxed()
+            })
+        };
+        let faults: Arc<Mutex<VecDeque<CreateCommitFault>>> = Arc::new(Mutex::new(
+            (0..3)
+                .map(|_| CreateCommitFault {
+                    error: CommitFault::Redirected.error(),
+                    script_ran: false,
+                })
+                .collect(),
+        ));
+        let svc = build_service_with_layer_store(
+            &fx.tv,
+            Arc::new(
+                store(&fx)
+                    .with_create_layer_commit_fault_injector_for_test(Arc::clone(&faults))
+                    .with_create_layer_post_failed_run_hook_for_test(hook)
+                    .with_create_commit_finisher_timing_for_test(
+                        std::time::Duration::from_millis(1),
+                        std::time::Duration::from_millis(1),
+                        std::time::Duration::ZERO,
+                    ),
+            ),
+        );
+
+        let status = create_status(
+            &svc,
+            create_header_for(&fx, NEW_LAYER, ""),
+            create_payload(),
+        )
+        .await;
+
+        assert!(
+            moved.load(Ordering::SeqCst),
+            "precondition: the mapping moved before the first run's check"
+        );
+        assert!(
+            faults.lock().unwrap().is_empty(),
+            "precondition: the first run and the re-plan's two runs each took a redirect"
+        );
+        assert_gave_up_plain_unavailable(&status, CommitFault::Redirected);
+        assert_eq!(
+            mapping_of(&fx, NEW_LAYER).await,
+            Some(other.to_string()),
+            "no run of this call landed: the layer maps to the other create's object"
+        );
+        let superseded: Option<String> = fx
+            .tv
+            .client()
+            .pool
+            .hget(
+                fx.tv.key_schema().obj_header(&other.to_string()),
+                "superseded",
+            )
+            .await
+            .expect("HGET superseded must succeed");
+        assert_eq!(
+            superseded.as_deref(),
+            Some("1"),
+            "precondition: the re-plan fenced the object it planned against"
         );
     }
 
@@ -1158,7 +1517,7 @@ mod fault_injected {
             &svc,
             make_request(streaming_create(vec![
                 overwrite,
-                make_create_data(field_payload()),
+                make_create_data(create_payload()),
             ])),
         )
         .await

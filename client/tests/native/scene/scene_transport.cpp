@@ -16,6 +16,7 @@
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/tf/notice.h>
 #include <pxr/base/tf/errorMark.h>
+#include <pxr/base/tf/diagnosticMgr.h>
 #include <pxr/usd/sdf/changeBlock.h>
 #include <pxr/usd/sdf/copyUtils.h>
 #include <pxr/usd/sdf/attributeSpec.h>
@@ -1066,6 +1067,8 @@ int creationInteractive(int argc, char** argv) {
     if (argc == 6) options.flags=OMNI_USD_LIVE_RUNTIME_DISABLE_DIAGNOSTIC_HISTORY;
     else options.diagnostic_min_severity=OMNI_USD_LIVE_SEVERITY_DEBUG;
     options.max_status_subjects=2; // One endpoint plus one shared creation/attachment subject.
+    // A call budget the test names, such as one whose stream share is the creation's one unit.
+    if (const char* calls = std::getenv("LIVE_TEST_MAX_CALLS_PER_ENDPOINT")) options.max_calls_per_endpoint = std::stoull(calls);
     check(omniUsdLiveInitialize(&options) == OMNI_USD_LIVE_OK, "creation initialize failed"); owner.initialized = true;
     auto endpoint = record<OmniUsdLiveEndpointOptions>(); endpoint.authority = argv[2]; endpoint.access_token = "synthetic-writer";
     check(omniUsdLiveRegisterEndpoint(&endpoint,&owner.endpoint) == OMNI_USD_LIVE_OK, "creation endpoint failed");
@@ -1118,6 +1121,14 @@ int creationInteractive(int argc, char** argv) {
         case SceneCreation::Phase::OutcomeUnknown: return "unknown";
         }
         throw std::runtime_error("unknown creation phase");
+    };
+    // The endpoint's call budget: calls open, stream units and call units held.
+    const auto callCounts = [&] {
+        const auto found = owner.runtime ? owner.runtime->findEndpoint(owner.endpoint) : nullptr;
+        if (!found) return std::string("null");
+        const auto counts = found->calls->counts();
+        return "{\"open\":" + std::to_string(counts.open) + ",\"streams\":" + std::to_string(counts.streams) +
+            ",\"calls\":" + std::to_string(counts.calls) + "}";
     };
     auto report = [&](OmniUsdLiveResult result) {
         const auto state = creation->snapshot();
@@ -1224,6 +1235,7 @@ int creationInteractive(int argc, char** argv) {
                   << ",\"status_operation\":" << status.operation
                   << ",\"status_grpc_present\":" << status.grpc_status_present << ",\"status_grpc\":" << status.grpc_status
                   << ",\"status_progress_known\":" << status.progress_known
+                  << ",\"calls\":" << callCounts()
                   << ",\"diagnostics\":" << diagnosticSnapshot
                   << ",\"attach_result\":" << (owner.attachment && terminal(progress) ? progress.result : attachResult)
                   << ",\"applied\":" << progress.applied
@@ -1685,8 +1697,9 @@ public:
     // helper, which fences on the flush that job queued. Returns the ID of the
     // one intent that flush admitted, or the layer's failure cause with ID 0.
     // `write(layer, backing)` receives the live layer and its installed host
-    // backing. A healthy layer whose flush admitted nothing fails the driver:
-    // the campaign oracles bind one intent per command. While the issuance
+    // backing. A healthy layer's flush admits nothing, and the ID is 0, when the
+    // edit changes nothing in the scene it edited; the campaign oracles predict
+    // which commands those are and bind one intent to each other. While the issuance
     // window is full a flush job coalesces instead, so the job then admits the
     // edit at once, as a save does.
     // The queued job owns `write` and everything it captures, so a job that
@@ -1705,9 +1718,7 @@ public:
                     if(bound->deferredInstallDue(flushed,issued)) bound->scheduleFlush();
                 }
             });
-        if(admission.result!=OMNI_USD_LIVE_OK) return {admission.result,0};
-        check(admission.id!=0,"a graph authoring command must admit exactly one intent");
-        return {OMNI_USD_LIVE_OK,admission.id};
+        return {admission.result,admission.result==OMNI_USD_LIVE_OK ? admission.id : 0};
     }
     bool exportLayer(const std::string& path) { return call([&] { return bool(layer_) && layer_->Export(path); }); }
     void close() {
@@ -1732,6 +1743,22 @@ public:
     }
 };
 
+// Collects the commentary of every Tf warning posted while it exists, such
+// as the one naming a replaced section, which journal application posts.
+class GraphWarnings final : public TfDiagnosticMgr::Delegate {
+    std::mutex mutex_; std::vector<std::string> warnings_;
+public:
+    GraphWarnings() { TfDiagnosticMgr::GetInstance().AddDelegate(this); }
+    ~GraphWarnings() override { TfDiagnosticMgr::GetInstance().RemoveDelegate(this); }
+    void IssueError(const TfError&) override {}
+    void IssueFatalError(const TfCallContext&,const std::string&) override {}
+    void IssueStatus(const TfStatus&) override {}
+    void IssueWarning(const TfWarning& warning) override {
+        std::lock_guard<std::mutex> lock(mutex_); warnings_.push_back(warning.GetCommentary());
+    }
+    std::vector<std::string> warnings() { std::lock_guard<std::mutex> lock(mutex_); return warnings_; }
+};
+
 int graphInteractive(int argc, char** argv) {
     check(argc == 5, "usage: scene_transport --graph AUTHORITY SESSION LAYER");
     RuntimeOwner owner;
@@ -1752,6 +1779,7 @@ int graphInteractive(int argc, char** argv) {
     limits.scene.maxSections = 16384; limits.scene.maxFields = 65536;
     limits.scene.envelope.maxBytes = 16u*1024*1024;
     auto events = std::make_shared<GraphEvents>();
+    GraphWarnings warnings;
     std::unique_ptr<GraphHost> host;
     if (std::string(argv[1]) == "--graph-host") {
         host = std::make_unique<GraphHost>(events);
@@ -1765,6 +1793,10 @@ int graphInteractive(int argc, char** argv) {
         [events](const auto&) { events->signal(); });
     GraphReader reader(owner.attachment,events);
     std::deque<GraphSaved> saved;
+    // A settle report carries no scenes or intents, so a long campaign's
+    // many waits stay within the driver's output bound.
+    bool compact = false, quiet = false;
+    std::shared_ptr<std::promise<void>> hostHold;
     auto report = [&](OmniUsdLiveResult result, uint64_t accepted = 0, bool diagnostics = false) {
         reader.observe();
         for (const auto& previous : saved) previous.verify();
@@ -1794,8 +1826,13 @@ int graphInteractive(int argc, char** argv) {
                   << ",\"status_grpc_present\":" << status.grpc_status_present << ",\"status_grpc\":" << status.grpc_status
                   << ",\"incident\":" << status.incident_id << ",\"accepted_id\":" << accepted
                   << ",\"writer\":" << writerIdentity.text << ",\"local_admitted\":" << progress.localAdmitted
-                  << ",\"local_retired\":" << progress.localRetired
-                  << ",\"pending_intents\":[";
+                  << ",\"local_retired\":" << progress.localRetired;
+        if (compact) {
+            std::cout << '}' << std::endl;
+            check(bool(std::cout), "graph output failed");
+            return;
+        }
+        std::cout << ",\"pending_intents\":[";
         constexpr char hex[] = "0123456789abcdef";
         for (size_t i = 0; i < current.ids.size(); ++i) {
             if (i) std::cout << ',';
@@ -1820,6 +1857,14 @@ int graphInteractive(int argc, char** argv) {
             check(omniUsdLiveCopyDiagnostics(owner.endpoint,&config,output.data(),&size) == OMNI_USD_LIVE_OK &&
                   size && size <= output.size(), "bounded graph diagnostic snapshot failed");
             std::cout << ",\"diagnostics\":" << output.data();
+            GraphJson posted;
+            posted.add("[");
+            for (const auto& text : warnings.warnings()) {
+                if (posted.text.size() > 1) posted.add(",");
+                posted.quote(text);
+            }
+            posted.add("]");
+            std::cout << ",\"warnings\":" << posted.text;
         }
         std::cout << '}' << std::endl;
         check(bool(std::cout), "graph output failed");
@@ -1853,7 +1898,7 @@ int graphInteractive(int argc, char** argv) {
             result = host->exportLayer(path) ? OMNI_USD_LIVE_OK : OMNI_USD_LIVE_IO_ERROR;
             check(owner.attachment->snapshot()->pending.size() == before->pending.size(),
                   "export changed retained graph work");
-        } else if (verb == "wait" || verb == "journal-applied") {
+        } else if (verb == "wait" || verb == "settle" || verb == "journal-applied") {
             std::string value;
             check(bool(command >> value) && !(command >> extra), "invalid graph wait");
             uint64_t sequence = 0;
@@ -1871,7 +1916,7 @@ int graphInteractive(int argc, char** argv) {
                 // that a definitive rejection failed, which keeps applying peer
                 // updates (design section 13).
                 if (verb == "journal-applied" && state->applied >= sequence) break;
-                if (terminal(progress) && verb == "wait") { result = progress.result; break; }
+                if (terminal(progress) && verb != "journal-applied") { result = progress.result; break; }
                 if (state->applied >= sequence && progress.applied >= sequence && state->pending.empty()) break;
                 reader.healthy();
                 if (!events->wait(observed,until)) { result = OMNI_USD_LIVE_TIMEOUT; break; }
@@ -1954,6 +1999,110 @@ int graphInteractive(int argc, char** argv) {
                     });
                 }
             } catch (OmniUsdLiveResult failure) { result = failure; }
+        } else if (verb == "usd-over" || verb == "usd-def") {
+            // SdfCreatePrimInLayer creates PATH and each missing ancestor as an
+            // `over` with no other field, as UsdStage authoring through an edit
+            // target does; usd-def then defines PATH as a typed prim. Either
+            // sets PATH's int attribute `marker` to NUMBER. An optional
+            // ANCESTOR, a prim path above PATH, is defined as a typed `Xform`
+            // in the same write rather than left an implicit container.
+            std::string path, typed; int64_t number = 0;
+            check(bool(command >> path >> number) && SdfPath::IsValidPathString(path) &&
+                  SdfPath(path).IsAbsoluteRootOrPrimPath() && number >= INT32_MIN && number <= INT32_MAX,
+                  "invalid graph usd prim");
+            if (command >> typed)
+                check(!(command >> extra) && SdfPath::IsValidPathString(typed) &&
+                      SdfPath(typed).IsAbsoluteRootOrPrimPath() && SdfPath(path).HasPrefix(SdfPath(typed)) &&
+                      SdfPath(typed) != SdfPath(path), "invalid graph usd typed ancestor");
+            check(bool(host), "graph authoring requires --graph-host");
+            try {
+                std::tie(result, accepted) = host->author([=](const SdfLayerRefPtr& layer, HostSceneProjection&) {
+                    const auto prim = SdfCreatePrimInLayer(layer, SdfPath(path));
+                    if (!prim) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+                    if (verb == "usd-def") {
+                        prim->SetSpecifier(SdfSpecifierDef);
+                        prim->SetTypeName("Cube");
+                    }
+                    if (!typed.empty()) {
+                        const auto ancestor = layer->GetPrimAtPath(SdfPath(typed));
+                        if (!ancestor) throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+                        ancestor->SetSpecifier(SdfSpecifierDef);
+                        ancestor->SetTypeName("Xform");
+                    }
+                    auto attribute = layer->GetAttributeAtPath(SdfPath(path).AppendProperty(TfToken("marker")));
+                    if (!attribute) attribute = SdfAttributeSpec::New(prim, "marker", SdfValueTypeNames->Int);
+                    if (!attribute || !attribute->SetDefaultValue(VtValue(int(number))))
+                        throw OmniUsdLiveResult(OMNI_USD_LIVE_INVALID_ARGUMENT);
+                });
+            } catch (OmniUsdLiveResult failure) { result = failure; }
+        } else if (verb == "host-hold" || verb == "host-release") {
+            // host-hold queues a host job that blocks the host until
+            // host-release, so peer work received meanwhile waits for one
+            // batched application.
+            check(bool(host) && !(command >> extra), "invalid graph host hold");
+            if (verb == "host-hold") {
+                check(!hostHold, "graph host already held");
+                hostHold = std::make_shared<std::promise<void>>();
+                auto released = hostHold->get_future().share();
+                auto started = std::make_shared<std::promise<void>>();
+                auto running = started->get_future();
+                host->dispatch([released, started] { started->set_value(); released.wait(); });
+                check(running.wait_for(std::chrono::seconds(5)) == std::future_status::ready, "graph host hold did not start");
+            } else {
+                check(bool(hostHold), "graph host not held");
+                hostHold->set_value();
+                hostHold.reset();
+            }
+        } else if (verb == "quiet") {
+            // `quiet on` makes every later report but a diagnostics one compact.
+            std::string mode;
+            check(bool(command >> mode) && (mode == "on" || mode == "off") && !(command >> extra), "invalid graph quiet");
+            quiet = mode == "on";
+        } else if (verb == "jitter-off") {
+            // No holdback: consecutive received peer work is eligible at once,
+            // so it joins one batched application.
+            check(!(command >> extra), "invalid graph jitter-off");
+            auto jitter = record<OmniUsdLiveJitterParams>();
+            result = omniUsdLiveConfigureJitterReduction(owner.endpoint, &jitter);
+        } else if (verb == "covered") {
+            // Waits until the layer's read has received work through SEQUENCE.
+            uint64_t sequence = 0;
+            check(bool(command >> sequence) && !(command >> extra), "invalid graph covered");
+            const auto until = Clock::now()+std::chrono::seconds(5);
+            for (;;) {
+                const auto observed = events->revision();
+                const auto progress = owner.attachment->progress();
+                if (progress.covered >= sequence) break;
+                if (terminal(progress)) { result = progress.result; break; }
+                // Read progress signals no event while the host is held, so
+                // the predicate is polled under the watchdog.
+                if (Clock::now() >= until) { result = OMNI_USD_LIVE_TIMEOUT; break; }
+                (void)events->wait(observed,std::min(until,Clock::now()+std::chrono::milliseconds(5)));
+            }
+        } else if (verb == "usd-type") {
+            // Sets an existing prim's typeName, authoring a field of it.
+            std::string path, type;
+            check(bool(command >> path >> type) && !(command >> extra) && SdfPath::IsValidPathString(path) &&
+                  identifier(type), "invalid graph usd-type");
+            check(bool(host), "graph authoring requires --graph-host");
+            try {
+                std::tie(result, accepted) = host->author([=](const SdfLayerRefPtr& layer, HostSceneProjection&) {
+                    const auto prim = layer->GetPrimAtPath(SdfPath(path));
+                    if (!prim) throw OmniUsdLiveResult(OMNI_USD_LIVE_NOT_FOUND);
+                    prim->SetTypeName(type);
+                });
+            } catch (OmniUsdLiveResult failure) { result = failure; }
+        } else if (verb == "restore-refuse") {
+            // The process refuses its next COUNT restore admissions for capacity.
+            uint32_t count = 0;
+            check(bool(command >> count) && !(command >> extra), "invalid graph restore-refuse");
+            SceneJournal::refuseRestoresForTest(count);
+        } else if (verb == "restore-rounds") {
+            // The process's restore round bound; zero restores nothing, as a
+            // client without restore does.
+            uint32_t rounds = 0;
+            check(bool(command >> rounds) && !(command >> extra), "invalid graph restore-rounds");
+            SceneJournal::setRestoreRoundsForTest(rounds);
         } else if (verb == "sample" || verb == "sample-map" || verb == "erase-sample") {
             uint64_t section=0,bits=0; int64_t number=0;
             check(bool(command >> section >> bits) && section,"invalid graph sample identity/time");
@@ -1973,9 +2122,14 @@ int graphInteractive(int argc, char** argv) {
                 });
             } catch(OmniUsdLiveResult failure) { result=failure; }
         } else if (verb == "reverse-children") {
-            // Reverses a section's prim children: one Reorder naming all of them.
-            uint64_t section = 0;
-            check(bool(command >> section) && section && !(command >> extra), "invalid graph reverse-children");
+            // Reverses a section's prim children: one Reorder naming all of them. An optional FIELD NUMBER also
+            // sets that int field of the section in the same host turn, so each such edit's bytes are distinct.
+            uint64_t section = 0; std::string field; int64_t number = 0;
+            check(bool(command >> section) && section, "invalid graph reverse-children");
+            const bool marked = bool(command >> field);
+            check(!marked || (identifier(field) && bool(command >> number) && number >= INT32_MIN &&
+                              number <= INT32_MAX), "invalid graph reverse-children field");
+            check(!(command >> extra), "unexpected graph reverse-children argument");
             check(bool(host), "graph authoring requires --graph-host");
             const auto attachment = owner.attachment;
             try {
@@ -1985,6 +2139,7 @@ int graphInteractive(int argc, char** argv) {
                     auto names = data.Get(path, SdfChildrenKeys->PrimChildren).Get<std::vector<TfToken>>();
                     std::reverse(names.begin(), names.end());
                     data.Set(path, SdfChildrenKeys->PrimChildren, VtValue(names));
+                    if (marked) data.Set(path, TfToken(field), VtValue(int(number)));
                 });
             } catch (OmniUsdLiveResult failure) { result = failure; }
         } else if (verb == "set-value" || verb == "erase-field") {
@@ -2021,6 +2176,8 @@ int graphInteractive(int argc, char** argv) {
                 });
             } catch (OmniUsdLiveResult failure) { result = failure; }
         } else throw std::runtime_error("unknown graph command");
+        compact = verb == "settle" || verb == "host-hold" || verb == "host-release" || verb == "covered" ||
+            verb == "jitter-off" || (quiet && verb != "diagnostics" && verb != "close-diagnostics");
         report(result, accepted, verb == "diagnostics" || verb == "close-diagnostics");
         if (verb == "close" || verb == "close-diagnostics") break;
     }

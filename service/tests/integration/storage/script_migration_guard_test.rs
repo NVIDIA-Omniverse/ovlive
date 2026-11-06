@@ -204,7 +204,7 @@ const SENTINEL: [Sentinel; 5] = [
 /// their pinned source hash (decision 11). A script whose hash no longer
 /// matches fails [`every_pinned_script_matches_its_hash`] until its reason is
 /// re-confirmed against the edit and the hash updated.
-const ALLOWLIST: [Allowed; 41] = [
+const ALLOWLIST: [Allowed; 57] = [
     allowed(
         "alloc_object_id",
         Reason::A1,
@@ -233,17 +233,39 @@ const ALLOWLIST: [Allowed; 41] = [
         "6a8f25ee86f901be691c9a7ddc4d4d076266458380547211692571484359b4b7",
     ),
     allowed(
+        "dr_unhold",
+        Reason::A1,
+        "every key (lease, counter, marker) read before the first write; then the counter's \
+         `SET` and the marker's `DEL`, last, on the key the opening `EXISTS` proved present",
+        "5a1b10741fb3a737f3c9ade456dc17d01b914ebccc12cb87430629d83dcd42a8",
+    ),
+    allowed(
+        "ext_backup_clear",
+        Reason::A1,
+        "one key; the opening `EXISTS` names it, so a meta that moved is refused before any \
+         write; then the memory-neutral `HDEL` opener, the keyless `TIME` and one `HSET`, last, \
+         on that present key",
+        "ae85e2afdc9e1204f4b237311bf15c9a16b07bf83cf8e3f01512c28644b9063c",
+    ),
+    allowed(
         "ext_backup_confirm",
         Reason::A1,
         "one key; the opening `EXISTS` names it, so a meta that moved is refused before any \
-         write; then `HGET`, the keyless `TIME` and one `HSET`, last",
-        "676d7e5db88d12eae1e784bbc8f50135edf7823a8c8cb9366088e838233d074e",
+         write; then the `HGET`s, the keyless `TIME` and one `HSET`, last",
+        "3eabb38cadd4ecb47895d7c28dbc0d4d9ffb2c8e07870691d7c779dc1b18da6d",
     ),
     allowed(
         "ext_enqueue_attempt_resolve",
         Reason::A1,
         "additive",
         "bc7c9568df2d4203d34ccf84c10e54c8d83274e129868a8753ac962c51a1d4fd",
+    ),
+    allowed(
+        "ext_ref_count_set",
+        Reason::A1,
+        "one key; the opening `TYPE` names it, so a meta that moved is refused before any write; \
+         then an `HGET` and one `HSET`, last",
+        "991cda2cc3eb3e613e6df5302f6680f927556033825e66795c5fe7228fc51975",
     ),
     allowed(
         "ext_release_enqueue",
@@ -272,8 +294,10 @@ const ALLOWLIST: [Allowed; 41] = [
     allowed(
         "ext_store_value",
         Reason::A1,
-        "the heal is a plain `SET`, never `DEL` then `SET` (decision 9)",
-        "b3ca486e85d65ddeeac40d1701b22d6c67e024a976c1fc0bcb7c3f846e782e72",
+        "the heal is a plain `SET`, never `DEL` then `SET` (decision 9); the recover mode opens \
+         with an `EXISTS` of the meta, then its one write, `SET NX`, and an `HGET` of that \
+         present meta",
+        "2eb8103582f0cecee302ee5e9cef431106f21fb99de0f58e8890b3252ae8fe98",
     ),
     allowed(
         "gc_claim_pending",
@@ -325,6 +349,14 @@ const ALLOWLIST: [Allowed; 41] = [
         "05434477021ae9aeac5857888282cd0c855df4d6625ef580be4b7efb9f1258af",
     ),
     allowed(
+        "layer_unmap",
+        Reason::A1,
+        "a `GET` of the mapping first, so a moved mapping is refused before any write; the \
+         `SREM` of the index is the first write, so a moved index is refused before any write; \
+         then the `DEL` of the mapping the `GET` proved present, last",
+        "f536ef3fe8031664a8d844ef053e8ba864a0ebf041934f11a43a8cfd25adbf22",
+    ),
+    allowed(
         "leader_acquire_or_refresh",
         Reason::A1,
         "one write per branch; untagged lock",
@@ -335,6 +367,12 @@ const ALLOWLIST: [Allowed; 41] = [
         Reason::A1,
         "one write per branch; untagged lock",
         "b1210516d5fc19b6603ea016535cc54c7aacb0dd8ba217cd15b5b467c9d0dd30",
+    ),
+    allowed(
+        "leader_release_if_held",
+        Reason::A1,
+        "one key; `GET`, then one `DEL`, last",
+        "7d97f4086e0c1241e432a692258901fda82fdbca10f1d3da598e47838f30e055",
     ),
     allowed(
         "presence_refresh",
@@ -349,11 +387,86 @@ const ALLOWLIST: [Allowed; 41] = [
         "a949a741dc22ccfe250df56a59b47c9c61037a9b1bbd74c8c783a7a15f3c9cc1",
     ),
     allowed(
+        "recon_ext_commit",
+        Reason::A1,
+        "every read (`:tomb`, `:rearm`, `:collected`) before the first write; each write names a \
+         key a read proved present, the `PEXPIRE` follows the `ZADD` that filled its key, and no \
+         command names a key after a trim that can empty it; a run past its `t0` bound returns \
+         after the reads, writing nothing",
+        "1fd8e7c09e9995ad58577e24582efef125c3bcd21878d43e6807013f896f849b",
+    ),
+    allowed(
+        "recon_ext_rearm",
+        Reason::A1,
+        "the out-of-memory opener (`ZREM :rearm` of a never-written member) first, then every \
+         read (`:tomb`, `:collected`, `:deleting`, `:orphans`) before the first real write; each \
+         write names a key the opener or a read proved present, and each `ZREM` that can empty a \
+         key is that key's last command",
+        "e22bfd96c5b3aef14d8c882fcc7d9dfca5c11c9cb917a992153628eec496b503",
+    ),
+    allowed(
+        "recon_ext_settle",
+        Reason::A1,
+        "the memory-neutral opener (`ZREM :tomb` of a never-written member) and every read of \
+         `:rearm` and `:collected` before the first real write; each key's one `ZREM` that can \
+         empty it is that key's last command",
+        "902243cc21854e8cbe25bc7e7aa5b02b78372ba305eababf71267db4bb54683d",
+    ),
+    allowed(
+        "recon_orphan_commit",
+        Reason::A1,
+        "the read of `:orphans`, then one `ZADD` of `:deleting` as the first write; its trim and \
+         `PEXPIRE` follow on that just-filled key",
+        "efb4a2e105a0a7bf9d242091abe709736b1a24979b1b6661f40c3d7d94cc97a1",
+    ),
+    allowed(
+        "recon_redate",
+        Reason::A1,
+        "one `ZADD XX GT`, the only write",
+        "0df3fb04b1f85397224bc9a1f6e8712954a1dc7930e1ccc513db641b1448994b",
+    ),
+    allowed(
+        "recon_tomb_record",
+        Reason::A1,
+        "`ZCARD` of both keys before the first write; then `ZADD`s, which cannot empty a key, the \
+         trim of `:deleting` after its `ZADD`, and its `PEXPIRE`",
+        "21ee8b1b95f1f89fd44fc4af453017734f392b91b671b56f7a4155fdf23a9460",
+    ),
+    allowed(
         "retired_object_wake",
         Reason::A1,
         "one key; the opening `PEXPIRE` names it, so a stream that moved is refused before any \
          write, and every later command names a present key",
         "9177194207451f84524d97467e79b7c3d37bc36c4e9159fbd78519c871de126b",
+    ),
+    allowed(
+        "session_index_release",
+        Reason::A1,
+        "both `TYPE` probes before any write; an `SREM` runs only on a set its probe found \
+         present, `path_index` first, then the names set, a different key",
+        "87c0b5547779c907919d8091a09804ebedd9170406e42f841e54813af9c0a34f",
+    ),
+    allowed(
+        "session_meta_veto",
+        Reason::A1,
+        "both `TYPE` probes and the deletion marker's `EXISTS`, then a no-op `PEXPIRE` opener and \
+         one `SET`, last, both on the veto key (`KEYS[2]`): absent, it is a missing declared key, \
+         so a migrating source redirects the `EVALSHA` before the script runs (or refuses its \
+         first `TYPE`), before any write; present (a repeat), it is still present for the `SET`",
+        "6c0477c8df957a616f4a04b107e2ee1f77607aabaabd13dbb6c510e18b26ec7b",
+    ),
+    allowed(
+        "session_meta_write",
+        Reason::A1,
+        "the deletion marker's and the veto's `EXISTS`, then one `HSET`, last, the only write",
+        "108cf1cc308ece93162031eaf23427ff125fede59bbb5d71f54ff6d596673bac",
+    ),
+    allowed(
+        "session_path_index_reconcile",
+        Reason::A1,
+        "every read before the first write; the writes are `SREM`s on `path_index`, which its \
+         `TYPE` found present, in 500-member chunks of which only the last can empty it",
+        "2a709314cfabbb60dcaa994a3500d8ed6d2daf0d428013378a648db333bd0cc1",
     ),
     allowed(
         "snapshot_fence_renew",
@@ -434,6 +547,12 @@ const ALLOWLIST: [Allowed; 41] = [
         "f893c0aa90cde493146ae636b610775ceed9cb33ffac46f15f3c576ca7fdce0a",
     ),
     allowed(
+        "session_record_restore",
+        Reason::A3,
+        "writes only with the record (`KEYS[1]`) absent; every key it writes is declared",
+        "a5353ac5e7421a4bab15316c7cbd71b79ec142130f8d8a3cba76ac2ce0be20a3",
+    ),
+    allowed(
         "snapshot_fence_acquire",
         Reason::A4,
         "a fence always holds `size_e` / `size_b`",
@@ -481,13 +600,31 @@ const READ_ONLY_COMPUTED: [(&str, &str); 3] = [
 ];
 
 /// Commands that write a key.
-const WRITE_COMMANDS: [&str; 19] = [
-    "SET", "DEL", "UNLINK", "HSET", "HSETNX", "HDEL", "HINCRBY", "INCR", "INCRBY", "DECRBY",
-    "SADD", "SREM", "ZADD", "ZREM", "RPUSH", "PEXPIRE", "XADD", "XTRIM", "RENAME",
+const WRITE_COMMANDS: [&str; 20] = [
+    "SET",
+    "DEL",
+    "UNLINK",
+    "HSET",
+    "HSETNX",
+    "HDEL",
+    "HINCRBY",
+    "INCR",
+    "INCRBY",
+    "DECRBY",
+    "SADD",
+    "SREM",
+    "ZADD",
+    "ZREM",
+    "ZREMRANGEBYSCORE",
+    "RPUSH",
+    "PEXPIRE",
+    "XADD",
+    "XTRIM",
+    "RENAME",
 ];
 
 /// Commands that only read a key.
-const READ_COMMANDS: [&str; 24] = [
+const READ_COMMANDS: [&str; 25] = [
     "GET",
     "EXISTS",
     "TYPE",
@@ -505,6 +642,7 @@ const READ_COMMANDS: [&str; 24] = [
     "SCARD",
     "SRANDMEMBER",
     "ZSCORE",
+    "ZMSCORE",
     "ZCARD",
     "ZRANGE",
     "ZRANGEBYSCORE",
@@ -765,8 +903,8 @@ fn every_writing_script_is_on_exactly_one_list_and_no_read_only_script_is_on_eit
     let read_only = scripts.len() - writing.len();
     assert_eq!(
         (sentinel.len(), allowlisted.len(), read_only),
-        (5, 41, 8),
-        "the lists as SDD §18.1 states them: 5 sentinel, 41 allowlisted, 8 read-only. A change \
+        (5, 57, 9),
+        "the lists as SDD §18.1 states them: 5 sentinel, 57 allowlisted, 9 read-only. A change \
          here is a change to the section"
     );
 }

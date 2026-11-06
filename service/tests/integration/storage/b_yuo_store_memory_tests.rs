@@ -37,10 +37,17 @@
 //! - [`MapFacade`], a proxy playing a cluster whose `CLUSTER SLOTS` the test
 //!   rewrites (every entry on the one endpoint, as an Azure Managed Redis node
 //!   fronts several shards), fails, or answers malformed, for the `CLUSTER
-//!   SLOTS` each read with `LIVE_EDIT_VALKEY_MEMORY_BYTES` set sends, and
-//!   whose `INFO memory` reports no `maxmemory` field or a staged limit;
+//!   SLOTS` every clustered read sends, whatever is configured, and whose
+//!   `INFO memory` reports no `maxmemory` field or a staged limit;
+//! - [`ScaleOutFacade`] (b.xb7), three proxies playing a cluster that gains a
+//!   primary after the client connected, which the client's routing table
+//!   does not list — the read must confirm its `INFO` targets against the
+//!   map, re-syncing the table once — whose new node can refuse its
+//!   connections' setup, so that re-sync cannot complete, and whose replies
+//!   can be held back, to carry startup's read past its deadline;
 //! - a 3-shard cluster, when `LIVE_EDIT_TEST_CLUSTER_URL` is set (skipped
-//!   otherwise).
+//!   otherwise), and, in CI's `test-cluster-disruptive:` job, one whose slot
+//!   moves under a read's stale routing table (`test-fault-injection`).
 //!
 //! Startup reads the store once whatever is configured, and the store's
 //! memory replaces the budget unless it is explicit (`startup_store_memory`),
@@ -73,15 +80,18 @@ use live_edit::storage::ext_release_gate::{
 use live_edit::storage::external_values::{
     ExtRelease, ExternalValueStore, GcPassState, GcPolicy, ValkeyExternalValueStore,
 };
+use live_edit::storage::scan_guard::RoutingRefresh;
 use live_edit::storage::store_memory::{
     budget_from_reading, memory_bytes_budget, parse_info_maxmemory, read_store_memory,
     refreshed_budget, resolve_startup, spawn_store_memory_refresh_every_for_test,
-    startup_store_memory, store_memory_gauge, ClusterMapProblem, ClusterMapProblemKind,
-    MaxmemoryField, RefreshSeed, ReplconfCalls, StoreMemoryGaugeArm, StoreMemoryProblem,
-    StoreMemoryProblemKind, StoreMemoryReading, StoreMemoryRefresh,
+    startup_store_memory, store_memory_gauge, ClusterMapProblem, ClusterMapProblemKind, InfoUnread,
+    MaxmemoryField, PrimariesUnconfirmed, RefreshSeed, ReplconfCalls, StoreMemoryGaugeArm,
+    StoreMemoryProblem, StoreMemoryProblemKind, StoreMemoryReading, StoreMemoryRefresh,
 };
-use live_edit::storage::test_support::TestValkey;
+use live_edit::storage::test_support::{connect_test_client_or_skip, TestValkey};
 
+#[cfg(feature = "test-fault-injection")]
+use crate::storage::scan_guard_disruptive_test::{another_primary, move_slot};
 use crate::storage::snapshot_read_support::{
     client_through, error_reply_script, test_valkey_addr, ProxyAction, ProxyRule, ScriptReplyProxy,
 };
@@ -1183,8 +1193,8 @@ const MAP_FACADE_NODE_ID: &str = "b0qhk00000000000000000000000000000map000";
 /// set, a reply whose second entry names no primary; `INFO memory` answers
 /// `used_memory:470333232` and no `maxmemory` field, or `maxmemory:<n>` while
 /// `maxmemory` holds `Some(n)`; `INFO commandstats` lists no
-/// `cmdstat_replconf` line. Counts the `CLUSTER SLOTS` and the `INFO
-/// commandstats` it receives.
+/// `cmdstat_replconf` line. Counts the `CLUSTER SLOTS`, the `INFO memory`
+/// and the `INFO commandstats` it receives.
 struct MapFacade {
     proxy: ScriptReplyProxy,
     map: Arc<Mutex<Vec<(u16, u16)>>>,
@@ -1192,6 +1202,7 @@ struct MapFacade {
     slots_malformed: Arc<AtomicBool>,
     maxmemory: Arc<Mutex<Option<u64>>>,
     slots_reads: Arc<AtomicUsize>,
+    info_memory_reads: Arc<AtomicUsize>,
     commandstats_reads: Arc<AtomicUsize>,
 }
 
@@ -1203,6 +1214,7 @@ impl MapFacade {
         let slots_malformed = Arc::new(AtomicBool::new(false));
         let maxmemory = Arc::new(Mutex::new(None::<u64>));
         let slots_reads = Arc::new(AtomicUsize::new(0));
+        let info_memory_reads = Arc::new(AtomicUsize::new(0));
         let commandstats_reads = Arc::new(AtomicUsize::new(0));
         let rule: ProxyRule = {
             let (port_slot, map, slots_fail, slots_reads) = (
@@ -1211,9 +1223,10 @@ impl MapFacade {
                 Arc::clone(&slots_fail),
                 Arc::clone(&slots_reads),
             );
-            let (slots_malformed, maxmemory, commandstats_reads) = (
+            let (slots_malformed, maxmemory, info_memory_reads, commandstats_reads) = (
                 Arc::clone(&slots_malformed),
                 Arc::clone(&maxmemory),
+                Arc::clone(&info_memory_reads),
                 Arc::clone(&commandstats_reads),
             );
             Arc::new(move |args: &[Vec<u8>]| {
@@ -1256,6 +1269,7 @@ impl MapFacade {
                             .to_owned(),
                     )),
                     (b"INFO", Some(b"memory")) => {
+                        info_memory_reads.fetch_add(1, Ordering::SeqCst);
                         let line = maxmemory.lock().unwrap().map(|n| format!("maxmemory:{n}"));
                         Some(memory_reply(line.as_deref(), DEV_USED))
                     }
@@ -1282,8 +1296,13 @@ impl MapFacade {
             slots_malformed,
             maxmemory,
             slots_reads,
+            info_memory_reads,
             commandstats_reads,
         }
+    }
+
+    fn info_memory_reads(&self) -> usize {
+        self.info_memory_reads.load(Ordering::SeqCst)
     }
 
     /// A [`TestValkey`] connected through the facade in cluster mode.
@@ -1326,17 +1345,33 @@ fn map_of(reading: &StoreMemoryReading) -> (Vec<(u16, u16)>, usize) {
     }
 }
 
-/// T5 (PD4), I4: with `LIVE_EDIT_VALKEY_MEMORY_BYTES` set, each read sends
-/// its own `CLUSTER SLOTS` and takes the map from the reply, so a store
+/// Why a reading has no `INFO memory` answers, when it is that its pass
+/// could not confirm its targets (b.xb7); `None` for any other reading.
+fn unconfirmed(reading: &StoreMemoryReading) -> Option<&PrimariesUnconfirmed> {
+    match reading {
+        StoreMemoryReading::Read {
+            info: Err(InfoUnread::Unconfirmed(cause)),
+            ..
+        } => Some(cause),
+        _ => None,
+    }
+}
+
+/// T5 (PD4), I4, b.xb7: each read on a cluster sends its own `CLUSTER SLOTS`,
+/// whatever is configured, and takes the map from the reply, so a store
 /// resharded from 2 entries to 8 since the client connected is seen at once —
 /// 8 shards on 1 endpoint, the budget one eighth of an eighth of 80 % of
-/// 24 GB, never divided by the endpoint. With the setting unset, nothing needs
-/// the map: no `CLUSTER SLOTS` is sent and the reading carries no ranges.
+/// 24 GB, never divided by the endpoint. The 8 entries still sit on the one
+/// endpoint the client's routing table lists, so the table divides the slots
+/// as the map does: the read is confirmed and its `INFO` answered, the setting
+/// set or not.
 ///
 /// **Fails if the read took the client's cached routing table instead**: the
-/// third read still sees 2 entries, and the budget is 1,200,000,000.
+/// reads still see 2 entries, and the budget is 1,200,000,000. **Fails on the
+/// build before b.xb7** (stated, not run), which sent no `CLUSTER SLOTS` with
+/// the setting unset and so carried no ranges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn with_the_store_total_set_each_read_sends_its_own_cluster_slots() {
+async fn each_read_sends_its_own_cluster_slots_whatever_is_configured() {
     let facade = MapFacade::start(two_shards()).await;
     let tv = facade.test_valkey().await;
     let first = read_store_memory(tv.client(), Some(X20_TOTAL)).await;
@@ -1350,20 +1385,22 @@ async fn with_the_store_total_set_each_read_sends_its_own_cluster_slots() {
     let before = facade.slots_reads();
     let unset = read_store_memory(tv.client(), None).await;
     assert_eq!(
-        facade.slots_reads(),
-        before,
-        "the setting unset: no CLUSTER SLOTS"
-    );
-    assert_eq!(
-        (map_of(&unset.reading), unset.map_problem),
-        ((Vec::new(), 1), None),
-        "the setting unset: no map, and none needed"
+        (
+            facade.slots_reads() - before,
+            map_of(&unset.reading),
+            unset.map_problem,
+            unset.reading.primaries().map(<[_]>::len),
+        ),
+        (1, (eight_shards(), 1), None, Some(1)),
+        "the setting unset: (CLUSTER SLOTS sent, map, map problem, INFO memory answered)"
     );
 
+    let before = facade.slots_reads();
     let read = read_store_memory(tv.client(), Some(X20_TOTAL)).await;
-    assert!(
-        facade.slots_reads() > before,
-        "the setting set: the read sends CLUSTER SLOTS"
+    assert_eq!(
+        facade.slots_reads() - before,
+        1,
+        "the setting set: the read sends one CLUSTER SLOTS"
     );
     assert_eq!(read.map_problem, None);
     assert_eq!(map_of(&read.reading), (eight_shards(), 1));
@@ -1380,50 +1417,66 @@ async fn with_the_store_total_set_each_read_sends_its_own_cluster_slots() {
     drop(facade.proxy);
 }
 
-/// T5 (PD4): a `CLUSTER SLOTS` the store keeps refusing leaves the pass with
-/// no map — the failure reported, no ranges, no budget from rule 3 — while
-/// the `INFO`s behind it are answered at once: the command is an ordinary
-/// one, so it never holds up the shared maintenance client the way fred's
-/// `sync_cluster` would, retrying inside the client's router for as long as
-/// the store refuses. The next read once the store answers gets the map.
+/// T5 (PD4), b.xb7: a `CLUSTER SLOTS` the store keeps refusing leaves the
+/// pass with no map — the failure reported, no ranges, no budget from rule 3
+/// — and, with no map to confirm its targets against, no `INFO` at all: its
+/// primaries are unconfirmed. The `CLUSTER SLOTS` is sent once, as an
+/// ordinary command, so it never holds up the shared maintenance client the
+/// way fred's `sync_cluster` would, retrying inside the client's router for
+/// as long as the store refuses: a command sent on that client right after
+/// is answered. The next read once the store answers gets the map, and its
+/// `INFO`.
 ///
 /// **Fails with the map read through `sync_cluster`**: fred retries the
 /// refused `CLUSTER SLOTS` inside the client's router (more than one reaches
-/// the store), and the `INFO memory` queued behind that sync times out, so
-/// the reading has no primaries. Both are asserted as outcomes — a count
-/// and a failed `INFO` — never as elapsed time; [`SETTLE`] is only a hang
-/// bound.
+/// the store), and the `PING` queued behind that sync times out at the
+/// client's command timeout. Both are asserted as outcomes — a count and a
+/// failed command — never as elapsed time; [`SETTLE`] is only a hang bound.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_cluster_slots_leaves_no_map_and_does_not_hold_up_the_client() {
     let facade = MapFacade::start(two_shards()).await;
     let tv = facade.test_valkey().await;
     *facade.map.lock().unwrap() = eight_shards();
     facade.slots_fail.store(true, Ordering::SeqCst);
-    let before = facade.slots_reads();
+    let (slots_before, info_before) = (facade.slots_reads(), facade.info_memory_reads());
 
     let failed = tokio::time::timeout(SETTLE, read_store_memory(tv.client(), Some(X20_TOTAL)))
         .await
         .expect("the read ends");
+    let (maintenance, _token) = tv.client().acquire_maintenance();
+    let follow_up: Result<String, _> = tokio::time::timeout(SETTLE, maintenance.next().ping(None))
+        .await
+        .expect("the PING ends");
 
     assert_eq!(
         (
-            facade.slots_reads() - before,
-            failed.reading.primaries().is_some(),
+            facade.slots_reads() - slots_before,
+            facade.info_memory_reads() - info_before,
+            follow_up.map_err(|e| e.to_string()),
         ),
-        (1, true),
-        "(CLUSTER SLOTS sent, the INFO memory behind it answered): sent once, not \
-         retried, and nothing held up; got {failed:?}"
+        (1, 0, Ok("PONG".to_owned())),
+        "(CLUSTER SLOTS sent, INFO memory sent, the next command on that client): sent \
+         once, not retried, no INFO, and nothing held up; got {failed:?}"
     );
     assert_eq!(
         failed.map_problem.as_ref().map(ClusterMapProblem::kind),
         Some(ClusterMapProblemKind::ReadFailed),
         "the failure is reported: {failed:?}"
     );
+    assert!(
+        matches!(
+            unconfirmed(&failed.reading),
+            Some(PrimariesUnconfirmed::NoMap(ClusterMapProblem::ReadFailed(
+                _
+            )))
+        ),
+        "no map, so the primaries are unconfirmed: {failed:?}"
+    );
     assert_eq!(map_of(&failed.reading), (Vec::new(), 1), "no map");
     assert_eq!(
         budget_from_reading(&failed.reading, Some(X20_TOTAL)),
         None,
-        "no map, no maxmemory: no budget from the store"
+        "no map, no INFO: no budget from the store"
     );
 
     facade.slots_fail.store(false, Ordering::SeqCst);
@@ -1431,9 +1484,13 @@ async fn a_refused_cluster_slots_leaves_no_map_and_does_not_hold_up_the_client()
         .await
         .expect("a CLUSTER SLOTS the store answers is bounded");
     assert_eq!(
-        (map_of(&recovered.reading), recovered.map_problem),
-        ((eight_shards(), 1), None),
-        "the next read sees the resharded map"
+        (
+            map_of(&recovered.reading),
+            recovered.map_problem,
+            recovered.reading.primaries().map(<[_]>::len),
+        ),
+        ((eight_shards(), 1), None, Some(1)),
+        "the next read sees the resharded map, and its INFO memory is answered"
     );
     drop(tv);
     drop(facade.proxy);
@@ -1500,11 +1557,12 @@ async fn on_a_staged_cluster_reporting_maxmemory_the_limit_wins_over_the_store_t
 
 /// A malformed `CLUSTER SLOTS` reply — here a second entry naming no primary
 /// — is no map at all, never part of one. At startup the read reports
-/// `Malformed` and carries no ranges, its `INFO memory` is still answered,
-/// and the budget is the fallback — not one from the client's cached routing
-/// table, which still lists the 2 entries it connected with. On a refresh
-/// the last good budget (8 entries: 300,000,000) stands, and the malformed
-/// map WARNs once however many passes see it.
+/// `Malformed` and carries no ranges; with no map to confirm its targets
+/// against it sends no `INFO memory` (b.xb7); and the budget is the fallback
+/// — not one from the client's cached routing table, which still lists the 2
+/// entries it connected with. On a refresh the last good budget (8 entries:
+/// 300,000,000) stands, and the malformed map WARNs once however many passes
+/// see it.
 ///
 /// Current-thread runtime with a thread-local subscriber: the refresh task is
 /// spawned, so it is polled on the thread the capture is installed on.
@@ -1522,18 +1580,29 @@ async fn a_malformed_cluster_slots_reply_is_no_map_and_warns_once() {
     );
 
     facade.slots_malformed.store(true, Ordering::SeqCst);
+    let info_before = facade.info_memory_reads();
     let malformed = read_store_memory(tv.client(), Some(X20_TOTAL)).await;
     assert_eq!(malformed.map_problem, Some(ClusterMapProblem::Malformed));
     assert_eq!(map_of(&malformed.reading).0, Vec::new(), "no ranges");
-    assert!(
-        malformed.reading.primaries().is_some(),
-        "INFO memory is still answered: {malformed:?}"
+    assert_eq!(
+        (
+            facade.info_memory_reads() - info_before,
+            unconfirmed(&malformed.reading),
+        ),
+        (
+            0,
+            Some(&PrimariesUnconfirmed::NoMap(ClusterMapProblem::Malformed))
+        ),
+        "(INFO memory sent, why none): {malformed:?}"
     );
     let startup = resolve_startup(floor(), &malformed, Some(X20_TOTAL));
     assert_eq!(startup.budget, floor(), "startup on no map: the fallback");
     assert_eq!(
-        startup.seed().map_problem,
-        Some(ClusterMapProblemKind::Malformed)
+        (startup.seed().problem, startup.seed().map_problem),
+        (
+            Some(StoreMemoryProblemKind::PrimariesUnconfirmed),
+            Some(ClusterMapProblemKind::Malformed)
+        )
     );
 
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -1583,13 +1652,18 @@ async fn a_malformed_cluster_slots_reply_is_no_map_and_warns_once() {
     drop(facade.proxy);
 }
 
-/// A pass with no map — its `CLUSTER SLOTS` malformed or refused — still
-/// takes rule 2 when the store reports a `maxmemory`: on a staged cluster
-/// reporting 3 GiB, with `LIVE_EDIT_VALKEY_MEMORY_BYTES` set, startup starts
-/// on `info` (one eighth of 3 GiB), not the fallback, and the map problem is
-/// still reported.
+/// b.xb7: a pass with no map — its `CLUSTER SLOTS` malformed or refused —
+/// cannot confirm its `INFO` targets, so it sends no `INFO` and takes no
+/// rule-2 figure even from a store that reports a `maxmemory`: on a staged
+/// cluster reporting 3 GiB, with `LIVE_EDIT_VALKEY_MEMORY_BYTES` set,
+/// startup starts on the fallback, the problem is the unconfirmed primaries,
+/// and the map problem is still reported. With the map back, the same store
+/// starts on `info` (one eighth of 3 GiB).
+///
+/// **Fails on the build before b.xb7** (stated, not run), where a pass with no
+/// map still sent its `INFO`s and started on `info`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_staged_cluster_with_no_map_still_takes_the_stores_limit() {
+async fn a_staged_cluster_with_no_map_sends_no_info_and_starts_on_the_fallback() {
     let facade = MapFacade::start(eight_shards()).await;
     *facade.maxmemory.lock().unwrap() = Some(THREE_GIB);
     let tv = facade.test_valkey().await;
@@ -1602,32 +1676,45 @@ async fn a_staged_cluster_with_no_map_still_takes_the_stores_limit() {
     };
 
     let mut outcomes = Vec::new();
-    for (what, malformed) in [("malformed", true), ("refused", false)] {
+    for (what, malformed, refused) in [
+        ("malformed", true, false),
+        ("refused", false, true),
+        ("the map back", false, false),
+    ] {
         facade.slots_malformed.store(malformed, Ordering::SeqCst);
-        facade.slots_fail.store(!malformed, Ordering::SeqCst);
+        facade.slots_fail.store(refused, Ordering::SeqCst);
+        let info_before = facade.info_memory_reads();
         let read = read_store_memory(tv.client(), Some(X20_TOTAL)).await;
         let resolution = resolve_startup(floor(), &read, Some(X20_TOTAL));
         outcomes.push((
             what,
             read.map_problem.as_ref().map(ClusterMapProblem::kind),
+            facade.info_memory_reads() - info_before,
+            resolution.problem.as_ref().map(StoreMemoryProblem::kind),
             resolution.budget,
         ));
     }
+    let unconfirmed = Some(StoreMemoryProblemKind::PrimariesUnconfirmed);
     assert_eq!(
         outcomes,
         [
             (
                 "malformed",
                 Some(ClusterMapProblemKind::Malformed),
-                info_budget
+                0,
+                unconfirmed,
+                floor()
             ),
             (
                 "refused",
                 Some(ClusterMapProblemKind::ReadFailed),
-                info_budget
+                0,
+                unconfirmed,
+                floor()
             ),
+            ("the map back", None, 1, None, info_budget),
         ],
-        "(case, map problem, startup budget)"
+        "(case, map problem, INFO memory sent, problem, startup budget)"
     );
     facade.slots_malformed.store(false, Ordering::SeqCst);
     facade.slots_fail.store(false, Ordering::SeqCst);
@@ -1635,11 +1722,744 @@ async fn a_staged_cluster_with_no_map_still_takes_the_stores_limit() {
     drop(facade.proxy);
 }
 
+// ── b.xb7: a primary the routing table does not list ───────────────────────
+
+/// The `maxmemory` the scale-out facade's second node reports: 1 GiB, below
+/// the first node's 3 GiB, so a budget taken over both primaries is its ÷ 8
+/// and one taken over the first alone is not.
+const NEW_PRIMARY_MAXMEMORY: u64 = 1_073_741_824;
+
+/// The node ids the scale-out facade's `CLUSTER SLOTS` reply names.
+const SCALE_OUT_IDS: [&str; 3] = [
+    "b0xb7000000000000000000000000000000first",
+    "b0xb70000000000000000000000000000second",
+    "b0xb7000000000000000000000000000000third",
+];
+
+/// The reconnect backoff of the scale-out tests' clients: fred retries a
+/// cluster sync it could not complete inside the member's router at this
+/// pace (`valkey_reconnect_max_delay_ms`, which is also the floor of the
+/// exponential backoff), so a sync left running once the new node refuses
+/// its setup completes within one step of the node accepting.
+const SCALE_OUT_RECONNECT_DELAY_MS: u32 = 100;
+
+/// How long the scale-out facade holds each reply of a kind before it sends
+/// it (zero: at once). A held reply is still answered, so a client sees a
+/// slow command, never a failed one, while the delay stays below its command
+/// timeout.
+#[derive(Clone, Copy, Default)]
+struct StepDelays {
+    cluster_slots: Duration,
+    info_memory: Duration,
+    commandstats: Duration,
+}
+
+/// `script`'s reply, held for `delay` first when it is not zero.
+fn after(delay: Duration, script: String) -> ProxyAction {
+    if delay.is_zero() {
+        ProxyAction::Eval(script)
+    } else {
+        ProxyAction::DelayedEval(delay, script)
+    }
+}
+
+/// Three [`ScriptReplyProxy`]s in front of the test store playing a cluster
+/// that scales out. `CLUSTER SLOTS`, answered alike by every node, gives
+/// dev's two entries (2 × 8,192 slots): both on the first node while `moved`
+/// is clear, the second on the second node once it is set — a primary added
+/// after the client connected, which its routing table does not list. While
+/// `alternate` is set, the `CLUSTER SLOTS` the nodes answer from then on
+/// alternate between those maps, whatever `moved` says: the 1st, 3rd, … the
+/// scaled-out one, the 2nd, 4th, … the old one. While `three_primaries` is
+/// set, whatever the others say, it gives three entries (5,461 / 5,462 /
+/// 5,461 slots), one on each node; the third node is in no other map. `INFO
+/// memory` answers `maxmemory` [`NEW_PRIMARY_MAXMEMORY`] on the second node
+/// and 3 GiB on the others — or, while `report_maxmemory` is clear, no
+/// `maxmemory` field on any, as Azure Managed Redis answers — each node
+/// counting its own; `INFO commandstats` answers a `cmdstat_replconf` count
+/// of 5. `delays` holds those three replies back. While `refuse_setup` is
+/// set, the second node answers `CLUSTER INFO` — the last step of every
+/// connection's setup in fred — with `cluster_state:fail` (a node still
+/// joining), so no connection to it opens; it counts those refusals, and the
+/// `cluster_state:ok` answers it gives otherwise. The nodes count the
+/// `CLUSTER SLOTS` they answer in one count.
+struct ScaleOutFacade {
+    nodes: [ScriptReplyProxy; 3],
+    moved: Arc<AtomicBool>,
+    alternate: Arc<AtomicBool>,
+    three_primaries: Arc<AtomicBool>,
+    refuse_setup: Arc<AtomicBool>,
+    report_maxmemory: Arc<AtomicBool>,
+    delays: Arc<Mutex<StepDelays>>,
+    slots_reads: Arc<AtomicUsize>,
+    info_memory_reads: [Arc<AtomicUsize>; 3],
+    setup_refusals: Arc<AtomicUsize>,
+    setups_answered: Arc<AtomicUsize>,
+}
+
+impl ScaleOutFacade {
+    async fn start() -> Self {
+        let ports: Arc<OnceLock<[u16; 3]>> = Arc::new(OnceLock::new());
+        let moved = Arc::new(AtomicBool::new(false));
+        let alternate = Arc::new(AtomicBool::new(false));
+        let alternated = Arc::new(AtomicUsize::new(0));
+        let three_primaries = Arc::new(AtomicBool::new(false));
+        let refuse_setup = Arc::new(AtomicBool::new(false));
+        let report_maxmemory = Arc::new(AtomicBool::new(true));
+        let delays = Arc::new(Mutex::new(StepDelays::default()));
+        let slots_reads = Arc::new(AtomicUsize::new(0));
+        let info_memory_reads: [Arc<AtomicUsize>; 3] = Default::default();
+        let setup_refusals = Arc::new(AtomicUsize::new(0));
+        let setups_answered = Arc::new(AtomicUsize::new(0));
+        let rule = |node: usize| -> ProxyRule {
+            let (ports, moved, refuse_setup) = (
+                Arc::clone(&ports),
+                Arc::clone(&moved),
+                Arc::clone(&refuse_setup),
+            );
+            let three_primaries = Arc::clone(&three_primaries);
+            let (alternate, alternated, slots_reads) = (
+                Arc::clone(&alternate),
+                Arc::clone(&alternated),
+                Arc::clone(&slots_reads),
+            );
+            let (report_maxmemory, delays) = (Arc::clone(&report_maxmemory), Arc::clone(&delays));
+            let info_memory_reads = Arc::clone(&info_memory_reads[node]);
+            let (setup_refusals, setups_answered) =
+                (Arc::clone(&setup_refusals), Arc::clone(&setups_answered));
+            Arc::new(move |args: &[Vec<u8>]| {
+                let ports = *ports
+                    .get()
+                    .expect("the ports are recorded before any client connects");
+                let name = args.first()?.to_ascii_uppercase();
+                let sub = args.get(1).map(|a| a.to_ascii_lowercase());
+                let delays = *delays.lock().unwrap();
+                match (name.as_slice(), sub.as_deref()) {
+                    (b"CLUSTER", Some(b"slots")) => {
+                        slots_reads.fetch_add(1, Ordering::SeqCst);
+                        let scaled_out = if alternate.load(Ordering::SeqCst) {
+                            alternated.fetch_add(1, Ordering::SeqCst) % 2 == 0
+                        } else {
+                            moved.load(Ordering::SeqCst)
+                        };
+                        let second_owner = usize::from(scaled_out);
+                        let entry = |start: u16, end: u16, owner: usize| {
+                            format!(
+                                "{{{start}, {end}, {{'127.0.0.1', {}, '{}'}}}}",
+                                ports[owner], SCALE_OUT_IDS[owner]
+                            )
+                        };
+                        let entries = if three_primaries.load(Ordering::SeqCst) {
+                            [
+                                entry(0, 5460, 0),
+                                entry(5461, 10922, 1),
+                                entry(10923, 16383, 2),
+                            ]
+                            .join(", ")
+                        } else {
+                            [entry(0, 8191, 0), entry(8192, 16383, second_owner)].join(", ")
+                        };
+                        Some(after(delays.cluster_slots, format!("return {{{entries}}}")))
+                    }
+                    (b"CLUSTER", Some(b"info")) => {
+                        if node == 1 && refuse_setup.load(Ordering::SeqCst) {
+                            setup_refusals.fetch_add(1, Ordering::SeqCst);
+                            return Some(ProxyAction::Eval(
+                                "return 'cluster_state:fail\\r\\ncluster_slots_assigned:16384\\r\\n\
+                                 cluster_known_nodes:2\\r\\ncluster_size:2\\r\\n'"
+                                    .to_owned(),
+                            ));
+                        }
+                        if node == 1 {
+                            setups_answered.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Some(ProxyAction::Eval(
+                            "return 'cluster_state:ok\\r\\ncluster_slots_assigned:16384\\r\\n\
+                             cluster_known_nodes:2\\r\\ncluster_size:2\\r\\n'"
+                                .to_owned(),
+                        ))
+                    }
+                    (b"INFO", Some(b"memory")) => {
+                        info_memory_reads.fetch_add(1, Ordering::SeqCst);
+                        let maxmemory = [THREE_GIB, NEW_PRIMARY_MAXMEMORY, THREE_GIB][node];
+                        let line = report_maxmemory
+                            .load(Ordering::SeqCst)
+                            .then(|| format!("maxmemory:{maxmemory}"));
+                        let ProxyAction::Eval(script) = memory_reply(line.as_deref(), DEV_USED)
+                        else {
+                            unreachable!("memory_reply answers a script");
+                        };
+                        Some(after(delays.info_memory, script))
+                    }
+                    (b"INFO", Some(b"commandstats")) => Some(after(
+                        delays.commandstats,
+                        "return '# Commandstats\\r\\n\
+                         cmdstat_replconf:calls=5,usec=1,usec_per_call=0.20\\r\\n'"
+                            .to_owned(),
+                    )),
+                    _ => None,
+                }
+            })
+        };
+        let first = ScriptReplyProxy::start(test_valkey_addr(), rule(0)).await;
+        let second = ScriptReplyProxy::start(test_valkey_addr(), rule(1)).await;
+        let third = ScriptReplyProxy::start(test_valkey_addr(), rule(2)).await;
+        ports
+            .set([first.port(), second.port(), third.port()])
+            .expect("the ports are recorded exactly once");
+        Self {
+            nodes: [first, second, third],
+            moved,
+            alternate,
+            three_primaries,
+            refuse_setup,
+            report_maxmemory,
+            delays,
+            slots_reads,
+            info_memory_reads,
+            setup_refusals,
+            setups_answered,
+        }
+    }
+
+    fn port(&self, node: usize) -> u16 {
+        self.nodes[node].port()
+    }
+
+    /// `INFO memory` frames each node has received: `[first, second, third]`.
+    fn info_memory_reads(&self) -> [usize; 3] {
+        [0, 1, 2].map(|node| self.info_memory_reads[node].load(Ordering::SeqCst))
+    }
+
+    /// `CLUSTER SLOTS` frames the nodes have answered.
+    fn slots_reads(&self) -> usize {
+        self.slots_reads.load(Ordering::SeqCst)
+    }
+
+    /// A client connected through the first node in cluster mode, with one
+    /// pooled client per pool, the [`SCALE_OUT_RECONNECT_DELAY_MS`] backoff
+    /// and the test configuration's 5 s command timeout; `None` after a
+    /// `SKIP:` line when no store was promised.
+    async fn client(&self) -> Option<ValkeyClient> {
+        self.client_with_command_timeout(crate::common::test_config().valkey_command_timeout_ms)
+            .await
+    }
+
+    /// [`Self::client`] with a command timeout of `command_timeout_ms`.
+    async fn client_with_command_timeout(&self, command_timeout_ms: u64) -> Option<ValkeyClient> {
+        let mut cfg = crate::common::test_config();
+        cfg.valkey_url = format!("redis-cluster://127.0.0.1:{}", self.port(0));
+        cfg.valkey_pool_size = 1;
+        cfg.subscriber_pool_size = 1;
+        cfg.valkey_reconnect_max_delay_ms = SCALE_OUT_RECONNECT_DELAY_MS;
+        cfg.valkey_command_timeout_ms = command_timeout_ms;
+        connect_test_client_or_skip(&cfg).await
+    }
+}
+
+/// The ports of the distinct primaries `client`'s maintenance member's
+/// routing table lists, sorted.
+fn listed_primary_ports(client: &ValkeyClient) -> Vec<u16> {
+    let mut ports: Vec<u16> = client
+        .maintenance_pool
+        .next()
+        .cached_cluster_state()
+        .expect("a connected cluster client has a routing table")
+        .unique_primary_nodes()
+        .iter()
+        .map(|server| server.port)
+        .collect();
+    ports.sort_unstable();
+    ports
+}
+
+/// The `info` budget `maxmemory` gives over `primaries` primaries.
+fn info_budget(maxmemory: u64, primaries: usize) -> ExtReleaseBudget {
+    ExtReleaseBudget {
+        bytes: maxmemory / 8,
+        source: ExtReleaseBudgetSource::StoreInfo {
+            min_maxmemory_bytes: maxmemory,
+            primaries,
+        },
+    }
+}
+
+/// b.xb7 T4, the Issue's regression test: a primary added after the client
+/// connected, which the client's routing table does not list, is read in the
+/// same pass with `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset. The client connects
+/// while every slot is the first node's; the map then gives the second entry
+/// to the second node, which reports the smaller `maxmemory`. Startup's one
+/// read sends its `CLUSTER SLOTS`, finds the maintenance member's table
+/// dividing the slots otherwise, re-syncs it once, and sends `INFO memory` to
+/// both primaries: the budget is the smaller `maxmemory` ÷ 8, under `info`,
+/// from 2 primaries, and the member's table lists the second node afterwards.
+/// The pass sends exactly two `CLUSTER SLOTS`: its own, and the one fred's
+/// completed sync sends — the count
+/// [`a_read_whose_one_re_sync_still_leaves_the_table_differing_sends_no_info_and_syncs_once`]
+/// relies on. Counts and budgets, never elapsed time; [`SETTLE`] only bounds
+/// the read.
+///
+/// **Fails on the build before b.xb7** (stated, not run): it sent no `CLUSTER
+/// SLOTS` with the setting unset, sent `INFO memory` only to the primaries the
+/// table listed — the first node — and budgeted from its 3 GiB. Seen red by
+/// in-place perturbation: with `info_targets` answering the cached table's
+/// own primaries without the comparison, the second node gets no `INFO
+/// memory`, the budget is 3 GiB ÷ 8 from one primary, and the table still
+/// lists only the first node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_reaches_a_primary_its_routing_table_does_not_list_and_budgets_from_it() {
+    let facade = ScaleOutFacade::start().await;
+    let Some(client) = facade.client().await else {
+        return;
+    };
+    assert_eq!(
+        listed_primary_ports(&client),
+        vec![facade.port(0)],
+        "precondition: the maintenance member's table lists the first node alone"
+    );
+    facade.moved.store(true, Ordering::SeqCst);
+    let slots_before = facade.slots_reads();
+
+    let startup = tokio::time::timeout(SETTLE, startup_store_memory(&client, floor(), None))
+        .await
+        .expect("the read ends");
+
+    let mut both = vec![facade.port(0), facade.port(1)];
+    both.sort_unstable();
+    assert_eq!(
+        (
+            facade.info_memory_reads(),
+            startup.budget,
+            startup.problem,
+            listed_primary_ports(&client),
+            facade.slots_reads() - slots_before,
+        ),
+        (
+            [1, 1, 0],
+            info_budget(NEW_PRIMARY_MAXMEMORY, 2),
+            None,
+            both,
+            2
+        ),
+        "(INFO memory per node, startup budget, problem, the table's primaries after the read, \
+         CLUSTER SLOTS sent: the read's and its one sync's)"
+    );
+    drop(client);
+}
+
+/// b.xb7: a pass re-syncs its routing table at most once. The facade answers
+/// the pass's own `CLUSTER SLOTS` with the scaled-out map and the next one —
+/// the one fred's sync sends — with the old map, so the sync completes
+/// (`Refreshed`) to a table that still divides the slots otherwise than the
+/// pass's map. The pass is unconfirmed, naming the completed re-sync; it
+/// sends no `INFO memory` to any node; and it sends exactly two `CLUSTER
+/// SLOTS` — its own and the one sync's (a completed sync sends one: see
+/// [`a_read_reaches_a_primary_its_routing_table_does_not_list_and_budgets_from_it`]),
+/// so a second sync, which would send a third, is ruled out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_one_re_sync_still_leaves_the_table_differing_sends_no_info_and_syncs_once() {
+    let facade = ScaleOutFacade::start().await;
+    let Some(client) = facade.client().await else {
+        return;
+    };
+    facade.alternate.store(true, Ordering::SeqCst);
+    let slots_before = facade.slots_reads();
+
+    let read = tokio::time::timeout(SETTLE, read_store_memory(&client, None))
+        .await
+        .expect("the read ends");
+
+    let refresh = match unconfirmed(&read.reading) {
+        Some(PrimariesUnconfirmed::TableDiffers { refresh, .. }) => refresh.clone(),
+        _ => panic!("a table that still differs, unconfirmed; got {read:?}"),
+    };
+    assert_eq!(
+        (
+            refresh,
+            facade.info_memory_reads(),
+            facade.slots_reads() - slots_before,
+            listed_primary_ports(&client),
+        ),
+        (
+            Some(RoutingRefresh::Refreshed),
+            [0, 0, 0],
+            2,
+            vec![facade.port(0)]
+        ),
+        "(the re-sync, INFO memory per node, CLUSTER SLOTS sent, the table's primaries after)"
+    );
+    drop(client);
+}
+
+/// b.xb7 T4, the variant: the new primary refuses its connections' setup, so
+/// the read's one re-sync of the routing table cannot complete — fred has
+/// written the new table, but holds no connection to the new node — and the
+/// read is unconfirmed: no `INFO memory` reaches any node that pass, the
+/// problem is the unconfirmed primaries, naming a re-sync that timed out, and
+/// a refresh keeps the `info` budget startup took from the first node. The
+/// re-sync cannot fail instead: the client's reconnect policy allows
+/// unlimited attempts, and fred retries a `cluster_state` refusal, so the
+/// sync never returns before the bound cuts the wait. Once the node accepts
+/// and the sync still running in the member's router completes, the next
+/// read is confirmed and reaches both primaries, and a refresh moves the
+/// budget to the smaller `maxmemory`.
+///
+/// The read's re-sync is cut off at the client's command timeout (5 s), and
+/// fred keeps retrying it inside the member's router every
+/// [`SCALE_OUT_RECONNECT_DELAY_MS`]; the test waits for the new node to answer
+/// a connection's setup (`cluster_state:ok`) before the next read, so that
+/// read finds the sync done. Only that member's sync connects to the new
+/// node: no other client of the facade draws a `-MOVED` or reconnects, so the
+/// refusals are its sync's. Counts and budgets, never elapsed time; [`SETTLE`]
+/// only bounds each wait.
+///
+/// Fail-on-old, by in-place perturbation: with the table taken and compared
+/// again after a re-sync that timed out, as after a completed one, the table
+/// fred wrote matches, so the read sends `INFO memory` to its primaries, the
+/// new node among them, while the cut-off sync still holds the member's
+/// router: the reading is a failed `INFO` (it timed out), not an unconfirmed
+/// one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_routing_refresh_cannot_reach_the_new_primary_sends_no_info_until_it_can() {
+    let facade = ScaleOutFacade::start().await;
+    facade.refuse_setup.store(true, Ordering::SeqCst);
+    let Some(client) = facade.client().await else {
+        return;
+    };
+    let startup = tokio::time::timeout(SETTLE, startup_store_memory(&client, floor(), None))
+        .await
+        .expect("the startup read ends");
+    assert_eq!(
+        (startup.budget, facade.info_memory_reads()),
+        (info_budget(THREE_GIB, 1), [1, 0, 0]),
+        "precondition: startup read the first node alone"
+    );
+    facade.moved.store(true, Ordering::SeqCst);
+
+    let cut_off = tokio::time::timeout(SETTLE, read_store_memory(&client, None))
+        .await
+        .expect("the read ends");
+
+    let refresh = match unconfirmed(&cut_off.reading) {
+        Some(PrimariesUnconfirmed::TableDiffers { refresh, .. }) => refresh.clone(),
+        _ => panic!("a table that still differs, unconfirmed; got {cut_off:?}"),
+    };
+    assert!(
+        matches!(refresh, Some(RoutingRefresh::TimedOut { .. })),
+        "the re-sync timed out: {refresh:?}"
+    );
+    assert_eq!(
+        (
+            facade.info_memory_reads(),
+            StoreMemoryProblem::of_reading(&cut_off.reading).map(|p| p.kind()),
+            refreshed_budget(&startup.budget, &cut_off.reading, None),
+            facade.setup_refusals.load(Ordering::SeqCst) > 0,
+        ),
+        (
+            [1, 0, 0],
+            Some(StoreMemoryProblemKind::PrimariesUnconfirmed),
+            None,
+            true,
+        ),
+        "(INFO memory per node, problem, refreshed budget, the new node refused a setup)"
+    );
+
+    facade.refuse_setup.store(false, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    while facade.setups_answered.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sync left running never connected to the new node"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let confirmed = tokio::time::timeout(SETTLE, read_store_memory(&client, None))
+        .await
+        .expect("the next read ends");
+
+    assert_eq!(
+        (
+            facade.info_memory_reads(),
+            confirmed.reading.primaries().map(<[_]>::len),
+            refreshed_budget(&startup.budget, &confirmed.reading, None),
+        ),
+        (
+            [2, 1, 0],
+            Some(2),
+            Some(info_budget(NEW_PRIMARY_MAXMEMORY, 2)),
+        ),
+        "(INFO memory per node, primaries read, refreshed budget) once the node accepts"
+    );
+    drop(client);
+}
+
+// ── b.xb7: startup's read bounded as a whole ───────────────────────────────
+
+/// The command timeout T of the startup-deadline tests' clients, 4 s: startup's
+/// deadline is 2T, 8 s. Each held reply below is held 0.55T (2.2 s), under T by
+/// 1.8 s, so a held command is answered, never failed by its own timeout, and
+/// only the read's deadline — the sum of four held replies, 2.2T — cuts a
+/// step off.
+const DEADLINE_TEST_COMMAND_TIMEOUT_MS: u64 = 4_000;
+
+/// A share of [`DEADLINE_TEST_COMMAND_TIMEOUT_MS`], in thousandths.
+fn of_command_timeout(thousandths: u64) -> Duration {
+    Duration::from_millis(DEADLINE_TEST_COMMAND_TIMEOUT_MS * thousandths / 1000)
+}
+
+/// b.xb7 2(b) and 2(d): startup's read is bounded as a whole at two command
+/// timeouts (2T), a refresh pass is not. On a cluster of three primaries,
+/// each of the read's four steps — the `CLUSTER SLOTS` and an `INFO memory`
+/// on each primary — is held 0.55T, each answered well within T, together
+/// 2.2T. Startup's read is cut off at 2T in its third `INFO memory`: a failed
+/// `INFO memory` naming the deadline, the map kept — so with
+/// `LIVE_EDIT_VALKEY_MEMORY_BYTES` set the budget is rule 3 from its three
+/// entries, `override`, not the fallback — the gauge absent, the resolution
+/// marked `cut_off_at_deadline`, and its seed carrying no problem. The same
+/// four steps read as a refresh pass (`read_store_memory`, on a second
+/// client whose connections hold no reply still owed) are waited for past
+/// 2T: all three primaries answer, and the budget is the smallest
+/// `maxmemory`'s.
+///
+/// Slow by design (about 17 s): the cut-off needs replies held past 2T, and
+/// each must stay under T. Outcomes only, never elapsed time; [`SETTLE`]
+/// bounds each read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_startup_read_cut_off_in_info_memory_keeps_the_map_and_a_refresh_read_is_not_cut_off() {
+    let facade = ScaleOutFacade::start().await;
+    facade.three_primaries.store(true, Ordering::SeqCst);
+    let (startup_client, refresh_client) = tokio::join!(
+        facade.client_with_command_timeout(DEADLINE_TEST_COMMAND_TIMEOUT_MS),
+        facade.client_with_command_timeout(DEADLINE_TEST_COMMAND_TIMEOUT_MS),
+    );
+    let (Some(startup_client), Some(refresh_client)) = (startup_client, refresh_client) else {
+        return;
+    };
+    *facade.delays.lock().unwrap() = StepDelays {
+        cluster_slots: of_command_timeout(550),
+        info_memory: of_command_timeout(550),
+        commandstats: Duration::ZERO,
+    };
+
+    let startup = tokio::time::timeout(
+        SETTLE,
+        startup_store_memory(&startup_client, floor(), Some(DEV_TOTAL)),
+    )
+    .await
+    .expect("the startup read ends");
+
+    let why = match &startup.problem {
+        Some(StoreMemoryProblem::ReadFailed(why)) => why.clone(),
+        other => panic!("a failed INFO memory; got {other:?} in {startup:?}"),
+    };
+    assert!(why.contains("reached its deadline"), "{why}");
+    assert_eq!(
+        (
+            startup.cut_off_at_deadline,
+            startup.budget.bytes,
+            startup.budget.source.label(),
+            startup.used_ratio,
+            startup.seed().problem,
+        ),
+        // 12 GB x 0.8 over the smallest of the three entries, 5,461 slots, ÷ 8.
+        (true, 399_975_585, "override", None, None),
+        "(cut off, budget, its source — rule 3 from the kept map — gauge, seeded problem)"
+    );
+
+    let refresh = tokio::time::timeout(SETTLE, read_store_memory(&refresh_client, None))
+        .await
+        .expect("the refresh read ends");
+    assert_eq!(
+        (
+            refresh.reading.primaries().map(<[_]>::len),
+            budget_from_reading(&refresh.reading, None),
+        ),
+        (Some(3), Some(info_budget(NEW_PRIMARY_MAXMEMORY, 3))),
+        "a refresh read is waited for past 2T: (primaries read, budget); got {refresh:?}"
+    );
+    drop(startup_client);
+    drop(refresh_client);
+}
+
+/// b.xb7 2(b): on a store that reports no `maxmemory` field, with
+/// `LIVE_EDIT_VALKEY_MEMORY_BYTES` set, startup's read also sends `INFO
+/// commandstats` to each primary. With each `INFO memory` and each `INFO
+/// commandstats` held 0.55T (together 2.2T, each well within T), the read is
+/// cut off at 2T in its second `INFO commandstats`: the count is unreadable,
+/// naming the deadline, while both `INFO memory` answers are kept — the
+/// problem is the absent field, the budget rule 3, the gauge's arm the store
+/// total's, pending — and the resolution is marked `cut_off_at_deadline`,
+/// its seed not carrying the unreadable count.
+///
+/// Slow by design (about 8 s), for the reason above. Outcomes only;
+/// [`SETTLE`] bounds the read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_startup_read_cut_off_in_info_commandstats_reads_the_count_as_unreadable() {
+    let facade = ScaleOutFacade::start().await;
+    facade.moved.store(true, Ordering::SeqCst);
+    facade.report_maxmemory.store(false, Ordering::SeqCst);
+    let Some(client) = facade
+        .client_with_command_timeout(DEADLINE_TEST_COMMAND_TIMEOUT_MS)
+        .await
+    else {
+        return;
+    };
+    *facade.delays.lock().unwrap() = StepDelays {
+        cluster_slots: Duration::ZERO,
+        info_memory: of_command_timeout(550),
+        commandstats: of_command_timeout(550),
+    };
+
+    let startup = tokio::time::timeout(
+        SETTLE,
+        startup_store_memory(&client, floor(), Some(DEV_TOTAL)),
+    )
+    .await
+    .expect("the startup read ends");
+
+    let why = startup
+        .commandstats_unreadable
+        .clone()
+        .unwrap_or_else(|| panic!("an unreadable count; got {startup:?}"));
+    assert!(why.contains("reached its deadline"), "{why}");
+    assert_eq!(
+        (
+            startup.cut_off_at_deadline,
+            facade.info_memory_reads(),
+            startup.problem.as_ref().map(StoreMemoryProblem::kind),
+            startup.budget.bytes,
+            startup.gauge_arm,
+            startup.replconf_calls,
+            startup.seed().commandstats_unreadable,
+        ),
+        (
+            true,
+            [1, 1, 0],
+            Some(StoreMemoryProblemKind::FieldAbsent),
+            600_000_000,
+            StoreMemoryGaugeArm::StoreTotalPending,
+            None,
+            false,
+        ),
+        "(cut off, INFO memory per node, problem, budget, gauge arm, count, seeded unreadable)"
+    );
+    drop(client);
+}
+
+/// The slot b.xb7 T6 moves: the first primary's pin slot, as
+/// `scan_guard_stale_table_test` moves it.
+#[cfg(feature = "test-fault-injection")]
+const MOVED_SLOT: u16 = 0;
+
+/// The bound on T6's one store-memory read: its `CLUSTER SLOTS`, one re-sync
+/// and an `INFO memory` per primary, each bounded by the 5 s command timeout
+/// and each milliseconds when healthy.
+#[cfg(feature = "test-fault-injection")]
+const READ_BUDGET: Duration = Duration::from_secs(15);
+
+/// b.xb7 T6, on a real cluster (`LIVE_EDIT_TEST_CLUSTER_URL`; skipped
+/// otherwise): the reader's maintenance member connects first, so its routing
+/// table is built; another client then moves slot 0 from the first primary
+/// A to another primary B. The member sends nothing keyed, so its table
+/// still maps slot 0 to A. One `read_store_memory` with
+/// `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset sends its `CLUSTER SLOTS`, finds the
+/// table grouping slot 0 with A's slots where the map groups it with B's,
+/// re-syncs the table once and is confirmed: `INFO memory` on every primary,
+/// and the member's table then routes slot 0 to B. Slot 0 is moved back
+/// before any assertion, so a failure leaves the cluster as it found it.
+///
+/// **Disruptive and twice gated**: `#[ignore]`d with the
+/// `ci: test-cluster-disruptive` label and selected by that job's `-E` filter
+/// through `slot_migration_disruptive` (which also puts it in
+/// `.config/nextest.toml`'s one-at-a-time `disruptive-cluster` group and keeps
+/// its `CLUSTER-GATED RAN:` line on a pass), and skipped without
+/// `LIVE_EDIT_TEST_CLUSTER_URL`. Compiled only with `test-fault-injection`,
+/// the feature the shared `SlotMigration` helper is built under: a run
+/// without it compiles the test out and reports nothing.
+///
+/// The slot moves go through `scan_guard_disruptive_test`'s `move_slot`, and
+/// the second primary is its `another_primary`.
+///
+/// **Worst case**, every wait at its budget, against nextest's 120 s kill:
+/// two moves, each `SlotMigration`'s drain (bounded at 30 s) and a
+/// convergence wait of `scan_guard_disruptive_test`'s `CONVERGENCE_BUDGET`
+/// (10 s), and the read's
+/// [`READ_BUDGET`] (15 s): 95 s; well under a second healthy.
+///
+/// **Fail-on-old** (stated, not run: this sandbox has no cluster): the build
+/// before b.xb7 sent no `CLUSTER SLOTS` with the setting unset and read the
+/// primaries its stale table listed — every primary here, so its `INFO`s were
+/// answered — but never re-synced the table, so slot 0 stays on A.
+#[cfg(feature = "test-fault-injection")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "ci: test-cluster-disruptive; disruptive, migrates a hash slot between shards"]
+async fn store_memory_cluster_slot_migration_disruptive_a_read_on_a_stale_table_resyncs_it_and_reads_every_primary(
+) {
+    let Some(url) = live_edit::storage::test_support::test_cluster_url() else {
+        eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set");
+        return;
+    };
+    let reader = TestValkey::setup_with_url(url.clone(), 1).await;
+    let admin = TestValkey::setup_with_url(url, 1).await;
+    let slot_owner = || {
+        reader
+            .client()
+            .maintenance_pool
+            .next()
+            .cached_cluster_state()
+            .expect("a connected cluster client has a routing table")
+            .get_server(MOVED_SLOT)
+            .cloned()
+            .expect("the table names the slot's owner")
+    };
+    let a = slot_owner();
+    let primaries = admin
+        .client()
+        .pool
+        .next()
+        .cached_cluster_state()
+        .expect("a routing table")
+        .unique_primary_nodes()
+        .len();
+    let b = another_primary(&admin, &a);
+
+    move_slot(&admin, MOVED_SLOT, &a, &b).await;
+    let stale = slot_owner();
+    let read = tokio::time::timeout(READ_BUDGET, read_store_memory(reader.client(), None)).await;
+    let after = slot_owner();
+    move_slot(&admin, MOVED_SLOT, &b, &a).await;
+
+    assert_eq!(
+        stale, a,
+        "fixture: the reader's maintenance member still maps slot {MOVED_SLOT} to its old owner"
+    );
+    let read = read.expect("the read ends within its budget");
+    let answered = read.reading.primaries().map(<[_]>::len);
+    assert_eq!(
+        (read.map_problem, answered, after),
+        (None, Some(primaries), b),
+        "(map problem, primaries read, slot {MOVED_SLOT}'s owner in the member's table after the \
+         read); got {:?}",
+        read.reading
+    );
+    println!(
+        "CLUSTER-GATED RAN: store_memory_cluster_slot_migration_disruptive_a_read_on_a_stale_table_resyncs_it_and_reads_every_primary"
+    );
+}
+
 /// T11, on a real cluster (`LIVE_EDIT_TEST_CLUSTER_URL`; skipped otherwise):
 /// the store is read on every primary, pinned per node, and each reports
 /// `used_memory`; the map's entries cover every slot once, at least one per
-/// primary. With `LIVE_EDIT_VALKEY_MEMORY_BYTES` set the map comes from the
-/// read's own `CLUSTER SLOTS`.
+/// primary. The map comes from the read's own `CLUSTER SLOTS`, which every
+/// clustered read sends.
+///
+/// b.xb7 T7: a read with `LIVE_EDIT_VALKEY_MEMORY_BYTES` unset is confirmed
+/// on every primary too — its map, read from real Valkey's own `CLUSTER
+/// SLOTS` spelling, divides the slots as the client's freshly connected
+/// routing table does — so a comparison that read the two as different on
+/// every pass (and so never sent an `INFO`) fails here. Prints
+/// `CLUSTER-GATED RAN:` when it ran (`.config/nextest.toml` keeps that line
+/// on a pass).
 ///
 /// CI's cluster (and `scripts/dev-valkey.sh cluster-up`'s) sets no
 /// `maxmemory`, so there only the unusable arm runs: the reading names the
@@ -1654,11 +2474,11 @@ async fn a_staged_cluster_with_no_map_still_takes_the_stores_limit() {
 /// [`startup_reads_the_store_whatever_is_configured_and_its_limit_wins`], and,
 /// on a cluster, by the staged
 /// [`on_a_staged_cluster_reporting_maxmemory_the_limit_wins_over_the_store_total`]
-/// and [`a_staged_cluster_with_no_map_still_takes_the_stores_limit`]. The arm
-/// is kept for a cluster that does report a limit.
+/// and [`a_staged_cluster_with_no_map_sends_no_info_and_starts_on_the_fallback`].
+/// The arm is kept for a cluster that does report a limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cluster_store_is_read_on_every_primary() {
-    let Ok(cluster_url) = std::env::var("LIVE_EDIT_TEST_CLUSTER_URL") else {
+    let Some(cluster_url) = live_edit::storage::test_support::test_cluster_url() else {
         eprintln!("SKIP: LIVE_EDIT_TEST_CLUSTER_URL not set (no multi-shard cluster configured)");
         return;
     };
@@ -1750,4 +2570,31 @@ async fn a_cluster_store_is_read_on_every_primary() {
             }
         }
     }
+
+    let unset = read_store_memory(tv.client(), None).await;
+    let StoreMemoryReading::Read {
+        info: Ok(answered),
+        slot_ranges,
+        ..
+    } = &unset.reading
+    else {
+        panic!(
+            "the setting unset: INFO memory on every primary, confirmed against the map; got \
+             {unset:?}"
+        );
+    };
+    assert_eq!(
+        (unset.map_problem.clone(), answered.len()),
+        (None, primaries),
+        "the setting unset: (map problem, primaries read)"
+    );
+    assert_eq!(
+        slot_ranges
+            .iter()
+            .map(|&(start, end)| u64::from(end - start) + 1)
+            .sum::<u64>(),
+        16_384,
+        "the setting unset: the map covers every slot once: {slot_ranges:?}"
+    );
+    println!("CLUSTER-GATED RAN: a_cluster_store_is_read_on_every_primary");
 }

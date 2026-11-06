@@ -233,17 +233,46 @@ Read-only token-exchange volumeMount for the live-edit (main) container.
 The token-provisioner container. The chart supplies a predefined name, which
 replaces any operator `name`, and appends the writable token-exchange
 volumeMount to any operator `volumeMounts`; the rest of the container (image,
-env, args) comes verbatim from values.
+env, args) comes verbatim from values. Called with (dict "root" $ "native"
+<bool>): native renders it as a native sidecar, an init container with
+`restartPolicy: Always`, replacing any operator `restartPolicy`.
 */}}
-{{- define "live-edit-service.accessTokenSidecar" -}}
-- name: {{ .Chart.Name }}-token-provisioner
-  {{- (omit .Values.serviceIdentity.accessTokenFile.provisionerSidecar.container "volumeMounts" "name") | toYaml | nindent 2 }}
+{{- define "live-edit-service.accessTokenProvisioner" -}}
+{{- $root := .root -}}
+{{- $container := $root.Values.serviceIdentity.accessTokenFile.provisionerSidecar.container -}}
+- name: {{ $root.Chart.Name }}-token-provisioner
+  {{- if .native }}
+  restartPolicy: Always
+  {{- (omit $container "volumeMounts" "name" "restartPolicy") | toYaml | nindent 2 }}
+  {{- else }}
+  {{- (omit $container "volumeMounts" "name") | toYaml | nindent 2 }}
+  {{- end }}
   volumeMounts:
-    {{- with .Values.serviceIdentity.accessTokenFile.provisionerSidecar.container.volumeMounts }}
+    {{- with $container.volumeMounts }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
     - name: token-exchange
-      mountPath: {{ include "live-edit-service.tokenMountPath" . | quote }}
+      mountPath: {{ include "live-edit-service.tokenMountPath" $root | quote }}
+{{- end }}
+
+{{/*
+The token provisioner as a regular container beside the server's: it runs as
+long as the server does.
+*/}}
+{{- define "live-edit-service.accessTokenSidecar" -}}
+{{- include "live-edit-service.accessTokenProvisioner" (dict "root" . "native" false) -}}
+{{- end }}
+
+{{/*
+The token provisioner as a native sidecar, for the disaster-recovery Jobs: a
+Job completes when its regular containers have exited, and a regular
+provisioner container never exits, so it would keep the Job running. A native
+sidecar starts before the main container and is stopped once the main
+container exits. Native sidecars are on by default from Kubernetes 1.29, the
+DR Jobs' minimum (live-edit-service.drChecks).
+*/}}
+{{- define "live-edit-service.accessTokenNativeSidecar" -}}
+{{- include "live-edit-service.accessTokenProvisioner" (dict "root" . "native" true) -}}
 {{- end }}
 
 {{/*
@@ -255,6 +284,202 @@ RAM and never spills to node disk; sizeLimit bounds it against pod memory.
   emptyDir:
     sizeLimit: 4Mi
     medium: Memory
+{{- end }}
+
+{{/*
+Sets azure.workload.identity/use: "true" in the pod-label dict `labels` when
+the service's ServiceAccount carries a workload-identity client id: the
+identity webhook injects the token only into pods carrying that label. Called
+with (dict "root" $ "labels" <dict>) by the server Deployment and the
+disaster-recovery Jobs, which run as the same ServiceAccount; renders nothing.
+*/}}
+{{- define "live-edit-service.workloadIdentityPodLabel" -}}
+{{- $annotations := .root.Values.serviceAccount.annotations -}}
+{{- if and $annotations (hasKey $annotations "azure.workload.identity/client-id") -}}
+{{- $_ := set .labels "azure.workload.identity/use" "true" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The pod spec the server Deployment and the disaster-recovery Jobs share, so a
+Job runs with the server's identity, image, settings, volumes and placement.
+Called with (dict "root" $ "workload" "server") or (dict "root" $ "workload"
+"drJob" "args" <the container args>); renders at indent 0 for the caller to
+nindent.
+
+Shared: imagePullSecrets, the ServiceAccount and its token automount, the pod
+and container securityContexts, the image, the settings ConfigMap (envFrom)
+and the env wiring (the Valkey URL, the service-token file), the metrics port,
+volumes and mounts (the token-exchange volume with them), nodeSelector and
+tolerations.
+
+Server only: the grpc port, the probes, shareProcessNamespace,
+terminationGracePeriodSeconds, resizePolicy, the token provisioner as a
+regular container, the full affinity, and live-edit-service.serverResources.
+
+DR Job only: restartPolicy Never, the container args (the image's entrypoint
+is the binary, so args select the mode, never command), the token provisioner
+as a native sidecar, only affinity.nodeAffinity, and
+live-edit-service.drResources. The reasons the Job leaves out each server-only
+field are at the head of the Job templates (dr-restore-job.yaml).
+
+The server's pod spec reads no dr.* value, so a DR action leaves the
+Deployment unchanged.
+*/}}
+{{- define "live-edit-service.podSpec" -}}
+{{- $root := .root -}}
+{{- $values := $root.Values -}}
+{{- if not (has .workload (list "server" "drJob")) -}}
+{{- fail (printf "live-edit-service.podSpec: workload must be \"server\" or \"drJob\" (got %q)" .workload) -}}
+{{- end -}}
+{{- $server := eq .workload "server" -}}
+{{- $accessTokenSidecar := eq (include "live-edit-service.accessTokenSidecarEnabled" $root) "true" -}}
+{{- include "live-edit-service.imagePullSecrets" ( dict "images" (list $values.image) "global" $values) }}
+serviceAccountName: {{ include "live-edit-service.serviceAccountName" $root }}
+automountServiceAccountToken: {{ $values.serviceAccount.automount }}
+securityContext:
+  {{- toYaml $values.podSecurityContext | nindent 2 }}
+{{- if $server }}
+{{- if $values.shareProcessNamespace }}
+shareProcessNamespace: true
+{{- end }}
+terminationGracePeriodSeconds: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "terminationGracePeriodSeconds" "value" $values.terminationGracePeriodSeconds "hint" "seconds") }}
+{{- else }}
+restartPolicy: Never
+{{- if $accessTokenSidecar }}
+initContainers:
+  {{- include "live-edit-service.accessTokenNativeSidecar" $root | nindent 2 }}
+{{- end }}
+{{- end }}
+containers:
+  - name: {{ $root.Chart.Name }}
+    securityContext:
+      {{- toYaml $values.securityContext | nindent 6 }}
+    image: "{{ $values.image.repository }}:{{ $values.image.tag | default $root.Chart.AppVersion }}"
+    imagePullPolicy: {{ $values.image.pullPolicy }}
+    {{- if not $server }}
+    args:
+      {{- toYaml .args | nindent 6 }}
+    {{- end }}
+    ports:
+      {{- if $server }}
+      - name: grpc
+        containerPort: {{ $values.service.grpc.port }}
+        protocol: TCP
+      {{- end }}
+      - name: metrics
+        containerPort: {{ $values.service.metrics.port }}
+        protocol: TCP
+    envFrom:
+    - configMapRef:
+        name: {{ include "live-edit-service.fullname" $root }}-settings
+    env:
+      - name: LIVE_EDIT_VALKEY_URL
+        {{- if $values.valkey.url.value }}
+        value: {{ $values.valkey.url.value | quote }}
+        {{- else if $values.valkey.url.valueFrom }}
+        valueFrom:
+          {{- toYaml $values.valkey.url.valueFrom | nindent 10 }}
+        {{- else }}
+        {{- if not $values.envSecretName }}
+        {{- fail "LIVE_EDIT_VALKEY_URL falls back to a Kubernetes Secret (envSecretName, key valkey-url) when neither valkey.url.value nor valkey.url.valueFrom is set, but envSecretName is empty. Set valkey.url.value / valkey.url.valueFrom (passwordless / non-secret URL), or set envSecretName to the Secret holding key valkey-url." -}}
+        {{- end }}
+        valueFrom:
+          secretKeyRef:
+            name: {{ $values.envSecretName }}
+            key: valkey-url
+        {{- end }}
+      {{- if $values.serviceIdentity.accessTokenFile.enabled }}
+      - name: LIVE_EDIT_SERVICE_TOKEN_FILE
+        value: "{{ $values.checkpoint.credentials.accessTokenFile.path }}"
+      - name: LIVE_EDIT_SERVICE_TOKEN_POLL_INTERVAL_SECS
+        {{- /* Plain digits whatever the size: see the integer-row note in configmap.yaml. */}}
+        value: "{{ include "live-edit-service.nonNegativeInteger" (dict "key" "checkpoint.credentials.accessTokenFile.pollIntervalSecs" "value" $values.checkpoint.credentials.accessTokenFile.pollIntervalSecs "hint" "seconds") }}"
+      {{- end }}
+      {{- if $values.serviceIdentity.clientCredentials.enabled }}
+      - name: LIVE_EDIT_SERVICE_TOKEN_CLIENT_CREDENTIALS_ENABLED
+        value: "true"
+      {{- end }}
+    {{- if $server }}
+    {{- with $values.startupProbe }}
+    startupProbe:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    livenessProbe:
+      {{- toYaml $values.livenessProbe | nindent 6 }}
+    readinessProbe:
+      {{- toYaml $values.readinessProbe | nindent 6 }}
+    {{- end }}
+    {{- /*
+      The server's resources go through live-edit-service.serverResources:
+      .Values.resources as set, except that an unset memory request is
+      derived from the memory limit (70%), and a set one above the limit
+      fails the render. A DR Job's go through live-edit-service.drResources:
+      dr.resources laid over .Values.resources, then the same derivation.
+    */}}
+    resources:
+      {{- if $server }}
+      {{- include "live-edit-service.serverResources" $root | nindent 6 }}
+      {{- else }}
+      {{- include "live-edit-service.drResources" $root | nindent 6 }}
+      {{- end }}
+    {{- /*
+      The service sizes every memory budget from its memory limit once,
+      at startup, so a memory resize must restart the container: an
+      in-place resize defaults to NotRequired, which would change the
+      limit under a process still sized for the old one. CPU keeps the
+      default (no restart). Rendered only on Kubernetes 1.27 and later:
+      in-place resize and the resizePolicy field do not exist before
+      1.27, so an older cluster has no resize to guard against and does
+      not know the field. Server only: Kubernetes refuses RestartContainer
+      in a pod whose restartPolicy is Never, as a Job's is.
+    */}}
+    {{- if and $server (semverCompare ">=1.27-0" $root.Capabilities.KubeVersion.Version) }}
+    resizePolicy:
+      - resourceName: memory
+        restartPolicy: RestartContainer
+    {{- end }}
+    {{- if or $values.volumeMounts $accessTokenSidecar }}
+    volumeMounts:
+      {{- with $values.volumeMounts }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- if $accessTokenSidecar }}
+      {{- include "live-edit-service.accessTokenVolumeMount" $root | nindent 6 }}
+      {{- end }}
+    {{- end }}
+  {{- if and $server $accessTokenSidecar }}
+  {{- include "live-edit-service.accessTokenSidecar" $root | nindent 2 }}
+  {{- end }}
+{{- if or $values.volumes $accessTokenSidecar }}
+volumes:
+  {{- with $values.volumes }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+  {{- if $accessTokenSidecar }}
+  {{- include "live-edit-service.accessTokenVolume" $root | nindent 2 }}
+  {{- end }}
+{{- end }}
+{{- with $values.nodeSelector }}
+nodeSelector:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- if $server }}
+{{- with $values.affinity }}
+affinity:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- else }}
+{{- with ($values.affinity | default dict).nodeAffinity }}
+affinity:
+  nodeAffinity:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- with $values.tolerations }}
+tolerations:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
 {{- end }}
 
 {{/*
@@ -324,9 +549,12 @@ scaler block.
   `if` (rbac.create in scaler-rbac.yaml; serviceAccount.create there and in
   the scalerServiceAccountName helper), where it reads as true, so its
   readers agree, the same way the server's own serviceAccount.create does
-  (serviceaccount.yaml); those booleans get no type check. The integers get no type or range check here
-  either: the scaler refuses a non-integer or out-of-range value at startup
-  and names the variable.
+  (serviceaccount.yaml); those booleans get no type check. The integers are
+  type-checked where scaler-deployment.yaml renders them, through the
+  nonNegativeInteger helper, which fails the render on anything but a whole
+  number, naming the key. Their range is not checked in the chart: the
+  scaler still refuses an out-of-range value at startup and names the
+  variable.
   A key added later is exempt only if every template that reads it renders a
   correct result when it is absent or null and its @param says what null
   means; otherwise it goes on the list below.
@@ -377,7 +605,14 @@ scaler block.
 {{- if and .Values.autoscaling.targetCPUUtilizationPercentage (empty $cpuRequest) -}}
 {{- fail (printf "autoscaling.targetCPUUtilizationPercentage (%v) needs resources.requests.cpu, which is empty: the scaler's CPU target is a percentage of that request. Set resources.requests.cpu, or set autoscaling.targetCPUUtilizationPercentage to null to turn the CPU signal off" .Values.autoscaling.targetCPUUtilizationPercentage) -}}
 {{- end -}}
-{{- if gt (int .Values.autoscaling.minReplicas) (int .Values.autoscaling.maxReplicas) -}}
+{{- /*
+  Compared as the helper's digits, the same values scaler-deployment.yaml
+  renders: a bare `int` would read a mistyped value as 0 and pass. Longer
+  digits are the larger number; equal lengths compare as text.
+*/ -}}
+{{- $minReplicas := include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.minReplicas" "value" .Values.autoscaling.minReplicas "hint" "a replica count") -}}
+{{- $maxReplicas := include "live-edit-service.nonNegativeInteger" (dict "key" "autoscaling.maxReplicas" "value" .Values.autoscaling.maxReplicas "hint" "a replica count") -}}
+{{- if or (gt (len $minReplicas) (len $maxReplicas)) (and (eq (len $minReplicas) (len $maxReplicas)) (gt $minReplicas $maxReplicas)) -}}
 {{- fail (printf "autoscaling.minReplicas (%v) is greater than autoscaling.maxReplicas (%v); the scaler refuses that configuration" .Values.autoscaling.minReplicas .Values.autoscaling.maxReplicas) -}}
 {{- end -}}
 {{- end -}}
@@ -464,7 +699,8 @@ container's memory limit at startup, so:
   silently ignore it otherwise.
 Renders nothing; evaluated by configmap.yaml and by
 live-edit-service.serverResources, so it runs on every render and before the
-server's resources are rendered.
+server's resources are rendered, and by live-edit-service.drResources before
+a disaster-recovery Job's.
 */}}
 {{- define "live-edit-service.podMemoryChecks" -}}
 {{- $limits := (.Values.resources | default dict).limits | default dict -}}
@@ -491,9 +727,35 @@ server's resources are rendered.
 {{- end }}
 
 {{/*
+The removed catch-up switch check. layer.catchupSnapshotEnabled, spelled
+layer.catchup_snapshot_enabled in 0.1.x, selected between the faithful
+catch-up and a legacy catch-up that has been removed, so this chart no longer
+sets it and the service refuses to start while its variable is set. The same
+rule as live-edit-service.podMemoryChecks' removed values: either key still at
+its old default, true (what `helm upgrade --reuse-values` keeps from an older
+release's values), or empty renders nothing; either key set to anything else
+fails the render, naming it, because it would otherwise be silently ignored.
+Renders nothing; evaluated by configmap.yaml, so it runs on every render.
+*/}}
+{{- define "live-edit-service.removedCatchupSwitchChecks" -}}
+{{- $layer := .Values.layer -}}
+{{- if kindIs "map" $layer -}}
+{{- range $key := list "catchupSnapshotEnabled" "catchup_snapshot_enabled" -}}
+{{- if hasKey $layer $key -}}
+{{- $value := index $layer $key -}}
+{{- if not (or (kindIs "invalid" $value) (eq (toString $value) "") (eq (toString $value) "true")) -}}
+{{- fail (printf "layer.%s is set to %v, but this chart no longer sets it: catch-up always behaves as the default (true) has since 0.1.0, and the legacy catch-up was removed. Remove layer.%s from your values." $key $value $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 A Kubernetes memory quantity as whole bytes, for the server container's memory
 limit and request (live-edit-service.podMemoryChecks,
-live-edit-service.serverResources). Called with (dict "key" <dotted values
+live-edit-service.serverResources) and a disaster-recovery Job's
+(live-edit-service.drResources). Called with (dict "key" <dotted values
 path> "value" <the value>); returns plain decimal digits, rounded up to a whole
 byte as Kubernetes rounds a quantity's value (away from zero). With "nanos"
 true it returns the value in nanobytes instead, rounded up: the precision
@@ -736,8 +998,9 @@ render cannot run without them. `--reset-then-reuse-values` (Helm 3.14+) keeps
 this chart's defaults and the previous release's own values only, so it fails
 only on old names the deployer set. Renders nothing; evaluated first by the
 two templates that read the renamed values, deployment.yaml (which Helm
-renders before configmap.yaml) and configmap.yaml, so no check of a renamed
-value reports before it.
+renders before configmap.yaml) and configmap.yaml, and by the
+disaster-recovery Job templates (live-edit-service.drChecks), which Helm
+renders before both, so no check of a renamed value reports before it.
 */}}
 {{- define "live-edit-service.renamedValueChecks" -}}
 {{- $renamed := list
@@ -773,7 +1036,6 @@ value reports before it.
   "layer update_retry_max_attempts updateRetryMaxAttempts"
   "layer update_per_object_concurrency updatePerObjectConcurrency"
   "layer update_layer_backend updateLayerBackend"
-  "layer catchup_snapshot_enabled catchupSnapshotEnabled"
   "layer structural_cache_audit_rate structuralCacheAuditRate"
   "layer structural_cache_audit_above_ceiling structuralCacheAuditAboveCeiling"
   "layer ext_value_verify extValueVerify"
@@ -797,5 +1059,368 @@ value reports before it.
 {{- end -}}
 {{- if $found -}}
 {{- fail (printf "these values were renamed to camelCase, and this chart no longer reads the old names: %s. Rename them in your values files and `--set` flags. If this is a `helm upgrade --reuse-values`, which carries the previous chart's values with every old name, upgrade with your renamed values files instead, or with `--reset-then-reuse-values` (Helm 3.14+) when the release's own earlier values used no old name" (join "; " $found)) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The disaster-recovery Jobs (dr-restore-job.yaml, dr-accept-loss-job.yaml).
+Every dr.* read below is nil-safe: `helm upgrade --reuse-values` from a
+release that predates the dr block passes values with no dr key at all, which
+reads as "no action set", and a `--set dr.restore.incident=...` on top of
+those renders the Job with Kubernetes' own backoffLimit, no TTL and the
+service's resources.
+*/}}
+
+{{/*
+A disaster-recovery value as text: absent, null or "" read as "" (unset), and
+a whole YAML number as its digits (Helm decodes a values-file number as
+float64, so an unquoted 20261013 would otherwise print as 2.0261013e+07).
+Anything else reads as its own text, for live-edit-service.drChecks to check.
+*/}}
+{{- define "live-edit-service.drText" -}}
+{{- if kindIs "float64" . -}}
+{{- if eq . (float64 (int64 .)) -}}
+{{- int64 . -}}
+{{- else -}}
+{{- . -}}
+{{- end -}}
+{{- else if not (kindIs "invalid" .) -}}
+{{- toString . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+One dr.<action>.<key> value as text (live-edit-service.drText), "" when dr or
+dr.<action> is absent or not a map. Called with (dict "root" $ "action"
+"restore"|"acceptLoss" "key" <name>).
+*/}}
+{{- define "live-edit-service.drValue" -}}
+{{- $dr := .root.Values.dr -}}
+{{- if kindIs "map" $dr -}}
+{{- $action := get $dr .action -}}
+{{- if kindIs "map" $action -}}
+{{- include "live-edit-service.drText" (get $action .key) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+"true" when a disaster-recovery action is set: dr.restore.incident or
+dr.acceptLoss.incident is not empty. The smoke-test hooks render nothing
+then: they run after every install and upgrade, and the upgrade that starts a
+Job runs while the service is held and cannot pass them, which would fail
+that upgrade (and roll it back under --atomic).
+*/}}
+{{- define "live-edit-service.drActionSet" -}}
+{{- if or (include "live-edit-service.drValue" (dict "root" . "action" "restore" "key" "incident")) (include "live-edit-service.drValue" (dict "root" . "action" "acceptLoss" "key" "incident")) -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+The disaster-recovery Job's name: <fullname>-dr-restore-<incident> or
+<fullname>-dr-accept-loss-<incident>, with -<attempt> when
+dr.<action>.attempt is set, so a new attempt is a new Job (a Job's pod
+template cannot change once created). Always at most 63 characters, the
+Kubernetes limit on a label value, which the Job's name is on its pod.
+
+The incident and attempt are never cut. When the whole name is over 63, the
+fullname is cut instead and followed by the first 8 hex characters of the
+sha256 of the whole fullname: <cut fullname>-<hash>-dr-<action>-<incident>
+[-<attempt>], with the cut fullname's trailing hyphens dropped, so two
+releases whose fullnames share the kept prefix still get different names.
+When the incident and attempt leave no room for any of the fullname, the name
+is <hash>-dr-<action>-<incident>[-<attempt>]; live-edit-service.drChecks
+fails a render where they leave no room for the hash either. Called with
+(dict "root" $ "action" "restore"|"acceptLoss").
+*/}}
+{{- define "live-edit-service.drJobName" -}}
+{{- $incident := include "live-edit-service.drValue" (dict "root" .root "action" .action "key" "incident") -}}
+{{- $attempt := include "live-edit-service.drValue" (dict "root" .root "action" .action "key" "attempt") -}}
+{{- $fullname := include "live-edit-service.fullname" .root -}}
+{{- $suffix := printf "-dr-%s-%s" (ternary "restore" "accept-loss" (eq .action "restore")) $incident -}}
+{{- if $attempt -}}
+{{- $suffix = printf "%s-%s" $suffix $attempt -}}
+{{- end -}}
+{{- if le (add (len $fullname) (len $suffix)) 63 -}}
+{{- printf "%s%s" $fullname $suffix -}}
+{{- else -}}
+{{- $hash := sha256sum $fullname | trunc 8 -}}
+{{- $cut := regexReplaceAll "-+$" (trunc (max 0 (sub 54 (len $suffix)) | int) $fullname) "" -}}
+{{- if $cut -}}
+{{- printf "%s-%s%s" $cut $hash $suffix -}}
+{{- else -}}
+{{- printf "%s%s" $hash $suffix -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The disaster-recovery Job's object labels: the common labels without
+app.kubernetes.io/name (a server selector key, omitted after the merge) and
+with component=dr-job, so no server selector (Deployment, Service,
+PodDisruptionBudget, NetworkPolicy) and not the scaler's selects a Job or its
+pod. The pod labels add .Values.podLabels and the workload-identity label
+(live-edit-service.drJob), with the same two rules.
+*/}}
+{{- define "live-edit-service.drJobLabels" -}}
+{{- $labels := mergeOverwrite (dict) (include "live-edit-service.labels" . | fromYaml) (dict "app.kubernetes.io/component" "dr-job") -}}
+{{- omit $labels "app.kubernetes.io/name" | toYaml -}}
+{{- end }}
+
+{{/*
+The disaster-recovery checks. Renders nothing; included first by both Job
+templates on every render, so a mistake in dr.* fails the render whether or
+not a Job renders, before Helm changes anything. The renamed-value check runs
+first, as in deployment.yaml: Helm renders the Job templates before
+deployment.yaml and configmap.yaml.
+
+- dr, dr.restore and dr.acceptLoss must be maps when set.
+- One action at a time.
+- dr.acceptLoss.confirm (and confirmUnconfirmed) only beside
+  dr.acceptLoss.incident: a confirmation left set after its incident's hold
+  clears must not carry over to the next incident's accept-loss.
+- Accept-loss runs only with dr.acceptLoss.confirm: "discard-lost-data";
+  dr.acceptLoss.confirmUnconfirmed, when set, must be
+  "discard-unconfirmed-data" and comes only with the first confirmation (the
+  binary refuses it alone, exit 2, so the render catches it first).
+- The incident must be a DNS label (lowercase letters, digits, hyphens), as
+  the incident ids the hold names are; the attempt at most 8 such
+  characters; together, short enough that the Job's name
+  (live-edit-service.drJobName) fits 63 characters with the fullname cut to
+  nothing but its 8-character hash.
+- Kubernetes 1.29 or later whenever an action is set: a Job runs the token
+  provisioner as a native sidecar (live-edit-service.accessTokenNativeSidecar),
+  on by default only from 1.29.
+- dr.backoffLimit and dr.ttlSecondsAfterFinished, when set, are non-negative
+  whole numbers.
+- dr.resources, when set or when a Job renders, through
+  live-edit-service.drResources.
+*/}}
+{{- define "live-edit-service.drChecks" -}}
+{{- include "live-edit-service.renamedValueChecks" . -}}
+{{- $dr := .Values.dr -}}
+{{- if not (or (kindIs "invalid" $dr) (kindIs "map" $dr)) -}}
+{{- fail (printf "dr must be a map of settings (got %#v)" $dr) -}}
+{{- end -}}
+{{- $dr = $dr | default dict -}}
+{{- range $key := list "restore" "acceptLoss" -}}
+{{- $section := get $dr $key -}}
+{{- if not (or (kindIs "invalid" $section) (eq (toString $section) "") (kindIs "map" $section)) -}}
+{{- fail (printf "dr.%s must be a map of settings (got %#v)" $key $section) -}}
+{{- end -}}
+{{- end -}}
+{{- $restoreIncident := include "live-edit-service.drValue" (dict "root" . "action" "restore" "key" "incident") -}}
+{{- $incident := include "live-edit-service.drValue" (dict "root" . "action" "acceptLoss" "key" "incident") -}}
+{{- $confirm := include "live-edit-service.drValue" (dict "root" . "action" "acceptLoss" "key" "confirm") -}}
+{{- $confirmUnconfirmed := include "live-edit-service.drValue" (dict "root" . "action" "acceptLoss" "key" "confirmUnconfirmed") -}}
+{{- if and $restoreIncident $incident -}}
+{{- fail (printf "dr.restore.incident (%q) and dr.acceptLoss.incident (%q) are both set: run one disaster-recovery action at a time; accept-loss restores everything it can before it discards, so it never needs a restore beside it. Clear one of them" $restoreIncident $incident) -}}
+{{- end -}}
+{{- if not $incident -}}
+{{- if $confirm -}}
+{{- fail "dr.acceptLoss.confirm is set but dr.acceptLoss.incident is not: clear every dr.acceptLoss value once the hold clears, so a confirmation never carries over to the next incident's accept-loss" -}}
+{{- end -}}
+{{- if $confirmUnconfirmed -}}
+{{- fail "dr.acceptLoss.confirmUnconfirmed is set but dr.acceptLoss.incident is not: clear every dr.acceptLoss value once the hold clears, so a confirmation never carries over to the next incident's accept-loss" -}}
+{{- end -}}
+{{- else -}}
+{{- if and $confirmUnconfirmed (ne $confirmUnconfirmed "discard-unconfirmed-data") -}}
+{{- fail (printf "dr.acceptLoss.confirmUnconfirmed must be \"discard-unconfirmed-data\" or unset (got %q)" $confirmUnconfirmed) -}}
+{{- end -}}
+{{- if and $confirm (ne $confirm "discard-lost-data") -}}
+{{- fail (printf "dr.acceptLoss.confirm must be \"discard-lost-data\" (got %q): accept-loss permanently discards what no backup can restore, and runs only with that exact confirmation" $confirm) -}}
+{{- end -}}
+{{- if and $confirmUnconfirmed (not $confirm) -}}
+{{- fail "dr.acceptLoss.confirmUnconfirmed is set but dr.acceptLoss.confirm is not \"discard-lost-data\": the second confirmation is accepted only together with the first" -}}
+{{- end -}}
+{{- if not $confirm -}}
+{{- fail (printf "dr.acceptLoss.incident is set (%q) but dr.acceptLoss.confirm is not: accept-loss permanently discards what no backup can restore, and runs only with dr.acceptLoss.confirm: \"discard-lost-data\"" $incident) -}}
+{{- end -}}
+{{- end -}}
+{{- range $action := list "restore" "acceptLoss" -}}
+{{- $actionIncident := include "live-edit-service.drValue" (dict "root" $ "action" $action "key" "incident") -}}
+{{- $attempt := include "live-edit-service.drValue" (dict "root" $ "action" $action "key" "attempt") -}}
+{{- if and $actionIncident (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $actionIncident)) -}}
+{{- fail (printf "dr.%s.incident must be the incident id the hold names: lowercase letters, digits and hyphens, starting and ending with a letter or digit (got %q)" $action $actionIncident) -}}
+{{- end -}}
+{{- if and $attempt (not (regexMatch "^[a-z0-9]([-a-z0-9]{0,6}[a-z0-9])?$" $attempt)) -}}
+{{- fail (printf "dr.%s.attempt must be up to 8 lowercase letters, digits and hyphens, starting and ending with a letter or digit, such as 2 (got %q)" $action $attempt) -}}
+{{- end -}}
+{{- if $actionIncident -}}
+{{- $name := include "live-edit-service.drJobName" (dict "root" $ "action" $action) -}}
+{{- if gt (len $name) 63 -}}
+{{- fail (printf "dr.%s.incident (%q, %d characters) and dr.%s.attempt (%q) are too long for the disaster-recovery Job's name, %q, which must fit the 63 characters Kubernetes allows with at least an 8-character hash of the release's name: check that the incident is the id the hold names, and shorten or clear the attempt" $action $actionIncident (len $actionIncident) $action $attempt $name) -}}
+{{- end -}}
+{{- if not (semverCompare ">=1.29-0" $.Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "dr.%s.incident is set, but the disaster-recovery Jobs need Kubernetes 1.29 or later and this render targets %s: a Job runs the token provisioner as a native sidecar container, which Kubernetes turns on by default only from 1.29. Upgrade the cluster, or, when rendering without a cluster, pass --kube-version" $action $.Capabilities.KubeVersion.Version) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $name := list "backoffLimit" "ttlSecondsAfterFinished" -}}
+{{- $value := get $dr $name -}}
+{{- if not (or (kindIs "invalid" $value) (eq (toString $value) "")) -}}
+{{- $_ := include "live-edit-service.nonNegativeInteger" (dict "key" (printf "dr.%s" $name) "value" $value "hint" (ternary "retries" "seconds" (eq $name "backoffLimit"))) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (get $dr "resources") (eq (include "live-edit-service.drActionSet" .) "true") -}}
+{{- $_ := include "live-edit-service.drResources" . -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+The disaster-recovery Job's container resources, as YAML: dr.resources laid
+over .Values.resources key by key (a key dr.resources sets replaces the
+service's; requests and limits merge entry by entry, so dr.resources.limits:
+{memory: 8Gi} keeps the service's CPU), then the server's rule for the memory
+request (live-edit-service.serverResources): unset, it renders 70% of the
+limit, rounded down to whole Mi; set, it must not be above the limit. Unset,
+dr.resources renders exactly the server's resources, so the Job gets the
+memory limit the service's memory plan was sized for.
+
+The service's own checks run first (live-edit-service.podMemoryChecks), so an
+inherited value fails with the service's message; the Job's checks name
+dr.resources.* where dr.resources set the value, and resources.* where it was
+inherited. Works on a copy and never writes into .Values.
+*/}}
+{{- define "live-edit-service.drResources" -}}
+{{- include "live-edit-service.podMemoryChecks" . -}}
+{{- $overlay := get (.Values.dr | default dict) "resources" -}}
+{{- if not (or (kindIs "invalid" $overlay) (eq (toString $overlay) "") (kindIs "map" $overlay)) -}}
+{{- fail (printf "dr.resources must be a map of resource settings such as requests and limits (got %#v)" $overlay) -}}
+{{- end -}}
+{{- $overlay = $overlay | default dict -}}
+{{- $resources := deepCopy (.Values.resources | default dict) -}}
+{{- range $section, $entries := $overlay -}}
+{{- $base := get $resources $section -}}
+{{- if and (kindIs "map" $entries) (kindIs "map" $base) -}}
+{{- range $name, $value := $entries -}}
+{{- if kindIs "invalid" $value -}}
+{{- $_ := unset $base $name -}}
+{{- else -}}
+{{- $_ := set $base $name $value -}}
+{{- end -}}
+{{- end -}}
+{{- else if kindIs "invalid" $entries -}}
+{{- $_ := unset $resources $section -}}
+{{- else -}}
+{{- $_ := set $resources $section (deepCopy $entries) -}}
+{{- end -}}
+{{- end -}}
+{{- $overlayLimits := get $overlay "limits" -}}
+{{- $overlayRequests := get $overlay "requests" -}}
+{{- $limitKey := "resources.limits.memory" -}}
+{{- if and (kindIs "map" $overlayLimits) (hasKey $overlayLimits "memory") -}}
+{{- $limitKey = "dr.resources.limits.memory" -}}
+{{- end -}}
+{{- $requestKey := "resources.requests.memory" -}}
+{{- if and (kindIs "map" $overlayRequests) (hasKey $overlayRequests "memory") -}}
+{{- $requestKey = "dr.resources.requests.memory" -}}
+{{- end -}}
+{{- $limits := get $resources "limits" | default dict -}}
+{{- if not (kindIs "map" $limits) -}}
+{{- fail (printf "dr.resources.limits must be a map of resource quantities such as cpu and memory (got %#v)" $limits) -}}
+{{- end -}}
+{{- $limit := get $limits "memory" -}}
+{{- if or (kindIs "invalid" $limit) (eq (toString $limit) "") -}}
+{{- fail "dr.resources.limits.memory must be set: the disaster-recovery Job, like the service, sizes its memory budgets from its container's memory limit at startup. Set a limit, or leave dr.resources.limits.memory out to use resources.limits.memory" -}}
+{{- end -}}
+{{- $limitBytes := atoi (include "live-edit-service.memoryQuantityBytes" (dict "key" $limitKey "value" $limit)) -}}
+{{- if eq $limitBytes 0 -}}
+{{- fail (printf "%s is %#v, which is zero bytes: the disaster-recovery Job sizes its memory budgets from its container's memory limit, and its default memory request is 70%% of it. Set a non-zero limit" $limitKey $limit) -}}
+{{- end -}}
+{{- $derived := printf "%dMi" (div (mul $limitBytes 7) 10485760) -}}
+{{- $requests := get $resources "requests" | default dict -}}
+{{- if not (kindIs "map" $requests) -}}
+{{- fail (printf "dr.resources.requests must be a map of resource quantities such as cpu and memory (got %#v)" $requests) -}}
+{{- end -}}
+{{- $request := get $requests "memory" -}}
+{{- if or (kindIs "invalid" $request) (eq (toString $request) "") -}}
+{{- $_ := set $requests "memory" $derived -}}
+{{- $_ := set $resources "requests" $requests -}}
+{{- else -}}
+{{- $requestNanos := include "live-edit-service.memoryQuantityBytes" (dict "key" $requestKey "value" $request "nanos" true) -}}
+{{- $limitNanos := include "live-edit-service.memoryQuantityBytes" (dict "key" $limitKey "value" $limit "nanos" true) -}}
+{{- if or (gt (len $requestNanos) (len $limitNanos)) (and (eq (len $requestNanos) (len $limitNanos)) (gt $requestNanos $limitNanos)) -}}
+{{- fail (printf "%s (%#v) is above %s (%#v) for the disaster-recovery Job: Kubernetes refuses a request above the limit. Set dr.resources.requests.memory at or below the limit; unset, the request is 70%% of the limit (%s here)" $requestKey $request $limitKey $limit $derived) -}}
+{{- end -}}
+{{- end -}}
+{{- toYaml $resources -}}
+{{- end }}
+
+{{/*
+One disaster-recovery Job, as a whole manifest, or nothing when its action's
+incident is unset. Called with (dict "root" $ "action" "restore"|"acceptLoss")
+after live-edit-service.drChecks. The pod spec is the server's
+(live-edit-service.podSpec, workload drJob); the container args select the
+binary's mode: `dr restore <incident>`, or `dr accept-loss <incident>
+--confirm discard-lost-data`, plus `--confirm discard-unconfirmed-data` when
+dr.acceptLoss.confirmUnconfirmed is set.
+
+podFailurePolicy: exits 2 (a refused command line or configuration), 3 (the
+service stays held: something the Job cannot restore or confirm, or a
+precondition that cannot pass) and 4 (the hold names a different incident) of
+the main container fail the Job at once, as a retry would end the same way;
+any other failure, exit 1 or a crash, is retried up to backoffLimit. The rule names the main container, so
+the token provisioner's exit never matches it. A pod lost to a disruption
+(eviction, preemption, node drain: the DisruptionTarget condition) is retried
+without counting against backoffLimit.
+*/}}
+{{- define "live-edit-service.drJob" -}}
+{{- $root := .root -}}
+{{- $incident := include "live-edit-service.drValue" (dict "root" $root "action" .action "key" "incident") -}}
+{{- if $incident -}}
+{{- $dr := $root.Values.dr | default dict -}}
+{{- $args := list "dr" (ternary "restore" "accept-loss" (eq .action "restore")) $incident -}}
+{{- if eq .action "acceptLoss" -}}
+{{- $args = concat $args (list "--confirm" "discard-lost-data") -}}
+{{- if eq (include "live-edit-service.drValue" (dict "root" $root "action" .action "key" "confirmUnconfirmed")) "discard-unconfirmed-data" -}}
+{{- $args = concat $args (list "--confirm" "discard-unconfirmed-data") -}}
+{{- end -}}
+{{- end -}}
+{{- $backoffLimit := get $dr "backoffLimit" -}}
+{{- $ttl := get $dr "ttlSecondsAfterFinished" -}}
+{{- $podLabels := mergeOverwrite (dict) (include "live-edit-service.labels" $root | fromYaml) ($root.Values.podLabels | default dict) (dict "app.kubernetes.io/component" "dr-job") -}}
+{{- include "live-edit-service.workloadIdentityPodLabel" (dict "root" $root "labels" $podLabels) -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "live-edit-service.drJobName" (dict "root" $root "action" .action) }}
+  labels:
+    {{- include "live-edit-service.drJobLabels" $root | nindent 4 }}
+spec:
+  {{- if not (or (kindIs "invalid" $backoffLimit) (eq (toString $backoffLimit) "")) }}
+  backoffLimit: {{ include "live-edit-service.nonNegativeInteger" (dict "key" "dr.backoffLimit" "value" $backoffLimit "hint" "retries") }}
+  {{- end }}
+  {{- if not (or (kindIs "invalid" $ttl) (eq (toString $ttl) "")) }}
+  {{- $ttlSeconds := include "live-edit-service.nonNegativeInteger" (dict "key" "dr.ttlSecondsAfterFinished" "value" $ttl "hint" "seconds") }}
+  {{- /* 0 renders nothing: to Kubernetes it would mean "delete at once". */}}
+  {{- if ne $ttlSeconds "0" }}
+  ttlSecondsAfterFinished: {{ $ttlSeconds }}
+  {{- end }}
+  {{- end }}
+  podFailurePolicy:
+    rules:
+      - action: FailJob
+        onExitCodes:
+          containerName: {{ $root.Chart.Name }}
+          operator: In
+          values:
+            - 2
+            - 3
+            - 4
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+  template:
+    metadata:
+      {{- with $root.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- omit $podLabels "app.kubernetes.io/name" | toYaml | nindent 8 }}
+    spec:
+      {{- include "live-edit-service.podSpec" (dict "root" $root "workload" "drJob" "args" $args) | nindent 6 }}
 {{- end -}}
 {{- end }}

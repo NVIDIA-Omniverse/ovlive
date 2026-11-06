@@ -914,14 +914,15 @@ pub(crate) fn filter_snapshot_by_snap_seq(snapshot: &mut ObjectSnapshot, snap_se
 ///
 /// Thin wrapper over [`build_reset_ompf_from_state`] — it converts the
 /// storage-layer snapshot to the domain-layer [`ObjectState`] the builder
-/// actually consumes and delegates. The whole contract (return shape, the
-/// `DiffEngine::plan` routing argument, which `set_order` rank the wire slot
-/// carries, and the error taxonomy) is documented on that function.
+/// actually consumes and delegates. The whole contract (return shape, why it
+/// plans through `DiffEngine::plan_full_content`, which `set_order` rank the
+/// wire slot carries, and the error taxonomy) is documented on that function.
 pub(crate) fn build_reset_ompf(
     snapshot: &ObjectSnapshot,
 ) -> Result<(Vec<u8>, Vec<[u8; 32]>), CheckpointError> {
     // Convert storage-layer `ObjectSnapshot` to domain-layer `ObjectState` so
-    // we can reuse `DiffEngine::plan`'s DFS ordering / orphan handling.
+    // we can reuse `DiffEngine::plan_full_content`'s DFS ordering / orphan
+    // handling.
     build_reset_ompf_from_state(&snapshot_to_object_state(snapshot))
 }
 
@@ -944,23 +945,17 @@ pub(crate) fn build_reset_ompf(
 ///   checkpoint blob (sibling Subtask `.wi`'s entrypoint emits this alongside
 ///   the OMPF bytes).
 ///
-/// # Why route through `DiffEngine::plan`
+/// # Why plan through `DiffEngine::plan_full_content`
 ///
-/// The in-RPC diff path's `DiffPlan::FullContent` arm emits sections in DFS
-/// parent-first order with orphans appended (SDD §10.3). The reset-delta
-/// produced by this helper is the durable cross-Task round-trip contract
-/// (`t2.fgj.ya.n9` re-applies it on recovery), so the section ordering MUST
-/// match exactly — re-routing through `DiffEngine::plan(state, &[], 0, 0, None)`
-/// borrows the same DFS walk rather than duplicating it. The arguments
-/// `have_object_id = 0` and `have_version = 0` force the Case-1 (FullContent)
-/// branch by construction (any non-zero `state.object_id` triggers the
-/// "object_id mismatch" path; even on the degenerate `state.object_id == 0`
-/// branch, `have_version == 0` still routes to FullContent). That second half
-/// of the argument is what makes this safe for the SR-7.1 creation-time
-/// bootstrap, whose `ObjectState` comes straight out of the CreateLayer handler
-/// and therefore still carries `object_id == 0` (the id is allocated inside
-/// `LayerStore::create_layer`, never written back onto the in-memory state):
-/// `have_version == 0` forces FullContent on that input too.
+/// `DiffEngine::plan_full_content` emits sections in DFS parent-first order
+/// with orphans appended (SDD §10.3). The reset-delta produced by this helper
+/// is the durable cross-Task round-trip contract (`t2.fgj.ya.n9` re-applies it
+/// on recovery), so its section ordering is that walk's, borrowed rather than
+/// duplicated. The plan reads no `object_id`, so it is equally safe for the
+/// SR-7.1 creation-time bootstrap, whose `ObjectState` comes straight out of
+/// the CreateLayer handler and therefore still carries `object_id == 0` (the
+/// id is allocated inside `LayerStore::create_layer`, never written back onto
+/// the in-memory state).
 ///
 /// # Which rank the field `set_order` slot carries
 ///
@@ -989,10 +984,10 @@ pub(crate) fn build_reset_ompf(
 /// never a *correctness* problem, the second is why it is now a *byte-identity*
 /// guarantee.
 ///
-/// This remap lives in the checkpoint assembler only; `DiffEngine::plan` /
-/// `plan_full_content` stay **lossy** — no net-live pruning, no dense re-index,
+/// This remap lives in the checkpoint assembler only;
+/// `plan_full_content` stays **lossy** — no net-live pruning, no dense re-index,
 /// cumulative `set_order` emitted verbatim — and **stable** on the ground just
-/// stated, and the in-RPC diff path is unaffected (SR-4.1). Only the first half
+/// stated. Only the first half
 /// is a prohibition: the lossy semantics MUST NOT change, because this helper
 /// depends on them. The stable half is not a fixed wire order to preserve
 /// blindly but a deliberate total order that replaced `HashMap` iteration —
@@ -1000,7 +995,7 @@ pub(crate) fn build_reset_ompf(
 ///
 /// # Errors
 ///
-/// - [`CheckpointError::Permanent`] if `DiffEngine::plan` rejects the snapshot
+/// - [`CheckpointError::Permanent`] if `DiffEngine::plan_full_content` rejects the snapshot
 ///   (e.g. `SectionTreeTooDeep`), if `build_delta` fails (OODF FFI allocator
 ///   failure), or if `OmpfContainer::serialize` or the chunked-base framing
 ///   refuses its input.
@@ -1009,14 +1004,12 @@ pub(crate) fn build_reset_ompf(
 pub(crate) fn build_reset_ompf_from_state(
     state: &ObjectState,
 ) -> Result<(Vec<u8>, Vec<[u8; 32]>), CheckpointError> {
-    // Force the FullContent branch — see the doc-comment above for why this
-    // pair of zeros is the right key. Empty tombstones because a reset-delta
-    // describes the *current* state; the apply side rebuilds from scratch and
-    // does not need a tombstone list.
-    let plan =
-        DiffEngine::plan(state, &[], 0, 0, None).map_err(|e| CheckpointError::Permanent {
-            source: format!("diff plan rejected snapshot during checkpoint assembly: {e}").into(),
-        })?;
+    // The full content, with no tombstones: a reset-delta describes the
+    // *current* state; the apply side rebuilds from scratch and does not need
+    // a tombstone list.
+    let plan = DiffEngine::plan_full_content(state).map_err(|e| CheckpointError::Permanent {
+        source: format!("diff plan rejected snapshot during checkpoint assembly: {e}").into(),
+    })?;
 
     let (sections, mut fields, time_samples) = match plan {
         DiffPlan::FullContent {
@@ -1024,15 +1017,15 @@ pub(crate) fn build_reset_ompf_from_state(
             fields,
             time_samples,
         } => (sections, fields, time_samples),
-        // Unreachable by construction: `have_object_id=0, have_version=0` always
-        // produces FullContent. Surface as `Permanent` rather than panic so a
-        // future refactor of `DiffEngine::plan` that broke this invariant would
-        // be reported cleanly to the checkpoint loop instead of aborting the
-        // tokio worker.
+        // Unreachable by construction: `plan_full_content` only produces
+        // FullContent. Surface as `Permanent` rather than panic so a future
+        // refactor that broke this invariant would be reported cleanly to the
+        // checkpoint loop instead of aborting the tokio worker.
         other => {
             return Err(CheckpointError::Permanent {
                 source: format!(
-                    "DiffEngine::plan produced unexpected variant for reset-delta build: {other:?}"
+                    "DiffEngine::plan_full_content produced unexpected variant for reset-delta \
+                     build: {other:?}"
                 )
                 .into(),
             });
@@ -1104,9 +1097,10 @@ pub struct AssemblerOutcome {
 
 /// What one `assemble_layer_checkpoint` call decided to do (b.pw6).
 ///
-/// The assembler has five outcomes: it persisted a generation, it
-/// deliberately persisted nothing, its leader lease was lost under it, its
-/// owner shut down under it, or it failed. Only the last is a
+/// The assembler has six outcomes: it persisted a generation, it
+/// deliberately persisted nothing because no stable cut was proven, the
+/// checkpoint clean-up's fence deferred it, its leader lease was lost under
+/// it, its owner shut down under it, or it failed. Only the last is a
 /// `CheckpointError` — see [`ConsistentSnapshot`] for why the deliberate-skip
 /// case is kept out of the four-variant error vocabulary; a lost lease and a
 /// shutdown are not adapter failures either.
@@ -1150,6 +1144,15 @@ pub enum AssemblyDecision {
     /// failure: the caller stops as at any other cancellation, and the layer
     /// stays due.
     ShuttingDown,
+    /// The pre-PUT clean-up fence (`checkpoint::put_guard`, b.g65) refused the
+    /// PUT: the checkpoint clean-up deleted the backup copy of a large value
+    /// this generation names within the assembly's reliance window, or is
+    /// deleting an earlier copy of this same generation, or the re-arm that
+    /// must precede the PUT could not be recorded in Valkey. Nothing was
+    /// persisted. Handled like [`Self::SkippedNotQuiesced`]: no cursor write,
+    /// `writes_total{result="skipped"}`, and the layer stays due; the loop
+    /// also counts `reconcile_total{outcome="publish_deferred"}`.
+    DeferredCleanup,
 }
 
 /// Ext-refs sidecar JSON shape — `{"ext_hashes": ["<lowercase-64-hex>", ...]}`.
@@ -1165,9 +1168,24 @@ pub enum AssemblyDecision {
 /// Deliberately private: every producer goes through
 /// [`ext_refs_sidecar_json`], which is what keeps the byte-level determinism
 /// argument documented in one place.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, serde::Deserialize)]
 struct Sidecar {
     ext_hashes: Vec<String>,
+}
+
+/// The hashes an ext-refs sidecar produced by [`ext_refs_sidecar_json`] names,
+/// in its order: the inverse of that function, for the pre-PUT clean-up fence
+/// (`checkpoint::put_guard`), which re-arms exactly the hashes the sidecar
+/// about to be published names. Bytes that do not parse are `Permanent`: a
+/// producer serialized them a moment ago, so a parse failure is a bug, and a
+/// retry would read the same bytes.
+pub(crate) fn ext_refs_sidecar_hashes(sidecar: &[u8]) -> Result<Vec<String>, CheckpointError> {
+    serde_json::from_slice::<Sidecar>(sidecar)
+        .map(|s| s.ext_hashes)
+        .map_err(|e| CheckpointError::Permanent {
+            source: format!("ext-refs sidecar JSON about to be published does not parse: {e}")
+                .into(),
+        })
 }
 
 /// Serialize the ext-refs sidecar JSON that pairs with a **base** checkpoint
@@ -1180,10 +1198,9 @@ struct Sidecar {
 /// byte-for-byte deterministic across replicas seeing the same snapshot, and the
 /// ground for that claim is a three-link chain that does NOT start in this file:
 ///
-/// 1. [`DiffEngine::plan`](crate::domain::diff::DiffEngine::plan)'s
-///    `plan_full_content` arm — the arm `build_reset_ompf_from_state` forces —
-///    emits `fields` and `time_samples` in a **total order over `ObjectState`'s
-///    content**: fields on `(version, authoring_set_order, section_id,
+/// 1. [`DiffEngine::plan_full_content`](crate::domain::diff::DiffEngine::plan_full_content)
+///    — the plan `build_reset_ompf_from_state` builds from — emits `fields`
+///    and `time_samples` in a **total order over `ObjectState`'s content**: fields on `(version, authoring_set_order, section_id,
 ///    key_name)`, time samples on `(version, section_id, time)`. Each tuple ends
 ///    in the respective map's key, so neither can tie, and no `HashMap` table
 ///    layout survives into the plan (b.gcb / b.vz7).
@@ -1338,6 +1355,7 @@ pub async fn assemble_layer_checkpoint(
             Ok(AssemblyDecision::SkippedNotQuiesced) => "skipped_not_quiesced",
             Ok(AssemblyDecision::LeaseLost) => "lease_lost",
             Ok(AssemblyDecision::ShuttingDown) => "shutdown",
+            Ok(AssemblyDecision::DeferredCleanup) => "deferred_cleanup",
             Err(CheckpointError::NotFound) => "not_found",
             Err(_) => "error",
         },
@@ -1375,6 +1393,8 @@ pub async fn assemble_layer_checkpoint(
         // a second line here would just duplicate it. The periodic loop emits
         // the operator-facing per-layer WARN plus the metric ticks.
         Ok(AssemblyDecision::SkippedNotQuiesced) => {}
+        // `put_guard`'s clean-up fence already logged why at INFO.
+        Ok(AssemblyDecision::DeferredCleanup) => {}
         // The keeper that lost the lease already WARNed (the loop's
         // `CheckpointLease`, which also counts it), and the loop WARNs once
         // more for the layers it then leaves undone.
@@ -1471,6 +1491,9 @@ async fn assemble_inner(
     lease: &mut dyn LeaderLeaseKeeper,
     progress: &mut AssemblyProgress,
 ) -> Result<AssemblyDecision, CheckpointError> {
+    // The clean-up fence's reliance start (`checkpoint::put_guard`): every
+    // read this assembly publishes from happens after it.
+    let reliance_start = Instant::now();
     let loader = ValkeySnapshotLoader { client, keys };
     let object_id_str = object_id.to_string();
 
@@ -1574,7 +1597,8 @@ async fn assemble_inner(
     // Shared with the other three durable-generation producers; the residual
     // (it cannot catch a delete that lands after the probe) and why the b.vn6
     // conditional cursor stamp remains the real guard are on
-    // `crate::checkpoint::put_guard`.
+    // `crate::checkpoint::put_guard`. So is the clean-up fence that follows
+    // the probe (b.g65), whose refusal becomes `DeferredCleanup` below.
     //
     // `Ok(None)` folds onto `NotFound`, which is the same benign-and-terminal
     // arm this function's identity read above uses and the checkpoint loop
@@ -1591,10 +1615,15 @@ async fn assemble_inner(
         snap_seq,
         Bytes::from(ompf_bytes),
         meta,
+        reliance_start,
         "assembler",
     )
     .await;
     progress.write = Some(stage.elapsed());
+    let put = match put {
+        Err(e) if e.is_cleanup_in_flight() => return Ok(AssemblyDecision::DeferredCleanup),
+        other => other,
+    };
     let Some(handle) = put? else {
         return Err(CheckpointError::NotFound);
     };
@@ -3923,6 +3952,108 @@ mod tests {
             build_reset_ompf_from_state(state).expect("the state must assemble into a base");
         crate::checkpoint::apply::decode_checkpoint_ompf(state.object_id, &ompf)
             .expect("the base must decode")
+    }
+
+    /// Two live siblings sharing a collision slot survive the checkpoint
+    /// round trip with their subtrees, their listing and their values. An
+    /// earlier build's same-parent `MoveSection` rename onto an occupied name
+    /// renamed with no collision check (SDD §9.3), so stored state can hold
+    /// `A` (10) and a renamed `A` (11), of one type, under one parent, with a
+    /// child under 10 and a field on each of the three. This build's rename
+    /// cascades the occupant, so the rename is stored into the state
+    /// directly, as that build stored it.
+    ///
+    /// The base encodes every row as a `DiffChangeSection`, and the decode
+    /// (`ApplyMode::RestoreBase`) must rebuild each row as stored: a decode
+    /// that resolved the collision as a commit does would cascade-delete
+    /// the lowest-id sibling (10) and its child when it applied 11.
+    ///
+    /// The restored state is compared with the live one on every column the
+    /// round trip carries (`compose::tests::assert_faithful_columns`: each
+    /// row's parent, name, type and order; every children list in order;
+    /// every field's value and authoring rank). The re-derived columns
+    /// (versions, the cumulative `set_order` cursor) are excluded there. So
+    /// this catches a decode that keeps both rows but drops one from its
+    /// parent's list, loses the subtree, or loses a value.
+    #[test]
+    fn same_name_siblings_survive_the_checkpoint_round_trip() {
+        const P: u64 = 1;
+        const A: u64 = 10;
+        const B: u64 = 11;
+        const LEAF: u64 = 20;
+
+        /// A field on `section_id` whose value names the section, so a value
+        /// restored onto the wrong row cannot compare equal.
+        fn field_on(section_id: u64, set_order: u64) -> oodf_ffi::SetField {
+            oodf_ffi::SetField {
+                section_id,
+                key_name: format!("k{section_id}"),
+                value_or_ext_hash: format!("v{section_id}").into_bytes(),
+                ext_value_size: 0,
+                ext_value_index: 0,
+                set_order,
+            }
+        }
+
+        let mut state = ObjectState {
+            object_id: 1,
+            ..Default::default()
+        };
+        crate::domain::delta::apply_delta(
+            &mut state,
+            Some(oodf_ffi::OwnedDelta {
+                is_diff: false,
+                struct_commands: vec![
+                    xje_change(0, P, "P", 0),
+                    xje_create(P, A, "A"),
+                    xje_create(P, B, "B"),
+                    xje_create(A, LEAF, "leaf"),
+                ],
+                set_fields: vec![field_on(A, 0), field_on(B, 1), field_on(LEAF, 2)],
+                ..Default::default()
+            }),
+        )
+        .expect("the setup delta must apply");
+        // An earlier build's rename of 11 onto `A`, stored as it stored it.
+        state
+            .sections
+            .get_mut(&B)
+            .expect("the setup creates 11")
+            .name = "A".to_string();
+        assert!(
+            [A, B, LEAF]
+                .iter()
+                .all(|id| state.sections.contains_key(id)),
+            "the live state holds both same-name siblings and the child"
+        );
+        assert_eq!(state.sections[&A].name, state.sections[&B].name);
+        assert_eq!(
+            state.children.get(&P).map(Vec::as_slice),
+            Some([A, B].as_slice()),
+            "precondition: the stored rename keeps both siblings listed under P"
+        );
+        assert_eq!(
+            state.fields.len(),
+            3,
+            "precondition: a field on each of 10, 11 and 20"
+        );
+
+        let restored = xje_round_trip(&state);
+
+        let missing: Vec<u64> = [A, B, LEAF]
+            .into_iter()
+            .filter(|id| !restored.sections.contains_key(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the restored layer lost sections {missing:?} that the live layer holds"
+        );
+        assert_eq!(
+            restored.children.get(&P).map(Vec::as_slice),
+            Some([A, B].as_slice()),
+            "the restored P lists both same-name siblings, in the live order"
+        );
+        crate::checkpoint::compose::tests::assert_faithful_columns(&restored, &state);
     }
 
     /// Key saturation: under a parent whose largest key is `u32::MAX`, every

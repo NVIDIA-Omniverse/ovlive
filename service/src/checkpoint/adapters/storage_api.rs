@@ -64,16 +64,20 @@
 //!
 //! The two generation families are addressed under one flat `layers/`
 //! prefix, and the suffix partition between them is what lets a single
-//! paginated LIST of `layers/` serve every layer enumeration on this
-//! adapter — see the "Why the OMPF and tail parser families cannot alias"
-//! note above [`parse_tail_filename`]. The `sessions/` listing is a separate
-//! LIST; both run through one paginated walk,
-//! `StorageApiCheckpointStore::list_subtree_filenames`.
+//! paginated LIST of `layers/` serve every whole-store layer enumeration on
+//! this adapter — see the "Why the OMPF and tail parser families cannot alias"
+//! note above [`parse_tail_filename`]. One layer's own listing (the prune, the
+//! capture, the clean-up's dead-object phase, the re-base gather, the
+//! newest-generation read) LISTs only the partial-name prefix
+//! `layers/<object_id>.` (b.g65), falling back to the whole folder if
+//! storage-api refuses that prefix. The `sessions/` listing is a separate
+//! LIST; all of them run through one paginated walk,
+//! `StorageApiCheckpointStore::list_prefix_filenames`.
 //!
 //! storage-api answers an Enumerate of a prefix that holds no objects with a
 //! 404, on every page. The walk therefore reports a first-page 404 as
 //! [`CheckpointError::NotFound`] and lets each listing decide what an empty
-//! subtree means; a 404 on a later page means the subtree changed under the
+//! prefix means; a 404 on a later page means the prefix changed under the
 //! walk and is `Transient`.
 //!
 //! ## Outbound auth (SDD §14.6)
@@ -111,17 +115,26 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::rest::encode_resource_address;
 use crate::auth::service_token::ServiceTokenProvider;
-use crate::observability::metrics::SharedMetrics;
+use crate::observability::metrics::{
+    SharedMetrics, CHECKPOINT_ADAPTER_CALL_OUTCOME_CANCELLED,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_CEILING, CHECKPOINT_ADAPTER_CALL_OUTCOME_CONFLICT,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_NOT_FOUND, CHECKPOINT_ADAPTER_CALL_OUTCOME_OK,
+    CHECKPOINT_ADAPTER_CALL_OUTCOME_PERMANENT, CHECKPOINT_ADAPTER_CALL_OUTCOME_TRANSIENT,
+    CHECKPOINT_ADAPTER_CALL_VERB_DELETE, CHECKPOINT_ADAPTER_CALL_VERB_GET,
+    CHECKPOINT_ADAPTER_CALL_VERB_HEAD, CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+    CHECKPOINT_ADAPTER_CALL_VERB_PUT, CHECKPOINT_ADAPTER_CALL_VERB_UPLOAD_OPTIONS,
+};
 
 use super::super::store::{
-    parse_layer_artifact_filename, parse_layer_artifact_stem, CheckpointBlob, CheckpointError,
-    CheckpointHandle, CheckpointKind, CheckpointMeta, CheckpointStore, LayerArtifact,
-    LayerArtifactKind, ListedSidecarAbsent, LiveExtSet, MissingMetaCompanion, EXT_REFS_SUFFIX,
+    parse_layer_artifact_filename, parse_layer_artifact_stem, AbsentSidecar, CheckpointBlob,
+    CheckpointError, CheckpointHandle, CheckpointKind, CheckpointMeta, CheckpointStore,
+    LayerArtifact, LayerArtifactKind, LiveExtSet, MissingMetaCompanion, EXT_REFS_SUFFIX,
     META_SUFFIX, OMPF_SUFFIX, SESSION_CHECKPOINT_SUFFIX, TAIL_META_SUFFIX, TAIL_SUFFIX,
 };
 use super::{generation_sort_key, validate_generation_identity, validate_tail_put};
@@ -258,9 +271,103 @@ pub(crate) const CEILING_PHASE_ENUMERATION: &str = "enumeration";
 /// walks) must not be able to tell them apart by wording — only the walks
 /// apart from each other.
 const WALK_LAYERS_ENUMERATION: &str = "layers enumeration";
+/// One layer's own prefix, `layers/<object_id>.` (b.g65, N4): distinct from
+/// [`WALK_LAYERS_ENUMERATION`] so its ceiling, clamp and continuation-page
+/// errors can be told apart from the whole-folder walk's.
+const WALK_LAYER_PREFIX_ENUMERATION: &str = "layer prefix enumeration";
 const WALK_SESSIONS_ENUMERATION: &str = "sessions enumeration";
 const WALK_EXT_REFS_SIDECAR: &str = "ext-refs sidecar walk";
 const WALK_TEMP_REAP: &str = "temp-artifact reap";
+/// The list-route canary's listing through the `layers/` helper.
+const WALK_DR_CANARY_LAYERS_HELPER: &str = "list-route canary listing (layers helper)";
+/// The list-route canary's listing through the `sessions/` helper.
+const WALK_DR_CANARY_SESSIONS_HELPER: &str = "list-route canary listing (sessions helper)";
+
+/// The subtree under `<base_path>/.live-edit/` that holds the DR list-route
+/// canaries (`CheckpointStore::verify_list_route`): one directory per run,
+/// `dr-canary/<uuid>/`, never read by anything but the canary itself.
+const DR_CANARY_SUBTREE: &str = "dr-canary";
+
+/// The canary object's name inside its run directory.
+const DR_CANARY_OBJECT: &str = "canary";
+
+/// The canary object's bytes: small, and self-describing for an operator who
+/// finds a leftover one.
+const DR_CANARY_BODY: &[u8] = b"live-edit disaster-recovery list-route canary; safe to delete\n";
+
+/// How many ext-refs sidecar GETs the live-set walk
+/// ([`StorageApiCheckpointStore::list_live_ext_set`]) keeps in flight at once
+/// (b.g65, B3). Fixed, not a setting: a 429 is already `Transient` and
+/// retried, and a walk throttled past its ceiling fails closed and the next
+/// clean-up pass retries.
+pub const EXT_REFS_WALK_CONCURRENCY: usize = 8;
+
+/// Records one sample on `live_edit_checkpoint_adapter_call_duration_seconds`
+/// for one logical call (b.g65); built by
+/// [`StorageApiCheckpointStore::start_call_timer`].
+///
+/// [`Self::finish`] records the call's answer. A guard dropped unfinished — the
+/// caller stopped polling the call's future, whether at a deadline, a shutdown
+/// or a sibling's error in a fan-out — records `cancelled` from its `Drop`, so
+/// every exit, unwinding included, leaves exactly one sample.
+struct CallTimer<'a> {
+    metrics: Option<&'a (SharedMetrics, String)>,
+    verb: &'static str,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl CallTimer<'_> {
+    /// Record the call's `outcome`, one of `CHECKPOINT_ADAPTER_CALL_OUTCOMES`.
+    fn finish(mut self, outcome: &'static str) {
+        self.record(outcome);
+    }
+
+    fn record(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some((metrics, service)) = self.metrics {
+            metrics.observe_checkpoint_adapter_call_duration(
+                self.verb,
+                outcome,
+                service,
+                self.started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+}
+
+impl Drop for CallTimer<'_> {
+    fn drop(&mut self) {
+        self.record(CHECKPOINT_ADAPTER_CALL_OUTCOME_CANCELLED);
+    }
+}
+
+/// The `outcome` label a call's own answer earns on
+/// `live_edit_checkpoint_adapter_call_duration_seconds`: an exhaustive reading
+/// of [`CheckpointError`], taken before any caller remaps it (a DELETE's 404
+/// is `not_found` even though the delete then reports success).
+fn call_outcome<T>(result: &Result<T, CheckpointError>) -> &'static str {
+    match result {
+        Ok(_) => CHECKPOINT_ADAPTER_CALL_OUTCOME_OK,
+        Err(CheckpointError::NotFound) => CHECKPOINT_ADAPTER_CALL_OUTCOME_NOT_FOUND,
+        Err(CheckpointError::Conflict) => CHECKPOINT_ADAPTER_CALL_OUTCOME_CONFLICT,
+        Err(CheckpointError::Transient { .. }) => CHECKPOINT_ADAPTER_CALL_OUTCOME_TRANSIENT,
+        Err(CheckpointError::Permanent { .. }) | Err(CheckpointError::NotImplemented { .. }) => {
+            CHECKPOINT_ADAPTER_CALL_OUTCOME_PERMANENT
+        }
+    }
+}
+
+/// What one sidecar read of the live-set walk produced.
+enum SidecarRead {
+    /// The sidecar's hashes.
+    Hashes(Vec<String>),
+    /// The listing named it, and it read absent by address.
+    Absent(AbsentSidecar),
+}
 
 /// The `sessions` subtree under `<base_path>/.live-edit/`. One constant for the
 /// session-checkpoint address builders and the `sessions/` walk of
@@ -364,6 +471,39 @@ const UPLOAD_OPTIONS_PATH: &str = "/v1alpha/fileobject/upload-options/by-address
 /// state — "the pre-flight is not currently informative" — and the cadence
 /// argument above applies unchanged to both. See [`UploadOptions`].
 const UPLOAD_OPTIONS_REPROBE_BACKOFF: Duration = Duration::from_secs(300);
+
+/// How long per-layer listings go straight to the whole `layers/` folder after
+/// storage-api refused a per-layer prefix with HTTP 400 or 403, before one
+/// listing tries the prefix again (b.g65, P9; see [`LayerPrefixListing`]).
+///
+/// The same five minutes as [`UPLOAD_OPTIONS_REPROBE_BACKOFF`], for the same
+/// reason: at most one wasted prefix request per window on a deployment that
+/// refuses prefixes — rather than one before every prune, capture, re-base
+/// gather and lazy-recovery read — while a permission granted later is picked
+/// up within minutes rather than at the next pod restart.
+const LAYER_PREFIX_REPROBE_BACKOFF: Duration = Duration::from_secs(300);
+
+/// Whether this adapter lists one layer through its own prefix
+/// `layers/<object_id>.` or through the whole `layers/` folder (b.g65, P9),
+/// modelled on [`UploadOptions::Unavailable`].
+///
+/// A refusal of the prefix (HTTP 400 or 403) is a property of the deployment —
+/// a permission or a request the storage service will not validate — not of
+/// one layer, so it is remembered: until `retry_at` every per-layer listing
+/// goes straight to the whole folder, and the first listing after it tries the
+/// prefix again. That retry decides the next state: a listing the prefix
+/// answers (a first-page 404 included) makes it [`Self::Accepted`], another
+/// refusal starts a new window, and any other error passes through and leaves
+/// the window lapsed, so the next listing tries again. Only 400 and 403 count
+/// as a refusal: a repeated 401, a TLS failure, a malformed page or any other
+/// status is not a property of the prefix, and passes through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerPrefixListing {
+    /// List through the per-layer prefix. The state this adapter starts in.
+    Accepted,
+    /// The prefix was refused: use the whole folder until `retry_at`.
+    Refused { retry_at: tokio::time::Instant },
+}
 
 /// Payload size at or above which a write consults the upload-options
 /// pre-flight (b.z22 review round 1, F3).
@@ -533,6 +673,16 @@ pub struct StorageApiCheckpointStore {
     /// can both probe; the duplicate costs one GET and the second store wins,
     /// which is why no in-flight singleflight is worth its complexity here.
     upload_options: std::sync::Mutex<UploadOptions>,
+    /// Whether storage-api is currently taken to refuse per-layer prefix
+    /// listings (b.g65, P9) — see [`LayerPrefixListing`]. A `std::sync::Mutex`
+    /// for the same reason as [`Self::upload_options`]: never held across an
+    /// `.await`.
+    layer_prefix_listing: std::sync::Mutex<LayerPrefixListing>,
+    /// Set by the first per-layer listing that storage-api refused (HTTP 400
+    /// or 403) and that fell back to the whole `layers/` folder (b.g65, P9),
+    /// so that fallback WARNs once per adapter — one per process in
+    /// production — rather than on every refusal. In memory only; never reset.
+    layer_prefix_fallback_warned: std::sync::atomic::AtomicBool,
 }
 
 impl StorageApiCheckpointStore {
@@ -606,6 +756,8 @@ impl StorageApiCheckpointStore {
             upload_options: std::sync::Mutex::new(UploadOptions::Unprobed {
                 probation_until: None,
             }),
+            layer_prefix_listing: std::sync::Mutex::new(LayerPrefixListing::Accepted),
+            layer_prefix_fallback_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -626,6 +778,30 @@ impl StorageApiCheckpointStore {
     fn record_ceiling_elapsed(&self, phase: &str) {
         if let Some((metrics, service)) = &self.metrics {
             metrics.inc_checkpoint_adapter_ceiling_elapsed(phase, service);
+        }
+    }
+
+    /// Start timing one logical call for
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65).
+    ///
+    /// Created at exactly three sites — [`Self::within_call_ceiling_of`], the
+    /// clamp arm of [`Self::within_walk_clamp`] and
+    /// [`Self::send_once_classified`] — because every request this adapter
+    /// sends goes through one of them; the retry loop, the redirect hops and
+    /// the completion POST all run inside one of those calls, so one sample
+    /// covers one call, never one attempt. One call nests inside another: a
+    /// `put`'s upload-options pre-flight (`fetch_upload_options`, through
+    /// [`Self::send_once_classified`]) records its own `upload_options`
+    /// sample, and its time is also inside the enclosing `put` sample. So the
+    /// `put` and `upload_options` samples of one write are not disjoint, and
+    /// summing the histogram's time across verbs counts a pre-flight twice.
+    /// With no metrics handle installed the guard records nothing.
+    fn start_call_timer(&self, verb: &'static str) -> CallTimer<'_> {
+        CallTimer {
+            metrics: self.metrics.as_ref(),
+            verb,
+            started: std::time::Instant::now(),
+            finished: false,
         }
     }
 
@@ -875,10 +1051,11 @@ impl StorageApiCheckpointStore {
 
     /// Render the storage-api Enumerate URL for `prefix_address` with an
     /// optional `continuation_handle` and `max_page_size`. The
-    /// `prefix_address` is a decoded `<base_path>/.live-edit/<subtree>/`
-    /// address, `layers/` or `sessions/` (the trailing `/` is what makes it
-    /// enumerable — the OpenAPI
-    /// `resource_address` parameter targets the enumerable parent address);
+    /// `prefix_address` is a decoded prefix: a folder
+    /// (`<base_path>/.live-edit/layers/` or `.../sessions/`) or one layer's
+    /// partial name (`<base_path>/.live-edit/layers/<object_id>.`). storage-api
+    /// lists whatever starts with it, so a trailing `/` is how a folder is
+    /// spelled, not what makes the address listable;
     /// both it and `continuation_handle` are percent-encoded through
     /// [`encode_resource_address`] so a `/` byte or arbitrary URL-unsafe character
     /// inside an opaque continuation handle cannot smuggle a sub-path or a
@@ -1383,6 +1560,23 @@ fn parse_generation_filename(name: &str) -> Option<(u64, u64, CheckpointKind)> {
     parse_tail_filename(name).map(|(object_id, to_seq)| (object_id, to_seq, CheckpointKind::Tail))
 }
 
+/// `Ok` when the list-route canary's listing `names` (filenames) holds the
+/// canary object; otherwise the `Permanent` that says the listing route is
+/// not proven, naming the `walk` and the canary's `address`.
+fn canary_listed(names: &[String], walk: &str, address: &str) -> Result<(), CheckpointError> {
+    if names.iter().any(|name| name == DR_CANARY_OBJECT) {
+        return Ok(());
+    }
+    Err(CheckpointError::Permanent {
+        source: format!(
+            "the storage-api listing route did not list back the object this check had just \
+             written ({walk}, {address}): the listing answered {} item(s)",
+            names.len()
+        )
+        .into(),
+    })
+}
+
 /// Map a body-read `reqwest::Error` (encountered AFTER a successful status
 /// classification, when reading the response body) to
 /// [`CheckpointError::Permanent`].
@@ -1397,6 +1591,38 @@ fn parse_generation_filename(name: &str) -> Option<(u64, u64, CheckpointKind)> {
 fn body_read_to_permanent(err: reqwest::Error) -> CheckpointError {
     CheckpointError::Permanent {
         source: format!("storage-api response body read failed: {err}").into(),
+    }
+}
+
+/// The `Permanent` source [`classify_outcome`] gives an HTTP status it does
+/// not retry or name (any other 4xx or 5xx: 400, 403, 405, 501, …). It carries
+/// the status so a caller can tell a refusal of the request (400, 403) from
+/// every other permanent failure ([`permanent_http_status`]; b.g65, P9).
+/// Renders as `storage-api returned HTTP {code}` — the status only, never the
+/// body or the URL.
+#[derive(Debug)]
+struct PermanentHttpStatus {
+    code: u16,
+}
+
+impl std::fmt::Display for PermanentHttpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "storage-api returned HTTP {}", self.code)
+    }
+}
+
+impl std::error::Error for PermanentHttpStatus {}
+
+/// The HTTP status of a `Permanent` that [`classify_outcome`] built from a
+/// response status ([`PermanentHttpStatus`]); `None` for every other error,
+/// a `Permanent` from a TLS failure, a malformed page or a repeated 401
+/// included.
+fn permanent_http_status(err: &CheckpointError) -> Option<u16> {
+    match err {
+        CheckpointError::Permanent { source } => source
+            .downcast_ref::<PermanentHttpStatus>()
+            .map(|status| status.code),
+        _ => None,
     }
 }
 
@@ -1770,7 +1996,7 @@ fn classify_outcome(result: Result<reqwest::Response, reqwest::Error>) -> Classi
                     })
                 }
                 _ => ClassifiedOutcome::Permanent(CheckpointError::Permanent {
-                    source: format!("storage-api returned HTTP {code}").into(),
+                    source: Box::new(PermanentHttpStatus { code }),
                 }),
             }
         }
@@ -2232,7 +2458,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
             ];
             for url in &tail_urls {
                 match self
-                    .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(url))
+                    .send_classified(
+                        CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                        REDIRECT_CONTEXT_DELETE,
+                        || self.client.delete(url),
+                    )
                     .await
                 {
                     Ok(_) => {}
@@ -2280,7 +2510,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
             // SR-1.3 case #14 — the companion already vanished (maybe a
             // prior partial-delete attempt, maybe a concurrent pruner).
             match self
-                .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(url))
+                .send_classified(
+                    CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                    REDIRECT_CONTEXT_DELETE,
+                    || self.client.delete(url),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -2356,7 +2590,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
         // family — `delete_*` paths return `Ok(())` when the artifact is
         // already absent).
         match self
-            .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(&url))
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                REDIRECT_CONTEXT_DELETE,
+                || self.client.delete(&url),
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -2466,16 +2704,24 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// 2xx → `Ok(true)`; 404 → `Ok(false)`; every other outcome is the
     /// classified error, never `Ok(false)`.
     ///
-    /// A 404 may be storage-api's cached not-found answer rather than a fresh
-    /// one: the backend can cache not-found per pod (15 minutes per pod,
-    /// measured on RC), and a write clears the entry only on the pod that
-    /// served it. So `Ok(false)` may be stale for up to the storage cache TTL,
-    /// and nothing here can tell a cached answer from a fresh one. See the
-    /// trait contract on `CheckpointStore::ext_blob_exists`.
+    /// Either answer may come from storage-api's per-pod cache rather than a
+    /// fresh read (15 minutes per pod, measured on RC), and a write or delete
+    /// clears the entry on at most the pod that served it, and only with
+    /// update invalidation on (peers asynchronously with the shared cache;
+    /// SDD §22.16): a 404 may be a cached
+    /// not-found for a blob written since, and a 2xx a cached answer for one
+    /// deleted since. So either `Ok` may be stale for up to the storage cache
+    /// TTL (`Config::checkpoint_storage_api_not_found_cache_secs`), and nothing
+    /// here can tell a cached answer from a fresh one. See the trait contract
+    /// on `CheckpointStore::ext_blob_exists`.
     async fn ext_blob_exists(&self, hash_hex: &str) -> Result<bool, CheckpointError> {
         let url = self.ext_blob_url(hash_hex);
         match self
-            .send_classified(REDIRECT_CONTEXT_EXT_EXISTS_PROBE, || self.client.head(&url))
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_HEAD,
+                REDIRECT_CONTEXT_EXT_EXISTS_PROBE,
+                || self.client.head(&url),
+            )
             .await
         {
             // A HEAD carries no body to read.
@@ -2489,7 +2735,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
         let url = self.ext_blob_url(hash_hex);
         // SR-1.3 case #16 — delete of an absent hash is `Ok(())`.
         match self
-            .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(&url))
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                REDIRECT_CONTEXT_DELETE,
+                || self.client.delete(&url),
+            )
             .await
         {
             Ok(_) => Ok(()),
@@ -2514,7 +2764,9 @@ impl CheckpointStore for StorageApiCheckpointStore {
             Ok(response) => response,
             // May be storage-api's cached not-found answer, so `Ok(None)` can
             // be stale — see the trait contract on
-            // `CheckpointStore::get_counters_sidecar`.
+            // `CheckpointStore::get_counters_sidecar`. A body read below can
+            // be a cached earlier one, as stale
+            // (`Config::checkpoint_storage_api_not_found_cache_secs`).
             Err(err) if err.is_not_found() => return Ok(None),
             Err(err) => return Err(err),
         };
@@ -2618,18 +2870,14 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// bounded by one [`storage_api_publish_worst_case`] ceiling (180 s at the
     /// defaults), and since b.gg7 that bound is *enforced* in
     /// [`Self::send_classified`] rather than merely described. The
-    /// reconciliation collect's claim grace (a tombstone is acted on only once
-    /// its first sighting is older than `reconcile_grace`, a multiple of the
-    /// publish worst case) **bounds** that race but does not close it: the
-    /// grace is measured from the tombstone, not from the in-flight publish,
-    /// and the collect's lease gate stops a second collector, not a concurrent
-    /// publisher (duplicate leaders and the lease-less base bootstrap both
-    /// publish). The accepted residual — a writer whose assembly plus
-    /// first-artifact publish outlasts the grace while a peer prunes a
-    /// generation sharing a hash with it — is stated in SDD §22.17.3 ("The
-    /// grace bounds the publish race; it does not close it"). Neither the
-    /// grace nor the lease gate is to be removed on the strength of this
-    /// ordering.
+    /// reconciliation collect does not rely on this ordering alone (b.g65):
+    /// every producer re-arms the hashes its sidecar names immediately before
+    /// the PUT (`checkpoint::put_guard`), and the collect's delete-time fence
+    /// refuses a hash re-armed after the threshold its snapshot is anchored
+    /// to, so a sidecar published while the walk runs cannot lose its hashes
+    /// to a delete (SDD §22.17.3, §22.17.5). This ordering is what keeps the
+    /// re-arm-to-visible gap within one publish worst case; neither it nor
+    /// the fence is to be removed on the strength of the other.
     ///
     /// Mirrors the InMemory adapter override at
     /// `src/checkpoint/adapters/in_memory.rs:336-358` and the LocalDisk
@@ -2637,20 +2885,19 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// the SR-1.3 conformance harness case #23 sees identical semantics across
     /// all three Epic-1 adapters.
     ///
-    /// **404 on a listed ext-refs sidecar GET → the typed
-    /// [`ListedSidecarAbsent`] `Transient`, naming the sidecar (b.oya).** The
-    /// walk GETs only sidecars the `layers/` LIST just named, so a 404 is not
-    /// "this generation carries no sidecar" — that generation is simply never
-    /// listed — but an inconsistency between the listing and the by-address
-    /// read. Skipping it would under-count the live set, and an under-counted
-    /// live set is an over-delete: the collect phase deletes every tombstoned
-    /// blob the set does not name. So the walk returns
-    /// [`CheckpointError::listed_sidecar_absent`] and never a partial set; the
-    /// collect phase deletes nothing that pass, and qualifies the abort by who
-    /// holds the checkpoint lease (see `checkpointer::run_reconcile_collect`).
-    /// Every other classification
-    /// (Transient, Permanent, Conflict, Unauthorized) propagates verbatim
-    /// because retry / auth / classification is owned by `send_classified`.
+    /// **404 on a listed ext-refs sidecar GET → reported, never skipped
+    /// silently.** The walk GETs only sidecars the `layers/` LIST just named,
+    /// so a 404 is not "this generation carries no sidecar" — that generation
+    /// is simply never listed — but a sidecar deleted (or unfinished) between
+    /// the listing and the by-address read. Skipping it would under-count the
+    /// live set, and an under-counted live set is an over-delete.
+    /// [`Self::list_live_ext_set`] reports it in [`LiveExtSet::absent`], with
+    /// whether the same LIST named its `.ompf`, and the collect decides on
+    /// evidence (b.g65); this method answers the typed
+    /// [`CheckpointError::listed_sidecar_absent`] instead, never a partial set.
+    /// Every other classification (Transient, Permanent, Conflict,
+    /// Unauthorized) propagates verbatim because retry / auth /
+    /// classification is owned by `send_classified`.
     ///
     /// **One walk, two answers (b.oya).** The walk itself lives in
     /// [`Self::list_live_ext_set`], which also counts the layer artifacts the
@@ -2663,9 +2910,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// exposes — a paginated LIST plus one GET per sidecar — so it carries the
     /// [`storage_api_enumeration_ceiling`] twice over: once inside
     /// [`Self::list_layers_prefix_filenames`] for the LIST, once across the GET
-    /// fan-out here — each of those halves exact rather than approximate, since
-    /// every call inside them is clamped to the walk's remaining budget by
-    /// [`Self::send_classified_within`]. An elapse in either surfaces as
+    /// fan-out here — at most [`EXT_REFS_WALK_CONCURRENCY`] GETs in flight
+    /// (b.g65), none started after the deadline — each of those halves exact
+    /// rather than approximate, since every call inside them is clamped to the
+    /// walk's remaining budget by [`Self::send_classified_within`]. An elapse
+    /// in either surfaces as
     /// `Transient` and never as a partial set; the collect phase's fail-closed
     /// consumption of this method (see `run_reconcile_collect`) makes a
     /// truncated-but-successful return the one outcome that would be unsafe.
@@ -2695,7 +2944,7 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// set forever, degrading the reconciliation collect toward deleting
     /// nothing.
     async fn list_referenced_ext_hashes(&self) -> Result<HashSet<String>, CheckpointError> {
-        Ok(self.list_live_ext_set().await?.hashes)
+        self.list_live_ext_set().await?.into_complete_hashes()
     }
 
     /// The live-set walk [`Self::list_referenced_ext_hashes`] documents, plus
@@ -2707,18 +2956,26 @@ impl CheckpointStore for StorageApiCheckpointStore {
     ///
     /// A first-page 404 is the wrapper's empty listing, so it yields
     /// `(∅, 0)` with no sidecar GET. A later-page 404 and both ceilings stay
-    /// `Transient`, and a listed sidecar that reads absent stays the typed
-    /// [`ListedSidecarAbsent`] error — never a partial set and never a count
-    /// without its hashes.
+    /// `Transient`, and a listed sidecar that reads absent is reported in
+    /// `absent` (b.g65) — never a partial set passed off as complete.
     async fn list_live_ext_set(&self) -> Result<LiveExtSet, CheckpointError> {
         let filenames = self.list_layers_prefix_filenames().await?;
         // Counted from the very listing the sidecar keys come from — the
         // same request, which is the whole point: a count from any other
-        // listing cannot vouch for this one.
-        let listed_layer_artifacts = filenames
+        // listing cannot vouch for this one. The same pass notes which
+        // generations the listing named an `.ompf` for (b.g65): a sidecar
+        // that reads absent is reported with whether its base was listed.
+        let mut listed_layer_artifacts = 0usize;
+        let mut listed_bases: HashSet<(u64, u64)> = HashSet::new();
+        for artifact in filenames
             .iter()
-            .filter(|name| parse_layer_artifact_filename(name).is_some())
-            .count();
+            .filter_map(|name| parse_layer_artifact_filename(name))
+        {
+            listed_layer_artifacts += 1;
+            if artifact.kind == LayerArtifactKind::Ompf {
+                listed_bases.insert((artifact.object_id, artifact.snap_seq));
+            }
+        }
         let sidecar_keys: Vec<(u64, u64)> = filenames
             .iter()
             .filter_map(|name| parse_ext_refs_filename(name))
@@ -2735,78 +2992,94 @@ impl CheckpointStore for StorageApiCheckpointStore {
         let deadline = tokio::time::Instant::now() + ceiling;
         let sidecar_count = sidecar_keys.len();
 
-        let mut hashes: HashSet<String> = HashSet::new();
-        for (index, (object_id, snap_seq)) in sidecar_keys.into_iter().enumerate() {
-            // Checked between GETs. Fail-closed as `Transient`: the collect
-            // phase consumes this set fail-closed (a partial live set is an
-            // over-delete), so a truncated walk MUST NOT be returned as if it
-            // were complete.
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!(
-                    ceiling_secs = ceiling.as_secs(),
-                    sidecars_read = index,
-                    sidecar_count,
-                    "storage-api ext-refs sidecar walk exceeded its ceiling; abandoning it as \
-                     Transient rather than returning a partial live set (an under-counted live \
-                     set is exactly the over-delete the retention protocol exists to prevent)"
-                );
-                self.record_ceiling_elapsed(CEILING_PHASE_ENUMERATION);
-                return Err(CheckpointError::Transient {
-                    source: format!(
-                        "storage-api ext-refs sidecar walk exceeded the enforced ceiling of {}s \
-                         after {index} of {sidecar_count} sidecars",
-                        ceiling.as_secs()
-                    )
-                    .into(),
-                });
-            }
-            let url = self.layer_ext_refs_url(object_id, snap_seq);
-            // Clamped to the remaining deadline (b.gg7 review round 2): the
-            // cooperative test above only fires *before* a GET, so without this
-            // the walk's true bound is `ceiling + one publish_worst_case` — the
-            // last sidecar admitted at deadline − ε is entitled to a full 180 s.
-            // See `Self::send_classified_within` for why the clamp is honest
-            // rather than merely tighter.
-            let response = match self
-                .get_artifact_within(WALK_EXT_REFS_SIDECAR, deadline, &url)
-                .await
-            {
-                Ok(response) => response,
-                // 404 on a sidecar the LIST above just named (b.oya): an
-                // inconsistency, never an empty sidecar. Skipping it would
-                // drop every hash it names from the live set, and the collect
-                // phase deletes any tombstoned blob absent from that set — so
-                // a skip is an over-delete of blobs a retained backup may
-                // still name. The typed `ListedSidecarAbsent` `Transient`,
-                // naming the sidecar, never a partial set: the collect phase
-                // deletes nothing that pass, and decides by who holds the
-                // checkpoint lease whether the abort counts as a live-set
-                // failure (a peer's lease-gated prune explains it routinely)
-                // — see `checkpointer::run_reconcile_collect`.
-                Err(err) if err.is_not_found() => {
-                    return Err(CheckpointError::listed_sidecar_absent(
-                        ListedSidecarAbsent {
-                            artifact: url.to_string(),
-                        },
-                    ));
+        // b.g65 (B3, closes b.ib2): at most `EXT_REFS_WALK_CONCURRENCY` GETs
+        // in flight. Each read is the clamped GET, then the body, then the
+        // parse; no GET starts once the deadline has passed. The first error
+        // of any kind other than a not-found returns at once, and dropping the
+        // stream cancels the GETs still in flight: never a partial set.
+        let listed_bases = &listed_bases;
+        let reads = futures::stream::iter(sidecar_keys)
+            .map(|(object_id, snap_seq)| async move {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(None);
                 }
-                Err(err) => return Err(err),
-            };
-            let bytes = response.bytes().await.map_err(body_read_to_permanent)?;
-            // Per SR-1.5 the sidecar is opaque at put time; parsing
-            // happens here on demand. A malformed sidecar surfaces as
-            // `Permanent` (it cannot be retried into success), matching
-            // the InMemory and LocalDisk adapters so the conformance
-            // harness sees consistent classification.
-            let parsed: ExtRefsSidecar =
-                serde_json::from_slice(&bytes).map_err(|err| CheckpointError::Permanent {
-                    source: Box::new(err),
-                })?;
-            hashes.extend(parsed.ext_hashes);
+                let url = self.layer_ext_refs_url(object_id, snap_seq);
+                // Clamped to the remaining deadline (b.gg7 review round 2):
+                // without the clamp the walk's true bound would be `ceiling +
+                // one publish_worst_case`. See `Self::send_classified_within`
+                // for why the clamp is honest rather than merely tighter.
+                let response = match self
+                    .get_artifact_within(WALK_EXT_REFS_SIDECAR, deadline, &url)
+                    .await
+                {
+                    Ok(response) => response,
+                    // A not-found on a sidecar the LIST above just named: never
+                    // an empty sidecar. Reported, not skipped (b.g65): the
+                    // collect decides on evidence whether it may skip it, and
+                    // otherwise deletes nothing that pass.
+                    Err(err) if err.is_not_found() => {
+                        return Ok(SidecarRead::Absent(AbsentSidecar {
+                            object_id,
+                            snap_seq,
+                            base_listed: listed_bases.contains(&(object_id, snap_seq)),
+                            artifact: url,
+                        }))
+                    }
+                    Err(err) => return Err(Some(err)),
+                };
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| Some(body_read_to_permanent(e)))?;
+                // Per SR-1.5 the sidecar is opaque at put time; parsing
+                // happens here on demand. A malformed sidecar surfaces as
+                // `Permanent` naming its URL (it cannot be retried into
+                // success), matching the InMemory and LocalDisk adapters.
+                let parsed: ExtRefsSidecar = serde_json::from_slice(&bytes)
+                    .map_err(|err| Some(CheckpointError::malformed_ext_refs_sidecar(url, err)))?;
+                Ok(SidecarRead::Hashes(parsed.ext_hashes))
+            })
+            .buffer_unordered(EXT_REFS_WALK_CONCURRENCY);
+        futures::pin_mut!(reads);
+
+        let mut hashes: HashSet<String> = HashSet::new();
+        let mut absent: Vec<AbsentSidecar> = Vec::new();
+        let mut read: usize = 0;
+        while let Some(result) = reads.next().await {
+            match result {
+                Ok(SidecarRead::Hashes(found)) => hashes.extend(found),
+                Ok(SidecarRead::Absent(sidecar)) => absent.push(sidecar),
+                Err(Some(err)) => return Err(err),
+                // A read admitted after the deadline. Fail-closed as
+                // `Transient`: the collect consumes this set fail-closed (a
+                // partial live set is an over-delete), so a truncated walk
+                // MUST NOT be returned as if it were complete.
+                Err(None) => {
+                    tracing::warn!(
+                        ceiling_secs = ceiling.as_secs(),
+                        sidecars_read = read,
+                        sidecar_count,
+                        "storage-api ext-refs sidecar walk exceeded its ceiling; abandoning it as \
+                         Transient rather than returning a partial live set (an under-counted live \
+                         set is exactly the over-delete the retention protocol exists to prevent)"
+                    );
+                    self.record_ceiling_elapsed(CEILING_PHASE_ENUMERATION);
+                    return Err(CheckpointError::Transient {
+                        source: format!(
+                            "storage-api ext-refs sidecar walk exceeded the enforced ceiling of \
+                             {}s after {read} of {sidecar_count} sidecars",
+                            ceiling.as_secs()
+                        )
+                        .into(),
+                    });
+                }
+            }
+            read += 1;
         }
         Ok(LiveExtSet {
             hashes,
             listed_layer_artifacts,
+            absent,
         })
     }
 
@@ -2873,21 +3146,20 @@ impl CheckpointStore for StorageApiCheckpointStore {
         };
         let bytes = response.bytes().await.map_err(body_read_to_permanent)?;
         // Per SR-1.5 the sidecar is opaque at put time; parsing happens here
-        // on demand. A malformed sidecar surfaces as `Permanent` (it cannot
-        // be retried into success), matching the InMemory and LocalDisk
-        // adapters so the conformance harness sees consistent classification.
-        let parsed: ExtRefsSidecar =
-            serde_json::from_slice(&bytes).map_err(|err| CheckpointError::Permanent {
-                source: Box::new(err),
-            })?;
+        // on demand. A malformed sidecar surfaces as `Permanent` naming its
+        // URL (it cannot be retried into success), matching the InMemory and
+        // LocalDisk adapters so the conformance harness sees consistent
+        // classification.
+        let parsed: ExtRefsSidecar = serde_json::from_slice(&bytes)
+            .map_err(|err| CheckpointError::malformed_ext_refs_sidecar(url, err))?;
         Ok(parsed.ext_hashes.into_iter().collect())
     }
 
     /// Raw, unfiltered enumeration of the `layers/` subtree (b.9qd).
     ///
-    /// One flat paginated LIST — the same
+    /// One flat paginated LIST — the same whole-folder
     /// [`Self::list_layers_prefix_filenames`] walk behind every other
-    /// `layers/` enumeration on this adapter — parsed for every artifact kind instead of
+    /// whole-store `layers/` enumeration on this adapter — parsed for every artifact kind instead of
     /// filtered down to one. Filenames that parse as none of them are skipped
     /// silently, so an unrelated object an operator placed in the namespace is
     /// never a deletion candidate.
@@ -2961,9 +3233,9 @@ impl CheckpointStore for StorageApiCheckpointStore {
     ///
     /// A temp object is **not addressable from `(object_id, snap_seq)` alone**
     /// — its name carries a UUID nobody can reconstruct — so this LISTs the
-    /// stem's namespace (the same paginated
-    /// [`Self::list_layers_prefix_filenames`] walk every other `layers/`
-    /// enumeration on this adapter uses) and DELETEs the matches. That is one LIST per
+    /// stem's namespace (the paginated whole-folder
+    /// [`Self::list_layers_prefix_filenames`] walk the whole-store `layers/`
+    /// enumerations on this adapter use) and DELETEs the matches. That is one LIST per
     /// reclaimed stem, which is why the caller only reaches it for a candidate
     /// that has already survived a full grace window.
     ///
@@ -3035,9 +3307,13 @@ impl CheckpointStore for StorageApiCheckpointStore {
             }
             let url = self.by_address_url(&format!("{prefix}/layers/{name}"));
             match self
-                .send_classified_within(WALK_TEMP_REAP, REDIRECT_CONTEXT_DELETE, deadline, || {
-                    self.client.delete(&url)
-                })
+                .send_classified_within(
+                    CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                    WALK_TEMP_REAP,
+                    REDIRECT_CONTEXT_DELETE,
+                    deadline,
+                    || self.client.delete(&url),
+                )
                 .await
             {
                 Ok(_) => removed += 1,
@@ -3055,6 +3331,11 @@ impl CheckpointStore for StorageApiCheckpointStore {
     /// derived from the configured timeout rather than frozen.
     fn publish_worst_case(&self) -> Duration {
         storage_api_publish_worst_case(self.request_timeout)
+    }
+
+    /// The list-route canary: [`Self::verify_list_route_canary`].
+    async fn verify_list_route(&self) -> Result<(), CheckpointError> {
+        self.verify_list_route_canary().await
     }
 }
 
@@ -3297,12 +3578,17 @@ impl StorageApiCheckpointStore {
     /// here — see [`multiple_choices_message`]. It is a real call-site
     /// descriptor, not a disjunction of every site that might have produced it
     /// (b.z22 review round 1, F5).
+    ///
+    /// `verb` is the call's `verb` label on
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65), one of
+    /// `CHECKPOINT_ADAPTER_CALL_VERBS`.
     async fn send_classified(
         &self,
+        verb: &'static str,
         context: &'static str,
         build_request: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, CheckpointError> {
-        self.within_call_ceiling(self.send_classified_inner(context, build_request))
+        self.within_call_ceiling(verb, self.send_classified_inner(context, build_request))
             .await
     }
 
@@ -3321,12 +3607,21 @@ impl StorageApiCheckpointStore {
     /// reconciliation grace, the retention cascade's residual window, the
     /// checkpointer's lease arithmetic — stays exactly as true after this change
     /// as before it.
+    ///
+    /// It is also one of the three sites that time a call for
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65), under
+    /// `verb` — see [`Self::within_call_ceiling_of`].
     async fn within_call_ceiling<T>(
         &self,
+        verb: &'static str,
         work: impl std::future::Future<Output = Result<T, CheckpointError>>,
     ) -> Result<T, CheckpointError> {
-        self.within_call_ceiling_of(storage_api_publish_worst_case(self.request_timeout), work)
-            .await
+        self.within_call_ceiling_of(
+            verb,
+            storage_api_publish_worst_case(self.request_timeout),
+            work,
+        )
+        .await
     }
 
     /// [`Self::within_call_ceiling`] with the ceiling supplied rather than
@@ -3342,14 +3637,25 @@ impl StorageApiCheckpointStore {
     /// this ceiling using a small explicit budget, instead of racing accumulated
     /// per-request delays against `6 × request_timeout`. Same shape the walk
     /// clamp already has, where the deadline is the caller's to state.
+    ///
+    /// Records one sample per call on
+    /// `live_edit_checkpoint_adapter_call_duration_seconds{verb}` (b.g65): the
+    /// call's own answer, `ceiling` on an elapse, or `cancelled` if the caller
+    /// drops the call first.
     async fn within_call_ceiling_of<T>(
         &self,
+        verb: &'static str,
         ceiling: Duration,
         work: impl std::future::Future<Output = Result<T, CheckpointError>>,
     ) -> Result<T, CheckpointError> {
+        let timer = self.start_call_timer(verb);
         match tokio::time::timeout(ceiling, work).await {
-            Ok(result) => result,
+            Ok(result) => {
+                timer.finish(call_outcome(&result));
+                result
+            }
             Err(_elapsed) => {
+                timer.finish(CHECKPOINT_ADAPTER_CALL_OUTCOME_CEILING);
                 tracing::warn!(
                     ceiling_secs = ceiling.as_secs(),
                     request_timeout_ms = self.request_timeout.as_millis() as u64,
@@ -3414,14 +3720,19 @@ impl StorageApiCheckpointStore {
     /// a sidecar fan-out from a LIST pagination from a temp reap, exactly as
     /// they can when the cooperative test fires instead. Same phrasing as those
     /// arms for the same reason — one alerting story, not three.
+    ///
+    /// `verb` labels the call on
+    /// `live_edit_checkpoint_adapter_call_duration_seconds` (b.g65), as on
+    /// [`Self::send_classified`].
     async fn send_classified_within(
         &self,
+        verb: &'static str,
         walk: &'static str,
         context: &'static str,
         deadline: tokio::time::Instant,
         build_request: impl Fn() -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, CheckpointError> {
-        self.within_walk_clamp(walk, deadline, || {
+        self.within_walk_clamp(verb, walk, deadline, || {
             self.send_classified_inner(context, build_request)
         })
         .await
@@ -3437,8 +3748,13 @@ impl StorageApiCheckpointStore {
     /// more-budget-than-one-call branch hands the work to
     /// [`Self::within_call_ceiling`] instead, and only one of the two arms may
     /// construct it.
+    ///
+    /// The call is timed once under `verb` (b.g65): by
+    /// [`Self::within_call_ceiling_of`] on the delegate branch, and here on the
+    /// clamp arm, where an elapse records `ceiling` under the walk's own verb.
     async fn within_walk_clamp<T, F>(
         &self,
+        verb: &'static str,
         walk: &'static str,
         deadline: tokio::time::Instant,
         make_work: impl FnOnce() -> F,
@@ -3453,11 +3769,16 @@ impl StorageApiCheckpointStore {
             // per-call ceiling is already the binding term and the clamp would
             // be a no-op wrapper. Delegate, keeping `within_call_ceiling` the
             // single enforcement site for the per-call number.
-            return self.within_call_ceiling(make_work()).await;
+            return self.within_call_ceiling(verb, make_work()).await;
         }
+        let timer = self.start_call_timer(verb);
         match tokio::time::timeout(remaining, make_work()).await {
-            Ok(result) => result,
+            Ok(result) => {
+                timer.finish(call_outcome(&result));
+                result
+            }
             Err(_elapsed) => {
+                timer.finish(CHECKPOINT_ADAPTER_CALL_OUTCOME_CEILING);
                 let ceiling = storage_api_enumeration_ceiling(self.request_timeout);
                 tracing::warn!(
                     walk,
@@ -3671,7 +3992,28 @@ impl StorageApiCheckpointStore {
     /// success (`response.bytes()`, `response.json()`) need no separate bound:
     /// they run under the *same* per-request deadline as the send that produced
     /// the `Response`.
+    ///
+    /// # Timed once (b.g65)
+    ///
+    /// Having no ceiling wrap, this is the third site that times a call for
+    /// `live_edit_checkpoint_adapter_call_duration_seconds`, under `verb`
+    /// (`head` for the two rollback probes, `upload_options` for the
+    /// pre-flight). The sample is the probe's answer, or `cancelled` if the
+    /// caller drops it.
     async fn send_once_classified(
+        &self,
+        verb: &'static str,
+        context: &'static str,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, CheckpointError> {
+        let timer = self.start_call_timer(verb);
+        let result = self.send_once_classified_untimed(context, builder).await;
+        timer.finish(call_outcome(&result));
+        result
+    }
+
+    /// The body of [`Self::send_once_classified`], outside its call timer.
+    async fn send_once_classified_untimed(
         &self,
         context: &'static str,
         builder: reqwest::RequestBuilder,
@@ -3964,7 +4306,11 @@ impl StorageApiCheckpointStore {
     /// when the fallback engaged. Either way `.bytes()` on it yields the
     /// artifact, so no caller has to know which happened.
     async fn get_artifact(&self, url: &str) -> Result<reqwest::Response, CheckpointError> {
-        self.within_call_ceiling(self.get_artifact_inner(url)).await
+        self.within_call_ceiling(
+            CHECKPOINT_ADAPTER_CALL_VERB_GET,
+            self.get_artifact_inner(url),
+        )
+        .await
     }
 
     /// [`Self::get_artifact`] under an explicit per-call ceiling — a test-only
@@ -3985,8 +4331,12 @@ impl StorageApiCheckpointStore {
         url: &str,
         ceiling: Duration,
     ) -> Result<reqwest::Response, CheckpointError> {
-        self.within_call_ceiling_of(ceiling, self.get_artifact_inner(url))
-            .await
+        self.within_call_ceiling_of(
+            CHECKPOINT_ADAPTER_CALL_VERB_GET,
+            ceiling,
+            self.get_artifact_inner(url),
+        )
+        .await
     }
 
     /// [`Self::get_artifact`] clamped to an enumeration walk's deadline — the
@@ -4002,8 +4352,10 @@ impl StorageApiCheckpointStore {
         deadline: tokio::time::Instant,
         url: &str,
     ) -> Result<reqwest::Response, CheckpointError> {
-        self.within_walk_clamp(walk, deadline, || self.get_artifact_inner(url))
-            .await
+        self.within_walk_clamp(CHECKPOINT_ADAPTER_CALL_VERB_GET, walk, deadline, || {
+            self.get_artifact_inner(url)
+        })
+        .await
     }
 
     /// Un-bounded body of [`Self::get_artifact`], split out so the two ceiling
@@ -4401,7 +4753,11 @@ impl StorageApiCheckpointStore {
                 .into(),
         })?;
         let response = self
-            .send_once_classified(REDIRECT_CONTEXT_PREFLIGHT, self.client.get(&url))
+            .send_once_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_UPLOAD_OPTIONS,
+                REDIRECT_CONTEXT_PREFLIGHT,
+                self.client.get(&url),
+            )
             .await?;
         let raw = response.bytes().await.map_err(body_read_to_permanent)?;
         let parsed: FetchWriteTypeInfoResponse =
@@ -4434,8 +4790,11 @@ impl StorageApiCheckpointStore {
     /// a 404 to `Permanent`, and `put_ext_blob` still carves `Conflict` out to
     /// `Ok(())` for content-addressed idempotency.
     async fn put_artifact(&self, url: &str, body: Bytes) -> Result<(), CheckpointError> {
-        self.within_call_ceiling(self.put_artifact_inner(url, body))
-            .await
+        self.within_call_ceiling(
+            CHECKPOINT_ADAPTER_CALL_VERB_PUT,
+            self.put_artifact_inner(url, body),
+        )
+        .await
     }
 
     /// [`Self::put_artifact`] under an explicit per-call ceiling — a test-only
@@ -4452,8 +4811,12 @@ impl StorageApiCheckpointStore {
         body: Bytes,
         ceiling: Duration,
     ) -> Result<(), CheckpointError> {
-        self.within_call_ceiling_of(ceiling, self.put_artifact_inner(url, body))
-            .await
+        self.within_call_ceiling_of(
+            CHECKPOINT_ADAPTER_CALL_VERB_PUT,
+            ceiling,
+            self.put_artifact_inner(url, body),
+        )
+        .await
     }
 
     /// Un-bounded body of [`Self::put_artifact`].
@@ -4747,9 +5110,11 @@ impl StorageApiCheckpointStore {
     ///   the probe at all: `put_layer_checkpoint` deletes the sidecar
     ///   unguarded via `best_effort_delete_artifact`, because as the first
     ///   artifact of the publish there is nothing yet to be racing (any
-    ///   pre-existing OMPF at this `(object_id, snap_seq)` already had its own
-    ///   byte-identical sidecar). Same net effect — the sidecar does not
-    ///   survive — by a shorter path.
+    ///   pre-existing OMPF at this `(object_id, snap_seq)` written by a leader
+    ///   on a release with the same base decode already had its own
+    ///   byte-identical sidecar; across a rollout onto a different base decode
+    ///   the two sidecars can differ, the accepted residual in SDD §22.20.6).
+    ///   Same net effect — the sidecar does not survive — by a shorter path.
     /// - **Tail (the envelope, second of the pair).** Exactly the OMPF case in
     ///   the tail's own terms: the caller runs
     ///   `rollback_partial_tail_publish`, whose durable-envelope probe finds the
@@ -5083,7 +5448,11 @@ impl StorageApiCheckpointStore {
         what: &str,
     ) {
         match self
-            .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(url))
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                REDIRECT_CONTEXT_DELETE,
+                || self.client.delete(url),
+            )
             .await
         {
             Ok(_) => {}
@@ -5127,7 +5496,11 @@ impl StorageApiCheckpointStore {
     /// the same fact that makes the base helper's live-set sentence wrong here.
     async fn best_effort_delete_tail_meta(&self, url: &str, object_id: u64, to_seq: u64) {
         match self
-            .send_classified(REDIRECT_CONTEXT_DELETE, || self.client.delete(url))
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                REDIRECT_CONTEXT_DELETE,
+                || self.client.delete(url),
+            )
             .await
         {
             Ok(_) => {}
@@ -5181,6 +5554,7 @@ impl StorageApiCheckpointStore {
         let tail_url = self.layer_tail_url(object_id, to_seq);
         match self
             .send_once_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_HEAD,
                 REDIRECT_CONTEXT_TAIL_ROLLBACK_PROBE,
                 self.client.head(&tail_url),
             )
@@ -5270,7 +5644,11 @@ impl StorageApiCheckpointStore {
     async fn rollback_partial_publish(&self, object_id: u64, snap_seq: u64, sidecar_written: bool) {
         let ompf_url = self.layer_ompf_url(object_id, snap_seq);
         match self
-            .send_once_classified(REDIRECT_CONTEXT_ROLLBACK_PROBE, self.client.head(&ompf_url))
+            .send_once_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_HEAD,
+                REDIRECT_CONTEXT_ROLLBACK_PROBE,
+                self.client.head(&ompf_url),
+            )
             .await
         {
             Ok(_response) => {
@@ -5329,19 +5707,20 @@ impl StorageApiCheckpointStore {
     /// Enumerate calls and return every artifact **filename** (the last
     /// `/`-separated segment of each `resource_address`), unfiltered.
     ///
-    /// The one `layers/` walk behind *every* layers-subtree enumeration —
-    /// [`Self::list_layer_generations_via_enumerate`], `list_all_object_ids`,
-    /// `list_referenced_ext_hashes`, `list_layer_artifacts` and
-    /// [`Self::delete_layer_temp_artifacts`]. Each caller differs only in the
+    /// The one whole-folder `layers/` walk behind every enumeration that must
+    /// see every layer — `list_all_object_ids`, `list_referenced_ext_hashes`,
+    /// `list_layer_artifacts`, [`Self::list_live_ext_set`] and
+    /// [`Self::delete_layer_temp_artifacts`] — and the fallback of the
+    /// per-layer listing ([`Self::list_layer_prefix_filenames`]) when
+    /// storage-api refuses a per-layer prefix. Each caller differs only in the
     /// parser it filters the filenames through, which is what keeps the base
     /// and tail stem families from being partitioned differently in two walks.
     ///
-    /// It is [`Self::list_subtree_filenames`] pinned to `layers/`. That method
-    /// is the single LIST primitive on this adapter — the `sessions/` walk of
-    /// `list_session_checkpoint_ids` is its only other caller — so the
-    /// pagination contract, the first-page / later-page 404 split, the
-    /// non-advancing-handle guard and the enumeration ceiling exist in exactly
-    /// one place.
+    /// It is [`Self::list_subtree_filenames`] pinned to `layers/`, which in
+    /// turn is [`Self::list_prefix_filenames`] — the single LIST primitive on
+    /// this adapter — on the folder address, so the pagination contract, the
+    /// first-page / later-page 404 split, the non-advancing-handle guard and
+    /// the enumeration ceiling exist in exactly one place.
     ///
     /// # A first-page 404 is "no layer artifacts"
     ///
@@ -5363,8 +5742,9 @@ impl StorageApiCheckpointStore {
     /// failure posture); its collect deletes against an empty live set only
     /// when the live-set walk's OWN listing named one
     /// ([`Self::list_live_ext_set`] counts it from this wrapper's result); and
-    /// the retention prune WARNs on an empty post-write listing instead of
-    /// planning over it (`checkpointer::prune_after_write`).
+    /// the retention prune, which reads the per-layer listing, WARNs on an
+    /// empty post-write listing instead of planning over it
+    /// (`checkpointer::prune_after_write`).
     ///
     /// Returning the whole subtree's filenames materialises one `String` per
     /// artifact, so the count is per-kind: a retained **base** contributes up
@@ -5379,36 +5759,175 @@ impl StorageApiCheckpointStore {
     /// object-id walk already built, and it is transient (dropped at the end
     /// of the call).
     ///
-    /// Note this is **not** a maintenance-only path:
-    /// `list_layer_generations_via_enumerate` reaches it from
-    /// `get_latest_layer_checkpoint`, which the
-    /// lazy-recovery read path calls on a cache miss. The allocation is
-    /// therefore on a request-serving path too, which is why the bound above
-    /// is stated in absolute terms rather than waved off as background work.
-    /// It is still the right shape: the LIST response itself is larger than
-    /// the filenames extracted from it, and the alternative (streaming the
-    /// filter into each caller) would put the pagination contract, the 404
-    /// rule, and the non-advancing-handle guard back into three copies.
+    /// Note this is **not** a maintenance-only path: when storage-api refuses
+    /// a per-layer prefix, `list_layer_generations_via_enumerate` falls back
+    /// to it from `get_latest_layer_checkpoint`, which the lazy-recovery read
+    /// path calls on a cache miss. The allocation can therefore be on a
+    /// request-serving path too, which is why the bound above is stated in
+    /// absolute terms rather than waved off as background work. It is still
+    /// the right shape: the LIST response itself is larger than the filenames
+    /// extracted from it, and the alternative (streaming the filter into each
+    /// caller) would put the pagination contract, the 404 rule, and the
+    /// non-advancing-handle guard back into three copies.
     async fn list_layers_prefix_filenames(&self) -> Result<Vec<String>, CheckpointError> {
-        match self
-            .list_subtree_filenames("layers", WALK_LAYERS_ENUMERATION)
+        self.list_subtree_filenames_or_empty("layers", WALK_LAYERS_ENUMERATION)
             .await
-        {
+    }
+
+    /// The `layers/` listing's helper at any subtree: [`Self::list_subtree_filenames`]
+    /// with a first-page 404 read as an empty subtree. The seam the list-route
+    /// canary ([`Self::verify_list_route_canary`]) uses to send its own
+    /// listing through the exact code [`Self::list_layers_prefix_filenames`]
+    /// runs; every other caller lists `layers`.
+    async fn list_subtree_filenames_or_empty(
+        &self,
+        subtree: &str,
+        walk: &'static str,
+    ) -> Result<Vec<String>, CheckpointError> {
+        match self.list_subtree_filenames(subtree, walk).await {
             Err(CheckpointError::NotFound) => Ok(Vec::new()),
             other => other,
         }
     }
 
-    /// Walk the flat `<base_path>/.live-edit/<subtree>/` subtree via paginated
-    /// Enumerate calls and return every artifact **filename** (the last
-    /// `/`-separated segment of each `resource_address`), unfiltered.
+    /// LIST one layer's own artifacts: every filename under the partial-name
+    /// prefix `<base_path>/.live-edit/layers/<object_id>.` (b.g65, N4).
     ///
-    /// The single LIST primitive on this adapter: the `layers/` walk
+    /// Every per-layer listing — the retention prune, the tail capture's
+    /// listing, the clean-up's dead-object phase, the re-base gather, and
+    /// `get_latest_layer_checkpoint` — reads one small page here instead of
+    /// the whole `layers/` folder, so its cost no longer grows with the number
+    /// of layers in the store. storage-api passes a partial-name prefix
+    /// through to the backend's own prefix listing (Azure `list_blobs` and S3
+    /// `list_objects_v2` take any prefix; a folder's trailing `/` is not
+    /// required), so a prefix ending in `.` names exactly the artifacts whose
+    /// filename starts `<object_id>.`. The trailing `.` is what keeps object
+    /// `123` out of object `12`'s listing; the caller's own filter on the
+    /// parsed object id stays as a second guard, and is what makes the
+    /// fallback's whole-folder answer per-layer.
+    ///
+    /// # A first-page 404 is "no artifacts for this layer"
+    ///
+    /// The same storage-api answer as for an empty folder: a prefix that names
+    /// no object is a first-page 404, mapped to `Ok(vec![])` exactly as
+    /// [`Self::list_layers_prefix_filenames`] does for `layers/`. A later-page
+    /// 404 is the walk's `Transient`.
+    ///
+    /// # Fallback to the whole folder (P9)
+    ///
+    /// A refusal of the prefix — HTTP 403 (a permission refusal) or 400 (a
+    /// request storage-api will not validate), read off the `Permanent`'s
+    /// [`PermanentHttpStatus`] — makes this read fall back to
+    /// [`Self::list_layers_prefix_filenames`], whose answer the caller filters
+    /// to the layer. The refusal is remembered ([`LayerPrefixListing`]): for
+    /// [`LAYER_PREFIX_REPROBE_BACKOFF`] every per-layer listing goes straight
+    /// to the whole folder, then one tries the prefix again. A deployment that
+    /// refuses per-layer prefixes therefore lists as it did before per-layer
+    /// listing existed, plus one refused prefix request per window. The first
+    /// refusal in this adapter WARNs, naming it and the remedy; later ones are
+    /// silent. Production builds one adapter per process, so that is one WARN
+    /// per process.
+    ///
+    /// Every other error passes through unchanged: a `Transient` still defers
+    /// rather than paying for a whole-folder listing, and a `Permanent` that is
+    /// not a 400 or 403 — a repeated 401, a TLS failure, a malformed page, a
+    /// non-advancing handle, another status — reaches the caller rather than
+    /// being hidden behind a folder listing.
+    async fn list_layer_prefix_filenames(
+        &self,
+        object_id: u64,
+    ) -> Result<Vec<String>, CheckpointError> {
+        let now = tokio::time::Instant::now();
+        let refused = matches!(
+            *self.lock_layer_prefix_listing(),
+            LayerPrefixListing::Refused { retry_at } if now < retry_at
+        );
+        if refused {
+            return self.list_layers_prefix_filenames().await;
+        }
+        let prefix_address = format!("{}/layers/{}.", self.live_edit_prefix(), object_id);
+        let listed = match self
+            .list_prefix_filenames(&prefix_address, WALK_LAYER_PREFIX_ENUMERATION)
+            .await
+        {
+            Err(CheckpointError::NotFound) => Ok(Vec::new()),
+            other => other,
+        };
+        match listed {
+            Ok(filenames) => {
+                *self.lock_layer_prefix_listing() = LayerPrefixListing::Accepted;
+                Ok(filenames)
+            }
+            Err(err) if matches!(permanent_http_status(&err), Some(400 | 403)) => {
+                // Re-read the clock: the refused request may have taken up to
+                // a per-call ceiling, as the upload-options backoff does.
+                *self.lock_layer_prefix_listing() = LayerPrefixListing::Refused {
+                    retry_at: tokio::time::Instant::now() + LAYER_PREFIX_REPROBE_BACKOFF,
+                };
+                if !self
+                    .layer_prefix_fallback_warned
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        object_id,
+                        error = %err,
+                        reprobe_secs = LAYER_PREFIX_REPROBE_BACKOFF.as_secs(),
+                        "storage-api refused a per-layer backup listing (prefix \
+                         .live-edit/layers/<object_id>.) with a permission or validation \
+                         error; listing the whole backup folder instead, which is slower on \
+                         large stores, and trying the prefix again after the re-probe interval. \
+                         Check the storage service's listing permission under \
+                         .live-edit/layers/. Logged once per process"
+                    );
+                }
+                self.list_layers_prefix_filenames().await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The [`LayerPrefixListing`] state. Poisoning is recovered from, as for
+    /// the upload-options cache: the state is one enum, valid whatever a
+    /// panicking holder was doing.
+    fn lock_layer_prefix_listing(&self) -> std::sync::MutexGuard<'_, LayerPrefixListing> {
+        self.layer_prefix_listing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Walk the flat `<base_path>/.live-edit/<subtree>/` folder: the folder
+    /// address (its trailing `/` included) handed to
+    /// [`Self::list_prefix_filenames`]. Its two callers are the `layers/` walk
     /// ([`Self::list_layers_prefix_filenames`]) and the `sessions/` walk of
-    /// `list_session_checkpoint_ids` are its two callers. `walk` names the
-    /// walk in the ceiling's error, its WARN and the per-page clamp; it MUST
-    /// be one of the `WALK_*` descriptors, so an operator can tell the walks
-    /// apart by wording.
+    /// `list_session_checkpoint_ids`; both map its first-page 404 to an empty
+    /// list. The list-route canary ([`Self::verify_list_route_canary`]) sends
+    /// its own listing through each of the two.
+    async fn list_subtree_filenames(
+        &self,
+        subtree: &str,
+        walk: &'static str,
+    ) -> Result<Vec<String>, CheckpointError> {
+        let prefix_address = format!("{}/{}/", self.live_edit_prefix(), subtree);
+        self.list_prefix_filenames(&prefix_address, walk).await
+    }
+
+    /// Enumerate every object whose decoded address starts with
+    /// `prefix_address`, via paginated Enumerate calls, and return each
+    /// artifact **filename** (the last `/`-separated segment of each
+    /// `resource_address`), unfiltered.
+    ///
+    /// The single LIST primitive on this adapter. `prefix_address` is either a
+    /// folder (`<base_path>/.live-edit/<subtree>/`, through
+    /// [`Self::list_subtree_filenames`]) or a partial name
+    /// (`<base_path>/.live-edit/layers/<object_id>.`, through
+    /// [`Self::list_layer_prefix_filenames`]). storage-api lists both: it
+    /// passes the address through as a raw prefix to the backend's prefix
+    /// listing, and a trailing `/` is only how a folder is spelled, not what
+    /// makes an address listable. `walk` names the walk in the ceiling's
+    /// error, its WARN and the per-page clamp; it MUST be one of the `WALK_*`
+    /// descriptors, so an operator can tell the walks apart by wording. Each
+    /// page is one `list_page` sample on
+    /// `live_edit_checkpoint_adapter_call_duration_seconds`.
     ///
     /// Pagination loops until `next_continuation_handle` is null / absent,
     /// matching the OpenAPI Enumerate contract at
@@ -5424,14 +5943,15 @@ impl StorageApiCheckpointStore {
     ///
     /// storage-api answers an Enumerate of a prefix that holds no objects with
     /// a 404, on every page (storage-core `enumerate_nonexistent_prefix`), so a
-    /// 404 cannot tell an empty subtree from a store at the wrong address.
+    /// 404 cannot tell an empty prefix from a store at the wrong address.
     ///
     /// - **First page** (no continuation handle sent): returned as
-    ///   [`CheckpointError::NotFound`], unreclassified. What an empty subtree
-    ///   means is the listing's decision, made by the caller: both
-    ///   [`Self::list_layers_prefix_filenames`] and
-    ///   `list_session_checkpoint_ids` map it to an empty list.
-    /// - **Later page**: the subtree emptied while the walk was reading it.
+    ///   [`CheckpointError::NotFound`], unreclassified. What an empty prefix
+    ///   means is the listing's decision, made by the caller:
+    ///   [`Self::list_layers_prefix_filenames`],
+    ///   [`Self::list_layer_prefix_filenames`] and
+    ///   `list_session_checkpoint_ids` all map it to an empty list.
+    /// - **Later page**: the prefix emptied while the walk was reading it.
     ///   `Transient`, naming `walk` — the pages already read are no longer a
     ///   true listing, so the walk never returns them as a partial or empty
     ///   set; the caller re-lists.
@@ -5454,17 +5974,11 @@ impl StorageApiCheckpointStore {
     /// admitted before the deadline is entitled to a full per-call ceiling
     /// afterwards, so the walk's true cost would be `ceiling + 180 s`. With it
     /// the published 540 s is exact.
-    async fn list_subtree_filenames(
+    async fn list_prefix_filenames(
         &self,
-        subtree: &str,
+        prefix_address: &str,
         walk: &'static str,
     ) -> Result<Vec<String>, CheckpointError> {
-        // The enumerable parent is `<base_path>/.live-edit/<subtree>/` — the
-        // trailing `/` is what makes it enumerable per the OpenAPI
-        // contract. Without it the server would interpret the address as a
-        // leaf object and return 404.
-        let prefix_address = format!("{}/{}/", self.live_edit_prefix(), subtree);
-
         let mut filenames: Vec<String> = Vec::new();
         let mut continuation: Option<String> = None;
         // b.gg7: bound the *walk*, not just each page. Established before the
@@ -5474,11 +5988,11 @@ impl StorageApiCheckpointStore {
         let ceiling = storage_api_enumeration_ceiling(self.request_timeout);
         let deadline = tokio::time::Instant::now() + ceiling;
         loop {
-            let url = self.data_objects_list_url(&prefix_address, continuation.as_deref(), None);
+            let url = self.data_objects_list_url(prefix_address, continuation.as_deref(), None);
             // A 404 here is storage-api's answer for a prefix that holds no
             // objects, not a missing route. On the first page it is the
-            // caller's to interpret (NotFound); on a later page the subtree
-            // changed under the walk (Transient). See the doc-comment.
+            // caller's to interpret (NotFound); on a later page the listed
+            // prefix changed under the walk (Transient). See the doc-comment.
             //
             // Clamped to the remaining deadline (b.gg7 review round 2) so the
             // walk's true bound is the published ceiling and not
@@ -5487,9 +6001,13 @@ impl StorageApiCheckpointStore {
             // deadline would otherwise be entitled to a full per-call ceiling
             // on top of it.
             let response = match self
-                .send_classified_within(walk, REDIRECT_CONTEXT_LIST, deadline, || {
-                    self.client.get(&url)
-                })
+                .send_classified_within(
+                    CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+                    walk,
+                    REDIRECT_CONTEXT_LIST,
+                    deadline,
+                    || self.client.get(&url),
+                )
                 .await
             {
                 Ok(response) => response,
@@ -5500,7 +6018,7 @@ impl StorageApiCheckpointStore {
                     return Err(CheckpointError::Transient {
                         source: format!(
                             "storage-api {walk} got a 404 on a continuation page at {url}: the \
-                             subtree changed during the listing; re-list it"
+                             listed prefix changed during the listing; re-list it"
                         )
                         .into(),
                     });
@@ -5538,8 +6056,8 @@ impl StorageApiCheckpointStore {
                             walk,
                             ceiling_secs = ceiling.as_secs(),
                             filenames_collected = filenames.len(),
-                            "storage-api subtree enumeration exceeded its ceiling with pages \
-                             still outstanding; abandoning it as Transient so the caller \
+                            "storage-api enumeration (see the walk field) exceeded its ceiling with \
+                             pages still outstanding; abandoning it as Transient so the caller \
                              re-enumerates rather than acting on, or waiting out, an unbounded walk"
                         );
                         self.record_ceiling_elapsed(CEILING_PHASE_ENUMERATION);
@@ -5560,16 +6078,116 @@ impl StorageApiCheckpointStore {
         Ok(filenames)
     }
 
-    /// LIST the layer-checkpoint subtree and return every generation belonging
-    /// to `object_id` as `(sequence, kind)` — a base's `snap_seq` tagged
+    /// `CheckpointStore::verify_list_route` for this adapter (b.oya S2, SDD
+    /// SR-9.3): prove in this call that the Enumerate route lists back an
+    /// object written now.
+    ///
+    /// 1. PUT [`DR_CANARY_BODY`] at
+    ///    `<base>/.live-edit/dr-canary/<uuid>/canary`, a directory unique to
+    ///    this call, so the canary lives where no earlier call has listed. A
+    ///    listing cache in front of the listing route could answer from a
+    ///    stale cached *parent* listing, though no storage-service or
+    ///    storage-core layer caches the Enumerate route the adapter lists
+    ///    through (SDD §22.22, *The absence rule*); a fresh directory keeps
+    ///    the canary's proof independent of any such cache. What the canary
+    ///    guards against is a listing that is denied or mis-routed.
+    /// 2. List that directory through each of the adapter's two listing
+    ///    helpers — the `layers/` helper's NotFound-as-empty mapping
+    ///    ([`Self::list_subtree_filenames_or_empty`]) and the `sessions/`
+    ///    walk's primitive ([`Self::list_subtree_filenames`]) — and require
+    ///    the canary in each. The directory holds only the canary, so it is in
+    ///    the first page.
+    /// 3. Delete the canary and its directory, best-effort, whatever step 2
+    ///    found.
+    ///
+    /// Leftovers come only from a run killed between steps 1 and 3: one small
+    /// object, and its directory, under `dr-canary/`. Nothing but the canary
+    /// reads that subtree, so they are harmless, and an operator may delete
+    /// them by hand. No run removes another run's leftovers. That would mean
+    /// listing `dr-canary/`, and were a listing cache ever placed in front of
+    /// the route (none is today; SDD §22.22), that listing could be served as
+    /// the stale parent of a later run's fresh `<uuid>/` directory. The later
+    /// run's canary would then fail, and the service would stay held.
+    ///
+    /// Errors: the PUT's or a listing's error as it is (a `Transient` one is a
+    /// backend fault); a listing that answered without the canary is a
+    /// `Permanent` naming the helper, since the listing route is not proven.
+    async fn verify_list_route_canary(&self) -> Result<(), CheckpointError> {
+        let run_dir = format!("{DR_CANARY_SUBTREE}/{}", uuid::Uuid::new_v4().simple());
+        let canary_address = format!("{}/{run_dir}/{DR_CANARY_OBJECT}", self.live_edit_prefix());
+        let canary_url = self.by_address_url(&canary_address);
+        self.put_bytes(&canary_url, Bytes::from_static(DR_CANARY_BODY))
+            .await?;
+
+        let checked = async {
+            let via_layers_helper = self
+                .list_subtree_filenames_or_empty(&run_dir, WALK_DR_CANARY_LAYERS_HELPER)
+                .await?;
+            canary_listed(
+                &via_layers_helper,
+                WALK_DR_CANARY_LAYERS_HELPER,
+                &canary_address,
+            )?;
+            let via_sessions_helper = match self
+                .list_subtree_filenames(&run_dir, WALK_DR_CANARY_SESSIONS_HELPER)
+                .await
+            {
+                // `list_session_checkpoint_ids` reads a first-page 404 as an
+                // empty listing; so does this one.
+                Err(CheckpointError::NotFound) => Vec::new(),
+                other => other?,
+            };
+            canary_listed(
+                &via_sessions_helper,
+                WALK_DR_CANARY_SESSIONS_HELPER,
+                &canary_address,
+            )
+        }
+        .await;
+
+        self.best_effort_delete_canary(&canary_url).await;
+        let dir_address = format!("{}/{run_dir}/", self.live_edit_prefix());
+        self.best_effort_delete_canary(&self.by_address_url(&dir_address))
+            .await;
+        checked
+    }
+
+    /// Delete one canary address (an object or its directory), best-effort:
+    /// a 404 is silent, any other failure is a DEBUG line. A leftover sits
+    /// under `dr-canary/`, which nothing but the canary reads; it is harmless
+    /// and may be deleted by hand.
+    async fn best_effort_delete_canary(&self, url: &str) {
+        match self
+            .send_classified(
+                CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
+                REDIRECT_CONTEXT_DELETE,
+                || self.client.delete(url),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(err) if err.is_not_found() => {}
+            Err(err) => tracing::debug!(
+                error = %err,
+                "could not delete a disaster-recovery list-route canary; it is left under \
+                 dr-canary/, which nothing else reads, and may be deleted by hand"
+            ),
+        }
+    }
+
+    /// LIST `object_id`'s own artifacts and return every generation belonging
+    /// to it as `(sequence, kind)` — a base's `snap_seq` tagged
     /// [`CheckpointKind::Base`], a tail envelope's `to_seq` tagged
     /// [`CheckpointKind::Tail`] — ordered newest-first.
     ///
-    /// Reads the *same* single flat LIST every other `layers/` enumeration on
-    /// this adapter uses ([`Self::list_layers_prefix_filenames`]); the only change
-    /// from a base-only walk is the filter, which goes through
+    /// Reads the layer's own prefix `layers/<object_id>.`
+    /// ([`Self::list_layer_prefix_filenames`], b.g65 N4), which falls back to
+    /// the whole `layers/` folder only when storage-api refuses the prefix.
+    /// The filter is kept either way: it goes through
     /// [`parse_generation_filename`] so both stems are admitted and the
-    /// companions (`.meta.json`, `.ext-refs.json`, `.tail.meta.json`) are not.
+    /// companions (`.meta.json`, `.ext-refs.json`, `.tail.meta.json`) are not,
+    /// and it keeps only `object_id`'s generations, which is what makes the
+    /// fallback's answer per-layer.
     ///
     /// Ordering comes from the shared
     /// [`generation_sort_key`](super::generation_sort_key) —
@@ -5585,7 +6203,7 @@ impl StorageApiCheckpointStore {
         object_id: u64,
     ) -> Result<Vec<(u64, CheckpointKind)>, CheckpointError> {
         let mut generations: Vec<(u64, CheckpointKind)> = self
-            .list_layers_prefix_filenames()
+            .list_layer_prefix_filenames(object_id)
             .await?
             .iter()
             .filter_map(|name| parse_generation_filename(name))
@@ -7865,6 +8483,16 @@ mod tests {
                 err.is_permanent(),
                 "expected CheckpointError::Permanent on malformed sidecar JSON, got {err:?}"
             );
+            assert!(
+                err.to_string().contains(&format!(
+                    "ext-refs sidecar {}/v1alpha/fileobject/by-address/{} is malformed",
+                    mock_server.uri(),
+                    crate::auth::rest::encode_resource_address(
+                        "/projects/team-a/.live-edit/layers/42.7.ext-refs.json"
+                    )
+                )),
+                "b.g65 (C): the per-handle error names the sidecar's URL; got: {err}"
+            );
         }
 
         /// 17. Handle for an absent generation → 404 → `Ok(empty)`.
@@ -10014,64 +10642,172 @@ mod tests {
             );
         }
 
-        /// b.oya (decider S1) — a sidecar the `layers/` LIST named that then
-        /// 404s on its by-address GET is `Transient`, naming the sidecar, and
-        /// never skipped.
+        /// b.oya (decider S1), b.g65 (N2) — a sidecar the `layers/` LIST named
+        /// that then 404s on its by-address GET is never silently skipped:
+        /// `list_referenced_ext_hashes` (the complete-set answer) is
+        /// `Transient`, naming the sidecar, and the live-set walk the collect
+        /// reads REPORTS it in `LiveExtSet::absent`, with whether the same
+        /// listing named its base's `.ompf`, and goes on to read the rest.
         ///
-        /// Skipping it would return a live set without `55.3`'s hashes, and
-        /// the reconciliation collect phase deletes every tombstoned blob the
-        /// live set does not name — a blob a retained backup may still
-        /// reference. `Transient` aborts that collect pass with no deletes and
-        /// the next pass re-lists. Pre-fix the walk `continue`d past the 404
-        /// and answered `{aa, bb}`.
+        /// Skipping it unreported would return a live set without its hashes,
+        /// and the reconciliation collect deletes every tombstoned blob the live
+        /// set does not name — a blob a retained backup may still reference.
+        /// Reported, the collect skips it only on evidence (an unfinished
+        /// publish, or a deleter's announcement). Here `42.7` (a complete base)
+        /// and `55.3` (a lone sidecar) are listed but deliberately unmounted, so
+        /// their GETs are wiremock's 404.
         #[tokio::test]
         async fn list_referenced_ext_hashes_listed_sidecar_that_404s_is_transient_naming_it() {
             let server = MockServer::start().await;
             mount_layers_listing(&server).await;
-            mount_sidecar(&server, r"42\.7", &["aa"]).await;
             mount_sidecar(&server, r"99\.1", &["bb"]).await;
-            // `55.3.ext-refs.json` is listed but deliberately unmounted, so its
-            // GET is wiremock's 404: listed, then absent by address.
 
             let (store, _token_dir) = make_test_adapter(&server);
             let err = match store.list_referenced_ext_hashes().await {
                 Err(err) => err,
                 Ok(hashes) => panic!(
-                    "a listed sidecar that reads absent must fail the walk, never yield a live \
-                     set without its hashes; got Ok({hashes:?})"
+                    "a listed sidecar that reads absent must fail the complete-set walk, never \
+                     yield a live set without its hashes; got Ok({hashes:?})"
                 ),
             };
             assert!(
                 matches!(err, CheckpointError::Transient { .. }),
-                "Transient, so the collect phase defers to the next pass; got {err:?}"
+                "Transient, so a caller retries on a later read; got {err:?}"
             );
             assert!(
                 err.is_listed_sidecar_absent(),
-                "and typed as the listed-sidecar-absent marker, the one live-set failure the \
-                 collect phase qualifies by who holds the checkpoint lease; got {err:?}"
+                "and typed as the listed-sidecar-absent marker; got {err:?}"
             );
             assert!(
-                err.to_string().contains("55.3.ext-refs.json"),
+                err.to_string().contains(".ext-refs.json"),
                 "the error must name the sidecar that read absent; got: {err}"
             );
-            // The collect reads the walk through `list_live_ext_set`, so the
-            // marker has to survive there too — never a set, and never a count
-            // without its hashes.
-            match store.list_live_ext_set().await {
-                Err(err) => assert!(
-                    err.is_listed_sidecar_absent(),
-                    "list_live_ext_set must carry the same marker; got {err:?}"
-                ),
-                Ok(live) => {
-                    panic!("list_live_ext_set must fail the walk too, never yield {live:?}")
+            let live = store
+                .list_live_ext_set()
+                .await
+                .expect("the live-set walk reports a 404 on a listed sidecar instead of failing");
+            assert_eq!(
+                live.hashes,
+                ["bb".to_string()].into_iter().collect::<HashSet<_>>(),
+                "the readable sidecar's hashes, and only those"
+            );
+            let mut absent = live.absent.clone();
+            absent.sort_by_key(|a| a.object_id);
+            assert_eq!(
+                absent
+                    .iter()
+                    .map(|a| (a.object_id, a.snap_seq, a.base_listed))
+                    .collect::<Vec<_>>(),
+                vec![(42, 7, true), (55, 3, false)],
+                "each absence with its stem and whether the same listing named its base's OMPF"
+            );
+            assert!(
+                absent[0].artifact.ends_with("42.7.ext-refs.json")
+                    && absent[1].artifact.ends_with("55.3.ext-refs.json"),
+                "each names the sidecar's address: {absent:?}"
+            );
+        }
+
+        /// B3 (b.g65, closes b.ib2): the live-set walk reads its sidecars
+        /// exactly `EXT_REFS_WALK_CONCURRENCY` (8) at a time, and the set it
+        /// returns is exactly the union of every sidecar's hashes.
+        ///
+        /// Each GET is held one second by the fake, so two GETs whose
+        /// arrivals are less than a second apart were in flight together; the
+        /// largest number of arrivals inside any one-second window is the
+        /// walk's concurrency. A sequential walk reads 1, an unbounded one 32,
+        /// and a narrower bound (`buffer_unordered(4)`) 4. The upper bound
+        /// holds whatever the scheduling: a GET can start only after another
+        /// finished, which is a full hold after that one arrived. Reaching 8
+        /// needs only the first eight GETs, sent together, to arrive within
+        /// one hold of each other; the hold is a second rather than less to
+        /// leave that ample room on a loaded runner. The walk takes four holds.
+        #[tokio::test]
+        async fn list_live_ext_set_reads_its_sidecars_exactly_eight_at_a_time_and_unions_them() {
+            const SIDECARS: u64 = 32;
+            const HOLD: Duration = Duration::from_secs(1);
+            struct Recording(std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>);
+            impl wiremock::Respond for Recording {
+                fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                    self.0
+                        .lock()
+                        .expect("arrival log")
+                        .push(std::time::Instant::now());
+                    let oid = request
+                        .url
+                        .path()
+                        .rsplit("%2F")
+                        .next()
+                        .and_then(|name| name.split('.').next())
+                        .expect("a sidecar address")
+                        .to_owned();
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({ "ext_hashes": [format!("h{oid}")] }))
+                        .set_delay(HOLD)
                 }
             }
+
+            let server = MockServer::start().await;
+            let items: Vec<serde_json::Value> = (0..SIDECARS)
+                .flat_map(|oid| {
+                    ["ompf", "ext-refs.json"].map(|ext| {
+                        json!({
+                            "resource_address":
+                                format!("{BASE_PATH}/.live-edit/layers/{oid}.1.{ext}")
+                        })
+                    })
+                })
+                .collect();
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v1alpha/fileobject/data-objects/"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "next_continuation_handle": null,
+                    "items": items,
+                })))
+                .mount(&server)
+                .await;
+            let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            Mock::given(method("GET"))
+                .and(path_regex(r"\.ext-refs\.json$"))
+                .respond_with(Recording(std::sync::Arc::clone(&arrivals)))
+                .mount(&server)
+                .await;
+
+            let (store, _token_dir) = make_test_adapter(&server);
+            let live = store
+                .list_live_ext_set()
+                .await
+                .expect("the walk reads every sidecar");
+
+            let expected: HashSet<String> = (0..SIDECARS).map(|oid| format!("h{oid}")).collect();
+            assert_eq!(live.hashes, expected, "the union of every sidecar's hashes");
+            assert!(live.absent.is_empty());
+            let mut times = arrivals.lock().expect("arrival log").clone();
+            times.sort();
+            assert_eq!(times.len(), SIDECARS as usize, "one GET per listed sidecar");
+            let concurrency = times
+                .iter()
+                .enumerate()
+                .map(|(i, start)| {
+                    times[i..]
+                        .iter()
+                        .take_while(|t| t.duration_since(*start) < HOLD)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                concurrency,
+                super::super::EXT_REFS_WALK_CONCURRENCY,
+                "exactly EXT_REFS_WALK_CONCURRENCY sidecar GETs in flight at once"
+            );
         }
 
         /// b.oya — only a 404 on a listed sidecar is the listed-sidecar-absent
         /// marker. A malformed sidecar (`Permanent`) and a persistent 503
         /// (`Transient`) from the same walk are not, so the collect phase counts
-        /// them as `live_set_failed` whoever holds the checkpoint lease.
+        /// them as `live_set_failed` and never reads them as an explainable
+        /// absence.
         #[tokio::test]
         async fn list_referenced_ext_hashes_other_sidecar_failures_are_not_the_listed_absent_marker(
         ) {
@@ -10107,6 +10843,21 @@ mod tests {
                     !err.is_listed_sidecar_absent(),
                     "{label}: only a 404 on a listed sidecar is the marker; got {err:?}"
                 );
+                if label == "malformed body" {
+                    let url = format!(
+                        "{}/v1alpha/fileobject/by-address/{}",
+                        server.uri(),
+                        crate::auth::rest::encode_resource_address(&format!(
+                            "{BASE_PATH}/.live-edit/layers/55.3.ext-refs.json"
+                        ))
+                    );
+                    assert!(
+                        err.to_string()
+                            .contains(&format!("ext-refs sidecar {url} is malformed")),
+                        "b.g65 (C): the walk's malformed-sidecar error names the sidecar's URL \
+                         ({url}); got: {err}"
+                    );
+                }
             }
         }
 
@@ -12216,9 +12967,15 @@ mod tests {
 
         // ── layers/ — the other half of the listing 404 rule ────────────────
 
-        /// Every `CheckpointStore` method that reads the one flat `layers/`
-        /// walk (`list_layers_prefix_filenames`), so a status table can be
-        /// driven through all of them rather than through one representative.
+        /// Every `CheckpointStore` method that reads a `layers/` listing, so a
+        /// status table can be driven through all of them rather than through
+        /// one representative. Five read the whole-folder walk
+        /// (`list_layers_prefix_filenames`); `ListLayerCheckpoints` and
+        /// `GetLatestLayerCheckpoint` read the layer's own prefix,
+        /// `layers/<object_id>.` (b.g65, N4), through the same pagination and
+        /// 404 rule, which is why they share these tables. The routes the
+        /// mocks here match accept either prefix; the per-layer prefix itself
+        /// is pinned in `n4_per_layer_listing_tests`.
         #[derive(Debug, Clone, Copy)]
         enum LayersMethod {
             ListLayerArtifacts,
@@ -14993,8 +15750,9 @@ mod tests {
         //! | Site | Ceiling | `phase` |
         //! |---|---|---|
         //! | [`StorageApiCheckpointStore::send_classified`] | [`storage_api_publish_worst_case`] | `call` |
-        //! | `list_subtree_filenames` — the `layers/` pagination walk | [`storage_api_enumeration_ceiling`] | `enumeration` |
-        //! | `list_subtree_filenames` — the `sessions/` pagination walk | [`storage_api_enumeration_ceiling`] | `enumeration` |
+        //! | `list_prefix_filenames` via `list_subtree_filenames` — the `layers/` pagination walk | [`storage_api_enumeration_ceiling`] | `enumeration` |
+        //! | `list_prefix_filenames` via `list_subtree_filenames` — the `sessions/` pagination walk | [`storage_api_enumeration_ceiling`] | `enumeration` |
+        //! | `list_prefix_filenames` — one layer's own prefix, `layers/<oid>.` (b.g65; pinned in `n4_per_layer_listing_tests`) | [`storage_api_enumeration_ceiling`] | `enumeration` |
         //! | `list_referenced_ext_hashes` (sidecar GET fan-out) | [`storage_api_enumeration_ceiling`] | `enumeration` |
         //! | `delete_layer_temp_artifacts` (temp-reap DELETE fan-out) | [`storage_api_enumeration_ceiling`] | `enumeration` |
         //!
@@ -15161,6 +15919,19 @@ mod tests {
             }) as u64
         }
 
+        /// Samples on
+        /// `live_edit_checkpoint_adapter_call_duration_seconds{verb, outcome,
+        /// service}` (b.g65), 0 when the cell has none (a histogram is never
+        /// seeded).
+        fn call_samples(metrics: &SharedMetrics, verb: &str, outcome: &str) -> u64 {
+            sample_value(
+                &render(metrics),
+                "live_edit_checkpoint_adapter_call_duration_seconds_count",
+                &[("verb", verb), ("outcome", outcome), ("service", SERVICE)],
+            )
+            .unwrap_or(0.0) as u64
+        }
+
         /// A LIST endpoint that never terminates: every page reports zero items
         /// and a **strictly advancing** continuation handle.
         ///
@@ -15258,11 +16029,15 @@ mod tests {
             let started = Instant::now();
             let err = tokio::time::timeout(
                 HARD_TEST_TIMEOUT,
-                store.send_classified(REDIRECT_CONTEXT_LIST, || {
-                    // Supersedes the client-level 100 ms deadline for this
-                    // request only, so the inner body outlives the ceiling.
-                    store.client.get(&url).timeout(Duration::from_secs(30))
-                }),
+                store.send_classified(
+                    crate::observability::metrics::CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+                    REDIRECT_CONTEXT_LIST,
+                    || {
+                        // Supersedes the client-level 100 ms deadline for this
+                        // request only, so the inner body outlives the ceiling.
+                        store.client.get(&url).timeout(Duration::from_secs(30))
+                    },
+                ),
             )
             .await
             .expect(
@@ -15300,6 +16075,12 @@ mod tests {
                  remedies (backend brownout vs. an artifact namespace that has outgrown one \
                  grace window), so conflating them makes the counter unactionable"
             );
+            assert_eq!(
+                call_samples(&metrics, "list_page", "ceiling"),
+                1,
+                "b.g65: the elapsed call is one `ceiling` sample under the verb it was sent with \
+                 on the adapter-call histogram"
+            );
         }
 
         /// The ceilings do not depend on the metrics handle.
@@ -15333,9 +16114,11 @@ mod tests {
             let started = Instant::now();
             let err = tokio::time::timeout(
                 HARD_TEST_TIMEOUT,
-                store.send_classified(REDIRECT_CONTEXT_LIST, || {
-                    store.client.get(&url).timeout(Duration::from_secs(30))
-                }),
+                store.send_classified(
+                    crate::observability::metrics::CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+                    REDIRECT_CONTEXT_LIST,
+                    || store.client.get(&url).timeout(Duration::from_secs(30)),
+                ),
             )
             .await
             .expect("an un-metered adapter must still end on its own ceiling, not on this bound")
@@ -15510,10 +16293,11 @@ mod tests {
 
             // One LIST page, answered immediately: the sidecar fan-out
             // establishes its own deadline *after* the LIST, so the LIST must
-            // not spend the budget under test. 200 sidecars at 25 ms is 5 s of
-            // walking against an 1 800 ms ceiling — an ample overshoot, and the
-            // walk stops long before it reaches the end.
-            let sidecars: Vec<serde_json::Value> = (0..200u64)
+            // not spend the budget under test. 800 sidecars at 25 ms, read
+            // `EXT_REFS_WALK_CONCURRENCY` (8) at a time (b.g65, B3), is 2.5 s
+            // of walking against an 1 800 ms ceiling — an ample overshoot, and
+            // the walk stops long before it reaches the end.
+            let sidecars: Vec<serde_json::Value> = (0..800u64)
                 .map(|i| {
                     json!({
                         "resource_address":
@@ -15751,6 +16535,7 @@ mod tests {
             let err = tokio::time::timeout(
                 HARD_TEST_TIMEOUT,
                 store.send_classified_within(
+                    crate::observability::metrics::CHECKPOINT_ADAPTER_CALL_VERB_DELETE,
                     WALK_TEMP_REAP,
                     REDIRECT_CONTEXT_DELETE,
                     tokio::time::Instant::now() + REMAINING,
@@ -15797,6 +16582,927 @@ mod tests {
                  binding here, so a tick there would mislead an operator into reading a walk \
                  that ran out of budget as a backend brownout"
             );
+            assert_eq!(
+                call_samples(&metrics, "delete", "ceiling"),
+                1,
+                "b.g65: the clamp arm records one `ceiling` sample under the walk call's verb on \
+                 the adapter-call histogram"
+            );
+        }
+
+        // ── The adapter-call histogram, per call (b.g65) ─────────────────
+        //
+        // `live_edit_checkpoint_adapter_call_duration_seconds` takes ONE sample
+        // per logical call: retries, backoff, the 401 refresh and redirect hops
+        // are inside it. Each case below fails if recording happened per
+        // attempt (the 503 ladder would read 3) or not at all (0).
+
+        /// A GET answered 503, 503, then 200 is one call: one `{get, ok}`
+        /// sample, and no `transient` sample for the retried attempts.
+        #[tokio::test]
+        async fn a_get_retried_through_two_503s_records_one_ok_sample() {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(2)
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"blob".to_vec()))
+                .mount(&mock_server)
+                .await;
+            let (store, metrics, _token_dir) =
+                make_metered_adapter(&mock_server, Duration::from_secs(5));
+
+            let bytes = store
+                .get_ext_blob("ab12")
+                .await
+                .expect("the third attempt answers");
+            assert_eq!(bytes.as_deref(), Some(b"blob".as_slice()));
+            assert_eq!(
+                mock_server
+                    .received_requests()
+                    .await
+                    .expect("requests recorded")
+                    .len(),
+                3,
+                "fixture: three attempts reached the server"
+            );
+            assert_eq!(call_samples(&metrics, "get", "ok"), 1);
+            assert_eq!(
+                call_samples(&metrics, "get", "transient"),
+                0,
+                "a retried attempt is not a call"
+            );
+        }
+
+        /// A 404 is one `{get, not_found}` sample — the call's answer before
+        /// `get_ext_blob` maps it to `Ok(None)`.
+        #[tokio::test]
+        async fn a_get_answered_404_records_one_not_found_sample() {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&mock_server)
+                .await;
+            let (store, metrics, _token_dir) =
+                make_metered_adapter(&mock_server, Duration::from_secs(5));
+
+            assert_eq!(
+                store
+                    .get_ext_blob("ab12")
+                    .await
+                    .expect("a 404 is an absent blob"),
+                None
+            );
+            assert_eq!(call_samples(&metrics, "get", "not_found"), 1);
+            assert_eq!(call_samples(&metrics, "get", "ok"), 0);
+        }
+
+        /// A three-page LIST records three `list_page` samples: a full listing
+        /// is N samples, one per page.
+        #[tokio::test]
+        async fn a_three_page_listing_records_three_list_page_samples() {
+            let mock_server = MockServer::start().await;
+            for (page, (sent, next)) in [
+                (None, Some("page-2")),
+                (Some("page-2"), Some("page-3")),
+                (Some("page-3"), None),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let item = json!({
+                    "resource_address": format!("{BASE_PATH}/.live-edit/layers/{}.1.ompf", page + 1),
+                });
+                let mut mock = Mock::given(method("GET"))
+                    .and(path_regex(r"^/v1alpha/fileobject/data-objects/"));
+                mock = match sent {
+                    Some(handle) => mock.and(wiremock::matchers::query_param(
+                        "continuation_handle",
+                        handle,
+                    )),
+                    None => mock.and(wiremock::matchers::query_param_is_missing(
+                        "continuation_handle",
+                    )),
+                };
+                mock.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "next_continuation_handle": next,
+                    "items": [item],
+                })))
+                .mount(&mock_server)
+                .await;
+            }
+            let (store, metrics, _token_dir) =
+                make_metered_adapter(&mock_server, Duration::from_secs(5));
+
+            let artifacts = store
+                .list_layer_artifacts()
+                .await
+                .expect("the three-page listing completes");
+            assert_eq!(artifacts.len(), 3, "fixture: one artifact per page");
+            assert_eq!(call_samples(&metrics, "list_page", "ok"), 3);
+        }
+
+        /// `ext_blob_exists` is one `{head, ok}` sample, and a single-shot
+        /// HEAD (the rollback probes' path, `send_once_classified`) answered
+        /// 503 is one `{head, transient}` sample.
+        #[tokio::test]
+        async fn a_head_records_one_head_sample_on_both_send_paths() {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"ext%2Fab12\.blob$"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&mock_server)
+                .await;
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"probe-target$"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&mock_server)
+                .await;
+            let (store, metrics, _token_dir) =
+                make_metered_adapter(&mock_server, Duration::from_secs(5));
+
+            assert!(store.ext_blob_exists("ab12").await.expect("a 200 HEAD"));
+            assert_eq!(call_samples(&metrics, "head", "ok"), 1);
+
+            let url = store.by_address_url(&format!("{}/probe-target", store.live_edit_prefix()));
+            let probe = store
+                .send_once_classified(
+                    crate::observability::metrics::CHECKPOINT_ADAPTER_CALL_VERB_HEAD,
+                    REDIRECT_CONTEXT_LIST,
+                    store.client.head(&url),
+                )
+                .await;
+            assert!(
+                matches!(probe, Err(CheckpointError::Transient { .. })),
+                "fixture: a single-shot 503 is Transient; got {probe:?}"
+            );
+            assert_eq!(call_samples(&metrics, "head", "transient"), 1);
+        }
+
+        /// A call its caller drops mid-flight records one `cancelled` sample:
+        /// the timer's `Drop` closes it, so an abandoned call is never missing
+        /// from the histogram.
+        #[tokio::test]
+        async fn a_call_dropped_mid_flight_records_one_cancelled_sample() {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+                .mount(&mock_server)
+                .await;
+            let (store, metrics, _token_dir) =
+                make_metered_adapter(&mock_server, Duration::from_secs(30));
+
+            let dropped =
+                tokio::time::timeout(Duration::from_millis(200), store.get_ext_blob("ab12")).await;
+            assert!(
+                dropped.is_err(),
+                "fixture: the call was still in flight when dropped"
+            );
+            assert_eq!(call_samples(&metrics, "get", "cancelled"), 1);
+            assert_eq!(call_samples(&metrics, "get", "ok"), 0);
+        }
+    }
+
+    mod n4_per_layer_listing_tests {
+        //! b.g65 N4 — one layer's listing reads the layer's own prefix,
+        //! `<base_path>/.live-edit/layers/<object_id>.`, not the whole
+        //! `layers/` folder: `list_layer_checkpoints` and
+        //! `get_latest_layer_checkpoint` (the prune, the tail capture's
+        //! listing, the clean-up's dead-object phase, the re-base gather and
+        //! lazy recovery). The shared `layers/` mocks elsewhere in this file
+        //! match any listing path, so these pin the requested path itself.
+        //!
+        //! - the per-layer prefix is requested, percent-encoded through
+        //!   `encode_resource_address`, and the whole folder never is;
+        //! - a first-page 404 on the prefix is "no artifacts for this layer";
+        //! - object `123`'s artifacts never land in object `12`'s answer;
+        //! - a refusal of the prefix (403 or 400) falls back to the whole
+        //!   folder, filtered, with one WARN per adapter (one per process in
+        //!   production) and the same answer, and is remembered: listings go
+        //!   straight to the folder until the re-probe time, then one tries
+        //!   the prefix again, whose answer restores per-layer listing and
+        //!   whose refusal starts a new window;
+        //! - every other error on the prefix passes through with no fallback,
+        //!   no WARN and the state unchanged: a 500 or 503 (`Transient`), and a
+        //!   405, a repeated 401, a malformed page or a non-advancing handle
+        //!   (`Permanent`); `permanent_http_status` is what tells them apart;
+        //! - pagination holds on the prefix, and so does the walk ceiling.
+
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use serde_json::json;
+        use tempfile::TempDir;
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::auth::rest::encode_resource_address;
+        use crate::checkpoint::store::{CheckpointError, CheckpointKind, CheckpointStore};
+
+        use super::super::{LayerPrefixListing, StorageApiCheckpointStore};
+        use super::make_test_token_provider;
+
+        const BASE_PATH: &str = "/projects/team-a";
+
+        fn adapter(
+            server: &MockServer,
+            request_timeout: Duration,
+        ) -> (StorageApiCheckpointStore, TempDir) {
+            let (token_provider, token_dir) = make_test_token_provider();
+            let store = StorageApiCheckpointStore::new(
+                server.uri(),
+                PathBuf::from(BASE_PATH),
+                token_provider,
+                Duration::from_millis(5_000),
+                request_timeout,
+            )
+            .expect("storage-api checkpoint adapter constructor must succeed");
+            (store, token_dir)
+        }
+
+        /// The request path of an Enumerate of the decoded `prefix_address`.
+        fn list_path(prefix_address: &str) -> String {
+            format!(
+                "/v1alpha/fileobject/data-objects/{}",
+                encode_resource_address(prefix_address)
+            )
+        }
+
+        fn layer_prefix(object_id: u64) -> String {
+            format!("{BASE_PATH}/.live-edit/layers/{object_id}.")
+        }
+
+        fn folder() -> String {
+            format!("{BASE_PATH}/.live-edit/layers/")
+        }
+
+        fn page(names: &[&str], next: Option<&str>) -> serde_json::Value {
+            let items: Vec<serde_json::Value> = names
+                .iter()
+                .map(|name| json!({ "resource_address": format!("{BASE_PATH}/.live-edit/layers/{name}") }))
+                .collect();
+            json!({ "next_continuation_handle": next, "items": items })
+        }
+
+        /// Mount the by-address reads `get_latest_layer_checkpoint` makes for
+        /// base `<oid>.<seq>`: its OMPF and its meta.
+        async fn mount_base_reads(server: &MockServer, object_id: u64, snap_seq: u64) {
+            Mock::given(method("GET"))
+                .and(path_regex(format!(
+                    r"layers%2F{object_id}\.{snap_seq}\.ompf$"
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ompf".to_vec()))
+                .mount(server)
+                .await;
+            let meta = crate::checkpoint::store::CheckpointMeta {
+                snap_seq: Some(snap_seq),
+                ..crate::checkpoint::adapters::identity_default()
+            };
+            Mock::given(method("GET"))
+                .and(path_regex(format!(
+                    r"layers%2F{object_id}\.{snap_seq}\.meta\.json$"
+                )))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(serde_json::to_vec(&meta).expect("meta JSON encodes")),
+                )
+                .mount(server)
+                .await;
+        }
+
+        async fn listing_paths(server: &MockServer) -> Vec<String> {
+            server
+                .received_requests()
+                .await
+                .expect("requests recorded")
+                .into_iter()
+                .map(|r| r.url.path().to_owned())
+                .filter(|p| p.starts_with("/v1alpha/fileobject/data-objects/"))
+                .collect()
+        }
+
+        /// `list_layer_checkpoints(12)` requests exactly the `layers/12.`
+        /// prefix and never `layers/`, and answers object 12's generations
+        /// newest-first. Before N4 it listed the whole folder on every call,
+        /// so its cost grew with every layer in the store.
+        #[tokio::test]
+        async fn list_layer_checkpoints_requests_only_the_layers_own_prefix() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                    &[
+                        "12.3.ompf",
+                        "12.3.meta.json",
+                        "12.3.ext-refs.json",
+                        "12.5.tail",
+                        "12.5.tail.meta.json",
+                    ],
+                    None,
+                )))
+                .mount(&server)
+                .await;
+            let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+            let handles = store
+                .list_layer_checkpoints(12)
+                .await
+                .expect("the per-layer listing answers");
+
+            assert_eq!(
+                handles
+                    .iter()
+                    .map(|h| (h.seq(), h.kind))
+                    .collect::<Vec<_>>(),
+                vec![(5, CheckpointKind::Tail), (3, CheckpointKind::Base)]
+            );
+            assert_eq!(
+                listing_paths(&server).await,
+                vec![list_path(&layer_prefix(12))],
+                "exactly one listing, of the layer's own prefix; never `{}`",
+                list_path(&folder())
+            );
+        }
+
+        /// A first-page 404 on the per-layer prefix — storage-api's answer for
+        /// a prefix naming no object — is "this layer has no artifacts": an
+        /// empty listing, and `get_latest_layer_checkpoint` answers `None`,
+        /// with no fall back to the folder.
+        #[tokio::test]
+        async fn a_first_page_404_on_the_layer_prefix_is_an_empty_listing() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+            assert!(store
+                .list_layer_checkpoints(12)
+                .await
+                .expect("an empty prefix is not an error")
+                .is_empty());
+            assert!(store
+                .get_latest_layer_checkpoint(12)
+                .await
+                .expect("an empty prefix is not an error")
+                .is_none());
+            assert!(
+                listing_paths(&server)
+                    .await
+                    .iter()
+                    .all(|p| *p == list_path(&layer_prefix(12))),
+                "a 404 is an answer, not a refusal: no whole-folder listing follows"
+            );
+        }
+
+        /// Object `123`'s artifacts never land in object `12`'s answer: the
+        /// trailing `.` of the prefix keeps them out server-side, and the
+        /// adapter's own filter on the parsed object id is the second guard —
+        /// exercised here by a listing that (wrongly) names `123.9.ompf`.
+        #[tokio::test]
+        async fn object_123_never_leaks_into_object_12s_listing() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                    &[
+                        "12.3.ompf",
+                        "12.3.meta.json",
+                        "123.9.ompf",
+                        "123.9.meta.json",
+                    ],
+                    None,
+                )))
+                .mount(&server)
+                .await;
+            mount_base_reads(&server, 12, 3).await;
+            let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+            let handles = store.list_layer_checkpoints(12).await.expect("listing");
+            assert_eq!(
+                handles
+                    .iter()
+                    .map(|h| (h.object_id, h.seq()))
+                    .collect::<Vec<_>>(),
+                vec![(12, 3)]
+            );
+            let latest = store
+                .get_latest_layer_checkpoint(12)
+                .await
+                .expect("read")
+                .expect("object 12 has a base");
+            assert_eq!(
+                (latest.handle.object_id, latest.handle.snap_seq),
+                (12, 3),
+                "the newest generation is 12's own, never 123.9"
+            );
+        }
+
+        /// A refusal of the per-layer prefix — storage-api's 403 (no listing
+        /// permission there) or 400 (a prefix it will not validate) — falls
+        /// back to the whole `layers/` folder, filtered to the layer, so the
+        /// answer is the same; the refusal is remembered, so the next listing
+        /// goes straight to the folder; and the fallback WARNs once per
+        /// adapter, however many listings fall back.
+        #[tokio::test]
+        async fn a_refused_layer_prefix_falls_back_to_the_whole_folder_with_one_warn() {
+            for status in [403_u16, 400] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path(list_path(&layer_prefix(12))))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path(list_path(&folder())))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(page(
+                        &["12.3.ompf", "12.3.meta.json", "123.9.ompf", "77.1.ompf"],
+                        None,
+                    )))
+                    .mount(&server)
+                    .await;
+                let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+                let (answers, logs) = capture_warns(async {
+                    let first = store.list_layer_checkpoints(12).await;
+                    let second = store.list_layer_checkpoints(12).await;
+                    (first, second)
+                })
+                .await;
+                let (first, second) = answers;
+                for answer in [first, second] {
+                    let handles = answer.unwrap_or_else(|e| {
+                        panic!("{status}: the fallback answers instead of failing: {e:?}")
+                    });
+                    assert_eq!(
+                        handles
+                            .iter()
+                            .map(|h| (h.object_id, h.seq()))
+                            .collect::<Vec<_>>(),
+                        vec![(12, 3)],
+                        "{status}: the same answer the per-layer listing would give"
+                    );
+                }
+                assert_eq!(
+                    listing_paths(&server).await,
+                    vec![
+                        list_path(&layer_prefix(12)),
+                        list_path(&folder()),
+                        list_path(&folder()),
+                    ],
+                    "{status}: the first listing tries the prefix, then the folder; the second \
+                     goes straight to the folder while the refusal is remembered"
+                );
+                assert_eq!(
+                    logs.lines()
+                        .filter(|l| l.contains("refused a per-layer backup listing"))
+                        .count(),
+                    1,
+                    "{status}: one WARN, however many listings fall back; got:\n{logs}"
+                );
+            }
+        }
+
+        /// A `Transient` answer on the prefix (a persistent 500 or 503) does
+        /// NOT fall back: a deferral is not worth a whole-folder listing. It
+        /// passes through, and the adapter keeps listing by prefix.
+        #[tokio::test]
+        async fn a_transient_layer_prefix_answer_does_not_fall_back() {
+            for status in [500_u16, 503] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path(list_path(&layer_prefix(12))))
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&server)
+                    .await;
+                let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+                let err = store
+                    .list_layer_checkpoints(12)
+                    .await
+                    .expect_err("a persistent 5xx fails the listing");
+                assert!(
+                    matches!(err, CheckpointError::Transient { .. }),
+                    "{status}: {err:?}"
+                );
+                assert!(
+                    listing_paths(&server)
+                        .await
+                        .iter()
+                        .all(|p| *p == list_path(&layer_prefix(12))),
+                    "{status}: no whole-folder listing on a transient answer"
+                );
+                assert_eq!(
+                    *store.lock_layer_prefix_listing(),
+                    LayerPrefixListing::Accepted,
+                    "{status}: a transient answer is not a refusal of the prefix"
+                );
+            }
+        }
+
+        /// b.g65 (P9, F7): only a 400 or 403 is a refusal of the per-layer
+        /// prefix. Every other `Permanent` on the prefix — a 405 (a status
+        /// `classify_outcome` maps to `Permanent` like 403), a 401 that the
+        /// token refresh does not cure, a page that is not an
+        /// `EnumerateResult`, a continuation handle that does not advance —
+        /// passes through to the caller: no whole-folder listing, no fallback
+        /// WARN, and the remembered state unchanged, whether the adapter was
+        /// listing by prefix or had a lapsed refusal on record. Falling back
+        /// on these would hide a protocol fault behind folder listings and
+        /// spend the once-per-process WARN on the wrong cause.
+        #[tokio::test]
+        async fn a_permanent_that_is_not_a_400_or_403_on_the_layer_prefix_passes_through() {
+            #[derive(Clone, Copy, Debug)]
+            enum Row {
+                Http405,
+                Unauthorized,
+                MalformedPage,
+                NonAdvancingHandle,
+            }
+            let lapsed = tokio::time::Instant::now();
+            for row in [
+                Row::Http405,
+                Row::Unauthorized,
+                Row::MalformedPage,
+                Row::NonAdvancingHandle,
+            ] {
+                for start in [
+                    LayerPrefixListing::Accepted,
+                    LayerPrefixListing::Refused { retry_at: lapsed },
+                ] {
+                    let server = MockServer::start().await;
+                    let prefix =
+                        || Mock::given(method("GET")).and(path(list_path(&layer_prefix(12))));
+                    match row {
+                        Row::Http405 => {
+                            prefix()
+                                .respond_with(ResponseTemplate::new(405))
+                                .mount(&server)
+                                .await
+                        }
+                        Row::Unauthorized => {
+                            prefix()
+                                .respond_with(ResponseTemplate::new(401))
+                                .mount(&server)
+                                .await
+                        }
+                        Row::MalformedPage => {
+                            prefix()
+                                .respond_with(
+                                    ResponseTemplate::new(200)
+                                        .set_body_bytes(b"not-an-enumerate-result{{{".to_vec()),
+                                )
+                                .mount(&server)
+                                .await
+                        }
+                        Row::NonAdvancingHandle => {
+                            prefix()
+                                .respond_with(
+                                    ResponseTemplate::new(200)
+                                        .set_body_json(page(&["12.3.ompf"], Some("same"))),
+                                )
+                                .mount(&server)
+                                .await
+                        }
+                    }
+                    Mock::given(method("GET"))
+                        .and(path(list_path(&folder())))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .set_body_json(page(&["12.3.ompf", "12.3.meta.json"], None)),
+                        )
+                        .mount(&server)
+                        .await;
+                    let (store, dir) = adapter(&server, Duration::from_secs(5));
+                    // A live service token on disk, so the 401 row's refresh
+                    // loads it and the retry presents an unexpired
+                    // credential: a 401 then is the adapter's `Permanent`.
+                    std::fs::write(
+                        dir.path().join("service-token.json"),
+                        format!(
+                            r#"{{"access_token":"token-a","expires_on":"{}"}}"#,
+                            (chrono::Utc::now() + chrono::Duration::seconds(7_200)).to_rfc3339()
+                        ),
+                    )
+                    .expect("write the token fixture");
+                    *store.lock_layer_prefix_listing() = start;
+
+                    let (answer, logs) = capture_warns(store.list_layer_checkpoints(12)).await;
+
+                    let err = answer.expect_err("the listing fails rather than falling back");
+                    assert!(
+                        matches!(err, CheckpointError::Permanent { .. }),
+                        "{row:?} from {start:?}: the error passes through as it was: {err:?}"
+                    );
+                    let paths = listing_paths(&server).await;
+                    assert!(
+                        !paths.is_empty()
+                            && paths.iter().all(|p| *p == list_path(&layer_prefix(12))),
+                        "{row:?} from {start:?}: the prefix is listed and the folder never is: \
+                         {paths:?}"
+                    );
+                    assert!(
+                        !logs.contains("refused a per-layer backup listing"),
+                        "{row:?} from {start:?}: no fallback WARN; got:\n{logs}"
+                    );
+                    assert_eq!(
+                        *store.lock_layer_prefix_listing(),
+                        start,
+                        "{row:?}: the remembered state is unchanged"
+                    );
+                }
+            }
+        }
+
+        /// b.g65 (P9, F7): a refusal is remembered only until its re-probe
+        /// time. The first listing after it tries the prefix again; an answer
+        /// there puts the adapter back on per-layer listing (`Accepted`), so
+        /// the next listing reads the prefix too and the folder is never
+        /// listed. A first-page 404 is an answer too ("no artifacts for this
+        /// layer"): it restores `Accepted` exactly as a 200 does. The folder is
+        /// mounted with an artifact of object 12, so a fallback would also
+        /// show in the answer.
+        #[tokio::test]
+        async fn a_lapsed_prefix_refusal_tries_the_prefix_again_and_an_answer_restores_it() {
+            for (status, expected) in [(200_u16, vec![3_u64]), (404, vec![])] {
+                let server = MockServer::start().await;
+                let prefix_answer = match status {
+                    200 => ResponseTemplate::new(200)
+                        .set_body_json(page(&["12.3.ompf", "12.3.meta.json"], None)),
+                    _ => ResponseTemplate::new(status),
+                };
+                Mock::given(method("GET"))
+                    .and(path(list_path(&layer_prefix(12))))
+                    .respond_with(prefix_answer)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("GET"))
+                    .and(path(list_path(&folder())))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(page(&["12.4.ompf", "12.4.meta.json"], None)),
+                    )
+                    .mount(&server)
+                    .await;
+                let (store, _dir) = adapter(&server, Duration::from_secs(5));
+                *store.lock_layer_prefix_listing() = LayerPrefixListing::Refused {
+                    retry_at: tokio::time::Instant::now(),
+                };
+
+                for _ in 0..2 {
+                    let handles = store.list_layer_checkpoints(12).await.expect("listing");
+                    assert_eq!(
+                        handles.iter().map(|h| h.seq()).collect::<Vec<_>>(),
+                        expected,
+                        "{status}: the prefix's own answer"
+                    );
+                }
+
+                assert_eq!(
+                    *store.lock_layer_prefix_listing(),
+                    LayerPrefixListing::Accepted,
+                    "{status}: the prefix answered, so per-layer listing is restored"
+                );
+                assert_eq!(
+                    listing_paths(&server).await,
+                    vec![list_path(&layer_prefix(12)), list_path(&layer_prefix(12))],
+                    "{status}: both listings read the prefix; the folder is never listed"
+                );
+            }
+        }
+
+        /// b.g65 (P9, F7): a re-probe the prefix refuses again starts a new
+        /// refusal window — that listing falls back, the next one goes
+        /// straight to the folder — and the WARN, already spent, is not
+        /// repeated.
+        #[tokio::test]
+        async fn a_prefix_refused_again_at_its_re_probe_starts_a_new_window_without_a_second_warn()
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .respond_with(ResponseTemplate::new(403))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&folder())))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(page(&["12.3.ompf", "12.3.meta.json"], None)),
+                )
+                .mount(&server)
+                .await;
+            let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+            let ((), logs) = capture_warns(async {
+                store.list_layer_checkpoints(12).await.expect("first");
+                // The refusal's window lapses: the next listing is a re-probe.
+                *store.lock_layer_prefix_listing() = LayerPrefixListing::Refused {
+                    retry_at: tokio::time::Instant::now(),
+                };
+                let before_reprobe = tokio::time::Instant::now();
+                store.list_layer_checkpoints(12).await.expect("re-probe");
+                match *store.lock_layer_prefix_listing() {
+                    LayerPrefixListing::Refused { retry_at } => assert!(
+                        retry_at >= before_reprobe + super::super::LAYER_PREFIX_REPROBE_BACKOFF,
+                        "a new window, a full backoff after the re-probe"
+                    ),
+                    other => panic!("the re-probe was refused, so the state is Refused: {other:?}"),
+                }
+                store
+                    .list_layer_checkpoints(12)
+                    .await
+                    .expect("inside the new window");
+            })
+            .await;
+
+            assert_eq!(
+                listing_paths(&server).await,
+                vec![
+                    list_path(&layer_prefix(12)),
+                    list_path(&folder()),
+                    list_path(&layer_prefix(12)),
+                    list_path(&folder()),
+                    list_path(&folder()),
+                ],
+                "first listing: prefix then folder; the re-probe: prefix then folder; inside the \
+                 new window: the folder only"
+            );
+            assert_eq!(
+                logs.lines()
+                    .filter(|l| l.contains("refused a per-layer backup listing"))
+                    .count(),
+                1,
+                "one WARN per adapter; got:\n{logs}"
+            );
+        }
+
+        /// b.g65 (P9, F7): `classify_outcome` gives an HTTP status it does not
+        /// retry or name a `Permanent` that carries the status, and
+        /// `permanent_http_status` reads it back — so the fallback can tell a
+        /// 400 or 403 from a 405 or a 501 — while a `Permanent` built any
+        /// other way (a TLS failure, a malformed page, a repeated 401) and
+        /// every other variant carry none. The status-carrying error still
+        /// renders as `storage-api returned HTTP {code}`.
+        #[test]
+        fn permanent_http_status_reads_only_a_status_built_permanent() {
+            use super::super::{classify_outcome, permanent_http_status, ClassifiedOutcome};
+            for code in [400_u16, 403, 405, 501] {
+                let response = reqwest::Response::from(
+                    http::Response::builder()
+                        .status(code)
+                        .body(Vec::<u8>::new())
+                        .expect("a response"),
+                );
+                let ClassifiedOutcome::Permanent(err) = classify_outcome(Ok(response)) else {
+                    panic!("{code} classifies as Permanent");
+                };
+                assert_eq!(permanent_http_status(&err), Some(code));
+                assert_eq!(
+                    err.to_string(),
+                    format!("permanent checkpoint-store error: storage-api returned HTTP {code}")
+                );
+            }
+            for (err, what) in [
+                (
+                    CheckpointError::Permanent {
+                        source: "EnumerateResult JSON parse failed".into(),
+                    },
+                    "a Permanent with a text source",
+                ),
+                (
+                    CheckpointError::Transient {
+                        source: "storage-api returned HTTP 503".into(),
+                    },
+                    "a Transient",
+                ),
+                (CheckpointError::NotFound, "NotFound"),
+            ] {
+                assert_eq!(permanent_http_status(&err), None, "{what}");
+            }
+        }
+
+        /// Pagination holds on the per-layer prefix: every page of
+        /// `layers/12.` is read, by continuation handle.
+        #[tokio::test]
+        async fn the_layer_prefix_listing_paginates() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .and(wiremock::matchers::query_param_is_missing(
+                    "continuation_handle",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(page(&["12.3.ompf", "12.3.meta.json"], Some("page-2"))),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .and(wiremock::matchers::query_param(
+                    "continuation_handle",
+                    "page-2",
+                ))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(page(&["12.4.ompf", "12.4.meta.json"], None)),
+                )
+                .mount(&server)
+                .await;
+            let (store, _dir) = adapter(&server, Duration::from_secs(5));
+
+            let handles = store.list_layer_checkpoints(12).await.expect("listing");
+            assert_eq!(
+                handles.iter().map(|h| h.seq()).collect::<Vec<_>>(),
+                vec![4, 3],
+                "both pages' generations, newest first"
+            );
+        }
+
+        /// The walk ceiling holds on the per-layer prefix: a prefix that keeps
+        /// handing back fresh continuation handles is abandoned as
+        /// `Transient` at the enumeration ceiling (18 × a 100 ms request
+        /// timeout here), never followed forever. The ceiling error names the
+        /// walk as the per-layer "layer prefix enumeration", so an operator
+        /// can tell it from the whole-folder "layers enumeration".
+        #[tokio::test]
+        async fn the_layer_prefix_listing_is_bounded_by_the_walk_ceiling() {
+            struct Endless(std::sync::atomic::AtomicU64);
+            impl wiremock::Respond for Endless {
+                fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+                    let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({
+                            "next_continuation_handle": format!("page-{n}"),
+                            "items": [],
+                        }))
+                        .set_delay(Duration::from_millis(25))
+                }
+            }
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path(&layer_prefix(12))))
+                .respond_with(Endless(std::sync::atomic::AtomicU64::new(0)))
+                .mount(&server)
+                .await;
+            let (store, _dir) = adapter(&server, Duration::from_millis(100));
+
+            let err =
+                tokio::time::timeout(Duration::from_secs(20), store.list_layer_checkpoints(12))
+                    .await
+                    .expect("the walk ends on its own ceiling")
+                    .expect_err("an endless prefix listing has no answer");
+            assert!(matches!(err, CheckpointError::Transient { .. }), "{err:?}");
+            assert!(
+                err.to_string().contains("exceeded the enforced ceiling"),
+                "the walk's ceiling ended it: {err}"
+            );
+            assert!(
+                err.to_string().contains("layer prefix enumeration"),
+                "the ceiling names the per-layer walk, not the whole-folder one: {err}"
+            );
+        }
+
+        /// Capture everything `future` logs at WARN and above.
+        async fn capture_warns<F, T>(future: F) -> (T, String)
+        where
+            F: std::future::Future<Output = T>,
+        {
+            use tracing::instrument::WithSubscriber;
+            #[derive(Clone)]
+            struct Writer(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for Writer {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("log buffer").extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+                type Writer = Writer;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(Writer(buf.clone()))
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish();
+            let value = future
+                .with_subscriber(tracing::Dispatch::new(subscriber))
+                .await;
+            let text = String::from_utf8_lossy(&buf.lock().expect("log buffer")).into_owned();
+            (value, text)
         }
     }
 
@@ -16078,6 +17784,20 @@ mod tests {
                      it is seeded"
                 )
             }) as u64
+        }
+
+        /// Samples on
+        /// `live_edit_checkpoint_adapter_call_duration_seconds{verb, outcome,
+        /// service}` (b.g65): one per logical call, the redirect hop and the
+        /// completion included. 0 when the cell has no sample (a histogram is
+        /// never seeded).
+        fn call_samples(metrics: &SharedMetrics, verb: &str, outcome: &str) -> u64 {
+            sample_value(
+                &render(metrics),
+                "live_edit_checkpoint_adapter_call_duration_seconds_count",
+                &[("verb", verb), ("outcome", outcome), ("service", SERVICE)],
+            )
+            .unwrap_or(0.0) as u64
         }
 
         /// A presigned target URL on `target`, carrying the [`SAS_MARKER`] the
@@ -16655,7 +18375,11 @@ mod tests {
                 // Exactly the pre-b.z22 call shape: `client.get` with no
                 // download preference declared.
                 let err = store
-                    .send_classified(REDIRECT_CONTEXT_LIST, || store.client.get(&url))
+                    .send_classified(
+                        crate::observability::metrics::CHECKPOINT_ADAPTER_CALL_VERB_LIST_PAGE,
+                        REDIRECT_CONTEXT_LIST,
+                        || store.client.get(&url),
+                    )
                     .await
                     .expect_err(
                         "the negative control must fail — if a preference-free GET succeeds here \
@@ -16831,6 +18555,12 @@ mod tests {
                     redirect_counter(&metrics, "get", "target_failed"),
                     0,
                     "a successful hop must not also tick a failure cell"
+                );
+                assert_eq!(
+                    call_samples(&metrics, "get", "ok"),
+                    1,
+                    "b.g65: the by-address GET and its redirect hop are ONE logical call, one \
+                     `{{get, ok}}` sample on the adapter-call histogram — never one per request"
                 );
             }
 
@@ -17593,6 +19323,12 @@ mod tests {
                 assert_eq!(redirect_counter(&metrics, "put", "followed"), 1);
                 assert_eq!(redirect_counter(&metrics, "put", "completed"), 1);
                 assert_eq!(redirect_counter(&metrics, "put", "complete_failed"), 0);
+                assert_eq!(
+                    call_samples(&metrics, "put", "ok"),
+                    1,
+                    "b.g65: the by-address PUT, its upload hop and the completion POST are ONE \
+                     logical call, one `{{put, ok}}` sample on the adapter-call histogram"
+                );
             }
 
             /// `method: "post"` is honoured as an upload verb.

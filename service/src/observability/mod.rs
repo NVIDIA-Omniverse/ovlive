@@ -36,7 +36,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use crate::config::LogFormat;
-use otlp::OtlpTransport;
+use otlp::{OtlpSetupError, OtlpTransport};
 use trace_export::TraceExportState;
 
 /// Global handle to the initialized `SdkTracerProvider` used by `init_tracing`.
@@ -92,7 +92,8 @@ pub type TraceExport = (Arc<TraceExportState>, OtlpTransport);
 /// An endpoint that is not a valid `http://` or `https://` URL, or an exporter
 /// that cannot be built for it, is an `Err` naming the variable and the
 /// cause, and no subscriber is installed: `main` reports it on stderr and
-/// exits.
+/// exits. The error's [`otlp::OtlpSetupError`] variant says whether the value
+/// alone was refused or the exporter could not be built.
 ///
 /// Second and subsequent calls are a no-op returning `Ok(None)` (b.3z7
 /// medium). This mirrors the b.q1d guard on `build_otel_layer` — both layers
@@ -102,7 +103,7 @@ pub fn init_tracing(
     log_level: &str,
     log_format: LogFormat,
     trace_filter: &str,
-) -> Result<Option<TraceExport>, String> {
+) -> Result<Option<TraceExport>, OtlpSetupError> {
     if TRACING_INITIALIZED.swap(true, Ordering::AcqRel) {
         tracing::warn!(
             "init_tracing called while tracing is already initialized — \
@@ -168,7 +169,7 @@ pub(crate) fn build_registry(
         Box<dyn tracing::Subscriber + Send + Sync + 'static>,
         Option<TraceExport>,
     ),
-    String,
+    OtlpSetupError,
 > {
     let (tracer, trace_export) = match build_otel_layer()? {
         Some((tracer, state, transport)) => (Some(tracer), Some((state, transport))),
@@ -348,9 +349,11 @@ pub async fn shutdown_tracing() {
 ///   built (the double-init guard): `Ok(None)`.
 /// - A valid `http://` or `https://` endpoint: the tracer for the layer, the
 ///   pipeline's loss accounting, and the endpoint's transport.
-/// - Any other value, or an exporter that cannot be built for it: `Err`
-///   naming the variable and the cause ([`otlp`]).
-/// - A set compression variable: `Err` naming that variable ([`otlp`]).
+/// - Any other value: an [`OtlpSetupError::Setting`] naming the variable and
+///   the cause ([`otlp`]); an exporter that cannot be built for a valid one:
+///   an [`OtlpSetupError::Exporter`].
+/// - A set compression variable: an [`OtlpSetupError::Setting`] naming that
+///   variable ([`otlp`]).
 ///
 /// The endpoint passed to the exporter is always the non-empty value read
 /// here, so the SDK never falls back to `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
@@ -358,10 +361,13 @@ pub async fn shutdown_tracing() {
 /// The processor's queue capacity comes from `OTEL_BSP_MAX_QUEUE_SIZE`, parsed
 /// the way the SDK parses it; see [`trace_export`] for why the capacity is
 /// passed explicitly and how every span is accounted for.
-fn build_otel_layer() -> Result<Option<(SdkTracer, Arc<TraceExportState>, OtlpTransport)>, String> {
+fn build_otel_layer(
+) -> Result<Option<(SdkTracer, Arc<TraceExportState>, OtlpTransport)>, OtlpSetupError> {
     use opentelemetry::trace::TracerProvider as _;
 
-    let Some(endpoint) = otlp::otlp_endpoint_from_env(otlp::OTEL_EXPORTER_OTLP_ENDPOINT)? else {
+    let Some(endpoint) = otlp::otlp_endpoint_from_env(otlp::OTEL_EXPORTER_OTLP_ENDPOINT)
+        .map_err(OtlpSetupError::Setting)?
+    else {
         return Ok(None);
     };
 
@@ -1003,8 +1009,15 @@ mod tests {
                 )
             });
             assert!(
-                error.starts_with("OTEL_EXPORTER_OTLP_ENDPOINT "),
+                error
+                    .to_string()
+                    .starts_with("OTEL_EXPORTER_OTLP_ENDPOINT "),
                 "{endpoint:?}: the error must name the variable; got {error:?}"
+            );
+            assert!(
+                matches!(error, OtlpSetupError::Setting(_)) && error.is_deterministic(),
+                "{endpoint:?}: a refused endpoint value is a setting refusal, the same on every \
+                 run; got {error:?}"
             );
             assert!(
                 OTEL_PROVIDER

@@ -185,7 +185,7 @@ ElastiCache replication is asynchronous: configure {ref}`durability <live-edit-d
 - **Memory:** choose a node type whose published `maxmemory` is about twice your expected peak per shard (`db.r7g.large`: about 13 GiB).
   To tell when it is filling up, see {ref}`Store memory <live-edit-monitoring-store-memory>`.
 - **CPU:** prefer `r7g` nodes, and add shards for write headroom.
-- **Connections:** the limit is 65,000 per node, about four times the rollout peak at the chart defaults.
+- **Connections:** the limit is 65,000 per node, about six times the rollout peak at the chart defaults.
 
 (live-edit-backing-store-aws-durability)=
 ## Durability

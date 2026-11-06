@@ -60,12 +60,14 @@
 // leaves at worst a self-healing inconsistency — never a client-visible
 // half-commit. The contract each handler honors:
 //
-//   CreateSession — Non-idempotent (generates a fresh UUID4). Writes
-//     path_index inside MULTI/EXEC, then session_meta outside (on a different
-//     Cluster slot). A drop between EXEC and HSET leaves an orphan
-//     path_index entry; `SessionStore::list` opportunistically SREMs orphans
-//     on read, so the inconsistency self-heals on the next `ListSessions`
-//     for that base_path.
+//   CreateSession — Non-idempotent (generates a fresh UUID4). Writes both
+//     index members inside MULTI/EXEC, then session_meta outside (on a
+//     different Cluster slot) through a script that refuses a vetoed id. A
+//     drop between EXEC and the metadata write leaves both members with no
+//     metadata: a ghost the next `ListSessions` for that base_path vetoes and
+//     removes, so the inconsistency self-heals. A drop after the write was
+//     sent leaves either a complete session or, if a walk vetoed the id
+//     first, that same ghost.
 //
 //   DeleteSession — Idempotent (second call returns NOT_FOUND). Post-b.yis
 //     ordering is SREM path_index → MULTI{DEL session_meta, DEL
@@ -161,18 +163,20 @@
 //     the same operation_id is instead answered ALREADY_COMMITTED from the
 //     landed commit's record.
 //
-//   CreateSession — no duplicate, but a name can stay held. Failures after
-//     the commit was sent undo the attempt first, so the client's retry
-//     (the Kit client retries CreateSession through the same retry policy as
-//     every other RPC) normally starts clean. Three residuals can
+//   CreateSession — no duplicate, but a name can stay held. A failed
+//     metadata write is settled with a veto (the call answers OK if the write
+//     landed, and otherwise releases the attempt's members), and a failed
+//     reconciling read releases the attempt's members first, so the client's
+//     retry (the Kit client retries CreateSession through the same retry
+//     policy as every other RPC) normally starts clean. Three residuals can
 //     make it answer ALREADY_EXISTS:
-//       - the undo could not release the name and the commit had landed: the
-//         name stays held until the next ListSessions of that base path;
-//       - a late `HSET` plus a failed names `SREM`: a complete, never-removed
-//         session under an id the client was never told;
+//       - a release that failed after its commit landed: the name stays held
+//         until the next ListSessions of that base path;
+//       - a metadata write whose settle also failed and that then landed: a
+//         complete, listed session under an id the client was never told;
 //       - a late `EXEC`: a ghost the in-process retry ignores but a later
 //         call sees until the next ListSessions.
-//     See `undo_create_attempt` (`src/storage/session.rs`) and SDD §7.10.
+//     See `settle_failed_meta_write` (`src/storage/session.rs`) and SDD §7.10.
 //
 //   DeleteLayer, DeleteSession — idempotent: a retry after a commit that
 //     landed answers NOT_FOUND, and a partly-run DeleteSession cascade
@@ -317,7 +321,7 @@ pub struct MetricsService<S> {
 /// yields `Some("")` — so the fallback branch is unreachable. We keep the
 /// match arms on the split's output so `""` is classified as `"other"`
 /// alongside everything else unknown.
-fn endpoint_name(path: &str) -> &'static str {
+pub(crate) fn endpoint_name(path: &str) -> &'static str {
     let Some(method) = path.rsplit('/').next() else {
         return OTHER_ENDPOINT;
     };
